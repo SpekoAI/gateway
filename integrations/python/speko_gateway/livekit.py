@@ -191,7 +191,9 @@ class SpeechStream(stt.RecognizeStream):
             else:
                 await self._gateway_stream.push_frame(item)
                 last_was_flush = False
-        await self._gateway_stream.aclose()
+        if not last_was_flush:
+            await self._gateway_stream.flush()
+        await self._gateway_stream.finish()
 
     async def _receive_events(self) -> None:
         assert self._gateway_stream is not None
