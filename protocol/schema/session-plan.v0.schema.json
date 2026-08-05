@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.speko.ai/voice/session-plan.v0.schema.json",
+  "title": "Speko Voice Session Plan v0",
+  "description": "A signed, concrete execution decision consumed by Speko Gateway. Managed routing plans are issued by Speko; local BYOK plans are signed in process. Cross-field expiry and signature checks are enforced by the runtime.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["plan_id", "session_id", "attempt_id", "execution", "expires_at", "route", "reservation", "telemetry", "requirements", "signature"],
+  "properties": {
+    "plan_id": {"$ref": "#/$defs/nonEmptyString"},
+    "session_id": {"$ref": "#/$defs/nonEmptyString"},
+    "attempt_id": {"$ref": "#/$defs/nonEmptyString"},
+    "execution": {"$ref": "#/$defs/execution"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "route": {"$ref": "#/$defs/route"},
+    "reservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "lease_duration_seconds", "lease_expires_at", "renewal_url", "concurrency", "usage"],
+      "properties": {
+        "id": {"$ref": "#/$defs/nonEmptyString"},
+        "lease_duration_seconds": {"type": "integer", "minimum": 1},
+        "lease_expires_at": {"type": "string", "format": "date-time"},
+        "renewal_url": {
+          "oneOf": [
+            {"const": ""},
+            {"type": "string", "format": "uri", "pattern": "^https://"}
+          ]
+        },
+        "concurrency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lease_id", "slots"],
+          "properties": {
+            "lease_id": {"$ref": "#/$defs/nonEmptyString"},
+            "slots": {"type": "integer", "minimum": 1}
+          }
+        },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["unit", "authorized_units"],
+          "properties": {
+            "unit": {"enum": ["duration_seconds", "characters"]},
+            "authorized_units": {"type": "integer", "minimum": 1}
+          }
+        }
+      }
+    },
+    "telemetry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "maxProperties": 0
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["endpoint", "token", "flush_interval_ms"],
+          "properties": {
+            "endpoint": {"type": "string", "format": "uri", "pattern": "^https://"},
+            "token": {"$ref": "#/$defs/nonEmptyString"},
+            "flush_interval_ms": {"type": "integer", "minimum": 1000, "maximum": 60000}
+          }
+        }
+      ]
+    },
+    "fallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exchange_url"],
+      "properties": {
+        "exchange_url": {"type": "string", "format": "uri", "pattern": "^https://"}
+      }
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "protocol_revision", "runtime_version"],
+      "properties": {
+        "protocol": {"const": "speko.voice.v0"},
+        "protocol_revision": {"const": 3},
+        "runtime_version": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "signature": {"$ref": "#/$defs/nonEmptyString"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"execution": {"type": "object", "properties": {"credential_source": {"const": "byok"}}}}},
+      "then": {"properties": {"route": {"type": "object", "not": {"type": "object", "required": ["credential"]}}}}
+    },
+    {
+      "if": {"properties": {"execution": {"type": "object", "properties": {"provider_route": {"const": "speko_relay"}}}}},
+      "then": {
+        "properties": {
+          "execution": {"type": "object", "properties": {"credential_source": {"const": "managed"}}},
+          "route": {"type": "object", "properties": {"credential": {"type": "object", "properties": {"kind": {"const": "relay_access"}}}}, "required": ["credential"]}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"execution": {"type": "object", "properties": {"credential_source": {"const": "managed"}}}}},
+      "then": {"properties": {"telemetry": {"type": "object", "required": ["endpoint", "token", "flush_interval_ms"]}}}
+    }
+  ],
+  "$defs": {
+    "nonEmptyString": {"type": "string", "minLength": 1},
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["placement", "provider_route", "credential_source"],
+      "properties": {
+        "placement": {"enum": ["embedded", "sidecar", "client"]},
+        "provider_route": {"enum": ["provider_direct", "speko_relay"]},
+        "credential_source": {"enum": ["managed", "byok"]}
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model", "adapter", "transport", "endpoint"],
+      "properties": {
+        "provider": {"$ref": "#/$defs/nonEmptyString"},
+        "model": {"$ref": "#/$defs/nonEmptyString"},
+        "region": {"type": "string"},
+        "adapter": {"$ref": "#/$defs/nonEmptyString"},
+        "transport": {"enum": ["websocket", "http", "grpc", "webrtc"]},
+        "endpoint": {"type": "string", "format": "uri"},
+        "credential": {"$ref": "#/$defs/credential"}
+      }
+    },
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value", "expires_at"],
+      "properties": {
+        "kind": {"enum": ["bearer", "signed_url", "session_url", "relay_access"]},
+        "value": {"$ref": "#/$defs/nonEmptyString"},
+        "expires_at": {"type": "string", "format": "date-time"}
+      }
+    }
+  }
+}

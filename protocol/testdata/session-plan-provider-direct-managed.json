@@ -1,0 +1,52 @@
+{
+  "plan_id": "plan_123",
+  "session_id": "sess_123",
+  "attempt_id": "att_1",
+  "execution": {
+    "placement": "sidecar",
+    "provider_route": "provider_direct",
+    "credential_source": "managed"
+  },
+  "expires_at": "2026-08-01T12:00:30Z",
+  "route": {
+    "provider": "deepgram",
+    "model": "nova-3",
+    "region": "eu",
+    "adapter": "deepgram.stt.v1",
+    "transport": "websocket",
+    "endpoint": "wss://api.deepgram.com/v1/listen",
+    "credential": {
+      "kind": "bearer",
+      "value": "temporary-provider-token",
+      "expires_at": "2026-08-01T12:00:00Z"
+    }
+  },
+  "reservation": {
+    "id": "res_123",
+    "lease_duration_seconds": 3600,
+    "lease_expires_at": "2026-08-01T13:00:00Z",
+    "renewal_url": "https://gateway.speko.ai/v1/sessions/sess_123/lease-renewals",
+    "concurrency": {
+      "lease_id": "conc_123",
+      "slots": 1
+    },
+    "usage": {
+      "unit": "duration_seconds",
+      "authorized_units": 3600
+    }
+  },
+  "telemetry": {
+    "endpoint": "https://gateway.speko.ai/v1/runtime-events",
+    "token": "session-scoped-telemetry-token",
+    "flush_interval_ms": 5000
+  },
+  "fallback": {
+    "exchange_url": "https://gateway.speko.ai/v1/sessions/sess_123/fallback-plans"
+  },
+  "requirements": {
+    "protocol": "speko.voice.v0",
+    "protocol_revision": 3,
+    "runtime_version": "0.1.0"
+  },
+  "signature": "test-fixture-not-a-real-signature"
+}

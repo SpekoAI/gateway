@@ -1,0 +1,25 @@
+services:
+  gateway:
+    image: spekoai/gateway:${SPEKO_GATEWAY_TAG:-latest}
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      SPEKO_LOCAL_AUTH_TOKEN: ${SPEKO_LOCAL_AUTH_TOKEN:?set SPEKO_LOCAL_AUTH_TOKEN}
+      SPEKO_API_KEY: ${SPEKO_API_KEY:-}
+      SPEKO_DEEPGRAM_BYOK_API_KEY: ${SPEKO_DEEPGRAM_BYOK_API_KEY:-}
+      SPEKO_ELEVENLABS_BYOK_API_KEY: ${SPEKO_ELEVENLABS_BYOK_API_KEY:-}
+      SPEKO_CARTESIA_BYOK_API_KEY: ${SPEKO_CARTESIA_BYOK_API_KEY:-}
+      SPEKO_TELEMETRY_DISABLED: ${SPEKO_TELEMETRY_DISABLED:-false}
+    volumes:
+      - speko-runtime:/run/speko
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    restart: unless-stopped
+
+volumes:
+  speko-runtime:
+    name: speko-runtime

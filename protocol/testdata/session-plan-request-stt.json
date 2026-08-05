@@ -1,0 +1,36 @@
+{
+  "kind": "stt",
+  "protocol": "speko.voice.v0",
+  "protocol_revision": 3,
+  "runtime": {
+    "name": "go",
+    "version": "0.1.0",
+    "instance_id": "rt_123",
+    "placement": "sidecar",
+    "provider_routes": ["provider_direct", "speko_relay"],
+    "adapters": ["deepgram.stt.v1", "cartesia.stt.v1"]
+  },
+  "integration": {
+    "name": "livekit-python",
+    "version": "0.1.0",
+    "framework_version": "1.x",
+    "transport": "livekit-webrtc"
+  },
+  "execution": {
+    "provider_route": "auto",
+    "credential_source": "managed",
+    "relay_policy": "allowed"
+  },
+  "request": {
+    "provider": "auto",
+    "language": "en",
+    "objective": "latency",
+    "model": "auto",
+    "region_hint": "eu-central-1"
+  },
+  "media": {
+    "encoding": "pcm_s16le",
+    "sample_rate_hz": 16000,
+    "channels": 1
+  }
+}
