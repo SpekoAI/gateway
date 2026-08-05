@@ -25,7 +25,7 @@
     "id": "res_elevenlabs_123",
     "lease_duration_seconds": 60,
     "lease_expires_at": "2026-08-01T12:01:00Z",
-    "renewal_url": "https://gateway.speko.ai/v1/sessions/sess_elevenlabs_123/lease-renewals",
+    "renewal_url": "https://gateway.speko.dev/v1/sessions/sess_elevenlabs_123/lease-renewals",
     "concurrency": {
       "lease_id": "conc_elevenlabs_123",
       "slots": 1
@@ -36,12 +36,12 @@
     }
   },
   "telemetry": {
-    "endpoint": "https://gateway.speko.ai/v1/runtime-events",
+    "endpoint": "https://gateway.speko.dev/v1/runtime-events",
     "token": "session-scoped-telemetry-token",
     "flush_interval_ms": 5000
   },
   "fallback": {
-    "exchange_url": "https://gateway.speko.ai/v1/sessions/sess_elevenlabs_123/fallback-plans"
+    "exchange_url": "https://gateway.speko.dev/v1/sessions/sess_elevenlabs_123/fallback-plans"
   },
   "requirements": {
     "protocol": "speko.voice.v0",

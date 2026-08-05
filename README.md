@@ -110,7 +110,7 @@ is disabled. The exact payloads and trust boundaries are documented in
 | `SPEKO_TELEMETRY_DISABLED` | `false` | Opts out of telemetry |
 | `SPEKO_SOCKET_PATH` | `/run/speko/runtime.sock` | Absolute Unix socket path |
 | `SPEKO_LOCAL_MAX_SESSION_DURATION` | `24h` | Local BYOK session ceiling |
-| `SPEKO_CONTROL_PLANE_URL` | `https://gateway.speko.ai` | Speko control plane |
+| `SPEKO_CONTROL_PLANE_URL` | `https://gateway.speko.dev` | Speko control plane |
 | `SPEKO_JWKS_URL` | `<control-plane>/.well-known/jwks.json` | Signing keys |
 | `SPEKO_PLAN_ISSUER` | control-plane URL | Required plan issuer |
 | `SPEKO_PLAN_AUDIENCE` | `speko-runtime` | Required plan audience |
