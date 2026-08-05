@@ -179,7 +179,7 @@ func New(config Config) (*Server, error) {
 		return nil, errors.New("gateway: local auth token is required")
 	}
 	if config.Runtime.Placement != protocol.PlacementSidecar || strings.TrimSpace(config.Runtime.Name) == "" || strings.TrimSpace(config.Runtime.Version) == "" || strings.TrimSpace(config.Runtime.InstanceID) == "" || len(config.Runtime.ProviderRoutes) != 1 || config.Runtime.ProviderRoutes[0] != protocol.RouteProviderDirect {
-		return nil, errors.New("gateway: runtime must be a complete provider-direct sidecar descriptor")
+		return nil, errors.New("gateway: runtime must be a complete provider-direct descriptor")
 	}
 	if config.MaxSessions == 0 {
 		config.MaxSessions = defaultMaxSessions
