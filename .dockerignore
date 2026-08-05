@@ -1,0 +1,10 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+bin
+run
+secrets
+*.log
+.DS_Store

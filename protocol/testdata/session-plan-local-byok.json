@@ -1,0 +1,39 @@
+{
+  "plan_id": "plan_local_123",
+  "session_id": "session_local_123",
+  "attempt_id": "attempt_local_123",
+  "execution": {
+    "placement": "sidecar",
+    "provider_route": "provider_direct",
+    "credential_source": "byok"
+  },
+  "expires_at": "2026-08-01T12:00:30Z",
+  "route": {
+    "provider": "deepgram",
+    "model": "nova-3",
+    "adapter": "deepgram.stt.v1",
+    "transport": "websocket",
+    "endpoint": "wss://api.deepgram.com/v1/listen"
+  },
+  "reservation": {
+    "id": "local-session_local_123",
+    "lease_duration_seconds": 3600,
+    "lease_expires_at": "2026-08-01T13:00:00Z",
+    "renewal_url": "",
+    "concurrency": {
+      "lease_id": "local-session_local_123",
+      "slots": 1
+    },
+    "usage": {
+      "unit": "duration_seconds",
+      "authorized_units": 3600
+    }
+  },
+  "telemetry": {},
+  "requirements": {
+    "protocol": "speko.voice.v0",
+    "protocol_revision": 3,
+    "runtime_version": "0.1.0"
+  },
+  "signature": "local-test-signature"
+}

@@ -1,0 +1,37 @@
+{
+  "kind": "tts",
+  "protocol": "speko.voice.v0",
+  "protocol_revision": 3,
+  "runtime": {
+    "name": "go",
+    "version": "0.1.0",
+    "instance_id": "rt_123",
+    "placement": "sidecar",
+    "provider_routes": ["provider_direct"],
+    "adapters": ["deepgram.tts.v1", "elevenlabs.tts.v1"]
+  },
+  "integration": {
+    "name": "livekit-python",
+    "version": "0.1.0",
+    "framework_version": "1.x",
+    "transport": "livekit-webrtc"
+  },
+  "execution": {
+    "provider_route": "provider_direct",
+    "credential_source": "managed",
+    "relay_policy": "forbidden"
+  },
+  "request": {
+    "provider": "auto",
+    "language": "en",
+    "objective": "latency",
+    "model": "auto",
+    "voice": "voice_123",
+    "max_input_characters": 4000
+  },
+  "media": {
+    "encoding": "pcm_s16le",
+    "sample_rate_hz": 16000,
+    "channels": 1
+  }
+}

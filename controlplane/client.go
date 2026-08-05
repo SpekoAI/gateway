@@ -1,0 +1,257 @@
+// Package controlplane implements the runtime-facing Speko control-plane
+// contract. It only performs setup and recovery-boundary calls; it is never a
+// dependency of the audio or text hot path.
+package controlplane
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/SpekoAI/gateway/protocol"
+)
+
+const maxResponseBytes = 1 << 20
+
+// Config configures an authenticated control-plane client. The Speko API key
+// authenticates setup calls and is never sent to an upstream model provider.
+type Config struct {
+	BaseURL           string
+	APIKey            string
+	HTTPClient        *http.Client
+	UserAgent         string
+	AllowInsecureHTTP bool
+}
+
+// Client obtains signed session plans and exchanges fallback plans at explicit
+// recovery boundaries.
+type Client struct {
+	baseURL    *url.URL
+	bearer     string
+	httpClient *http.Client
+	userAgent  string
+}
+
+// CreateOptions provides per-request metadata. IdempotencyKey is required so
+// timeout retries cannot reserve two concurrent sessions.
+type CreateOptions struct {
+	IdempotencyKey string
+}
+
+// FallbackRequest explains a recovery-boundary exchange without sending raw
+// media, transcripts, or provider credential values to the control plane.
+type FallbackRequest struct {
+	AttemptID      string `json:"attempt_id"`
+	Reason         string `json:"reason"`
+	ProviderCode   string `json:"provider_code,omitempty"`
+	ProviderStatus int    `json:"provider_status,omitempty"`
+}
+
+// HTTPError is returned for non-2xx responses. RequestID allows live canaries
+// and support tooling to correlate the control-plane decision without logging
+// bearer credentials or response bodies.
+type HTTPError struct {
+	Status    int
+	RequestID string
+	Message   string
+}
+
+func (e *HTTPError) Error() string {
+	if e.RequestID != "" {
+		return fmt.Sprintf("control plane request failed with HTTP %d (request_id=%s)", e.Status, e.RequestID)
+	}
+	return fmt.Sprintf("control plane request failed with HTTP %d", e.Status)
+}
+
+// New constructs a control-plane client.
+func New(config Config) (*Client, error) {
+	if strings.TrimSpace(config.APIKey) == "" {
+		return nil, errors.New("controlplane: api key is required")
+	}
+	endpoint, err := url.Parse(config.BaseURL)
+	if err != nil || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || (endpoint.Scheme != "https" && !(config.AllowInsecureHTTP && endpoint.Scheme == "http")) {
+		return nil, errors.New("controlplane: base url must be an absolute https URL")
+	}
+	if config.HTTPClient == nil {
+		config.HTTPClient = http.DefaultClient
+	}
+	return &Client{
+		baseURL:    endpoint,
+		bearer:     config.APIKey,
+		httpClient: config.HTTPClient,
+		userAgent:  config.UserAgent,
+	}, nil
+}
+
+// CreateSessionPlan calls POST /v1/session-plans and returns the exact signed
+// plan issued by the control plane. Verification remains a separate mandatory
+// runtime step so callers cannot accidentally trust HTTP transport alone.
+func (c *Client) CreateSessionPlan(ctx context.Context, request protocol.SessionPlanRequest, options CreateOptions) (protocol.SessionPlan, string, error) {
+	if err := request.Validate(); err != nil {
+		return protocol.SessionPlan{}, "", fmt.Errorf("controlplane: invalid session plan request: %w", err)
+	}
+	if strings.TrimSpace(options.IdempotencyKey) == "" {
+		return protocol.SessionPlan{}, "", errors.New("controlplane: idempotency key is required")
+	}
+	endpoint := c.resolve("/v1/session-plans")
+	var plan protocol.SessionPlan
+	requestID, err := c.postPlan(ctx, endpoint, request, options.IdempotencyKey, &plan)
+	if err != nil {
+		return protocol.SessionPlan{}, requestID, err
+	}
+	return plan, requestID, nil
+}
+
+// ExchangeFallbackPlan obtains a newly signed plan only at a known recovery
+// boundary. The exchange URL is itself signed inside the current plan and is
+// therefore used verbatim after validation by the caller.
+func (c *Client) ExchangeFallbackPlan(ctx context.Context, current protocol.SessionPlan, request FallbackRequest, idempotencyKey string) (protocol.SessionPlan, string, error) {
+	if current.Fallback == nil || strings.TrimSpace(current.Fallback.ExchangeURL) == "" {
+		return protocol.SessionPlan{}, "", errors.New("controlplane: current plan does not permit fallback")
+	}
+	if request.AttemptID != current.AttemptID {
+		return protocol.SessionPlan{}, "", errors.New("controlplane: fallback attempt_id must match current plan")
+	}
+	if strings.TrimSpace(request.Reason) == "" || strings.TrimSpace(idempotencyKey) == "" {
+		return protocol.SessionPlan{}, "", errors.New("controlplane: fallback reason and idempotency key are required")
+	}
+	endpoint, err := url.Parse(current.Fallback.ExchangeURL)
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || !sameOrigin(endpoint, c.baseURL) {
+		return protocol.SessionPlan{}, "", errors.New("controlplane: fallback exchange URL must use the configured control-plane origin")
+	}
+	var plan protocol.SessionPlan
+	requestID, err := c.postPlan(ctx, endpoint, request, idempotencyKey, &plan)
+	if err != nil {
+		return protocol.SessionPlan{}, requestID, err
+	}
+	return plan, requestID, nil
+}
+
+// RenewSessionLease extends the existing reservation while leaving the
+// provider connection untouched. The plan-scoped telemetry token authenticates
+// this call, so a long-running gateway never needs to reuse a permanent API key.
+func (c *Client) RenewSessionLease(ctx context.Context, current protocol.SessionPlan) (protocol.SessionLease, string, error) {
+	if strings.TrimSpace(current.Reservation.RenewalURL) == "" || current.Reservation.LeaseExpiresAt.IsZero() {
+		return protocol.SessionLease{}, "", errors.New("controlplane: current plan does not permit lease renewal")
+	}
+	endpoint, err := url.Parse(current.Reservation.RenewalURL)
+	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "https" && !(c.baseURL.Scheme == "http" && endpoint.Scheme == "http" && endpoint.Host == c.baseURL.Host)) {
+		return protocol.SessionLease{}, "", errors.New("controlplane: lease renewal URL must be absolute https")
+	}
+	value := protocol.SessionLeaseRenewalRequest{
+		ReservationID: current.Reservation.ID, AttemptID: current.AttemptID,
+		LeaseExpiresAt: current.Reservation.LeaseExpiresAt,
+	}
+	body, err := json.Marshal(value)
+	if err != nil {
+		return protocol.SessionLease{}, "", fmt.Errorf("controlplane: encode lease renewal: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return protocol.SessionLease{}, "", fmt.Errorf("controlplane: create lease renewal: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+current.Telemetry.Token)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Speko-Protocol-Revision", fmt.Sprint(protocol.CurrentRevision))
+	if c.userAgent != "" {
+		request.Header.Set("User-Agent", c.userAgent)
+	}
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return protocol.SessionLease{}, "", fmt.Errorf("controlplane: send lease renewal: %w", err)
+	}
+	defer response.Body.Close()
+	requestID := response.Header.Get("X-Request-ID")
+	body, err = io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	if err != nil {
+		return protocol.SessionLease{}, requestID, fmt.Errorf("controlplane: read lease renewal: %w", err)
+	}
+	if len(body) > maxResponseBytes {
+		return protocol.SessionLease{}, requestID, errors.New("controlplane: response exceeds size limit")
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return protocol.SessionLease{}, requestID, &HTTPError{Status: response.StatusCode, RequestID: requestID}
+	}
+	var lease protocol.SessionLease
+	if err := json.Unmarshal(body, &lease); err != nil {
+		return protocol.SessionLease{}, requestID, errors.New("controlplane: response did not contain a session lease")
+	}
+	if err := lease.Validate(time.Now(), current); err != nil {
+		return protocol.SessionLease{}, requestID, fmt.Errorf("controlplane: invalid session lease: %w", err)
+	}
+	return lease, requestID, nil
+}
+
+func (c *Client) postPlan(ctx context.Context, endpoint *url.URL, value any, idempotencyKey string, target *protocol.SessionPlan) (string, error) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return "", fmt.Errorf("controlplane: encode request: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("controlplane: create request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+c.bearer)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Idempotency-Key", idempotencyKey)
+	request.Header.Set("Speko-Protocol-Revision", fmt.Sprint(protocol.CurrentRevision))
+	if c.userAgent != "" {
+		request.Header.Set("User-Agent", c.userAgent)
+	}
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("controlplane: send request: %w", err)
+	}
+	defer response.Body.Close()
+	requestID := response.Header.Get("X-Request-ID")
+	body, err = io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	if err != nil {
+		return requestID, fmt.Errorf("controlplane: read response: %w", err)
+	}
+	if len(body) > maxResponseBytes {
+		return requestID, errors.New("controlplane: response exceeds size limit")
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		message := ""
+		var failure struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(body, &failure) == nil {
+			message = failure.Error.Message
+		}
+		return requestID, &HTTPError{Status: response.StatusCode, RequestID: requestID, Message: message}
+	}
+	if err := json.Unmarshal(body, target); err == nil && target.Signature != "" {
+		return requestID, nil
+	}
+	var wrapped struct {
+		Plan protocol.SessionPlan `json:"plan"`
+	}
+	if err := json.Unmarshal(body, &wrapped); err != nil || wrapped.Plan.Signature == "" {
+		return requestID, errors.New("controlplane: response did not contain a signed session plan")
+	}
+	*target = wrapped.Plan
+	return requestID, nil
+}
+
+func (c *Client) resolve(path string) *url.URL {
+	endpoint := *c.baseURL
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + path
+	endpoint.RawQuery = ""
+	return &endpoint
+}
+
+func sameOrigin(left, right *url.URL) bool {
+	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host)
+}
