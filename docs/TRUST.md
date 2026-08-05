@@ -109,6 +109,12 @@ events. On a managed-credential route, the gateway still exports
 those records are required to meter and consolidate the provider charge. BYOK
 routes have no mandatory billing records.
 
+Anonymous BYOK events are sent without an authorization header to
+`https://gateway.speko.ai/v1/anonymous-runtime-events`. The receiver rejects
+unknown event fields and keeps these events in storage with no organization,
+API key, plan, reservation, or billing association. Managed plan telemetry is
+sent separately to the authenticated endpoint supplied in the signed plan.
+
 Telemetry delivery is asynchronous, bounded, and never blocks audio or text.
 Events can be dropped under pressure or after bounded retries; counters expose
 that condition without recording customer content.

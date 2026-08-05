@@ -10,52 +10,74 @@ routing, observability, and consolidated billing.
 
 ## Add Gateway to a LiveKit agent
 
-LiveKit Cloud builds your agent from its Dockerfile. To colocate Speko Gateway
-with the official [Python agent starter](https://github.com/livekit-examples/agent-starter-python),
-make these changes to the starter Dockerfile:
+The public image contains both the Gateway binary and its Python integration.
+Apply this diff to the official
+[LiveKit Python agent starter](https://github.com/livekit-examples/agent-starter-python)
+Dockerfile:
 
 ```diff
- # syntax=docker/dockerfile:1
-+ARG PYTHON_VERSION=3.14
+ ARG PYTHON_VERSION=3.14
 +FROM spekoai/gateway:latest AS speko-gateway
-
  FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim AS base
- ...
+
+ FROM base AS build
+ WORKDIR /app
+ COPY pyproject.toml uv.lock ./
+ RUN mkdir -p src
+ RUN uv sync --locked
++COPY --from=speko-gateway /opt/speko/python /opt/speko/python
++RUN uv pip install --python /app/.venv/bin/python /opt/speko/python
+ RUN uv run --module livekit.agents download-files
+ COPY . .
+
  FROM base
- ...
+ ARG UID=10001
+ RUN adduser \
+     --disabled-password \
+     --gecos "" \
+     --home "/app" \
+     --shell "/sbin/nologin" \
+     --uid "${UID}" \
+     appuser
  COPY --from=build --chown=appuser:appuser /app /app
 +COPY --from=speko-gateway /usr/local/bin/speko-gateway /usr/local/bin/speko-gateway
 +RUN install -d -o appuser -g appuser -m 0700 /run/speko
- ...
+ WORKDIR /app
  USER appuser
 -CMD ["uv", "run", "src/agent.py", "start"]
 +CMD ["sh", "-c", "/usr/local/bin/speko-gateway & exec uv run src/agent.py start"]
 ```
 
-The two processes share `/run/speko/runtime.sock` inside the container. Point
-the LiveKit-side Speko adapter at that socket; it authenticates with
-`SPEKO_LOCAL_AUTH_TOKEN`. The provider connection remains inside Gateway.
+Then select Speko for STT where the agent creates its `AgentSession`:
 
-For Speko-managed routing and consolidated billing, add the two secrets to the
-LiveKit deployment:
+```python
+from speko_gateway.livekit import STT
+
+session = AgentSession(stt=STT())
+```
+
+Set a local token plus one credential choice:
 
 ```bash
+# Speko-managed routing, observability, and consolidated billing
 lk agent update-secrets \
   --secrets "SPEKO_LOCAL_AUTH_TOKEN=$(openssl rand -hex 32)" \
   --secrets "SPEKO_API_KEY=your-speko-api-key"
+
+# Or BYOK: omit SPEKO_API_KEY and use your provider key
+lk agent update-secrets \
+  --secrets "SPEKO_LOCAL_AUTH_TOKEN=$(openssl rand -hex 32)" \
+  --secrets "SPEKO_DEEPGRAM_BYOK_API_KEY=your-deepgram-key"
 ```
 
-For BYOK, omit `SPEKO_API_KEY` and provide a provider key such as
-`SPEKO_DEEPGRAM_BYOK_API_KEY` instead. Gateway adds that key in memory only
-after verifying its locally signed routing plan.
+Both choices use the same local socket and LiveKit integration. With BYOK,
+provider credentials stay in the Gateway process and anonymous telemetry
+remains on unless explicitly disabled. The current image supports
+provider-direct routes; it does not yet implement Speko relay.
 
-This single-container layout is convenient for LiveKit Cloud, but both
-processes share the container environment. Run Gateway in a separate container
-when the agent process must not be able to inspect provider credentials.
-
-The current image supports provider-direct routes; it does not yet implement
-Speko relay. See [the protocol guide](docs/PROTOCOL.md) for the local API and
-WebSocket contract.
+Because the LiveKit agent and Gateway share one container in this setup, the
+agent process can inspect the container environment. Use separate containers
+when process-level credential isolation is required.
 
 ## Anonymous telemetry and opt-out
 
