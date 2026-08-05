@@ -7,3 +7,6 @@
 /secrets/
 *.log
 coverage.out
+.venv/
+__pycache__/
+*.py[cod]

@@ -28,7 +28,7 @@ import (
 const (
 	maxSecretBytes          = 64 << 10
 	defaultControlPlaneURL  = "https://gateway.speko.ai"
-	defaultTelemetryURL     = "https://gateway.speko.ai/v1/runtime-events"
+	defaultTelemetryURL     = "https://gateway.speko.ai/v1/anonymous-runtime-events"
 	defaultPlanAudience     = "speko-runtime"
 	defaultLocalSessionTime = 24 * time.Hour
 )
