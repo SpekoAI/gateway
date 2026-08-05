@@ -94,6 +94,9 @@ class LiveKitSTTStream:
     async def flush(self) -> None:
         await self._session.commit_audio()
 
+    async def finish(self) -> None:
+        await self._session.finish()
+
     async def aclose(self) -> None:
         await self._session.aclose()
 

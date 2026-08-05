@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 from livekit import rtc
@@ -26,7 +27,10 @@ class FakeStream:
     def __init__(self) -> None:
         self.frames: list[bytes] = []
         self.flushes = 0
+        self.finishes = 0
         self.closed = False
+        self.finished = asyncio.Event()
+        self.final_received_while_open = False
 
     async def push_frame(self, frame: rtc.AudioFrame) -> None:
         self.frames.append(bytes(frame.data))
@@ -34,12 +38,18 @@ class FakeStream:
     async def flush(self) -> None:
         self.flushes += 1
 
+    async def finish(self) -> None:
+        self.finishes += 1
+        self.finished.set()
+
     async def aclose(self) -> None:
         self.closed = True
 
     async def events(self) -> AsyncIterator[LiveKitSpeechEvent]:
         yield LiveKitSpeechEvent(type="speech.started", provider_request_id="dg-test")
         yield LiveKitSpeechEvent(type="transcript.delta", text="hello")
+        await self.finished.wait()
+        self.final_received_while_open = not self.closed
         yield LiveKitSpeechEvent(type="transcript.final", text="hello world")
         yield LiveKitSpeechEvent(type="speech.ended")
 
@@ -94,10 +104,31 @@ async def test_stream_maps_gateway_events_to_livekit() -> None:
     assert events[2].request_id == "dg-test"
     assert fake_stream.frames == [bytes(frame().data)]
     assert fake_stream.flushes == 1
+    assert fake_stream.finishes == 1
+    assert fake_stream.final_received_while_open is True
     assert fake_stream.closed is True
 
     await plugin.aclose()
     assert client.closed is False
+
+
+async def test_end_input_flushes_and_drains_final_events_before_close() -> None:
+    plugin = STT(FakeClient())  # type: ignore[arg-type]
+    fake_stream = FakeStream()
+    stream = plugin.stream()
+    stream._bridge = FakeBridge(fake_stream)  # type: ignore[assignment]
+
+    stream.push_frame(frame())
+    stream.end_input()
+    events = [event async for event in stream]
+
+    assert agents_stt.SpeechEventType.FINAL_TRANSCRIPT in {
+        event.type for event in events
+    }
+    assert fake_stream.flushes == 1
+    assert fake_stream.finishes == 1
+    assert fake_stream.final_received_while_open is True
+    assert fake_stream.closed is True
 
 
 def test_plugin_declares_streaming_stt() -> None:

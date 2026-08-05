@@ -141,6 +141,7 @@ class GatewaySession:
     ) -> None:
         self._websocket = websocket
         self.metadata = metadata
+        self._close_requested = False
         self._closed = False
         self._write_lock = asyncio.Lock()
 
@@ -161,13 +162,18 @@ class GatewaySession:
     async def cancel(self) -> None:
         await self._command("response.cancel")
 
+    async def finish(self) -> None:
+        """Gracefully finish input while continuing to receive terminal events."""
+
+        await self._command("session.close")
+
     async def aclose(self) -> None:
         if self._closed:
             return
-        self._closed = True
         try:
-            await self._command("session.close")
+            await self.finish()
         finally:
+            self._closed = True
             await self._websocket.close()
 
     async def events(self) -> AsyncIterator[CanonicalEvent]:
@@ -191,9 +197,15 @@ class GatewaySession:
 
     async def _command(self, type_: str, data: dict[str, Any] | None = None) -> None:
         async with self._write_lock:
-            if self._closed and type_ != "session.close":
+            if self._closed:
                 raise GatewayError("Gateway session is closed")
+            if self._close_requested:
+                if type_ == "session.close":
+                    return
+                raise GatewayError("Gateway session is finishing")
             await self._websocket.send_json({"type": type_, "data": data})
+            if type_ == "session.close":
+                self._close_requested = True
 
 
 async def _decode_json(response: aiohttp.ClientResponse) -> dict[str, Any]:
