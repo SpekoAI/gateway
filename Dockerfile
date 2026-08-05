@@ -33,6 +33,7 @@ LABEL org.opencontainers.image.title="Speko Gateway" \
       org.opencontainers.image.created=$BUILD_DATE
 COPY --from=build --chown=65532:65532 /out/speko-gateway /usr/local/bin/speko-gateway
 COPY --from=build --chown=65532:65532 /out/runtime /run/speko
+COPY --from=build --chown=65532:65532 /src/integrations/python /opt/speko/python
 USER 65532:65532
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/speko-gateway"]

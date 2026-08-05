@@ -8,3 +8,8 @@ run
 secrets
 *.log
 .DS_Store
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+coverage.out
