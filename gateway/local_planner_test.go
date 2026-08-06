@@ -73,6 +73,25 @@ func TestLocalPlannerRequiresBYOKAndUnambiguousProvider(t *testing.T) {
 	}
 }
 
+func TestLocalPlannerRoutesCartesiaSTT(t *testing.T) {
+	t.Parallel()
+	planner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{Providers: []string{"cartesia"}})
+	if err != nil {
+		t.Fatalf("new local planner: %v", err)
+	}
+	request := localPlanRequest()
+	request.Runtime.Adapters = []string{"cartesia.stt.v1"}
+	request.Request.Provider = "cartesia"
+	request.Request.Model = "auto"
+	plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create Cartesia STT plan: %v", err)
+	}
+	if plan.Route.Provider != "cartesia" || plan.Route.Adapter != "cartesia.stt.v1" || plan.Route.Model != "ink-2" || plan.Route.Endpoint != "wss://api.cartesia.ai/stt/websocket" {
+		t.Fatalf("Cartesia STT route = %+v", plan.Route)
+	}
+}
+
 func localPlanRequest() protocol.SessionPlanRequest {
 	return protocol.SessionPlanRequest{
 		Kind: protocol.SessionKindSTT, Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision,

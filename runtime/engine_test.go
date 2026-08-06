@@ -93,9 +93,12 @@ func TestTTSSessionEnforcesFixedUnicodeCharacterAllowance(t *testing.T) {
 	t.Parallel()
 
 	adapter := mock.NewTTSAdapter("mock.limited.tts")
-	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), runtimepkg.NopTelemetry{})
+	telemetry := &collectingTelemetry{}
+	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), telemetry)
 	plan := validPlan(protocol.SessionKindTTS, adapter.ID(), 60)
 	plan.Reservation.Usage.AuthorizedUnits = 3
+	plan.Execution.CredentialSource = protocol.CredentialsManaged
+	plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "short-lived", ExpiresAt: fixedNow.Add(time.Minute)}
 	session, err := engine.Open(context.Background(), runtimepkg.OpenRequest{
 		Kind: protocol.SessionKindTTS, Plan: plan,
 		Media: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1},
@@ -114,6 +117,30 @@ func TestTTSSessionEnforcesFixedUnicodeCharacterAllowance(t *testing.T) {
 	}
 	session.Close()
 	collectEvents(t, session)
+	assertUsageReported(t, telemetry.snapshot(), protocol.UsageUnitCharacters, 3_000, true)
+}
+
+func TestSTTSessionReportsAcceptedPCMDurationFromCompleteSamples(t *testing.T) {
+	t.Parallel()
+	adapter := mock.NewSTTAdapter("mock.usage-duration.stt")
+	telemetry := &collectingTelemetry{}
+	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), telemetry)
+	plan := validPlan(protocol.SessionKindSTT, adapter.ID(), 60)
+	plan.Execution.CredentialSource = protocol.CredentialsManaged
+	plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "short-lived", ExpiresAt: fixedNow.Add(time.Minute)}
+	session, err := engine.Open(context.Background(), runtimepkg.OpenRequest{
+		Kind: protocol.SessionKindSTT, Plan: plan,
+		Media: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1},
+	})
+	if err != nil {
+		t.Fatalf("open STT session: %v", err)
+	}
+	if err := session.SubmitAudio(runtimepkg.AudioInput{Data: make([]byte, 32_001)}); err != nil {
+		t.Fatalf("submit PCM: %v", err)
+	}
+	session.Close()
+	collectEvents(t, session)
+	assertUsageReported(t, telemetry.snapshot(), protocol.UsageUnitDurationSeconds, 1_000, true)
 }
 
 func TestEngineInjectsBYOKCredentialOnlyIntoAdapterRequest(t *testing.T) {
@@ -226,12 +253,13 @@ func TestInputBackpressureRetainsRejectedAudioAndReleasesAcceptedAudio(t *testin
 		}
 		return stream
 	})
-	limits := runtimepkg.Limits{MaxInputMessages: 1, MaxInputBytes: 4, MaxOutputEvents: 8}
-	engine := newEngine(t, adapter, limits, runtimepkg.NopTelemetry{})
+	limits := runtimepkg.Limits{MaxInputMessages: 1, MaxInputBytes: 8_000, MaxOutputEvents: 8}
+	telemetry := &collectingTelemetry{}
+	engine := newEngine(t, adapter, limits, telemetry)
 	session := openSession(t, engine, protocol.SessionKindSTT, adapter.ID())
 
 	var firstReleased, secondReleased, rejectedReleased atomic.Int32
-	if err := session.SubmitAudio(runtimepkg.AudioInput{Data: []byte{1, 1}, Release: func() { firstReleased.Add(1) }}); err != nil {
+	if err := session.SubmitAudio(runtimepkg.AudioInput{Data: make([]byte, 8_000), Release: func() { firstReleased.Add(1) }}); err != nil {
 		t.Fatalf("first submit: %v", err)
 	}
 	select {
@@ -239,10 +267,10 @@ func TestInputBackpressureRetainsRejectedAudioAndReleasesAcceptedAudio(t *testin
 	case <-time.After(time.Second):
 		t.Fatal("provider did not receive first frame")
 	}
-	if err := session.SubmitAudio(runtimepkg.AudioInput{Data: []byte{2, 2}, Release: func() { secondReleased.Add(1) }}); err != nil {
+	if err := session.SubmitAudio(runtimepkg.AudioInput{Data: make([]byte, 8_000), Release: func() { secondReleased.Add(1) }}); err != nil {
 		t.Fatalf("second submit: %v", err)
 	}
-	err := session.SubmitAudio(runtimepkg.AudioInput{Data: []byte{3, 3}, Release: func() { rejectedReleased.Add(1) }})
+	err := session.SubmitAudio(runtimepkg.AudioInput{Data: make([]byte, 8_000), Release: func() { rejectedReleased.Add(1) }})
 	if !errors.Is(err, runtimepkg.ErrBackpressure) {
 		t.Fatalf("third submit error = %v, want ErrBackpressure", err)
 	}
@@ -259,6 +287,7 @@ func TestInputBackpressureRetainsRejectedAudioAndReleasesAcceptedAudio(t *testin
 	if got := secondReleased.Load(); got != 1 {
 		t.Fatalf("second frame release calls = %d, want 1", got)
 	}
+	assertUsageReported(t, telemetry.snapshot(), protocol.UsageUnitDurationSeconds, 500, false)
 }
 
 func TestSlowConsumerGetsTerminalBackpressureError(t *testing.T) {
@@ -423,6 +452,7 @@ func TestProviderFailureBecomesStructuredProviderError(t *testing.T) {
 			Message:        "provider limited this request",
 			Retryable:      true,
 			ProviderStatus: 429,
+			Extensions:     map[string]json.RawMessage{"provider.test/v1": json.RawMessage(`{"status_code":429}`)},
 		}}); err != nil {
 			t.Fatalf("emit provider failure: %v", err)
 		}
@@ -448,6 +478,9 @@ func TestProviderFailureBecomesStructuredProviderError(t *testing.T) {
 	}
 	if data.Code != "provider_rate_limited" || data.Source != "provider" || !data.Retryable || data.ProviderStatus != 429 {
 		t.Fatalf("terminal data = %+v", data)
+	}
+	if events[len(events)-1].Extensions["provider.test/v1"] == nil {
+		t.Fatal("terminal provider error omitted its local raw extension")
 	}
 }
 
@@ -538,6 +571,27 @@ func names(events []runtimepkg.TelemetryEvent) []string {
 		result = append(result, event.Name)
 	}
 	return result
+}
+
+func assertUsageReported(t *testing.T, events []runtimepkg.TelemetryEvent, unit protocol.UsageUnit, quantityMillis int64, required bool) {
+	t.Helper()
+	count := 0
+	for _, event := range events {
+		if event.Name != "usage.reported" {
+			continue
+		}
+		count++
+		var payload struct {
+			Unit           protocol.UsageUnit `json:"unit"`
+			QuantityMillis int64              `json:"quantity_millis"`
+		}
+		if err := json.Unmarshal(event.Data, &payload); err != nil || payload.Unit != unit || payload.QuantityMillis != quantityMillis || event.Required != required {
+			t.Fatalf("usage.reported = %+v payload=%+v err=%v", event, payload, err)
+		}
+	}
+	if count != 1 {
+		t.Fatalf("usage.reported count = %d, events=%v", count, names(events))
+	}
 }
 
 type collectingTelemetry struct {

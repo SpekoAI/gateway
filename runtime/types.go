@@ -148,6 +148,9 @@ type ProviderError struct {
 	Retryable      bool
 	ProviderStatus int
 	Cause          error
+	// Extensions may retain a provider's raw error payload for the local
+	// canonical error event. Telemetry never copies this field.
+	Extensions map[string]json.RawMessage
 }
 
 func (e *ProviderError) Error() string {

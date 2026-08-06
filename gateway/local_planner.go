@@ -194,7 +194,8 @@ func (p *LocalPlanner) selectProvider(kind protocol.SessionKind, requested strin
 
 func supportsLocalKind(provider string, kind protocol.SessionKind) bool {
 	return (provider == "deepgram" && (kind == protocol.SessionKindSTT || kind == protocol.SessionKindTTS)) ||
-		((provider == "elevenlabs" || provider == "cartesia") && kind == protocol.SessionKindTTS)
+		(provider == "elevenlabs" && kind == protocol.SessionKindTTS) ||
+		(provider == "cartesia" && (kind == protocol.SessionKindSTT || kind == protocol.SessionKindTTS))
 }
 
 func localRoute(kind protocol.SessionKind, provider, model string) (protocol.PlanRoute, error) {
@@ -220,6 +221,11 @@ func localRoute(kind protocol.SessionKind, provider, model string) (protocol.Pla
 			model = "sonic-3"
 		}
 		return protocol.PlanRoute{Provider: provider, Model: model, Adapter: "cartesia.tts.v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket"}, nil
+	case provider == "cartesia" && kind == protocol.SessionKindSTT:
+		if model == "" || model == "auto" {
+			model = "ink-2"
+		}
+		return protocol.PlanRoute{Provider: provider, Model: model, Adapter: "cartesia.stt.v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/stt/websocket"}, nil
 	default:
 		return protocol.PlanRoute{}, fmt.Errorf("gateway: unsupported local route provider=%q kind=%q", provider, kind)
 	}
