@@ -142,6 +142,36 @@ func TestCreateSessionPlanReturnsRequestIDOnControlPlaneError(t *testing.T) {
 	}
 }
 
+func TestRuntimeInstanceHeartbeatUsesAPIKeyAndInstancePath(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPut || request.URL.Path != "/v1/runtime-instances/gateway-pod-1" {
+			t.Fatalf("request = %s %s", request.Method, request.URL.Path)
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer sk_speko_test" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		var heartbeat controlplane.InstanceHeartbeat
+		if err := json.NewDecoder(request.Body).Decode(&heartbeat); err != nil {
+			t.Fatalf("decode heartbeat: %v", err)
+		}
+		if heartbeat.RuntimeName != "go-gateway" || heartbeat.ActiveSessions != 2 || heartbeat.SessionCapacity != 10 {
+			t.Fatalf("heartbeat = %+v", heartbeat)
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	client := newClient(t, server, "sk_speko_test")
+
+	err := client.ReportInstance(context.Background(), "gateway-pod-1", controlplane.InstanceHeartbeat{
+		RuntimeName: "go-gateway", RuntimeVersion: "test", StartedAt: time.Now().UTC(),
+		ActiveSessions: 2, SessionCapacity: 10,
+	})
+	if err != nil {
+		t.Fatalf("ReportInstance: %v", err)
+	}
+}
+
 func newClient(t *testing.T, server *httptest.Server, apiKey string) *controlplane.Client {
 	t.Helper()
 	client, err := controlplane.New(controlplane.Config{BaseURL: server.URL, APIKey: apiKey, HTTPClient: server.Client()})
