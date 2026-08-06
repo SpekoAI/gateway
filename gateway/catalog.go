@@ -34,6 +34,17 @@ type CatalogEntry struct {
 	DefaultVoice string             `json:"default_voice,omitempty"`
 	Transport    protocol.Transport `json:"transport"`
 	Endpoint     string             `json:"endpoint"`
+	// RequiresDeploymentConfig, when non-empty, says this row cannot be dialled as
+	// written and names what an operator must supply. Google STT is the case: its
+	// path embeds the caller's own GCP project
+	// (/v2/projects/{project}/locations/{location}/recognizers/_:recognize), so no
+	// static endpoint is correct for anybody.
+	//
+	// The row stays published because the catalog answers "what does this build
+	// implement", and hiding a supported vendor would be its own lie. But the
+	// planner refuses it until configured rather than dialling a literal
+	// PROJECT_ID and handing back a vendor 404 an operator cannot act on.
+	RequiresDeploymentConfig string `json:"requires_deployment_config,omitempty"`
 }
 
 var providerCatalog = []CatalogEntry{
@@ -66,9 +77,10 @@ var providerCatalog = []CatalogEntry{
 	// is /v2/projects/{project}/locations/{location}/recognizers/_:recognize, so a
 	// plan MUST rewrite the project and location. The row below is a template, not
 	// a dialable URL — `eu` because Chirp 3 wins hi/ta/te only from that region.
-	{Provider: "google", Kind: protocol.SessionKindSTT, Adapter: "google.stt.v1", DefaultModel: "chirp_3", Transport: protocol.TransportHTTP, Endpoint: "https://speech.googleapis.com/v2/projects/PROJECT_ID/locations/eu/recognizers/_:recognize"},
+	{Provider: "google", Kind: protocol.SessionKindSTT, Adapter: "google.stt.v1", DefaultModel: "chirp_3", Transport: protocol.TransportHTTP, Endpoint: "https://speech.googleapis.com/v2/projects/PROJECT_ID/locations/eu/recognizers/_:recognize",
+		RequiresDeploymentConfig: "set SPEKO_GOOGLE_STT_ENDPOINT to a project-scoped recognize URL"},
 	{Provider: "gradium", Kind: protocol.SessionKindSTT, Adapter: "gradium.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/asr"},
-	{Provider: "gradium", Kind: protocol.SessionKindTTS, Adapter: "gradium.tts.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/tts"},
+	{Provider: "gradium", Kind: protocol.SessionKindTTS, Adapter: "gradium.tts.v1", DefaultModel: "default", DefaultVoice: "YTpq7expH9539ERJ", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/tts"},
 	{Provider: "rime", Kind: protocol.SessionKindTTS, Adapter: "rime.tts.v1", DefaultModel: "coda", DefaultVoice: "astra", Transport: protocol.TransportWebSocket, Endpoint: "wss://users-ws.rime.ai/ws3"},
 	{Provider: "hume", Kind: protocol.SessionKindTTS, Adapter: "hume.tts.v1", DefaultModel: "octave-2", DefaultVoice: "Colton Rivers", Transport: protocol.TransportHTTP, Endpoint: "https://api.hume.ai/v0/tts/stream/json"},
 	{Provider: "inworld", Kind: protocol.SessionKindSTT, Adapter: "inworld.stt.v1", DefaultModel: "inworld-stt-1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional"},
@@ -127,6 +139,10 @@ type catalogModel struct {
 	// here. Reporting the row rather than hiding it keeps the published list the
 	// same shape everywhere while staying honest about this instance.
 	Installed bool `json:"installed"`
+	// RequiresConfig repeats the catalog's reason so a caller reading this list
+	// learns the row needs deployment config BEFORE wiring the id, rather than
+	// from a failed session.
+	RequiresConfig string `json:"requires_config,omitempty"`
 }
 
 // models publishes the catalog. Unauthenticated on purpose: it names no customer,
@@ -150,12 +166,13 @@ func (s *Server) models(writer http.ResponseWriter, request *http.Request) {
 		}
 		_, present := installed[entry.Adapter]
 		rows = append(rows, catalogModel{
-			ID:        entry.Provider + ":" + entry.DefaultModel,
-			Provider:  entry.Provider,
-			Kind:      entry.Kind,
-			Adapter:   entry.Adapter,
-			Transport: entry.Transport,
-			Installed: present,
+			ID:             entry.Provider + ":" + entry.DefaultModel,
+			Provider:       entry.Provider,
+			Kind:           entry.Kind,
+			Adapter:        entry.Adapter,
+			Transport:      entry.Transport,
+			Installed:      present,
+			RequiresConfig: entry.RequiresDeploymentConfig,
 		})
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{
