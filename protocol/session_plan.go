@@ -90,10 +90,21 @@ type SessionPlanRequest struct {
 	Protocol         string            `json:"protocol"`
 	ProtocolRevision int               `json:"protocol_revision"`
 	Runtime          RuntimeDescriptor `json:"runtime"`
+	Workload         *Workload         `json:"workload,omitempty"`
 	Integration      *Integration      `json:"integration,omitempty"`
 	Execution        ExecutionRequest  `json:"execution"`
 	Request          RequestOptions    `json:"request"`
 	Media            *MediaFormat      `json:"media,omitempty"`
+}
+
+// Workload identifies the customer-owned logical workload that opened a
+// session. It is deliberately framework-neutral: a managed Speko agent is one
+// workload type, while a customer can use another stable type/id pair for a
+// custom service. The identifier is operational metadata only and carries no
+// prompt, transcript, or user content.
+type Workload struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
 }
 
 // RuntimeDescriptor describes the implementation that will execute the plan.
@@ -338,6 +349,11 @@ func (r SessionPlanRequest) Validate() error {
 	if err := r.Runtime.validate(); err != nil {
 		return fmt.Errorf("runtime: %w", err)
 	}
+	if r.Workload != nil {
+		if err := r.Workload.validate(); err != nil {
+			return fmt.Errorf("workload: %w", err)
+		}
+	}
 	if r.Integration != nil && (strings.TrimSpace(r.Integration.Name) == "" || strings.TrimSpace(r.Integration.Version) == "") {
 		return fmt.Errorf("integration: name and version are required together")
 	}
@@ -365,6 +381,16 @@ func (r SessionPlanRequest) Validate() error {
 		if err := r.Media.validate(); err != nil {
 			return fmt.Errorf("media: %w", err)
 		}
+	}
+	return nil
+}
+
+func (w Workload) validate() error {
+	if strings.TrimSpace(w.Type) == "" || strings.TrimSpace(w.ID) == "" {
+		return fmt.Errorf("type and id are required")
+	}
+	if len(w.Type) > 64 || len(w.ID) > 256 {
+		return fmt.Errorf("type or id exceeds its size limit")
 	}
 	return nil
 }

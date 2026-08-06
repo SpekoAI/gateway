@@ -105,6 +105,19 @@ func TestSessionPlanRequestRejectsConflictingRoutePolicy(t *testing.T) {
 	assertInvalid(t, request.Validate(), "not supported by the runtime")
 }
 
+func TestSessionPlanRequestValidatesOptionalWorkloadIdentity(t *testing.T) {
+	t.Parallel()
+
+	request := validRequest(t)
+	request.Workload = &protocol.Workload{Type: "agent", ID: "agent_123"}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("valid workload must validate: %v", err)
+	}
+
+	request.Workload.ID = ""
+	assertInvalid(t, request.Validate(), "workload: type and id are required")
+}
+
 func validRequest(t *testing.T) protocol.SessionPlanRequest {
 	t.Helper()
 	var request protocol.SessionPlanRequest

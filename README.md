@@ -115,6 +115,10 @@ is disabled. The exact payloads and trust boundaries are documented in
 | `SPEKO_PLAN_ISSUER` | control-plane URL | Required plan issuer |
 | `SPEKO_PLAN_AUDIENCE` | `speko-runtime` | Required plan audience |
 | `SPEKO_RUNTIME_INSTANCE_ID` | hostname | Non-secret process identity |
+| `SPEKO_WORKLOAD_TYPE` | `agent` when an ID is set | Dashboard workload category |
+| `SPEKO_WORKLOAD_ID` | unset | Stable Agent or custom workload ID |
+| `SPEKO_MAX_SESSIONS` | `100` | Per-process session capacity |
+| `SPEKO_INSTANCE_HEARTBEAT_INTERVAL` | `20s` | Hosted dashboard worker heartbeat interval |
 
 Every secret also supports an exclusive `*_FILE` form for Docker and
 Kubernetes secrets—for example,
