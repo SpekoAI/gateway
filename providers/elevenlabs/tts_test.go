@@ -17,7 +17,7 @@ import (
 	"github.com/coder/websocket"
 )
 
-func TestAdapterUsesMultiContextWireContractAndMapsAlignment(t *testing.T) {
+func TestAdapterReusesOneSocketForMultipleContextsAndMapsAlignment(t *testing.T) {
 	t.Parallel()
 	requests := make(chan *http.Request, 1)
 	server := newMultiContextServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
@@ -46,6 +46,29 @@ func TestAdapterUsesMultiContextWireContractAndMapsAlignment(t *testing.T) {
 			"isFinal": true,
 		}); err != nil {
 			t.Errorf("write response: %v", err)
+			return
+		}
+		secondAppend, err := readClientMessage(ctx, conn)
+		if err != nil || secondAppend.ContextID == "" || secondAppend.ContextID == appendMessage.ContextID || secondAppend.Text != "Again" {
+			t.Errorf("second append = %+v, err=%v", secondAppend, err)
+			return
+		}
+		secondFlush, err := readClientMessage(ctx, conn)
+		if err != nil || secondFlush.ContextID != secondAppend.ContextID || !secondFlush.Flush {
+			t.Errorf("second flush = %+v, err=%v", secondFlush, err)
+			return
+		}
+		secondClose, err := readClientMessage(ctx, conn)
+		if err != nil || secondClose.ContextID != secondAppend.ContextID || !secondClose.CloseContext {
+			t.Errorf("second close context = %+v, err=%v", secondClose, err)
+			return
+		}
+		if err := writeServerJSON(ctx, conn, map[string]any{
+			"contextId": secondAppend.ContextID,
+			"audio":     base64.StdEncoding.EncodeToString([]byte{8, 9}),
+			"isFinal":   true,
+		}); err != nil {
+			t.Errorf("write second response: %v", err)
 			return
 		}
 		closeSocket, err := readClientMessage(ctx, conn)
@@ -89,6 +112,19 @@ func TestAdapterUsesMultiContextWireContractAndMapsAlignment(t *testing.T) {
 	}
 	if events[2].Extensions[extensionID] == nil {
 		t.Fatal("alignment must retain ElevenLabs payload")
+	}
+	if err := stream.AppendText(context.Background(), "Again"); err != nil {
+		t.Fatalf("append second utterance: %v", err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit second utterance: %v", err)
+	}
+	secondEvents := collectEvents(t, stream.Events(), 3)
+	if got := strings.Join(eventTypes(secondEvents), ","); got != "audio.started,audio.frame,audio.done" {
+		t.Fatalf("second event types = %s", got)
+	}
+	if string(secondEvents[1].Audio) != string([]byte{8, 9}) {
+		t.Fatalf("second audio = %v", secondEvents[1].Audio)
 	}
 	if err := stream.Close(context.Background()); err != nil {
 		t.Fatalf("close: %v", err)

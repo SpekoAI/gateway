@@ -17,7 +17,7 @@ import (
 	"github.com/coder/websocket"
 )
 
-func TestAdapterUsesCartesiaWireContractAndMapsAudio(t *testing.T) {
+func TestAdapterReusesOneSocketForMultipleContextsAndMapsAudio(t *testing.T) {
 	t.Parallel()
 
 	requests := make(chan *http.Request, 1)
@@ -51,6 +51,24 @@ func TestAdapterUsesCartesiaWireContractAndMapsAudio(t *testing.T) {
 		}
 		if err := writeJSON(ctx, conn, map[string]any{"type": "done", "context_id": first.ContextID, "done": true}); err != nil {
 			t.Errorf("done: %v", err)
+			return
+		}
+		third, err := readGeneration(ctx, conn)
+		if err != nil || third.Transcript != "Again" || !third.Continue || third.ContextID == "" || third.ContextID == first.ContextID {
+			t.Errorf("second context generation = %+v, err=%v", third, err)
+			return
+		}
+		fourth, err := readGeneration(ctx, conn)
+		if err != nil || fourth.Transcript != "" || fourth.Continue || fourth.ContextID != third.ContextID {
+			t.Errorf("second context final generation = %+v, err=%v", fourth, err)
+			return
+		}
+		if err := writeJSON(ctx, conn, map[string]any{"type": "chunk", "context_id": third.ContextID, "request_id": "cart_req_456", "data": base64.StdEncoding.EncodeToString([]byte{4, 5})}); err != nil {
+			t.Errorf("second audio chunk: %v", err)
+			return
+		}
+		if err := writeJSON(ctx, conn, map[string]any{"type": "done", "context_id": third.ContextID, "done": true}); err != nil {
+			t.Errorf("second done: %v", err)
 			return
 		}
 		waitForClientClose(ctx, conn)
@@ -92,6 +110,19 @@ func TestAdapterUsesCartesiaWireContractAndMapsAudio(t *testing.T) {
 	}
 	if err := json.Unmarshal(events[0].Data, &usage); err != nil || usage.ProviderRequestID != "cart_req_123" {
 		t.Fatalf("usage correlation = %+v, err=%v", usage, err)
+	}
+	if err := providerStream.AppendText(context.Background(), "Again"); err != nil {
+		t.Fatalf("append second context: %v", err)
+	}
+	if err := providerStream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit second context: %v", err)
+	}
+	secondEvents := collectProviderEvents(t, providerStream.Events(), 4)
+	if got := strings.Join(eventTypes(secondEvents), ","); got != "usage.observed,audio.started,audio.frame,audio.done" {
+		t.Fatalf("second context event types = %s", got)
+	}
+	if string(secondEvents[2].Audio) != string([]byte{4, 5}) {
+		t.Fatalf("second context audio = %v", secondEvents[2].Audio)
 	}
 	if err := providerStream.Close(context.Background()); err != nil {
 		t.Fatalf("close stream: %v", err)

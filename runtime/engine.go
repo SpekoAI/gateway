@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -116,16 +117,19 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: request.Options, Media: request.Media})
 	if err != nil {
 		cancel()
+		e.recordOpenFailure(request, err)
 		return nil, fmt.Errorf("open provider stream: %w", err)
 	}
 	openLatency := e.now().Sub(openStarted)
 	if stream == nil {
 		cancel()
+		e.recordOpenFailure(request, errors.New("provider stream is required"))
 		return nil, errors.New("provider stream is required")
 	}
 	providerEvents := stream.Events()
 	if providerEvents == nil {
 		cancel()
+		e.recordOpenFailure(request, errors.New("provider stream must expose an events channel"))
 		return nil, errors.New("provider stream must expose an events channel")
 	}
 
@@ -142,6 +146,9 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 		limits:         e.limits,
 		telemetry:      e.telemetry,
 		now:            e.now,
+	}
+	if request.Media != nil {
+		session.media = *request.Media
 	}
 	session.setLeaseDeadline(request.Plan.Reservation.LeaseExpiresAt)
 	session.emitRegular(protocol.EventSessionReady, nil, nil, nil)
@@ -193,6 +200,7 @@ func validateOpenRequest(request OpenRequest, now time.Time) error {
 // from multiple goroutines; provider calls remain serialized by runInput.
 type Session struct {
 	kind           protocol.SessionKind
+	media          protocol.MediaFormat
 	plan           protocol.SessionPlan
 	stream         ProviderStream
 	providerEvents <-chan ProviderEvent
@@ -211,17 +219,19 @@ type Session struct {
 	errMu sync.RWMutex
 	err   error
 
-	providerMu    sync.Mutex
-	finishOnce    sync.Once
-	providerOnce  sync.Once
-	outputMu      sync.Mutex
-	outputClosed  bool
-	leaseMu       sync.Mutex
-	leaseTimer    *time.Timer
-	leaseDeadline time.Time
-	leaseSequence uint64
-	usageMu       sync.Mutex
-	usedUnits     int64
+	providerMu         sync.Mutex
+	finishOnce         sync.Once
+	providerOnce       sync.Once
+	outputMu           sync.Mutex
+	outputClosed       bool
+	leaseMu            sync.Mutex
+	leaseTimer         *time.Timer
+	leaseDeadline      time.Time
+	leaseSequence      uint64
+	usageMu            sync.Mutex
+	usedUnits          int64
+	acceptedAudioBytes int64
+	usageOnce          sync.Once
 }
 
 // AudioInput transfers ownership of Data to the session after SubmitAudio
@@ -425,6 +435,15 @@ func (s *Session) dispatch(message inputMessage) error {
 	switch message.kind {
 	case inputAudio:
 		err := s.stream.WriteAudio(s.ctx, message.audio.data)
+		if err == nil {
+			s.usageMu.Lock()
+			if frameBytes := int64(len(message.audio.data)); frameBytes > math.MaxInt64-s.acceptedAudioBytes {
+				s.acceptedAudioBytes = math.MaxInt64
+			} else {
+				s.acceptedAudioBytes += frameBytes
+			}
+			s.usageMu.Unlock()
+		}
 		if message.audio.release != nil {
 			message.audio.release()
 		}
@@ -503,8 +522,9 @@ func (s *Session) fail(err error) {
 		s.errMu.Unlock()
 		s.input.abort()
 		s.cancel()
+		s.recordUsageReported()
 		s.record("session.failed", telemetryErrorData(err))
-		s.emitTerminal(protocol.EventError, errorData(err), nil, nil)
+		s.emitTerminal(protocol.EventError, errorData(err), providerErrorExtensions(err), nil)
 		go s.abortProvider()
 	})
 }
@@ -518,6 +538,7 @@ func (s *Session) finish(err error) {
 		s.stopLeaseTimer()
 		s.input.abort()
 		s.cancel()
+		s.recordUsageReported()
 		s.record("session.closed", nil)
 		s.emitTerminal(protocol.EventSessionClosed, nil, nil, nil)
 	})
@@ -605,7 +626,73 @@ func (s *Session) recordAgentEvent(event protocol.Event) {
 }
 
 func requiredMeteringEvent(name string) bool {
-	return name == "usage.observed" || name == "session.closed" || name == "session.failed"
+	return name == "usage.observed" || name == "usage.reported" || name == "session.closed" || name == "session.failed"
+}
+
+func (s *Session) recordUsageReported() {
+	s.usageOnce.Do(func() {
+		s.usageMu.Lock()
+		usedUnits := s.usedUnits
+		acceptedAudioBytes := s.acceptedAudioBytes
+		s.usageMu.Unlock()
+		s.record("usage.reported", usageReportedData(s.kind, s.media, usedUnits, acceptedAudioBytes))
+	})
+}
+
+func (e *Engine) recordOpenFailure(request OpenRequest, openErr error) {
+	usage := usageReportedData(request.Kind, mediaValue(request.Media), 0, 0)
+	for _, event := range []TelemetryEvent{
+		{
+			Name: "usage.reported", SessionID: request.Plan.SessionID, AttemptID: request.Plan.AttemptID,
+			At: e.now(), EventID: telemetryEventID(request.Plan.AttemptID, "usage.reported", usage),
+			Destination: request.Plan.Telemetry, Data: usage,
+			Required: request.Plan.Execution.CredentialSource == protocol.CredentialsManaged,
+		},
+		{
+			Name: "session.failed", SessionID: request.Plan.SessionID, AttemptID: request.Plan.AttemptID,
+			At: e.now(), EventID: telemetryEventID(request.Plan.AttemptID, "session.failed", telemetryErrorData(openErr)),
+			Destination: request.Plan.Telemetry, Data: telemetryErrorData(openErr),
+			Required: request.Plan.Execution.CredentialSource == protocol.CredentialsManaged,
+		},
+	} {
+		e.telemetry.TryRecord(event)
+	}
+}
+
+func mediaValue(media *protocol.MediaFormat) protocol.MediaFormat {
+	if media == nil {
+		return protocol.MediaFormat{}
+	}
+	return *media
+}
+
+func usageReportedData(kind protocol.SessionKind, media protocol.MediaFormat, usedUnits, acceptedAudioBytes int64) json.RawMessage {
+	unit := protocol.UsageUnitDurationSeconds
+	quantityMillis := int64(0)
+	if kind == protocol.SessionKindTTS {
+		unit = protocol.UsageUnitCharacters
+		if usedUnits > 0 {
+			quantityMillis = (math.MaxInt64 / 1_000) * 1_000
+			if usedUnits <= math.MaxInt64/1_000 {
+				quantityMillis = usedUnits * 1_000
+			}
+		}
+	} else if media.Encoding == "pcm_s16le" && media.SampleRateHz > 0 && media.Channels > 0 && acceptedAudioBytes > 0 {
+		bytesPerFrame := int64(media.Channels * 2)
+		completeFrames := acceptedAudioBytes / bytesPerFrame
+		sampleRate := int64(media.SampleRateHz)
+		wholeSeconds, remainingFrames := completeFrames/sampleRate, completeFrames%sampleRate
+		remainingMillis := remainingFrames * 1_000 / sampleRate
+		quantityMillis = math.MaxInt64
+		if wholeSeconds <= (math.MaxInt64-remainingMillis)/1_000 {
+			quantityMillis = wholeSeconds*1_000 + remainingMillis
+		}
+	}
+	payload, err := json.Marshal(map[string]any{"unit": unit, "quantity_millis": quantityMillis})
+	if err != nil {
+		return json.RawMessage(`{"unit":"duration_seconds","quantity_millis":0}`)
+	}
+	return payload
 }
 
 // telemetryEventID is deterministic so a resent event deduplicates in the
@@ -708,4 +795,12 @@ func errorData(err error) json.RawMessage {
 		return json.RawMessage(`{"code":"internal","terminal":true,"source":"runtime"}`)
 	}
 	return data
+}
+
+func providerErrorExtensions(err error) map[string]json.RawMessage {
+	var providerError *ProviderError
+	if !errors.As(err, &providerError) || len(providerError.Extensions) == 0 {
+		return nil
+	}
+	return providerError.Extensions
 }

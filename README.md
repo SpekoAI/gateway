@@ -132,6 +132,7 @@ Kubernetes secrets—for example,
 | TTS | Deepgram | `deepgram.tts.v1` | `aura-2-thalia-en` |
 | TTS | ElevenLabs | `elevenlabs.tts.v1` | `eleven_flash_v2_5` |
 | TTS | Cartesia | `cartesia.tts.v1` | `sonic-3` |
+| STT | Cartesia | `cartesia.stt.v1` | `ink-2` |
 
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.
