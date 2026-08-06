@@ -725,3 +725,58 @@ func assertEventEnvelope(t *testing.T, events []protocol.Event, sessionID, attem
 		}
 	}
 }
+
+// A caller that sends `provider: "auto"` cannot know which vendor it will get,
+// so it cannot send a voice id from that vendor's id space. Before the signed
+// route carried a voice, `auto` plus TTS was unusable: every voice-taking
+// adapter rejects an empty voice id.
+func TestEngineFallsBackToThePlanVoiceOnlyWhenTheCallerSentNone(t *testing.T) {
+	t.Parallel()
+
+	opened := make(chan runtimepkg.AdapterRequest, 2)
+	adapter := mock.NewAdapter("mock.voice.tts", func(request runtimepkg.AdapterRequest) *mock.Stream {
+		opened <- request
+		return mock.NewStream(4)
+	})
+	engine, err := runtimepkg.New(runtimepkg.Config{
+		Adapters: []runtimepkg.Adapter{adapter},
+		Verifier: runtimepkg.PlanVerifierFunc(func(context.Context, protocol.SessionPlan) error { return nil }),
+		LocalCredentials: map[string]runtimepkg.LocalCredential{
+			"mock": {Kind: protocol.CredentialBearer, Value: "customer-owned-key"},
+		},
+		Now: func() time.Time { return fixedNow },
+	})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	media := &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1}
+	open := func(options protocol.RequestOptions) protocol.RequestOptions {
+		plan := validPlan(protocol.SessionKindTTS, adapter.ID(), 60)
+		plan.Route.Voice = "plan-chosen-voice"
+		session, err := engine.Open(context.Background(), runtimepkg.OpenRequest{
+			Kind: protocol.SessionKindTTS, Plan: plan, Options: options, Media: media,
+		})
+		if err != nil {
+			t.Fatalf("open TTS session: %v", err)
+		}
+		defer func() {
+			session.Close()
+			collectEvents(t, session)
+		}()
+		if plan.Route.Voice != "plan-chosen-voice" {
+			t.Fatal("engine mutated the verified plan")
+		}
+		return (<-opened).Options
+	}
+
+	if got := open(protocol.RequestOptions{}).Voice; got != "plan-chosen-voice" {
+		t.Fatalf("adapter voice with no caller voice = %q, want the plan's", got)
+	}
+	// Whitespace is not a choice: an adapter would reject it, so it is a blank.
+	if got := open(protocol.RequestOptions{Voice: "  "}).Voice; got != "plan-chosen-voice" {
+		t.Fatalf("adapter voice for a blank caller voice = %q, want the plan's", got)
+	}
+	if got := open(protocol.RequestOptions{Voice: "caller-chosen-voice"}).Voice; got != "caller-chosen-voice" {
+		t.Fatalf("adapter voice = %q, want the caller's override to win", got)
+	}
+}
