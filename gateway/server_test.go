@@ -114,6 +114,10 @@ func TestGatewayEnforcesLocalAuthAndDrainReadiness(t *testing.T) {
 	if metrics.StatusCode != http.StatusOK || !strings.Contains(string(body), "speko_gateway_sessions_active") {
 		t.Fatalf("metrics status=%d body=%s", metrics.StatusCode, body)
 	}
+	gatewayServer.BeginDrain()
+	if !gatewayServer.Stats().Draining {
+		t.Fatal("begin drain did not publish the draining state")
+	}
 	if err := gatewayServer.Drain(context.Background()); err != nil {
 		t.Fatalf("drain empty server: %v", err)
 	}
@@ -121,6 +125,24 @@ func TestGatewayEnforcesLocalAuthAndDrainReadiness(t *testing.T) {
 	defer ready.Body.Close()
 	if ready.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("ready while draining = %d", ready.StatusCode)
+	}
+}
+
+func TestGatewayRejectsOversizedWorkloadIdentity(t *testing.T) {
+	t.Parallel()
+	tests := []protocol.Workload{
+		{Type: strings.Repeat("t", 65), ID: "agent-1"},
+		{Type: "agent", ID: strings.Repeat("i", 257)},
+	}
+	for _, workload := range tests {
+		workload := workload
+		t.Run(workload.Type[:min(len(workload.Type), 8)], func(t *testing.T) {
+			config, _ := newServerConfigWithAdapter(t, mock.NewSTTAdapter("mock.stt.v1"), 0, 0, 0, 0)
+			config.Workload = &workload
+			if _, err := gateway.New(config); err == nil {
+				t.Fatalf("oversized workload was accepted: type=%d id=%d", len(workload.Type), len(workload.ID))
+			}
+		})
 	}
 }
 
@@ -896,6 +918,16 @@ func newServerWithOptions(t *testing.T, maxSessions int, attachTimeout time.Dura
 
 func newServerWithAdapter(t *testing.T, adapter runtimepkg.Adapter, maxSessions int, attachTimeout, streamWriteTimeout, setupTimeout time.Duration) (*gateway.Server, *fakePlanClient) {
 	t.Helper()
+	config, plans := newServerConfigWithAdapter(t, adapter, maxSessions, attachTimeout, streamWriteTimeout, setupTimeout)
+	server, err := gateway.New(config)
+	if err != nil {
+		t.Fatalf("new gateway: %v", err)
+	}
+	return server, plans
+}
+
+func newServerConfigWithAdapter(t *testing.T, adapter runtimepkg.Adapter, maxSessions int, attachTimeout, streamWriteTimeout, setupTimeout time.Duration) (gateway.Config, *fakePlanClient) {
+	t.Helper()
 	engine, err := runtimepkg.New(runtimepkg.Config{
 		Adapters:         []runtimepkg.Adapter{adapter},
 		Verifier:         runtimepkg.PlanVerifierFunc(func(context.Context, protocol.SessionPlan) error { return nil }),
@@ -919,11 +951,7 @@ func newServerWithAdapter(t *testing.T, adapter runtimepkg.Adapter, maxSessions 
 		SetupTimeout:       setupTimeout,
 		Now:                func() time.Time { return gatewayNow },
 	}
-	server, err := gateway.New(config)
-	if err != nil {
-		t.Fatalf("new gateway: %v", err)
-	}
-	return server, plans
+	return config, plans
 }
 
 func gatewayRequestBody() map[string]any {
