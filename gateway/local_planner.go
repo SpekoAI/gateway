@@ -60,7 +60,10 @@ func NewLocalPlanner(config LocalPlannerConfig) (*LocalPlanner, error) {
 	providers := make(map[string]struct{}, len(config.Providers))
 	for _, provider := range config.Providers {
 		provider = strings.ToLower(strings.TrimSpace(provider))
-		if provider != "deepgram" && provider != "elevenlabs" && provider != "cartesia" {
+		// Catalog-driven, like supportsLocalKind and localRoute. This was the last
+		// hardcoded vendor list, and it would have silently rejected every provider
+		// added to the catalog until someone remembered to edit it here too.
+		if !catalogHasProvider(provider) {
 			return nil, fmt.Errorf("gateway: unsupported local provider %q", provider)
 		}
 		providers[provider] = struct{}{}

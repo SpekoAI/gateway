@@ -35,6 +35,20 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "elevenlabs", Kind: protocol.SessionKindTTS, Adapter: "elevenlabs.tts.v1", DefaultModel: "eleven_flash_v2_5", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/text-to-speech"},
 	{Provider: "cartesia", Kind: protocol.SessionKindSTT, Adapter: "cartesia.stt.v1", DefaultModel: "ink-2", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/stt/websocket"},
 	{Provider: "cartesia", Kind: protocol.SessionKindTTS, Adapter: "cartesia.tts.v1", DefaultModel: "sonic-3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket"},
+	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "universal-3-5-pro", Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
+	// Gladia and PlayHT discover their real socket at runtime: an init call returns
+	// a URL with the session token already embedded. The endpoint here is the
+	// nominal one a plan carries — the adapter derives the init call from it (BYOK)
+	// or ignores it in favour of the credential (managed).
+	{Provider: "gladia", Kind: protocol.SessionKindSTT, Adapter: "gladia.stt.v1", DefaultModel: "solaria-1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gladia.io/v2/live"},
+	{Provider: "playht", Kind: protocol.SessionKindTTS, Adapter: "playht.tts.v1", DefaultModel: "Play3.0-mini", Transport: protocol.TransportWebSocket, Endpoint: "wss://ws.fal.run/playht-fal/playht-tts/stream"},
+	{Provider: "minimax", Kind: protocol.SessionKindTTS, Adapter: "minimax.tts.v1", DefaultModel: "speech-2.8-hd", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.minimax.io/ws/v1/t2a_v2"},
+	{Provider: "xai", Kind: protocol.SessionKindTTS, Adapter: "xai.tts.v1", DefaultModel: "tts", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/tts"},
+	// The first two HTTP-transport rows. The engine is transport-agnostic — it only
+	// needs a ProviderStream — so these stream by decoding the response body
+	// incrementally rather than by holding a socket open.
+	{Provider: "google", Kind: protocol.SessionKindTTS, Adapter: "google.tts.v1", DefaultModel: "chirp-3-hd", Transport: protocol.TransportHTTP, Endpoint: "https://texttospeech.googleapis.com/v1/text:synthesize"},
+	{Provider: "inworld", Kind: protocol.SessionKindTTS, Adapter: "inworld.tts.v1", DefaultModel: "inworld-tts-2", Transport: protocol.TransportHTTP, Endpoint: "https://api.inworld.ai/tts/v1/voice:stream"},
 }
 
 // Catalog returns every (provider, modality) this build implements, ordered so the
@@ -48,6 +62,16 @@ func Catalog() []CatalogEntry {
 		return entries[i].Kind < entries[j].Kind
 	})
 	return entries
+}
+
+// catalogHasProvider reports whether any modality of this provider is implemented.
+func catalogHasProvider(provider string) bool {
+	for _, entry := range providerCatalog {
+		if entry.Provider == provider {
+			return true
+		}
+	}
+	return false
 }
 
 func catalogEntryFor(kind protocol.SessionKind, provider string) (CatalogEntry, bool) {

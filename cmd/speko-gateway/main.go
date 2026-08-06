@@ -19,9 +19,16 @@ import (
 	"github.com/SpekoAI/gateway/controlplane"
 	"github.com/SpekoAI/gateway/gateway"
 	"github.com/SpekoAI/gateway/protocol"
+	"github.com/SpekoAI/gateway/providers/assemblyai"
 	"github.com/SpekoAI/gateway/providers/cartesia"
 	"github.com/SpekoAI/gateway/providers/deepgram"
 	"github.com/SpekoAI/gateway/providers/elevenlabs"
+	"github.com/SpekoAI/gateway/providers/gladia"
+	"github.com/SpekoAI/gateway/providers/google"
+	"github.com/SpekoAI/gateway/providers/inworld"
+	"github.com/SpekoAI/gateway/providers/minimax"
+	"github.com/SpekoAI/gateway/providers/playht"
+	"github.com/SpekoAI/gateway/providers/xai"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
 
@@ -120,14 +127,53 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	adapters := []runtimepkg.Adapter{deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter, cartesiaAdapter, cartesiaSTTAdapter}
+	assemblyAIAdapter, err := assemblyai.New(assemblyai.Config{})
+	if err != nil {
+		return err
+	}
+	gladiaAdapter, err := gladia.New(gladia.Config{})
+	if err != nil {
+		return err
+	}
+	googleAdapter, err := google.New(google.Config{})
+	if err != nil {
+		return err
+	}
+	inworldAdapter, err := inworld.New(inworld.Config{})
+	if err != nil {
+		return err
+	}
+	minimaxAdapter, err := minimax.New(minimax.Config{})
+	if err != nil {
+		return err
+	}
+	playhtAdapter, err := playht.New(playht.Config{})
+	if err != nil {
+		return err
+	}
+	xaiAdapter, err := xai.New(xai.Config{})
+	if err != nil {
+		return err
+	}
+	adapters := []runtimepkg.Adapter{
+		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
+		cartesiaAdapter, cartesiaSTTAdapter, assemblyAIAdapter, gladiaAdapter,
+		googleAdapter, inworldAdapter, minimaxAdapter, playhtAdapter, xaiAdapter,
+	}
+	adapterIDs := make([]string, 0, len(adapters))
+	for _, adapter := range adapters {
+		adapterIDs = append(adapterIDs, adapter.ID())
+	}
 	runtimeDescriptor := protocol.RuntimeDescriptor{
 		Name:           "go-gateway",
 		Version:        version,
 		InstanceID:     instanceID,
 		Placement:      protocol.PlacementSidecar,
 		ProviderRoutes: []protocol.ProviderRoute{protocol.RouteProviderDirect},
-		Adapters:       []string{deepgramAdapter.ID(), deepgramTTSAdapter.ID(), elevenLabsAdapter.ID(), elevenLabsSTTAdapter.ID(), cartesiaAdapter.ID(), cartesiaSTTAdapter.ID()},
+		// Derived from the slice above rather than restated. The two lists drifting
+		// apart would advertise an adapter the engine does not have, or hide one it
+		// does — and nothing would fail until a session tried to open.
+		Adapters: adapterIDs,
 	}
 
 	localCredentials := make(map[string]runtimepkg.LocalCredential)
@@ -135,6 +181,16 @@ func run() error {
 		"deepgram":   "SPEKO_DEEPGRAM_BYOK_API_KEY",
 		"cartesia":   "SPEKO_CARTESIA_BYOK_API_KEY",
 		"elevenlabs": "SPEKO_ELEVENLABS_BYOK_API_KEY",
+		"assemblyai": "SPEKO_ASSEMBLYAI_BYOK_API_KEY",
+		"gladia":     "SPEKO_GLADIA_BYOK_API_KEY",
+		"google":     "SPEKO_GOOGLE_BYOK_ACCESS_TOKEN",
+		"inworld":    "SPEKO_INWORLD_BYOK_API_KEY",
+		"minimax":    "SPEKO_MINIMAX_BYOK_API_KEY",
+		// PlayHT needs TWO secrets and LocalCredential holds one, so the user id and
+		// key travel packed as "<user_id>:<api_key>". Flagged for review: it is the
+		// one credential convention here that no vendor dictated.
+		"playht": "SPEKO_PLAYHT_BYOK_API_KEY",
+		"xai":    "SPEKO_XAI_BYOK_API_KEY",
 	} {
 		key, err := secret(name)
 		if err != nil {
