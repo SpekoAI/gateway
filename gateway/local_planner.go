@@ -216,6 +216,10 @@ func localRoute(kind protocol.SessionKind, provider, model string) (protocol.Pla
 	return protocol.PlanRoute{
 		Provider: entry.Provider, Model: model, Adapter: entry.Adapter,
 		Transport: entry.Transport, Endpoint: entry.Endpoint,
+		// Only ever a fallback. The caller's own request.voice reaches the adapter
+		// directly and takes precedence there, so this fills the blank rather than
+		// overriding a choice.
+		Voice: entry.DefaultVoice,
 	}, nil
 }
 

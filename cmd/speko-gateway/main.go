@@ -19,15 +19,22 @@ import (
 	"github.com/SpekoAI/gateway/controlplane"
 	"github.com/SpekoAI/gateway/gateway"
 	"github.com/SpekoAI/gateway/protocol"
+	"github.com/SpekoAI/gateway/providers/alibaba"
 	"github.com/SpekoAI/gateway/providers/assemblyai"
 	"github.com/SpekoAI/gateway/providers/cartesia"
 	"github.com/SpekoAI/gateway/providers/deepgram"
 	"github.com/SpekoAI/gateway/providers/elevenlabs"
 	"github.com/SpekoAI/gateway/providers/gladia"
 	"github.com/SpekoAI/gateway/providers/google"
+	"github.com/SpekoAI/gateway/providers/gradium"
+	"github.com/SpekoAI/gateway/providers/hume"
 	"github.com/SpekoAI/gateway/providers/inworld"
 	"github.com/SpekoAI/gateway/providers/minimax"
+	"github.com/SpekoAI/gateway/providers/openai"
 	"github.com/SpekoAI/gateway/providers/playht"
+	"github.com/SpekoAI/gateway/providers/rime"
+	"github.com/SpekoAI/gateway/providers/smallest"
+	"github.com/SpekoAI/gateway/providers/soniox"
 	"github.com/SpekoAI/gateway/providers/xai"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -155,10 +162,74 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	googleSTTAdapter, err := google.NewSTT(google.STTConfig{})
+	if err != nil {
+		return err
+	}
+	gradiumSTTAdapter, err := gradium.NewSTT(gradium.STTConfig{})
+	if err != nil {
+		return err
+	}
+	gradiumTTSAdapter, err := gradium.NewTTS(gradium.TTSConfig{})
+	if err != nil {
+		return err
+	}
+	rimeAdapter, err := rime.New(rime.Config{})
+	if err != nil {
+		return err
+	}
+	humeAdapter, err := hume.New(hume.Config{})
+	if err != nil {
+		return err
+	}
+	inworldSTTAdapter, err := inworld.NewSTT(inworld.STTConfig{})
+	if err != nil {
+		return err
+	}
+	xaiSTTAdapter, err := xai.NewSTT(xai.STTConfig{})
+	if err != nil {
+		return err
+	}
+	alibabaSTTAdapter, err := alibaba.NewSTT(alibaba.STTConfig{})
+	if err != nil {
+		return err
+	}
+	alibabaTTSAdapter, err := alibaba.NewTTS(alibaba.TTSConfig{})
+	if err != nil {
+		return err
+	}
+	openaiSTTAdapter, err := openai.NewSTT(openai.STTConfig{})
+	if err != nil {
+		return err
+	}
+	openaiTTSAdapter, err := openai.NewTTS(openai.TTSConfig{})
+	if err != nil {
+		return err
+	}
+	sonioxSTTAdapter, err := soniox.NewSTT(soniox.STTConfig{})
+	if err != nil {
+		return err
+	}
+	sonioxTTSAdapter, err := soniox.NewTTS(soniox.TTSConfig{})
+	if err != nil {
+		return err
+	}
+	smallestSTTAdapter, err := smallest.NewSTT(smallest.STTConfig{})
+	if err != nil {
+		return err
+	}
+	smallestTTSAdapter, err := smallest.New(smallest.Config{})
+	if err != nil {
+		return err
+	}
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
 		cartesiaAdapter, cartesiaSTTAdapter, assemblyAIAdapter, gladiaAdapter,
 		googleAdapter, inworldAdapter, minimaxAdapter, playhtAdapter, xaiAdapter,
+		sonioxSTTAdapter, sonioxTTSAdapter, smallestSTTAdapter, smallestTTSAdapter,
+		openaiSTTAdapter, openaiTTSAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
+		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
+		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {
@@ -189,8 +260,15 @@ func run() error {
 		// PlayHT needs TWO secrets and LocalCredential holds one, so the user id and
 		// key travel packed as "<user_id>:<api_key>". Flagged for review: it is the
 		// one credential convention here that no vendor dictated.
-		"playht": "SPEKO_PLAYHT_BYOK_API_KEY",
-		"xai":    "SPEKO_XAI_BYOK_API_KEY",
+		"playht":   "SPEKO_PLAYHT_BYOK_API_KEY",
+		"xai":      "SPEKO_XAI_BYOK_API_KEY",
+		"alibaba":  "SPEKO_ALIBABA_BYOK_API_KEY",
+		"gradium":  "SPEKO_GRADIUM_BYOK_API_KEY",
+		"rime":     "SPEKO_RIME_BYOK_API_KEY",
+		"hume":     "SPEKO_HUME_BYOK_API_KEY",
+		"openai":   "SPEKO_OPENAI_BYOK_API_KEY",
+		"soniox":   "SPEKO_SONIOX_BYOK_API_KEY",
+		"smallest": "SPEKO_SMALLEST_BYOK_API_KEY",
 	} {
 		key, err := secret(name)
 		if err != nil {

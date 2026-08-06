@@ -141,3 +141,29 @@ func TestEveryPublishedEntryIsRoutable(t *testing.T) {
 		}
 	}
 }
+
+// Several TTS vendors refuse to open without a voice — Rime, Gradium and Google
+// among them. In standalone BYOK mode there is no benchmark board to pick from,
+// so the catalog carries the fallback. Without it the adapter is registered,
+// published, and fails at open with a vendor error the operator cannot act on.
+func TestCatalogCarriesADefaultVoiceWhereTheVendorDemandsOne(t *testing.T) {
+	t.Parallel()
+	voices := map[string]string{}
+	for _, entry := range gateway.Catalog() {
+		if entry.Kind == protocol.SessionKindTTS {
+			voices[entry.Provider] = entry.DefaultVoice
+		}
+	}
+	for _, provider := range []string{"rime", "hume"} {
+		if voices[provider] == "" {
+			t.Fatalf("%s TTS has no default voice, so a standalone plan cannot open", provider)
+		}
+	}
+	// Google is deliberately blank: its voice names embed the language
+	// (hi-IN-Chirp3-HD-Aoede), so no single value is correct for every request.
+	// A wrong-language default would be worse than none — it would synthesize
+	// Hindi text in an English voice rather than failing.
+	if voices["google"] != "" {
+		t.Fatalf("google TTS carries default voice %q, but its voices are language-specific", voices["google"])
+	}
+}
