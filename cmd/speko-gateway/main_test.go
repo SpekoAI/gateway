@@ -6,7 +6,24 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/SpekoAI/gateway/gateway"
+	"github.com/SpekoAI/gateway/protocol"
 )
+
+func TestInstanceHeartbeatCarriesDrainingState(t *testing.T) {
+	startedAt := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+	heartbeat := instanceHeartbeat(
+		gateway.Stats{ActiveSessions: 2, PendingSessions: 1, SessionCapacity: 10, SessionsTotal: 25, Draining: true},
+		3,
+		protocol.RuntimeDescriptor{Name: "go-gateway", Version: "test", InstanceID: "worker-1"},
+		&protocol.Workload{Type: "agent", ID: "agent-1"},
+		startedAt,
+	)
+	if !heartbeat.Draining || heartbeat.ActiveSessions != 2 || heartbeat.TelemetryDropped != 3 || heartbeat.WorkloadID != "agent-1" {
+		t.Fatalf("heartbeat = %+v", heartbeat)
+	}
+}
 
 func TestSecretReadsEnvironmentOrFileWithoutAmbiguity(t *testing.T) {
 	t.Run("environment", func(t *testing.T) {

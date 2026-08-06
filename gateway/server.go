@@ -194,8 +194,10 @@ func New(config Config) (*Server, error) {
 	if config.Runtime.Placement != protocol.PlacementSidecar || strings.TrimSpace(config.Runtime.Name) == "" || strings.TrimSpace(config.Runtime.Version) == "" || strings.TrimSpace(config.Runtime.InstanceID) == "" || len(config.Runtime.ProviderRoutes) != 1 || config.Runtime.ProviderRoutes[0] != protocol.RouteProviderDirect {
 		return nil, errors.New("gateway: runtime must be a complete provider-direct descriptor")
 	}
-	if config.Workload != nil && (strings.TrimSpace(config.Workload.Type) == "" || strings.TrimSpace(config.Workload.ID) == "") {
-		return nil, errors.New("gateway: workload type and id are required together")
+	if config.Workload != nil {
+		if err := config.Workload.Validate(); err != nil {
+			return nil, fmt.Errorf("gateway: invalid workload: %w", err)
+		}
 	}
 	if config.MaxSessions == 0 {
 		config.MaxSessions = defaultMaxSessions
@@ -272,14 +274,22 @@ func (s *Server) Stats() Stats {
 	}
 }
 
-// Drain stops new session creation, allows existing sessions to finish, and
-// returns once all are gone or ctx expires. Existing WebSockets remain active.
-func (s *Server) Drain(ctx context.Context) error {
+// BeginDrain atomically stops new session creation without waiting for active
+// sessions. Callers can report the draining state before they wait or exit.
+func (s *Server) BeginDrain() {
 	s.mu.Lock()
 	if !s.draining {
 		s.draining = true
 		s.closeDrainedLocked()
 	}
+	s.mu.Unlock()
+}
+
+// Drain stops new session creation, allows existing sessions to finish, and
+// returns once all are gone or ctx expires. Existing WebSockets remain active.
+func (s *Server) Drain(ctx context.Context) error {
+	s.BeginDrain()
+	s.mu.Lock()
 	drained := s.drained
 	s.mu.Unlock()
 	select {

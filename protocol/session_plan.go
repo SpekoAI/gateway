@@ -107,6 +107,11 @@ type Workload struct {
 	ID   string `json:"id"`
 }
 
+// Validate checks the bounded, content-free workload identity contract.
+func (w Workload) Validate() error {
+	return w.validate()
+}
+
 // RuntimeDescriptor describes the implementation that will execute the plan.
 type RuntimeDescriptor struct {
 	Name           string          `json:"name"`
