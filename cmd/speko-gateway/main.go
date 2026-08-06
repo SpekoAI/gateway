@@ -235,6 +235,14 @@ func run() error {
 	select {
 	case <-processCtx.Done():
 		log.Printf("received shutdown signal; draining")
+		server.BeginDrain()
+		if hostedClient != nil {
+			heartbeatCtx, cancelHeartbeat := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := reportInstance(heartbeatCtx, hostedClient, server, telemetryExporter, runtimeDescriptor, workload, startedAt); err != nil {
+				log.Printf("final draining heartbeat failed: %v", err)
+			}
+			cancelHeartbeat()
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		drainErr := server.Drain(ctx)
 		cancel()
@@ -253,21 +261,9 @@ func run() error {
 
 func reportInstanceLoop(ctx context.Context, client *controlplane.Client, server *gateway.Server, telemetry *runtimepkg.TelemetryExporter, descriptor protocol.RuntimeDescriptor, workload *protocol.Workload, startedAt time.Time, interval time.Duration) {
 	report := func() {
-		stats := server.Stats()
-		telemetryStats := telemetry.Stats()
-		heartbeat := controlplane.InstanceHeartbeat{
-			RuntimeName: descriptor.Name, RuntimeVersion: descriptor.Version, StartedAt: startedAt,
-			ActiveSessions: stats.ActiveSessions, PendingSessions: stats.PendingSessions,
-			SessionCapacity: stats.SessionCapacity, SessionsTotal: stats.SessionsTotal,
-			TelemetryDropped: telemetryStats.Dropped, Draining: stats.Draining,
-		}
-		if workload != nil {
-			heartbeat.WorkloadType = workload.Type
-			heartbeat.WorkloadID = workload.ID
-		}
 		reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		if err := client.ReportInstance(reportCtx, descriptor.InstanceID, heartbeat); err != nil && ctx.Err() == nil {
+		if err := reportInstance(reportCtx, client, server, telemetry, descriptor, workload, startedAt); err != nil && ctx.Err() == nil {
 			log.Printf("runtime instance heartbeat failed: %v", err)
 		}
 	}
@@ -282,6 +278,27 @@ func reportInstanceLoop(ctx context.Context, client *controlplane.Client, server
 			report()
 		}
 	}
+}
+
+func reportInstance(ctx context.Context, client *controlplane.Client, server *gateway.Server, telemetry *runtimepkg.TelemetryExporter, descriptor protocol.RuntimeDescriptor, workload *protocol.Workload, startedAt time.Time) error {
+	stats := server.Stats()
+	telemetryStats := telemetry.Stats()
+	heartbeat := instanceHeartbeat(stats, telemetryStats.Dropped, descriptor, workload, startedAt)
+	return client.ReportInstance(ctx, descriptor.InstanceID, heartbeat)
+}
+
+func instanceHeartbeat(stats gateway.Stats, telemetryDropped uint64, descriptor protocol.RuntimeDescriptor, workload *protocol.Workload, startedAt time.Time) controlplane.InstanceHeartbeat {
+	heartbeat := controlplane.InstanceHeartbeat{
+		RuntimeName: descriptor.Name, RuntimeVersion: descriptor.Version, StartedAt: startedAt,
+		ActiveSessions: stats.ActiveSessions, PendingSessions: stats.PendingSessions,
+		SessionCapacity: stats.SessionCapacity, SessionsTotal: stats.SessionsTotal,
+		TelemetryDropped: telemetryDropped, Draining: stats.Draining,
+	}
+	if workload != nil {
+		heartbeat.WorkloadType = workload.Type
+		heartbeat.WorkloadID = workload.ID
+	}
+	return heartbeat
 }
 
 func env(name string) string { return strings.TrimSpace(os.Getenv(name)) }
