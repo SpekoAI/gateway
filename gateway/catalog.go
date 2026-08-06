@@ -22,8 +22,29 @@ type CatalogEntry struct {
 	Kind         protocol.SessionKind `json:"kind"`
 	Adapter      string               `json:"adapter"`
 	DefaultModel string               `json:"default_model"`
-	Transport    protocol.Transport   `json:"transport"`
-	Endpoint     string               `json:"endpoint"`
+	// DefaultVoice is used only in standalone BYOK mode. Several TTS vendors
+	// REFUSE to open without a voice — Rime, Gradium and Google among them — and
+	// the local planner has no benchmark board to choose from, so without this a
+	// perfectly good adapter fails at open with a vendor error the operator cannot
+	// act on. Empty means the vendor supplies its own default.
+	//
+	// Google is deliberately empty: its voice names embed the language
+	// (hi-IN-Chirp3-HD-Aoede), so no single value is correct and the caller must
+	// pass one. The control plane fills this from the measured board instead.
+	DefaultVoice string             `json:"default_voice,omitempty"`
+	Transport    protocol.Transport `json:"transport"`
+	Endpoint     string             `json:"endpoint"`
+	// RequiresDeploymentConfig, when non-empty, says this row cannot be dialled as
+	// written and names what an operator must supply. Google STT is the case: its
+	// path embeds the caller's own GCP project
+	// (/v2/projects/{project}/locations/{location}/recognizers/_:recognize), so no
+	// static endpoint is correct for anybody.
+	//
+	// The row stays published because the catalog answers "what does this build
+	// implement", and hiding a supported vendor would be its own lie. But the
+	// planner refuses it until configured rather than dialling a literal
+	// PROJECT_ID and handing back a vendor 404 an operator cannot act on.
+	RequiresDeploymentConfig string `json:"requires_deployment_config,omitempty"`
 }
 
 var providerCatalog = []CatalogEntry{
@@ -48,6 +69,28 @@ var providerCatalog = []CatalogEntry{
 	// needs a ProviderStream — so these stream by decoding the response body
 	// incrementally rather than by holding a socket open.
 	{Provider: "google", Kind: protocol.SessionKindTTS, Adapter: "google.tts.v1", DefaultModel: "chirp-3-hd", Transport: protocol.TransportHTTP, Endpoint: "https://texttospeech.googleapis.com/v1/text:synthesize"},
+	// Alibaba's realtime socket is one path serving both modalities; the model id
+	// selects which. International host — the mainland twin is a separate account.
+	{Provider: "alibaba", Kind: protocol.SessionKindSTT, Adapter: "alibaba.stt.v1", DefaultModel: "qwen3-asr-flash-realtime", Transport: protocol.TransportWebSocket, Endpoint: "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"},
+	{Provider: "alibaba", Kind: protocol.SessionKindTTS, Adapter: "alibaba.tts.v1", DefaultModel: "qwen3-tts-flash-realtime", Transport: protocol.TransportWebSocket, Endpoint: "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"},
+	// Google STT is the one PROJECT-SCOPED endpoint in the catalog: the real path
+	// is /v2/projects/{project}/locations/{location}/recognizers/_:recognize, so a
+	// plan MUST rewrite the project and location. The row below is a template, not
+	// a dialable URL — `eu` because Chirp 3 wins hi/ta/te only from that region.
+	{Provider: "google", Kind: protocol.SessionKindSTT, Adapter: "google.stt.v1", DefaultModel: "chirp_3", Transport: protocol.TransportHTTP, Endpoint: "https://speech.googleapis.com/v2/projects/PROJECT_ID/locations/eu/recognizers/_:recognize",
+		RequiresDeploymentConfig: "set SPEKO_GOOGLE_STT_ENDPOINT to a project-scoped recognize URL"},
+	{Provider: "gradium", Kind: protocol.SessionKindSTT, Adapter: "gradium.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/asr"},
+	{Provider: "gradium", Kind: protocol.SessionKindTTS, Adapter: "gradium.tts.v1", DefaultModel: "default", DefaultVoice: "YTpq7expH9539ERJ", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/tts"},
+	{Provider: "rime", Kind: protocol.SessionKindTTS, Adapter: "rime.tts.v1", DefaultModel: "coda", DefaultVoice: "astra", Transport: protocol.TransportWebSocket, Endpoint: "wss://users-ws.rime.ai/ws3"},
+	{Provider: "hume", Kind: protocol.SessionKindTTS, Adapter: "hume.tts.v1", DefaultModel: "octave-2", DefaultVoice: "Colton Rivers", Transport: protocol.TransportHTTP, Endpoint: "https://api.hume.ai/v0/tts/stream/json"},
+	{Provider: "inworld", Kind: protocol.SessionKindSTT, Adapter: "inworld.stt.v1", DefaultModel: "inworld-stt-1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional"},
+	{Provider: "xai", Kind: protocol.SessionKindSTT, Adapter: "xai.stt.v1", DefaultModel: "stt", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/stt"},
+	{Provider: "openai", Kind: protocol.SessionKindSTT, Adapter: "openai.stt.v1", DefaultModel: "gpt-live-transcribe", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.openai.com/v1/realtime"},
+	{Provider: "openai", Kind: protocol.SessionKindTTS, Adapter: "openai.tts.v1", DefaultModel: "gpt-4o-mini-tts", Transport: protocol.TransportHTTP, Endpoint: "https://api.openai.com/v1/audio/speech"},
+	{Provider: "soniox", Kind: protocol.SessionKindSTT, Adapter: "soniox.stt.v1", DefaultModel: "stt-rt-v5", Transport: protocol.TransportWebSocket, Endpoint: "wss://stt-rt.soniox.com/transcribe-websocket"},
+	{Provider: "soniox", Kind: protocol.SessionKindTTS, Adapter: "soniox.tts.v1", DefaultModel: "tts-rt-v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://tts-rt.soniox.com/tts-websocket"},
+	{Provider: "smallest", Kind: protocol.SessionKindSTT, Adapter: "smallest.stt.v1", DefaultModel: "pulse", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.smallest.ai/waves/v1/stt/live"},
+	{Provider: "smallest", Kind: protocol.SessionKindTTS, Adapter: "smallest.tts.v1", DefaultModel: "lightning_v3.1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.smallest.ai/waves/v1/tts/live"},
 	{Provider: "inworld", Kind: protocol.SessionKindTTS, Adapter: "inworld.tts.v1", DefaultModel: "inworld-tts-2", Transport: protocol.TransportHTTP, Endpoint: "https://api.inworld.ai/tts/v1/voice:stream"},
 }
 
@@ -96,6 +139,10 @@ type catalogModel struct {
 	// here. Reporting the row rather than hiding it keeps the published list the
 	// same shape everywhere while staying honest about this instance.
 	Installed bool `json:"installed"`
+	// RequiresConfig repeats the catalog's reason so a caller reading this list
+	// learns the row needs deployment config BEFORE wiring the id, rather than
+	// from a failed session.
+	RequiresConfig string `json:"requires_config,omitempty"`
 }
 
 // models publishes the catalog. Unauthenticated on purpose: it names no customer,
@@ -119,12 +166,13 @@ func (s *Server) models(writer http.ResponseWriter, request *http.Request) {
 		}
 		_, present := installed[entry.Adapter]
 		rows = append(rows, catalogModel{
-			ID:        entry.Provider + ":" + entry.DefaultModel,
-			Provider:  entry.Provider,
-			Kind:      entry.Kind,
-			Adapter:   entry.Adapter,
-			Transport: entry.Transport,
-			Installed: present,
+			ID:             entry.Provider + ":" + entry.DefaultModel,
+			Provider:       entry.Provider,
+			Kind:           entry.Kind,
+			Adapter:        entry.Adapter,
+			Transport:      entry.Transport,
+			Installed:      present,
+			RequiresConfig: entry.RequiresDeploymentConfig,
 		})
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{

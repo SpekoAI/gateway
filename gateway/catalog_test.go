@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/SpekoAI/gateway/gateway"
@@ -138,6 +139,75 @@ func TestEveryPublishedEntryIsRoutable(t *testing.T) {
 		}
 		if entry.Kind != protocol.SessionKindSTT && entry.Kind != protocol.SessionKindTTS {
 			t.Fatalf("catalog entry %+v claims a modality the gateway has no adapter shape for", entry)
+		}
+	}
+}
+
+// Several TTS vendors refuse to open without a voice — Rime, Gradium and Google
+// among them. In standalone BYOK mode there is no benchmark board to pick from,
+// so the catalog carries the fallback. Without it the adapter is registered,
+// published, and fails at open with a vendor error the operator cannot act on.
+func TestCatalogCarriesADefaultVoiceWhereTheVendorDemandsOne(t *testing.T) {
+	t.Parallel()
+	voices := map[string]string{}
+	for _, entry := range gateway.Catalog() {
+		if entry.Kind == protocol.SessionKindTTS {
+			voices[entry.Provider] = entry.DefaultVoice
+		}
+	}
+	for _, provider := range []string{"rime", "hume"} {
+		if voices[provider] == "" {
+			t.Fatalf("%s TTS has no default voice, so a standalone plan cannot open", provider)
+		}
+	}
+	// Google is deliberately blank: its voice names embed the language
+	// (hi-IN-Chirp3-HD-Aoede), so no single value is correct for every request.
+	// A wrong-language default would be worse than none — it would synthesize
+	// Hindi text in an English voice rather than failing.
+	if voices["google"] != "" {
+		t.Fatalf("google TTS carries default voice %q, but its voices are language-specific", voices["google"])
+	}
+}
+
+// Greptile caught both of these on review, and both were real: a published route
+// that cannot possibly dial is worse than an absent one, because an integrator
+// wires the id and gets a vendor error instead of ours.
+func TestNoPublishedRouteIsSilentlyUndialable(t *testing.T) {
+	t.Parallel()
+	for _, entry := range gateway.Catalog() {
+		// A placeholder in an endpoint MUST be declared, so the planner can refuse
+		// with a reason instead of sending the literal upstream.
+		if strings.Contains(entry.Endpoint, "PROJECT_ID") && entry.RequiresDeploymentConfig == "" {
+			t.Fatalf("%s/%s publishes a placeholder endpoint with no RequiresDeploymentConfig", entry.Provider, entry.Kind)
+		}
+		// And the converse: a row that declares config is required must actually
+		// carry a placeholder, or the declaration is stale and blocks a good route.
+		if entry.RequiresDeploymentConfig != "" && !strings.Contains(entry.Endpoint, "PROJECT_ID") {
+			t.Fatalf("%s/%s demands deployment config but its endpoint looks complete", entry.Provider, entry.Kind)
+		}
+	}
+}
+
+// Gradium, Rime and Google all refuse to synthesize without a voice. Gradium was
+// missing its default even though the catalog comment already said it needed one
+// — the kind of gap that only shows up when someone actually opens a session.
+func TestEveryVoiceDemandingTTSHasADefaultOrAStatedReason(t *testing.T) {
+	t.Parallel()
+	for _, entry := range gateway.Catalog() {
+		if entry.Kind != protocol.SessionKindTTS {
+			continue
+		}
+		switch entry.Provider {
+		case "gradium", "rime", "hume":
+			if entry.DefaultVoice == "" {
+				t.Fatalf("%s TTS requires a voice but the catalog carries no default", entry.Provider)
+			}
+		case "google":
+			// Deliberately blank: Google's voice names embed the language, so any
+			// single default would speak the wrong one rather than fail honestly.
+			if entry.DefaultVoice != "" {
+				t.Fatalf("google TTS carries default voice %q despite language-specific naming", entry.DefaultVoice)
+			}
 		}
 	}
 }
