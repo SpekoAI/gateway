@@ -31,6 +31,7 @@ const (
 	defaultTelemetryURL     = "https://gateway.speko.dev/v1/anonymous-runtime-events"
 	defaultPlanAudience     = "speko-runtime"
 	defaultLocalSessionTime = 24 * time.Hour
+	defaultHeartbeatTime    = 20 * time.Second
 )
 
 var (
@@ -78,6 +79,22 @@ func run() error {
 			return errors.New("determine runtime instance ID")
 		}
 	}
+	var workload *protocol.Workload
+	if workloadID := env("SPEKO_WORKLOAD_ID"); workloadID != "" {
+		workloadType := env("SPEKO_WORKLOAD_TYPE")
+		if workloadType == "" {
+			workloadType = "agent"
+		}
+		workload = &protocol.Workload{Type: workloadType, ID: workloadID}
+	}
+	maxSessions, err := positiveIntEnv("SPEKO_MAX_SESSIONS", 100)
+	if err != nil {
+		return err
+	}
+	heartbeatInterval, err := durationEnv("SPEKO_INSTANCE_HEARTBEAT_INTERVAL", defaultHeartbeatTime)
+	if err != nil {
+		return err
+	}
 
 	deepgramAdapter, err := deepgram.New(deepgram.Config{})
 	if err != nil {
@@ -122,6 +139,7 @@ func run() error {
 
 	var plans gateway.PlanClient
 	var verifier runtimepkg.PlanVerifier
+	var hostedClient *controlplane.Client
 	telemetryExporter, err := runtimepkg.NewTelemetryExporter(runtimepkg.TelemetryExporterConfig{
 		UserAgent:                "speko-gateway/" + version,
 		AnonymousEndpoint:        defaultTelemetryURL,
@@ -173,10 +191,11 @@ func run() error {
 		if jwksURL == "" {
 			jwksURL = strings.TrimRight(controlURL, "/") + "/.well-known/jwks.json"
 		}
-		plans, err = controlplane.New(controlplane.Config{BaseURL: controlURL, APIKey: apiKey, UserAgent: "speko-gateway/" + version})
+		hostedClient, err = controlplane.New(controlplane.Config{BaseURL: controlURL, APIKey: apiKey, UserAgent: "speko-gateway/" + version})
 		if err != nil {
 			return err
 		}
+		plans = hostedClient
 		verifier, err = runtimepkg.NewPlanVerifier(runtimepkg.PlanVerifierConfig{JWKSURL: jwksURL, Issuer: issuer, Audience: audience})
 		if err != nil {
 			return err
@@ -191,7 +210,7 @@ func run() error {
 		return err
 	}
 	server, err := gateway.New(gateway.Config{
-		Engine: engine, Plans: plans, LocalAuthToken: localToken, Runtime: runtimeDescriptor,
+		Engine: engine, Plans: plans, LocalAuthToken: localToken, Runtime: runtimeDescriptor, Workload: workload, MaxSessions: maxSessions,
 	})
 	if err != nil {
 		return err
@@ -207,17 +226,61 @@ func run() error {
 	serveErrors := make(chan error, 1)
 	go func() { serveErrors <- server.Serve(listener) }()
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	processCtx, cancelProcess := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancelProcess()
+	startedAt := time.Now().UTC()
+	if hostedClient != nil {
+		go reportInstanceLoop(processCtx, hostedClient, server, telemetryExporter, runtimeDescriptor, workload, startedAt, heartbeatInterval)
+	}
 	select {
-	case signal := <-signals:
-		log.Printf("received %s; draining", signal)
+	case <-processCtx.Done():
+		log.Printf("received shutdown signal; draining")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := server.Drain(ctx)
+		drainErr := server.Drain(ctx)
 		cancel()
-		return err
+		if hostedClient != nil {
+			deregisterCtx, cancelDeregister := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := hostedClient.DeregisterInstance(deregisterCtx, instanceID); err != nil {
+				log.Printf("runtime instance deregistration failed: %v", err)
+			}
+			cancelDeregister()
+		}
+		return drainErr
 	case err := <-serveErrors:
 		return err
+	}
+}
+
+func reportInstanceLoop(ctx context.Context, client *controlplane.Client, server *gateway.Server, telemetry *runtimepkg.TelemetryExporter, descriptor protocol.RuntimeDescriptor, workload *protocol.Workload, startedAt time.Time, interval time.Duration) {
+	report := func() {
+		stats := server.Stats()
+		telemetryStats := telemetry.Stats()
+		heartbeat := controlplane.InstanceHeartbeat{
+			RuntimeName: descriptor.Name, RuntimeVersion: descriptor.Version, StartedAt: startedAt,
+			ActiveSessions: stats.ActiveSessions, PendingSessions: stats.PendingSessions,
+			SessionCapacity: stats.SessionCapacity, SessionsTotal: stats.SessionsTotal,
+			TelemetryDropped: telemetryStats.Dropped, Draining: stats.Draining,
+		}
+		if workload != nil {
+			heartbeat.WorkloadType = workload.Type
+			heartbeat.WorkloadID = workload.ID
+		}
+		reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := client.ReportInstance(reportCtx, descriptor.InstanceID, heartbeat); err != nil && ctx.Err() == nil {
+			log.Printf("runtime instance heartbeat failed: %v", err)
+		}
+	}
+	report()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			report()
+		}
 	}
 }
 
@@ -231,6 +294,18 @@ func boolEnv(name string, fallback bool) (bool, error) {
 	parsed, err := strconv.ParseBool(value)
 	if err != nil {
 		return false, fmt.Errorf("%s must be true or false", name)
+	}
+	return parsed, nil
+}
+
+func positiveIntEnv(name string, fallback int) (int, error) {
+	value := env(name)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}
 	return parsed, nil
 }

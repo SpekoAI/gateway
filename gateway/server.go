@@ -55,6 +55,7 @@ type Config struct {
 	Engine         *runtimepkg.Engine
 	Plans          PlanClient
 	Runtime        protocol.RuntimeDescriptor
+	Workload       *protocol.Workload
 	LocalAuthToken string
 	MaxSessions    int
 	// AttachTimeout bounds the time a newly-created provider session may wait
@@ -77,6 +78,7 @@ type Server struct {
 	engine             *runtimepkg.Engine
 	plans              PlanClient
 	runtime            protocol.RuntimeDescriptor
+	workload           *protocol.Workload
 	localAuthHash      [sha256.Size]byte
 	maxSessions        int
 	attachTimeout      time.Duration
@@ -97,6 +99,17 @@ type Server struct {
 	authFailures    atomic.Uint64
 	leaseRenewals   atomic.Uint64
 	leaseFailures   atomic.Uint64
+}
+
+// Stats is the bounded, content-free process state safe to report to the
+// hosted customer control plane. It intentionally excludes local socket
+// paths, host resources, request bodies, and session identifiers.
+type Stats struct {
+	ActiveSessions  int64
+	PendingSessions int
+	SessionCapacity int
+	SessionsTotal   uint64
+	Draining        bool
 }
 
 // localSession keeps local lifecycle state that must be updated atomically
@@ -181,6 +194,9 @@ func New(config Config) (*Server, error) {
 	if config.Runtime.Placement != protocol.PlacementSidecar || strings.TrimSpace(config.Runtime.Name) == "" || strings.TrimSpace(config.Runtime.Version) == "" || strings.TrimSpace(config.Runtime.InstanceID) == "" || len(config.Runtime.ProviderRoutes) != 1 || config.Runtime.ProviderRoutes[0] != protocol.RouteProviderDirect {
 		return nil, errors.New("gateway: runtime must be a complete provider-direct descriptor")
 	}
+	if config.Workload != nil && (strings.TrimSpace(config.Workload.Type) == "" || strings.TrimSpace(config.Workload.ID) == "") {
+		return nil, errors.New("gateway: workload type and id are required together")
+	}
 	if config.MaxSessions == 0 {
 		config.MaxSessions = defaultMaxSessions
 	}
@@ -212,6 +228,7 @@ func New(config Config) (*Server, error) {
 		engine:             config.Engine,
 		plans:              config.Plans,
 		runtime:            config.Runtime,
+		workload:           config.Workload,
 		localAuthHash:      sha256.Sum256([]byte(config.LocalAuthToken)),
 		maxSessions:        config.MaxSessions,
 		attachTimeout:      config.AttachTimeout,
@@ -237,6 +254,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{session_id}/stream", s.streamSession)
 	mux.HandleFunc("DELETE /v1/sessions/{session_id}", s.deleteSession)
 	return mux
+}
+
+// Stats returns a point-in-time snapshot for instance heartbeats and local
+// operational tooling.
+func (s *Server) Stats() Stats {
+	s.mu.Lock()
+	pending := s.pendingSessions
+	draining := s.draining
+	s.mu.Unlock()
+	return Stats{
+		ActiveSessions:  s.sessionsActive.Load(),
+		PendingSessions: pending,
+		SessionCapacity: s.maxSessions,
+		SessionsTotal:   s.sessionsTotal.Load(),
+		Draining:        draining,
+	}
 }
 
 // Drain stops new session creation, allows existing sessions to finish, and
@@ -361,7 +394,7 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 	defer cancel()
 	planRequest := protocol.SessionPlanRequest{
 		Kind: body.Kind, Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision,
-		Runtime: s.runtime, Integration: body.Integration, Execution: body.Execution, Request: body.Request, Media: body.Media,
+		Runtime: s.runtime, Workload: s.workload, Integration: body.Integration, Execution: body.Execution, Request: body.Request, Media: body.Media,
 	}
 	plan, requestID, err := s.plans.CreateSessionPlan(setupCtx, planRequest, controlplane.CreateOptions{IdempotencyKey: idempotencyKey})
 	if err != nil {
