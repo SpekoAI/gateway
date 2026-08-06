@@ -132,8 +132,9 @@ func TestSTTAdapterSendsBase64AudioAndMapsTranscripts(t *testing.T) {
 		"audio_format":       "pcm_16000",
 		"include_timestamps": "true",
 		"commit_strategy":    "vad",
-		// Scribe rejects a regional tag with an error frame that kills the stream.
-		"language": "es",
+		// `language_code`, NOT `language`. The vendor ignores an unknown parameter, so
+		// the wrong name leaves Scribe auto-detecting and the caller never finds out.
+		"language_code": "es",
 	} {
 		if got := query.Get(field); got != wanted {
 			t.Fatalf("query %s = %q, want %q", field, got, wanted)
@@ -310,8 +311,11 @@ func newSTTServer(t *testing.T, callback func(context.Context, *http.Request, *w
 			http.NotFound(w, r)
 			return
 		}
-		if r.Header.Get("xi-api-key") == "" {
-			http.Error(w, "missing key", http.StatusUnauthorized)
+		// The vendor accepts EITHER a permanent key in the header OR a single-use
+		// token in the query string. The harness enforces the same either/or so a
+		// regression to header-only managed auth fails here rather than in staging.
+		if r.Header.Get("xi-api-key") == "" && r.URL.Query().Get("token") == "" {
+			http.Error(w, "missing credential", http.StatusUnauthorized)
 			return
 		}
 		conn, err := websocket.Accept(w, r, nil)
@@ -401,4 +405,83 @@ func asProviderError(err error, target **runtimepkg.ProviderError) bool {
 	}
 	*target = providerErr
 	return true
+}
+
+// A managed session carries a minted single-use token, and the vendor accepts a
+// token ONLY as the `token` query parameter. Sending it as `xi-api-key` fails
+// authentication, so managed sessions would have died at the handshake.
+func TestSTTAdapterSendsAManagedTokenAsAQueryParameter(t *testing.T) {
+	t.Parallel()
+	requests := make(chan *http.Request, 1)
+	server := newSTTServer(t, func(_ context.Context, request *http.Request, _ *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	providerStream, err := adapter.Open(context.Background(), sttRequest(server.URL, protocol.CredentialsManaged))
+	if err != nil {
+		t.Fatalf("open managed stream: %v", err)
+	}
+	defer func() { _ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+	request := <-requests
+	if got := request.URL.Query().Get("token"); got != "customer-elevenlabs-key" {
+		t.Fatalf("managed token query = %q, want the minted credential", got)
+	}
+	// And it must NOT also go in the header: the header is for a permanent key.
+	if header := request.Header.Get("xi-api-key"); header != "" {
+		t.Fatalf("managed session also sent xi-api-key = %q", header)
+	}
+}
+
+func TestSTTAdapterSendsABYOKKeyAsAHeader(t *testing.T) {
+	t.Parallel()
+	requests := make(chan *http.Request, 1)
+	server := newSTTServer(t, func(_ context.Context, request *http.Request, _ *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	providerStream, err := adapter.Open(context.Background(), sttRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open byok stream: %v", err)
+	}
+	defer func() { _ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+	request := <-requests
+	if got := request.Header.Get("xi-api-key"); got != "customer-elevenlabs-key" {
+		t.Fatalf("byok xi-api-key = %q, want the customer key", got)
+	}
+	// A permanent key must never be put in a URL, where it can reach logs.
+	if token := request.URL.Query().Get("token"); token != "" {
+		t.Fatalf("byok session leaked the key into the query string: %q", token)
+	}
+}
+
+// `audio_format` accepts a fixed set of tokens. The platform's TS adapter silently
+// substitutes pcm_16000 for anything else, which does not resample: Scribe reads
+// the bytes at the wrong rate and transcription degrades while the session looks
+// healthy. An unsupported rate must be refused instead.
+func TestSTTAdapterRefusesAnUndeclarableSampleRate(t *testing.T) {
+	t.Parallel()
+	adapter, err := NewSTT(STTConfig{AllowedEndpointHosts: []string{"example.test"}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	for _, rate := range []int{8000, 16000, 24000, 48000} {
+		request := sttRequest("http://example.test", protocol.CredentialsBYOK)
+		request.Media.SampleRateHz = rate
+		if _, err := adapter.Open(context.Background(), request); err != nil && strings.Contains(err.Error(), "sample rate") {
+			t.Fatalf("%d Hz was refused but is an accepted audio_format", rate)
+		}
+	}
+	request := sttRequest("http://example.test", protocol.CredentialsBYOK)
+	request.Media.SampleRateHz = 32_000
+	if _, err := adapter.Open(context.Background(), request); err == nil || !strings.Contains(err.Error(), "sample rate") {
+		t.Fatalf("32000 Hz = %v, want a sample-rate refusal rather than a silent pcm_16000", err)
+	}
 }

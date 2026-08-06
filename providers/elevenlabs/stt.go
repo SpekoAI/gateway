@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -109,8 +110,20 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	if err != nil {
 		return nil, err
 	}
+	// Two different credentials, two different channels. A BYOK session carries the
+	// customer's permanent API key, which belongs in `xi-api-key`. A managed session
+	// carries a single-use token minted by the control plane, and the vendor accepts
+	// a token ONLY as the `token` query parameter — sending it as the header fails
+	// authentication. Same split Cartesia already makes with its access token.
 	headers := make(http.Header)
-	headers.Set("xi-api-key", credential.Value)
+	if request.Plan.Execution.CredentialSource == protocol.CredentialsManaged {
+		endpoint, err = sttEndpointWithToken(endpoint, credential.Value)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		headers.Set("xi-api-key", credential.Value)
+	}
 	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
 		HTTPClient: sttHTTPClient(a.httpClient),
 		HTTPHeader: headers,
@@ -164,7 +177,15 @@ func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string
 	}
 	query := endpoint.Query()
 	query.Set("model_id", model)
-	query.Set("audio_format", "pcm_"+strconv.Itoa(media.SampleRateHz))
+	// `audio_format` accepts a FIXED set of tokens. Declaring pcm_16000 for 32 kHz
+	// audio — the platform's fallback — does not resample anything: Scribe reads the
+	// bytes at the wrong rate and the transcript degrades badly while the session
+	// looks healthy. An unsupported rate is refused here instead.
+	audioFormat, err := sttAudioFormat(media.SampleRateHz)
+	if err != nil {
+		return "", err
+	}
+	query.Set("audio_format", audioFormat)
 	// Word timestamps. Without this, a committed segment arrives as
 	// `committed_transcript` (text only) and no word timings are available at all.
 	// With it, Scribe emits `committed_transcript_with_timestamps` carrying a
@@ -174,12 +195,25 @@ func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string
 	// this only decides when Scribe finalizes a segment on its own side.
 	query.Set("commit_strategy", "vad")
 	if language := strings.TrimSpace(options.Language); language != "" {
-		// Scribe rejects an unsupported code with an error frame that kills the
-		// stream, so only the primary subtag is sent: it accepts `es`, not `es-MX`.
-		query.Set("language", baseLanguageTag(language))
+		// `language_code`, NOT `language`: the vendor ignores an unknown parameter,
+		// so the wrong name silently leaves Scribe auto-detecting instead of pinned.
+		// Only the primary subtag is accepted — `es`, not `es-MX`.
+		query.Set("language_code", baseLanguageTag(language))
 	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil
+}
+
+// sttAudioFormat maps a portable sample rate onto one of the vendor's accepted
+// `audio_format` tokens. 22050 and 44100 are accepted by ElevenLabs but are not
+// portable media rates here, so they are simply unreachable rather than special.
+func sttAudioFormat(sampleRateHz int) (string, error) {
+	switch sampleRateHz {
+	case 8000, 16000, 22050, 24000, 44100, 48000:
+		return "pcm_" + strconv.Itoa(sampleRateHz), nil
+	default:
+		return "", fmt.Errorf("elevenlabs stt does not accept a %d Hz sample rate", sampleRateHz)
+	}
 }
 
 // baseLanguageTag reduces a tag to its primary subtag.
@@ -189,6 +223,20 @@ func baseLanguageTag(language string) string {
 		return lowered[:index]
 	}
 	return lowered
+}
+
+// sttEndpointWithToken places a minted token in the query string. The credential
+// reaches the URL, so this value must never be logged; the runtime already treats
+// route endpoints as sensitive for exactly this reason.
+func sttEndpointWithToken(rawEndpoint, token string) (string, error) {
+	endpoint, err := url.Parse(rawEndpoint)
+	if err != nil {
+		return "", errors.New("elevenlabs stt endpoint could not be prepared")
+	}
+	query := endpoint.Query()
+	query.Set("token", token)
+	endpoint.RawQuery = query.Encode()
+	return endpoint.String(), nil
 }
 
 type sttStream struct {
