@@ -86,6 +86,7 @@ The gateway can export:
 | `agent.event` | canonical event type and sequence number |
 | `lease.renewed` | renewal sequence and expiry timestamp |
 | `usage.observed` | provider request correlation ID |
+| `usage.reported` | accepted character or complete-PCM duration quantity in thousandths of the declared unit |
 | `session.closed` | no payload |
 | `error` | error class, source, retryability, and provider HTTP status |
 
@@ -105,9 +106,9 @@ The exporter code deliberately excludes:
 
 Setting `SPEKO_TELEMETRY_DISABLED=true` suppresses anonymous and optional
 events. On a managed-credential route, the gateway still exports
-`usage.observed` and the terminal `session.closed` or `error` event because
-those records are required to meter and consolidate the provider charge. BYOK
-routes have no mandatory billing records.
+`usage.reported`, `usage.observed`, and the terminal `session.closed` or `error`
+event because those records are required to meter and consolidate the provider
+charge. BYOK routes have no mandatory billing records.
 
 Anonymous BYOK events are sent without an authorization header to
 `https://gateway.speko.dev/v1/anonymous-runtime-events`. The receiver rejects
@@ -137,7 +138,9 @@ streaming STT](https://developers.deepgram.com/reference/speech-to-text/listen-s
 [ElevenLabs multi-context
 TTS](https://elevenlabs.io/docs/api-reference/text-to-speech/v-1-text-to-speech-voice-id-multi-stream-input/),
 and [Cartesia WebSocket
-TTS](https://docs.cartesia.ai/api-reference/tts/websocket). Provider-specific
+TTS](https://docs.cartesia.ai/api-reference/tts/websocket), plus [Cartesia
+manual-finalize STT](https://docs.cartesia.ai/api-reference/stt/websocket).
+Provider-specific
 authentication is visible in the corresponding adapter source and tests.
 
 Environment variables may be visible through container or host inspection.

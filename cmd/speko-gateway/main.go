@@ -112,14 +112,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	adapters := []runtimepkg.Adapter{deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, cartesiaAdapter}
+	cartesiaSTTAdapter, err := cartesia.NewSTT(cartesia.STTConfig{})
+	if err != nil {
+		return err
+	}
+	adapters := []runtimepkg.Adapter{deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, cartesiaAdapter, cartesiaSTTAdapter}
 	runtimeDescriptor := protocol.RuntimeDescriptor{
 		Name:           "go-gateway",
 		Version:        version,
 		InstanceID:     instanceID,
 		Placement:      protocol.PlacementSidecar,
 		ProviderRoutes: []protocol.ProviderRoute{protocol.RouteProviderDirect},
-		Adapters:       []string{deepgramAdapter.ID(), deepgramTTSAdapter.ID(), elevenLabsAdapter.ID(), cartesiaAdapter.ID()},
+		Adapters:       []string{deepgramAdapter.ID(), deepgramTTSAdapter.ID(), elevenLabsAdapter.ID(), cartesiaAdapter.ID(), cartesiaSTTAdapter.ID()},
 	}
 
 	localCredentials := make(map[string]runtimepkg.LocalCredential)

@@ -29,6 +29,9 @@ const (
 	EventAlignment     EventType = "alignment"
 	EventRouteSelected EventType = "route.selected"
 	EventUsageObserved EventType = "usage.observed"
+	// EventUsageReported is authenticated, content-free metering telemetry from
+	// the Gateway. It reports only a normalized quantity, never media or text.
+	EventUsageReported EventType = "usage.reported"
 	EventWarning       EventType = "warning"
 	EventError         EventType = "error"
 )
