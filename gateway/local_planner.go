@@ -192,43 +192,28 @@ func (p *LocalPlanner) selectProvider(kind protocol.SessionKind, requested strin
 	return selected, nil
 }
 
+// supportsLocalKind and localRoute both read the catalog in catalog.go, so a
+// provider is routable exactly when it is published. They used to carry their own
+// hardcoded provider lists, which is how a published id and an openable route can
+// drift apart.
 func supportsLocalKind(provider string, kind protocol.SessionKind) bool {
-	return (provider == "deepgram" && (kind == protocol.SessionKindSTT || kind == protocol.SessionKindTTS)) ||
-		(provider == "elevenlabs" && kind == protocol.SessionKindTTS) ||
-		(provider == "cartesia" && (kind == protocol.SessionKindSTT || kind == protocol.SessionKindTTS))
+	_, ok := catalogEntryFor(kind, provider)
+	return ok
 }
 
 func localRoute(kind protocol.SessionKind, provider, model string) (protocol.PlanRoute, error) {
-	model = strings.TrimSpace(model)
-	switch {
-	case provider == "deepgram" && kind == protocol.SessionKindSTT:
-		if model == "" || model == "auto" {
-			model = "nova-3"
-		}
-		return protocol.PlanRoute{Provider: provider, Model: model, Adapter: "deepgram.stt.v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.deepgram.com/v1/listen"}, nil
-	case provider == "deepgram" && kind == protocol.SessionKindTTS:
-		if model == "" || model == "auto" {
-			model = "aura-2-thalia-en"
-		}
-		return protocol.PlanRoute{Provider: provider, Model: model, Adapter: "deepgram.tts.v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.deepgram.com/v1/speak"}, nil
-	case provider == "elevenlabs" && kind == protocol.SessionKindTTS:
-		if model == "" || model == "auto" {
-			model = "eleven_flash_v2_5"
-		}
-		return protocol.PlanRoute{Provider: provider, Model: model, Adapter: "elevenlabs.tts.v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/text-to-speech"}, nil
-	case provider == "cartesia" && kind == protocol.SessionKindTTS:
-		if model == "" || model == "auto" {
-			model = "sonic-3"
-		}
-		return protocol.PlanRoute{Provider: provider, Model: model, Adapter: "cartesia.tts.v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket"}, nil
-	case provider == "cartesia" && kind == protocol.SessionKindSTT:
-		if model == "" || model == "auto" {
-			model = "ink-2"
-		}
-		return protocol.PlanRoute{Provider: provider, Model: model, Adapter: "cartesia.stt.v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/stt/websocket"}, nil
-	default:
+	entry, ok := catalogEntryFor(kind, provider)
+	if !ok {
 		return protocol.PlanRoute{}, fmt.Errorf("gateway: unsupported local route provider=%q kind=%q", provider, kind)
 	}
+	model = strings.TrimSpace(model)
+	if model == "" || model == "auto" {
+		model = entry.DefaultModel
+	}
+	return protocol.PlanRoute{
+		Provider: entry.Provider, Model: model, Adapter: entry.Adapter,
+		Transport: entry.Transport, Endpoint: entry.Endpoint,
+	}, nil
 }
 
 func localID(prefix string) (string, error) {
