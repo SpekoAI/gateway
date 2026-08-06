@@ -1,0 +1,143 @@
+package gateway_test
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/SpekoAI/gateway/gateway"
+	"github.com/SpekoAI/gateway/protocol"
+)
+
+type catalogResponse struct {
+	Protocol         string `json:"protocol"`
+	ProtocolRevision int    `json:"protocol_revision"`
+	Runtime          struct {
+		Name      string `json:"name"`
+		Placement string `json:"placement"`
+	} `json:"runtime"`
+	Models []struct {
+		ID        string `json:"id"`
+		Provider  string `json:"provider"`
+		Kind      string `json:"kind"`
+		Adapter   string `json:"adapter"`
+		Transport string `json:"transport"`
+		Installed bool   `json:"installed"`
+	} `json:"models"`
+}
+
+func fetchCatalog(t *testing.T, path string) catalogResponse {
+	t.Helper()
+	gatewayServer, _ := newServer(t)
+	httpServer := httptest.NewServer(gatewayServer.Handler())
+	t.Cleanup(httpServer.Close)
+	// Deliberately no local auth header: an integrator has to be able to read the
+	// catalog before the first session, and it names no customer and carries no
+	// credential.
+	response, err := http.Get(httpServer.URL + path)
+	if err != nil {
+		t.Fatalf("get %s: %v", path, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("get %s = %d, want 200 without auth", path, response.StatusCode)
+	}
+	var decoded catalogResponse
+	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	return decoded
+}
+
+func TestModelsPublishesEveryCatalogEntry(t *testing.T) {
+	t.Parallel()
+	catalog := fetchCatalog(t, "/v1/models")
+	if catalog.Protocol != string(protocol.VoiceV0) || catalog.ProtocolRevision != protocol.CurrentRevision {
+		t.Fatalf("catalog protocol = %s r%d, want %s r%d", catalog.Protocol, catalog.ProtocolRevision, protocol.VoiceV0, protocol.CurrentRevision)
+	}
+	if len(catalog.Models) != len(gateway.Catalog()) {
+		t.Fatalf("published %d models, want the %d catalog entries", len(catalog.Models), len(gateway.Catalog()))
+	}
+	// ElevenLabs STT is the row this endpoint exists to make discoverable: it is the
+	// board's strongest transcriber across the most languages and had no adapter at
+	// all until now.
+	var found bool
+	for _, model := range catalog.Models {
+		if model.Provider == "elevenlabs" && model.Kind == "stt" {
+			found = true
+			if model.ID != "elevenlabs:scribe_v2_realtime" {
+				t.Fatalf("elevenlabs stt id = %q, want the realtime model, not the batch one", model.ID)
+			}
+			if model.Adapter != "elevenlabs.stt.v1" || model.Transport != string(protocol.TransportWebSocket) {
+				t.Fatalf("elevenlabs stt row = %+v", model)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("catalog does not publish elevenlabs stt")
+	}
+	// Stable order, so a page rendering this does not reshuffle between restarts.
+	for index := 1; index < len(catalog.Models); index++ {
+		previous, current := catalog.Models[index-1], catalog.Models[index]
+		if previous.Provider > current.Provider {
+			t.Fatalf("catalog is unordered at %d: %q before %q", index, previous.Provider, current.Provider)
+		}
+	}
+}
+
+// A row can be in the catalog and absent from a given process. Hiding that would
+// let a caller wire an id this instance cannot open; reporting it keeps the list
+// the same shape everywhere while staying honest about the deployment.
+func TestModelsReportsWhatThisProcessActuallyInstalled(t *testing.T) {
+	t.Parallel()
+	catalog := fetchCatalog(t, "/v1/models")
+	// The harness installs only a mock adapter, so no real row may claim installed.
+	for _, model := range catalog.Models {
+		if model.Installed {
+			t.Fatalf("%s claims installed, but the test runtime carries only the mock adapter", model.ID)
+		}
+	}
+	if catalog.Runtime.Name == "" || catalog.Runtime.Placement == "" {
+		t.Fatalf("catalog runtime = %+v, want the descriptor identified", catalog.Runtime)
+	}
+}
+
+func TestModelsFiltersByKindAndProvider(t *testing.T) {
+	t.Parallel()
+	tts := fetchCatalog(t, "/v1/models?kind=tts")
+	if len(tts.Models) == 0 {
+		t.Fatal("kind=tts returned nothing")
+	}
+	for _, model := range tts.Models {
+		if model.Kind != "tts" {
+			t.Fatalf("kind=tts returned %s", model.Kind)
+		}
+	}
+	elevenlabs := fetchCatalog(t, "/v1/models?provider=elevenlabs")
+	if len(elevenlabs.Models) != 2 {
+		t.Fatalf("provider=elevenlabs returned %d rows, want stt and tts", len(elevenlabs.Models))
+	}
+	if unknown := fetchCatalog(t, "/v1/models?provider=nope"); len(unknown.Models) != 0 {
+		t.Fatalf("an unknown provider returned %d rows, want none", len(unknown.Models))
+	}
+}
+
+// The property that makes the catalog trustworthy: every published entry is
+// routable, and every routable provider is published. They were separate lists
+// before, which is how a published id and an openable route drift apart.
+func TestEveryPublishedEntryIsRoutable(t *testing.T) {
+	t.Parallel()
+	entries := gateway.Catalog()
+	if len(entries) == 0 {
+		t.Fatal("catalog is empty")
+	}
+	for _, entry := range entries {
+		if entry.DefaultModel == "" || entry.Endpoint == "" || entry.Adapter == "" {
+			t.Fatalf("catalog entry is incomplete: %+v", entry)
+		}
+		if entry.Kind != protocol.SessionKindSTT && entry.Kind != protocol.SessionKindTTS {
+			t.Fatalf("catalog entry %+v claims a modality the gateway has no adapter shape for", entry)
+		}
+	}
+}

@@ -114,7 +114,15 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 			Kind: credential.Kind, Value: credential.Value, ExpiresAt: request.Plan.ExpiresAt,
 		}
 	}
-	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: request.Options, Media: request.Media})
+	// The caller's own voice always wins; the signed route only fills a blank.
+	// Without this, `provider: "auto"` plus TTS is unusable: every voice-taking
+	// adapter rejects an empty voice id, and a caller that delegated the vendor
+	// choice has no way to know which vendor's id space to send one from.
+	adapterOptions := request.Options
+	if strings.TrimSpace(adapterOptions.Voice) == "" {
+		adapterOptions.Voice = adapterPlan.Route.Voice
+	}
+	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media})
 	if err != nil {
 		cancel()
 		e.recordOpenFailure(request, err)

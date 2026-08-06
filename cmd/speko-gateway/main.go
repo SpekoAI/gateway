@@ -108,6 +108,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	elevenLabsSTTAdapter, err := elevenlabs.NewSTT(elevenlabs.STTConfig{})
+	if err != nil {
+		return err
+	}
 	cartesiaAdapter, err := cartesia.New(cartesia.Config{})
 	if err != nil {
 		return err
@@ -116,14 +120,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	adapters := []runtimepkg.Adapter{deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, cartesiaAdapter, cartesiaSTTAdapter}
+	adapters := []runtimepkg.Adapter{deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter, cartesiaAdapter, cartesiaSTTAdapter}
 	runtimeDescriptor := protocol.RuntimeDescriptor{
 		Name:           "go-gateway",
 		Version:        version,
 		InstanceID:     instanceID,
 		Placement:      protocol.PlacementSidecar,
 		ProviderRoutes: []protocol.ProviderRoute{protocol.RouteProviderDirect},
-		Adapters:       []string{deepgramAdapter.ID(), deepgramTTSAdapter.ID(), elevenLabsAdapter.ID(), cartesiaAdapter.ID(), cartesiaSTTAdapter.ID()},
+		Adapters:       []string{deepgramAdapter.ID(), deepgramTTSAdapter.ID(), elevenLabsAdapter.ID(), elevenLabsSTTAdapter.ID(), cartesiaAdapter.ID(), cartesiaSTTAdapter.ID()},
 	}
 
 	localCredentials := make(map[string]runtimepkg.LocalCredential)

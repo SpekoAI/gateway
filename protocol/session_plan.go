@@ -212,8 +212,15 @@ type Execution struct {
 
 // PlanRoute contains no permanent Speko-owned provider credential.
 type PlanRoute struct {
-	Provider   string               `json:"provider"`
-	Model      string               `json:"model"`
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	// Voice is the control plane's choice for the provider it just selected,
+	// used only when the caller did not name one. It exists because a caller
+	// sending `provider: "auto"` cannot know which vendor it will get, and a
+	// Cartesia voice id means nothing to ElevenLabs — so the party that picks
+	// the vendor is the only one that can pick a voice for it. Optional: a plan
+	// without it is byte-identical to one from before this field existed.
+	Voice      string               `json:"voice,omitempty"`
 	Region     string               `json:"region,omitempty"`
 	Adapter    string               `json:"adapter"`
 	Transport  Transport            `json:"transport"`

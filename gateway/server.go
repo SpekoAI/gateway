@@ -252,6 +252,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.HandleFunc("GET /metrics", s.metrics)
+	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("POST /v1/sessions", s.createSession)
 	mux.HandleFunc("GET /v1/sessions/{session_id}/stream", s.streamSession)
 	mux.HandleFunc("DELETE /v1/sessions/{session_id}", s.deleteSession)
