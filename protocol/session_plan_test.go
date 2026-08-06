@@ -1,6 +1,7 @@
 package protocol_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -140,5 +141,41 @@ func assertInvalid(t *testing.T, err error, want string) {
 	t.Helper()
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Fatalf("expected validation error containing %q, got %v", want, err)
+	}
+}
+
+// The voice is additive on the wire. A runtime built before the field existed
+// verifies a plan carrying one: the JWS covers the raw payload bytes, and the
+// envelope binding re-marshals BOTH sides through the same struct, so an
+// unknown field drops from both and they still match. That runtime then ignores
+// the voice and fails in the adapter exactly as it does today — no new failure
+// mode, and no protocol revision bump. This test pins the half that could
+// silently break: a plan without a voice must stay byte-identical.
+func TestPlanRouteVoiceIsAdditiveOnTheWire(t *testing.T) {
+	t.Parallel()
+
+	route := protocol.PlanRoute{
+		Provider: "cartesia", Model: "sonic-3", Adapter: "cartesia.tts",
+		Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket",
+	}
+	encoded, err := json.Marshal(route)
+	if err != nil {
+		t.Fatalf("marshal voiceless route: %v", err)
+	}
+	if bytes.Contains(encoded, []byte(`"voice"`)) {
+		t.Fatalf("a route with no voice emitted the key: %s", encoded)
+	}
+
+	route.Voice = "a0e99841-438c-4a64-b679-ae501e7d6091"
+	encoded, err = json.Marshal(route)
+	if err != nil {
+		t.Fatalf("marshal voiced route: %v", err)
+	}
+	var decoded protocol.PlanRoute
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal voiced route: %v", err)
+	}
+	if decoded.Voice != route.Voice {
+		t.Fatalf("round-tripped voice = %q, want %q", decoded.Voice, route.Voice)
 	}
 }

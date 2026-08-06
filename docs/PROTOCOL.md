@@ -75,6 +75,21 @@ credential:
 }
 ```
 
+### Voice resolution
+
+`request.voice` is an override and always wins. It is also the only way to name a
+voice when you have named the provider yourself.
+
+When it is absent, the runtime uses `route.voice` from the signed plan. That
+field exists for `provider: "auto"`: a caller that delegates the vendor choice
+cannot know which id space to send a voice from — a Cartesia voice id means
+nothing to ElevenLabs — so the party that picks the vendor picks a voice for it
+too. Every voice-taking adapter rejects an empty voice id, so without this a
+delegated TTS route could not open at all.
+
+`route.voice` is optional and omitted when empty, so plans that carry no voice
+are unchanged on the wire.
+
 ## WebSocket
 
 Connect to `stream_url` through the same Unix socket with subprotocol
