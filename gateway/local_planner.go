@@ -209,6 +209,13 @@ func localRoute(kind protocol.SessionKind, provider, model string) (protocol.Pla
 	if !ok {
 		return protocol.PlanRoute{}, fmt.Errorf("gateway: unsupported local route provider=%q kind=%q", provider, kind)
 	}
+	// Refuse before building a route that cannot dial. Returning the reason beats
+	// letting the adapter send a literal PROJECT_ID and surfacing a vendor 404.
+	if entry.RequiresDeploymentConfig != "" {
+		return protocol.PlanRoute{}, fmt.Errorf(
+			"gateway: %s %s needs deployment configuration: %s",
+			entry.Provider, kind, entry.RequiresDeploymentConfig)
+	}
 	model = strings.TrimSpace(model)
 	if model == "" || model == "auto" {
 		model = entry.DefaultModel
@@ -216,6 +223,10 @@ func localRoute(kind protocol.SessionKind, provider, model string) (protocol.Pla
 	return protocol.PlanRoute{
 		Provider: entry.Provider, Model: model, Adapter: entry.Adapter,
 		Transport: entry.Transport, Endpoint: entry.Endpoint,
+		// Only ever a fallback. The caller's own request.voice reaches the adapter
+		// directly and takes precedence there, so this fills the blank rather than
+		// overriding a choice.
+		Voice: entry.DefaultVoice,
 	}, nil
 }
 
