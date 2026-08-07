@@ -1,0 +1,41 @@
+[
+  {
+    "event": "response.created",
+    "data": {"response_id": "resp_req_7d81b2"}
+  },
+  {
+    "event": "response.item.added",
+    "data": {
+      "output_index": 0,
+      "item": {"type": "function_call", "call_id": "call_1", "name": "get_weather"}
+    }
+  },
+  {
+    "event": "response.text.delta",
+    "data": {"output_index": 1, "delta": "The invoice total is "}
+  },
+  {
+    "event": "response.function_call_arguments.delta",
+    "data": {"output_index": 0, "delta": "{\"city\":\"Ber"}
+  },
+  {
+    "event": "response.item.completed",
+    "data": {
+      "output_index": 0,
+      "item": {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"Berlin\"}"}
+    }
+  },
+  {
+    "event": "response.completed",
+    "data": {
+      "stop_reason": "tool_call",
+      "usage": {"input_tokens": 411, "cached_input_tokens": 128, "output_tokens": 34}
+    }
+  },
+  {
+    "event": "error",
+    "data": {
+      "error": {"code": "provider_unavailable", "message": "no eligible provider is currently routable for this request", "retryable": true, "request_id": "req_7d81b2"}
+    }
+  }
+]

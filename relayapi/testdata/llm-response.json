@@ -1,0 +1,27 @@
+{
+  "id": "resp_req_7d81b2",
+  "route": {
+    "provider": "openai",
+    "model": "gpt-5.2",
+    "region": "us-west-2",
+    "attempt_id": "att_1"
+  },
+  "output": [
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [{"type": "text", "text": "The invoice total is 118.50 EUR."}]
+    },
+    {
+      "type": "structured_json",
+      "json": {"total": 118.5}
+    }
+  ],
+  "stop_reason": "stop",
+  "usage": {
+    "input_tokens": 411,
+    "cached_input_tokens": 128,
+    "output_tokens": 62,
+    "reasoning_tokens": 20
+  }
+}

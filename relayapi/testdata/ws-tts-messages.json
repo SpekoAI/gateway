@@ -1,0 +1,25 @@
+[
+  {
+    "type": "session.configure",
+    "routing": {"mode": "explicit", "provider": "cartesia", "model": "sonic-3"},
+    "voice": "a0e99841-438c-4a64-b679-ae501e7d6091",
+    "audio": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1}
+  },
+  {"type": "input.append", "text": "Welcome to "},
+  {"type": "input.commit"},
+  {"type": "input.cancel"},
+  {"type": "session.close"},
+  {
+    "type": "session.ready",
+    "request_id": "req_5cd2f7",
+    "route": {"provider": "cartesia", "model": "sonic-3", "region": "ap-northeast-1", "attempt_id": "att_1"}
+  },
+  {"type": "utterance.started", "sequence": 1},
+  {"type": "utterance.done", "sequence": 1},
+  {"type": "usage.updated", "usage": {"characters": 42}},
+  {"type": "session.closed", "usage": {"characters": 42}},
+  {
+    "type": "error",
+    "error": {"code": "lease_expired", "message": "the session lease could not be renewed before it expired", "retryable": true, "request_id": "req_5cd2f7"}
+  }
+]

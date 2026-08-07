@@ -188,6 +188,77 @@ func TestAdapterUsesAPIKeyHeaderForBYOK(t *testing.T) {
 	}
 }
 
+// A relay plan is managed for billing purposes but carries the connector's
+// permanent ElevenLabs key, which belongs in the xi-api-key header exactly like
+// a BYOK key. The single_use_token query channel would put the permanent key in
+// the URL and fail authentication besides.
+func TestAdapterUsesAPIKeyHeaderForRelayRoute(t *testing.T) {
+	t.Parallel()
+	requests := make(chan *http.Request, 1)
+	server := newMultiContextServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+		message, _ := readClientMessage(ctx, conn)
+		if !message.CloseSocket {
+			t.Errorf("close socket = %+v", message)
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, _ := New(testConfig(server.URL))
+	request := elevenLabsRequest(server.URL, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Value = "connector-elevenlabs-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case request := <-requests:
+		if got := request.Header.Get("xi-api-key"); got != "connector-elevenlabs-key" {
+			t.Fatalf("xi-api-key = %q", got)
+		}
+		if token := request.URL.Query().Get("single_use_token"); token != "" {
+			t.Fatalf("relay handshake leaked the key into the query string: %q", token)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not observe handshake")
+	}
+}
+
+// protocol.SessionPlan validation requires a relay plan to label its
+// credential relay_access, while a connector that synthesizes the plan and
+// drives the adapter directly labels the same permanent key bearer. The relay
+// arm must accept both spellings, or one of the two constructions becomes
+// quietly unreachable.
+func TestAdapterAcceptsRelayAccessCredentialKindOnRelayRoute(t *testing.T) {
+	t.Parallel()
+	server := newMultiContextServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		message, _ := readClientMessage(ctx, conn)
+		if !message.CloseSocket {
+			t.Errorf("close socket = %+v", message)
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, _ := New(testConfig(server.URL))
+	request := elevenLabsRequest(server.URL, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+	request.Plan.Route.Credential.Value = "connector-elevenlabs-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream with relay_access credential: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close relay stream: %v", err)
+	}
+}
+
 func TestAdapterCancelClosesContextWithoutFlush(t *testing.T) {
 	t.Parallel()
 	server := newMultiContextServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {

@@ -1,0 +1,43 @@
+{
+  "routing": {
+    "mode": "auto",
+    "objective": "quality"
+  },
+  "input": [
+    {
+      "type": "message",
+      "role": "system",
+      "content": [{"type": "text", "text": "You are a concise assistant."}]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "text", "text": "What is the weather in Berlin?"}]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Berlin\"}"
+    },
+    {
+      "type": "function_result",
+      "call_id": "call_1",
+      "result": "{\"temperature_c\":21}"
+    }
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Look up current weather for a city.",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }
+  ],
+  "max_output_tokens": 512,
+  "temperature": 0.7,
+  "stream": true
+}

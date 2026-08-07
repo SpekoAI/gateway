@@ -1,0 +1,26 @@
+{
+  "routing": {
+    "mode": "explicit",
+    "provider": "openai",
+    "model": "gpt-5.2"
+  },
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "text", "text": "Extract the invoice fields from: total due 118.50 EUR."}]
+    }
+  ],
+  "response_format": {
+    "type": "json_schema",
+    "name": "invoice",
+    "schema": {
+      "type": "object",
+      "properties": {"total": {"type": "number"}},
+      "required": ["total"],
+      "additionalProperties": false
+    },
+    "strict": true
+  },
+  "max_output_tokens": 256
+}

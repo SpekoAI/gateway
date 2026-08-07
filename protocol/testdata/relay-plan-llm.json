@@ -1,0 +1,41 @@
+{
+  "plan_id": "rplan_llm_123",
+  "request_id": "rreq_llm_123",
+  "session_id": "rsess_llm_123",
+  "attempt_id": "att_1",
+  "reservation_id": "res_relay_llm_123",
+  "organization_id": "org_123",
+  "principal_id": "cred_123",
+  "kind": "llm",
+  "region": "us-west-2",
+  "provider": "openai",
+  "model": "gpt-4.1-mini",
+  "endpoint": "https://api.openai.com/v1/responses",
+  "transport": "http",
+  "catalog_digest": "sha256:4d0c8e2a9f713b5e6d1c0a8b3f2e9d4c5b6a7f8e9d0c1b2a3f4e5d6c7b8a9f00",
+  "rate_card_version": "2026-08-01",
+  "budgets": [
+    {
+      "group": "llm_input",
+      "ceiling_units": 4096
+    },
+    {
+      "group": "llm_output",
+      "ceiling_units": 1024
+    }
+  ],
+  "relay_access": {
+    "value": "sra_test-fixture-not-a-real-bearer",
+    "expires_at": "2026-08-01T12:00:30Z"
+  },
+  "control_token": {
+    "value": "rct_test-fixture-not-a-real-token",
+    "expires_at": "2026-08-01T12:00:30Z"
+  },
+  "expires_at": "2026-08-01T12:00:30Z",
+  "requirements": {
+    "protocol": "speko.voice.v0",
+    "protocol_revision": 4
+  },
+  "signature": "test-fixture-not-a-real-signature"
+}

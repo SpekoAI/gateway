@@ -185,6 +185,80 @@ func TestTTSAdapterEnforcesDocumentedLocalLimits(t *testing.T) {
 	}
 }
 
+// A relay plan is managed for billing purposes but carries the connector's
+// permanent Deepgram key, which authenticates with the Token scheme exactly
+// like a customer-owned key — the managed Bearer scheme would be refused.
+func TestTTSAdapterUsesTokenSchemeForRelayRoute(t *testing.T) {
+	t.Parallel()
+	requests := make(chan *http.Request, 1)
+	server := newSpeakServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+		if message, err := readTTSControl(ctx, conn); err != nil || message.Type != "Close" {
+			t.Errorf("close = %+v, err=%v", message, err)
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, err := NewTTS(testTTSConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new TTS adapter: %v", err)
+	}
+	request := deepgramTTSRequest(server.URL, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Value = "connector-deepgram-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close relay stream: %v", err)
+	}
+
+	select {
+	case received := <-requests:
+		if got := received.Header.Get("Authorization"); got != "Token connector-deepgram-key" {
+			t.Fatalf("authorization = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not observe relay handshake")
+	}
+}
+
+// protocol.SessionPlan validation requires a relay plan to label its
+// credential relay_access, while a connector that synthesizes the plan and
+// drives the adapter directly labels the same permanent key bearer. The relay
+// arm must accept both spellings, or one of the two constructions becomes
+// quietly unreachable.
+func TestTTSAdapterAcceptsRelayAccessCredentialKindOnRelayRoute(t *testing.T) {
+	t.Parallel()
+	server := newSpeakServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if message, err := readTTSControl(ctx, conn); err != nil || message.Type != "Close" {
+			t.Errorf("close = %+v, err=%v", message, err)
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, err := NewTTS(testTTSConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new TTS adapter: %v", err)
+	}
+	request := deepgramTTSRequest(server.URL, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+	request.Plan.Route.Credential.Value = "connector-deepgram-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream with relay_access credential: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close relay stream: %v", err)
+	}
+}
+
 type ttsControl struct {
 	Type string `json:"type"`
 	Text string `json:"text"`

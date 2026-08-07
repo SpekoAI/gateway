@@ -58,6 +58,24 @@ Speko returns a signed, short-lived session plan. The gateway validates its
 structure, time bounds, issuer, audience, signature, provider endpoint, and
 adapter before it accepts media or attaches credentials.
 
+### Relay plans (revision 4)
+
+The Global Speko Relay uses a second, deliberately isolated plan family.
+Relay plans are compact JWS with protected-header typ
+`speko.relay-plan+jws` and audience `speko-relay`, signed by a dedicated
+control-plane key published on a dedicated JWKS document
+(`/.well-known/relay-jwks.json`) with its own kid — never the session-plan
+key or kid, so neither plan family's signature can ever authorize the
+other's consumer. The relay CONNECTOR (Speko-hosted, one process per
+provider) is the sole verifier and the sole consumer of a relay plan's
+single-use JTI; it consumes the JTI only after its region/provider/model/
+endpoint self-checks pass, dials providers exclusively at the embedded
+catalog's endpoint (the plan endpoint is an assertion to compare), and
+reads its one provider secret only after full verification. This
+repository contributes the verifier (`runtime.RelayPlanVerifier`), the
+relay-route adapter arms (credential kind `relay_access` alongside
+`bearer`; BYOK unchanged), and the public `relayapi` wire contract.
+
 When a session requests BYOK, the provider key remains in gateway memory and
 is not sent in the setup request. When it requests managed credentials, the
 plan carries a short-lived provider-specific credential. The permanent
@@ -149,8 +167,12 @@ Use the `_FILE` variants and a secrets manager in production.
 ## Non-goals and current limits
 
 - This repository does not contain Speko's hosted control plane or billing
-  implementation.
-- The image currently implements provider-direct routes, not Speko relay.
+  implementation, nor the hosted relay services themselves — it publishes
+  the relay's wire contract (`relayapi`), protocol types, verifier, and
+  adapter relay arms that those hosted services import.
+- The local gateway image serves provider-direct routes; sending traffic
+  through the hosted Speko relay is a hosted-service surface
+  (`relay.speko.dev`) with its own contract in `relayapi`.
 - Content-free timing events are an observability foundation, not distributed
   tracing across every application component. Framework adapters can add more
   canonical stages without moving raw content into telemetry.

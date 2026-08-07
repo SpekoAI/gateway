@@ -1,0 +1,852 @@
+# json-mirror: asyncapi.json sha256:21ca28bf7aabc805777c9066097e1b135586e83ed75843d8ca7b77cf27fe12ef
+# yaml-body: sha256:71bcd06f6c9b2d80b2627b211b741978cf2e297dd46095ee0936ed6f4b0e2c18
+#
+# This YAML document is the hand-authored, human-readable source of the
+# WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
+# document, converted mechanically, because the in-repo spec checks
+# (speccheck_test.go) parse JSON with the standard library rather than pulling
+# in a YAML dependency. The MIRROR is the normative machine-checked document —
+# every fixture and drift test reads asyncapi.json, never this file — and this
+# YAML is the courtesy view for humans. The fingerprint header above forces
+# the two to move together in one reviewable change, but it is a tripwire,
+# not a semantic proof: a review that touches either file must confirm the
+# other says the same thing. To change the contract, edit this file,
+# regenerate the mirror, and refresh the two header hashes — the exact
+# convention and a regeneration one-liner are documented in speccheck_test.go,
+# and TestSpecMirrorFingerprints fails on any half-done edit.
+asyncapi: "2.6.0"
+info:
+  title: Global Speko Relay streaming API
+  version: "1.0.0"
+  description: >-
+    WebSocket contract of the Global Speko Relay: streaming speech-to-text and
+    text-to-speech sessions. JSON text frames carry the control messages and
+    events documented here; binary frames carry raw audio in the format the
+    session.configure frame declared, with no JSON envelope. The Go types in
+    package relayapi are the source of truth for every shape in this document,
+    and speccheck_test.go machine-checks the two against each other. The HTTP
+    endpoints are specified separately in openapi.yaml.
+defaultContentType: application/json
+servers:
+  relay:
+    url: relay.speko.dev
+    protocol: wss
+    description: >-
+      Global entry point. The upgrade request authenticates with a
+      Speko-issued bearer token and must carry an Idempotency-Key header. The
+      idempotency content hash of a WebSocket session is the SHA-256 of the
+      exact session.configure text-frame bytes, so a retry must reproduce the
+      configure frame byte-for-byte; later frames are intentionally outside
+      the hash — they are the stream's continuous content, guarded by budgets
+      and leases, while the configure frame is the session's intent.
+    security:
+      - bearerAuth: []
+channels:
+  /v1/stt/stream:
+    description: >-
+      Streaming speech-to-text. The first text frame MUST be
+      session.configure; its exact frame bytes are the session's idempotency
+      content hash. Audio input travels in binary frames in the format the
+      configure frame declared, and the client must not send audio before
+      session.ready arrives. Exactly one terminal frame — session.closed or
+      error — ends every session.
+    bindings:
+      ws:
+        method: GET
+        headers:
+          type: object
+          properties:
+            Idempotency-Key:
+              type: string
+              minLength: 1
+              maxLength: 256
+              description: >-
+                Required on the upgrade request. The relay persists only the
+                key, a content hash, and the session's execution status —
+                never the content itself. The hash covers the exact
+                session.configure text-frame bytes; later frames are
+                intentionally outside the hash. Reusing a key with the same
+                hash while the original admission is still live returns
+                request_in_progress (retryable); after dispatch it returns
+                request_already_started with the original request id; reusing
+                a key with a different hash returns idempotency_conflict.
+                Keys are opaque, and the normative length bound is 256
+                BYTES — maxLength below counts code points, which JSON
+                Schema cannot avoid, so multi-byte keys hit the byte bound
+                first.
+          required:
+            - Idempotency-Key
+    publish:
+      operationId: sendSTTFrames
+      summary: Frames the client sends.
+      description: >-
+        JSON control frames, plus untyped binary frames carrying audio input.
+      message:
+        oneOf:
+          - $ref: "#/components/messages/sttSessionConfigure"
+          - $ref: "#/components/messages/sttInputCommit"
+          - $ref: "#/components/messages/sttSessionClose"
+          - $ref: "#/components/messages/sttAudioInput"
+    subscribe:
+      operationId: receiveSTTFrames
+      summary: Frames the relay sends.
+      description: >-
+        session.ready is always the first event frame; exactly one terminal
+        frame — session.closed or error — ends the session.
+      message:
+        oneOf:
+          - $ref: "#/components/messages/sttSessionReady"
+          - $ref: "#/components/messages/sttTranscriptDelta"
+          - $ref: "#/components/messages/sttTranscriptFinal"
+          - $ref: "#/components/messages/sttUsageUpdated"
+          - $ref: "#/components/messages/sttSessionClosed"
+          - $ref: "#/components/messages/wsError"
+  /v1/tts/stream:
+    description: >-
+      Streaming text-to-speech. The first text frame MUST be
+      session.configure; its exact frame bytes are the session's idempotency
+      content hash. The client must not append text before session.ready
+      arrives. Synthesized audio travels in binary frames between the
+      utterance.started and utterance.done events that share its sequence
+      number. Exactly one terminal frame — session.closed or error — ends
+      every session.
+    bindings:
+      ws:
+        method: GET
+        headers:
+          type: object
+          properties:
+            Idempotency-Key:
+              type: string
+              minLength: 1
+              maxLength: 256
+              description: >-
+                Required on the upgrade request. The relay persists only the
+                key, a content hash, and the session's execution status —
+                never the content itself. The hash covers the exact
+                session.configure text-frame bytes; later frames are
+                intentionally outside the hash. Reusing a key with the same
+                hash while the original admission is still live returns
+                request_in_progress (retryable); after dispatch it returns
+                request_already_started with the original request id; reusing
+                a key with a different hash returns idempotency_conflict.
+                Keys are opaque, and the normative length bound is 256
+                BYTES — maxLength below counts code points, which JSON
+                Schema cannot avoid, so multi-byte keys hit the byte bound
+                first.
+          required:
+            - Idempotency-Key
+    publish:
+      operationId: sendTTSFrames
+      summary: Frames the client sends.
+      description: >-
+        JSON control frames only; TTS clients never send binary frames.
+      message:
+        oneOf:
+          - $ref: "#/components/messages/ttsSessionConfigure"
+          - $ref: "#/components/messages/ttsInputAppend"
+          - $ref: "#/components/messages/ttsInputCommit"
+          - $ref: "#/components/messages/ttsInputCancel"
+          - $ref: "#/components/messages/ttsSessionClose"
+    subscribe:
+      operationId: receiveTTSFrames
+      summary: Frames the relay sends.
+      description: >-
+        session.ready is always the first event frame; exactly one terminal
+        frame — session.closed or error — ends the session.
+      message:
+        oneOf:
+          - $ref: "#/components/messages/ttsSessionReady"
+          - $ref: "#/components/messages/ttsUtteranceStarted"
+          - $ref: "#/components/messages/ttsAudioOutput"
+          - $ref: "#/components/messages/ttsUtteranceDone"
+          - $ref: "#/components/messages/ttsUsageUpdated"
+          - $ref: "#/components/messages/ttsSessionClosed"
+          - $ref: "#/components/messages/wsError"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Speko-issued API credential presented as a bearer token on the upgrade
+        request. Failures normalize to the authentication_failed error code.
+  messages:
+    sttSessionConfigure:
+      name: session.configure
+      title: STT session.configure
+      summary: >-
+        Opens a streaming transcription; must be the first text frame on the
+        socket.
+      payload:
+        $ref: "#/components/schemas/STTSessionConfigure"
+    sttInputCommit:
+      name: input.commit
+      title: STT input.commit
+      summary: Marks the end of the audio the client wants finalized.
+      payload:
+        $ref: "#/components/schemas/STTInputCommit"
+    sttSessionClose:
+      name: session.close
+      title: STT session.close
+      summary: >-
+        Asks the server to finish outstanding transcripts and end the session
+        with a terminal session.closed frame.
+      payload:
+        $ref: "#/components/schemas/STTSessionClose"
+    sttAudioInput:
+      name: audio
+      title: STT binary audio frame
+      summary: >-
+        One binary WebSocket frame of raw audio input in the format the
+        session.configure frame declared. Binary frames are untyped: they
+        carry no JSON envelope.
+      contentType: application/octet-stream
+      payload:
+        type: string
+        format: binary
+    sttSessionReady:
+      name: session.ready
+      title: STT session.ready
+      summary: >-
+        Confirms admission and reports the concrete route; always the first
+        event frame.
+      payload:
+        $ref: "#/components/schemas/STTSessionReady"
+    sttTranscriptDelta:
+      name: transcript.delta
+      title: STT transcript.delta
+      summary: An interim hypothesis, superseded by later frames.
+      payload:
+        $ref: "#/components/schemas/STTTranscriptDelta"
+    sttTranscriptFinal:
+      name: transcript.final
+      title: STT transcript.final
+      summary: A finalized span of transcript.
+      payload:
+        $ref: "#/components/schemas/STTTranscriptFinal"
+    sttUsageUpdated:
+      name: usage.updated
+      title: STT usage.updated
+      summary: Cumulative usage while the stream is live.
+      payload:
+        $ref: "#/components/schemas/STTUsageUpdated"
+    sttSessionClosed:
+      name: session.closed
+      title: STT session.closed
+      summary: The clean terminal frame carrying final usage.
+      payload:
+        $ref: "#/components/schemas/STTSessionClosed"
+    ttsSessionConfigure:
+      name: session.configure
+      title: TTS session.configure
+      summary: >-
+        Opens a streaming synthesis session; must be the first text frame on
+        the socket.
+      payload:
+        $ref: "#/components/schemas/TTSSessionConfigure"
+    ttsInputAppend:
+      name: input.append
+      title: TTS input.append
+      summary: Adds text to the utterance being assembled.
+      payload:
+        $ref: "#/components/schemas/TTSInputAppend"
+    ttsInputCommit:
+      name: input.commit
+      title: TTS input.commit
+      summary: >-
+        Finalizes the appended text as one utterance and starts synthesis.
+      payload:
+        $ref: "#/components/schemas/TTSInputCommit"
+    ttsInputCancel:
+      name: input.cancel
+      title: TTS input.cancel
+      summary: >-
+        Abandons uncommitted appended text and any in-flight synthesis for the
+        current utterance.
+      payload:
+        $ref: "#/components/schemas/TTSInputCancel"
+    ttsSessionClose:
+      name: session.close
+      title: TTS session.close
+      summary: >-
+        Asks the server to finish outstanding synthesis and end the session
+        with a terminal session.closed frame.
+      payload:
+        $ref: "#/components/schemas/TTSSessionClose"
+    ttsSessionReady:
+      name: session.ready
+      title: TTS session.ready
+      summary: >-
+        Confirms admission and reports the concrete route; always the first
+        event frame.
+      payload:
+        $ref: "#/components/schemas/TTSSessionReady"
+    ttsUtteranceStarted:
+      name: utterance.started
+      title: TTS utterance.started
+      summary: Announces the binary audio frames for one committed utterance.
+      payload:
+        $ref: "#/components/schemas/TTSUtteranceStarted"
+    ttsAudioOutput:
+      name: audio
+      title: TTS binary audio frame
+      summary: >-
+        One binary WebSocket frame of synthesized audio in the requested
+        output format, sent between the utterance.started and utterance.done
+        events that share its sequence number. Binary frames are untyped: they
+        carry no JSON envelope.
+      contentType: application/octet-stream
+      payload:
+        type: string
+        format: binary
+    ttsUtteranceDone:
+      name: utterance.done
+      title: TTS utterance.done
+      summary: Marks the end of one utterance's binary audio frames.
+      payload:
+        $ref: "#/components/schemas/TTSUtteranceDone"
+    ttsUsageUpdated:
+      name: usage.updated
+      title: TTS usage.updated
+      summary: Cumulative usage while the stream is live.
+      payload:
+        $ref: "#/components/schemas/TTSUsageUpdated"
+    ttsSessionClosed:
+      name: session.closed
+      title: TTS session.closed
+      summary: The clean terminal frame carrying final usage.
+      payload:
+        $ref: "#/components/schemas/TTSSessionClosed"
+    wsError:
+      name: error
+      title: Terminal error frame
+      summary: >-
+        The terminal error frame, shared by STT and TTS sessions. The type
+        name matches the SSE error event deliberately: one error vocabulary
+        across every streaming transport.
+      payload:
+        $ref: "#/components/schemas/ErrorEvent"
+  schemas:
+    RoutingMode:
+      type: string
+      description: >-
+        Discriminates the routing tagged union. The set is closed: an empty or
+        unknown mode is rejected so a typo can never silently fall back to
+        automatic provider selection.
+      enum:
+        - auto
+        - explicit
+    RoutingObjective:
+      type: string
+      description: >-
+        Ranks auto-mode candidates. Unknown objectives are rejected rather
+        than treated as balanced so callers learn about typos before any money
+        is reserved.
+      enum:
+        - balanced
+        - quality
+        - latency
+        - cost
+    Routing:
+      type: object
+      description: >-
+        Selects how the relay picks a provider for one session. It is a tagged
+        union over mode: auto carries the objective and optional allow/deny
+        provider filters, explicit carries exactly a provider and model.
+        Fields from the other arm are rejected in both directions; a
+        present-but-empty filter array ([]) counts as present and is rejected
+        in explicit mode, while an empty-string provider or model in auto
+        mode is indistinguishable from omission and tolerated as such. A
+        wholly omitted routing object means {mode: auto, objective:
+        balanced}, and an auto routing without an objective defaults to
+        balanced — the default exists for omission, never for partially
+        specified routing.
+      properties:
+        mode:
+          $ref: "#/components/schemas/RoutingMode"
+        objective:
+          $ref: "#/components/schemas/RoutingObjective"
+        allow_providers:
+          type: array
+          description: Auto mode only. Provider ids must not be blank.
+          items:
+            type: string
+        deny_providers:
+          type: array
+          description: Auto mode only. Provider ids must not be blank.
+          items:
+            type: string
+        provider:
+          type: string
+          description: Explicit mode only, and required there.
+        model:
+          type: string
+          description: Explicit mode only, and required there.
+      additionalProperties: false
+    Route:
+      type: object
+      description: >-
+        The response-side counterpart of Routing: the concrete decision that
+        served a session. region is the Speko relay location, not a
+        provider-processing residency guarantee, and attempt_id identifies the
+        (possibly post-fallback) attempt that produced the output.
+      properties:
+        provider:
+          type: string
+        model:
+          type: string
+        region:
+          type: string
+        attempt_id:
+          type: string
+      required:
+        - provider
+        - model
+        - region
+        - attempt_id
+      additionalProperties: false
+    AudioConfig:
+      type: object
+      description: >-
+        Raw audio on a relay stream: the binary input frames of an STT
+        session, or the synthesized output frames of a TTS session. The bounds
+        match the local gateway's portable media contract so a caller can move
+        between provider-direct and relay routes without re-encoding.
+      properties:
+        encoding:
+          type: string
+          enum:
+            - pcm_s16le
+            - opus
+        sample_rate_hz:
+          type: integer
+          minimum: 8000
+          maximum: 192000
+        channels:
+          type: integer
+          minimum: 1
+          maximum: 8
+      required:
+        - encoding
+        - sample_rate_hz
+        - channels
+      additionalProperties: false
+    Usage:
+      type: object
+      description: >-
+        Normalized, provider-neutral quantities for one session. Only the
+        lines relevant to the session's kind are set; zero lines are omitted
+        on the wire. Split lines are mutually exclusive by contract: a token
+        counted in cached_input_tokens is not repeated in input_tokens, and a
+        reasoning token is not repeated in output_tokens, so the splits always
+        sum to the totals.
+      properties:
+        duration_ms:
+          type: integer
+          minimum: 0
+        characters:
+          type: integer
+          minimum: 0
+        input_tokens:
+          type: integer
+          minimum: 0
+        cached_input_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        reasoning_tokens:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+    TranscriptSegment:
+      type: object
+      description: One time-aligned span of the transcript.
+      properties:
+        text:
+          type: string
+        start_ms:
+          type: integer
+          minimum: 0
+        end_ms:
+          type: integer
+          minimum: 0
+          description: Must not precede start_ms.
+      required:
+        - text
+        - start_ms
+        - end_ms
+      additionalProperties: false
+    ErrorCode:
+      type: string
+      description: >-
+        Stable, machine-readable failure class. The set is closed: the relay
+        normalizes every failure — including provider failures — to one of
+        these codes and never forwards a raw provider response body. On an
+        established WebSocket session the code arrives in a terminal error
+        frame and no HTTP status applies; when the same code is returned over
+        HTTP — including a rejected upgrade — it maps to one canonical
+        status: 400 capability_unsupported and invalid_request; 401
+        authentication_failed; 402 insufficient_credit; 403 not_entitled and
+        preview_access_required; 409 idempotency_conflict,
+        request_in_progress, and request_already_started; 413
+        payload_too_large; 415 unsupported_media; 429 rate_limited and
+        concurrency_exhausted; 500 relay_error; 502 provider_error; 503
+        provider_unavailable.
+      enum:
+        - authentication_failed
+        - not_entitled
+        - preview_access_required
+        - insufficient_credit
+        - capability_unsupported
+        - invalid_request
+        - rate_limited
+        - concurrency_exhausted
+        - provider_error
+        - provider_unavailable
+        - relay_error
+        - idempotency_conflict
+        - request_in_progress
+        - request_already_started
+        - budget_exhausted
+        - lease_expired
+        - payload_too_large
+        - unsupported_media
+    ErrorBody:
+      type: object
+      description: >-
+        The normalized failure detail. message is human-readable and
+        intentionally carries no provider payload; request_id is present
+        whenever a relay request id had been minted before the failure.
+      properties:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+        retryable:
+          type: boolean
+        request_id:
+          type: string
+      required:
+        - code
+        - message
+        - retryable
+      additionalProperties: false
+    ErrorEvent:
+      type: object
+      description: >-
+        The terminal error frame on a WebSocket session. Exactly one terminal
+        frame — session.closed or error — ends every session.
+      properties:
+        type:
+          type: string
+          enum:
+            - error
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+      required:
+        - type
+        - error
+      additionalProperties: false
+    STTSessionConfigure:
+      type: object
+      description: >-
+        Opens a streaming transcription. audio describes the raw binary frames
+        the client will send: streamed audio has no container, so the format
+        must be declared up front. The exact frame bytes are the session's
+        idempotency content hash; later frames are intentionally outside the
+        hash.
+      properties:
+        type:
+          type: string
+          enum:
+            - session.configure
+        routing:
+          $ref: "#/components/schemas/Routing"
+          description: >-
+            Omitted entirely, routing means {mode: auto, objective: balanced}.
+        audio:
+          $ref: "#/components/schemas/AudioConfig"
+        language:
+          type: string
+          description: Optional language hint.
+      required:
+        - type
+        - audio
+      additionalProperties: false
+    STTInputCommit:
+      type: object
+      description: Marks the end of the audio the client wants finalized.
+      properties:
+        type:
+          type: string
+          enum:
+            - input.commit
+      required:
+        - type
+      additionalProperties: false
+    STTSessionClose:
+      type: object
+      description: >-
+        Asks the server to finish outstanding transcripts and end the session
+        with a terminal session.closed frame.
+      properties:
+        type:
+          type: string
+          enum:
+            - session.close
+      required:
+        - type
+      additionalProperties: false
+    STTSessionReady:
+      type: object
+      description: >-
+        Confirms admission and reports the concrete route. It is always the
+        first event frame; the client must not send audio before it.
+      properties:
+        type:
+          type: string
+          enum:
+            - session.ready
+        request_id:
+          type: string
+        route:
+          $ref: "#/components/schemas/Route"
+      required:
+        - type
+        - request_id
+        - route
+      additionalProperties: false
+    STTTranscriptDelta:
+      type: object
+      description: >-
+        An interim hypothesis; later deltas and the next transcript.final
+        supersede it. Deltas are never empty — empty interim hypotheses are
+        dropped at normalization, never forwarded.
+      properties:
+        type:
+          type: string
+          enum:
+            - transcript.delta
+        text:
+          type: string
+      required:
+        - type
+        - text
+      additionalProperties: false
+    STTTranscriptFinal:
+      type: object
+      description: >-
+        A finalized span of transcript with optional time-aligned segments.
+        text may be empty: a finalized span of silence is legitimate.
+      properties:
+        type:
+          type: string
+          enum:
+            - transcript.final
+        text:
+          type: string
+        segments:
+          type: array
+          items:
+            $ref: "#/components/schemas/TranscriptSegment"
+      required:
+        - type
+        - text
+      additionalProperties: false
+    STTUsageUpdated:
+      type: object
+      description: >-
+        Cumulative usage while the stream is live, so callers can watch spend
+        before the terminal frame.
+      properties:
+        type:
+          type: string
+          enum:
+            - usage.updated
+        usage:
+          $ref: "#/components/schemas/Usage"
+      required:
+        - type
+        - usage
+      additionalProperties: false
+    STTSessionClosed:
+      type: object
+      description: The clean terminal frame carrying final usage.
+      properties:
+        type:
+          type: string
+          enum:
+            - session.closed
+        usage:
+          $ref: "#/components/schemas/Usage"
+      required:
+        - type
+        - usage
+      additionalProperties: false
+    TTSSessionConfigure:
+      type: object
+      description: >-
+        Opens a streaming synthesis session. audio is the requested output
+        format of the binary frames the server will send. The exact frame
+        bytes are the session's idempotency content hash; later frames are
+        intentionally outside the hash.
+      properties:
+        type:
+          type: string
+          enum:
+            - session.configure
+        routing:
+          $ref: "#/components/schemas/Routing"
+          description: >-
+            Omitted entirely, routing means {mode: auto, objective: balanced}.
+        voice:
+          type: string
+          description: >-
+            Optional: in auto mode the party that picks the provider picks a
+            default voice for it.
+        audio:
+          $ref: "#/components/schemas/AudioConfig"
+      required:
+        - type
+        - audio
+      additionalProperties: false
+    TTSInputAppend:
+      type: object
+      description: >-
+        Adds text to the utterance being assembled. Characters are counted
+        against the reserved budget when appended, so an over-budget append
+        fails before any provider work happens.
+      properties:
+        type:
+          type: string
+          enum:
+            - input.append
+        text:
+          type: string
+      required:
+        - type
+        - text
+      additionalProperties: false
+    TTSInputCommit:
+      type: object
+      description: >-
+        Finalizes the appended text as one utterance and starts synthesis.
+      properties:
+        type:
+          type: string
+          enum:
+            - input.commit
+      required:
+        - type
+      additionalProperties: false
+    TTSInputCancel:
+      type: object
+      description: >-
+        Abandons uncommitted appended text and any in-flight synthesis for the
+        current utterance.
+      properties:
+        type:
+          type: string
+          enum:
+            - input.cancel
+      required:
+        - type
+      additionalProperties: false
+    TTSSessionClose:
+      type: object
+      description: >-
+        Asks the server to finish outstanding synthesis and end the session
+        with a terminal session.closed frame.
+      properties:
+        type:
+          type: string
+          enum:
+            - session.close
+      required:
+        - type
+      additionalProperties: false
+    TTSSessionReady:
+      type: object
+      description: >-
+        Confirms admission and reports the concrete route. It is always the
+        first event frame; the client must not append text before it.
+      properties:
+        type:
+          type: string
+          enum:
+            - session.ready
+        request_id:
+          type: string
+        route:
+          $ref: "#/components/schemas/Route"
+      required:
+        - type
+        - request_id
+        - route
+      additionalProperties: false
+    TTSUtteranceStarted:
+      type: object
+      description: >-
+        Announces the binary audio frames for one committed utterance.
+        sequence is the 1-based utterance index within the session so clients
+        can correlate audio with commits.
+      properties:
+        type:
+          type: string
+          enum:
+            - utterance.started
+        sequence:
+          type: integer
+          minimum: 1
+      required:
+        - type
+        - sequence
+      additionalProperties: false
+    TTSUtteranceDone:
+      type: object
+      description: Marks the end of one utterance's binary audio frames.
+      properties:
+        type:
+          type: string
+          enum:
+            - utterance.done
+        sequence:
+          type: integer
+          minimum: 1
+      required:
+        - type
+        - sequence
+      additionalProperties: false
+    TTSUsageUpdated:
+      type: object
+      description: >-
+        Cumulative usage while the stream is live, so callers can watch spend
+        before the terminal frame.
+      properties:
+        type:
+          type: string
+          enum:
+            - usage.updated
+        usage:
+          $ref: "#/components/schemas/Usage"
+      required:
+        - type
+        - usage
+      additionalProperties: false
+    TTSSessionClosed:
+      type: object
+      description: The clean terminal frame carrying final usage.
+      properties:
+        type:
+          type: string
+          enum:
+            - session.closed
+        usage:
+          $ref: "#/components/schemas/Usage"
+      required:
+        - type
+        - usage
+      additionalProperties: false

@@ -88,9 +88,10 @@ func New(config Config) (*Adapter, error) {
 
 func (a *Adapter) ID() string { return a.id }
 
-// Open opens a provider-direct Cartesia TTS WebSocket. Customer API keys use
-// the X-API-Key header; short-lived managed access tokens use the documented
-// handshake query parameter.
+// Open opens a Cartesia TTS WebSocket. Customer API keys use the X-API-Key
+// header; short-lived managed access tokens use the documented handshake query
+// parameter. Relay plans carry the connector's permanent key and therefore use
+// the header form as well.
 func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
 	if request.Kind != protocol.SessionKindTTS {
 		return nil, fmt.Errorf("cartesia supports tts sessions, got %q", request.Kind)
@@ -111,7 +112,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		return nil, err
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("cartesia requires a bearer credential")
 	}
 
@@ -121,7 +122,13 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	}
 	headers := make(http.Header)
 	headers.Set("Cartesia-Version", a.version)
-	if request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK {
+	// A relay plan is managed for billing purposes but carries the connector's
+	// permanent Cartesia key, which belongs in the X-API-Key header exactly like
+	// a BYOK key. The access_token query channel stays reserved for the
+	// short-lived tokens of managed provider-direct routes.
+	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay {
+		headers.Set("X-API-Key", credential.Value)
+	} else if request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK {
 		headers.Set("X-API-Key", credential.Value)
 	} else {
 		endpoint, err = addAccessToken(endpoint, credential.Value)
@@ -173,6 +180,19 @@ func httpClient(client *http.Client) *http.Client {
 		return client
 	}
 	return http.DefaultClient
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives this adapter directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent Cartesia key
+// bearer. Both spellings carry a permanent key; the header-versus-query
+// channel split keys off the route, not the kind, so nothing else on the
+// relay arm changes.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 func websocketEndpoint(policy upstream.WebSocketPolicy, rawEndpoint string) (string, error) {
