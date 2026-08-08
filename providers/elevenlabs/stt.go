@@ -103,7 +103,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, fmt.Errorf("elevenlabs stt media: %w", err)
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("elevenlabs stt requires a bearer credential")
 	}
 	endpoint, err := realtimeEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media)
@@ -115,8 +115,13 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	// carries a single-use token minted by the control plane, and the vendor accepts
 	// a token ONLY as the `token` query parameter — sending it as the header fails
 	// authentication. Same split Cartesia already makes with its access token.
+	// A relay plan is the exception inside managed: it is managed for billing
+	// purposes but carries the connector's permanent provider key, so it uses the
+	// header channel like BYOK rather than putting a permanent key in the URL.
 	headers := make(http.Header)
-	if request.Plan.Execution.CredentialSource == protocol.CredentialsManaged {
+	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay {
+		headers.Set("xi-api-key", credential.Value)
+	} else if request.Plan.Execution.CredentialSource == protocol.CredentialsManaged {
 		endpoint, err = sttEndpointWithToken(endpoint, credential.Value)
 		if err != nil {
 			return nil, err
@@ -159,6 +164,19 @@ func sttHTTPClient(client *http.Client) *http.Client {
 		return client
 	}
 	return http.DefaultClient
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives this adapter directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent ElevenLabs key
+// bearer. Both spellings carry a permanent key; the header-versus-query
+// channel split keys off the route, not the kind, so nothing else on the
+// relay arm changes.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat) (string, error) {

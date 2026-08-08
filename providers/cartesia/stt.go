@@ -90,7 +90,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, err
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("cartesia STT requires a bearer credential")
 	}
 	endpoint, err := cartesiaSTTEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, a.version)
@@ -99,7 +99,13 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 	headers := make(http.Header)
 	headers.Set("Cartesia-Version", a.version)
-	if request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK {
+	// A relay plan is managed for billing purposes but carries the connector's
+	// permanent Cartesia key, which belongs in the X-API-Key header exactly like
+	// a BYOK key. The access_token query channel stays reserved for the
+	// short-lived tokens of managed provider-direct routes.
+	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay {
+		headers.Set("X-API-Key", credential.Value)
+	} else if request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK {
 		headers.Set("X-API-Key", credential.Value)
 	} else {
 		endpoint, err = addAccessToken(endpoint, credential.Value)

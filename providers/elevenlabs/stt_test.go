@@ -462,6 +462,61 @@ func TestSTTAdapterSendsABYOKKeyAsAHeader(t *testing.T) {
 	}
 }
 
+// A relay plan is managed for billing purposes but carries the connector's
+// permanent provider key, so it must use the header channel like BYOK — never
+// the `token` query parameter, where a permanent key could reach logs.
+func TestSTTAdapterSendsARelayKeyAsAHeader(t *testing.T) {
+	t.Parallel()
+	requests := make(chan *http.Request, 1)
+	server := newSTTServer(t, func(_ context.Context, request *http.Request, _ *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	request := sttRequest(server.URL, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Value = "connector-elevenlabs-key"
+	providerStream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream: %v", err)
+	}
+	defer func() { _ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+	received := <-requests
+	if got := received.Header.Get("xi-api-key"); got != "connector-elevenlabs-key" {
+		t.Fatalf("relay xi-api-key = %q, want the connector key", got)
+	}
+	if token := received.URL.Query().Get("token"); token != "" {
+		t.Fatalf("relay session leaked the key into the query string: %q", token)
+	}
+}
+
+// protocol.SessionPlan validation requires a relay plan to label its
+// credential relay_access, while a connector that synthesizes the plan and
+// drives the adapter directly labels the same permanent key bearer. The relay
+// arm must accept both spellings, or one of the two constructions becomes
+// quietly unreachable.
+func TestSTTAdapterAcceptsRelayAccessCredentialKindOnRelayRoute(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(context.Context, *http.Request, *websocket.Conn) {})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	request := sttRequest(server.URL, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+	request.Plan.Route.Credential.Value = "connector-elevenlabs-key"
+	providerStream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream with relay_access credential: %v", err)
+	}
+	_ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+}
+
 // `audio_format` accepts a fixed set of tokens. The platform's TS adapter silently
 // substitutes pcm_16000 for anything else, which does not resample: Scribe reads
 // the bytes at the wrong rate and transcription degrades while the session looks

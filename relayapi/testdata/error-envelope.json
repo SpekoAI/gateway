@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "insufficient_credit",
+    "message": "the organization has no remaining credit for this request",
+    "retryable": false,
+    "request_id": "req_9f2c1a"
+  }
+}

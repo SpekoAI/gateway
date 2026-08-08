@@ -92,12 +92,19 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, err
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("deepgram tts requires a bearer credential")
 	}
 	headers := make(http.Header)
 	authorizationScheme := "Bearer"
 	if request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK {
+		authorizationScheme = "Token"
+	}
+	// A relay plan is managed for billing purposes but carries the connector's
+	// permanent Deepgram key, which authenticates with the Token scheme exactly
+	// like a customer-owned key. Bearer stays reserved for the short-lived tokens
+	// the control plane mints on managed provider-direct routes.
+	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay {
 		authorizationScheme = "Token"
 	}
 	headers.Set("Authorization", authorizationScheme+" "+credential.Value)
