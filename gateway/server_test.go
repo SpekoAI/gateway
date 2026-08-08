@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -829,6 +830,10 @@ type fakePlanClient struct {
 	started  chan struct{}
 	release  <-chan struct{}
 
+	batchRequests []protocol.SessionPlanRequest
+	batchErr      error
+	batchSerial   int
+
 	fallbackPlan     *protocol.SessionPlan
 	fallbackErr      error
 	fallbackRequests []fallbackExchange
@@ -860,6 +865,40 @@ func (c *fakePlanClient) CreateSessionPlan(ctx context.Context, request protocol
 		}
 	}
 	return c.plan, "cp_gateway_123", nil
+}
+
+// CreateSessionPlanBatch returns count copies of the fixture plan with distinct
+// identifiers, so a pool built on this client behaves like one built on a real
+// control plane: every warm plan is independently usable exactly once.
+func (c *fakePlanClient) CreateSessionPlanBatch(_ context.Context, request protocol.SessionPlanRequest, count int, _ controlplane.CreateOptions) ([]protocol.SessionPlan, string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.batchErr != nil {
+		return nil, "", c.batchErr
+	}
+	c.batchRequests = append(c.batchRequests, request)
+	plans := make([]protocol.SessionPlan, 0, count)
+	for index := 0; index < count; index++ {
+		c.batchSerial++
+		plan := c.plan
+		plan.PlanID = fmt.Sprintf("%s_warm_%d", c.plan.PlanID, c.batchSerial)
+		plan.SessionID = fmt.Sprintf("%s_warm_%d", c.plan.SessionID, c.batchSerial)
+		plan.AttemptID = fmt.Sprintf("%s_warm_%d", c.plan.AttemptID, c.batchSerial)
+		plans = append(plans, plan)
+	}
+	return plans, "cp_gateway_batch_123", nil
+}
+
+func (c *fakePlanClient) batchCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.batchRequests)
+}
+
+func (c *fakePlanClient) createCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.requests)
 }
 
 func (c *fakePlanClient) RenewSessionLease(_ context.Context, current protocol.SessionPlan) (protocol.SessionLease, string, error) {

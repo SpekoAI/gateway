@@ -42,6 +42,10 @@ const (
 // local routing, and is deliberately absent from runtime.Engine's hot path.
 type PlanClient interface {
 	CreateSessionPlan(context.Context, protocol.SessionPlanRequest, controlplane.CreateOptions) (protocol.SessionPlan, string, error)
+	// CreateSessionPlanBatch issues several plans in one round trip so a
+	// PlanPool can keep them warm. A planner with no hosted control plane
+	// behind it — LocalPlanner — returns an error and is simply never pooled.
+	CreateSessionPlanBatch(context.Context, protocol.SessionPlanRequest, int, controlplane.CreateOptions) ([]protocol.SessionPlan, string, error)
 	RenewSessionLease(context.Context, protocol.SessionPlan) (protocol.SessionLease, string, error)
 	// ExchangeFallbackPlan performs the signed one-per-attempt fallback
 	// exchange when provider opening fails before any output was produced.
@@ -52,8 +56,12 @@ type PlanClient interface {
 // a Unix socket: a mounted socket can otherwise be reached by another process
 // in the same host or container namespace.
 type Config struct {
-	Engine         *runtimepkg.Engine
-	Plans          PlanClient
+	Engine *runtimepkg.Engine
+	Plans  PlanClient
+	// WarmPlans is optional. When set, a managed provider-direct create takes
+	// an already-signed plan out of memory and dials the provider immediately,
+	// with no control-plane call on the path. A miss falls through to Plans.
+	WarmPlans      *PlanPool
 	Runtime        protocol.RuntimeDescriptor
 	Workload       *protocol.Workload
 	LocalAuthToken string
@@ -77,6 +85,7 @@ type Config struct {
 type Server struct {
 	engine             *runtimepkg.Engine
 	plans              PlanClient
+	warmPlans          *PlanPool
 	runtime            protocol.RuntimeDescriptor
 	workload           *protocol.Workload
 	localAuthHash      [sha256.Size]byte
@@ -229,6 +238,7 @@ func New(config Config) (*Server, error) {
 	return &Server{
 		engine:             config.Engine,
 		plans:              config.Plans,
+		warmPlans:          config.WarmPlans,
 		runtime:            config.Runtime,
 		workload:           config.Workload,
 		localAuthHash:      sha256.Sum256([]byte(config.LocalAuthToken)),
@@ -340,6 +350,18 @@ func (s *Server) metrics(writer http.ResponseWriter, request *http.Request) {
 	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_input_queue_messages Total queued session input messages.\n# TYPE speko_gateway_input_queue_messages gauge\nspeko_gateway_input_queue_messages %d\n", inputMessages)
 	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_input_queue_bytes Total queued session input bytes.\n# TYPE speko_gateway_input_queue_bytes gauge\nspeko_gateway_input_queue_bytes %d\n", inputBytes)
 	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_telemetry_dropped_total Telemetry events dropped under pressure.\n# TYPE speko_gateway_telemetry_dropped_total counter\nspeko_gateway_telemetry_dropped_total %d\n", telemetryDropped)
+	if s.warmPlans != nil {
+		// The miss counter is the one that matters. Every miss is a session
+		// that paid a control-plane round trip before its provider socket
+		// opened, which is precisely the latency this is meant to remove.
+		pool := s.warmPlans.Metrics()
+		_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_warm_plan_hits_total Sessions created from a prefetched plan.\n# TYPE speko_gateway_warm_plan_hits_total counter\nspeko_gateway_warm_plan_hits_total %d\n", pool.Hits)
+		_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_warm_plan_misses_total Sessions that required a synchronous control-plane call.\n# TYPE speko_gateway_warm_plan_misses_total counter\nspeko_gateway_warm_plan_misses_total %d\n", pool.Misses)
+		_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_warm_plan_expired_total Prefetched plans discarded before use.\n# TYPE speko_gateway_warm_plan_expired_total counter\nspeko_gateway_warm_plan_expired_total %d\n", pool.Expired)
+		_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_warm_plan_refill_failures_total Failed warm-pool refills.\n# TYPE speko_gateway_warm_plan_refill_failures_total counter\nspeko_gateway_warm_plan_refill_failures_total %d\n", pool.Failures)
+		_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_warm_plan_depth Prefetched plans currently held.\n# TYPE speko_gateway_warm_plan_depth gauge\nspeko_gateway_warm_plan_depth %d\n", pool.Depth)
+		_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_warm_plan_routes Distinct route shapes being kept warm.\n# TYPE speko_gateway_warm_plan_routes gauge\nspeko_gateway_warm_plan_routes %d\n", pool.Routes)
+	}
 }
 
 func (s *Server) createSession(writer http.ResponseWriter, request *http.Request) {
@@ -403,11 +425,8 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 	// inherit cancellation from whichever request happened to become leader.
 	setupCtx, cancel := context.WithTimeout(context.Background(), s.setupTimeout)
 	defer cancel()
-	planRequest := protocol.SessionPlanRequest{
-		Kind: body.Kind, Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision,
-		Runtime: s.runtime, Workload: s.workload, Integration: body.Integration, Execution: body.Execution, Request: body.Request, Media: body.Media,
-	}
-	plan, requestID, err := s.plans.CreateSessionPlan(setupCtx, planRequest, controlplane.CreateOptions{IdempotencyKey: idempotencyKey})
+	planRequest := planRequestFor(body, s.runtime, s.workload)
+	plan, requestID, err := s.sessionPlan(setupCtx, planRequest, idempotencyKey)
 	if err != nil {
 		outcome := planFailure(err, requestID)
 		s.finishCreate(idempotencyKey, inflight, outcome)
@@ -466,6 +485,24 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 	outcome := createOutcome{response: response, status: http.StatusCreated}
 	s.finishCreate(idempotencyKey, inflight, outcome)
 	writeCreateOutcome(writer, outcome, false)
+}
+
+// sessionPlan returns a plan for this create, preferring one already signed and
+// waiting in memory.
+//
+// This is the whole of the zero-overhead change on the customer side. On a warm
+// hit nothing leaves the process before the provider is dialed, so the setup
+// cost of using the Gateway is the provider handshake and nothing else. On a
+// miss — a cold process, an unseen route shape, a drained pool — the behavior is
+// exactly what it was before, which is why the pool can be a pure optimization
+// rather than a new dependency.
+func (s *Server) sessionPlan(ctx context.Context, request protocol.SessionPlanRequest, idempotencyKey string) (protocol.SessionPlan, string, error) {
+	if s.warmPlans != nil {
+		if plan, warm := s.warmPlans.Take(request); warm {
+			return plan, "", nil
+		}
+	}
+	return s.plans.CreateSessionPlan(ctx, request, controlplane.CreateOptions{IdempotencyKey: idempotencyKey})
 }
 
 func (s *Server) renewSessionLease(ctx context.Context, session *runtimepkg.Session, plan protocol.SessionPlan) {
@@ -564,7 +601,23 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 		return session, plan, requestID, nil
 	}
 	var providerError *runtimepkg.ProviderError
-	if plan.Fallback == nil || !errors.As(err, &providerError) {
+	if !errors.As(err, &providerError) {
+		return nil, plan, requestID, err
+	}
+	// A second warm plan is a genuinely new attempt with its own credential and
+	// its own identifiers, which is exactly what the fallback exchange exists to
+	// produce — except it is already signed and in memory. Preferring it keeps
+	// recovery as fast as the first attempt was, and keeps the one-per-attempt
+	// exchange in reserve for when the pool cannot help.
+	if s.warmPlans != nil {
+		if retryPlan, warm := s.warmPlans.Take(planRequestFor(body, s.runtime, s.workload)); warm {
+			retrySession, retryErr := s.engine.Open(ctx, runtimepkg.OpenRequest{Kind: body.Kind, Plan: retryPlan, Options: body.Request, Media: body.Media})
+			if retryErr == nil {
+				return retrySession, retryPlan, requestID, nil
+			}
+		}
+	}
+	if plan.Fallback == nil {
 		return nil, plan, requestID, err
 	}
 	// The exchange needs its own idempotency key: the create key already
@@ -773,6 +826,17 @@ func (s *Server) waitForCreate(writer http.ResponseWriter, request *http.Request
 	case <-inflight.done:
 		writeCreateOutcome(writer, inflight.outcome, true)
 	case <-request.Context().Done():
+	}
+}
+
+// planRequestFor builds the control-plane request for one local create. Runtime
+// identity and workload come from gateway configuration and are never
+// caller-supplied.
+func planRequestFor(body CreateSessionRequest, runtime protocol.RuntimeDescriptor, workload *protocol.Workload) protocol.SessionPlanRequest {
+	return protocol.SessionPlanRequest{
+		Kind: body.Kind, Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision,
+		Runtime: runtime, Workload: workload, Integration: body.Integration,
+		Execution: body.Execution, Request: body.Request, Media: body.Media,
 	}
 }
 

@@ -58,6 +58,29 @@ Speko returns a signed, short-lived session plan. The gateway validates its
 structure, time bounds, issuer, audience, signature, provider endpoint, and
 adapter before it accepts media or attaches credentials.
 
+### Prefetched plans
+
+By default the gateway fetches plans **ahead of demand** and holds a small pool
+of them in memory, so that opening a session costs no control-plane round trip.
+This is a deliberate change to what the process holds, and it is worth stating
+plainly:
+
+- The gateway keeps up to `SPEKO_WARM_PLAN_TARGET` unused signed plans per route
+  shape (default 4), each carrying a short-lived delegated provider credential
+  and a session-scoped telemetry token.
+- Those credentials exist in process memory from the moment they are fetched
+  rather than from the moment a session starts — a longer window than
+  mint-on-demand, bounded by the plan lifetime (5 minutes by default) and the
+  pool size.
+- Every plan is validated and its `jti` consumed exactly once before any media
+  is accepted, exactly as a synchronously fetched plan is. Prefetching changes
+  when a plan arrives, not what is checked.
+- Unused plans are discarded at expiry and settle at zero.
+
+Set `SPEKO_WARM_PLAN_TARGET=0` to disable prefetching and fetch every plan at
+session-create time. Sessions then pay a control-plane round trip before the
+provider socket opens.
+
 ### Relay plans (revision 4)
 
 The Global Speko Relay uses a second, deliberately isolated plan family.
@@ -127,6 +150,13 @@ events. On a managed-credential route, the gateway still exports
 `usage.reported`, `usage.observed`, and the terminal `session.closed` or `error`
 event because those records are required to meter and consolidate the provider
 charge. BYOK routes have no mandatory billing records.
+
+Managed billing is post-paid: nothing is authorized before a session starts, and
+usage is settled monthly from these records afterwards. Two things follow.
+`lease.renewed` no longer occurs on a managed provider-direct route — the
+session lease is a ceiling the gateway enforces locally, with no mid-call
+control-plane call — and a lost `usage.reported` now results in that usage not
+being billed rather than in a fallback charge.
 
 Anonymous BYOK events are sent without an authorization header to
 `https://gateway.speko.dev/v1/anonymous-runtime-events`. The receiver rejects
