@@ -109,6 +109,46 @@ func (c *Client) CreateSessionPlan(ctx context.Context, request protocol.Session
 	return plan, requestID, nil
 }
 
+// CreateSessionPlanBatch calls POST /v1/session-plan-batches and returns
+// several independently signed plans.
+//
+// It exists so a gateway can keep plans warm ahead of demand. The latency a
+// caller actually feels is between their first audio frame and the provider
+// socket opening, and a plan fetched at that moment puts a full control-plane
+// round trip inside it. Fetching plans in advance moves that round trip off the
+// path entirely, and fetching them one at a time would only relocate it.
+func (c *Client) CreateSessionPlanBatch(ctx context.Context, request protocol.SessionPlanRequest, count int, options CreateOptions) ([]protocol.SessionPlan, string, error) {
+	if err := request.Validate(); err != nil {
+		return nil, "", fmt.Errorf("controlplane: invalid session plan request: %w", err)
+	}
+	if count < 1 {
+		return nil, "", errors.New("controlplane: plan batch count must be positive")
+	}
+	if strings.TrimSpace(options.IdempotencyKey) == "" {
+		return nil, "", errors.New("controlplane: idempotency key is required")
+	}
+	body := struct {
+		Count int                         `json:"count"`
+		Plan  protocol.SessionPlanRequest `json:"plan"`
+	}{Count: count, Plan: request}
+	var batch struct {
+		Plans []protocol.SessionPlan `json:"plans"`
+	}
+	requestID, err := c.postJSON(ctx, c.resolve("/v1/session-plan-batches"), body, options.IdempotencyKey, &batch)
+	if err != nil {
+		return nil, requestID, err
+	}
+	if len(batch.Plans) == 0 {
+		return nil, requestID, errors.New("controlplane: plan batch response contained no plans")
+	}
+	for _, plan := range batch.Plans {
+		if plan.Signature == "" {
+			return nil, requestID, errors.New("controlplane: plan batch response contained an unsigned plan")
+		}
+	}
+	return batch.Plans, requestID, nil
+}
+
 // ExchangeFallbackPlan obtains a newly signed plan only at a known recovery
 // boundary. The exchange URL is itself signed inside the current plan and is
 // therefore used verbatim after validation by the caller.
@@ -191,46 +231,9 @@ func (c *Client) RenewSessionLease(ctx context.Context, current protocol.Session
 }
 
 func (c *Client) postPlan(ctx context.Context, endpoint *url.URL, value any, idempotencyKey string, target *protocol.SessionPlan) (string, error) {
-	body, err := json.Marshal(value)
+	body, requestID, err := c.post(ctx, endpoint, value, idempotencyKey)
 	if err != nil {
-		return "", fmt.Errorf("controlplane: encode request: %w", err)
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("controlplane: create request: %w", err)
-	}
-	request.Header.Set("Authorization", "Bearer "+c.bearer)
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Idempotency-Key", idempotencyKey)
-	request.Header.Set("Speko-Protocol-Revision", fmt.Sprint(protocol.CurrentRevision))
-	if c.userAgent != "" {
-		request.Header.Set("User-Agent", c.userAgent)
-	}
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return "", fmt.Errorf("controlplane: send request: %w", err)
-	}
-	defer response.Body.Close()
-	requestID := response.Header.Get("X-Request-ID")
-	body, err = io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-	if err != nil {
-		return requestID, fmt.Errorf("controlplane: read response: %w", err)
-	}
-	if len(body) > maxResponseBytes {
-		return requestID, errors.New("controlplane: response exceeds size limit")
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		message := ""
-		var failure struct {
-			Error struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if json.Unmarshal(body, &failure) == nil {
-			message = failure.Error.Message
-		}
-		return requestID, &HTTPError{Status: response.StatusCode, RequestID: requestID, Message: message}
+		return requestID, err
 	}
 	if err := json.Unmarshal(body, target); err == nil && target.Signature != "" {
 		return requestID, nil
@@ -243,6 +246,62 @@ func (c *Client) postPlan(ctx context.Context, endpoint *url.URL, value any, ide
 	}
 	*target = wrapped.Plan
 	return requestID, nil
+}
+
+func (c *Client) postJSON(ctx context.Context, endpoint *url.URL, value any, idempotencyKey string, target any) (string, error) {
+	body, requestID, err := c.post(ctx, endpoint, value, idempotencyKey)
+	if err != nil {
+		return requestID, err
+	}
+	if err := json.Unmarshal(body, target); err != nil {
+		return requestID, errors.New("controlplane: response could not be decoded")
+	}
+	return requestID, nil
+}
+
+func (c *Client) post(ctx context.Context, endpoint *url.URL, value any, idempotencyKey string) ([]byte, string, error) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return nil, "", fmt.Errorf("controlplane: encode request: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, "", fmt.Errorf("controlplane: create request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+c.bearer)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Idempotency-Key", idempotencyKey)
+	request.Header.Set("Speko-Protocol-Revision", fmt.Sprint(protocol.CurrentRevision))
+	if c.userAgent != "" {
+		request.Header.Set("User-Agent", c.userAgent)
+	}
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return nil, "", fmt.Errorf("controlplane: send request: %w", err)
+	}
+	defer response.Body.Close()
+	requestID := response.Header.Get("X-Request-ID")
+	body, err = io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	if err != nil {
+		return nil, requestID, fmt.Errorf("controlplane: read response: %w", err)
+	}
+	if len(body) > maxResponseBytes {
+		return nil, requestID, errors.New("controlplane: response exceeds size limit")
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		message := ""
+		var failure struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(body, &failure) == nil {
+			message = failure.Error.Message
+		}
+		return nil, requestID, &HTTPError{Status: response.StatusCode, RequestID: requestID, Message: message}
+	}
+	return body, requestID, nil
 }
 
 func (c *Client) resolve(path string) *url.URL {
