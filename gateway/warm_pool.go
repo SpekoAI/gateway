@@ -22,6 +22,11 @@ const (
 	defaultWarmPoolMinLeft   = 60 * time.Second
 	defaultWarmPoolInterval  = 5 * time.Second
 	defaultWarmPoolMaxRoutes = 16
+	// A refill that never returns must not be able to starve every other
+	// route. Refills run sequentially in one goroutine, so one unbounded call
+	// would drain the whole pool and silently send every managed session back
+	// to synchronous setup until the process restarts.
+	defaultWarmPoolRefillTimeout = 10 * time.Second
 	// A route that has not been asked for in this long stops being refilled.
 	// Without it, a worker that briefly used a second language would keep
 	// paying for plans nobody wants for the life of the process.
@@ -76,11 +81,16 @@ type PlanPoolConfig struct {
 	// two seconds left would trade a control-plane round trip for a flaky one.
 	MinRemaining time.Duration
 	Interval     time.Duration
-	IdleAfter    time.Duration
-	MaxRoutes    int
-	Runtime      protocol.RuntimeDescriptor
-	Workload     *protocol.Workload
-	Now          func() time.Time
+	// RefillTimeout bounds one background batch request. It is not the caller's
+	// deadline — nobody is waiting on a refill — it exists so a control plane
+	// that accepts a connection and then stalls cannot take the pool down with
+	// it.
+	RefillTimeout time.Duration
+	IdleAfter     time.Duration
+	MaxRoutes     int
+	Runtime       protocol.RuntimeDescriptor
+	Workload      *protocol.Workload
+	Now           func() time.Time
 }
 
 // PlanPool keeps signed session plans warm so creating a session costs no
@@ -95,15 +105,16 @@ type PlanPoolConfig struct {
 // or an unreachable control plane all fall through to the ordinary synchronous
 // create, so nothing fails that would not have failed before.
 type PlanPool struct {
-	plans        PlanClient
-	target       int
-	minRemaining time.Duration
-	interval     time.Duration
-	idleAfter    time.Duration
-	maxRoutes    int
-	runtime      protocol.RuntimeDescriptor
-	workload     *protocol.Workload
-	now          func() time.Time
+	plans         PlanClient
+	target        int
+	minRemaining  time.Duration
+	interval      time.Duration
+	refillTimeout time.Duration
+	idleAfter     time.Duration
+	maxRoutes     int
+	runtime       protocol.RuntimeDescriptor
+	workload      *protocol.Workload
+	now           func() time.Time
 
 	mu     sync.Mutex
 	routes map[planKey]*warmRoute
@@ -145,15 +156,19 @@ func NewPlanPool(config PlanPoolConfig) (*PlanPool, error) {
 	if config.MaxRoutes == 0 {
 		config.MaxRoutes = defaultWarmPoolMaxRoutes
 	}
-	if config.Target < 1 || config.MinRemaining <= 0 || config.Interval <= 0 || config.IdleAfter <= 0 || config.MaxRoutes < 1 {
-		return nil, errors.New("gateway: plan pool target, minimum remaining, interval, idle window, and route bound must be positive")
+	if config.RefillTimeout == 0 {
+		config.RefillTimeout = defaultWarmPoolRefillTimeout
+	}
+	if config.Target < 1 || config.MinRemaining <= 0 || config.Interval <= 0 || config.IdleAfter <= 0 || config.MaxRoutes < 1 || config.RefillTimeout <= 0 {
+		return nil, errors.New("gateway: plan pool target, minimum remaining, interval, refill timeout, idle window, and route bound must be positive")
 	}
 	if config.Now == nil {
 		config.Now = time.Now
 	}
 	return &PlanPool{
 		plans: config.Plans, target: config.Target, minRemaining: config.MinRemaining,
-		interval: config.Interval, idleAfter: config.IdleAfter, maxRoutes: config.MaxRoutes,
+		interval: config.Interval, refillTimeout: config.RefillTimeout,
+		idleAfter: config.IdleAfter, maxRoutes: config.MaxRoutes,
 		runtime: config.Runtime, workload: config.Workload, now: config.Now,
 		routes: make(map[planKey]*warmRoute),
 	}, nil
@@ -294,7 +309,12 @@ func (p *PlanPool) refillRoute(ctx context.Context, key planKey, request protoco
 		p.failures.Add(1)
 		return
 	}
-	plans, _, err := p.plans.CreateSessionPlanBatch(ctx, request, count, controlplane.CreateOptions{IdempotencyKey: idempotencyKey})
+	// Bounded independently of the process lifetime. A control plane that
+	// accepts the connection and never answers would otherwise block this
+	// goroutine forever, and with it every other route's refill.
+	refillCtx, cancel := context.WithTimeout(ctx, p.refillTimeout)
+	defer cancel()
+	plans, _, err := p.plans.CreateSessionPlanBatch(refillCtx, request, count, controlplane.CreateOptions{IdempotencyKey: idempotencyKey})
 	if err != nil {
 		// Nothing to recover here. The pool stays as deep as it is and creates
 		// fall through to the synchronous path until the next tick succeeds.

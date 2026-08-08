@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SpekoAI/gateway/controlplane"
 	"github.com/SpekoAI/gateway/gateway"
 	"github.com/SpekoAI/gateway/protocol"
 	"github.com/SpekoAI/gateway/providers/mock"
@@ -269,4 +270,79 @@ func TestGatewayCreatesSessionFromWarmPlanWithoutControlPlaneCall(t *testing.T) 
 	}
 	cleanup := deleteSession(t, httpServer.URL+"/v1/sessions/"+created.SessionID, "local-token")
 	cleanup.Body.Close()
+}
+
+// blockingPlanClient hangs on the batch call until released, so a stalled
+// control plane can be simulated without a network.
+type blockingPlanClient struct {
+	fakePlanClient
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingPlanClient) CreateSessionPlanBatch(ctx context.Context, request protocol.SessionPlanRequest, count int, options controlplane.CreateOptions) ([]protocol.SessionPlan, string, error) {
+	select {
+	case c.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	}
+	return c.fakePlanClient.CreateSessionPlanBatch(ctx, request, count, options)
+}
+
+// TestPlanPoolBoundsAStalledRefill covers the failure mode where the control
+// plane accepts a connection and then never answers.
+//
+// Refills run sequentially in one goroutine. Without a per-request deadline
+// that single hung call blocks every route's refill for the life of the
+// process, so the pool silently drains and every managed session goes back to
+// paying a synchronous round trip — the exact latency this exists to remove,
+// reintroduced by a hang nobody would notice.
+func TestPlanPoolBoundsAStalledRefill(t *testing.T) {
+	t.Parallel()
+	client := &blockingPlanClient{
+		fakePlanClient: fakePlanClient{plan: gatewayPlan()},
+		entered:        make(chan struct{}, 1),
+		release:        make(chan struct{}),
+	}
+	pool, err := gateway.NewPlanPool(gateway.PlanPoolConfig{
+		Plans: client, Target: 2, RefillTimeout: 50 * time.Millisecond,
+		Runtime: managedWarmRequest().Runtime,
+		Now:     func() time.Time { return gatewayNow },
+	})
+	if err != nil {
+		t.Fatalf("new plan pool: %v", err)
+	}
+
+	warmed := make(chan error, 1)
+	go func() { warmed <- pool.Warm(context.Background(), managedWarmRequest()) }()
+
+	select {
+	case <-client.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refill never reached the control plane")
+	}
+	// The refill must give up on its own, without the caller's context being
+	// canceled and without the process exiting.
+	select {
+	case err := <-warmed:
+		if err != nil {
+			t.Fatalf("warm returned %v; a stalled refill is a miss, not an error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a stalled refill was not bounded by RefillTimeout")
+	}
+	close(client.release)
+
+	if metrics := pool.Metrics(); metrics.Failures == 0 {
+		t.Fatalf("pool metrics = %+v, want the timed-out refill counted", metrics)
+	}
+	// The route is still registered and still refillable, so recovery needs no
+	// restart.
+	if metrics := pool.Metrics(); metrics.Routes != 1 {
+		t.Fatalf("pool metrics = %+v, want the route retained", metrics)
+	}
 }
