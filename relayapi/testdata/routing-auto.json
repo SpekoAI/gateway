@@ -1,0 +1,6 @@
+{
+  "mode": "auto",
+  "objective": "balanced",
+  "allow_providers": ["openai", "anthropic"],
+  "deny_providers": ["together"]
+}

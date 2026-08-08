@@ -78,15 +78,22 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		return nil, errors.New("elevenlabs tts requires media configuration")
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("elevenlabs tts requires a bearer credential")
 	}
-	endpoint, err := multiContextEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, request.Plan.Execution.CredentialSource, credential.Value)
+	endpoint, err := multiContextEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, request.Plan.Execution.ProviderRoute, request.Plan.Execution.CredentialSource, credential.Value)
 	if err != nil {
 		return nil, err
 	}
 	headers := make(http.Header)
 	if request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK {
+		headers.Set("xi-api-key", credential.Value)
+	}
+	// A relay plan is managed for billing purposes but carries the connector's
+	// permanent ElevenLabs key, which belongs in the xi-api-key header exactly
+	// like a BYOK key. The single_use_token query channel stays reserved for the
+	// control-plane-minted tokens of managed provider-direct routes.
+	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay {
 		headers.Set("xi-api-key", credential.Value)
 	}
 	client := a.httpClient
@@ -108,7 +115,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	return stream, nil
 }
 
-func multiContextEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat, source protocol.CredentialSource, credential string) (string, error) {
+func multiContextEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat, route protocol.ProviderRoute, source protocol.CredentialSource, credential string) (string, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
 		return "", fmt.Errorf("elevenlabs endpoint: %w", err)
@@ -145,7 +152,10 @@ func multiContextEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model st
 	if language := strings.TrimSpace(options.Language); language != "" {
 		query.Set("language_code", language)
 	}
-	if source == protocol.CredentialsManaged {
+	// A relay plan is managed but carries a permanent key that dials via the
+	// xi-api-key header; only managed provider-direct tokens ride the query
+	// string, keeping the permanent key out of URLs where it could reach logs.
+	if source == protocol.CredentialsManaged && route != protocol.RouteSpekoRelay {
 		query.Set("single_use_token", credential)
 	}
 	endpoint.RawQuery = query.Encode()

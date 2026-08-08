@@ -1,0 +1,1142 @@
+# json-mirror: openapi.json sha256:52d3bfffbe2bf6cbbef4c67f3f7df01a14145d1b53a98069060ba9ad8411c680
+# yaml-body: sha256:b8071fc9d146bbfe9da44cbe46ea3a9caad5e1d697e67c830e02c2a571b2a2ad
+#
+# This YAML document is the hand-authored, human-readable source of the HTTP
+# contract. openapi.json is its checked-in JSON mirror: the same document,
+# converted mechanically, because the in-repo spec checks (speccheck_test.go)
+# parse JSON with the standard library rather than pulling in a YAML
+# dependency. The MIRROR is the normative machine-checked document — every
+# fixture and drift test reads openapi.json, never this file — and this YAML
+# is the courtesy view for humans. The fingerprint header above forces the
+# two to move together in one reviewable change, but it is a tripwire, not a
+# semantic proof: a review that touches either file must confirm the other
+# says the same thing. To change the contract, edit this file, regenerate the
+# mirror, and refresh the two header hashes — the exact convention and a
+# regeneration one-liner are documented in speccheck_test.go, and
+# TestSpecMirrorFingerprints fails on any half-done edit.
+openapi: "3.1.0"
+info:
+  title: Global Speko Relay API
+  version: "1.0.0"
+  description: >-
+    HTTP contract of the Global Speko Relay: model discovery, batch speech
+    transcription, one-shot speech synthesis, and LLM responses over JSON or
+    server-sent events. The Go types in package relayapi are the source of
+    truth for every shape in this document, and speccheck_test.go
+    machine-checks the two against each other. Streaming speech travels over
+    WebSocket and is specified separately in asyncapi.yaml.
+servers:
+  - url: https://relay.speko.dev
+    description: >-
+      Global entry point. Every response names the Speko relay region that
+      served it in Speko-Region; the region is a proximity fact about Speko
+      infrastructure, not a guarantee about where the provider processed the
+      content.
+security:
+  - bearerAuth: []
+paths:
+  /v1/models:
+    get:
+      operationId: listModels
+      summary: List entitled, currently routable models
+      description: >-
+        Returns the caller's entitled and currently routable slice of the
+        model catalog. The catalog digest identifies the release-pinned
+        catalog that produced the listing so support can correlate a caller's
+        view with an exact release. The listing is advisory: admission remains
+        the enforcement point for entitlements, gates, and credit.
+      responses:
+        "200":
+          description: The caller's slice of the catalog.
+          headers:
+            Speko-Request-ID:
+              $ref: "#/components/headers/SpekoRequestID"
+            Speko-Region:
+              $ref: "#/components/headers/SpekoRegion"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelsResponse"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/stt/transcriptions:
+    post:
+      operationId: createTranscription
+      summary: Transcribe one uploaded audio file
+      description: >-
+        Batch speech-to-text. The audio always travels as an uploaded part,
+        never as a URL: the relay fetches nothing on a caller's behalf. For
+        idempotency the content hash covers the decoded part payload bytes
+        only — no part headers, no boundary bytes — concatenated in part
+        order (request, then audio), so a retry hashes identically no matter
+        what boundary string the client generates. Usage lives in the
+        response body; there is deliberately no STT usage header.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              description: >-
+                Exactly two parts, hashed for idempotency in this order.
+              properties:
+                request:
+                  $ref: "#/components/schemas/TranscriptionRequest"
+                audio:
+                  type: string
+                  format: binary
+                  description: >-
+                    The audio bytes. The container (WAV/PCM headers at launch)
+                    declares the media format, so the metadata part carries
+                    only routing and options.
+              required:
+                - request
+                - audio
+              additionalProperties: false
+            encoding:
+              request:
+                contentType: application/json
+              audio:
+                contentType: application/octet-stream
+      responses:
+        "200":
+          description: The transcription result.
+          headers:
+            Speko-Request-ID:
+              $ref: "#/components/headers/SpekoRequestID"
+            Speko-Attempt-ID:
+              $ref: "#/components/headers/SpekoAttemptID"
+            Speko-Provider:
+              $ref: "#/components/headers/SpekoProvider"
+            Speko-Model:
+              $ref: "#/components/headers/SpekoModel"
+            Speko-Region:
+              $ref: "#/components/headers/SpekoRegion"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscriptionResponse"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/tts/speech:
+    post:
+      operationId: createSpeech
+      summary: Synthesize one utterance to a raw audio stream
+      description: >-
+        One-shot text-to-speech. The response body is a raw audio stream in
+        the requested output format; the route and the billed character count
+        come back in headers (Speko-Provider, Speko-Model, Speko-Region,
+        Speko-Usage-Characters) because a byte stream has no place for a JSON
+        envelope.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SpeechRequest"
+      responses:
+        "200":
+          description: >-
+            The synthesized audio, in the encoding, sample rate, and channel
+            count the request asked for.
+          headers:
+            Speko-Request-ID:
+              $ref: "#/components/headers/SpekoRequestID"
+            Speko-Attempt-ID:
+              $ref: "#/components/headers/SpekoAttemptID"
+            Speko-Provider:
+              $ref: "#/components/headers/SpekoProvider"
+            Speko-Model:
+              $ref: "#/components/headers/SpekoModel"
+            Speko-Region:
+              $ref: "#/components/headers/SpekoRegion"
+            Speko-Usage-Characters:
+              $ref: "#/components/headers/SpekoUsageCharacters"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+                description: Raw audio in the requested output format.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/llm/responses:
+    post:
+      operationId: createLLMResponse
+      summary: Generate an LLM response, as JSON or as a server-sent event stream
+      description: >-
+        Generates a response for the supplied conversation history. With
+        stream omitted or false the body is a single application/json
+        LLMResponse; with stream true the body is a text/event-stream whose
+        event payloads are documented by the ResponseCreated,
+        ResponseItemAdded, ResponseTextDelta,
+        ResponseFunctionCallArgumentsDelta, ResponseItemCompleted,
+        ResponseCompleted, and ErrorEnvelope schemas. Response ids are
+        Speko-minted (resp_<request-id>); provider response and conversation
+        ids never appear in output — they are captured only as content-free
+        telemetry evidence. There is no previous_response_id anywhere in the
+        contract: callers resend full history, including function results, on
+        every request.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LLMRequest"
+      responses:
+        "200":
+          description: >-
+            The generated response, as a JSON body (stream omitted or false)
+            or as a server-sent event stream (stream true).
+          headers:
+            Speko-Request-ID:
+              $ref: "#/components/headers/SpekoRequestID"
+            Speko-Attempt-ID:
+              $ref: "#/components/headers/SpekoAttemptID"
+            Speko-Provider:
+              $ref: "#/components/headers/SpekoProvider"
+            Speko-Model:
+              $ref: "#/components/headers/SpekoModel"
+            Speko-Region:
+              $ref: "#/components/headers/SpekoRegion"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMResponse"
+            text/event-stream:
+              schema:
+                type: string
+                description: >-
+                  Returned when the request set stream to true. Each SSE frame
+                  names its event and carries one JSON data payload documented
+                  by the schema of the same shape: response.created →
+                  ResponseCreated, response.item.added → ResponseItemAdded,
+                  response.text.delta → ResponseTextDelta,
+                  response.function_call_arguments.delta →
+                  ResponseFunctionCallArgumentsDelta, response.item.completed
+                  → ResponseItemCompleted, response.completed →
+                  ResponseCompleted, and error → ErrorEnvelope (the same
+                  envelope every non-2xx HTTP response uses). Every stream
+                  carries exactly one terminal event — response.completed on
+                  success or error on failure — never both and never zero, so
+                  a client that sees the connection close without a terminal
+                  event knows the stream was truncated rather than finished.
+        default:
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Speko-issued API credential presented as a bearer token. Failures
+        normalize to the authentication_failed error code.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Required on every POST. The relay persists only the key, a content
+        hash, and the request's execution status — never the content itself.
+        For single-part bodies the content hash covers the raw body bytes
+        exactly as sent; for multipart bodies it covers the decoded part
+        payload bytes only — no part headers, no boundary bytes —
+        concatenated in part order (request, then audio), so per-retry
+        boundary strings never change the hash. Reusing a key with the
+        same hash while the original admission is still live returns
+        request_in_progress (retryable); after dispatch it returns
+        request_already_started with the original request id, because
+        stateless mode cannot replay output; reusing a key with a different
+        hash returns idempotency_conflict. Keys are opaque; the relay imposes
+        no format beyond the length bound, and the normative bound is 256
+        BYTES — maxLength below counts code points, which JSON Schema cannot
+        avoid, so multi-byte keys hit the byte bound first.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+  headers:
+    SpekoRequestID:
+      description: >-
+        The relay request id, also embedded in error envelopes and
+        Speko-minted LLM response ids.
+      schema:
+        type: string
+    SpekoAttemptID:
+      description: >-
+        Identifies the (possibly post-fallback) attempt that produced the
+        response.
+      schema:
+        type: string
+    SpekoProvider:
+      description: The concrete provider that served the request.
+      schema:
+        type: string
+    SpekoModel:
+      description: The concrete model that served the request.
+      schema:
+        type: string
+    SpekoRegion:
+      description: >-
+        The Speko relay location that served the request. It is a proximity
+        fact about Speko infrastructure, not a guarantee about where the
+        provider processed the content.
+      schema:
+        type: string
+    SpekoUsageCharacters:
+      description: >-
+        TTS only: the billed character count for the synthesized input. It
+        exists because the one-shot TTS response body is a raw audio stream
+        with no place for a usage object. There is deliberately no STT
+        equivalent — STT usage lives in the JSON response body and in
+        WebSocket usage events.
+      schema:
+        type: integer
+        minimum: 0
+  responses:
+    Error:
+      description: >-
+        Normalized failure. Every non-2xx response carries this envelope; the
+        relay never forwards a raw provider response body.
+      headers:
+        Speko-Request-ID:
+          $ref: "#/components/headers/SpekoRequestID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+  schemas:
+    RoutingMode:
+      type: string
+      description: >-
+        Discriminates the routing tagged union. The set is closed: an empty or
+        unknown mode is rejected so a typo can never silently fall back to
+        automatic provider selection.
+      enum:
+        - auto
+        - explicit
+    RoutingObjective:
+      type: string
+      description: >-
+        Ranks auto-mode candidates. Unknown objectives are rejected rather
+        than treated as balanced so callers learn about typos before any money
+        is reserved.
+      enum:
+        - balanced
+        - quality
+        - latency
+        - cost
+    Routing:
+      type: object
+      description: >-
+        Selects how the relay picks a provider for one request. It is a tagged
+        union over mode: auto carries the objective and optional allow/deny
+        provider filters, explicit carries exactly a provider and model.
+        Fields from the other arm are rejected in both directions; a
+        present-but-empty filter array ([]) counts as present and is rejected
+        in explicit mode, while an empty-string provider or model in auto
+        mode is indistinguishable from omission and tolerated as such. A
+        wholly omitted routing object means {mode: auto, objective:
+        balanced}, and an auto routing without an objective defaults to
+        balanced — the default exists for omission, never for partially
+        specified routing.
+      properties:
+        mode:
+          $ref: "#/components/schemas/RoutingMode"
+        objective:
+          $ref: "#/components/schemas/RoutingObjective"
+        allow_providers:
+          type: array
+          description: Auto mode only. Provider ids must not be blank.
+          items:
+            type: string
+        deny_providers:
+          type: array
+          description: Auto mode only. Provider ids must not be blank.
+          items:
+            type: string
+        provider:
+          type: string
+          description: Explicit mode only, and required there.
+        model:
+          type: string
+          description: Explicit mode only, and required there.
+      additionalProperties: false
+    Route:
+      type: object
+      description: >-
+        The response-side counterpart of Routing: the concrete decision that
+        served a request. region is the Speko relay location, not a
+        provider-processing residency guarantee, and attempt_id identifies the
+        (possibly post-fallback) attempt that produced the output.
+      properties:
+        provider:
+          type: string
+        model:
+          type: string
+        region:
+          type: string
+        attempt_id:
+          type: string
+      required:
+        - provider
+        - model
+        - region
+        - attempt_id
+      additionalProperties: false
+    ErrorCode:
+      type: string
+      description: >-
+        Stable, machine-readable failure class. The set is closed: the relay
+        normalizes every failure — including provider failures — to one of
+        these codes and never forwards a raw provider response body. When an
+        error envelope travels as an HTTP response, each code maps to one
+        canonical status: 400 capability_unsupported and invalid_request;
+        401 authentication_failed; 402 insufficient_credit; 403 not_entitled
+        and preview_access_required; 409 idempotency_conflict,
+        request_in_progress, and request_already_started; 413
+        payload_too_large; 415 unsupported_media; 429 rate_limited and
+        concurrency_exhausted; 500 relay_error; 502 provider_error; 503
+        provider_unavailable. budget_exhausted and lease_expired terminate
+        streams that are already established — an SSE error event after the
+        200 — so no HTTP status carries them.
+      enum:
+        - authentication_failed
+        - not_entitled
+        - preview_access_required
+        - insufficient_credit
+        - capability_unsupported
+        - invalid_request
+        - rate_limited
+        - concurrency_exhausted
+        - provider_error
+        - provider_unavailable
+        - relay_error
+        - idempotency_conflict
+        - request_in_progress
+        - request_already_started
+        - budget_exhausted
+        - lease_expired
+        - payload_too_large
+        - unsupported_media
+    ErrorBody:
+      type: object
+      description: >-
+        The normalized failure detail. message is human-readable and
+        intentionally carries no provider payload; request_id is present
+        whenever a relay request id had been minted before the failure.
+      properties:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+        retryable:
+          type: boolean
+        request_id:
+          type: string
+      required:
+        - code
+        - message
+        - retryable
+      additionalProperties: false
+    ErrorEnvelope:
+      type: object
+      description: >-
+        The body of every non-2xx HTTP response and the data payload of the
+        SSE error event, so both transports share one normalized error shape.
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+      required:
+        - error
+      additionalProperties: false
+    Usage:
+      type: object
+      description: >-
+        Normalized, provider-neutral quantities for one request or stream.
+        Only the lines relevant to the request's kind are set; zero lines are
+        omitted on the wire. Split lines are mutually exclusive by contract: a
+        token counted in cached_input_tokens is not repeated in input_tokens,
+        and a reasoning token is not repeated in output_tokens, so the splits
+        always sum to the totals. Providers that report no split report
+        all-uncached / all-visible.
+      properties:
+        duration_ms:
+          type: integer
+          minimum: 0
+        characters:
+          type: integer
+          minimum: 0
+        input_tokens:
+          type: integer
+          minimum: 0
+        cached_input_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        reasoning_tokens:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+    Kind:
+      type: string
+      description: >-
+        The provider-neutral operation served by the relay. The set is
+        deliberately smaller than the local gateway's session kinds: the relay
+        serves stt, tts, and llm, and has no realtime kind.
+      enum:
+        - stt
+        - tts
+        - llm
+    ModelCapabilities:
+      type: object
+      description: >-
+        What a model supports. Capability gating happens before admission: a
+        request using tools or structured output on a model that does not
+        advertise them is rejected with capability_unsupported, never silently
+        stripped.
+      properties:
+        tools:
+          type: boolean
+        structured_output:
+          type: boolean
+        cached_input:
+          type: boolean
+        reasoning:
+          type: boolean
+      required:
+        - tools
+        - structured_output
+        - cached_input
+        - reasoning
+      additionalProperties: false
+    Model:
+      type: object
+      description: >-
+        One entitled, currently routable catalog entry. regions lists the
+        Speko relay regions (AWS region ids) where the model is routable right
+        now — relay locations, never provider-processing residency.
+      properties:
+        id:
+          type: string
+        provider:
+          type: string
+        kind:
+          $ref: "#/components/schemas/Kind"
+        capabilities:
+          $ref: "#/components/schemas/ModelCapabilities"
+        regions:
+          type: array
+          items:
+            type: string
+      required:
+        - id
+        - provider
+        - kind
+        - capabilities
+        - regions
+      additionalProperties: false
+    ModelsResponse:
+      type: object
+      description: >-
+        The GET /v1/models body: the caller's entitled and currently routable
+        slice of the catalog. catalog_digest identifies the release-pinned
+        catalog that produced the listing.
+      properties:
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/Model"
+        catalog_digest:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+      required:
+        - models
+        - catalog_digest
+      additionalProperties: false
+    TranscriptionRequest:
+      type: object
+      description: >-
+        The JSON metadata part ("request") of POST /v1/stt/transcriptions. The
+        audio container itself (WAV/PCM headers at launch) declares the media
+        format, so the metadata carries only routing and options.
+      properties:
+        routing:
+          $ref: "#/components/schemas/Routing"
+          description: >-
+            Omitted entirely, routing means {mode: auto, objective: balanced}.
+        language:
+          type: string
+          description: Optional language hint.
+      additionalProperties: false
+    TranscriptSegment:
+      type: object
+      description: One time-aligned span of the transcript.
+      properties:
+        text:
+          type: string
+        start_ms:
+          type: integer
+          minimum: 0
+        end_ms:
+          type: integer
+          minimum: 0
+          description: Must not precede start_ms.
+      required:
+        - text
+        - start_ms
+        - end_ms
+      additionalProperties: false
+    TranscriptionResponse:
+      type: object
+      description: >-
+        The batch transcription result. usage carries the billed duration;
+        there is deliberately no STT usage header. text may be empty: silent
+        audio legitimately transcribes to nothing.
+      properties:
+        text:
+          type: string
+        segments:
+          type: array
+          items:
+            $ref: "#/components/schemas/TranscriptSegment"
+        route:
+          $ref: "#/components/schemas/Route"
+        usage:
+          $ref: "#/components/schemas/Usage"
+      required:
+        - text
+        - route
+        - usage
+      additionalProperties: false
+    AudioConfig:
+      type: object
+      description: >-
+        Raw audio on a relay stream: the output format of a TTS request, or
+        the binary input frames of an STT stream. The bounds match the local
+        gateway's portable media contract so a caller can move between
+        provider-direct and relay routes without re-encoding.
+      properties:
+        encoding:
+          type: string
+          enum:
+            - pcm_s16le
+            - opus
+        sample_rate_hz:
+          type: integer
+          minimum: 8000
+          maximum: 192000
+        channels:
+          type: integer
+          minimum: 1
+          maximum: 8
+      required:
+        - encoding
+        - sample_rate_hz
+        - channels
+      additionalProperties: false
+    SpeechRequest:
+      type: object
+      description: >-
+        The POST /v1/tts/speech body. The response is a raw audio stream; the
+        route and billed character count come back in headers because a byte
+        stream has no place for a JSON envelope.
+      properties:
+        routing:
+          $ref: "#/components/schemas/Routing"
+          description: >-
+            Omitted entirely, routing means {mode: auto, objective: balanced}.
+        input:
+          type: string
+          description: The text to synthesize.
+        voice:
+          type: string
+          description: >-
+            Optional: in auto mode the party that picks the provider picks a
+            default voice for it.
+        audio:
+          $ref: "#/components/schemas/AudioConfig"
+      required:
+        - input
+        - audio
+      additionalProperties: false
+    ContentPart:
+      type: object
+      description: >-
+        One piece of a message's content. text is the only content part type
+        at launch; the part list exists so richer parts can be added later
+        without reshaping messages.
+      properties:
+        type:
+          type: string
+          enum:
+            - text
+        text:
+          type: string
+      required:
+        - type
+        - text
+      additionalProperties: false
+    MessageItem:
+      type: object
+      description: >-
+        A conversation message. There is no tool role: tool traffic uses the
+        dedicated function_call and function_result item types.
+      properties:
+        type:
+          type: string
+          enum:
+            - message
+        role:
+          type: string
+          enum:
+            - system
+            - user
+            - assistant
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentPart"
+      required:
+        - type
+        - role
+        - content
+      additionalProperties: false
+    AssistantMessageItem:
+      type: object
+      description: >-
+        The output-side narrowing of MessageItem: response output and
+        streamed output items only ever carry assistant-authored messages, so
+        the role enum admits nothing else. Request input uses the full
+        MessageItem.
+      properties:
+        type:
+          type: string
+          enum:
+            - message
+        role:
+          type: string
+          enum:
+            - assistant
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentPart"
+      required:
+        - type
+        - role
+        - content
+      additionalProperties: false
+    FunctionCallItem:
+      type: object
+      description: >-
+        A model-issued function call. arguments is JSON carried as a string,
+        matching how function call arguments stream as text deltas; call_id is
+        shared with function_result and links a result to the call that
+        produced it.
+      properties:
+        type:
+          type: string
+          enum:
+            - function_call
+        call_id:
+          type: string
+        name:
+          type: string
+        arguments:
+          type: string
+          description: The call arguments as a JSON text.
+      required:
+        - type
+        - call_id
+        - name
+        - arguments
+      additionalProperties: false
+    FunctionCallItemShell:
+      type: object
+      description: >-
+        The relaxed function_call shape announced by response.item.added:
+        identity fields are final, but arguments may still be streaming
+        through response.function_call_arguments.delta events, so it is not
+        yet required.
+      properties:
+        type:
+          type: string
+          enum:
+            - function_call
+        call_id:
+          type: string
+        name:
+          type: string
+        arguments:
+          type: string
+          description: The call arguments as a JSON text.
+      required:
+        - type
+        - call_id
+        - name
+      additionalProperties: false
+    FunctionResultItem:
+      type: object
+      description: >-
+        A caller-supplied function result, resent as part of full history.
+        call_id links the result to the function_call that produced it.
+      properties:
+        type:
+          type: string
+          enum:
+            - function_result
+        call_id:
+          type: string
+        result:
+          type: string
+          description: >-
+            The function result as opaque text: it is not required to be
+            JSON, and it may be omitted or empty — a function can succeed
+            with nothing to say.
+      required:
+        - type
+        - call_id
+      additionalProperties: false
+    StructuredJSONItem:
+      type: object
+      description: >-
+        The model's schema-conforming JSON when the request asked for
+        structured output. It is output-only: requests represent earlier
+        structured output as ordinary assistant text when resending history.
+      properties:
+        type:
+          type: string
+          enum:
+            - structured_json
+        json:
+          description: The structured output as a raw JSON value.
+      required:
+        - type
+        - json
+      additionalProperties: false
+    StructuredJSONItemShell:
+      type: object
+      description: >-
+        The relaxed structured_json shape announced by response.item.added:
+        the JSON value may still be streaming through response.text.delta
+        events, so it is not yet required.
+      properties:
+        type:
+          type: string
+          enum:
+            - structured_json
+        json:
+          description: The structured output as a raw JSON value.
+      required:
+        - type
+      additionalProperties: false
+    Item:
+      description: >-
+        The tagged union entry of LLM input and output. The union is closed
+        and flat: exactly one variant's fields may be set, and fields from
+        another variant are rejected rather than ignored. Callers resend full
+        conversation history on every request — including function_call and
+        function_result items — because the relay stores no conversation state
+        and exposes no previous_response_id. Each direction admits a subset of
+        the union: request input uses InputItem (no structured_json) and
+        response output uses OutputItem (no function_result, assistant
+        messages only); this schema documents the full item vocabulary the
+        two narrowings share.
+      oneOf:
+        - $ref: "#/components/schemas/MessageItem"
+        - $ref: "#/components/schemas/FunctionCallItem"
+        - $ref: "#/components/schemas/FunctionResultItem"
+        - $ref: "#/components/schemas/StructuredJSONItem"
+      discriminator:
+        propertyName: type
+        mapping:
+          message: "#/components/schemas/MessageItem"
+          function_call: "#/components/schemas/FunctionCallItem"
+          function_result: "#/components/schemas/FunctionResultItem"
+          structured_json: "#/components/schemas/StructuredJSONItem"
+    InputItem:
+      description: >-
+        The item union as request input admits it: structured_json items are
+        output-only, so the union has no branch for them — resent history
+        represents earlier structured output as ordinary assistant text. This
+        narrowing exists in the schema, not just in prose, so a generated
+        client cannot construct an input the relay rejects at runtime.
+      oneOf:
+        - $ref: "#/components/schemas/MessageItem"
+        - $ref: "#/components/schemas/FunctionCallItem"
+        - $ref: "#/components/schemas/FunctionResultItem"
+      discriminator:
+        propertyName: type
+        mapping:
+          message: "#/components/schemas/MessageItem"
+          function_call: "#/components/schemas/FunctionCallItem"
+          function_result: "#/components/schemas/FunctionResultItem"
+    OutputItem:
+      description: >-
+        The item union as response output emits it: function_result items
+        only ever travel caller-to-relay and output messages are always
+        assistant-authored, so the union carries no function_result branch
+        and narrows message to AssistantMessageItem. Output is
+        server-emitted — the narrowing makes a connector normalization bug
+        that mislabels an item a loud contract violation instead of a
+        plausible input shape.
+      oneOf:
+        - $ref: "#/components/schemas/AssistantMessageItem"
+        - $ref: "#/components/schemas/FunctionCallItem"
+        - $ref: "#/components/schemas/StructuredJSONItem"
+      discriminator:
+        propertyName: type
+        mapping:
+          message: "#/components/schemas/AssistantMessageItem"
+          function_call: "#/components/schemas/FunctionCallItem"
+          structured_json: "#/components/schemas/StructuredJSONItem"
+    ItemShell:
+      description: >-
+        The relaxed item shape announced by response.item.added: identity
+        fields are final, but the streamed content (message text, function
+        call arguments, structured JSON) may still be in flight, so the
+        content-bearing fields of the function_call and structured_json
+        variants are not yet required. The finalized item arrives in
+        response.item.completed. Shells obey the same output-side union
+        narrowing as OutputItem: no function_result branch, assistant
+        messages only.
+      oneOf:
+        - $ref: "#/components/schemas/AssistantMessageItem"
+        - $ref: "#/components/schemas/FunctionCallItemShell"
+        - $ref: "#/components/schemas/StructuredJSONItemShell"
+      discriminator:
+        propertyName: type
+        mapping:
+          message: "#/components/schemas/AssistantMessageItem"
+          function_call: "#/components/schemas/FunctionCallItemShell"
+          structured_json: "#/components/schemas/StructuredJSONItemShell"
+    FunctionTool:
+      type: object
+      description: >-
+        A caller-defined function the model may call. parameters is the
+        function's JSON Schema; the relay passes it through and enforces only
+        that it is well-formed JSON — schema semantics belong to the provider.
+        Tools are admitted only on models advertising the capability.
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        parameters:
+          description: The function's JSON Schema, passed through as a raw JSON value.
+      required:
+        - name
+      additionalProperties: false
+    ResponseFormat:
+      type: object
+      description: >-
+        Requests schema-conforming structured output. json_schema is the only
+        response format type — the field is an enum of one so
+        json_object-style loose modes can be added deliberately, never by
+        accident. Admitted only on models advertising structured output
+        support.
+      properties:
+        type:
+          type: string
+          enum:
+            - json_schema
+        name:
+          type: string
+        schema:
+          description: The output JSON Schema, passed through as a raw JSON value.
+        strict:
+          type: boolean
+      required:
+        - type
+        - name
+        - schema
+      additionalProperties: false
+    StopReason:
+      type: string
+      description: Why generation ended. The set is closed.
+      enum:
+        - stop
+        - max_output_tokens
+        - tool_call
+    LLMRequest:
+      type: object
+      description: >-
+        The POST /v1/llm/responses body. max_output_tokens is required: the
+        relay reserves credit for the worst-case generation before dispatch,
+        and an unbounded generation cannot be priced.
+      properties:
+        routing:
+          $ref: "#/components/schemas/Routing"
+          description: >-
+            Omitted entirely, routing means {mode: auto, objective: balanced}.
+        input:
+          type: array
+          description: >-
+            Full conversation history, resent on every request. The InputItem
+            union has no structured_json branch — those items are
+            output-only, and resent history represents earlier structured
+            output as ordinary assistant text.
+          items:
+            $ref: "#/components/schemas/InputItem"
+        tools:
+          type: array
+          description: Tool names must be unique.
+          items:
+            $ref: "#/components/schemas/FunctionTool"
+        response_format:
+          $ref: "#/components/schemas/ResponseFormat"
+        max_output_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          description: Must be greater than 0 and at most 1.
+          exclusiveMinimum: 0
+          maximum: 1
+        stream:
+          type: boolean
+          description: >-
+            When true the response is a text/event-stream instead of a single
+            JSON body.
+      required:
+        - input
+        - max_output_tokens
+      additionalProperties: false
+    LLMResponse:
+      type: object
+      description: >-
+        The non-streaming POST /v1/llm/responses body. id is Speko-minted —
+        resp_<request-id>, never a provider identifier; provider response and
+        conversation ids are captured only as content-free telemetry evidence.
+        There is no previous_response_id to feed it back into: callers resend
+        full history.
+      properties:
+        id:
+          type: string
+          pattern: "^resp_.+$"
+        route:
+          $ref: "#/components/schemas/Route"
+        output:
+          type: array
+          items:
+            $ref: "#/components/schemas/OutputItem"
+        stop_reason:
+          $ref: "#/components/schemas/StopReason"
+        usage:
+          $ref: "#/components/schemas/Usage"
+      required:
+        - id
+        - route
+        - output
+        - stop_reason
+        - usage
+      additionalProperties: false
+    ResponseCreated:
+      type: object
+      description: >-
+        Data payload of the response.created SSE event, which opens every
+        stream. response_id is Speko-minted (resp_<request-id>) and matches
+        the id a non-streaming call would have returned.
+      properties:
+        response_id:
+          type: string
+          pattern: "^resp_.+$"
+      required:
+        - response_id
+      additionalProperties: false
+    ResponseItemAdded:
+      type: object
+      description: >-
+        Data payload of the response.item.added SSE event: a new output item
+        at output_index. The item is a shell — its streamed content arrives
+        through subsequent delta events and is complete only in
+        response.item.completed.
+      properties:
+        output_index:
+          type: integer
+          minimum: 0
+        item:
+          $ref: "#/components/schemas/ItemShell"
+      required:
+        - output_index
+        - item
+      additionalProperties: false
+    ResponseTextDelta:
+      type: object
+      description: >-
+        Data payload of the response.text.delta SSE event: appends text to the
+        message or structured_json item at output_index. Deltas are never
+        empty — empty provider deltas are dropped at normalization, never
+        forwarded.
+      properties:
+        output_index:
+          type: integer
+          minimum: 0
+        delta:
+          type: string
+      required:
+        - output_index
+        - delta
+      additionalProperties: false
+    ResponseFunctionCallArgumentsDelta:
+      type: object
+      description: >-
+        Data payload of the response.function_call_arguments.delta SSE event:
+        appends argument text to the function_call item at output_index. The
+        concatenated deltas form the JSON arguments finalized in
+        response.item.completed.
+      properties:
+        output_index:
+          type: integer
+          minimum: 0
+        delta:
+          type: string
+      required:
+        - output_index
+        - delta
+      additionalProperties: false
+    ResponseItemCompleted:
+      type: object
+      description: >-
+        Data payload of the response.item.completed SSE event: the finalized
+        item at output_index — the same value a non-streaming response would
+        contain at that position.
+      properties:
+        output_index:
+          type: integer
+          minimum: 0
+        item:
+          $ref: "#/components/schemas/OutputItem"
+      required:
+        - output_index
+        - item
+      additionalProperties: false
+    ResponseCompleted:
+      type: object
+      description: >-
+        Data payload of the response.completed SSE event, the success terminal
+        event: the stop reason and the authoritative usage for the whole
+        response.
+      properties:
+        stop_reason:
+          $ref: "#/components/schemas/StopReason"
+        usage:
+          $ref: "#/components/schemas/Usage"
+      required:
+        - stop_reason
+        - usage
+      additionalProperties: false

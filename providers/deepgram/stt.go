@@ -96,11 +96,14 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		return nil, fmt.Errorf("deepgram media: %w", err)
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("deepgram requires a bearer credential")
 	}
 	reservationID := ""
-	if request.Plan.Execution.CredentialSource == protocol.CredentialsManaged {
+	// Reservation tagging follows the plan's billing authority, not its credential
+	// placement: a relay plan settles against a Speko reservation exactly like a
+	// managed provider-direct plan, so both must bind provider-side usage to it.
+	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay || request.Plan.Execution.CredentialSource == protocol.CredentialsManaged {
 		reservationID = request.Plan.Reservation.ID
 	}
 	endpoint, err := listenEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, reservationID)
@@ -110,6 +113,13 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	headers := make(http.Header)
 	authorizationScheme := "Bearer"
 	if request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK {
+		authorizationScheme = "Token"
+	}
+	// A relay plan is managed for billing purposes but carries the connector's
+	// permanent Deepgram key, which authenticates with the Token scheme exactly
+	// like a customer-owned key. Bearer stays reserved for the short-lived tokens
+	// the control plane mints on managed provider-direct routes.
+	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay {
 		authorizationScheme = "Token"
 	}
 	headers.Set("Authorization", authorizationScheme+" "+credential.Value)
@@ -147,6 +157,19 @@ func configHTTPClient(client *http.Client) *http.Client {
 		return client
 	}
 	return http.DefaultClient
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives this adapter directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent Deepgram key
+// bearer. Both spellings carry a permanent key; scheme selection and
+// reservation tagging key off the route, not the kind, so nothing else on
+// the relay arm changes.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat, reservationID string) (string, error) {

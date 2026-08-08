@@ -1,0 +1,7 @@
+{
+  "routing": {
+    "mode": "auto",
+    "objective": "latency"
+  },
+  "language": "en"
+}

@@ -233,6 +233,88 @@ func TestAdapterUsesDelegatedBearerForManagedRoute(t *testing.T) {
 	}
 }
 
+// A relay plan is managed for billing purposes but carries the connector's
+// permanent Deepgram key. Both halves of that split must survive together: the
+// Token scheme authenticates the permanent key, and the reservation extra keeps
+// provider-side usage bound to the Speko reservation.
+func TestAdapterUsesTokenSchemeAndKeepsReservationTagForRelayRoute(t *testing.T) {
+	t.Parallel()
+
+	requests := make(chan *http.Request, 1)
+	server := newListenServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+		if err := assertControl(ctx, conn, "CloseStream"); err != nil {
+			t.Errorf("close stream: %v", err)
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	request := adapterRequest(server.URL, protocol.RequestOptions{})
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+	request.Plan.Route.Credential.Value = "connector-deepgram-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close relay stream: %v", err)
+	}
+
+	select {
+	case received := <-requests:
+		if got := received.Header.Get("Authorization"); got != "Token connector-deepgram-key" {
+			t.Fatalf("authorization = %q", got)
+		}
+		if got := received.URL.Query().Get("extra"); got != "speko_reservation:res_deepgram" {
+			t.Fatalf("relay request metadata = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not observe relay websocket handshake")
+	}
+}
+
+// protocol.SessionPlan validation requires a relay plan to label its
+// credential relay_access, while a connector that synthesizes the plan and
+// drives the adapter directly labels the same permanent key bearer. The relay
+// arm must accept both spellings, or one of the two constructions becomes
+// quietly unreachable.
+func TestAdapterAcceptsRelayAccessCredentialKindOnRelayRoute(t *testing.T) {
+	t.Parallel()
+
+	server := newListenServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := assertControl(ctx, conn, "CloseStream"); err != nil {
+			t.Errorf("close stream: %v", err)
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	request := adapterRequest(server.URL, protocol.RequestOptions{})
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+	request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+	request.Plan.Route.Credential.Value = "connector-deepgram-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream with relay_access credential: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close relay stream: %v", err)
+	}
+}
+
 func newListenServer(t *testing.T, callback func(context.Context, *http.Request, *websocket.Conn)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -162,6 +162,81 @@ func TestSTTAdapterUsesAPIKeyForBYOKAndRejectsUnsupportedMedia(t *testing.T) {
 	}
 }
 
+// A relay plan is managed for billing purposes but carries the connector's
+// permanent Cartesia key, which belongs in the X-API-Key header exactly like a
+// BYOK key. The access_token query channel would put the permanent key in the
+// URL, where it could reach logs.
+func TestSTTAdapterUsesAPIKeyHeaderForRelayRoute(t *testing.T) {
+	t.Parallel()
+	requests := make(chan *http.Request, 1)
+	server := newCartesiaSTTServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+		if err := assertCartesiaText(ctx, conn, "close"); err != nil {
+			t.Errorf("close: %v", err)
+			return
+		}
+		_ = writeCartesiaJSON(ctx, conn, map[string]any{"type": "done"})
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	request := cartesiaSTTRequest(server.URL, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Value = "connector-cartesia-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close relay stream: %v", err)
+	}
+	select {
+	case received := <-requests:
+		if got := received.Header.Get("X-API-Key"); got != "connector-cartesia-key" {
+			t.Fatalf("X-API-Key = %q", got)
+		}
+		if got := received.URL.Query().Get("access_token"); got != "" {
+			t.Fatalf("relay URL contained access token %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not observe relay handshake")
+	}
+}
+
+// protocol.SessionPlan validation requires a relay plan to label its
+// credential relay_access, while a connector that synthesizes the plan and
+// drives the adapter directly labels the same permanent key bearer. The relay
+// arm must accept both spellings, or one of the two constructions becomes
+// quietly unreachable.
+func TestSTTAdapterAcceptsRelayAccessCredentialKindOnRelayRoute(t *testing.T) {
+	t.Parallel()
+	server := newCartesiaSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := assertCartesiaText(ctx, conn, "close"); err != nil {
+			t.Errorf("close: %v", err)
+			return
+		}
+		_ = writeCartesiaJSON(ctx, conn, map[string]any{"type": "done"})
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	request := cartesiaSTTRequest(server.URL, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+	request.Plan.Route.Credential.Value = "connector-cartesia-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream with relay_access credential: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close relay stream: %v", err)
+	}
+}
+
 func TestSTTAdapterMapsProviderError(t *testing.T) {
 	t.Parallel()
 	server := newCartesiaSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {

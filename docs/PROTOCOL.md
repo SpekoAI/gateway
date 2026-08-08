@@ -156,3 +156,38 @@ metadata, when preserved for local consumers, lives under namespaced
 
 The normative signed-plan structure is
 [`protocol/schema/session-plan.v0.schema.json`](../protocol/schema/session-plan.v0.schema.json).
+
+## Protocol revision 4: relay plans
+
+The LOCAL protocol above stays at revision 3 — nothing in the routes,
+WebSocket framing, or session-plan validation changed. Revision 4 exists
+for exactly one new plan family: the **relay plan** (`protocol.RelayPlan`,
+`protocol/relay_plan.go`), the signed dispatch authorization the Speko
+control plane mints for the Global Speko Relay's connectors. The two
+revisions coexist by construction:
+
+- `CurrentRevision` remains `3` and every rev-3 validator still
+  exact-matches it; `RelayRevision` is the separate constant `4` and relay
+  validators exact-match that. A runtime that predates the relay rejects a
+  relay plan outright instead of half-understanding it.
+- Relay plans are compact JWS with protected-header
+  `typ: "speko.relay-plan+jws"` (`RelayPlanJWSType`) and audience
+  `"speko-relay"` (`RelayPlanAudience`). Session plans keep their own typ
+  and audience, so neither signature can authorize the other's consumer
+  even under a hypothetical shared key — and keys are NOT shared: relay
+  plans are signed by a dedicated control-plane key published on a
+  dedicated JWKS document (`/.well-known/relay-jwks.json`), never the
+  session-plan key or kid.
+- A relay plan carries the dispatch route (provider, model, exact endpoint
+  as an assertion to verify, never an input to dial), signed budget
+  ceilings per `RelayBudgetGroup`, a single-use JTI, the `relay_access`
+  bearer the edge presents on the connector handshake, and a
+  session-scoped control token for the edge's follow-up ledger calls.
+- Relay-route adapters accept credential kind `relay_access` in addition
+  to `bearer`; BYOK and provider-direct behavior is unchanged.
+
+The relay's public customer-facing wire contract (HTTP, SSE, and WebSocket
+message shapes for `relay.speko.dev`) is the separate
+[`relayapi`](../relayapi/doc.go) package with its OpenAPI/AsyncAPI
+documents; it is a hosted-service contract, not part of the local socket
+protocol documented above.

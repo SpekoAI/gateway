@@ -214,6 +214,15 @@ type compactJWSHeader struct {
 }
 
 func parseCompactJWS(compact string) (compactJWSHeader, []byte, []byte, error) {
+	return parseCompactJWSWithType(compact, SessionPlanJWSType)
+}
+
+// parseCompactJWSWithType splits and vets a compact JWS whose protected
+// header must carry exactly the expected typ. The typ is a parameter because
+// session plans and relay plans share one JWS layout while staying mutually
+// unacceptable: this header check is what stops a signature minted for one
+// artifact from authorizing the other, even under a shared signing key.
+func parseCompactJWSWithType(compact, expectedType string) (compactJWSHeader, []byte, []byte, error) {
 	parts := strings.Split(compact, ".")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 		return compactJWSHeader{}, nil, nil, fmt.Errorf("%w: expected compact serialization", ErrPlanSignature)
@@ -229,7 +238,7 @@ func parseCompactJWS(compact string) (compactJWSHeader, []byte, []byte, error) {
 	if header.Algorithm != "EdDSA" && header.Algorithm != "RS256" {
 		return compactJWSHeader{}, nil, nil, fmt.Errorf("%w: unsupported algorithm", ErrPlanSignature)
 	}
-	if header.Type != SessionPlanJWSType || strings.TrimSpace(header.KeyID) == "" || len(header.Critical) != 0 || header.B64Payload != nil {
+	if header.Type != expectedType || strings.TrimSpace(header.KeyID) == "" || len(header.Critical) != 0 || header.B64Payload != nil {
 		return compactJWSHeader{}, nil, nil, fmt.Errorf("%w: unsafe or incomplete protected header", ErrPlanSignature)
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -260,6 +269,13 @@ func verifyJWS(publicKey crypto.PublicKey, algorithm string, signingInput, signa
 		if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature); err != nil {
 			return fmt.Errorf("%w: rsa verification failed", ErrPlanSignature)
 		}
+	default:
+		// parseCompactJWSWithType allowlists exactly the algorithms this
+		// switch verifies, so this arm is unreachable today. It fails closed
+		// anyway: extending the allowlist without teaching this switch the
+		// new algorithm must reject every JWS claiming it, not fall through
+		// and accept any signature under the new name.
+		return fmt.Errorf("%w: unsupported algorithm", ErrPlanSignature)
 	}
 	return nil
 }

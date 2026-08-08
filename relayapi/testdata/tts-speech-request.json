@@ -1,0 +1,14 @@
+{
+  "routing": {
+    "mode": "explicit",
+    "provider": "elevenlabs",
+    "model": "eleven_flash_v3"
+  },
+  "input": "Welcome to Speko.",
+  "voice": "rachel",
+  "audio": {
+    "encoding": "pcm_s16le",
+    "sample_rate_hz": 24000,
+    "channels": 1
+  }
+}

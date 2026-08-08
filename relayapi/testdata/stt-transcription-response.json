@@ -1,0 +1,19 @@
+{
+  "text": "hello world",
+  "segments": [
+    {
+      "text": "hello world",
+      "start_ms": 0,
+      "end_ms": 940
+    }
+  ],
+  "route": {
+    "provider": "deepgram",
+    "model": "nova-3",
+    "region": "us-west-2",
+    "attempt_id": "att_1"
+  },
+  "usage": {
+    "duration_ms": 940
+  }
+}

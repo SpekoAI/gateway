@@ -1,0 +1,29 @@
+{
+  "models": [
+    {
+      "id": "gpt-5.2",
+      "provider": "openai",
+      "kind": "llm",
+      "capabilities": {
+        "tools": true,
+        "structured_output": true,
+        "cached_input": true,
+        "reasoning": true
+      },
+      "regions": ["us-west-2", "eu-central-1"]
+    },
+    {
+      "id": "nova-3",
+      "provider": "deepgram",
+      "kind": "stt",
+      "capabilities": {
+        "tools": false,
+        "structured_output": false,
+        "cached_input": false,
+        "reasoning": false
+      },
+      "regions": ["us-west-2", "eu-west-1", "ap-southeast-1"]
+    }
+  ],
+  "catalog_digest": "sha256:8c1f2ad94e0f6bd3fbc7d2a4f4f36f5f5f2c9f0b1d4e7a8c3b6d9e0f1a2b3c4d"
+}
