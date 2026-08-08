@@ -121,6 +121,36 @@ is disabled. The exact payloads and trust boundaries are documented in
 | `SPEKO_WORKLOAD_ID` | unset | Stable Agent or custom workload ID |
 | `SPEKO_MAX_SESSIONS` | `100` | Per-process session capacity |
 | `SPEKO_INSTANCE_HEARTBEAT_INTERVAL` | `20s` | Hosted dashboard worker heartbeat interval |
+| `SPEKO_WARM_PLAN_TARGET` | `4` | Prefetched session plans kept per route; `0` disables prefetching |
+| `SPEKO_WARM_ROUTES` | unset | Routes to warm at startup, `kind:provider[:model[:language]]`, comma-separated |
+| `SPEKO_WARM_TTS_MAX_CHARACTERS` | `100000` | Character allowance requested for warmed TTS routes |
+
+## Zero-overhead session setup
+
+With Speko-managed routing, the Gateway keeps a small pool of signed session
+plans warm in the background. Creating a session takes one out of memory and
+dials the provider immediately, so using the Gateway costs the provider
+handshake and nothing else — no control-plane round trip on the path a caller
+waits on.
+
+The pool learns route shapes from traffic, so it warms itself after the first
+session of each shape. `SPEKO_WARM_ROUTES` covers the one case that cannot
+learn: the first session after a deploy or a scale-up, which is the one a real
+person is waiting on.
+
+```bash
+SPEKO_WARM_ROUTES=stt:deepgram:nova-3:en,tts:elevenlabs::en
+```
+
+A miss — a cold process, an unseen route shape, an unreachable control plane —
+falls through to a synchronous plan request. Nothing fails that would not have
+failed before; it is only slower. `GET /metrics` reports
+`speko_gateway_warm_plan_hits_total` and `speko_gateway_warm_plan_misses_total`;
+a miss rate that does not fall toward zero after warm-up means prefetching is
+not working.
+
+Prefetching does not apply to BYOK, where plans are signed inside this process
+and already cost nothing.
 
 Every secret also supports an exclusive `*_FILE` form for Docker and
 Kubernetes secrets—for example,

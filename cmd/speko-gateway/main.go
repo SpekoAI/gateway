@@ -351,8 +351,27 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Prefetching only applies to Speko-managed routing. BYOK plans are signed
+	// in this process by LocalPlanner and already cost nothing to produce.
+	var warmPlans *gateway.PlanPool
+	if hostedClient != nil {
+		warmPlanTarget, err := nonNegativeIntEnv("SPEKO_WARM_PLAN_TARGET", 4)
+		if err != nil {
+			return err
+		}
+		if warmPlanTarget > 0 {
+			warmPlans, err = gateway.NewPlanPool(gateway.PlanPoolConfig{
+				Plans: plans, Target: warmPlanTarget,
+				Runtime: runtimeDescriptor, Workload: workload,
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
 	server, err := gateway.New(gateway.Config{
-		Engine: engine, Plans: plans, LocalAuthToken: localToken, Runtime: runtimeDescriptor, Workload: workload, MaxSessions: maxSessions,
+		Engine: engine, Plans: plans, WarmPlans: warmPlans, LocalAuthToken: localToken,
+		Runtime: runtimeDescriptor, Workload: workload, MaxSessions: maxSessions,
 	})
 	if err != nil {
 		return err
@@ -371,6 +390,17 @@ func run() error {
 	processCtx, cancelProcess := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancelProcess()
 	startedAt := time.Now().UTC()
+	if warmPlans != nil {
+		// Warm the routes named in configuration before any traffic arrives, so
+		// the first session of the process — the one a real caller is waiting
+		// on — is as fast as the thousandth.
+		for _, route := range warmRoutesFromEnv() {
+			if err := warmPlans.Warm(processCtx, route); err != nil {
+				log.Printf("warm route %s/%s: %v", route.Kind, route.Request.Provider, err)
+			}
+		}
+		go warmPlans.Run(processCtx)
+	}
 	if hostedClient != nil {
 		go reportInstanceLoop(processCtx, hostedClient, server, telemetryExporter, runtimeDescriptor, workload, startedAt, heartbeatInterval)
 	}
@@ -441,6 +471,83 @@ func instanceHeartbeat(stats gateway.Stats, telemetryDropped uint64, descriptor 
 		heartbeat.WorkloadID = workload.ID
 	}
 	return heartbeat
+}
+
+// warmRoutesFromEnv parses SPEKO_WARM_ROUTES, a comma-separated list of
+// `kind:provider[:model[:language]]` entries — for example
+// `stt:deepgram:nova-3:en,tts:elevenlabs::en`.
+//
+// The pool learns route shapes from traffic on its own, so this exists for one
+// case only, and it is the case that matters most: the first session after a
+// deploy or a scale-up. Without it that session pays the full control-plane
+// round trip, and it is the session a real person is on the other end of.
+//
+// A malformed entry is skipped with a log line rather than failing boot. Warm
+// routes are an optimization, and refusing to start a voice worker over a typo
+// in an optional hint would be a worse outcome than a cold first call.
+func warmRoutesFromEnv() []protocol.SessionPlanRequest {
+	raw := env("SPEKO_WARM_ROUTES")
+	if raw == "" {
+		return nil
+	}
+	maxCharacters, err := positiveIntEnv("SPEKO_WARM_TTS_MAX_CHARACTERS", 100_000)
+	if err != nil {
+		log.Printf("SPEKO_WARM_TTS_MAX_CHARACTERS ignored: %v", err)
+		maxCharacters = 100_000
+	}
+	var routes []protocol.SessionPlanRequest
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		fields := strings.Split(entry, ":")
+		if len(fields) < 2 || len(fields) > 4 {
+			log.Printf("SPEKO_WARM_ROUTES entry %q ignored: want kind:provider[:model[:language]]", entry)
+			continue
+		}
+		kind := protocol.SessionKind(strings.ToLower(strings.TrimSpace(fields[0])))
+		if kind != protocol.SessionKindSTT && kind != protocol.SessionKindTTS {
+			log.Printf("SPEKO_WARM_ROUTES entry %q ignored: only stt and tts can be prefetched", entry)
+			continue
+		}
+		options := protocol.RequestOptions{Provider: strings.TrimSpace(fields[1])}
+		if len(fields) > 2 {
+			options.Model = strings.TrimSpace(fields[2])
+		}
+		if len(fields) > 3 {
+			options.Language = strings.TrimSpace(fields[3])
+		}
+		if kind == protocol.SessionKindTTS {
+			options.MaxInputCharacters = int64(maxCharacters)
+		}
+		routes = append(routes, protocol.SessionPlanRequest{
+			Kind: kind, Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision,
+			Execution: protocol.ExecutionRequest{
+				ProviderRoute: protocol.RouteAuto, CredentialSource: protocol.CredentialsManaged,
+				RelayPolicy: protocol.RelayForbidden,
+			},
+			Request: options,
+			// The plan does not bind media, and the runtime validates the real
+			// format at open, so a canonical shape is enough to make the
+			// prefetch request valid. 16 kHz mono is what the LiveKit
+			// integration sends.
+			Media: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1},
+		})
+	}
+	return routes
+}
+
+func nonNegativeIntEnv(name string, fallback int) (int, error) {
+	value := env(name)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer", name)
+	}
+	return parsed, nil
 }
 
 func env(name string) string { return strings.TrimSpace(os.Getenv(name)) }
