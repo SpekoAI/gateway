@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:18141121a7cd2b4c5ac4e706c8505ad6d7711cdc3a7626c2db331f5f371384f9
-# yaml-body: sha256:ad46f72910fad9199313e6a85f8e9f16e6562c6217d6ef6eecea88a5877cc639
+# json-mirror: asyncapi.json sha256:d8d53f963ae1c28b59dffad057202f6efa0902ef8b9261a87300e9c7f30ac5ec
+# yaml-body: sha256:e60ac469816f8d8e399eb968d019f2332171f738b7acc3df249ccbf3b4a017b9
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -362,6 +362,14 @@ components:
         balanced}, and an auto routing without an objective defaults to
         balanced — the default exists for omission, never for partially
         specified routing.
+
+        Explicit mode also accepts the combined "provider/model" spelling in
+        the model field: {"model": "openai/gpt-5.2"} with no provider splits
+        at the first slash, and a model redundantly prefixed with the stated
+        provider has the prefix stripped. Upstream model ids that themselves
+        contain a slash must therefore name the provider one way or the
+        other, e.g. "together/meta-llama/Llama-X" or provider "together"
+        with model "meta-llama/Llama-X".
       properties:
         mode:
           $ref: "#/components/schemas/RoutingMode"
@@ -382,7 +390,10 @@ components:
           description: Explicit mode only, and required there.
         model:
           type: string
-          description: Explicit mode only, and required there.
+          description: >-
+            Explicit mode only, and required there. Accepts either the bare
+            model id with the provider field set, or the combined
+            "provider/model" form with the provider field omitted.
       additionalProperties: false
     Route:
       type: object

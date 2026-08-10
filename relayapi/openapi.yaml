@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:8eb80ce003ebd8bd178f990e6df9b09f7298b9236be99b884054b53341dba641
-# yaml-body: sha256:8971d4b70d0c1b8c9eeb316bf38f532daa7bf2937498373fe04aef994e9d2b1f
+# json-mirror: openapi.json sha256:aae77161a3ed68947d1d5124a50bbd37c2d351ed4fedf6cda3572a42a944ea9e
+# yaml-body: sha256:0dff4f27d20126d846f7ca0c493513c5555c36fbcd464e83f86ee1c8deb34639
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -350,6 +350,14 @@ components:
         balanced}, and an auto routing without an objective defaults to
         balanced — the default exists for omission, never for partially
         specified routing.
+
+        Explicit mode also accepts the combined "provider/model" spelling in
+        the model field: {"model": "openai/gpt-5.2"} with no provider splits
+        at the first slash, and a model redundantly prefixed with the stated
+        provider has the prefix stripped. Upstream model ids that themselves
+        contain a slash must therefore name the provider one way or the
+        other, e.g. "together/meta-llama/Llama-X" or provider "together"
+        with model "meta-llama/Llama-X".
       properties:
         mode:
           $ref: "#/components/schemas/RoutingMode"
@@ -370,7 +378,10 @@ components:
           description: Explicit mode only, and required there.
         model:
           type: string
-          description: Explicit mode only, and required there.
+          description: >-
+            Explicit mode only, and required there. Accepts either the bare
+            model id with the provider field set, or the combined
+            "provider/model" form with the provider field omitted.
       additionalProperties: false
     Route:
       type: object
