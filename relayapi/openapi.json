@@ -343,7 +343,7 @@
       },
       "Routing": {
         "type": "object",
-        "description": "Selects how the relay picks a provider for one request. It is a tagged union over mode: auto carries the objective and optional allow/deny provider filters, explicit carries exactly a provider and model. Fields from the other arm are rejected in both directions; a present-but-empty filter array ([]) counts as present and is rejected in explicit mode, while an empty-string provider or model in auto mode is indistinguishable from omission and tolerated as such. A wholly omitted routing object means {mode: auto, objective: balanced}, and an auto routing without an objective defaults to balanced — the default exists for omission, never for partially specified routing.",
+        "description": "Selects how the relay picks a provider for one request. It is a tagged union over mode: auto carries the objective and optional allow/deny provider filters, explicit carries exactly a provider and model. Fields from the other arm are rejected in both directions; a present-but-empty filter array ([]) counts as present and is rejected in explicit mode, while an empty-string provider or model in auto mode is indistinguishable from omission and tolerated as such. A wholly omitted routing object means {mode: auto, objective: balanced}, and an auto routing without an objective defaults to balanced — the default exists for omission, never for partially specified routing.\nExplicit mode also accepts the combined \"provider/model\" spelling in the model field: {\"model\": \"openai/gpt-5.2\"} with no provider splits at the first slash, and a model redundantly prefixed with the stated provider has the prefix stripped. Upstream model ids that themselves contain a slash must therefore name the provider one way or the other, e.g. \"together/meta-llama/Llama-X\" or provider \"together\" with model \"meta-llama/Llama-X\".",
         "properties": {
           "mode": {
             "$ref": "#/components/schemas/RoutingMode"
@@ -371,7 +371,7 @@
           },
           "model": {
             "type": "string",
-            "description": "Explicit mode only, and required there."
+            "description": "Explicit mode only, and required there. Accepts either the bare model id with the provider field set, or the combined \"provider/model\" form with the provider field omitted."
           }
         },
         "additionalProperties": false

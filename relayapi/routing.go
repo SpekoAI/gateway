@@ -59,12 +59,33 @@ type Routing struct {
 // exists for omission, never for partially specified routing. An empty
 // filter array counts as naming the field: {"allow_providers": []} is a
 // partially specified routing, not an omitted one.
+//
+// Explicit mode additionally accepts the combined "provider/model" spelling
+// in the model field: {"model": "openai/gpt-5.2"} with no provider splits at
+// the FIRST slash into provider "openai" and model "gpt-5.2", and a model
+// redundantly prefixed with the provider field's own value ("provider":
+// "openai", "model": "openai/gpt-5.2") has the prefix stripped. Splitting at
+// the first slash is what keeps slash-bearing upstream ids expressible:
+// "together/meta-llama/Llama-X" names provider "together" and model
+// "meta-llama/Llama-X". A model whose own id contains a slash therefore
+// cannot be sent without naming its provider one way or the other — the
+// leading segment is always claimed as the provider — which is the existing
+// contract anyway: explicit mode has never accepted a bare model.
 func (r Routing) NormalizeDefault() Routing {
 	if r.Mode == "" && r.Objective == "" && r.AllowProviders == nil && r.DenyProviders == nil && r.Provider == "" && r.Model == "" {
 		return Routing{Mode: RoutingModeAuto, Objective: ObjectiveBalanced}
 	}
 	if r.Mode == RoutingModeAuto && r.Objective == "" {
 		r.Objective = ObjectiveBalanced
+	}
+	if r.Mode == RoutingModeExplicit {
+		if prefix, rest, found := strings.Cut(r.Model, "/"); found && strings.TrimSpace(prefix) != "" && strings.TrimSpace(rest) != "" {
+			if r.Provider == "" {
+				r.Provider, r.Model = prefix, rest
+			} else if prefix == r.Provider {
+				r.Model = rest
+			}
+		}
 	}
 	return r
 }

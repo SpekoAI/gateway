@@ -46,6 +46,52 @@ func TestRoutingNormalizeDefault(t *testing.T) {
 	assertInvalid(t, partial.Validate(), "mode: unsupported value")
 }
 
+func TestRoutingNormalizeDefaultSplitsCombinedModel(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		routing      relayapi.Routing
+		wantProvider string
+		wantModel    string
+	}{
+		{"combined model without provider", relayapi.Routing{Mode: relayapi.RoutingModeExplicit, Model: "openai/gpt-5.2"}, "openai", "gpt-5.2"},
+		{"split happens at the first slash", relayapi.Routing{Mode: relayapi.RoutingModeExplicit, Model: "together/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"}, "together", "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"},
+		{"redundant provider prefix is stripped", relayapi.Routing{Mode: relayapi.RoutingModeExplicit, Provider: "elevenlabs", Model: "elevenlabs/eleven_flash_v2_5"}, "elevenlabs", "eleven_flash_v2_5"},
+		{"slash-bearing model id under a different provider is untouched", relayapi.Routing{Mode: relayapi.RoutingModeExplicit, Provider: "together", Model: "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"}, "together", "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"},
+		{"plain model is untouched", relayapi.Routing{Mode: relayapi.RoutingModeExplicit, Provider: "deepgram", Model: "nova-3"}, "deepgram", "nova-3"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			normalized := tc.routing.NormalizeDefault()
+			if normalized.Provider != tc.wantProvider || normalized.Model != tc.wantModel {
+				t.Fatalf("normalized to %q/%q, want %q/%q", normalized.Provider, normalized.Model, tc.wantProvider, tc.wantModel)
+			}
+			if err := normalized.Validate(); err != nil {
+				t.Fatalf("normalized combined routing must validate: %v", err)
+			}
+		})
+	}
+
+	// Degenerate slash forms must not manufacture a provider or an empty
+	// model: they stay as sent and fail validation or catalog lookup instead.
+	for _, model := range []string{"/gpt-5.2", "openai/", "/"} {
+		normalized := relayapi.Routing{Mode: relayapi.RoutingModeExplicit, Model: model}.NormalizeDefault()
+		if normalized.Provider != "" || normalized.Model != model {
+			t.Fatalf("degenerate model %q was rewritten to %q/%q", model, normalized.Provider, normalized.Model)
+		}
+	}
+
+	// Auto mode never splits: a model there is a cross-arm mistake Validate
+	// rejects, and normalization must not launder it into a filter.
+	autoWithModel := relayapi.Routing{Mode: relayapi.RoutingModeAuto, Model: "openai/gpt-5.2"}.NormalizeDefault()
+	if autoWithModel.Provider != "" || autoWithModel.Model != "openai/gpt-5.2" {
+		t.Fatalf("auto routing was rewritten to %+v", autoWithModel)
+	}
+	assertInvalid(t, autoWithModel.Validate(), "valid only in explicit mode")
+}
+
 // JSON [] is present, not omitted: a routing carrying only an empty filter
 // names the auto arm without a mode, so it is partially specified routing —
 // the omission default must leave it broken for Validate to reject rather
