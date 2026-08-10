@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:21ca28bf7aabc805777c9066097e1b135586e83ed75843d8ca7b77cf27fe12ef
-# yaml-body: sha256:71bcd06f6c9b2d80b2627b211b741978cf2e297dd46095ee0936ed6f4b0e2c18
+# json-mirror: asyncapi.json sha256:18141121a7cd2b4c5ac4e706c8505ad6d7711cdc3a7626c2db331f5f371384f9
+# yaml-body: sha256:ad46f72910fad9199313e6a85f8e9f16e6562c6217d6ef6eecea88a5877cc639
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -494,7 +494,10 @@ components:
         request_in_progress, and request_already_started; 413
         payload_too_large; 415 unsupported_media; 429 rate_limited and
         concurrency_exhausted; 500 relay_error; 502 provider_error; 503
-        provider_unavailable.
+        provider_unavailable. preview_access_required dates from the relay's
+        preview period and is no longer returned now that the relay is
+        generally available; it stays in the closed set so deployed clients
+        keep decoding.
       enum:
         - authentication_failed
         - not_entitled
@@ -692,7 +695,8 @@ components:
         Opens a streaming synthesis session. audio is the requested output
         format of the binary frames the server will send. The exact frame
         bytes are the session's idempotency content hash; later frames are
-        intentionally outside the hash.
+        intentionally outside the hash. The frame carries no language field
+        yet; the relay currently synthesizes English.
       properties:
         type:
           type: string

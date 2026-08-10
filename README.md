@@ -74,8 +74,10 @@ Both choices use the same local socket and LiveKit integration. With BYOK,
 provider credentials stay in the Gateway process and anonymous telemetry
 remains on unless explicitly disabled. The local image serves
 provider-direct routes; the hosted Speko relay (`relay.speko.dev`) is a
-separate Speko-operated surface whose public wire contract lives in this
-repository's `relayapi` package (OpenAPI + AsyncAPI).
+separate, generally available Speko-operated surface whose public wire
+contract lives in this repository's `relayapi` package (OpenAPI + AsyncAPI).
+Any Speko organization can route relay requests to any model in the
+published catalog.
 
 Because the LiveKit agent and Gateway share one container in this setup, the
 agent process can inspect the container environment. Use separate containers
