@@ -443,6 +443,70 @@ async def test_llm_stream_preserves_relay_error_classification() -> None:
     await plugin.aclose()
 
 
+async def test_tts_stream_without_text_ends_cleanly() -> None:
+    class NeverBridge:
+        def __init__(self) -> None:
+            self.starts = 0
+
+        async def start(self) -> FakeTTSStream:
+            self.starts += 1
+            return FakeTTSStream()
+
+    plugin = TTS(FakeClient())  # type: ignore[arg-type]
+    bridge = NeverBridge()
+    stream = plugin.stream()
+    stream._bridge = bridge  # type: ignore[assignment]
+
+    stream.end_input()
+    audio = [event async for event in stream]
+
+    assert audio == []
+    assert bridge.starts == 0
+
+    await plugin.aclose()
+
+
+async def test_malformed_sse_payload_normalizes_to_relay_error() -> None:
+    from speko_gateway.relay import _sse_events
+
+    class StubContent:
+        def __init__(self, lines: list[bytes]) -> None:
+            self._lines = lines
+
+        def __aiter__(self):
+            return self._iterate()
+
+        async def _iterate(self):
+            for line in self._lines:
+                yield line
+
+    class StubResponse:
+        def __init__(self, lines: list[bytes]) -> None:
+            self.content = StubContent(lines)
+
+    response = StubResponse(
+        [
+            b"event: response.created\n",
+            b'data: {"response_id": "resp_req-1"}\n',
+            b"\n",
+            b"event: response.text.delta\n",
+            b"data: {not json}\n",
+            b"\n",
+        ]
+    )
+
+    received: list[str] = []
+    try:
+        async for event, _payload in _sse_events(response):  # type: ignore[arg-type]
+            received.append(event)
+    except RelayError as error:
+        assert error.retryable is True
+        assert "malformed" in str(error)
+    else:
+        raise AssertionError("expected malformed SSE to raise RelayError")
+    assert received == ["response.created"]
+
+
 def test_routing_mode_follows_gateway_configuration(monkeypatch) -> None:
     monkeypatch.delenv("SPEKO_API_KEY", raising=False)
     monkeypatch.delenv("SPEKO_API_KEY_FILE", raising=False)
