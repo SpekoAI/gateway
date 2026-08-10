@@ -33,6 +33,13 @@ class LiveKitSpeechEvent:
     provider_request_id: str = ""
 
 
+@dataclass(frozen=True)
+class LiveKitTTSEvent:
+    type: str
+    audio: bytes | None = None
+    provider_request_id: str = ""
+
+
 def execution_from_env() -> dict[str, str]:
     """Match the request to Gateway's configured managed or BYOK mode."""
 
@@ -84,6 +91,89 @@ class LiveKitSTTBridge:
         return LiveKitSTTStream(session)
 
 
+class LiveKitTTSBridge:
+    """Map LiveKit synthesis semantics to the canonical TTS stream."""
+
+    def __init__(
+        self,
+        client: GatewayClient,
+        *,
+        voice: str = "",
+        language: str = "en",
+        model: str = "auto",
+        provider: str = "auto",
+        sample_rate: int = 24_000,
+        num_channels: int = 1,
+        max_input_characters: int = 100_000,
+    ) -> None:
+        self._client = client
+        self._voice = voice
+        self._language = language
+        self._model = model
+        self._provider = provider
+        self._sample_rate = sample_rate
+        self._num_channels = num_channels
+        self._max_input_characters = max_input_characters
+
+    async def start(self) -> LiveKitTTSStream:
+        request: dict[str, Any] = {
+            "provider": self._provider,
+            "model": self._model,
+            "language": self._language,
+            "max_input_characters": self._max_input_characters,
+        }
+        if self._voice:
+            request["voice"] = self._voice
+        session = await self._client.open(
+            SessionConfig(
+                kind="tts",
+                execution=execution_from_env(),
+                request=request,
+                media={
+                    "encoding": "pcm_s16le",
+                    "sample_rate_hz": self._sample_rate,
+                    "channels": self._num_channels,
+                },
+                integration={
+                    "name": "livekit-python",
+                    "version": _INTEGRATION_VERSION,
+                    "transport": "livekit-webrtc",
+                },
+            )
+        )
+        return LiveKitTTSStream(session)
+
+
+class LiveKitTTSStream:
+    def __init__(self, session: GatewaySession) -> None:
+        self._session = session
+
+    async def append_text(self, text: str) -> None:
+        await self._session.append_text(text)
+
+    async def commit(self) -> None:
+        await self._session.commit_text()
+
+    async def finish(self) -> None:
+        await self._session.finish()
+
+    async def aclose(self) -> None:
+        await self._session.aclose()
+
+    async def events(self) -> AsyncIterator[LiveKitTTSEvent]:
+        async for event in self._session.events():
+            if event.type == "error":
+                raise _stream_error(event)
+            if event.type == "audio.frame" and event.audio:
+                yield LiveKitTTSEvent(type="audio.frame", audio=event.audio)
+                continue
+            if event.type in {"audio.started", "audio.done"}:
+                yield LiveKitTTSEvent(
+                    type=event.type,
+                    provider_request_id=str(event.data.get("provider_request_id", "")),
+                )
+
+
 class LiveKitSTTStream:
     def __init__(self, session: GatewaySession) -> None:
         self._session = session
@@ -103,18 +193,20 @@ class LiveKitSTTStream:
     async def events(self) -> AsyncIterator[LiveKitSpeechEvent]:
         async for event in self._session.events():
             if event.type == "error":
-                code = str(event.data.get("code", ""))
-                source = str(event.data.get("source", ""))
-                retryable = event.data.get("retryable", True)
-                raise GatewayError(
-                    "Gateway provider stream failed",
-                    code=code,
-                    source=source,
-                    retryable=retryable if isinstance(retryable, bool) else True,
-                )
+                raise _stream_error(event)
             mapped = _speech_event(event)
             if mapped is not None:
                 yield mapped
+
+
+def _stream_error(event: CanonicalEvent) -> GatewayError:
+    retryable = event.data.get("retryable", True)
+    return GatewayError(
+        "Gateway provider stream failed",
+        code=str(event.data.get("code", "")),
+        source=str(event.data.get("source", "")),
+        retryable=retryable if isinstance(retryable, bool) else True,
+    )
 
 
 def _speech_event(event: CanonicalEvent) -> LiveKitSpeechEvent | None:

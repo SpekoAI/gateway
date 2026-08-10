@@ -48,13 +48,49 @@ Dockerfile:
 +CMD ["sh", "-c", "/usr/local/bin/speko-gateway & exec uv run src/agent.py start"]
 ```
 
-Then select Speko for STT where the agent creates its `AgentSession`:
+Then select Speko for the voice legs where the agent creates its
+`AgentSession`:
 
 ```python
-from speko_gateway.livekit import STT
+from livekit.plugins import openai
 
-session = AgentSession(stt=STT())
+from speko_gateway.livekit import STT, TTS
+
+session = AgentSession(
+    stt=STT(),
+    llm=openai.LLM(model="gpt-4.1-mini"),  # any LiveKit LLM plugin
+    tts=TTS(),
+)
 ```
+
+The Gateway carries STT and TTS; the LLM stays on whichever LiveKit plugin
+the agent already uses. `TTS()` accepts `voice=`, `provider=`, `model=`, and
+`language=` overrides — the defaults follow the gateway catalog, and in
+managed auto mode the signed plan supplies a voice for whichever vendor it
+picks. With BYOK, vendors whose adapters require a voice id (ElevenLabs,
+Cartesia) need an explicit `voice=`.
+
+With a Speko API key the LLM can come from Speko too, served by the hosted
+relay (`relay.speko.dev`):
+
+```python
+from speko_gateway.livekit import LLM, STT, TTS
+
+session = AgentSession(
+    stt=STT(),
+    llm=LLM(),  # hosted Speko relay picks a routable model
+    tts=TTS(),
+)
+```
+
+`LLM()` requires `SPEKO_API_KEY` and speaks HTTPS directly to the relay —
+not the local socket — under the public [`relayapi`](relayapi/doc.go)
+contract. That crosses a different trust boundary: unlike the
+provider-direct voice legs, the conversation history travels through the
+Speko relay. Routing defaults to `{mode: auto, objective: balanced}`;
+`LLM(provider=..., model=...)` pins an explicit route, and `objective=`
+accepts `quality`, `latency`, or `cost`. `GET relay.speko.dev/v1/models`
+lists what is routable right now.
 
 Set a local token plus one credential choice:
 
