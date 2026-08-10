@@ -363,6 +363,17 @@ class SynthesisStream(tts.SynthesizeStream):
         self._gateway_stream: LiveKitTTSStream | None = None
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        # The emitter must be initialized even when no text ever arrives:
+        # the base class calls end_input() on it unconditionally after _run
+        # returns, and an uninitialized emitter raises there. Only the
+        # gateway dial waits for the first token.
+        output_emitter.initialize(
+            request_id=utils.shortuuid(),
+            sample_rate=self._tts.sample_rate,
+            num_channels=self._tts.num_channels,
+            mime_type="audio/pcm",
+            stream=True,
+        )
         first_token: str | None = None
         async for item in self._input_ch:
             if isinstance(item, self._FlushSentinel):
@@ -372,13 +383,6 @@ class SynthesisStream(tts.SynthesizeStream):
         if first_token is None:
             return
 
-        output_emitter.initialize(
-            request_id=utils.shortuuid(),
-            sample_rate=self._tts.sample_rate,
-            num_channels=self._tts.num_channels,
-            mime_type="audio/pcm",
-            stream=True,
-        )
         try:
             self._gateway_stream = await self._bridge.start()
             self._mark_started()
