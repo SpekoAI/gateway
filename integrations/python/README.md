@@ -41,7 +41,12 @@ from speko_gateway.livekit import LLM, STT, TTS
 
 session = AgentSession(
     stt=STT(),
-    llm=LLM(),  # hosted Speko relay picks a routable model
+    llm=LLM(
+        provider="auto",          # default: relay picks; set with model= to pin a route
+        model="auto",             # default: GET relay.speko.dev/v1/models lists the options
+        objective="balanced",     # default: or "quality", "latency", "cost"
+        max_output_tokens=8_192,  # default
+    ),
     tts=TTS(),
 )
 ```
@@ -49,7 +54,5 @@ session = AgentSession(
 `LLM()` requires `SPEKO_API_KEY` (plus optional `SPEKO_RELAY_URL`) and speaks
 HTTPS directly to `relay.speko.dev`, not the local socket — so unlike the
 provider-direct voice legs, the conversation history travels through the
-Speko relay. Routing defaults to auto/balanced; `LLM(provider=..., model=...)`
-pins an explicit route and `objective=` accepts `quality`, `latency`, or
-`cost`. Function tools are supported; image and audio content is silently
-skipped — only text is forwarded.
+Speko relay. Function tools are supported; image and audio content is
+silently skipped — only text is forwarded.
