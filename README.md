@@ -81,7 +81,12 @@ from speko_gateway.livekit import LLM, STT, TTS
 
 session = AgentSession(
     stt=STT(),
-    llm=LLM(),  # hosted Speko relay picks a routable model
+    llm=LLM(
+        provider="auto",          # default: relay picks; set with model= to pin a route
+        model="auto",             # default: GET relay.speko.dev/v1/models lists the options
+        objective="balanced",     # default: or "quality", "latency", "cost"
+        max_output_tokens=8_192,  # default
+    ),
     tts=TTS(),
 )
 ```
@@ -90,10 +95,7 @@ session = AgentSession(
 not the local socket — under the public [`relayapi`](relayapi/doc.go)
 contract. That crosses a different trust boundary: unlike the
 provider-direct voice legs, the conversation history travels through the
-Speko relay. Routing defaults to `{mode: auto, objective: balanced}`;
-`LLM(provider=..., model=...)` pins an explicit route, and `objective=`
-accepts `quality`, `latency`, or `cost`. `GET relay.speko.dev/v1/models`
-lists what is routable right now.
+Speko relay.
 
 Set a local token plus one credential choice:
 
