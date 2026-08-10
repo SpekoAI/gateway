@@ -57,18 +57,21 @@ from livekit.plugins import openai
 from speko_gateway.livekit import STT, TTS
 
 session = AgentSession(
-    stt=STT(),
+    stt=STT(
+        language="en",         # default
+        model="nova-3",        # default
+        sample_rate=16_000,    # default
+    ),
     llm=openai.LLM(model="gpt-4.1-mini"),  # any LiveKit LLM plugin
-    tts=TTS(),
+    tts=TTS(
+        provider="auto",       # default: the configured BYOK vendor, or the managed plan's pick
+        model="auto",          # default: the provider's catalog default
+        voice="",              # default: plan- or catalog-supplied; BYOK ElevenLabs/Cartesia need one
+        language="en",         # default
+        sample_rate=24_000,    # default
+    ),
 )
 ```
-
-The Gateway carries STT and TTS; the LLM stays on whichever LiveKit plugin
-the agent already uses. `TTS()` accepts `voice=`, `provider=`, `model=`, and
-`language=` overrides — the defaults follow the gateway catalog, and in
-managed auto mode the signed plan supplies a voice for whichever vendor it
-picks. With BYOK, vendors whose adapters require a voice id (ElevenLabs,
-Cartesia) need an explicit `voice=`.
 
 With a Speko API key the LLM can come from Speko too, served by the hosted
 relay (`relay.speko.dev`):
