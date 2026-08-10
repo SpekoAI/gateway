@@ -202,7 +202,10 @@ Use the `_FILE` variants and a secrets manager in production.
   adapter relay arms that those hosted services import.
 - The local gateway image serves provider-direct routes; sending traffic
   through the hosted Speko relay is a hosted-service surface
-  (`relay.speko.dev`) with its own contract in `relayapi`.
+  (`relay.speko.dev`) with its own contract in `relayapi`. The Python
+  integration's `LLM` class is a client of that surface: when it is used,
+  prompts and conversation history travel to the relay, authenticated with
+  the Speko API key.
 - Content-free timing events are an observability foundation, not distributed
   tracing across every application component. Framework adapters can add more
   canonical stages without moving raw content into telemetry.
