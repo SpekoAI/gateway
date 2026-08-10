@@ -102,30 +102,37 @@ class RelayLLMClient:
 async def _sse_events(
     response: aiohttp.ClientResponse,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    # JSONDecodeError, UnicodeDecodeError, and aiohttp's line-limit overrun
+    # are all ValueError: a stream that cannot be parsed is normalized to a
+    # retryable RelayError so it stays inside the adapter's connection-error
+    # classification instead of escaping as a raw decoding exception.
     event = ""
     data_lines: list[str] = []
-    async for raw_line in response.content:
-        line = raw_line.decode("utf-8").rstrip("\r\n")
-        if line == "":
-            if event and data_lines:
-                payload = json.loads("\n".join(data_lines))
-                if isinstance(payload, dict):
-                    yield event, payload
-            event = ""
-            data_lines = []
-            continue
-        if line.startswith(":"):
-            continue
-        field, _, value = line.partition(":")
-        value = value.removeprefix(" ")
-        if field == "event":
-            event = value
-        elif field == "data":
-            data_lines.append(value)
-    if event and data_lines:
-        payload = json.loads("\n".join(data_lines))
-        if isinstance(payload, dict):
-            yield event, payload
+    try:
+        async for raw_line in response.content:
+            line = raw_line.decode("utf-8").rstrip("\r\n")
+            if line == "":
+                if event and data_lines:
+                    payload = json.loads("\n".join(data_lines))
+                    if isinstance(payload, dict):
+                        yield event, payload
+                event = ""
+                data_lines = []
+                continue
+            if line.startswith(":"):
+                continue
+            field, _, value = line.partition(":")
+            value = value.removeprefix(" ")
+            if field == "event":
+                event = value
+            elif field == "data":
+                data_lines.append(value)
+        if event and data_lines:
+            payload = json.loads("\n".join(data_lines))
+            if isinstance(payload, dict):
+                yield event, payload
+    except ValueError as err:
+        raise RelayError("relay stream sent a malformed event", retryable=True) from err
 
 
 async def _decode_json(response: aiohttp.ClientResponse) -> dict[str, Any]:
