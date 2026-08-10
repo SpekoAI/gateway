@@ -32,7 +32,8 @@ func (a AudioConfig) Validate() error {
 // SpeechRequest is the POST /v1/tts/speech body. The response is a raw audio
 // stream; the route and billed character count come back in headers
 // (Speko-Provider, Speko-Model, Speko-Region, Speko-Usage-Characters)
-// because a byte stream has no place for a JSON envelope.
+// because a byte stream has no place for a JSON envelope. The request
+// carries no language field yet; the relay currently synthesizes English.
 type SpeechRequest struct {
 	Routing Routing     `json:"routing"`
 	Input   string      `json:"input"`
@@ -87,7 +88,8 @@ const (
 	TTSEventError            TTSEventType = "error"
 )
 
-// TTSSessionConfigure opens a streaming synthesis session.
+// TTSSessionConfigure opens a streaming synthesis session. The frame
+// carries no language field yet; the relay currently synthesizes English.
 type TTSSessionConfigure struct {
 	Type    TTSControlType `json:"type"`
 	Routing Routing        `json:"routing"`

@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:52d3bfffbe2bf6cbbef4c67f3f7df01a14145d1b53a98069060ba9ad8411c680
-# yaml-body: sha256:b8071fc9d146bbfe9da44cbe46ea3a9caad5e1d697e67c830e02c2a571b2a2ad
+# json-mirror: openapi.json sha256:8eb80ce003ebd8bd178f990e6df9b09f7298b9236be99b884054b53341dba641
+# yaml-body: sha256:8971d4b70d0c1b8c9eeb316bf38f532daa7bf2937498373fe04aef994e9d2b1f
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -38,13 +38,16 @@ paths:
   /v1/models:
     get:
       operationId: listModels
-      summary: List entitled, currently routable models
+      summary: List currently routable models
       description: >-
-        Returns the caller's entitled and currently routable slice of the
-        model catalog. The catalog digest identifies the release-pinned
-        catalog that produced the listing so support can correlate a caller's
-        view with an exact release. The listing is advisory: admission remains
-        the enforcement point for entitlements, gates, and credit.
+        Returns the slice of the model catalog that is currently routable.
+        The relay is generally available: every organization may route to any
+        catalog model, so the listing is shaped by routability, not by
+        per-organization enrollment. The catalog digest identifies the
+        release-pinned catalog that produced the listing so support can
+        correlate a caller's view with an exact release. The listing is
+        advisory: admission remains the enforcement point for access gates
+        and credit.
       responses:
         "200":
           description: The caller's slice of the catalog.
@@ -406,7 +409,10 @@ components:
         concurrency_exhausted; 500 relay_error; 502 provider_error; 503
         provider_unavailable. budget_exhausted and lease_expired terminate
         streams that are already established — an SSE error event after the
-        200 — so no HTTP status carries them.
+        200 — so no HTTP status carries them. preview_access_required dates
+        from the relay's preview period and is no longer returned now that
+        the relay is generally available; it stays in the closed set so
+        deployed clients keep decoding.
       enum:
         - authentication_failed
         - not_entitled
@@ -522,9 +528,9 @@ components:
     Model:
       type: object
       description: >-
-        One entitled, currently routable catalog entry. regions lists the
-        Speko relay regions (AWS region ids) where the model is routable right
-        now — relay locations, never provider-processing residency.
+        One currently routable catalog entry. regions lists the Speko relay
+        regions (AWS region ids) where the model is routable right now —
+        relay locations, never provider-processing residency.
       properties:
         id:
           type: string
@@ -548,9 +554,9 @@ components:
     ModelsResponse:
       type: object
       description: >-
-        The GET /v1/models body: the caller's entitled and currently routable
-        slice of the catalog. catalog_digest identifies the release-pinned
-        catalog that produced the listing.
+        The GET /v1/models body: the currently routable slice of the catalog.
+        catalog_digest identifies the release-pinned catalog that produced
+        the listing.
       properties:
         models:
           type: array
@@ -649,7 +655,8 @@ components:
       description: >-
         The POST /v1/tts/speech body. The response is a raw audio stream; the
         route and billed character count come back in headers because a byte
-        stream has no place for a JSON envelope.
+        stream has no place for a JSON envelope. The request carries no
+        language field yet; the relay currently synthesizes English.
       properties:
         routing:
           $ref: "#/components/schemas/Routing"

@@ -27,7 +27,7 @@ type ModelCapabilities struct {
 	Reasoning        bool `json:"reasoning"`
 }
 
-// Model is one entitled, currently routable catalog entry. Regions lists the
+// Model is one currently routable catalog entry. Regions lists the
 // Speko relay regions (AWS region ids) where the model is routable right
 // now — relay locations, never provider-processing residency.
 type Model struct {
@@ -57,10 +57,10 @@ func (m Model) Validate() error {
 	return nil
 }
 
-// ModelsResponse is the GET /v1/models body: the caller's entitled and
-// currently routable slice of the catalog. CatalogDigest identifies the
-// release-pinned catalog that produced the listing so support can correlate
-// a caller's view with an exact release.
+// ModelsResponse is the GET /v1/models body: the currently routable slice
+// of the catalog. CatalogDigest identifies the release-pinned catalog that
+// produced the listing so support can correlate a caller's view with an
+// exact release.
 type ModelsResponse struct {
 	Models        []Model `json:"models"`
 	CatalogDigest string  `json:"catalog_digest"`

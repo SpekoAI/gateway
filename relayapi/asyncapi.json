@@ -513,7 +513,7 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. On an established WebSocket session the code arrives in a terminal error frame and no HTTP status applies; when the same code is returned over HTTP — including a rejected upgrade — it maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 403 not_entitled and preview_access_required; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable.",
+        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. On an established WebSocket session the code arrives in a terminal error frame and no HTTP status applies; when the same code is returned over HTTP — including a rejected upgrade — it maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 403 not_entitled and preview_access_required; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable. preview_access_required dates from the relay's preview period and is no longer returned now that the relay is generally available; it stays in the closed set so deployed clients keep decoding.",
         "enum": [
           "authentication_failed",
           "not_entitled",
@@ -751,7 +751,7 @@
       },
       "TTSSessionConfigure": {
         "type": "object",
-        "description": "Opens a streaming synthesis session. audio is the requested output format of the binary frames the server will send. The exact frame bytes are the session's idempotency content hash; later frames are intentionally outside the hash.",
+        "description": "Opens a streaming synthesis session. audio is the requested output format of the binary frames the server will send. The exact frame bytes are the session's idempotency content hash; later frames are intentionally outside the hash. The frame carries no language field yet; the relay currently synthesizes English.",
         "properties": {
           "type": {
             "type": "string",

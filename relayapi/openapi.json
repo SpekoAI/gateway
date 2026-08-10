@@ -20,8 +20,8 @@
     "/v1/models": {
       "get": {
         "operationId": "listModels",
-        "summary": "List entitled, currently routable models",
-        "description": "Returns the caller's entitled and currently routable slice of the model catalog. The catalog digest identifies the release-pinned catalog that produced the listing so support can correlate a caller's view with an exact release. The listing is advisory: admission remains the enforcement point for entitlements, gates, and credit.",
+        "summary": "List currently routable models",
+        "description": "Returns the slice of the model catalog that is currently routable. The relay is generally available: every organization may route to any catalog model, so the listing is shaped by routability, not by per-organization enrollment. The catalog digest identifies the release-pinned catalog that produced the listing so support can correlate a caller's view with an exact release. The listing is advisory: admission remains the enforcement point for access gates and credit.",
         "responses": {
           "200": {
             "description": "The caller's slice of the catalog.",
@@ -403,7 +403,7 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. When an error envelope travels as an HTTP response, each code maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 403 not_entitled and preview_access_required; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable. budget_exhausted and lease_expired terminate streams that are already established — an SSE error event after the 200 — so no HTTP status carries them.",
+        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. When an error envelope travels as an HTTP response, each code maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 403 not_entitled and preview_access_required; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable. budget_exhausted and lease_expired terminate streams that are already established — an SSE error event after the 200 — so no HTTP status carries them. preview_access_required dates from the relay's preview period and is no longer returned now that the relay is generally available; it stays in the closed set so deployed clients keep decoding.",
         "enum": [
           "authentication_failed",
           "not_entitled",
@@ -529,7 +529,7 @@
       },
       "Model": {
         "type": "object",
-        "description": "One entitled, currently routable catalog entry. regions lists the Speko relay regions (AWS region ids) where the model is routable right now — relay locations, never provider-processing residency.",
+        "description": "One currently routable catalog entry. regions lists the Speko relay regions (AWS region ids) where the model is routable right now — relay locations, never provider-processing residency.",
         "properties": {
           "id": {
             "type": "string"
@@ -561,7 +561,7 @@
       },
       "ModelsResponse": {
         "type": "object",
-        "description": "The GET /v1/models body: the caller's entitled and currently routable slice of the catalog. catalog_digest identifies the release-pinned catalog that produced the listing.",
+        "description": "The GET /v1/models body: the currently routable slice of the catalog. catalog_digest identifies the release-pinned catalog that produced the listing.",
         "properties": {
           "models": {
             "type": "array",
@@ -677,7 +677,7 @@
       },
       "SpeechRequest": {
         "type": "object",
-        "description": "The POST /v1/tts/speech body. The response is a raw audio stream; the route and billed character count come back in headers because a byte stream has no place for a JSON envelope.",
+        "description": "The POST /v1/tts/speech body. The response is a raw audio stream; the route and billed character count come back in headers because a byte stream has no place for a JSON envelope. The request carries no language field yet; the relay currently synthesizes English.",
         "properties": {
           "routing": {
             "$ref": "#/components/schemas/Routing",

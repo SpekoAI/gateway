@@ -31,8 +31,11 @@ import (
 type ErrorCode string
 
 const (
-	ErrorCodeAuthenticationFailed  ErrorCode = "authentication_failed"
-	ErrorCodeNotEntitled           ErrorCode = "not_entitled"
+	ErrorCodeAuthenticationFailed ErrorCode = "authentication_failed"
+	ErrorCodeNotEntitled          ErrorCode = "not_entitled"
+	// ErrorCodePreviewAccessRequired dates from the relay's preview period
+	// and is no longer returned now that the relay is generally available;
+	// it stays in the closed set so deployed clients keep decoding.
 	ErrorCodePreviewAccessRequired ErrorCode = "preview_access_required"
 	ErrorCodeInsufficientCredit    ErrorCode = "insufficient_credit"
 	ErrorCodeCapabilityUnsupported ErrorCode = "capability_unsupported"
