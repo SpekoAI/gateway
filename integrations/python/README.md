@@ -13,17 +13,25 @@ from livekit.plugins import openai
 from speko_gateway.livekit import STT, TTS
 
 session = AgentSession(
-    stt=STT(),
+    stt=STT(
+        language="en",         # default
+        model="nova-3",        # default
+        sample_rate=16_000,    # default
+    ),
     llm=openai.LLM(model="gpt-4.1-mini"),  # any LiveKit LLM plugin
-    tts=TTS(),
+    tts=TTS(
+        provider="auto",       # default: the configured BYOK vendor, or the managed plan's pick
+        model="auto",          # default: the provider's catalog default
+        voice="",              # default: plan- or catalog-supplied; BYOK ElevenLabs/Cartesia need one
+        language="en",         # default
+        sample_rate=24_000,    # default
+    ),
 )
 ```
 
 `STT()` and `TTS()` read `SPEKO_SOCKET_PATH` and `SPEKO_LOCAL_AUTH_TOKEN`.
 Routing mode is derived from `SPEKO_API_KEY`: managed when present, local BYOK
-when absent. `TTS()` accepts `voice=`, `provider=`, `model=`, and `language=`
-overrides; the defaults follow the gateway catalog. The LLM comes from any
-LiveKit plugin — the local gateway carries only the voice legs.
+when absent.
 
 With a Speko API key the LLM can come from Speko too, served by the hosted
 relay:
