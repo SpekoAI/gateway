@@ -213,9 +213,10 @@ func websocketEndpoint(policy upstream.WebSocketPolicy, rawEndpoint string) (*ur
 //
 // Rime is bearer-API-key only: it publishes no temporary-token or
 // ephemeral-credential endpoint (re-verified against docs.rime.ai on
-// 2026-08-07). So there is no managed/BYOK split to make here, and inventing
-// one would only add a branch that can never be exercised. Both sources take
-// the same path deliberately.
+// 2026-08-07). So there is no managed/BYOK/relay split to make here, and
+// inventing one would only add a branch that can never be exercised. Every
+// source takes the same path deliberately: a relay plan carries the
+// connector's permanent key through the identical Authorization header.
 //
 // The consequence belongs to the control plane, not to this file: because no
 // mint endpoint exists, a managed Rime route has to hand the runtime a real,
@@ -224,7 +225,7 @@ func websocketEndpoint(policy upstream.WebSocketPolicy, rawEndpoint string) (*ur
 // be.
 func accessToken(plan protocol.SessionPlan) (string, error) {
 	credential := plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return "", errors.New("rime requires a bearer credential")
 	}
 	switch plan.Execution.CredentialSource {
@@ -233,6 +234,18 @@ func accessToken(plan protocol.SessionPlan) (string, error) {
 	default:
 		return "", fmt.Errorf("rime cannot use credential source %q", plan.Execution.CredentialSource)
 	}
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives this adapter directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent Rime key
+// bearer. Both spellings carry a permanent key destined for the identical
+// Authorization header, so nothing else on the relay arm changes.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 func validateGenerationOptions(model string, options protocol.RequestOptions, media protocol.MediaFormat, host string) error {

@@ -527,6 +527,10 @@ func TestOpenRejectsInvalidRequests(t *testing.T) {
 		"wrong credential kind": {mutate: func(r *runtimepkg.AdapterRequest) {
 			r.Plan.Route.Credential.Kind = protocol.CredentialSignedURL
 		}, want: "bearer credential"},
+		// A relay-access credential cannot authenticate a provider-direct call.
+		"relay_access kind on provider-direct": {mutate: func(r *runtimepkg.AdapterRequest) {
+			r.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+		}, want: "bearer credential"},
 		"empty credential": {mutate: func(r *runtimepkg.AdapterRequest) {
 			r.Plan.Route.Credential.Value = "   "
 		}, want: "bearer credential"},
@@ -593,6 +597,56 @@ func TestCloudSamplingRateIsEnforcedOnlyForRimesOwnHost(t *testing.T) {
 	offCloud := protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 44_101, Channels: 1}
 	if err := validateGenerationOptions("coda", options, offCloud, "tts.internal.example"); err != nil {
 		t.Errorf("on-prem must accept any rate: %v", err)
+	}
+}
+
+// TestRelayRouteUsesTheBearerHeaderAndAcceptsBothCredentialKinds pins the
+// relay arm. Rime is bearer-only, so a relay plan sends the connector's
+// permanent key through the same Authorization header as every other source —
+// and the arm must accept both credential spellings: protocol.SessionPlan
+// validation requires relay plans to label the credential relay_access, while
+// a connector that synthesizes the plan and drives the adapter directly
+// labels the same permanent key bearer.
+func TestRelayRouteUsesTheBearerHeaderAndAcceptsBothCredentialKinds(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []protocol.CredentialKind{protocol.CredentialBearer, protocol.CredentialRelayAccess} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+			requests := make(chan *http.Request, 1)
+			server := newTTSServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+				requests <- request.Clone(request.Context())
+				waitForClientClose(ctx, conn)
+			})
+			defer server.Close()
+
+			adapter, err := New(testConfig(server.URL))
+			if err != nil {
+				t.Fatalf("new adapter: %v", err)
+			}
+			request := adapterRequest(server.URL)
+			request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+			request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+			request.Plan.Route.Credential.Kind = kind
+			request.Plan.Route.Credential.Value = "connector-rime-key"
+			stream, err := adapter.Open(context.Background(), request)
+			if err != nil {
+				t.Fatalf("open relay stream: %v", err)
+			}
+			defer func() { _ = closeStream(t, stream) }()
+
+			select {
+			case received := <-requests:
+				if got := received.Header.Get("Authorization"); got != "Bearer connector-rime-key" {
+					t.Errorf("Authorization = %q", got)
+				}
+				if strings.Contains(received.URL.RawQuery, "connector-rime-key") {
+					t.Errorf("handshake query leaked the connector key: %s", received.URL.RawQuery)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("server did not observe the relay handshake")
+			}
+		})
 	}
 }
 
@@ -780,8 +834,17 @@ func writeJSON(ctx context.Context, conn *websocket.Conn, value any) error {
 	return conn.Write(ctx, websocket.MessageText, payload)
 }
 
+// waitForClientClose keeps the server side of the socket open, draining any
+// frames the client sends, until the client closes or the context ends. A
+// single Read is not enough: it returns on the first inbound message, the
+// callback exits, and the deferred CloseNow tears the connection down under a
+// test that is still mid-conversation.
 func waitForClientClose(ctx context.Context, conn *websocket.Conn) {
-	_, _, _ = conn.Read(ctx)
+	for {
+		if _, _, err := conn.Read(ctx); err != nil {
+			return
+		}
+	}
 }
 
 func adapterRequest(serverURL string) runtimepkg.AdapterRequest {

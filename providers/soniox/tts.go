@@ -138,7 +138,7 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, fmt.Errorf("soniox tts does not support sample rate %d", request.Media.SampleRateHz)
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("soniox tts requires a bearer credential")
 	}
 	endpoint, err := ttsEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint)
@@ -147,7 +147,7 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 
 	// No Authorization header: the api_key travels inside the start message for
-	// managed and BYOK credentials alike. See doc.go.
+	// managed, BYOK, and relay credentials alike. See doc.go.
 	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: sttHTTPClient(a.httpClient)})
 	if err != nil {
 		status := 0

@@ -315,8 +315,17 @@ func writeJSON(ctx context.Context, conn *websocket.Conn, value any) error {
 	return conn.Write(ctx, websocket.MessageText, payload)
 }
 
+// waitForClientClose keeps the server side of the socket open, draining any
+// frames the client sends, until the client closes or the context ends. A
+// single Read is not enough: it returns on the first inbound message, the
+// callback exits, and the deferred CloseNow tears the connection down under a
+// test that is still mid-conversation.
 func waitForClientClose(ctx context.Context, conn *websocket.Conn) {
-	_, _, _ = conn.Read(ctx)
+	for {
+		if _, _, err := conn.Read(ctx); err != nil {
+			return
+		}
+	}
 }
 
 func adapterRequest(serverURL string) runtimepkg.AdapterRequest {

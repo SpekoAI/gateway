@@ -284,7 +284,7 @@ func TestTTSAdapterRejectsUnsupportedRequests(t *testing.T) {
 			want:   "cannot open provider",
 		},
 		// Same credential story as STT: no delegated credential exists for
-		// Waves, so a managed plan cannot be honoured honestly.
+		// Waves, so a managed provider-direct plan cannot be honoured honestly.
 		"managed credential source": {
 			mutate: func(request *runtimepkg.AdapterRequest) {
 				request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
@@ -294,6 +294,14 @@ func TestTTSAdapterRejectsUnsupportedRequests(t *testing.T) {
 		"non-bearer credential": {
 			mutate: func(request *runtimepkg.AdapterRequest) {
 				request.Plan.Route.Credential.Kind = protocol.CredentialSessionURL
+			},
+			want: "requires a bearer credential",
+		},
+		// relay_access is accepted only on the relay route; on provider-direct
+		// it means the control plane mislabeled the plan.
+		"relay_access kind off the relay route": {
+			mutate: func(request *runtimepkg.AdapterRequest) {
+				request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
 			},
 			want: "requires a bearer credential",
 		},
@@ -341,6 +349,70 @@ func TestTTSAdapterRejectsUnsupportedRequests(t *testing.T) {
 			t.Fatalf("%s error = %v, want it to mention %q", name, err, testCase.want)
 		}
 	}
+}
+
+// A relay plan is managed for billing purposes but carries the relay
+// connector's permanent Smallest key, which is exactly the account key the
+// Waves APIs are documented to take and rides the same Authorization: Bearer
+// header as a BYOK key. It is the one managed construction the adapter
+// accepts.
+func TestTTSAdapterUsesBearerHeaderForRelayRoute(t *testing.T) {
+	t.Parallel()
+	requests := make(chan *http.Request, 1)
+	server := newSmallestTTSServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+		_, _, _ = conn.Read(ctx)
+	})
+	defer server.Close()
+	adapter, err := New(smallestTTSConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new TTS adapter: %v", err)
+	}
+	request := smallestTTSRequest(server.URL)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+	request.Plan.Route.Credential.Value = "connector-smallest-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream: %v", err)
+	}
+	defer abortSmallestStream(t, stream)
+
+	select {
+	case received := <-requests:
+		if got := received.Header.Get("Authorization"); got != "Bearer connector-smallest-key" {
+			t.Fatalf("Authorization = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not observe the relay handshake")
+	}
+}
+
+// protocol.SessionPlan validation requires a relay plan to label its
+// credential relay_access, while the relay connector that synthesizes the
+// plan and drives this adapter directly labels the same permanent key bearer.
+// The relay arm must accept both spellings, or one of the two constructions
+// becomes quietly unreachable.
+func TestTTSAdapterAcceptsRelayAccessCredentialKindOnRelayRoute(t *testing.T) {
+	t.Parallel()
+	server := newSmallestTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		_, _, _ = conn.Read(ctx)
+	})
+	defer server.Close()
+	adapter, err := New(smallestTTSConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new TTS adapter: %v", err)
+	}
+	request := smallestTTSRequest(server.URL)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+	request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+	request.Plan.Route.Credential.Value = "connector-smallest-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream with relay_access credential: %v", err)
+	}
+	abortSmallestStream(t, stream)
 }
 
 func TestTTSAdapterClassifiesErrors(t *testing.T) {

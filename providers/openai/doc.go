@@ -29,4 +29,14 @@
 // workaround for clients that cannot set headers, not a separate
 // ephemeral-credential channel. Branching on CredentialSource would invent a
 // split the vendor does not publish.
+//
+// Relay. Plans routed through relay.speko.dev (RouteSpekoRelay) carry the
+// relay connector's permanent OpenAI key. There is no separate channel for it:
+// the key travels in the identical Authorization: Bearer header, never in a
+// URL. The only relay-specific behaviour is credential-kind acceptance —
+// protocol.SessionPlan validation requires relay plans to label their
+// credential relay_access, while the relay connector, which synthesizes plans
+// and drives these adapters directly (no Engine, no SessionPlan.Validate),
+// labels the same permanent key bearer — so both adapters accept either
+// spelling on the relay route, and only bearer elsewhere.
 package openai

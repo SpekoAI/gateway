@@ -150,7 +150,7 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, errors.New("alibaba tts requires a voice in request options")
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("alibaba tts requires a bearer credential")
 	}
 	endpoint, err := realtimeEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, model, ttsSupportedModels, "alibaba tts")
@@ -159,8 +159,9 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 
 	// One credential channel, same as the STT twin: a managed plan carries a
-	// DashScope temporary API key (st-...) and a BYOK plan the customer's
-	// permanent key (sk-...), and both are bearer API keys on this header.
+	// DashScope temporary API key (st-...), a BYOK plan the customer's
+	// permanent key (sk-...), and a relay plan the relay connector's permanent
+	// key — all bearer API keys on this one header.
 	headers := make(http.Header)
 	headers.Set("Authorization", "Bearer "+credential.Value)
 	// No OpenAI-Beta here. Unlike the ASR endpoint, neither the Qwen-TTS

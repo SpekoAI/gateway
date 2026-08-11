@@ -170,7 +170,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		return nil, err
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("minimax requires a bearer credential")
 	}
 	apiKey, err := parseCredential(credential.Value)
@@ -189,9 +189,11 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	// interface (HTTP, WebSocket, realtime) authenticates with the same bearer
 	// key in the Authorization header, and there is no query-parameter auth on
 	// this endpoint. A managed route therefore carries a control-plane-delegated
-	// value through the identical header. Putting a token in the query string
-	// here would silently fail the handshake, so both sources share this path
-	// until MiniMax ships a token mint.
+	// value through the identical header, and a relay plan carries the
+	// connector's permanent key through it too — the routes differ only in
+	// which credential kinds they accept, never in placement. Putting a token
+	// in the query string here would silently fail the handshake, so every
+	// source shares this path until MiniMax ships a token mint.
 	headers := make(http.Header)
 	headers.Set("Authorization", "Bearer "+apiKey)
 
@@ -312,6 +314,18 @@ func parseCredential(raw string) (string, error) {
 		return "", errors.New("minimax credential envelope requires a non-empty apiKey")
 	}
 	return strings.TrimSpace(envelope.APIKey), nil
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives this adapter directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent MiniMax key
+// bearer. Both spellings carry a permanent key destined for the identical
+// Authorization header, so nothing else on the relay arm changes.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 type stream struct {

@@ -91,6 +91,51 @@ func TestTTSCommitTextSendsDocumentedRequest(t *testing.T) {
 	}
 }
 
+// TestTTSRelayRouteSendsTheConnectorKeyAsBearer: a relay plan is managed for
+// billing purposes but carries the relay connector's permanent OpenAI key.
+// OpenAI has exactly one credential channel, so the key travels in the same
+// Authorization: Bearer header as every other source and never in the URL.
+// Both credential-kind spellings must synthesize, because protocol.SessionPlan
+// validation labels a relay credential relay_access while the relay connector
+// that synthesizes plans and drives this adapter directly labels the same
+// permanent key bearer.
+func TestTTSRelayRouteSendsTheConnectorKeyAsBearer(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []protocol.CredentialKind{protocol.CredentialBearer, protocol.CredentialRelayAccess} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+			requests := make(chan *http.Request, 1)
+			server := newSpeechServer(t, func(w http.ResponseWriter, r *http.Request) {
+				requests <- r.Clone(r.Context())
+				_, _ = w.Write([]byte{1, 2, 3, 4})
+			})
+			defer server.Close()
+
+			stream := openTTS(t, server.URL, nil, func(request *runtimepkg.AdapterRequest) {
+				request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+				request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+				request.Plan.Route.Credential.Kind = kind
+				request.Plan.Route.Credential.Value = "connector-openai-key"
+			})
+			defer func() { _ = stream.Abort(context.Background()) }()
+			synthesizeTTS(t, stream, "Hello")
+
+			select {
+			case received := <-requests:
+				if got := received.Header.Get("Authorization"); got != "Bearer connector-openai-key" {
+					t.Errorf("Authorization = %q", got)
+				}
+				if received.URL.RawQuery != "" {
+					t.Errorf("relay request query = %q, want none", received.URL.RawQuery)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("server never observed the synthesis request")
+			}
+		})
+	}
+}
+
 // TestTTSStreamsFramesBeforeSynthesisCompletes is the streaming contract. The
 // server holds the response open after the first chunk and only continues once
 // the adapter has already surfaced a frame, so a buffer-the-whole-body
@@ -408,6 +453,17 @@ func TestTTSRejectsMismatchedPlans(t *testing.T) {
 			name: "non-bearer credential",
 			mutate: func(r *runtimepkg.AdapterRequest) {
 				r.Plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialSessionURL, Value: "secret-that-must-not-leak"}
+			},
+			wantSub: "bearer credential",
+		},
+		{
+			// relay_access is protocol.SessionPlan.Validate's label for a relay
+			// credential; the same validation forbids it on provider_direct, so
+			// the adapter refuses it there rather than treating it as a bearer
+			// synonym.
+			name: "relay_access credential off the relay route",
+			mutate: func(r *runtimepkg.AdapterRequest) {
+				r.Plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialRelayAccess, Value: "secret-that-must-not-leak"}
 			},
 			wantSub: "bearer credential",
 		},

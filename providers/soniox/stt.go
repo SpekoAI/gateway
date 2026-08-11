@@ -119,7 +119,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, err
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("soniox stt requires a bearer credential")
 	}
 	endpoint, err := sttEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint)
@@ -128,7 +128,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 
 	// No Authorization header: Soniox authenticates the start message, not the
-	// handshake, for both managed and BYOK credentials alike. See doc.go.
+	// handshake, for managed, BYOK, and relay credentials alike. See doc.go.
 	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: sttHTTPClient(a.httpClient)})
 	if err != nil {
 		status := 0
@@ -193,6 +193,19 @@ func sttHTTPClient(client *http.Client) *http.Client {
 	return http.DefaultClient
 }
 
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives these adapters directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent Soniox key
+// bearer. Both spellings ride the same api_key field of the first JSON
+// message: Soniox has no header-versus-query channel to split on, so nothing
+// else on the relay arm changes.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
+}
+
 func sttEndpoint(policy upstream.WebSocketPolicy, rawEndpoint string) (string, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
@@ -253,7 +266,9 @@ func sonioxPrimaryLanguage(language string) (string, bool) {
 // sttClientReferenceID correlates the provider's usage log with the plan's
 // reservation, the same intent as the Deepgram adapter's `extra` parameter.
 // Soniox ignores the field when the credential is a temporary API key, so this
-// is best-effort correlation for managed routes rather than a guarantee.
+// is best-effort correlation for managed provider-direct routes rather than a
+// guarantee. Relay plans are managed too and take the same tag — and because
+// they carry the connector's permanent key, Soniox does record it for them.
 func sttClientReferenceID(plan protocol.SessionPlan) string {
 	if plan.Execution.CredentialSource != protocol.CredentialsManaged {
 		return ""

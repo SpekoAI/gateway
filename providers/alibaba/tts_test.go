@@ -85,6 +85,58 @@ func TestTTSHandshakeAndSessionUpdateMatchTheDocumentedWireShape(t *testing.T) {
 	}
 }
 
+// A relay plan is managed for billing purposes but carries the relay
+// connector's permanent DashScope key, which rides the same
+// `Authorization: Bearer` header as every other API key on this endpoint.
+func TestTTSRelayRouteUsesTheSameBearerHeader(t *testing.T) {
+	t.Parallel()
+	harness := newRealtimeHarness(t)
+	defer harness.Close()
+	adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{harness.host}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatalf("new TTS adapter: %v", err)
+	}
+	request := ttsRequest(harness.endpoint, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Value = "sk-relay-connector-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream: %v", err)
+	}
+	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+	received := harness.handshake(t)
+	if got := received.Header.Get("Authorization"); got != "Bearer sk-relay-connector-key" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := received.URL.Query().Get("model"); got != "qwen3-tts-flash-realtime" {
+		t.Fatalf("handshake model = %q", got)
+	}
+}
+
+// protocol.SessionPlan validation requires a relay plan to label its
+// credential relay_access, while the relay connector that synthesizes the
+// plan and drives this adapter directly labels the same permanent key bearer.
+// The relay arm must accept both spellings, or one of the two constructions
+// becomes quietly unreachable.
+func TestTTSRelayRouteAcceptsRelayAccessCredentialKind(t *testing.T) {
+	t.Parallel()
+	harness := newRealtimeHarness(t)
+	defer harness.Close()
+	adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{harness.host}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatalf("new TTS adapter: %v", err)
+	}
+	request := ttsRequest(harness.endpoint, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+	request.Plan.Route.Credential.Value = "sk-relay-connector-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream with relay_access credential: %v", err)
+	}
+	_ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+}
+
 func TestTTSStreamsSeveralAudioFramesBeforeDone(t *testing.T) {
 	t.Parallel()
 	harness := newRealtimeHarness(t)
@@ -329,6 +381,11 @@ func TestTTSOpenRejectsPlansItCannotHonor(t *testing.T) {
 		// credential means the control plane invented a delegation mechanism.
 		"wrong credential kind": func(r *runtimepkg.AdapterRequest) {
 			r.Plan.Route.Credential.Kind = protocol.CredentialSignedURL
+		},
+		// relay_access is accepted only on the relay route; on provider-direct
+		// it means the control plane mislabeled the plan.
+		"relay_access kind off the relay route": func(r *runtimepkg.AdapterRequest) {
+			r.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
 		},
 		"empty credential": func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Credential.Value = "" },
 		"auto model":       func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Model = "auto" },

@@ -141,6 +141,7 @@ func TestSTTCredentialSourceSelectsAuthChannel(t *testing.T) {
 	t.Parallel()
 	for _, testCase := range []struct {
 		name   string
+		route  protocol.ProviderRoute
 		source protocol.CredentialSource
 		value  string
 		want   string
@@ -148,13 +149,23 @@ func TestSTTCredentialSourceSelectsAuthChannel(t *testing.T) {
 		{
 			// The portal key is already base64("key:secret"), so Inworld reads
 			// it as a Basic credential. Sending it as a bearer token fails.
-			name: "byok sends the portal key as Basic", source: protocol.CredentialsBYOK,
-			value: "customer-inworld-key", want: "Basic customer-inworld-key",
+			name: "byok sends the portal key as Basic", route: protocol.RouteProviderDirect,
+			source: protocol.CredentialsBYOK,
+			value:  "customer-inworld-key", want: "Basic customer-inworld-key",
 		},
 		{
 			// The control-plane JWT response is typed "type":"Bearer".
-			name: "managed sends the minted jwt as Bearer", source: protocol.CredentialsManaged,
-			value: "minted.inworld.jwt", want: "Bearer minted.inworld.jwt",
+			name: "managed sends the minted jwt as Bearer", route: protocol.RouteProviderDirect,
+			source: protocol.CredentialsManaged,
+			value:  "minted.inworld.jwt", want: "Bearer minted.inworld.jwt",
+		},
+		{
+			// A relay plan is managed for billing purposes but carries the relay
+			// connector's permanent portal key, which is a Basic credential
+			// exactly like a customer's own.
+			name: "relay sends the connector key as Basic", route: protocol.RouteSpekoRelay,
+			source: protocol.CredentialsManaged,
+			value:  "connector-inworld-key", want: "Basic connector-inworld-key",
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -165,6 +176,7 @@ func TestSTTCredentialSourceSelectsAuthChannel(t *testing.T) {
 				t.Fatalf("new STT adapter: %v", err)
 			}
 			request := sttAdapterRequest(harness.server.URL, testCase.source)
+			request.Plan.Execution.ProviderRoute = testCase.route
 			request.Plan.Route.Credential.Value = testCase.value
 			if _, err := adapter.Open(context.Background(), request); err != nil {
 				t.Fatalf("open stream: %v", err)
@@ -185,6 +197,25 @@ func TestSTTCredentialSourceSelectsAuthChannel(t *testing.T) {
 				t.Fatalf("handshake path = %q, want %q", got, sttWirePath)
 			}
 		})
+	}
+}
+
+// TestSTTRelayRouteAcceptsRelayAccessCredentialKind pins the relay arm's other
+// credential spelling: protocol.SessionPlan validation requires a relay plan
+// to label its credential relay_access, while the relay connector that
+// synthesizes the plan and drives this adapter directly labels the same
+// permanent key bearer. Both must open, and both take the Basic channel.
+func TestSTTRelayRouteAcceptsRelayAccessCredentialKind(t *testing.T) {
+	t.Parallel()
+	harness := newSTTHarness(t, nil)
+	sttOpenStream(t, harness, protocol.CredentialsManaged, func(request *runtimepkg.AdapterRequest) {
+		request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+		request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+		request.Plan.Route.Credential.Value = "connector-inworld-key"
+	})
+	received := harness.nextRequest(t)
+	if got := received.Header.Get("Authorization"); got != "Basic connector-inworld-key" {
+		t.Fatalf("Authorization header = %q, want the Basic channel", got)
 	}
 }
 
@@ -498,9 +529,9 @@ func TestSTTOpenRejectsUnusableRequests(t *testing.T) {
 			mutate: func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Credential = nil },
 		},
 		{
-			// A relay-access grant is not a provider credential; sending it as
-			// one would put an internal token on Inworld's wire.
-			name: "relay credential", wantSub: "bearer credential",
+			// relay_access is accepted only on the relay route; on
+			// provider-direct it means the control plane mislabeled the plan.
+			name: "relay credential off the relay route", wantSub: "bearer credential",
 			mutate: func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess },
 		},
 		{

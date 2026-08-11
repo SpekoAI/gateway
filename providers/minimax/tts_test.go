@@ -696,6 +696,63 @@ func TestAdapterUsesTheBearerHeaderForBothCredentialSources(t *testing.T) {
 	}
 }
 
+// TestAdapterUsesTheBearerHeaderOnTheRelayRoute pins the relay arm. A relay
+// plan carries the connector's permanent key through the same Authorization
+// header as every other source — MiniMax has no other channel — and the arm
+// must accept both credential spellings: protocol.SessionPlan validation
+// requires relay plans to label the credential relay_access, while a
+// connector that synthesizes the plan and drives the adapter directly labels
+// the same permanent key bearer.
+func TestAdapterUsesTheBearerHeaderOnTheRelayRoute(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name string
+		kind protocol.CredentialKind
+	}{
+		{"bearer", protocol.CredentialBearer},
+		{"relay_access", protocol.CredentialRelayAccess},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			handshakes := make(chan *http.Request, 1)
+			server := newTTSServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+				handshakes <- request.Clone(request.Context())
+				_ = openTask(ctx, conn)
+				waitForClientClose(ctx, conn)
+			})
+			defer server.Close()
+
+			adapter, err := New(testConfig(server.URL))
+			if err != nil {
+				t.Fatalf("new adapter: %v", err)
+			}
+			request := adapterRequest(server.URL)
+			request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+			request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+			request.Plan.Route.Credential.Kind = testCase.kind
+			request.Plan.Route.Credential.Value = "connector-minimax-key"
+			stream, err := adapter.Open(context.Background(), request)
+			if err != nil {
+				t.Fatalf("open relay stream: %v", err)
+			}
+			_ = stream.Close(context.Background())
+
+			select {
+			case received := <-handshakes:
+				if got := received.Header.Get("Authorization"); got != "Bearer connector-minimax-key" {
+					t.Fatalf("Authorization = %q", got)
+				}
+				if strings.Contains(received.URL.RawQuery, "connector-minimax-key") {
+					t.Fatalf("credential leaked into the query string: %q", received.URL.RawQuery)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("server did not observe the relay handshake")
+			}
+		})
+	}
+}
+
 // TestAdapterUnwrapsAPackedCredentialAndSendsNoQueryParameters covers the
 // tenant question. The current T2A references contain no GroupId or any other
 // query parameter, so the handshake URL must stay exactly as the plan pinned

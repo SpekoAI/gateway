@@ -56,6 +56,11 @@
 //
 // # Credentials
 //
-// Rime is bearer-only. See accessToken for why managed and BYOK share one code
-// path.
+// Rime is bearer-only. See accessToken for why BYOK, managed, and the relay
+// (RouteSpekoRelay) all share one code path: every source sends its key as
+// `Authorization: Bearer` on the handshake. The relay arm additionally
+// accepts credential kind relay_access alongside bearer, because the relay
+// connector synthesizes plans that bypass protocol.SessionPlan.Validate and
+// label the connector's permanent key bearer, while validated relay plans
+// must label it relay_access.
 package rime

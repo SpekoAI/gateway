@@ -150,7 +150,7 @@ func (a *Adapter) Open(_ context.Context, request runtimepkg.AdapterRequest) (ru
 		return nil, errors.New("inworld tts requires a voice id in request options")
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("inworld tts requires a bearer credential")
 	}
 	endpoint, err := synthesisEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint)
@@ -165,7 +165,7 @@ func (a *Adapter) Open(_ context.Context, request runtimepkg.AdapterRequest) (ru
 		events:           make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		httpClient:       httpClient(a.httpClient),
 		endpoint:         endpoint,
-		authorization:    authorizationHeader(request.Plan.Execution.CredentialSource, credential.Value),
+		authorization:    authorizationHeader(request.Plan.Execution.ProviderRoute, request.Plan.Execution.CredentialSource, credential.Value),
 		maxResponseBytes: a.maxResponseBytes,
 		model:            model,
 		voice:            voice,
@@ -186,17 +186,36 @@ func (a *Adapter) Open(_ context.Context, request runtimepkg.AdapterRequest) (ru
 //     `"type": "Bearer"` and Inworld's own sample app uses it as
 //     `Authorization: Bearer <token>` against api.inworld.ai REST endpoints.
 //
+// A relay plan is managed for billing purposes but carries the relay
+// connector's permanent portal key — the same Base64 "<key>:<secret>" value a
+// customer holds — so it takes the Basic channel exactly like BYOK. Bearer
+// stays reserved for the short-lived JWTs the control plane mints on managed
+// provider-direct routes.
+//
 // Both travel in the Authorization header. Unlike the ElevenLabs and Cartesia
 // WebSocket adapters there is no query-parameter channel to fall back to here:
 // Inworld's query-parameter credential (`?authorization=`) is declared only on
 // the WebSocket resource /tts/v1/voice:streamBidirectional, where a browser
 // cannot set headers. Putting a token in this endpoint's query string would
 // leave it unauthenticated and log the secret in the URL.
-func authorizationHeader(source protocol.CredentialSource, value string) string {
-	if source == protocol.CredentialsBYOK {
+func authorizationHeader(route protocol.ProviderRoute, source protocol.CredentialSource, value string) string {
+	if route == protocol.RouteSpekoRelay || source == protocol.CredentialsBYOK {
 		return "Basic " + value
 	}
 	return "Bearer " + value
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives these adapters directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent Inworld key
+// bearer. Both spellings carry a permanent portal key; the Basic-versus-Bearer
+// prefix keys off the route and the source, never the kind, so nothing else on
+// the relay arm changes.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 func httpClient(client *http.Client) *http.Client {

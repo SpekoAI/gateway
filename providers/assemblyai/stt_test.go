@@ -252,6 +252,96 @@ func TestBYOKSessionUsesBareAuthorizationHeader(t *testing.T) {
 	}
 }
 
+// TestCredentialChannelIsKeyedByRoute pins where the credential lands for
+// every route/source combination this adapter can be handed. The relay rows
+// exist because a relay plan is managed for billing purposes but carries the
+// connector's permanent AssemblyAI key, which belongs in the bare
+// Authorization header exactly like a BYOK key — the `token` query channel
+// would put a permanent key in the URL, where it could reach logs. The relay
+// arm accepts the relay_access credential kind alongside bearer because
+// protocol.SessionPlan validation and the plan-synthesizing relay connector
+// spell the same permanent key differently.
+func TestCredentialChannelIsKeyedByRoute(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name           string
+		route          protocol.ProviderRoute
+		source         protocol.CredentialSource
+		kind           protocol.CredentialKind
+		credential     string
+		wantHeader     string
+		wantQueryToken string
+	}{
+		{
+			name:  "byok permanent key rides the bare header",
+			route: protocol.RouteProviderDirect, source: protocol.CredentialsBYOK, kind: protocol.CredentialBearer,
+			credential: "customer-assemblyai-key", wantHeader: "customer-assemblyai-key",
+		},
+		{
+			name:  "managed temporary token rides the query",
+			route: protocol.RouteProviderDirect, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer,
+			credential: "temporary-assemblyai-token", wantQueryToken: "temporary-assemblyai-token",
+		},
+		{
+			name:  "relay permanent key rides the bare header",
+			route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer,
+			credential: "connector-assemblyai-key", wantHeader: "connector-assemblyai-key",
+		},
+		{
+			name:  "relay accepts the relay_access credential kind",
+			route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialRelayAccess,
+			credential: "connector-assemblyai-key", wantHeader: "connector-assemblyai-key",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			requests := make(chan *http.Request, 1)
+			server := newSTTServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+				requests <- request.Clone(request.Context())
+				if err := assertControl(ctx, conn, "Terminate"); err != nil {
+					t.Errorf("terminate: %v", err)
+					return
+				}
+				_ = writeJSONFrame(ctx, conn, map[string]any{"type": "Termination"})
+				_, _, _ = conn.Read(ctx)
+			})
+			defer server.Close()
+
+			adapter, err := New(testConfig(server.URL))
+			if err != nil {
+				t.Fatalf("new adapter: %v", err)
+			}
+			request := sttRequest(server.URL, testCase.source)
+			request.Plan.Execution.ProviderRoute = testCase.route
+			request.Plan.Route.Credential.Kind = testCase.kind
+			request.Plan.Route.Credential.Value = testCase.credential
+			stream, err := adapter.Open(context.Background(), request)
+			if err != nil {
+				t.Fatalf("open stream: %v", err)
+			}
+			if err := stream.Close(context.Background()); err != nil {
+				t.Fatalf("close stream: %v", err)
+			}
+
+			select {
+			case received := <-requests:
+				if got := received.Header.Get("Authorization"); got != testCase.wantHeader {
+					t.Fatalf("Authorization = %q, want %q", got, testCase.wantHeader)
+				}
+				if got := received.URL.Query().Get("token"); got != testCase.wantQueryToken {
+					t.Fatalf("token query parameter = %q, want %q", got, testCase.wantQueryToken)
+				}
+				if testCase.wantQueryToken == "" && strings.Contains(received.URL.RawQuery, testCase.credential) {
+					t.Fatalf("permanent key leaked into the query string: %q", received.URL.RawQuery)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("server did not observe the handshake")
+			}
+		})
+	}
+}
+
 // TestOpenRejectsUnsupportedRequests keeps every refusal local. Each of these
 // would otherwise reach AssemblyAI and come back as either a session-killing
 // close code or, worse, a healthy session producing wrong text.
@@ -292,6 +382,13 @@ func TestOpenRejectsUnsupportedRequests(t *testing.T) {
 		{
 			name:    "blank credential",
 			mutate:  func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Credential.Value = "   " },
+			wantErr: "bearer credential",
+		},
+		{
+			// relay_access is a relay-route spelling only; a provider-direct
+			// plan carrying it never came from the relay and must be refused.
+			name:    "relay_access credential outside the relay",
+			mutate:  func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess },
 			wantErr: "bearer credential",
 		},
 		{

@@ -68,6 +68,14 @@
 // lists exactly one authentication field, Authorization, and no STS material
 // has any place to go on this wire.
 //
+// The Speko relay changes nothing about placement either: a RouteSpekoRelay
+// plan carries the relay connector's permanent key on the same
+// `Authorization: Bearer` header. The only relay-specific accommodation is the
+// credential kind — the relay arm accepts relay_access beside bearer, because
+// protocol.SessionPlan validation labels a relay plan's credential
+// relay_access while the relay connector, which synthesizes its plans and
+// never runs Validate, labels the same key bearer.
+//
 // # Why the two adapters send different headers
 //
 // STT sends `OpenAI-Beta: realtime=v1` and TTS does not. That asymmetry is
