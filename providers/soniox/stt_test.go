@@ -175,6 +175,10 @@ func TestSTTEmitsPartialsDuringTheAudioStreamAndFinalsAtBoundaries(t *testing.T)
 		}
 		// Non-final tokens: Soniox re-sends the whole provisional tail each
 		// frame, so the delta is the concatenation of what is on the wire.
+		// firstFrame closes BEFORE the write: the client can observe the
+		// partial the instant the frame is flushed, so closing afterwards
+		// races the test's ordering check against this goroutine's schedule.
+		close(firstFrame)
 		if err := writeJSONFrame(ctx, conn, map[string]any{
 			"tokens": []any{
 				map[string]any{"text": "What's ", "is_final": false, "start_ms": 100, "end_ms": 300},
@@ -185,7 +189,6 @@ func TestSTTEmitsPartialsDuringTheAudioStreamAndFinalsAtBoundaries(t *testing.T)
 			t.Errorf("partial frame: %v", err)
 			return
 		}
-		close(firstFrame)
 		if err := expectBinary(ctx, conn, []byte{5, 6, 7, 8}); err != nil {
 			t.Errorf("second audio frame: %v", err)
 			return
