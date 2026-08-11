@@ -78,6 +78,44 @@ func TestSTTOpenSendsDocumentedSessionUpdate(t *testing.T) {
 	}
 }
 
+// TestSTTRelayRouteSendsTheConnectorKeyAsBearer: a relay plan is managed for
+// billing purposes but carries the relay connector's permanent OpenAI key.
+// OpenAI has exactly one credential channel, so the key travels in the same
+// Authorization: Bearer header as every other source and never in the URL.
+// Both credential-kind spellings must open, because protocol.SessionPlan
+// validation labels a relay credential relay_access while the relay connector
+// that synthesizes plans and drives this adapter directly labels the same
+// permanent key bearer.
+func TestSTTRelayRouteSendsTheConnectorKeyAsBearer(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []protocol.CredentialKind{protocol.CredentialBearer, protocol.CredentialRelayAccess} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+			handshakes := make(chan *http.Request, 1)
+			frames := make(chan []byte, 4)
+			server := newRealtimeServer(t, handshakes, frames, nil)
+			defer server.Close()
+
+			stream := openSTT(t, server.URL, func(request *runtimepkg.AdapterRequest) {
+				request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+				request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+				request.Plan.Route.Credential.Kind = kind
+				request.Plan.Route.Credential.Value = "connector-openai-key"
+			})
+			defer func() { _ = stream.Abort(context.Background()) }()
+
+			handshake := receiveRequest(t, handshakes)
+			if got := handshake.Header.Get("Authorization"); got != "Bearer connector-openai-key" {
+				t.Errorf("Authorization = %q", got)
+			}
+			if handshake.URL.RawQuery != "" {
+				t.Errorf("relay handshake query = %q, want none", handshake.URL.RawQuery)
+			}
+		})
+	}
+}
+
 // TestSTTUsesSingularLanguageForNonLiveModels guards the other half of the
 // vendor's language-field split, and that a regional tag is reduced to the
 // ISO-639-1 primary subtag the singular field documents.
@@ -455,6 +493,17 @@ func TestSTTRejectsMismatchedPlans(t *testing.T) {
 			name: "non-bearer credential",
 			mutate: func(r *runtimepkg.AdapterRequest) {
 				r.Plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialSignedURL, Value: "secret-that-must-not-leak"}
+			},
+			wantSub: "bearer credential",
+		},
+		{
+			// relay_access is protocol.SessionPlan.Validate's label for a relay
+			// credential; the same validation forbids it on provider_direct, so
+			// the adapter refuses it there rather than treating it as a bearer
+			// synonym.
+			name: "relay_access credential off the relay route",
+			mutate: func(r *runtimepkg.AdapterRequest) {
+				r.Plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialRelayAccess, Value: "secret-that-must-not-leak"}
 			},
 			wantSub: "bearer credential",
 		},

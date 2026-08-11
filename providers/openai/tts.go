@@ -198,7 +198,7 @@ func (a *TTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequest) 
 		return nil, err
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("openai tts requires a bearer credential")
 	}
 	endpoint, err := ttsSpeechEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint)
@@ -219,6 +219,10 @@ func (a *TTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequest) 
 		// a transcription session; nothing documents it against /v1/audio/*.
 		// Branching on CredentialSource here would invent a split the vendor does
 		// not publish. See the report for the consequence for managed routing.
+		// A relay plan changes nothing here either: it carries the relay
+		// connector's permanent OpenAI key, which belongs in this same header
+		// and never in a URL — only the accepted credential-kind label widens
+		// on that route (see acceptableCredentialKind).
 		httpClient:       ttsHTTPClient(a.httpClient),
 		endpoint:         endpoint,
 		authorization:    "Bearer " + credential.Value,

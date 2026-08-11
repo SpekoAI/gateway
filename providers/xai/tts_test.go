@@ -152,18 +152,26 @@ func TestSocketDeliversFramesBeforeAudioDone(t *testing.T) {
 // secret is used "in the same fashion as an API key". A managed session that
 // silently moved the token to a query parameter (as ElevenLabs requires) would
 // 401 at the handshake in production while every other test still passed, so
-// both sources are asserted to use the identical Bearer header and to leave the
-// URL clean.
+// every source is asserted to use the identical Bearer header and to leave the
+// URL clean. The relay rows ride the same header with the connector's
+// permanent key, under both credential-kind spellings: protocol.SessionPlan
+// validation labels a relay credential relay_access, while the relay connector
+// that synthesizes plans and drives this adapter directly labels the same key
+// bearer.
 func TestSocketCredentialSourcesShareTheBearerHeader(t *testing.T) {
 	t.Parallel()
 
 	for _, testCase := range []struct {
 		name   string
+		route  protocol.ProviderRoute
 		source protocol.CredentialSource
+		kind   protocol.CredentialKind
 		token  string
 	}{
-		{name: "byok permanent key", source: protocol.CredentialsBYOK, token: "customer-xai-key"},
-		{name: "managed ephemeral client secret", source: protocol.CredentialsManaged, token: "ephemeral-client-secret"},
+		{name: "byok permanent key", route: protocol.RouteProviderDirect, source: protocol.CredentialsBYOK, kind: protocol.CredentialBearer, token: "customer-xai-key"},
+		{name: "managed ephemeral client secret", route: protocol.RouteProviderDirect, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, token: "ephemeral-client-secret"},
+		{name: "relay connector key labelled bearer", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, token: "connector-xai-key"},
+		{name: "relay connector key labelled relay_access", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialRelayAccess, token: "connector-xai-key"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -179,7 +187,9 @@ func TestSocketCredentialSourcesShareTheBearerHeader(t *testing.T) {
 				t.Fatalf("new adapter: %v", err)
 			}
 			request := adapterRequest(server.URL, protocol.TransportWebSocket)
+			request.Plan.Execution.ProviderRoute = testCase.route
 			request.Plan.Execution.CredentialSource = testCase.source
+			request.Plan.Route.Credential.Kind = testCase.kind
 			request.Plan.Route.Credential.Value = testCase.token
 			stream, err := adapter.Open(context.Background(), request)
 			if err != nil {
@@ -408,18 +418,24 @@ func TestUnaryCommitPostsDocumentedBodyAndStreamsFrames(t *testing.T) {
 	}
 }
 
-// Same rationale as the WebSocket credential test: one documented channel, and
-// a regression here fails only in production.
+// Same rationale as the WebSocket credential test: one documented channel, a
+// regression here fails only in production, and the relay rows must reuse the
+// identical header under both credential-kind spellings — the unary branch is
+// the one surface a relay plan could reach with a different code path.
 func TestUnaryCredentialSourcesShareTheBearerHeader(t *testing.T) {
 	t.Parallel()
 
 	for _, testCase := range []struct {
 		name   string
+		route  protocol.ProviderRoute
 		source protocol.CredentialSource
+		kind   protocol.CredentialKind
 		token  string
 	}{
-		{name: "byok permanent key", source: protocol.CredentialsBYOK, token: "customer-xai-key"},
-		{name: "managed ephemeral client secret", source: protocol.CredentialsManaged, token: "ephemeral-client-secret"},
+		{name: "byok permanent key", route: protocol.RouteProviderDirect, source: protocol.CredentialsBYOK, kind: protocol.CredentialBearer, token: "customer-xai-key"},
+		{name: "managed ephemeral client secret", route: protocol.RouteProviderDirect, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, token: "ephemeral-client-secret"},
+		{name: "relay connector key labelled bearer", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, token: "connector-xai-key"},
+		{name: "relay connector key labelled relay_access", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialRelayAccess, token: "connector-xai-key"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -436,7 +452,9 @@ func TestUnaryCredentialSourcesShareTheBearerHeader(t *testing.T) {
 				t.Fatalf("new adapter: %v", err)
 			}
 			request := adapterRequest(server.URL, protocol.TransportHTTP)
+			request.Plan.Execution.ProviderRoute = testCase.route
 			request.Plan.Execution.CredentialSource = testCase.source
+			request.Plan.Route.Credential.Kind = testCase.kind
 			request.Plan.Route.Credential.Value = testCase.token
 			stream, err := adapter.Open(context.Background(), request)
 			if err != nil {
@@ -652,7 +670,11 @@ func TestOpenRejectsInvalidRequests(t *testing.T) {
 			wantErr: "bearer credential",
 		},
 		{
-			name: "credential of the wrong kind",
+			// relay_access is protocol.SessionPlan.Validate's label for a relay
+			// credential; the same validation forbids it on provider_direct, so
+			// the adapter refuses it there rather than treating it as a bearer
+			// synonym.
+			name: "a relay_access credential off the relay route",
 			mutate: func(r *runtimepkg.AdapterRequest) {
 				r.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
 			},

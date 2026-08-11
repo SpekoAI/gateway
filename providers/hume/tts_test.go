@@ -147,6 +147,67 @@ func TestManagedCredentialUsesBearerAuthorization(t *testing.T) {
 	}
 }
 
+// TestRelayRouteUsesTheAPIKeyHeader covers the third arm. A relay plan is
+// managed for billing purposes but carries the connector's permanent Hume key,
+// which is a portal API key and belongs in X-Hume-Api-Key exactly like a BYOK
+// key — spending it as a bearer token is not a documented form, and the
+// Authorization channel stays reserved for minted access tokens.
+func TestRelayRouteUsesTheAPIKeyHeader(t *testing.T) {
+	t.Parallel()
+
+	headers := make(chan http.Header, 1)
+	server := newStreamServer(t, func(w http.ResponseWriter, r *http.Request) {
+		headers <- r.Header.Clone()
+		writeMessages(t, w, audioMessage(pcm(7)))
+	})
+	defer server.Close()
+
+	stream := openStream(t, server.URL, func(request *runtimepkg.AdapterRequest) {
+		request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+		request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+		request.Plan.Route.Credential.Value = "connector-hume-key"
+	})
+	defer func() { _ = stream.Abort(context.Background()) }()
+	synthesize(t, stream, "hello")
+
+	got := <-headers
+	if want := "connector-hume-key"; got.Get(vendorAPIKeyHeader) != want {
+		t.Errorf("%s = %q, want %q", vendorAPIKeyHeader, got.Get(vendorAPIKeyHeader), want)
+	}
+	if authorization := got.Get("Authorization"); authorization != "" {
+		t.Errorf("Authorization = %q, want empty for a relay session", authorization)
+	}
+}
+
+// TestRelayRouteAcceptsRelayAccessCredentialKind: protocol.SessionPlan
+// validation requires a relay plan to label its credential relay_access, while
+// a connector that synthesizes the plan and drives the adapter directly labels
+// the same permanent key bearer. The relay arm must accept both spellings, or
+// one of the two constructions becomes quietly unreachable.
+func TestRelayRouteAcceptsRelayAccessCredentialKind(t *testing.T) {
+	t.Parallel()
+
+	headers := make(chan http.Header, 1)
+	server := newStreamServer(t, func(w http.ResponseWriter, r *http.Request) {
+		headers <- r.Header.Clone()
+		writeMessages(t, w, audioMessage(pcm(7)))
+	})
+	defer server.Close()
+
+	stream := openStream(t, server.URL, func(request *runtimepkg.AdapterRequest) {
+		request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+		request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+		request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+		request.Plan.Route.Credential.Value = "connector-hume-key"
+	})
+	defer func() { _ = stream.Abort(context.Background()) }()
+	synthesize(t, stream, "hello")
+
+	if got := (<-headers).Get(vendorAPIKeyHeader); got != "connector-hume-key" {
+		t.Errorf("%s = %q, want the permanent connector key", vendorAPIKeyHeader, got)
+	}
+}
+
 // TestStreamEmitsStartedFramesThenDone covers the canonical event contract and
 // the decode step between the wire and Audio. The payload bytes are chosen so
 // that base64 encoding and decoding cannot be confused: 0x00/0xFF/0x10/0x7F is
@@ -475,6 +536,11 @@ func TestOpenRejectsUnusableRequests(t *testing.T) {
 	}, {
 		name:    "wrong_credential_kind",
 		mutate:  func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Credential.Kind = protocol.CredentialSignedURL },
+		wantSub: "requires a bearer credential",
+	}, {
+		// A relay-access credential cannot authenticate a provider-direct call.
+		name:    "relay_access_kind_on_provider_direct",
+		mutate:  func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess },
 		wantSub: "requires a bearer credential",
 	}, {
 		// Octave has no sample-rate parameter and always returns 48 kHz, so a

@@ -85,17 +85,25 @@ func TestSTTStartRequestMatchesDocumentedWireShape(t *testing.T) {
 // Soniox reads the credential out of api_key for a long-lived key and a
 // temporary key alike, so a managed route must produce the same message shape
 // as a BYOK route. A CredentialSource branch here would be an invented split.
-func TestSTTManagedAndBYOKUseTheSameCredentialField(t *testing.T) {
+// The relay rows pin the same invariant for the third route: a relay plan
+// carries the connector's permanent key in the same field, labelled bearer by
+// the plan-synthesizing connector or relay_access by protocol.SessionPlan
+// validation, and both spellings must open.
+func TestSTTEveryRouteUsesTheSameCredentialField(t *testing.T) {
 	t.Parallel()
 
 	for _, testCase := range []struct {
-		name              string
-		source            protocol.CredentialSource
-		credential        string
-		wantClientRefence any
+		name                string
+		route               protocol.ProviderRoute
+		source              protocol.CredentialSource
+		kind                protocol.CredentialKind
+		credential          string
+		wantClientReference any
 	}{
-		{name: "byok", source: protocol.CredentialsBYOK, credential: "customer-soniox-key", wantClientRefence: nil},
-		{name: "managed", source: protocol.CredentialsManaged, credential: "temporary-soniox-key", wantClientRefence: "res_soniox"},
+		{name: "byok", route: protocol.RouteProviderDirect, source: protocol.CredentialsBYOK, kind: protocol.CredentialBearer, credential: "customer-soniox-key", wantClientReference: nil},
+		{name: "managed", route: protocol.RouteProviderDirect, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, credential: "temporary-soniox-key", wantClientReference: "res_soniox"},
+		{name: "relay with bearer kind", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, credential: "connector-soniox-key", wantClientReference: "res_soniox"},
+		{name: "relay with relay_access kind", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialRelayAccess, credential: "connector-soniox-key", wantClientReference: "res_soniox"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -119,7 +127,9 @@ func TestSTTManagedAndBYOKUseTheSameCredentialField(t *testing.T) {
 				t.Fatalf("new adapter: %v", err)
 			}
 			request := sttAdapterRequest(server.URL)
+			request.Plan.Execution.ProviderRoute = testCase.route
 			request.Plan.Execution.CredentialSource = testCase.source
+			request.Plan.Route.Credential.Kind = testCase.kind
 			request.Plan.Route.Credential.Value = testCase.credential
 			stream, err := adapter.Open(context.Background(), request)
 			if err != nil {
@@ -140,8 +150,8 @@ func TestSTTManagedAndBYOKUseTheSameCredentialField(t *testing.T) {
 			if got := start["api_key"]; got != testCase.credential {
 				t.Errorf("api_key = %v", got)
 			}
-			if got := start["client_reference_id"]; got != testCase.wantClientRefence {
-				t.Errorf("client_reference_id = %v, want %v", got, testCase.wantClientRefence)
+			if got := start["client_reference_id"]; got != testCase.wantClientReference {
+				t.Errorf("client_reference_id = %v, want %v", got, testCase.wantClientReference)
 			}
 		})
 	}

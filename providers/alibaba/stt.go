@@ -158,7 +158,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, err
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("alibaba stt requires a bearer credential")
 	}
 	endpoint, err := realtimeEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, sttSupportedModels, "alibaba stt")
@@ -167,10 +167,12 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 
 	// One credential channel, deliberately. A managed plan carries DashScope's
-	// short-lived "temporary API key" (st-...) and a BYOK plan carries the
-	// customer's permanent key (sk-...). Both are API keys and both are
-	// presented as `Authorization: Bearer`; DashScope documents no query
-	// parameter, no second header, and no STS material on this endpoint.
+	// short-lived "temporary API key" (st-...), a BYOK plan carries the
+	// customer's permanent key (sk-...), and a relay plan carries the relay
+	// connector's permanent key. All are API keys and all are presented as
+	// `Authorization: Bearer`; DashScope documents no query parameter, no
+	// second header, and no STS material on this endpoint, so the relay arm
+	// changes nothing about placement.
 	headers := make(http.Header)
 	headers.Set("Authorization", "Bearer "+credential.Value)
 	// Sent because every Qwen-ASR-Realtime sample Alibaba publishes sets it,
@@ -217,6 +219,18 @@ func httpClientOrDefault(client *http.Client) *http.Client {
 		return client
 	}
 	return http.DefaultClient
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives these adapters directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent DashScope key
+// bearer. Both spellings carry a permanent key on the one Authorization:
+// Bearer channel this endpoint has, so nothing else on the relay arm changes.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 // realtimeEndpoint validates the plan endpoint and appends the model selector.

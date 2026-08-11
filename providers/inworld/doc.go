@@ -12,6 +12,24 @@
 // parameter instead of a header. That would be a second adapter with a
 // websocket route; this one is the HTTP path.
 //
+// # Credentials and the relay arm
+//
+// Both adapters in this package authenticate through the Authorization header,
+// with the prefix keyed to where the credential came from (see
+// sttAuthorization and authorizationHeader):
+//
+//   - BYOK: the customer's permanent portal key — already the Base64 of
+//     "<key>:<secret>" — as `Basic <key>`.
+//   - Managed provider-direct: the short-lived JWT the control plane mints at
+//     POST /auth/v1/tokens/token:generate, as `Bearer <jwt>`.
+//   - Relay (RouteSpekoRelay): the relay connector's permanent portal key,
+//     which is the same kind of value as a BYOK key and therefore takes the
+//     Basic channel. On the relay route the adapters accept the relay_access
+//     credential kind beside bearer, because protocol.SessionPlan validation
+//     labels a relay plan's credential relay_access while the relay connector,
+//     which synthesizes its plans and never runs Validate, labels the same key
+//     bearer.
+//
 // This is the first HTTP-transport adapter in the repository. Every other
 // provider here speaks WebSocket, so the shape is worth stating once: the
 // runtime engine only requires a runtimepkg.ProviderStream, and nothing in that

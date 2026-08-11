@@ -105,6 +105,59 @@ func TestSTTHandshakeAndSessionUpdateMatchTheDocumentedWireShape(t *testing.T) {
 	}
 }
 
+// A relay plan is managed for billing purposes but carries the relay
+// connector's permanent DashScope key. DashScope takes every API key —
+// temporary or permanent — on the same `Authorization: Bearer` header, so the
+// relay arm changes nothing about placement; it only has to open.
+func TestSTTRelayRouteUsesTheSameBearerHeader(t *testing.T) {
+	t.Parallel()
+	harness := newRealtimeHarness(t)
+	defer harness.Close()
+	adapter, err := NewSTT(STTConfig{AllowedEndpointHosts: []string{harness.host}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	request := sttRequest(harness.endpoint, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Value = "sk-relay-connector-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream: %v", err)
+	}
+	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+	received := harness.handshake(t)
+	if got := received.Header.Get("Authorization"); got != "Bearer sk-relay-connector-key" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := received.URL.Query().Get("model"); got != "qwen3-asr-flash-realtime" {
+		t.Fatalf("handshake model = %q", got)
+	}
+}
+
+// protocol.SessionPlan validation requires a relay plan to label its
+// credential relay_access, while the relay connector that synthesizes the
+// plan and drives this adapter directly labels the same permanent key bearer.
+// The relay arm must accept both spellings, or one of the two constructions
+// becomes quietly unreachable.
+func TestSTTRelayRouteAcceptsRelayAccessCredentialKind(t *testing.T) {
+	t.Parallel()
+	harness := newRealtimeHarness(t)
+	defer harness.Close()
+	adapter, err := NewSTT(STTConfig{AllowedEndpointHosts: []string{harness.host}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	request := sttRequest(harness.endpoint, protocol.CredentialsManaged)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+	request.Plan.Route.Credential.Value = "sk-relay-connector-key"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open relay stream with relay_access credential: %v", err)
+	}
+	_ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+}
+
 func TestSTTEmitsPartialsWhileAudioIsStillStreaming(t *testing.T) {
 	t.Parallel()
 	harness := newRealtimeHarness(t)
@@ -363,6 +416,11 @@ func TestSTTOpenRejectsPlansItCannotHonor(t *testing.T) {
 		// delegation mechanism DashScope does not have.
 		"wrong credential kind": func(r *runtimepkg.AdapterRequest) {
 			r.Plan.Route.Credential.Kind = protocol.CredentialSessionURL
+		},
+		// relay_access is accepted only on the relay route; on provider-direct
+		// it means the control plane mislabeled the plan.
+		"relay_access kind off the relay route": func(r *runtimepkg.AdapterRequest) {
+			r.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
 		},
 		"empty credential": func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Credential.Value = "  " },
 		// `auto` never reaches a provider: the control plane resolves it.
