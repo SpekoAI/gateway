@@ -137,7 +137,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	if err != nil {
 		return nil, err
 	}
-	credential, err := requireBYOK(request, "smallest stt")
+	credential, err := requireAccountKey(request, "smallest stt")
 	if err != nil {
 		return nil, err
 	}

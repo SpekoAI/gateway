@@ -27,8 +27,15 @@
 //   - BYOK: the customer's permanent portal API key travels in the
 //     `X-Hume-Api-Key` request header. The TTS OpenAPI document declares this
 //     as the resource's only security scheme.
-//   - Managed: a short-lived access token travels in the standard
-//     `Authorization: Bearer <token>` header.
+//   - Managed provider-direct: a short-lived access token travels in the
+//     standard `Authorization: Bearer <token>` header.
+//   - Relay (RouteSpekoRelay): the plan is managed for billing purposes but
+//     carries the relay connector's permanent Hume key, which is a portal API
+//     key and therefore rides `X-Hume-Api-Key` like a BYOK key. The relay arm
+//     accepts credential kinds bearer and relay_access — the relay connector
+//     synthesizes plans that bypass protocol.SessionPlan.Validate and label
+//     the permanent key bearer, while validated relay plans must label it
+//     relay_access.
 //
 // The access token is minted by the control plane, not by this adapter, with
 //

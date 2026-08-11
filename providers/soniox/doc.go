@@ -26,6 +26,15 @@
 // itself, and branching on CredentialSource would encode a distinction the
 // vendor does not make.
 //
+// A relay plan (Execution.ProviderRoute == RouteSpekoRelay) changes nothing
+// about the channel either: the relay connector's permanent key rides the same
+// api_key field. The only relay accommodation is in the credential-kind check —
+// protocol.SessionPlan validation requires relay plans to label their
+// credential relay_access, while the relay connector that synthesizes plans
+// and drives these adapters directly labels the same permanent key bearer, so
+// both spellings are accepted on the relay route and only there (see
+// acceptableCredentialKind).
+//
 // Short-lived credentials are minted by the control plane, not here:
 //
 //	POST https://api.soniox.com/v1/auth/temporary-api-key

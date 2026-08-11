@@ -417,7 +417,9 @@ func TestTTSRejectsMismatchedRequestsWithoutLeakingTheCredential(t *testing.T) {
 			wantErr: "bearer credential",
 		},
 		{
-			name: "wrong credential kind",
+			// relay_access is a relay-route spelling only; a provider-direct
+			// plan carrying it never came from the relay and must be refused.
+			name: "relay_access credential outside the relay",
 			mutate: func(r *runtimepkg.AdapterRequest) {
 				r.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
 			},
@@ -509,17 +511,24 @@ func TestTTSRefusesTextOutsideTheVendorLimits(t *testing.T) {
 
 // Same assertion as the STT twin, for the other half of the temporary-key
 // scope: TTS also authenticates through api_key in the start message, so the
-// managed and BYOK paths differ only in the secret they carry.
-func TestTTSManagedAndBYOKUseTheSameCredentialField(t *testing.T) {
+// managed, BYOK, and relay paths differ only in the secret they carry. The
+// relay rows pin that a relay-synthesized plan opens with either credential
+// spelling — bearer from the plan-synthesizing connector, relay_access from
+// protocol.SessionPlan validation.
+func TestTTSEveryRouteUsesTheSameCredentialField(t *testing.T) {
 	t.Parallel()
 
 	for _, testCase := range []struct {
 		name       string
+		route      protocol.ProviderRoute
 		source     protocol.CredentialSource
+		kind       protocol.CredentialKind
 		credential string
 	}{
-		{name: "byok", source: protocol.CredentialsBYOK, credential: "customer-soniox-key"},
-		{name: "managed", source: protocol.CredentialsManaged, credential: "temporary-soniox-key"},
+		{name: "byok", route: protocol.RouteProviderDirect, source: protocol.CredentialsBYOK, kind: protocol.CredentialBearer, credential: "customer-soniox-key"},
+		{name: "managed", route: protocol.RouteProviderDirect, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, credential: "temporary-soniox-key"},
+		{name: "relay with bearer kind", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, credential: "connector-soniox-key"},
+		{name: "relay with relay_access kind", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialRelayAccess, credential: "connector-soniox-key"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -543,7 +552,9 @@ func TestTTSManagedAndBYOKUseTheSameCredentialField(t *testing.T) {
 				t.Fatalf("new adapter: %v", err)
 			}
 			request := ttsAdapterRequest(server.URL)
+			request.Plan.Execution.ProviderRoute = testCase.route
 			request.Plan.Execution.CredentialSource = testCase.source
+			request.Plan.Route.Credential.Kind = testCase.kind
 			request.Plan.Route.Credential.Value = testCase.credential
 			stream, err := adapter.Open(context.Background(), request)
 			if err != nil {

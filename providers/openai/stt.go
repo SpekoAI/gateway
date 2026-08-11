@@ -175,7 +175,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, err
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("openai stt requires a bearer credential")
 	}
 	endpoint, err := sttRealtimeEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint)
@@ -192,7 +192,11 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	// mechanism. Nothing in OpenAI's documentation distinguishes managed from
 	// BYOK here, so there is no split to implement: inventing one would be a
 	// wire bug. Contrast the ElevenLabs STT adapter, where the vendor really
-	// does accept a minted token ONLY as a query parameter.
+	// does accept a minted token ONLY as a query parameter. A relay plan
+	// changes nothing here either: it carries the relay connector's permanent
+	// OpenAI key, which belongs in this same header and never in a URL — only
+	// the accepted credential-kind label widens on that route (see
+	// acceptableCredentialKind).
 	headers := make(http.Header)
 	headers.Set("Authorization", "Bearer "+credential.Value)
 
@@ -236,6 +240,19 @@ func sttHTTPClient(client *http.Client) *http.Client {
 		return client
 	}
 	return http.DefaultClient
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives this adapter directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent OpenAI key
+// bearer. Both spellings carry a permanent key, and both travel in the one
+// Authorization: Bearer header this package sends everywhere, so nothing else
+// on the relay arm changes. Shared by the STT and TTS adapters.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 func sttRealtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint string) (string, error) {

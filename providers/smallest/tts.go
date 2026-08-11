@@ -134,8 +134,9 @@ func New(config Config) (*Adapter, error) {
 func (a *Adapter) ID() string { return a.id }
 
 // Open dials the Lightning streaming socket. Smallest authenticates the Waves
-// APIs with one long-lived account key in an Authorization header, so this is a
-// BYOK-only adapter; see requireBYOK.
+// APIs with one long-lived account key in an Authorization header, so the only
+// credentials this adapter accepts are a customer's BYOK key and the relay
+// connector's permanent key; see requireAccountKey.
 func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
 	if request.Kind != protocol.SessionKindTTS {
 		return nil, fmt.Errorf("smallest tts supports tts sessions, got %q", request.Kind)
@@ -155,7 +156,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	if err := validateTTSOptions(request.Plan.Route.Model, request.Options, *request.Media); err != nil {
 		return nil, err
 	}
-	credential, err := requireBYOK(request, "smallest tts")
+	credential, err := requireAccountKey(request, "smallest tts")
 	if err != nil {
 		return nil, err
 	}
@@ -617,19 +618,35 @@ type ttsInbound struct {
 
 // -- helpers shared with the STT adapter ------------------------------------
 
-// requireBYOK enforces the credential policy explained in the package comment:
-// Smallest publishes no delegated, session-scoped credential for the Waves
-// APIs, so a "managed" plan could only carry the customer's root account key
-// and must be refused rather than forwarded.
-func requireBYOK(request runtimepkg.AdapterRequest, adapter string) (string, error) {
-	if request.Plan.Execution.CredentialSource != protocol.CredentialsBYOK {
-		return "", fmt.Errorf("%s is BYOK-only: Smallest publishes no delegated credential for the Waves APIs, got credential source %q", adapter, request.Plan.Execution.CredentialSource)
+// requireAccountKey enforces the credential policy explained in the package
+// comment: Smallest publishes no delegated, session-scoped credential for the
+// Waves APIs, so a managed provider-direct plan could only be carrying the
+// customer's root account key and must be refused rather than forwarded. A
+// relay plan is managed for billing purposes but carries the relay
+// connector's OWN permanent account key — exactly the credential these APIs
+// are documented to take — so the relay arm is the one managed construction
+// that can be honoured, on the same Authorization: Bearer header as BYOK.
+func requireAccountKey(request runtimepkg.AdapterRequest, adapter string) (string, error) {
+	if request.Plan.Execution.ProviderRoute != protocol.RouteSpekoRelay && request.Plan.Execution.CredentialSource != protocol.CredentialsBYOK {
+		return "", fmt.Errorf("%s is BYOK-only on provider-direct routes: Smallest publishes no delegated credential for the Waves APIs, got credential source %q", adapter, request.Plan.Execution.CredentialSource)
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return "", fmt.Errorf("%s requires a bearer credential", adapter)
 	}
 	return strings.TrimSpace(credential.Value), nil
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives this adapter directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent Smallest key
+// bearer. Both spellings carry a permanent account key placed in the same
+// Authorization: Bearer header, so nothing else on the relay arm changes.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 // normalizeLanguage strips a region subtag, because Smallest takes bare

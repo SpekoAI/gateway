@@ -216,7 +216,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, err
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("inworld stt requires a bearer credential")
 	}
 	endpoint, err := sttEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint)
@@ -225,7 +225,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 
 	headers := make(http.Header)
-	headers.Set("Authorization", sttAuthorization(request.Plan.Execution.CredentialSource, credential.Value))
+	headers.Set("Authorization", sttAuthorization(request.Plan.Execution.ProviderRoute, request.Plan.Execution.CredentialSource, credential.Value))
 	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
 		HTTPClient: httpClient(a.httpClient),
 		HTTPHeader: headers,
@@ -293,6 +293,12 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 //     `"type": "Bearer"`. Inworld documents `Authorization: Bearer $JWT` as the
 //     way to open a WebSocket with a minted token.
 //
+// A relay plan is managed for billing purposes but carries the relay
+// connector's permanent portal key — the same Base64 "<key>:<secret>" value a
+// customer holds — so it takes the Basic channel exactly like BYOK. Bearer
+// stays reserved for the short-lived JWTs the control plane mints on managed
+// provider-direct routes.
+//
 // Both travel in the request HEADER, and that is the deliberate choice here.
 // This resource's AsyncAPI additionally declares a security scheme named
 // `authorization` with `in: query` — the browser fallback, since a browser
@@ -301,8 +307,8 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 // an access log. Unlike AssemblyAI and ElevenLabs STT, where the managed token
 // is ONLY accepted in the query string, Inworld accepts both credentials in the
 // header, so there is no correctness reason to split the two channels.
-func sttAuthorization(source protocol.CredentialSource, value string) string {
-	if source == protocol.CredentialsBYOK {
+func sttAuthorization(route protocol.ProviderRoute, source protocol.CredentialSource, value string) string {
+	if route == protocol.RouteSpekoRelay || source == protocol.CredentialsBYOK {
 		return "Basic " + value
 	}
 	return "Bearer " + value

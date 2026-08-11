@@ -211,16 +211,18 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 // `Authorization: Bearer <token>` header. Its ephemeral client secret
 // (POST /v1/realtime/client_secrets) is documented as usable "in the same
 // fashion as an API key", so a managed plan differs from a BYOK plan only in
-// the lifetime of the string, never in where the string is placed. The one
-// documented alternative channel — the `xai-client-secret.<token>`
-// sec-websocket-protocol prefix — exists solely because browsers cannot set
-// request headers, and must not be used from a server-side gateway.
+// the lifetime of the string, never in where the string is placed. A relay
+// plan differs only in who owns the string — the relay connector's permanent
+// xAI key rides the same header, never a URL. The one documented alternative
+// channel — the `xai-client-secret.<token>` sec-websocket-protocol prefix —
+// exists solely because browsers cannot set request headers, and must not be
+// used from a server-side gateway.
 //
 // Contrast providers/elevenlabs/stt.go, where BYOK and managed genuinely take
 // different channels. Copying that split to xAI would invent a wire detail.
 func bearerCredential(plan protocol.SessionPlan) (string, error) {
 	credential := plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return "", errors.New("xai tts requires a bearer credential")
 	}
 	switch plan.Execution.CredentialSource {
@@ -229,6 +231,19 @@ func bearerCredential(plan protocol.SessionPlan) (string, error) {
 	default:
 		return "", fmt.Errorf("xai tts cannot use credential source %q", plan.Execution.CredentialSource)
 	}
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives this adapter directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent xAI key bearer.
+// Both spellings carry a permanent key, and both travel in the one
+// Authorization: Bearer header this package sends everywhere, so nothing else
+// on the relay arm changes. Shared by every xAI surface via bearerCredential.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 // generation holds the already-validated synthesis choices shared by both

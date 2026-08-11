@@ -157,7 +157,7 @@ func (a *Adapter) Open(_ context.Context, request runtimepkg.AdapterRequest) (ru
 		return nil, err
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || credential.Kind != protocol.CredentialBearer || strings.TrimSpace(credential.Value) == "" {
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("hume tts requires a bearer credential")
 	}
 	endpoint, err := synthesisEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint)
@@ -176,8 +176,8 @@ func (a *Adapter) Open(_ context.Context, request runtimepkg.AdapterRequest) (ru
 		events:           make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		httpClient:       httpClient(a.httpClient),
 		endpoint:         endpoint,
-		authHeader:       authHeaderName(request.Plan.Execution.CredentialSource),
-		authValue:        authHeaderValue(request.Plan.Execution.CredentialSource, credential.Value),
+		authHeader:       authHeaderName(request.Plan.Execution.ProviderRoute, request.Plan.Execution.CredentialSource),
+		authValue:        authHeaderValue(request.Plan.Execution.ProviderRoute, request.Plan.Execution.CredentialSource, credential.Value),
 		maxResponseBytes: a.maxResponseBytes,
 		version:          version,
 		voice:            voice,
@@ -192,26 +192,42 @@ func (a *Adapter) Open(_ context.Context, request runtimepkg.AdapterRequest) (ru
 //     The TTS OpenAPI document declares exactly one security scheme for this
 //     resource, `{type: apiKey, in: header, name: X-Hume-Api-Key}`. Sending
 //     that key as a bearer token is not a documented form.
-//   - Managed: the control plane mints a 30-minute access token at
-//     POST /oauth2-cc/token and Hume's own guidance for spending it on a REST
-//     request is `Authorization: Bearer <accessToken>`.
+//   - Managed provider-direct: the control plane mints a 30-minute access
+//     token at POST /oauth2-cc/token and Hume's own guidance for spending it
+//     on a REST request is `Authorization: Bearer <accessToken>`.
+//   - Relay: a relay plan is managed for billing purposes but carries the
+//     connector's PERMANENT Hume key, not a minted access token, so it
+//     belongs in `X-Hume-Api-Key` exactly like a BYOK key. The Authorization
+//     channel stays reserved for real access tokens.
 //
 // Neither channel is a query parameter here. Hume does accept `api_key` and
 // `access_token` in the query string, but only on its WebSocket resources,
 // where a browser cannot set headers; putting a secret in this endpoint's
 // query string would log it in every proxy along the way.
-func authHeaderName(source protocol.CredentialSource) string {
-	if source == protocol.CredentialsManaged {
+func authHeaderName(route protocol.ProviderRoute, source protocol.CredentialSource) string {
+	if source == protocol.CredentialsManaged && route != protocol.RouteSpekoRelay {
 		return "Authorization"
 	}
 	return "X-Hume-Api-Key"
 }
 
-func authHeaderValue(source protocol.CredentialSource, value string) string {
-	if source == protocol.CredentialsManaged {
+func authHeaderValue(route protocol.ProviderRoute, source protocol.CredentialSource, value string) string {
+	if source == protocol.CredentialsManaged && route != protocol.RouteSpekoRelay {
 		return "Bearer " + value
 	}
 	return value
+}
+
+// acceptableCredentialKind reports whether a delegated credential's kind may
+// authenticate the plan's route. Bearer is the norm everywhere; the relay arm
+// additionally accepts relay_access, because protocol.SessionPlan validation
+// requires relay plans to label their credential relay_access while a relay
+// connector that synthesizes the plan and drives this adapter directly — no
+// Engine, no SessionPlan.Validate — labels the same permanent Hume key
+// bearer. Both spellings carry a permanent key; the header selection keys off
+// the route, not the kind, so nothing else on the relay arm changes.
+func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
+	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
 func httpClient(client *http.Client) *http.Client {

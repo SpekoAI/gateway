@@ -197,12 +197,17 @@ func TestCredentialSourceSelectsAuthScheme(t *testing.T) {
 
 	for _, testCase := range []struct {
 		name   string
+		route  protocol.ProviderRoute
 		source protocol.CredentialSource
 		value  string
 		want   string
 	}{
-		{"byok sends the portal key as Basic", protocol.CredentialsBYOK, "customer-inworld-key", "Basic customer-inworld-key"},
-		{"managed sends the minted jwt as Bearer", protocol.CredentialsManaged, "minted.jwt.value", "Bearer minted.jwt.value"},
+		{"byok sends the portal key as Basic", protocol.RouteProviderDirect, protocol.CredentialsBYOK, "customer-inworld-key", "Basic customer-inworld-key"},
+		{"managed sends the minted jwt as Bearer", protocol.RouteProviderDirect, protocol.CredentialsManaged, "minted.jwt.value", "Bearer minted.jwt.value"},
+		// A relay plan is managed for billing purposes but carries the relay
+		// connector's permanent portal key, which is a Basic credential exactly
+		// like a customer's own.
+		{"relay sends the connector key as Basic", protocol.RouteSpekoRelay, protocol.CredentialsManaged, "connector-inworld-key", "Basic connector-inworld-key"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -216,6 +221,7 @@ func TestCredentialSourceSelectsAuthScheme(t *testing.T) {
 			defer server.Close()
 
 			stream := openStream(t, server.URL, func(request *runtimepkg.AdapterRequest) {
+				request.Plan.Execution.ProviderRoute = testCase.route
 				request.Plan.Execution.CredentialSource = testCase.source
 				request.Plan.Route.Credential.Value = testCase.value
 			})
@@ -232,6 +238,35 @@ func TestCredentialSourceSelectsAuthScheme(t *testing.T) {
 				t.Errorf("request carried query parameters %v; the credential belongs in the header", query)
 			}
 		})
+	}
+}
+
+// TestRelayRouteAcceptsRelayAccessCredentialKind pins the relay arm's other
+// credential spelling: protocol.SessionPlan validation requires a relay plan
+// to label its credential relay_access, while the relay connector that
+// synthesizes the plan and drives this adapter directly labels the same
+// permanent key bearer. Both must open, and both take the Basic channel.
+func TestRelayRouteAcceptsRelayAccessCredentialKind(t *testing.T) {
+	t.Parallel()
+
+	headers := make(chan http.Header, 1)
+	server := newStreamServer(t, func(w http.ResponseWriter, r *http.Request) {
+		headers <- r.Header.Clone()
+		writeMessages(t, w, audioMessage(pcm(1)))
+	})
+	defer server.Close()
+
+	stream := openStream(t, server.URL, func(request *runtimepkg.AdapterRequest) {
+		request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+		request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+		request.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
+		request.Plan.Route.Credential.Value = "connector-inworld-key"
+	})
+	defer func() { _ = stream.Abort(context.Background()) }()
+	synthesize(t, stream, "Hello")
+
+	if got := (<-headers).Get("Authorization"); got != "Basic connector-inworld-key" {
+		t.Errorf("Authorization = %q, want the Basic channel", got)
 	}
 }
 

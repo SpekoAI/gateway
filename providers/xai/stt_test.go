@@ -95,17 +95,25 @@ func TestSTTHandshakeSendsDocumentedQueryParameters(t *testing.T) {
 // xAI documents ONE authentication channel for transcription, and its ephemeral
 // client secret is scoped to the Speech-to-Speech API, never to STT. So a
 // managed plan and a BYOK plan must be byte-identical on the wire apart from
-// the token itself. A split here would be an invented wire detail.
+// the token itself; a split here would be an invented wire detail. The relay
+// rows ride the same header with the connector's permanent key, under both
+// credential-kind spellings: protocol.SessionPlan validation labels a relay
+// credential relay_access, while the relay connector that synthesizes plans
+// and drives this adapter directly labels the same key bearer.
 func TestSTTCredentialSourcesShareTheBearerHeader(t *testing.T) {
 	t.Parallel()
 
 	for _, testCase := range []struct {
 		name   string
+		route  protocol.ProviderRoute
 		source protocol.CredentialSource
+		kind   protocol.CredentialKind
 		token  string
 	}{
-		{name: "byok permanent key", source: protocol.CredentialsBYOK, token: "customer-xai-key"},
-		{name: "managed short lived token", source: protocol.CredentialsManaged, token: "managed-xai-token"},
+		{name: "byok permanent key", route: protocol.RouteProviderDirect, source: protocol.CredentialsBYOK, kind: protocol.CredentialBearer, token: "customer-xai-key"},
+		{name: "managed short lived token", route: protocol.RouteProviderDirect, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, token: "managed-xai-token"},
+		{name: "relay connector key labelled bearer", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, token: "connector-xai-key"},
+		{name: "relay connector key labelled relay_access", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialRelayAccess, token: "connector-xai-key"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -121,7 +129,9 @@ func TestSTTCredentialSourcesShareTheBearerHeader(t *testing.T) {
 				t.Fatalf("new STT adapter: %v", err)
 			}
 			request := sttAdapterRequest(server.URL)
+			request.Plan.Execution.ProviderRoute = testCase.route
 			request.Plan.Execution.CredentialSource = testCase.source
+			request.Plan.Route.Credential.Kind = testCase.kind
 			request.Plan.Route.Credential.Value = testCase.token
 			stream, err := adapter.Open(context.Background(), request)
 			if err != nil {
@@ -650,6 +660,17 @@ func TestSTTOpenRejectsInvalidRequests(t *testing.T) {
 			name: "a signed-url credential",
 			mutate: func(r *runtimepkg.AdapterRequest) {
 				r.Plan.Route.Credential.Kind = protocol.CredentialSignedURL
+			},
+			wantSub: "bearer credential",
+		},
+		{
+			// relay_access is protocol.SessionPlan.Validate's label for a relay
+			// credential; the same validation forbids it on provider_direct, so
+			// the adapter refuses it there rather than treating it as a bearer
+			// synonym.
+			name: "a relay_access credential off the relay route",
+			mutate: func(r *runtimepkg.AdapterRequest) {
+				r.Plan.Route.Credential.Kind = protocol.CredentialRelayAccess
 			},
 			wantSub: "bearer credential",
 		},
