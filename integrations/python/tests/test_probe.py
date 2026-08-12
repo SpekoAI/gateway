@@ -387,6 +387,30 @@ async def test_probe_rearms_flush_when_a_post_fails_with_markers_queued() -> Non
     await probe.aclose()
 
 
+async def test_probe_close_wins_over_deferred_rearm() -> None:
+    # A failed post schedules a deferred re-arm; when aclose runs first, that
+    # callback must not start another flush task racing the shutdown flush,
+    # and every emitted marker must be accounted for exactly once.
+    session = FakeAgentSession()
+    client = BlockedThenFailingClient()
+    probe = ConversationProbe(session, client=client)  # type: ignore[arg-type]
+    probe.start()
+
+    probe._begin_flush()  # conversation.started goes in flight
+    user_state(session, "listening", "speaking")  # two markers queue mid-flight
+    client.release.set()
+    await probe.aclose()
+
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.3)
+    assert probe._flush_timer is None
+    assert probe._flush_task is None or probe._flush_task.done()
+    assert len(probe._pending) == 0
+    # started + turn.started + speech.started + conversation.ended, all failed.
+    assert probe.dropped_events == 4
+
+
 async def test_probe_never_raises_into_the_agent() -> None:
     session = FakeAgentSession()
     client = FailingGatewayClient()

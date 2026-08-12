@@ -517,6 +517,11 @@ class ConversationProbe:
         self._schedule_flush()
 
     def _schedule_flush(self) -> None:
+        if self._closed:
+            # A deferred re-arm (or a stray timer) can fire after aclose has
+            # drained and accounted for everything; scheduling anything now
+            # would race the completed shutdown flush.
+            return
         if self._loop is None:
             try:
                 self._loop = asyncio.get_running_loop()
@@ -534,7 +539,10 @@ class ConversationProbe:
         if self._flush_timer is not None:
             self._flush_timer.cancel()
             self._flush_timer = None
-        if self._loop is None or not self._pending:
+        if self._closed or self._loop is None or not self._pending:
+            # After aclose only its own final flush may run; a timer or
+            # deferred callback that outlived the close must not start a task
+            # that would race shutdown accounting.
             return
         if self._flush_task is not None and not self._flush_task.done():
             # The running flusher drains everything queued so far.
