@@ -12,7 +12,14 @@ const (
 	// plans and rev-4 relay plans coexist, each validator exact-matches its
 	// own revision, and a runtime that predates the relay rejects a relay
 	// plan outright instead of half-understanding it.
-	RelayRevision = 4
+	// RelayLegacyRevision is the original managed-only Relay plan revision.
+	// New connectors keep accepting it as an *implicit managed* plan while the
+	// fleet rolls forward; callers must never attach credential_source to it.
+	RelayLegacyRevision = 4
+	// RelayRevision adds the signed credential source required for Relay BYOK.
+	// A connector that predates this revision rejects it rather than treating a
+	// zero-charge BYOK reservation as managed traffic.
+	RelayRevision = 5
 	// RelayPlanJWSType is the protected-header typ required on a relay-plan
 	// compact JWS. Even under a shared signing key, the typ check stops a
 	// session-plan signature from authorizing a relay dispatch and a
@@ -98,6 +105,10 @@ type RelayPlan struct {
 	// RateCardVersion records the rate card frozen into the attempt's price
 	// lines at admission so settlement disputes are reconstructible.
 	RateCardVersion string `json:"rate_card_version"`
+	// CredentialSource names who owns the provider credential. It is signed
+	// with the plan and is required for revision 5. Revision 4 deliberately
+	// omits it and therefore always means managed credentials.
+	CredentialSource CredentialSource `json:"credential_source,omitempty"`
 	// Budgets carries at least one group with a positive ceiling; groups are
 	// unique and must be legal for Kind.
 	Budgets []RelayBudget `json:"budgets"`
@@ -238,6 +249,9 @@ func (p RelayPlan) Validate(now time.Time) error {
 	if err := p.Requirements.validate(); err != nil {
 		return fmt.Errorf("requirements: %w", err)
 	}
+	if err := p.validateCredentialSource(); err != nil {
+		return fmt.Errorf("credential_source: %w", err)
+	}
 	if strings.TrimSpace(p.Signature) == "" {
 		return fmt.Errorf("signature: required")
 	}
@@ -297,10 +311,37 @@ func (r RelayRequirements) validate() error {
 	if r.Protocol != VoiceV0 {
 		return fmt.Errorf("protocol: got %q, want %q", r.Protocol, VoiceV0)
 	}
-	if r.ProtocolRevision != RelayRevision {
-		return fmt.Errorf("protocol_revision: got %d, want %d", r.ProtocolRevision, RelayRevision)
+	if r.ProtocolRevision != RelayLegacyRevision && r.ProtocolRevision != RelayRevision {
+		return fmt.Errorf("protocol_revision: got %d, want %d or %d", r.ProtocolRevision, RelayLegacyRevision, RelayRevision)
 	}
 	return nil
+}
+
+// validateCredentialSource keeps the rollout boundary explicit. A rev-4 plan
+// has no source claim and is managed by definition; accepting a populated
+// source on rev-4 would let an old connector silently ignore a BYOK claim.
+func (p RelayPlan) validateCredentialSource() error {
+	switch p.Requirements.ProtocolRevision {
+	case RelayLegacyRevision:
+		if p.CredentialSource != "" {
+			return fmt.Errorf("must be omitted for protocol revision %d", RelayLegacyRevision)
+		}
+	case RelayRevision:
+		if p.CredentialSource != CredentialsManaged && p.CredentialSource != CredentialsBYOK {
+			return fmt.Errorf("must be %q or %q for protocol revision %d", CredentialsManaged, CredentialsBYOK, RelayRevision)
+		}
+	}
+	return nil
+}
+
+// EffectiveCredentialSource returns the source an executing connector must
+// use. It is the only compatibility shim: revision 4 is managed, and every
+// revision 5 plan has already been structurally required to state a source.
+func (p RelayPlan) EffectiveCredentialSource() CredentialSource {
+	if p.Requirements.ProtocolRevision == RelayLegacyRevision {
+		return CredentialsManaged
+	}
+	return p.CredentialSource
 }
 
 // validateRelayCredential is shared by the relay access bearer and the
