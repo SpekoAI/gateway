@@ -17,6 +17,7 @@ from typing import Any
 import aiohttp
 
 from .client import _env_secret
+from .probe import report_leg as _report_probe_leg
 
 _DEFAULT_RELAY_URL = "https://relay.speko.dev"
 _TERMINAL_EVENTS = {"response.completed", "error"}
@@ -85,6 +86,7 @@ class RelayLLMClient:
         ) as response:
             if response.status != 200:
                 raise _envelope_error(response.status, await _decode_json(response))
+            _report_llm_leg(response)
             terminal = False
             async for event, payload in _sse_events(response):
                 if event == "error":
@@ -97,6 +99,19 @@ class RelayLLMClient:
                     "relay stream ended without a terminal event",
                     retryable=True,
                 )
+
+
+def _report_llm_leg(response: aiohttp.ClientResponse) -> None:
+    """Bind the relay request ID to the active conversation probe, if any.
+
+    The `Speko-Request-ID` header is the relay's identity namespace for this
+    LLM leg — the only identifier the profiler can use to join relay-side
+    records to a caller turn. Strictly a no-op when no probe is active.
+    """
+
+    request_id = str(response.headers.get("Speko-Request-ID", ""))
+    if request_id:
+        _report_probe_leg("llm", request_id=request_id)
 
 
 async def _sse_events(

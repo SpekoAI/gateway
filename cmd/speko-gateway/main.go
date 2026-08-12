@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -40,12 +41,16 @@ import (
 )
 
 const (
-	maxSecretBytes          = 64 << 10
-	defaultControlPlaneURL  = "https://gateway.speko.dev"
-	defaultTelemetryURL     = "https://gateway.speko.dev/v1/anonymous-runtime-events"
-	defaultPlanAudience     = "speko-runtime"
-	defaultLocalSessionTime = 24 * time.Hour
-	defaultHeartbeatTime    = 20 * time.Second
+	maxSecretBytes         = 64 << 10
+	defaultControlPlaneURL = "https://gateway.speko.dev"
+	defaultTelemetryURL    = "https://gateway.speko.dev/v1/anonymous-runtime-events"
+	// defaultAnonymousTurnEventsURL shares the anonymous telemetry base above:
+	// turn markers without an API key go to the same unauthenticated surface
+	// as anonymous runtime events, just a different path.
+	defaultAnonymousTurnEventsURL = "https://gateway.speko.dev/v1/anonymous-turn-events"
+	defaultPlanAudience           = "speko-runtime"
+	defaultLocalSessionTime       = 24 * time.Hour
+	defaultHeartbeatTime          = 20 * time.Second
 )
 
 var (
@@ -282,6 +287,7 @@ func run() error {
 	var plans gateway.PlanClient
 	var verifier runtimepkg.PlanVerifier
 	var hostedClient *controlplane.Client
+	turnEventDestinations := gateway.TurnEventDestinations{AnonymousEndpoint: defaultAnonymousTurnEventsURL}
 	telemetryExporter, err := runtimepkg.NewTelemetryExporter(runtimepkg.TelemetryExporterConfig{
 		UserAgent:                "speko-gateway/" + version,
 		AnonymousEndpoint:        defaultTelemetryURL,
@@ -337,6 +343,15 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		// Turn markers on a managed route go to the configured control plane
+		// and nowhere else — the endpoint is derived from SPEKO_CONTROL_PLANE_URL
+		// alone, under the same https origin rule the fallback path applies.
+		authenticatedTurnEventsEndpoint, err := turnEventEndpoint(controlURL)
+		if err != nil {
+			return err
+		}
+		turnEventDestinations.AuthenticatedEndpoint = authenticatedTurnEventsEndpoint
+		turnEventDestinations.AuthenticatedToken = apiKey
 		plans = hostedClient
 		verifier, err = runtimepkg.NewPlanVerifier(runtimepkg.PlanVerifierConfig{JWKSURL: jwksURL, Issuer: issuer, Audience: audience})
 		if err != nil {
@@ -372,6 +387,7 @@ func run() error {
 	server, err := gateway.New(gateway.Config{
 		Engine: engine, Plans: plans, WarmPlans: warmPlans, LocalAuthToken: localToken,
 		Runtime: runtimeDescriptor, Workload: workload, MaxSessions: maxSessions,
+		Telemetry: telemetryExporter, TurnEvents: turnEventDestinations,
 	})
 	if err != nil {
 		return err
@@ -536,6 +552,19 @@ func warmRoutesFromEnv() []protocol.SessionPlanRequest {
 		})
 	}
 	return routes
+}
+
+// turnEventEndpoint derives the authenticated turn-event ingest URL from the
+// configured control-plane URL and nothing else. The same https origin shape
+// the control-plane client enforces is checked again here so a future
+// AllowInsecureHTTP escape hatch cannot silently widen where the API key is
+// sent.
+func turnEventEndpoint(controlPlaneURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimRight(controlPlaneURL, "/"))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("SPEKO_CONTROL_PLANE_URL must be an absolute https URL to derive the turn-event endpoint")
+	}
+	return parsed.String() + "/v1/turn-events", nil
 }
 
 func nonNegativeIntEnv(name string, fallback int) (int, error) {

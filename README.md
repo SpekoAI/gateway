@@ -97,6 +97,23 @@ contract. That crosses a different trust boundary: unlike the
 provider-direct voice legs, the conversation history travels through the
 Speko relay.
 
+Optionally, attach the conversation profiler probe to correlate STT, LLM,
+TTS, and playback into per-turn latency traces. It emits content-free timing
+markers only (see [TRUST.md](docs/TRUST.md#conversation-turn-markers)), never
+raises into the agent, and is suppressed by `SPEKO_TELEMETRY_DISABLED=true`:
+
+```python
+from speko_gateway.probe import ConversationProbe
+
+session = AgentSession(stt=STT(), llm=LLM(), tts=TTS())
+probe = ConversationProbe(session)
+probe.start()                  # before session.start()
+
+await session.start(...)
+...
+await probe.aclose()           # during shutdown
+```
+
 Set a local token plus one credential choice:
 
 ```bash

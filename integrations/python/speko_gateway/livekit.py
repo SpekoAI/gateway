@@ -34,7 +34,23 @@ from ._livekit_bridge import (
     LiveKitTTSStream,
 )
 from .client import GatewayClient, GatewayError
+from .probe import report_leg as _report_probe_leg
+from .probe import report_marker as _report_probe_marker
 from .relay import RelayError, RelayLLMClient
+
+
+def _report_stream_leg(kind: str, stream: Any) -> None:
+    """Attach a Gateway stream's leg identity to the active probe, if any.
+
+    Strictly a no-op without an active probe; the getattr defaults keep it a
+    no-op for test fakes that carry no Gateway session identifiers.
+    """
+
+    _report_probe_leg(
+        kind,
+        session_id=str(getattr(stream, "session_id", "") or ""),
+        attempt_id=str(getattr(stream, "attempt_id", "") or ""),
+    )
 
 
 class STT(stt.STT):
@@ -160,6 +176,7 @@ class SpeechStream(stt.RecognizeStream):
 
         try:
             self._gateway_stream = await self._bridge.start(first_frame)
+            _report_stream_leg("stt", self._gateway_stream)
             await self._gateway_stream.push_frame(first_frame)
             send_task = asyncio.create_task(
                 self._send_audio(), name="speko.livekit.stt.send"
@@ -384,7 +401,11 @@ class SynthesisStream(tts.SynthesizeStream):
             return
 
         try:
+            # The synthesis request begins at the Gateway dial, not at the
+            # first audio byte — that difference is the tts_first_audio metric.
+            _report_probe_marker("tts.requested")
             self._gateway_stream = await self._bridge.start()
+            _report_stream_leg("tts", self._gateway_stream)
             self._mark_started()
             await self._gateway_stream.append_text(first_token)
             send_task = asyncio.create_task(
@@ -444,6 +465,7 @@ class SynthesisStream(tts.SynthesizeStream):
         # the emitter would count as a mismatch.
         segment_open = False
         segment_done = False
+        first_audio_reported = False
         async for event in self._gateway_stream.events():
             if segment_done:
                 continue
@@ -455,6 +477,9 @@ class SynthesisStream(tts.SynthesizeStream):
                     )
                 continue
             if event.type == "audio.frame" and event.audio is not None:
+                if not first_audio_reported:
+                    first_audio_reported = True
+                    _report_probe_marker("tts.first_audio")
                 if not segment_open:
                     segment_open = True
                     output_emitter.start_segment(segment_id=utils.shortuuid())
@@ -575,6 +600,8 @@ class RelayLLMStream(llm.LLMStream):
                 retryable=False,
             )
         response_id = utils.shortuuid()
+        _report_probe_marker("llm.requested")
+        first_token_reported = False
         events = self._client.stream_response(request)
         try:
             async for event, payload in events:
@@ -584,6 +611,9 @@ class RelayLLMStream(llm.LLMStream):
                 if event == "response.text.delta":
                     delta = str(payload.get("delta", ""))
                     if delta:
+                        if not first_token_reported:
+                            first_token_reported = True
+                            _report_probe_marker("llm.first_token")
                         self._event_ch.send_nowait(
                             llm.ChatChunk(
                                 id=response_id,
@@ -594,6 +624,9 @@ class RelayLLMStream(llm.LLMStream):
                 if event == "response.item.completed":
                     item = payload.get("item")
                     if isinstance(item, dict) and item.get("type") == "function_call":
+                        if not first_token_reported:
+                            first_token_reported = True
+                            _report_probe_marker("llm.first_token")
                         self._event_ch.send_nowait(
                             llm.ChatChunk(
                                 id=response_id,
@@ -613,6 +646,7 @@ class RelayLLMStream(llm.LLMStream):
                         )
                     continue
                 if event == "response.completed":
+                    _report_probe_marker("llm.completed", ok=True)
                     usage = payload.get("usage")
                     if isinstance(usage, dict):
                         self._event_ch.send_nowait(
@@ -621,11 +655,13 @@ class RelayLLMStream(llm.LLMStream):
                             )
                         )
         except RelayError as err:
+            _report_probe_marker("llm.completed", ok=False)
             suffix = f" ({err.code})" if err.code else ""
             raise APIConnectionError(
                 f"Speko relay LLM failed{suffix}", retryable=err.retryable
             ) from err
         except (aiohttp.ClientError, OSError) as err:
+            _report_probe_marker("llm.completed", ok=False)
             raise APIConnectionError("Speko relay LLM transport failed") from err
         finally:
             await events.aclose()

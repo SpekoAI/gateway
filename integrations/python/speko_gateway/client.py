@@ -101,6 +101,19 @@ class GatewayClient:
         async with self._session.get(f"{_BASE_URL}/readyz") as response:
             return response.status == 200
 
+    async def post_turn_events(self, events: list[dict[str, Any]]) -> None:
+        """POST one content-free turn-marker batch to ``/v1/turn-events``.
+
+        The response is deliberately ignored: retry and deduplication belong
+        to the Gateway's telemetry exporter, so the probe never resends a
+        batch and a failed post costs the caller nothing but the markers.
+        """
+
+        async with self._session.post(
+            f"{_BASE_URL}/v1/turn-events", json={"events": events}
+        ) as response:
+            await response.read()
+
     async def open(
         self, config: SessionConfig, *, idempotency_key: str | None = None
     ) -> GatewaySession:
