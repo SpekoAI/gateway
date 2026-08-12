@@ -14,6 +14,7 @@
   "transport": "websocket",
   "catalog_digest": "sha256:4d0c8e2a9f713b5e6d1c0a8b3f2e9d4c5b6a7f8e9d0c1b2a3f4e5d6c7b8a9f00",
   "rate_card_version": "2026-08-01",
+  "credential_source": "managed",
   "budgets": [
     {
       "group": "tts_characters",
@@ -37,7 +38,7 @@
   "expires_at": "2026-08-01T12:00:30Z",
   "requirements": {
     "protocol": "speko.voice.v0",
-    "protocol_revision": 4
+    "protocol_revision": 5
   },
   "signature": "test-fixture-not-a-real-signature"
 }
