@@ -25,6 +25,25 @@ func TestInstanceHeartbeatCarriesDrainingState(t *testing.T) {
 	}
 }
 
+func TestTurnEventEndpointDerivesOnlyFromHTTPSControlPlaneOrigin(t *testing.T) {
+	endpoint, err := turnEventEndpoint("https://control.speko.test/")
+	if err != nil || endpoint != "https://control.speko.test/v1/turn-events" {
+		t.Fatalf("endpoint = %q err = %v", endpoint, err)
+	}
+	for _, invalid := range []string{
+		"http://control.speko.test",
+		"https://user:secret@control.speko.test",
+		"https://control.speko.test?token=1",
+		"https://control.speko.test#fragment",
+		"control.speko.test",
+		"",
+	} {
+		if _, err := turnEventEndpoint(invalid); err == nil {
+			t.Fatalf("turnEventEndpoint(%q) accepted a non-https origin", invalid)
+		}
+	}
+}
+
 func TestSecretReadsEnvironmentOrFileWithoutAmbiguity(t *testing.T) {
 	t.Run("environment", func(t *testing.T) {
 		t.Setenv("TEST_GATEWAY_SECRET", "  value-from-env  ")

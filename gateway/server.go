@@ -78,22 +78,33 @@ type Config struct {
 	// Now exists for deterministic lease scheduling tests. Production uses the
 	// process wall clock.
 	Now func() time.Time
+	// Telemetry receives validated turn markers from POST /v1/turn-events.
+	// A nil sink discards them, keeping the route harmless for embedders that
+	// never wire an exporter.
+	Telemetry runtimepkg.TelemetrySink
+	// TurnEvents selects the export destination for turn markers. Empty
+	// destinations leave the exporter's own anonymous default in charge.
+	TurnEvents TurnEventDestinations
 }
 
 // Server serves REST setup, canonical WebSocket streaming, readiness/drain,
 // and Prometheus metrics. It holds no permanent provider credential.
 type Server struct {
-	engine             *runtimepkg.Engine
-	plans              PlanClient
-	warmPlans          *PlanPool
-	runtime            protocol.RuntimeDescriptor
-	workload           *protocol.Workload
-	localAuthHash      [sha256.Size]byte
-	maxSessions        int
-	attachTimeout      time.Duration
-	streamWriteTimeout time.Duration
-	setupTimeout       time.Duration
-	now                func() time.Time
+	engine    *runtimepkg.Engine
+	plans     PlanClient
+	warmPlans *PlanPool
+	runtime   protocol.RuntimeDescriptor
+	workload  *protocol.Workload
+	telemetry runtimepkg.TelemetrySink
+	// turnEventDestinations is fixed at construction: the destination for a
+	// turn marker must never be influenced by request data.
+	turnEventDestinations TurnEventDestinations
+	localAuthHash         [sha256.Size]byte
+	maxSessions           int
+	attachTimeout         time.Duration
+	streamWriteTimeout    time.Duration
+	setupTimeout          time.Duration
+	now                   func() time.Time
 
 	mu              sync.Mutex
 	sessions        map[string]*localSession
@@ -235,22 +246,27 @@ func New(config Config) (*Server, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
+	if config.Telemetry == nil {
+		config.Telemetry = runtimepkg.NopTelemetry{}
+	}
 	return &Server{
-		engine:             config.Engine,
-		plans:              config.Plans,
-		warmPlans:          config.WarmPlans,
-		runtime:            config.Runtime,
-		workload:           config.Workload,
-		localAuthHash:      sha256.Sum256([]byte(config.LocalAuthToken)),
-		maxSessions:        config.MaxSessions,
-		attachTimeout:      config.AttachTimeout,
-		streamWriteTimeout: config.StreamWriteTimeout,
-		setupTimeout:       config.SetupTimeout,
-		now:                config.Now,
-		sessions:           make(map[string]*localSession),
-		idempotency:        make(map[string]idempotencyRecord),
-		inflight:           make(map[string]*inflightCreate),
-		drained:            make(chan struct{}),
+		engine:                config.Engine,
+		plans:                 config.Plans,
+		warmPlans:             config.WarmPlans,
+		runtime:               config.Runtime,
+		workload:              config.Workload,
+		telemetry:             config.Telemetry,
+		turnEventDestinations: config.TurnEvents,
+		localAuthHash:         sha256.Sum256([]byte(config.LocalAuthToken)),
+		maxSessions:           config.MaxSessions,
+		attachTimeout:         config.AttachTimeout,
+		streamWriteTimeout:    config.StreamWriteTimeout,
+		setupTimeout:          config.SetupTimeout,
+		now:                   config.Now,
+		sessions:              make(map[string]*localSession),
+		idempotency:           make(map[string]idempotencyRecord),
+		inflight:              make(map[string]*inflightCreate),
+		drained:               make(chan struct{}),
 	}, nil
 }
 
@@ -266,6 +282,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions", s.createSession)
 	mux.HandleFunc("GET /v1/sessions/{session_id}/stream", s.streamSession)
 	mux.HandleFunc("DELETE /v1/sessions/{session_id}", s.deleteSession)
+	mux.HandleFunc("POST /v1/turn-events", s.recordTurnEvents)
 	return mux
 }
 

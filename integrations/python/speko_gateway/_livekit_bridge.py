@@ -148,6 +148,18 @@ class LiveKitTTSStream:
     def __init__(self, session: GatewaySession) -> None:
         self._session = session
 
+    @property
+    def session_id(self) -> str:
+        """Gateway session identifier, exposed for profiler leg attachment."""
+
+        return str(self._session.metadata.get("session_id", ""))
+
+    @property
+    def attempt_id(self) -> str:
+        """Gateway attempt identifier, exposed for profiler leg attachment."""
+
+        return str(self._session.metadata.get("attempt_id", ""))
+
     async def append_text(self, text: str) -> None:
         await self._session.append_text(text)
 
@@ -177,6 +189,18 @@ class LiveKitTTSStream:
 class LiveKitSTTStream:
     def __init__(self, session: GatewaySession) -> None:
         self._session = session
+
+    @property
+    def session_id(self) -> str:
+        """Gateway session identifier, exposed for profiler leg attachment."""
+
+        return str(self._session.metadata.get("session_id", ""))
+
+    @property
+    def attempt_id(self) -> str:
+        """Gateway attempt identifier, exposed for profiler leg attachment."""
+
+        return str(self._session.metadata.get("attempt_id", ""))
 
     async def push_frame(self, frame: AudioFrameLike) -> None:
         await self._session.send_audio(frame.data)

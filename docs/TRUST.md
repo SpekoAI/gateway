@@ -102,10 +102,10 @@ relay-route adapter arms (credential kind `relay_access` alongside
 When a session requests BYOK, the provider key remains in gateway memory and
 is not sent in the setup request. When it requests managed credentials, the
 plan carries a short-lived provider-specific credential. The permanent
-`SPEKO_API_KEY` is used only for control-plane plan/fallback calls and is never
-sent to a provider.
-Fallback calls are restricted to the configured control-plane origin, even
-when a signed plan contains the exchange path.
+`SPEKO_API_KEY` is used only for control-plane plan/fallback/turn-event calls
+and is never sent to a provider.
+Fallback and turn-event calls are restricted to the configured control-plane
+origin, even when a signed plan contains the exchange path.
 
 The selected provider receives the requested model/media options and its
 authentication material. On managed Deepgram STT routes it also receives the
@@ -167,6 +167,33 @@ sent separately to the authenticated endpoint supplied in the signed plan.
 Telemetry delivery is asynchronous, bounded, and never blocks audio or text.
 Events can be dropped under pressure or after bounded retries; counters expose
 that condition without recording customer content.
+
+### Conversation turn markers
+
+The optional conversation profiler (`speko_gateway.probe` in the Python
+integration) reports content-free timing markers per caller turn over the
+local socket (`POST /v1/turn-events`). Conversation and turn identifiers are
+random and opaque — never derived from room names, participant identities, or
+caller IDs. The marker vocabulary is closed; the gateway rejects any batch
+containing an unknown marker type or an unknown data field:
+
+| Marker | Content-free payload |
+| --- | --- |
+| `conversation.started` / `conversation.ended` | integration name/version; end reason and turn count. The gateway adds the configured workload/instance identity and its own version; callers cannot supply those fields. |
+| `turn.started` / `turn.completed` | initiator (`user` or `agent`) |
+| `user.speech.started` / `user.speech.ended` / `user.transcript.final` | timing only — never the transcript |
+| `llm.requested` / `llm.first_token` / `llm.completed` | success flag only — never prompts or output |
+| `tool.started` / `tool.completed` | 1-based tool index and success flag — never tool names, arguments, or results |
+| `tts.requested` / `tts.first_audio` / `playback.started` / `playback.stopped` | interruption flag and playback position — never synthesized text or audio |
+| `interrupt.detected` / `interrupt.cancel_sent` | timing only |
+| `leg.attached` | the session/attempt IDs (STT/TTS) or relay request ID (LLM) already known to Speko, plus optional provider/model names |
+
+Every marker carries a monotonic millisecond stamp and a sequence number and
+nothing else. Turn markers are always optional telemetry: with a Speko API key
+they are posted to the configured control-plane origin (and only there); with
+BYOK they use the anonymous endpoint with no authorization header and no
+account linkage. `SPEKO_TELEMETRY_DISABLED=true` suppresses them entirely —
+no turn marker is ever required for billing.
 
 ## Credential handling
 
