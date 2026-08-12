@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -343,6 +344,47 @@ async def test_probe_batches_at_64_and_drops_beyond_bounded_queue() -> None:
     assert probe.dropped_events == 1300 + 4 - 1024
     # Sequence numbers are only consumed by queued events, so they stay dense.
     assert [event["seq"] for event in events] == list(range(1, 1025))
+
+
+class BlockedThenFailingClient(FakeGatewayClient):
+    """First post blocks until released, then every post fails."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def post_turn_events(self, events: list[dict[str, Any]]) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            await self.release.wait()
+        raise OSError("socket gone")
+
+
+async def test_probe_rearms_flush_when_a_post_fails_with_markers_queued() -> None:
+    # Markers appended while a post is in flight can consume the flush timer
+    # through a no-op _begin_flush; when that post then fails, the leftovers
+    # must be re-armed and drained rather than stranded until the next append.
+    session = FakeAgentSession()
+    client = BlockedThenFailingClient()
+    probe = ConversationProbe(session, client=client)  # type: ignore[arg-type]
+    probe.start()
+
+    probe._begin_flush()  # first batch (conversation.started) goes in flight
+    user_state(session, "listening", "speaking")  # two markers queue mid-flight
+    probe._begin_flush()  # the timer firing mid-flight: consumed, no-op
+    assert probe._flush_timer is None
+
+    client.release.set()  # the in-flight post now fails
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    # Without the re-arm the two queued markers would sit here forever with no
+    # timer and no task. With it, a fresh flush drains and counts them.
+    await asyncio.sleep(0.3)
+    assert probe.dropped_events == 3
+    assert len(probe._pending) == 0
+    await probe.aclose()
 
 
 async def test_probe_never_raises_into_the_agent() -> None:

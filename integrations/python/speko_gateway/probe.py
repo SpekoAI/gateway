@@ -237,6 +237,12 @@ class ConversationProbe:
             await self._flush()
         except Exception:
             _logger.debug("speko probe final flush failed", exc_info=True)
+        if self._pending:
+            # A failed final post bails with markers still queued; the probe
+            # is closed, so account for them instead of leaving the loss
+            # invisible.
+            self.dropped_events += len(self._pending)
+            self._pending.clear()
         if self._owns_client:
             try:
                 await self._client.aclose()
@@ -536,19 +542,29 @@ class ConversationProbe:
         self._flush_task = self._loop.create_task(self._flush())
 
     async def _flush(self) -> None:
-        while self._pending:
-            batch_size = min(_MAX_BATCH_EVENTS, len(self._pending))
-            batch = [self._pending.popleft() for _ in range(batch_size)]
-            try:
-                await self._client.post_turn_events(batch)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # No retry by design: the Gateway exporter owns retry and
-                # deduplication; a failed local post just drops the batch.
-                self.dropped_events += len(batch)
-                _logger.debug("speko probe turn event post failed", exc_info=True)
-                return
+        try:
+            while self._pending:
+                batch_size = min(_MAX_BATCH_EVENTS, len(self._pending))
+                batch = [self._pending.popleft() for _ in range(batch_size)]
+                try:
+                    await self._client.post_turn_events(batch)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # No retry by design: the Gateway exporter owns retry and
+                    # deduplication; a failed local post just drops the batch.
+                    self.dropped_events += len(batch)
+                    _logger.debug("speko probe turn event post failed", exc_info=True)
+                    return
+        finally:
+            # Markers appended while a post was in flight can have consumed
+            # the timer through a no-op _begin_flush; if this task then bails
+            # on a failed post, nothing is armed and the leftovers would
+            # strand until the next append. Re-arm once this task is done —
+            # call_soon runs after the task is marked finished, so the next
+            # _begin_flush actually starts a new one.
+            if self._pending and not self._closed and self._loop is not None:
+                self._loop.call_soon(self._schedule_flush)
 
     def _ensure_playback_listeners(self) -> None:
         if self._audio_output is not None:
