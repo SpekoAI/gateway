@@ -304,8 +304,9 @@ func testRelayPlan(expiresAt time.Time) protocol.RelayPlan {
 		Kind:   protocol.SessionKindLLM,
 		Region: "us-west-2", Provider: "openai", Model: "gpt-4.1-mini",
 		Endpoint: "https://api.openai.com/v1/responses", Transport: protocol.TransportHTTP,
-		CatalogDigest:   "sha256:4d0c8e2a9f713b5e6d1c0a8b3f2e9d4c5b6a7f8e9d0c1b2a3f4e5d6c7b8a9f00",
-		RateCardVersion: "2026-08-01",
+		CatalogDigest:    "sha256:4d0c8e2a9f713b5e6d1c0a8b3f2e9d4c5b6a7f8e9d0c1b2a3f4e5d6c7b8a9f00",
+		RateCardVersion:  "2026-08-01",
+		CredentialSource: protocol.CredentialsManaged,
 		Budgets: []protocol.RelayBudget{
 			{Group: protocol.RelayBudgetGroupLLMInput, CeilingUnits: 4096},
 			{Group: protocol.RelayBudgetGroupLLMOutput, CeilingUnits: 1024},

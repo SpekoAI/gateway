@@ -92,7 +92,10 @@ func TestRelayPlanRejectsInvalidMutations(t *testing.T) {
 		{"missing control token", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.ControlToken = protocol.RelayControlToken{} }, "control_token: value and expires_at are required"},
 		{"control token outlives the plan", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.ControlToken.ExpiresAt = p.ExpiresAt.Add(time.Second) }, "control_token: expiry must not outlive the plan"},
 		{"wrong protocol", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.Requirements.Protocol = "speko.voice.v1" }, "requirements: protocol: got"},
-		{"session-plan revision", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.Requirements.ProtocolRevision = protocol.CurrentRevision }, "protocol_revision: got 3, want 4"},
+		{"prior relay revision", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.Requirements.ProtocolRevision = 4 }, "protocol_revision: got 4, want 5"},
+		{"session-plan revision", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.Requirements.ProtocolRevision = protocol.CurrentRevision }, "protocol_revision: got 3, want 5"},
+		{"missing credential source", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.CredentialSource = "" }, "credential_source: must be \"managed\" or \"byok\""},
+		{"unsupported credential source", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.CredentialSource = "delegated" }, "credential_source: must be \"managed\" or \"byok\""},
 		{"missing signature", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.Signature = "" }, "signature: required"},
 	}
 	for _, testCase := range cases {
@@ -103,6 +106,17 @@ func TestRelayPlanRejectsInvalidMutations(t *testing.T) {
 			testCase.mutate(&plan)
 			assertInvalid(t, plan.Validate(now), testCase.want)
 		})
+	}
+}
+
+func TestRelayPlanAcceptsBYOKCredentialSource(t *testing.T) {
+	t.Parallel()
+
+	var plan protocol.RelayPlan
+	decodeFixture(t, "relay-plan-stt.json", &plan)
+	plan.CredentialSource = protocol.CredentialsBYOK
+	if err := plan.Validate(time.Date(2026, time.August, 1, 11, 59, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("BYOK relay plan must validate: %v", err)
 	}
 }
 
