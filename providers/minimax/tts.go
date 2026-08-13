@@ -292,28 +292,13 @@ func validateGenerationOptions(model, voice string, media protocol.MediaFormat) 
 	return nil
 }
 
-// parseCredential resolves the bearer key. MiniMax authenticates with a single
-// API key, so a bare string is the normal case. A packed JSON envelope
-// {"apiKey":"...","groupId":"..."} is also unwrapped, because some provisioning
-// paths store legacy group-scoped keys that way and sending the whole JSON blob
-// as the bearer token would fail authentication in a thoroughly confusing way.
-// Any groupId in the envelope is deliberately unused: it has no place in the
-// documented T2A wire format. Errors never echo the credential value.
+// parseCredential resolves the bare MiniMax bearer key.
 func parseCredential(raw string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
-	if !strings.HasPrefix(trimmed, "{") {
-		return trimmed, nil
+	if trimmed == "" {
+		return "", errors.New("minimax credential is empty")
 	}
-	var envelope struct {
-		APIKey string `json:"apiKey"`
-	}
-	if err := json.Unmarshal([]byte(trimmed), &envelope); err != nil {
-		return "", errors.New("minimax credential is not valid JSON")
-	}
-	if strings.TrimSpace(envelope.APIKey) == "" {
-		return "", errors.New("minimax credential envelope requires a non-empty apiKey")
-	}
-	return strings.TrimSpace(envelope.APIKey), nil
+	return trimmed, nil
 }
 
 // acceptableCredentialKind reports whether a delegated credential's kind may

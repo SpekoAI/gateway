@@ -81,7 +81,7 @@ Set `SPEKO_WARM_PLAN_TARGET=0` to disable prefetching and fetch every plan at
 session-create time. Sessions then pay a control-plane round trip before the
 provider socket opens.
 
-### Relay plans (revision 4)
+### Relay plans (revision 5)
 
 The Global Speko Relay uses a second, deliberately isolated plan family.
 Relay plans are compact JWS with protected-header typ

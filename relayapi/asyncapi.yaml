@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:d8d53f963ae1c28b59dffad057202f6efa0902ef8b9261a87300e9c7f30ac5ec
-# yaml-body: sha256:e60ac469816f8d8e399eb968d019f2332171f738b7acc3df249ccbf3b4a017b9
+# json-mirror: asyncapi.json sha256:f2aea85a2e2e9325ae27ed265cd06f1622dccaaac6908c6bc2ba68ce903f5855
+# yaml-body: sha256:2c0240a1cb334832fac5d269bcde6ed11cb51bfce43fc85d09e5260b2ec5c548
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -500,19 +500,14 @@ components:
         frame and no HTTP status applies; when the same code is returned over
         HTTP — including a rejected upgrade — it maps to one canonical
         status: 400 capability_unsupported and invalid_request; 401
-        authentication_failed; 402 insufficient_credit; 403 not_entitled and
-        preview_access_required; 409 idempotency_conflict,
+        authentication_failed; 402 insufficient_credit;
+        409 idempotency_conflict,
         request_in_progress, and request_already_started; 413
         payload_too_large; 415 unsupported_media; 429 rate_limited and
         concurrency_exhausted; 500 relay_error; 502 provider_error; 503
-        provider_unavailable. preview_access_required dates from the relay's
-        preview period and is no longer returned now that the relay is
-        generally available; it stays in the closed set so deployed clients
-        keep decoding.
+        provider_unavailable.
       enum:
         - authentication_failed
-        - not_entitled
-        - preview_access_required
         - insufficient_credit
         - capability_unsupported
         - invalid_request

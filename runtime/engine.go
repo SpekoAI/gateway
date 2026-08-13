@@ -381,34 +381,6 @@ func (s *Session) stopLeaseTimer() {
 	s.leaseMu.Unlock()
 }
 
-// RenewLease extends only the local accounting/concurrency deadline. It does
-// not reopen, replace, or otherwise touch the provider stream.
-func (s *Session) RenewLease(lease protocol.SessionLease) error {
-	select {
-	case <-s.done:
-		return ErrSessionClosed
-	default:
-	}
-	s.leaseMu.Lock()
-	current := s.plan
-	current.Reservation.LeaseExpiresAt = s.leaseDeadline
-	if err := lease.Validate(s.now(), current); err != nil {
-		s.leaseMu.Unlock()
-		return fmt.Errorf("runtime: invalid session lease renewal: %w", err)
-	}
-	s.setLeaseDeadlineLocked(lease.ExpiresAt)
-	s.leaseMu.Unlock()
-	s.record("lease.renewed", json.RawMessage(fmt.Sprintf(`{"sequence":%d,"expires_at_ms":%d}`, lease.Sequence, lease.ExpiresAt.UnixMilli())))
-	return nil
-}
-
-// RejectLeaseRenewal terminates the session after an explicit control-plane
-// denial. Transient renewal errors must not call this; the existing lease stays
-// usable until its deadline while the gateway retries.
-func (s *Session) RejectLeaseRenewal() {
-	s.fail(ErrLeaseRenewalDenied)
-}
-
 // Stats returns a point-in-time view of bounded queue usage.
 func (s *Session) Stats() Stats {
 	messages, bytes := s.input.stats()
@@ -733,10 +705,6 @@ func telemetryErrorData(err error) json.RawMessage {
 		code = "session_lease_expired"
 		retryable = true
 	}
-	if errors.Is(err, ErrLeaseRenewalDenied) {
-		code = "session_lease_renewal_denied"
-		retryable = false
-	}
 	var providerError *ProviderError
 	if errors.As(err, &providerError) {
 		code = providerError.Code
@@ -772,10 +740,6 @@ func errorData(err error) json.RawMessage {
 	if errors.Is(err, ErrSessionLeaseExpired) {
 		code = "session_lease_expired"
 		retryable = true
-	}
-	if errors.Is(err, ErrLeaseRenewalDenied) {
-		code = "session_lease_renewal_denied"
-		retryable = false
 	}
 	var providerError *ProviderError
 	if errors.As(err, &providerError) {

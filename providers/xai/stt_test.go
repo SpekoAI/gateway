@@ -864,7 +864,6 @@ func sttAdapterRequest(serverURL string) runtimepkg.AdapterRequest {
 			},
 			Reservation: protocol.Reservation{
 				ID: "res_xai_stt", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute),
-				RenewalURL:  "https://control.speko.test/v1/sessions/sess_xai_stt/lease-renewals",
 				Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_xai_stt", Slots: 1},
 				Usage:       protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 600},
 			},

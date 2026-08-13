@@ -1200,7 +1200,7 @@ func sttGoogleRequest(server *httptest.Server, source protocol.CredentialSource)
 				Transport: protocol.TransportHTTP, Endpoint: endpoint.String(),
 				Credential: &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: sttCredentialFor(source), ExpiresAt: now.Add(time.Hour)},
 			},
-			Reservation:  protocol.Reservation{ID: "res_google_stt", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), RenewalURL: "https://control.speko.test/v1/sessions/sess_google_stt/lease-renewals", Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_google_stt", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 600}},
+			Reservation:  protocol.Reservation{ID: "res_google_stt", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_google_stt", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 600}},
 			Telemetry:    protocol.Telemetry{Endpoint: "https://control.speko.test/v1/runtime-events", Token: "telemetry-token", FlushIntervalMS: 5_000},
 			Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: "test"},
 			Signature:    "test",

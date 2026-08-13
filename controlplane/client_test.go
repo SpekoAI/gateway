@@ -181,44 +181,6 @@ func newClient(t *testing.T, server *httptest.Server, apiKey string) *controlpla
 	return client
 }
 
-func TestClientRenewsWithPlanScopedToken(t *testing.T) {
-	t.Parallel()
-	var serverURL string
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/v1/sessions/session-test/lease-renewals" || request.Header.Get("Authorization") != "Bearer telemetry" {
-			t.Fatalf("renewal request path=%q auth=%q", request.URL.Path, request.Header.Get("Authorization"))
-		}
-		var renewal protocol.SessionLeaseRenewalRequest
-		if err := json.NewDecoder(request.Body).Decode(&renewal); err != nil {
-			t.Fatalf("decode renewal: %v", err)
-		}
-		expiresAt := renewal.LeaseExpiresAt.Add(time.Minute)
-		_ = json.NewEncoder(writer).Encode(protocol.SessionLease{
-			ReservationID: renewal.ReservationID, SessionID: "session-test", AttemptID: renewal.AttemptID,
-			ConcurrencyLeaseID: "lease-test", Sequence: 1,
-			ExpiresAt: expiresAt, RenewAfter: expiresAt.Add(-20 * time.Second),
-		})
-	}))
-	serverURL = server.URL
-	t.Cleanup(server.Close)
-	client, err := controlplane.New(controlplane.Config{BaseURL: serverURL, APIKey: "permanent-api-key", AllowInsecureHTTP: true})
-	if err != nil {
-		t.Fatalf("new client: %v", err)
-	}
-	now := time.Now().UTC()
-	plan := validPlan()
-	plan.Reservation.LeaseExpiresAt = now.Add(time.Minute)
-	plan.Reservation.RenewalURL = serverURL + "/v1/sessions/session-test/lease-renewals"
-	plan.Telemetry.Token = "telemetry"
-	lease, _, err := client.RenewSessionLease(context.Background(), plan)
-	if err != nil {
-		t.Fatalf("renew lease: %v", err)
-	}
-	if lease.Sequence != 1 || !lease.ExpiresAt.Equal(plan.Reservation.LeaseExpiresAt.Add(time.Minute)) {
-		t.Fatalf("lease = %+v", lease)
-	}
-}
-
 func validRequest() protocol.SessionPlanRequest {
 	return protocol.SessionPlanRequest{
 		Kind: protocol.SessionKindSTT, Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision,
@@ -235,7 +197,7 @@ func validPlan() protocol.SessionPlan {
 		PlanID: "plan-test", SessionID: "session-test", AttemptID: "attempt-test", ExpiresAt: now.Add(time.Minute), Signature: "signed-plan",
 		Execution:    protocol.Execution{Placement: protocol.PlacementEmbedded, ProviderRoute: protocol.RouteProviderDirect, CredentialSource: protocol.CredentialsBYOK},
 		Route:        protocol.PlanRoute{Provider: "mock", Model: "model", Adapter: "mock.stt.v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://provider.speko.test/stream"},
-		Reservation:  protocol.Reservation{ID: "reservation-test", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), RenewalURL: "https://control.speko.test/v1/sessions/session-test/lease-renewals", Concurrency: protocol.ConcurrencyReservation{LeaseID: "lease-test", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 60}},
+		Reservation:  protocol.Reservation{ID: "reservation-test", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), Concurrency: protocol.ConcurrencyReservation{LeaseID: "lease-test", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 60}},
 		Telemetry:    protocol.Telemetry{Endpoint: "https://control.speko.test/v1/runtime-events", Token: "telemetry", FlushIntervalMS: 5_000},
 		Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: "test"},
 	}

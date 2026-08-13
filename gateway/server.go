@@ -46,7 +46,6 @@ type PlanClient interface {
 	// PlanPool can keep them warm. A planner with no hosted control plane
 	// behind it — LocalPlanner — returns an error and is simply never pooled.
 	CreateSessionPlanBatch(context.Context, protocol.SessionPlanRequest, int, controlplane.CreateOptions) ([]protocol.SessionPlan, string, error)
-	RenewSessionLease(context.Context, protocol.SessionPlan) (protocol.SessionLease, string, error)
 	// ExchangeFallbackPlan performs the signed one-per-attempt fallback
 	// exchange when provider opening fails before any output was produced.
 	ExchangeFallbackPlan(context.Context, protocol.SessionPlan, controlplane.FallbackRequest, string) (protocol.SessionPlan, string, error)
@@ -117,8 +116,6 @@ type Server struct {
 	sessionsActive  atomic.Int64
 	sessionsTotal   atomic.Uint64
 	authFailures    atomic.Uint64
-	leaseRenewals   atomic.Uint64
-	leaseFailures   atomic.Uint64
 }
 
 // Stats is the bounded, content-free process state safe to report to the
@@ -140,7 +137,6 @@ type localSession struct {
 	attached        bool
 	attachDeadline  time.Time
 	attachmentTimer *time.Timer
-	leaseCancel     context.CancelFunc
 }
 
 // inflightCreate represents the single setup operation permitted for an
@@ -362,8 +358,6 @@ func (s *Server) metrics(writer http.ResponseWriter, request *http.Request) {
 	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_sessions_total Sessions opened by this process.\n# TYPE speko_gateway_sessions_total counter\nspeko_gateway_sessions_total %d\n", s.sessionsTotal.Load())
 	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_draining Whether new sessions are refused.\n# TYPE speko_gateway_draining gauge\nspeko_gateway_draining %d\n", boolMetric(draining))
 	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_auth_failures_total Rejected local authentication attempts.\n# TYPE speko_gateway_auth_failures_total counter\nspeko_gateway_auth_failures_total %d\n", s.authFailures.Load())
-	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_lease_renewals_total Successful session lease renewals.\n# TYPE speko_gateway_lease_renewals_total counter\nspeko_gateway_lease_renewals_total %d\n", s.leaseRenewals.Load())
-	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_lease_renewal_failures_total Failed lease renewal requests.\n# TYPE speko_gateway_lease_renewal_failures_total counter\nspeko_gateway_lease_renewal_failures_total %d\n", s.leaseFailures.Load())
 	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_input_queue_messages Total queued session input messages.\n# TYPE speko_gateway_input_queue_messages gauge\nspeko_gateway_input_queue_messages %d\n", inputMessages)
 	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_input_queue_bytes Total queued session input bytes.\n# TYPE speko_gateway_input_queue_bytes gauge\nspeko_gateway_input_queue_bytes %d\n", inputBytes)
 	_, _ = fmt.Fprintf(writer, "# HELP speko_gateway_telemetry_dropped_total Telemetry events dropped under pressure.\n# TYPE speko_gateway_telemetry_dropped_total counter\nspeko_gateway_telemetry_dropped_total %d\n", telemetryDropped)
@@ -480,12 +474,10 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 		writeCreateOutcome(writer, outcome, false)
 		return
 	}
-	leaseCtx, leaseCancel := context.WithCancel(context.Background())
 	local := &localSession{
 		session:        session,
 		idempotencyKey: idempotencyKey,
 		attachDeadline: s.now().Add(s.attachTimeout),
-		leaseCancel:    leaseCancel,
 	}
 	s.sessions[plan.SessionID] = local
 	s.idempotency[idempotencyKey] = idempotencyRecord{response: response, fingerprint: fingerprint}
@@ -496,9 +488,6 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 	})
 	s.mu.Unlock()
 	go s.removeWhenDone(plan.SessionID, session)
-	if plan.Reservation.RenewalURL != "" {
-		go s.renewSessionLease(leaseCtx, session, plan)
-	}
 	outcome := createOutcome{response: response, status: http.StatusCreated}
 	s.finishCreate(idempotencyKey, inflight, outcome)
 	writeCreateOutcome(writer, outcome, false)
@@ -520,90 +509,6 @@ func (s *Server) sessionPlan(ctx context.Context, request protocol.SessionPlanRe
 		}
 	}
 	return s.plans.CreateSessionPlan(ctx, request, controlplane.CreateOptions{IdempotencyKey: idempotencyKey})
-}
-
-func (s *Server) renewSessionLease(ctx context.Context, session *runtimepkg.Session, plan protocol.SessionPlan) {
-	current := plan
-	retryDelay := 500 * time.Millisecond
-	renewAt := current.Reservation.LeaseExpiresAt.Add(-time.Duration(current.Reservation.LeaseDurationSeconds) * time.Second / 3)
-	for {
-		if renewAt.Before(s.now()) {
-			renewAt = s.now()
-		}
-		timer := time.NewTimer(renewAt.Sub(s.now()))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-session.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-
-		remainingBeforeCall := current.Reservation.LeaseExpiresAt.Sub(s.now())
-		callTimeout := s.setupTimeout
-		if halfRemaining := remainingBeforeCall / 2; halfRemaining > 0 && callTimeout > halfRemaining {
-			callTimeout = halfRemaining
-		}
-		if callTimeout > 5*time.Second {
-			callTimeout = 5 * time.Second
-		}
-		if callTimeout <= 0 {
-			return
-		}
-		callCtx, cancel := context.WithTimeout(ctx, callTimeout)
-		lease, _, err := s.plans.RenewSessionLease(callCtx, current)
-		cancel()
-		if err == nil {
-			if err := session.RenewLease(lease); err != nil {
-				s.leaseFailures.Add(1)
-				session.RejectLeaseRenewal()
-				return
-			}
-			current.Reservation.LeaseExpiresAt = lease.ExpiresAt
-			renewAt = lease.RenewAfter
-			s.leaseRenewals.Add(1)
-			retryDelay = 500 * time.Millisecond
-			continue
-		}
-		s.leaseFailures.Add(1)
-		if leaseRenewalExplicitlyDenied(err) {
-			session.RejectLeaseRenewal()
-			return
-		}
-		// A transport or 5xx failure does not disturb the provider stream. Retry
-		// within the current lease; the runtime's deadline remains the final
-		// fail-closed guard if this process or the control plane stays unavailable.
-		remaining := current.Reservation.LeaseExpiresAt.Sub(s.now())
-		if remaining <= 0 {
-			return
-		}
-		wait := retryDelay
-		if wait > remaining {
-			wait = remaining
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-session.Done():
-			return
-		case <-time.After(wait):
-		}
-		if retryDelay < 5*time.Second {
-			retryDelay *= 2
-		}
-		// Retry immediately instead of waiting for the normal renewal point.
-		renewAt = s.now()
-	}
-}
-
-func leaseRenewalExplicitlyDenied(err error) bool {
-	var httpError *controlplane.HTTPError
-	if !errors.As(err, &httpError) {
-		return false
-	}
-	return httpError.Status >= 400 && httpError.Status < 500 && httpError.Status != http.StatusRequestTimeout
 }
 
 // openWithFallback opens the provider session and performs at most one
@@ -744,9 +649,6 @@ func (s *Server) detachSessionLocked(sessionID string, expected *runtimepkg.Sess
 	}
 	if local.attachmentTimer != nil {
 		local.attachmentTimer.Stop()
-	}
-	if local.leaseCancel != nil {
-		local.leaseCancel()
 	}
 	delete(s.sessions, sessionID)
 	if record, exists := s.idempotency[local.idempotencyKey]; exists && record.response.SessionID == sessionID {

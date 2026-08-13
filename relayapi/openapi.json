@@ -13,7 +13,9 @@
   ],
   "security": [
     {
-      "bearerAuth": []
+      "bearerAuth": [
+
+      ]
     }
   ],
   "paths": {
@@ -403,11 +405,9 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. When an error envelope travels as an HTTP response, each code maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 403 not_entitled and preview_access_required; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable. budget_exhausted and lease_expired terminate streams that are already established — an SSE error event after the 200 — so no HTTP status carries them. preview_access_required dates from the relay's preview period and is no longer returned now that the relay is generally available; it stays in the closed set so deployed clients keep decoding.",
+        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. When an error envelope travels as an HTTP response, each code maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable. budget_exhausted and lease_expired terminate streams that are already established — an SSE error event after the 200 — so no HTTP status carries them.",
         "enum": [
           "authentication_failed",
-          "not_entitled",
-          "preview_access_required",
           "insufficient_credit",
           "capability_unsupported",
           "invalid_request",

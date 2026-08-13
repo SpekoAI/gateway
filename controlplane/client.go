@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/SpekoAI/gateway/protocol"
 )
@@ -172,62 +171,6 @@ func (c *Client) ExchangeFallbackPlan(ctx context.Context, current protocol.Sess
 		return protocol.SessionPlan{}, requestID, err
 	}
 	return plan, requestID, nil
-}
-
-// RenewSessionLease extends the existing reservation while leaving the
-// provider connection untouched. The plan-scoped telemetry token authenticates
-// this call, so a long-running gateway never needs to reuse a permanent API key.
-func (c *Client) RenewSessionLease(ctx context.Context, current protocol.SessionPlan) (protocol.SessionLease, string, error) {
-	if strings.TrimSpace(current.Reservation.RenewalURL) == "" || current.Reservation.LeaseExpiresAt.IsZero() {
-		return protocol.SessionLease{}, "", errors.New("controlplane: current plan does not permit lease renewal")
-	}
-	endpoint, err := url.Parse(current.Reservation.RenewalURL)
-	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "https" && !(c.baseURL.Scheme == "http" && endpoint.Scheme == "http" && endpoint.Host == c.baseURL.Host)) {
-		return protocol.SessionLease{}, "", errors.New("controlplane: lease renewal URL must be absolute https")
-	}
-	value := protocol.SessionLeaseRenewalRequest{
-		ReservationID: current.Reservation.ID, AttemptID: current.AttemptID,
-		LeaseExpiresAt: current.Reservation.LeaseExpiresAt,
-	}
-	body, err := json.Marshal(value)
-	if err != nil {
-		return protocol.SessionLease{}, "", fmt.Errorf("controlplane: encode lease renewal: %w", err)
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
-	if err != nil {
-		return protocol.SessionLease{}, "", fmt.Errorf("controlplane: create lease renewal: %w", err)
-	}
-	request.Header.Set("Authorization", "Bearer "+current.Telemetry.Token)
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Speko-Protocol-Revision", fmt.Sprint(protocol.CurrentRevision))
-	if c.userAgent != "" {
-		request.Header.Set("User-Agent", c.userAgent)
-	}
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return protocol.SessionLease{}, "", fmt.Errorf("controlplane: send lease renewal: %w", err)
-	}
-	defer response.Body.Close()
-	requestID := response.Header.Get("X-Request-ID")
-	body, err = io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-	if err != nil {
-		return protocol.SessionLease{}, requestID, fmt.Errorf("controlplane: read lease renewal: %w", err)
-	}
-	if len(body) > maxResponseBytes {
-		return protocol.SessionLease{}, requestID, errors.New("controlplane: response exceeds size limit")
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return protocol.SessionLease{}, requestID, &HTTPError{Status: response.StatusCode, RequestID: requestID}
-	}
-	var lease protocol.SessionLease
-	if err := json.Unmarshal(body, &lease); err != nil {
-		return protocol.SessionLease{}, requestID, errors.New("controlplane: response did not contain a session lease")
-	}
-	if err := lease.Validate(time.Now(), current); err != nil {
-		return protocol.SessionLease{}, requestID, fmt.Errorf("controlplane: invalid session lease: %w", err)
-	}
-	return lease, requestID, nil
 }
 
 func (c *Client) postPlan(ctx context.Context, endpoint *url.URL, value any, idempotencyKey string, target *protocol.SessionPlan) (string, error) {

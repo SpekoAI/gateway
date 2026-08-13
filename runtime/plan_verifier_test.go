@@ -173,7 +173,7 @@ func testBYOKPlan(now, expiresAt time.Time) protocol.SessionPlan {
 		PlanID: "plan-test", SessionID: "session-test", AttemptID: "attempt-test", ExpiresAt: expiresAt,
 		Execution:    protocol.Execution{Placement: protocol.PlacementEmbedded, ProviderRoute: protocol.RouteProviderDirect, CredentialSource: protocol.CredentialsBYOK},
 		Route:        protocol.PlanRoute{Provider: "mock", Model: "model", Adapter: "mock.stt.v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://provider.speko.test/stream"},
-		Reservation:  protocol.Reservation{ID: "reservation-test", LeaseDurationSeconds: 60, LeaseExpiresAt: expiresAt.Add(time.Minute), RenewalURL: "https://control.speko.test/v1/sessions/session-test/lease-renewals", Concurrency: protocol.ConcurrencyReservation{LeaseID: "lease-test", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 60}},
+		Reservation:  protocol.Reservation{ID: "reservation-test", LeaseDurationSeconds: 60, LeaseExpiresAt: expiresAt.Add(time.Minute), Concurrency: protocol.ConcurrencyReservation{LeaseID: "lease-test", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 60}},
 		Telemetry:    protocol.Telemetry{Endpoint: "https://control.speko.test/v1/runtime-events", Token: "telemetry-token", FlushIntervalMS: 5_000},
 		Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: "test"},
 	}
