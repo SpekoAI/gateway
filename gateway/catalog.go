@@ -57,12 +57,11 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "cartesia", Kind: protocol.SessionKindSTT, Adapter: "cartesia.stt.v1", DefaultModel: "ink-2", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/stt/websocket"},
 	{Provider: "cartesia", Kind: protocol.SessionKindTTS, Adapter: "cartesia.tts.v1", DefaultModel: "sonic-3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket"},
 	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "universal-3-5-pro", Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
-	// Gladia and PlayHT discover their real socket at runtime: an init call returns
+	// Gladia discovers its real socket at runtime: an init call returns
 	// a URL with the session token already embedded. The endpoint here is the
 	// nominal one a plan carries — the adapter derives the init call from it (BYOK)
 	// or ignores it in favour of the credential (managed).
 	{Provider: "gladia", Kind: protocol.SessionKindSTT, Adapter: "gladia.stt.v1", DefaultModel: "solaria-1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gladia.io/v2/live"},
-	{Provider: "playht", Kind: protocol.SessionKindTTS, Adapter: "playht.tts.v1", DefaultModel: "Play3.0-mini", Transport: protocol.TransportWebSocket, Endpoint: "wss://ws.fal.run/playht-fal/playht-tts/stream"},
 	{Provider: "minimax", Kind: protocol.SessionKindTTS, Adapter: "minimax.tts.v1", DefaultModel: "speech-2.8-hd", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.minimax.io/ws/v1/t2a_v2"},
 	{Provider: "xai", Kind: protocol.SessionKindTTS, Adapter: "xai.tts.v1", DefaultModel: "tts", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/tts"},
 	// The first two HTTP-transport rows. The engine is transport-agnostic — it only

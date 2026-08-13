@@ -205,7 +205,6 @@ Every catalog provider has a BYOK credential variable:
 | Inworld | `SPEKO_INWORLD_BYOK_API_KEY` | Base64 portal credential (`key:secret`) |
 | MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
 | OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
-| PlayHT | `SPEKO_PLAYHT_BYOK_USER_ID` + `SPEKO_PLAYHT_BYOK_API_KEY` | Both vendor credential fields are required |
 | Rime | `SPEKO_RIME_BYOK_API_KEY` | API key |
 | Smallest | `SPEKO_SMALLEST_BYOK_API_KEY` | API key |
 | Soniox | `SPEKO_SONIOX_BYOK_API_KEY` | API key |
@@ -243,7 +242,7 @@ Kubernetes secrets—for example,
 `SPEKO_API_KEY_FILE=/run/secrets/speko_api_key`.
 Single-value provider credential files are reread for every new session, so an
 external refresher can replace a short-lived Google OAuth token without
-restarting the Gateway. PlayHT's two credential parts are combined at startup.
+restarting the Gateway.
 
 ## Included provider adapters
 
@@ -257,7 +256,6 @@ restarting the Gateway. PlayHT's two credential parts are combined at startup.
 | TTS | Cartesia | `cartesia.tts.v1` | `sonic-3` |
 | STT | AssemblyAI | `assemblyai.stt.v1` | `universal-3-5-pro` |
 | STT | Gladia | `gladia.stt.v1` | `solaria-1` |
-| TTS | PlayHT | `playht.tts.v1` | `Play3.0-mini` |
 | TTS | MiniMax | `minimax.tts.v1` | `speech-2.8-hd` |
 | STT | xAI | `xai.stt.v1` | `stt` |
 | TTS | xAI | `xai.tts.v1` | `tts` |
