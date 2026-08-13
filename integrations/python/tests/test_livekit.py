@@ -550,12 +550,12 @@ async def test_voice_plugins_forward_provider_and_credential_source() -> None:
 
     tts_plugin = TTS(
         FakeClient(),
-        provider="playht",
+        provider="elevenlabs",
         credential_source="managed",  # type: ignore[arg-type]
     )
     tts_stream = tts_plugin.stream()
     tts_bridge = tts_stream._bridge
-    assert tts_bridge._provider == "playht"
+    assert tts_bridge._provider == "elevenlabs"
     assert tts_bridge._credential_source == "managed"
     await stt_stream.aclose()
     await tts_stream.aclose()

@@ -32,7 +32,6 @@ import (
 	"github.com/SpekoAI/gateway/providers/inworld"
 	"github.com/SpekoAI/gateway/providers/minimax"
 	"github.com/SpekoAI/gateway/providers/openai"
-	"github.com/SpekoAI/gateway/providers/playht"
 	"github.com/SpekoAI/gateway/providers/rime"
 	"github.com/SpekoAI/gateway/providers/smallest"
 	"github.com/SpekoAI/gateway/providers/soniox"
@@ -159,10 +158,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	playhtAdapter, err := playht.New(playht.Config{})
-	if err != nil {
-		return err
-	}
 	xaiAdapter, err := xai.New(xai.Config{})
 	if err != nil {
 		return err
@@ -230,7 +225,7 @@ func run() error {
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
 		cartesiaAdapter, cartesiaSTTAdapter, assemblyAIAdapter, gladiaAdapter,
-		googleAdapter, inworldAdapter, minimaxAdapter, playhtAdapter, xaiAdapter,
+		googleAdapter, inworldAdapter, minimaxAdapter, xaiAdapter,
 		sonioxSTTAdapter, sonioxTTSAdapter, smallestSTTAdapter, smallestTTSAdapter,
 		openaiSTTAdapter, openaiTTSAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,

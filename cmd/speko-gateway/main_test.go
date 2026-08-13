@@ -50,10 +50,9 @@ func TestBYOKCredentialVariablesAreExposedByExamplesAndCompose(t *testing.T) {
 			t.Errorf("docker-compose.yml does not forward %s", spec.Env)
 		}
 	}
-	for _, name := range []string{"SPEKO_PLAYHT_BYOK_USER_ID", "SPEKO_GOOGLE_STT_ENDPOINT"} {
-		if !strings.Contains(string(environment), name+"=") || !strings.Contains(string(compose), name+":") {
-			t.Errorf("configuration surfaces do not expose %s", name)
-		}
+	const googleEndpoint = "SPEKO_GOOGLE_STT_ENDPOINT"
+	if !strings.Contains(string(environment), googleEndpoint+"=") || !strings.Contains(string(compose), googleEndpoint+":") {
+		t.Errorf("configuration surfaces do not expose %s", googleEndpoint)
 	}
 	for _, entry := range gateway.Catalog() {
 		if entry.Kind != protocol.SessionKindTTS {
@@ -63,22 +62,6 @@ func TestBYOKCredentialVariablesAreExposedByExamplesAndCompose(t *testing.T) {
 		if !strings.Contains(string(environment), name+"=") || !strings.Contains(string(compose), name+":") {
 			t.Errorf("configuration surfaces do not expose %s", name)
 		}
-	}
-}
-
-func TestPlayHTAcceptsVendorNativeCredentialParts(t *testing.T) {
-	for _, spec := range localCredentialSpecs {
-		t.Setenv(spec.Env, "")
-		t.Setenv(spec.Env+"_FILE", "")
-	}
-	t.Setenv("SPEKO_PLAYHT_BYOK_USER_ID", "user-123")
-	t.Setenv("SPEKO_PLAYHT_BYOK_API_KEY", "key-456")
-	credentials, err := loadLocalCredentials()
-	if err != nil {
-		t.Fatalf("load local credentials: %v", err)
-	}
-	if got := credentials["playht"].Value; got != "user-123:key-456" {
-		t.Fatalf("PlayHT credential = %q", got)
 	}
 }
 
