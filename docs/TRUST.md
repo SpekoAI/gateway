@@ -125,7 +125,6 @@ The gateway can export:
 | --- | --- |
 | `session.opened` | provider connection latency in milliseconds |
 | `agent.event` | canonical event type and sequence number |
-| `lease.renewed` | renewal sequence and expiry timestamp |
 | `usage.observed` | provider request correlation ID |
 | `usage.reported` | accepted character or complete-PCM duration quantity in thousandths of the declared unit |
 | `session.closed` | no payload |
@@ -152,11 +151,9 @@ event because those records are required to meter and consolidate the provider
 charge. BYOK routes have no mandatory billing records.
 
 Managed billing is post-paid: nothing is authorized before a session starts, and
-usage is settled monthly from these records afterwards. Two things follow.
-`lease.renewed` no longer occurs on a managed provider-direct route — the
-session lease is a ceiling the gateway enforces locally, with no mid-call
-control-plane call — and a lost `usage.reported` now results in that usage not
-being billed rather than in a fallback charge.
+usage is settled monthly from these records afterwards. A lost
+`usage.reported` results in that usage not being billed rather than in a
+fallback charge.
 
 Anonymous BYOK events are sent without an authorization header to
 `https://gateway.speko.dev/v1/anonymous-runtime-events`. The receiver rejects
