@@ -86,7 +86,7 @@ The setup body is provider-neutral:
 }
 ```
 
-Standalone mode requires `credential_source=byok`,
+Local BYOK planning requires `credential_source=byok`,
 `provider_route=provider_direct`, and `relay_policy=forbidden`. If more than one
 configured BYOK provider supports the requested kind, `request.provider` must
 be explicit.

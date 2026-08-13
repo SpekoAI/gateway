@@ -252,35 +252,26 @@ func run() error {
 		Adapters: adapterIDs,
 	}
 
-	localCredentials := make(map[string]runtimepkg.LocalCredential)
-	for provider, name := range map[string]string{
-		"deepgram":   "SPEKO_DEEPGRAM_BYOK_API_KEY",
-		"cartesia":   "SPEKO_CARTESIA_BYOK_API_KEY",
-		"elevenlabs": "SPEKO_ELEVENLABS_BYOK_API_KEY",
-		"assemblyai": "SPEKO_ASSEMBLYAI_BYOK_API_KEY",
-		"gladia":     "SPEKO_GLADIA_BYOK_API_KEY",
-		"google":     "SPEKO_GOOGLE_BYOK_ACCESS_TOKEN",
-		"inworld":    "SPEKO_INWORLD_BYOK_API_KEY",
-		"minimax":    "SPEKO_MINIMAX_BYOK_API_KEY",
-		// PlayHT needs TWO secrets and LocalCredential holds one, so the user id and
-		// key travel packed as "<user_id>:<api_key>". Flagged for review: it is the
-		// one credential convention here that no vendor dictated.
-		"playht":   "SPEKO_PLAYHT_BYOK_API_KEY",
-		"xai":      "SPEKO_XAI_BYOK_API_KEY",
-		"alibaba":  "SPEKO_ALIBABA_BYOK_API_KEY",
-		"gradium":  "SPEKO_GRADIUM_BYOK_API_KEY",
-		"rime":     "SPEKO_RIME_BYOK_API_KEY",
-		"hume":     "SPEKO_HUME_BYOK_API_KEY",
-		"openai":   "SPEKO_OPENAI_BYOK_API_KEY",
-		"soniox":   "SPEKO_SONIOX_BYOK_API_KEY",
-		"smallest": "SPEKO_SMALLEST_BYOK_API_KEY",
-	} {
-		key, err := secret(name)
+	localCredentials, err := loadLocalCredentials()
+	if err != nil {
+		return err
+	}
+	var localPlanner *gateway.LocalPlanner
+	if len(localCredentials) > 0 {
+		maxSessionDuration, err := durationEnv("SPEKO_LOCAL_MAX_SESSION_DURATION", defaultLocalSessionTime)
 		if err != nil {
 			return err
 		}
-		if key != "" {
-			localCredentials[provider] = runtimepkg.LocalCredential{Kind: protocol.CredentialBearer, Value: key}
+		routeOverrides, err := loadLocalRouteOverrides()
+		if err != nil {
+			return err
+		}
+		localPlanner, err = gateway.NewLocalPlanner(gateway.LocalPlannerConfig{
+			Providers: configuredProviders(localCredentials), MaxSessionDuration: maxSessionDuration,
+			RouteOverrides: routeOverrides,
+		})
+		if err != nil {
+			return err
 		}
 	}
 
@@ -304,20 +295,8 @@ func run() error {
 		log.Printf("telemetry exporter: exported=%d suppressed=%d dropped=%d retried=%d failed_batches=%d", stats.Exported, stats.Suppressed, stats.Dropped, stats.Retried, stats.FailedBatches)
 	}()
 	if apiKey == "" {
-		if len(localCredentials) == 0 {
+		if localPlanner == nil {
 			return errors.New("local routing requires at least one SPEKO_<PROVIDER>_BYOK_API_KEY (or _FILE)")
-		}
-		maxSessionDuration, err := durationEnv("SPEKO_LOCAL_MAX_SESSION_DURATION", defaultLocalSessionTime)
-		if err != nil {
-			return err
-		}
-		providers := make([]string, 0, len(localCredentials))
-		for provider := range localCredentials {
-			providers = append(providers, provider)
-		}
-		localPlanner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{Providers: providers, MaxSessionDuration: maxSessionDuration})
-		if err != nil {
-			return err
 		}
 		plans = localPlanner
 		verifier = localPlanner
@@ -352,12 +331,25 @@ func run() error {
 		}
 		turnEventDestinations.AuthenticatedEndpoint = authenticatedTurnEventsEndpoint
 		turnEventDestinations.AuthenticatedToken = apiKey
-		plans = hostedClient
-		verifier, err = runtimepkg.NewPlanVerifier(runtimepkg.PlanVerifierConfig{JWKSURL: jwksURL, Issuer: issuer, Audience: audience})
+		hostedVerifier, err := runtimepkg.NewPlanVerifier(runtimepkg.PlanVerifierConfig{JWKSURL: jwksURL, Issuer: issuer, Audience: audience})
 		if err != nil {
 			return err
 		}
-		log.Printf("routing=speko optional_telemetry=%t", !telemetryDisabled)
+		plans = hostedClient
+		verifier = hostedVerifier
+		if localPlanner != nil {
+			plans, err = gateway.NewCredentialSourcePlanner(localPlanner, hostedClient)
+			if err != nil {
+				return err
+			}
+			verifier = runtimepkg.PlanVerifierFunc(func(ctx context.Context, plan protocol.SessionPlan) error {
+				if plan.Execution.CredentialSource == protocol.CredentialsBYOK {
+					return localPlanner.Verify(ctx, plan)
+				}
+				return hostedVerifier.Verify(ctx, plan)
+			})
+		}
+		log.Printf("routing=speko local_byok_providers=%d optional_telemetry=%t", len(localCredentials), !telemetryDisabled)
 	}
 
 	engine, err := runtimepkg.New(runtimepkg.Config{

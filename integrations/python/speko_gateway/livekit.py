@@ -27,6 +27,7 @@ from livekit.agents.llm.tool_context import get_raw_function_info
 from livekit.agents.utils import is_given
 
 from ._livekit_bridge import (
+    CredentialSource,
     LiveKitSpeechEvent,
     LiveKitSTTBridge,
     LiveKitSTTStream,
@@ -61,7 +62,9 @@ class STT(stt.STT):
         client: GatewayClient | None = None,
         *,
         language: str = "en",
-        model: str = "nova-3",
+        model: str = "auto",
+        provider: str = "auto",
+        credential_source: CredentialSource = "auto",
         sample_rate: int = 16_000,
     ) -> None:
         super().__init__(
@@ -79,6 +82,8 @@ class STT(stt.STT):
         self._owns_client = client is None
         self._language = language
         self._model = model
+        self._provider_name = provider
+        self._credential_source = credential_source
         self._sample_rate = sample_rate
         self._streams: weakref.WeakSet[SpeechStream] = weakref.WeakSet()
 
@@ -124,6 +129,8 @@ class STT(stt.STT):
             self._client,
             language=resolved_language,
             model=self._model,
+            provider=self._provider_name,
+            credential_source=self._credential_source,
         )
         stream = SpeechStream(
             stt_instance=self,
@@ -305,6 +312,7 @@ class TTS(tts.TTS):
         provider: str = "auto",
         sample_rate: int = 24_000,
         max_input_characters: int = 100_000,
+        credential_source: CredentialSource = "auto",
     ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -318,6 +326,7 @@ class TTS(tts.TTS):
         self._model = model
         self._provider_name = provider
         self._max_input_characters = max_input_characters
+        self._credential_source = credential_source
         self._streams: weakref.WeakSet[SynthesisStream] = weakref.WeakSet()
 
     @property
@@ -350,6 +359,7 @@ class TTS(tts.TTS):
             sample_rate=self.sample_rate,
             num_channels=self.num_channels,
             max_input_characters=self._max_input_characters,
+            credential_source=self._credential_source,
         )
         stream = SynthesisStream(
             tts_instance=self,

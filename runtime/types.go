@@ -81,8 +81,12 @@ type OpenRequest struct {
 // local runtime. It is deliberately separate from SessionPlan:
 // BYOK secrets are never sent to, signed by, or logged by the control plane.
 type LocalCredential struct {
-	Kind  protocol.CredentialKind
-	Value string
+	Kind protocol.CredentialKind
+	// Exactly one of Value and ValueFile is configured. ValueFile is reread for
+	// every session so an external OAuth refresher can rotate short-lived tokens
+	// without restarting the Gateway.
+	Value     string
+	ValueFile string
 }
 
 // Adapter is the one provider-specific implementation point in the embedded
