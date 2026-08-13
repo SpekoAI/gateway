@@ -29,8 +29,8 @@ func TestLocalPlannerIssuesVerifiableCredentialFreeBYOKPlan(t *testing.T) {
 	if requestID != "" || plan.Execution.CredentialSource != protocol.CredentialsBYOK || plan.Execution.ProviderRoute != protocol.RouteProviderDirect || plan.Route.Provider != "deepgram" || plan.Route.Credential != nil {
 		t.Fatalf("local plan = %+v, request_id=%q", plan, requestID)
 	}
-	if plan.Telemetry != (protocol.Telemetry{}) || plan.Reservation.RenewalURL != "" {
-		t.Fatalf("local plan unexpectedly carries a remote destination: telemetry=%+v renewal=%q", plan.Telemetry, plan.Reservation.RenewalURL)
+	if plan.Telemetry != (protocol.Telemetry{}) {
+		t.Fatalf("local plan unexpectedly carries a remote destination: telemetry=%+v", plan.Telemetry)
 	}
 	if err := plan.Validate(now); err != nil {
 		t.Fatalf("local plan validation: %v", err)

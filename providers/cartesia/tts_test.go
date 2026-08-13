@@ -352,7 +352,7 @@ func planFor(now time.Time, endpoint string) protocol.SessionPlan {
 			Provider: "cartesia", Model: "sonic-3", Adapter: AdapterID, Transport: protocol.TransportWebSocket, Endpoint: endpoint,
 			Credential: &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "customer-cartesia-key", ExpiresAt: now.Add(30 * time.Minute)},
 		},
-		Reservation:  protocol.Reservation{ID: "res_cartesia", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), RenewalURL: "https://control.speko.test/v1/sessions/sess_cartesia/lease-renewals", Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_cartesia", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitCharacters, AuthorizedUnits: 4_000}},
+		Reservation:  protocol.Reservation{ID: "res_cartesia", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_cartesia", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitCharacters, AuthorizedUnits: 4_000}},
 		Telemetry:    protocol.Telemetry{Endpoint: "https://control.speko.test/v1/runtime-events", Token: "telemetry-token", FlushIntervalMS: 5_000},
 		Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: "0.1.0"},
 		Signature:    "test-signature",

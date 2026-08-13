@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:aae77161a3ed68947d1d5124a50bbd37c2d351ed4fedf6cda3572a42a944ea9e
-# yaml-body: sha256:0dff4f27d20126d846f7ca0c493513c5555c36fbcd464e83f86ee1c8deb34639
+# json-mirror: openapi.json sha256:d1a0451491d2769020519a14efaa9271a7158e72bfa244def092575e02b10a6b
+# yaml-body: sha256:fafb8d08af40e3bfaf909182f142c98c71ddc27edf092864575011f2ef13f92a
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -413,21 +413,16 @@ components:
         these codes and never forwards a raw provider response body. When an
         error envelope travels as an HTTP response, each code maps to one
         canonical status: 400 capability_unsupported and invalid_request;
-        401 authentication_failed; 402 insufficient_credit; 403 not_entitled
-        and preview_access_required; 409 idempotency_conflict,
+        401 authentication_failed; 402 insufficient_credit;
+        409 idempotency_conflict,
         request_in_progress, and request_already_started; 413
         payload_too_large; 415 unsupported_media; 429 rate_limited and
         concurrency_exhausted; 500 relay_error; 502 provider_error; 503
         provider_unavailable. budget_exhausted and lease_expired terminate
         streams that are already established — an SSE error event after the
-        200 — so no HTTP status carries them. preview_access_required dates
-        from the relay's preview period and is no longer returned now that
-        the relay is generally available; it stays in the closed set so
-        deployed clients keep decoding.
+        200 — so no HTTP status carries them.
       enum:
         - authentication_failed
-        - not_entitled
-        - preview_access_required
         - insufficient_credit
         - capability_unsupported
         - invalid_request

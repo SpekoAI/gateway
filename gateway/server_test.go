@@ -12,7 +12,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -250,67 +249,6 @@ func TestGatewayExpiresUnattachedSessions(t *testing.T) {
 	}
 	cleanup := deleteSession(t, httpServer.URL+"/v1/sessions/session-gateway", "local-token")
 	cleanup.Body.Close()
-}
-
-func TestGatewayRenewsLeaseWithoutReopeningProviderStream(t *testing.T) {
-	t.Parallel()
-	now := time.Now().UTC()
-	var opens atomic.Int32
-	adapter := mock.NewAdapter("mock.renewable.stt", func(_ runtimepkg.AdapterRequest) *mock.Stream {
-		opens.Add(1)
-		return mock.NewStream(8)
-	})
-	engine, err := runtimepkg.New(runtimepkg.Config{
-		Adapters:         []runtimepkg.Adapter{adapter},
-		Verifier:         runtimepkg.PlanVerifierFunc(func(context.Context, protocol.SessionPlan) error { return nil }),
-		LocalCredentials: map[string]runtimepkg.LocalCredential{"mock": {Kind: protocol.CredentialBearer, Value: "customer-mock-key"}},
-		Now:              time.Now,
-	})
-	if err != nil {
-		t.Fatalf("new engine: %v", err)
-	}
-	plan := gatewayPlan()
-	plan.Route.Adapter = adapter.ID()
-	plan.ExpiresAt = now.Add(5 * time.Second)
-	plan.Reservation.LeaseDurationSeconds = 1
-	plan.Reservation.LeaseExpiresAt = now.Add(time.Second)
-	plans := &fakePlanClient{plan: plan}
-	server, err := gateway.New(gateway.Config{
-		Engine: engine, Plans: plans, LocalAuthToken: "local-token", Now: time.Now,
-		Runtime:       protocol.RuntimeDescriptor{Name: "go-gateway", Version: "test", InstanceID: "renewal-test", Placement: protocol.PlacementSidecar, ProviderRoutes: []protocol.ProviderRoute{protocol.RouteProviderDirect}, Adapters: []string{adapter.ID()}},
-		AttachTimeout: 5 * time.Second, SetupTimeout: 200 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("new gateway: %v", err)
-	}
-	httpServer := httptest.NewServer(server.Handler())
-	t.Cleanup(httpServer.Close)
-	response := postJSON(t, httpServer.URL+"/v1/sessions", gatewayRequestBody(), "local-token", "renewable-create")
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(response.Body)
-		t.Fatalf("create status = %d: %s", response.StatusCode, body)
-	}
-	var created struct {
-		SessionID string `json:"session_id"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
-		t.Fatalf("decode created session: %v", err)
-	}
-	t.Cleanup(func() {
-		request, _ := http.NewRequest(http.MethodDelete, httpServer.URL+"/v1/sessions/"+created.SessionID, nil)
-		request.Header.Set("Authorization", "Bearer local-token")
-		if deleted, err := http.DefaultClient.Do(request); err == nil {
-			_ = deleted.Body.Close()
-		}
-	})
-	time.Sleep(2300 * time.Millisecond)
-	if got := plans.renewalCallCount(); got < 2 {
-		t.Fatalf("lease renewal calls = %d, want at least 2", got)
-	}
-	if got := opens.Load(); got != 1 {
-		t.Fatalf("provider opens = %d, want one persistent stream", got)
-	}
 }
 
 func TestGatewayAttachmentClaimSurvivesAttachmentTimeout(t *testing.T) {
@@ -837,7 +775,6 @@ type fakePlanClient struct {
 	fallbackPlan     *protocol.SessionPlan
 	fallbackErr      error
 	fallbackRequests []fallbackExchange
-	renewalRequests  []protocol.SessionPlan
 }
 
 type fallbackExchange struct {
@@ -899,25 +836,6 @@ func (c *fakePlanClient) createCallCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.requests)
-}
-
-func (c *fakePlanClient) RenewSessionLease(_ context.Context, current protocol.SessionPlan) (protocol.SessionLease, string, error) {
-	c.mu.Lock()
-	c.renewalRequests = append(c.renewalRequests, current)
-	sequence := len(c.renewalRequests)
-	c.mu.Unlock()
-	expiresAt := current.Reservation.LeaseExpiresAt.Add(time.Duration(current.Reservation.LeaseDurationSeconds) * time.Second)
-	return protocol.SessionLease{
-		ReservationID: current.Reservation.ID, SessionID: current.SessionID, AttemptID: current.AttemptID,
-		ConcurrencyLeaseID: current.Reservation.Concurrency.LeaseID, Sequence: sequence,
-		ExpiresAt: expiresAt, RenewAfter: expiresAt.Add(-time.Duration(current.Reservation.LeaseDurationSeconds) * time.Second / 3),
-	}, "cp_gateway_lease_123", nil
-}
-
-func (c *fakePlanClient) renewalCallCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.renewalRequests)
 }
 
 func (c *fakePlanClient) ExchangeFallbackPlan(_ context.Context, current protocol.SessionPlan, request controlplane.FallbackRequest, idempotencyKey string) (protocol.SessionPlan, string, error) {
@@ -1007,7 +925,7 @@ func gatewayPlan() protocol.SessionPlan {
 		PlanID: "plan-gateway", SessionID: "session-gateway", AttemptID: "attempt-gateway", Signature: "test-signature", ExpiresAt: gatewayNow.Add(time.Hour),
 		Execution:    protocol.Execution{Placement: protocol.PlacementSidecar, ProviderRoute: protocol.RouteProviderDirect, CredentialSource: protocol.CredentialsBYOK},
 		Route:        protocol.PlanRoute{Provider: "mock", Model: "mock-model", Adapter: "mock.stt.v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://provider.speko.test/stream"},
-		Reservation:  protocol.Reservation{ID: "reservation-gateway", LeaseDurationSeconds: 60, LeaseExpiresAt: gatewayNow.Add(time.Minute), RenewalURL: "https://control.speko.test/v1/sessions/session-gateway/lease-renewals", Concurrency: protocol.ConcurrencyReservation{LeaseID: "lease-gateway", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 60}},
+		Reservation:  protocol.Reservation{ID: "reservation-gateway", LeaseDurationSeconds: 60, LeaseExpiresAt: gatewayNow.Add(time.Minute), Concurrency: protocol.ConcurrencyReservation{LeaseID: "lease-gateway", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 60}},
 		Telemetry:    protocol.Telemetry{Endpoint: "https://control.speko.test/v1/runtime-events", Token: "telemetry", FlushIntervalMS: 5_000},
 		Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: "test"},
 	}

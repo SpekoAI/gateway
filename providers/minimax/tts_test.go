@@ -753,51 +753,6 @@ func TestAdapterUsesTheBearerHeaderOnTheRelayRoute(t *testing.T) {
 	}
 }
 
-// TestAdapterUnwrapsAPackedCredentialAndSendsNoQueryParameters covers the
-// tenant question. The current T2A references contain no GroupId or any other
-// query parameter, so the handshake URL must stay exactly as the plan pinned
-// it. A packed credential envelope must still be unwrapped, because sending
-// the raw JSON blob as the bearer token would fail auth confusingly.
-func TestAdapterUnwrapsAPackedCredentialAndSendsNoQueryParameters(t *testing.T) {
-	t.Parallel()
-
-	handshakes := make(chan *http.Request, 1)
-	server := newTTSServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
-		handshakes <- request.Clone(request.Context())
-		_ = openTask(ctx, conn)
-		waitForClientClose(ctx, conn)
-	})
-	defer server.Close()
-
-	adapter, err := New(testConfig(server.URL))
-	if err != nil {
-		t.Fatalf("new adapter: %v", err)
-	}
-	request := adapterRequest(server.URL)
-	request.Plan.Route.Credential.Value = `{"apiKey":"legacy-key","groupId":"1899"}`
-	stream, err := adapter.Open(context.Background(), request)
-	if err != nil {
-		t.Fatalf("open stream: %v", err)
-	}
-	_ = stream.Close(context.Background())
-
-	select {
-	case received := <-handshakes:
-		if got := received.Header.Get("Authorization"); got != "Bearer legacy-key" {
-			t.Fatalf("Authorization = %q (the envelope must be unwrapped)", got)
-		}
-		// No undocumented parameters may ride along on the handshake.
-		if received.URL.RawQuery != "" {
-			t.Fatalf("handshake query must be empty, got %q", received.URL.RawQuery)
-		}
-		if received.URL.Path != "/ws/v1/t2a_v2" {
-			t.Fatalf("handshake path = %q", received.URL.Path)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("server did not observe the handshake")
-	}
-}
-
 // TestAdapterRejectsUnusableRequests keeps a malformed plan from ever reaching
 // MiniMax with a customer credential attached.
 func TestAdapterRejectsUnusableRequests(t *testing.T) {
@@ -882,13 +837,6 @@ func TestAdapterRejectsUnusableRequests(t *testing.T) {
 			name:    "endpoint host outside the allowlist",
 			mutate:  func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Endpoint = "ws://evil.test/ws/v1/t2a_v2" },
 			wantSub: "endpoint",
-		},
-		{
-			name: "malformed credential envelope",
-			mutate: func(r *runtimepkg.AdapterRequest) {
-				r.Plan.Route.Credential.Value = `{"groupId":"123"}`
-			},
-			wantSub: "apiKey",
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {

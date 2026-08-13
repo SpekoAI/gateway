@@ -376,7 +376,7 @@ func elevenLabsRequest(serverURL string, source protocol.CredentialSource) runti
 			Execution:    protocol.Execution{Placement: protocol.PlacementEmbedded, ProviderRoute: protocol.RouteProviderDirect, CredentialSource: source},
 			ExpiresAt:    now.Add(time.Hour),
 			Route:        protocol.PlanRoute{Provider: "elevenlabs", Model: "eleven_flash_v2_5", Adapter: AdapterID, Transport: protocol.TransportWebSocket, Endpoint: endpoint.String(), Credential: &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: credential, ExpiresAt: now.Add(time.Hour)}},
-			Reservation:  protocol.Reservation{ID: "res_el_tts", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), RenewalURL: "https://control.speko.test/v1/sessions/sess_el_tts/lease-renewals", Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_el_tts", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitCharacters, AuthorizedUnits: 4_000}},
+			Reservation:  protocol.Reservation{ID: "res_el_tts", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_el_tts", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitCharacters, AuthorizedUnits: 4_000}},
 			Telemetry:    protocol.Telemetry{Endpoint: "https://control.speko.test/v1/runtime-events", Token: "telemetry-token", FlushIntervalMS: 5_000},
 			Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: "test"}, Signature: "test",
 		},

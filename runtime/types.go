@@ -22,15 +22,8 @@ var (
 	// ErrSessionAborted means the runtime force-terminated the provider stream
 	// because its local consumer or transport could not continue safely.
 	ErrSessionAborted = errors.New("runtime: session aborted")
-	// ErrSessionLeaseExpired means the renewable financial/concurrency lease
-	// was not extended before its deadline. It is not a fixed stream cap.
+	// ErrSessionLeaseExpired means the session reached its fixed deadline.
 	ErrSessionLeaseExpired = errors.New("runtime: session lease expired")
-	// ErrSessionLifetimeExceeded is retained as a source-compatible alias for
-	// integrations built before renewable leases were introduced.
-	ErrSessionLifetimeExceeded = ErrSessionLeaseExpired
-	// ErrLeaseRenewalDenied means the control plane explicitly refused another
-	// lease slice (for example credit, entitlement, or kill-switch policy).
-	ErrLeaseRenewalDenied = errors.New("runtime: session lease renewal denied")
 	// ErrUsageLimitExceeded means accepting the input would exceed the fixed
 	// provider-usage allowance in the signed reservation. Lease renewal cannot
 	// increase this allowance.

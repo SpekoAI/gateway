@@ -153,8 +153,7 @@ type RequestOptions struct {
 }
 
 // UsageUnit identifies the provider quantity whose spend was authorized by a
-// reservation. Time leases and usage authorization are deliberately separate:
-// renewing a lease never changes a character allowance.
+// reservation. Session time and usage authorization are deliberately separate.
 type UsageUnit string
 
 const (
@@ -163,8 +162,7 @@ const (
 )
 
 // UsageReservation is the fixed provider-usage allowance committed before a
-// credential is minted. Character top-ups require a separate authorization
-// flow and are not implied by SessionLease renewal.
+// credential is minted.
 type UsageReservation struct {
 	Unit            UsageUnit `json:"unit"`
 	AuthorizedUnits int64     `json:"authorized_units"`
@@ -218,8 +216,8 @@ type PlanRoute struct {
 	// used only when the caller did not name one. It exists because a caller
 	// sending `provider: "auto"` cannot know which vendor it will get, and a
 	// Cartesia voice id means nothing to ElevenLabs — so the party that picks
-	// the vendor is the only one that can pick a voice for it. Optional: a plan
-	// without it is byte-identical to one from before this field existed.
+	// the vendor is the only one that can pick a voice for it. It is optional
+	// because non-TTS routes do not select voices.
 	Voice      string               `json:"voice,omitempty"`
 	Region     string               `json:"region,omitempty"`
 	Adapter    string               `json:"adapter"`
@@ -240,56 +238,13 @@ func (c DelegatedCredential) String() string {
 	return fmt.Sprintf("%s(redacted, expires_at=%s)", c.Kind, c.ExpiresAt.UTC().Format(time.RFC3339))
 }
 
-// Reservation describes the first renewable capacity lease for a session.
-// LeaseDurationSeconds is the duration of one lease slice, not a maximum stream
-// lifetime. LeaseExpiresAt is the current absolute deadline and RenewalURL is
-// the plan-scoped control-plane endpoint used to extend it without reopening
-// the provider stream.
+// Reservation describes the fixed capacity and usage bounds for a session.
 type Reservation struct {
 	ID                   string                 `json:"id"`
 	LeaseDurationSeconds int                    `json:"lease_duration_seconds"`
 	LeaseExpiresAt       time.Time              `json:"lease_expires_at"`
-	RenewalURL           string                 `json:"renewal_url"`
 	Concurrency          ConcurrencyReservation `json:"concurrency"`
 	Usage                UsageReservation       `json:"usage"`
-}
-
-// SessionLeaseRenewalRequest uses optimistic concurrency at the current
-// deadline. Repeating an identical request is idempotent and returns the same
-// extension; a stale caller cannot manufacture overlapping capacity.
-type SessionLeaseRenewalRequest struct {
-	ReservationID  string    `json:"reservation_id"`
-	AttemptID      string    `json:"attempt_id"`
-	LeaseExpiresAt time.Time `json:"lease_expires_at"`
-}
-
-// SessionLease is a control-plane-authorized extension of an existing
-// reservation. It changes only accounting/concurrency lifetime; the runtime
-// keeps the already-open provider stream and delegated credential untouched.
-type SessionLease struct {
-	ReservationID      string    `json:"reservation_id"`
-	SessionID          string    `json:"session_id"`
-	AttemptID          string    `json:"attempt_id"`
-	ConcurrencyLeaseID string    `json:"concurrency_lease_id"`
-	Sequence           int       `json:"sequence"`
-	ExpiresAt          time.Time `json:"expires_at"`
-	RenewAfter         time.Time `json:"renew_after"`
-}
-
-// Validate checks that a renewal is bound to the active session and advances
-// its current lease. HTTP authentication and TLS protect the control-plane
-// response; the original signed plan protects the renewal endpoint and IDs.
-func (l SessionLease) Validate(now time.Time, plan SessionPlan) error {
-	if l.ReservationID != plan.Reservation.ID || l.SessionID != plan.SessionID || l.AttemptID != plan.AttemptID || l.ConcurrencyLeaseID != plan.Reservation.Concurrency.LeaseID {
-		return fmt.Errorf("session lease: binding does not match session plan")
-	}
-	if l.Sequence < 1 || l.ExpiresAt.IsZero() || !l.ExpiresAt.After(now) || !l.ExpiresAt.After(plan.Reservation.LeaseExpiresAt) {
-		return fmt.Errorf("session lease: expiry must advance the active lease")
-	}
-	if l.RenewAfter.IsZero() || !l.RenewAfter.Before(l.ExpiresAt) {
-		return fmt.Errorf("session lease: renew_after must precede expiry")
-	}
-	return nil
 }
 
 // ConcurrencyReservation identifies the capacity lease consumed by this
@@ -436,11 +391,6 @@ func (p SessionPlan) Validate(now time.Time) error {
 	}
 	if p.Reservation.LeaseExpiresAt.IsZero() || !p.Reservation.LeaseExpiresAt.After(now) {
 		return fmt.Errorf("reservation: lease is expired")
-	}
-	if p.Reservation.RenewalURL != "" {
-		if err := validateSecureURL(p.Reservation.RenewalURL, "https"); err != nil {
-			return fmt.Errorf("reservation.renewal_url: %w", err)
-		}
 	}
 	if strings.TrimSpace(p.Reservation.Concurrency.LeaseID) == "" || p.Reservation.Concurrency.Slots <= 0 {
 		return fmt.Errorf("reservation.concurrency: lease_id and positive slots are required")
