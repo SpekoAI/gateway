@@ -126,6 +126,15 @@ func catalogEntryFor(kind protocol.SessionKind, provider string) (CatalogEntry, 
 	return CatalogEntry{}, false
 }
 
+func catalogEntryForAdapter(adapter string) (CatalogEntry, bool) {
+	for _, entry := range providerCatalog {
+		if entry.Adapter == adapter {
+			return entry, true
+		}
+	}
+	return CatalogEntry{}, false
+}
+
 // catalogModel is one published model row.
 type catalogModel struct {
 	ID        string               `json:"id"`

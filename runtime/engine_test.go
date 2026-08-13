@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -180,6 +182,56 @@ func TestEngineInjectsBYOKCredentialOnlyIntoAdapterRequest(t *testing.T) {
 	}
 	session.Close()
 	collectEvents(t, session)
+}
+
+func TestEngineReloadsFileBackedBYOKCredentialForEverySession(t *testing.T) {
+	t.Parallel()
+	credentialPath := filepath.Join(t.TempDir(), "google-access-token")
+	if err := os.WriteFile(credentialPath, []byte("first-token\n"), 0o600); err != nil {
+		t.Fatalf("write first credential: %v", err)
+	}
+	opened := make(chan runtimepkg.AdapterRequest, 2)
+	adapter := mock.NewAdapter("mock.rotating.stt", func(request runtimepkg.AdapterRequest) *mock.Stream {
+		opened <- request
+		return mock.NewStream(4)
+	})
+	engine, err := runtimepkg.New(runtimepkg.Config{
+		Adapters: []runtimepkg.Adapter{adapter},
+		Verifier: runtimepkg.PlanVerifierFunc(func(context.Context, protocol.SessionPlan) error { return nil }),
+		LocalCredentials: map[string]runtimepkg.LocalCredential{
+			"google": {Kind: protocol.CredentialBearer, ValueFile: credentialPath},
+		},
+		Now: func() time.Time { return fixedNow },
+	})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	open := func() {
+		plan := validPlan(protocol.SessionKindSTT, adapter.ID(), 60)
+		plan.Execution.CredentialSource = protocol.CredentialsBYOK
+		plan.Route.Provider = "google"
+		plan.Route.Credential = nil
+		session, err := engine.Open(context.Background(), runtimepkg.OpenRequest{
+			Kind: protocol.SessionKindSTT, Plan: plan,
+			Media: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1},
+		})
+		if err != nil {
+			t.Fatalf("open session: %v", err)
+		}
+		session.Close()
+		collectEvents(t, session)
+	}
+	open()
+	if got := (<-opened).Plan.Route.Credential.Value; got != "first-token" {
+		t.Fatalf("first credential = %q", got)
+	}
+	if err := os.WriteFile(credentialPath, []byte("second-token\n"), 0o600); err != nil {
+		t.Fatalf("rotate credential: %v", err)
+	}
+	open()
+	if got := (<-opened).Plan.Route.Credential.Value; got != "second-token" {
+		t.Fatalf("rotated credential = %q", got)
+	}
 }
 
 func TestEngineUsesDelegatedCredentialForManagedRoute(t *testing.T) {

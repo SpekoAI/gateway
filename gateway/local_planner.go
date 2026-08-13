@@ -33,14 +33,27 @@ var (
 type LocalPlannerConfig struct {
 	Providers          []string
 	MaxSessionDuration time.Duration
-	Now                func() time.Time
+	// RouteOverrides supplies deployment-specific values that cannot live in
+	// the public catalog. Keys are adapter IDs. Google STT's project-scoped
+	// recognize URL and operator-selected TTS voices are the common cases.
+	RouteOverrides map[string]LocalRouteOverride
+	Now            func() time.Time
 }
 
-// LocalPlanner issues and verifies process-local plans when no Speko API key
-// is configured. HMAC signing preserves the same verify-before-key-injection
-// invariant used by connected plans without contacting Speko.
+// LocalRouteOverride customizes one catalog route in process-local BYOK mode.
+// Empty fields retain the catalog value.
+type LocalRouteOverride struct {
+	Endpoint     string
+	DefaultVoice string
+}
+
+// LocalPlanner issues and verifies process-local BYOK plans. It is used both by
+// a BYOK-only Gateway and by explicit BYOK requests on a mixed managed/BYOK
+// Gateway. HMAC signing preserves the same verify-before-key-injection invariant
+// used by connected plans without contacting Speko.
 type LocalPlanner struct {
 	providers          map[string]struct{}
+	routeOverrides     map[string]LocalRouteOverride
 	maxSessionDuration time.Duration
 	now                func() time.Time
 	key                [sha256.Size]byte
@@ -70,7 +83,23 @@ func NewLocalPlanner(config LocalPlannerConfig) (*LocalPlanner, error) {
 	if len(providers) == 0 {
 		return nil, errors.New("gateway: at least one local provider is required")
 	}
-	planner := &LocalPlanner{providers: providers, maxSessionDuration: config.MaxSessionDuration, now: config.Now}
+	routeOverrides := make(map[string]LocalRouteOverride, len(config.RouteOverrides))
+	for adapter, override := range config.RouteOverrides {
+		adapter = strings.TrimSpace(adapter)
+		if _, ok := catalogEntryForAdapter(adapter); !ok {
+			return nil, fmt.Errorf("gateway: local route override names unknown adapter %q", adapter)
+		}
+		override.Endpoint = strings.TrimSpace(override.Endpoint)
+		override.DefaultVoice = strings.TrimSpace(override.DefaultVoice)
+		if override.Endpoint == "" && override.DefaultVoice == "" {
+			return nil, fmt.Errorf("gateway: local route override for %q is empty", adapter)
+		}
+		routeOverrides[adapter] = override
+	}
+	planner := &LocalPlanner{
+		providers: providers, routeOverrides: routeOverrides,
+		maxSessionDuration: config.MaxSessionDuration, now: config.Now,
+	}
 	if _, err := rand.Read(planner.key[:]); err != nil {
 		return nil, fmt.Errorf("gateway: generate local plan key: %w", err)
 	}
@@ -88,7 +117,7 @@ func (p *LocalPlanner) CreateSessionPlan(_ context.Context, request protocol.Ses
 	if err != nil {
 		return protocol.SessionPlan{}, "", err
 	}
-	route, err := localRoute(request.Kind, provider, request.Request.Model)
+	route, err := p.localRoute(request.Kind, provider, request.Request.Model)
 	if err != nil {
 		return protocol.SessionPlan{}, "", err
 	}
@@ -206,14 +235,19 @@ func supportsLocalKind(provider string, kind protocol.SessionKind) bool {
 	return ok
 }
 
-func localRoute(kind protocol.SessionKind, provider, model string) (protocol.PlanRoute, error) {
+func (p *LocalPlanner) localRoute(kind protocol.SessionKind, provider, model string) (protocol.PlanRoute, error) {
 	entry, ok := catalogEntryFor(kind, provider)
 	if !ok {
 		return protocol.PlanRoute{}, fmt.Errorf("gateway: unsupported local route provider=%q kind=%q", provider, kind)
 	}
+	override := p.routeOverrides[entry.Adapter]
+	endpoint := entry.Endpoint
+	if override.Endpoint != "" {
+		endpoint = override.Endpoint
+	}
 	// Refuse before building a route that cannot dial. Returning the reason beats
 	// letting the adapter send a literal PROJECT_ID and surfacing a vendor 404.
-	if entry.RequiresDeploymentConfig != "" {
+	if entry.RequiresDeploymentConfig != "" && override.Endpoint == "" {
 		return protocol.PlanRoute{}, fmt.Errorf(
 			"gateway: %s %s needs deployment configuration: %s",
 			entry.Provider, kind, entry.RequiresDeploymentConfig)
@@ -222,13 +256,17 @@ func localRoute(kind protocol.SessionKind, provider, model string) (protocol.Pla
 	if model == "" || model == "auto" {
 		model = entry.DefaultModel
 	}
+	voice := entry.DefaultVoice
+	if override.DefaultVoice != "" {
+		voice = override.DefaultVoice
+	}
 	return protocol.PlanRoute{
 		Provider: entry.Provider, Model: model, Adapter: entry.Adapter,
-		Transport: entry.Transport, Endpoint: entry.Endpoint,
+		Transport: entry.Transport, Endpoint: endpoint,
 		// Only ever a fallback. The caller's own request.voice reaches the adapter
 		// directly and takes precedence there, so this fills the blank rather than
 		// overriding a choice.
-		Voice: entry.DefaultVoice,
+		Voice: voice,
 	}, nil
 }
 

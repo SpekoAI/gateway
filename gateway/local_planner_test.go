@@ -92,6 +92,74 @@ func TestLocalPlannerRoutesCartesiaSTT(t *testing.T) {
 	}
 }
 
+func TestLocalPlannerRoutesEveryCatalogEntryWithBYOK(t *testing.T) {
+	t.Parallel()
+	for _, entry := range gateway.Catalog() {
+		entry := entry
+		t.Run(string(entry.Kind)+"/"+entry.Provider, func(t *testing.T) {
+			t.Parallel()
+			overrides := map[string]gateway.LocalRouteOverride{}
+			if entry.RequiresDeploymentConfig != "" {
+				overrides[entry.Adapter] = gateway.LocalRouteOverride{
+					Endpoint: "https://speech.googleapis.com/v2/projects/test-project/locations/eu/recognizers/_:recognize",
+				}
+			}
+			planner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{
+				Providers: []string{entry.Provider}, RouteOverrides: overrides,
+			})
+			if err != nil {
+				t.Fatalf("new local planner: %v", err)
+			}
+			request := localPlanRequest()
+			request.Kind = entry.Kind
+			request.Runtime.Adapters = []string{entry.Adapter}
+			request.Request.Provider = entry.Provider
+			request.Request.Model = "auto"
+			if entry.Kind == protocol.SessionKindTTS {
+				request.Request.MaxInputCharacters = 1_000
+				request.Request.Voice = "test-voice"
+			}
+			plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
+			if err != nil {
+				t.Fatalf("create local plan: %v", err)
+			}
+			if plan.Route.Provider != entry.Provider || plan.Route.Adapter != entry.Adapter || plan.Route.Model != entry.DefaultModel || plan.Route.Transport != entry.Transport {
+				t.Fatalf("route = %+v, catalog = %+v", plan.Route, entry)
+			}
+			if entry.RequiresDeploymentConfig == "" && plan.Route.Endpoint != entry.Endpoint {
+				t.Fatalf("route endpoint = %q, want %q", plan.Route.Endpoint, entry.Endpoint)
+			}
+			if strings.Contains(plan.Route.Endpoint, "PROJECT_ID") {
+				t.Fatalf("route kept placeholder endpoint %q", plan.Route.Endpoint)
+			}
+		})
+	}
+}
+
+func TestLocalPlannerAppliesOperatorVoiceOverride(t *testing.T) {
+	t.Parallel()
+	planner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{
+		Providers: []string{"cartesia"},
+		RouteOverrides: map[string]gateway.LocalRouteOverride{
+			"cartesia.tts.v1": {DefaultVoice: "operator-voice"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("new local planner: %v", err)
+	}
+	request := localPlanRequest()
+	request.Kind = protocol.SessionKindTTS
+	request.Runtime.Adapters = []string{"cartesia.tts.v1"}
+	request.Request = protocol.RequestOptions{Provider: "cartesia", Model: "auto", MaxInputCharacters: 1_000}
+	plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create local plan: %v", err)
+	}
+	if plan.Route.Voice != "operator-voice" {
+		t.Fatalf("route voice = %q", plan.Route.Voice)
+	}
+}
+
 func localPlanRequest() protocol.SessionPlanRequest {
 	return protocol.SessionPlanRequest{
 		Kind: protocol.SessionKindSTT, Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision,

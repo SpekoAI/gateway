@@ -15,23 +15,28 @@ from speko_gateway.livekit import STT, TTS
 session = AgentSession(
     stt=STT(
         language="en",         # default
-        model="nova-3",        # default
+        provider="auto",       # default; set for BYOK when several STT keys exist
+        model="auto",          # default: the provider's catalog default
+        credential_source="auto", # or "byok" / "managed"
         sample_rate=16_000,    # default
     ),
     llm=openai.LLM(model="gpt-4.1-mini"),  # any LiveKit LLM plugin
     tts=TTS(
         provider="auto",       # default: the configured BYOK vendor, or the managed plan's pick
         model="auto",          # default: the provider's catalog default
-        voice="",              # default: plan- or catalog-supplied; BYOK ElevenLabs/Cartesia need one
+        voice="",              # default: request, configured fallback, or catalog default
         language="en",         # default
         sample_rate=24_000,    # default
+        credential_source="auto", # or "byok" / "managed"
     ),
 )
 ```
 
 `STT()` and `TTS()` read `SPEKO_SOCKET_PATH` and `SPEKO_LOCAL_AUTH_TOKEN`.
-Routing mode is derived from `SPEKO_API_KEY`: managed when present, local BYOK
-when absent.
+`credential_source="auto"` preserves the original behavior: managed when
+`SPEKO_API_KEY` is present and local BYOK otherwise. Set `"byok"` explicitly
+to use local provider credentials while retaining a Speko API key for LLM or
+other managed traffic.
 
 With a Speko API key the LLM can come from Speko too, served by the hosted
 relay:

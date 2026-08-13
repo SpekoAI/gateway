@@ -11,6 +11,92 @@ import (
 	"github.com/SpekoAI/gateway/protocol"
 )
 
+func TestEveryCatalogProviderHasAConfigurableBYOKCredential(t *testing.T) {
+	catalogProviders := map[string]struct{}{}
+	for _, entry := range gateway.Catalog() {
+		catalogProviders[entry.Provider] = struct{}{}
+	}
+	configured := map[string]string{}
+	for _, spec := range localCredentialSpecs {
+		if previous := configured[spec.Provider]; previous != "" {
+			t.Fatalf("provider %q has duplicate credential variables %q and %q", spec.Provider, previous, spec.Env)
+		}
+		configured[spec.Provider] = spec.Env
+	}
+	for provider := range catalogProviders {
+		if configured[provider] == "" {
+			t.Fatalf("catalog provider %q has no BYOK credential variable", provider)
+		}
+	}
+	if len(configured) != len(catalogProviders) {
+		t.Fatalf("credential providers = %d, catalog providers = %d", len(configured), len(catalogProviders))
+	}
+}
+
+func TestBYOKCredentialVariablesAreExposedByExamplesAndCompose(t *testing.T) {
+	environment, err := os.ReadFile(filepath.Join("..", "..", ".env.example"))
+	if err != nil {
+		t.Fatalf("read .env.example: %v", err)
+	}
+	compose, err := os.ReadFile(filepath.Join("..", "..", "deploy", "docker-compose.yml"))
+	if err != nil {
+		t.Fatalf("read docker-compose.yml: %v", err)
+	}
+	for _, spec := range localCredentialSpecs {
+		if !strings.Contains(string(environment), spec.Env+"=") {
+			t.Errorf(".env.example does not expose %s", spec.Env)
+		}
+		if !strings.Contains(string(compose), spec.Env+":") {
+			t.Errorf("docker-compose.yml does not forward %s", spec.Env)
+		}
+	}
+	for _, name := range []string{"SPEKO_PLAYHT_BYOK_USER_ID", "SPEKO_GOOGLE_STT_ENDPOINT"} {
+		if !strings.Contains(string(environment), name+"=") || !strings.Contains(string(compose), name+":") {
+			t.Errorf("configuration surfaces do not expose %s", name)
+		}
+	}
+	for _, entry := range gateway.Catalog() {
+		if entry.Kind != protocol.SessionKindTTS {
+			continue
+		}
+		name := "SPEKO_" + strings.ToUpper(entry.Provider) + "_BYOK_TTS_VOICE"
+		if !strings.Contains(string(environment), name+"=") || !strings.Contains(string(compose), name+":") {
+			t.Errorf("configuration surfaces do not expose %s", name)
+		}
+	}
+}
+
+func TestPlayHTAcceptsVendorNativeCredentialParts(t *testing.T) {
+	for _, spec := range localCredentialSpecs {
+		t.Setenv(spec.Env, "")
+		t.Setenv(spec.Env+"_FILE", "")
+	}
+	t.Setenv("SPEKO_PLAYHT_BYOK_USER_ID", "user-123")
+	t.Setenv("SPEKO_PLAYHT_BYOK_API_KEY", "key-456")
+	credentials, err := loadLocalCredentials()
+	if err != nil {
+		t.Fatalf("load local credentials: %v", err)
+	}
+	if got := credentials["playht"].Value; got != "user-123:key-456" {
+		t.Fatalf("PlayHT credential = %q", got)
+	}
+}
+
+func TestLocalRouteOverridesReadGoogleEndpointAndProviderVoice(t *testing.T) {
+	t.Setenv("SPEKO_GOOGLE_STT_ENDPOINT", "https://speech.googleapis.com/v2/projects/test-project/locations/eu/recognizers/_:recognize")
+	t.Setenv("SPEKO_CARTESIA_BYOK_TTS_VOICE", "voice-123")
+	overrides, err := loadLocalRouteOverrides()
+	if err != nil {
+		t.Fatalf("load local route overrides: %v", err)
+	}
+	if got := overrides["google.stt.v1"].Endpoint; !strings.Contains(got, "projects/test-project/") {
+		t.Fatalf("Google STT endpoint = %q", got)
+	}
+	if got := overrides["cartesia.tts.v1"].DefaultVoice; got != "voice-123" {
+		t.Fatalf("Cartesia default voice = %q", got)
+	}
+}
+
 func TestInstanceHeartbeatCarriesDrainingState(t *testing.T) {
 	startedAt := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
 	heartbeat := instanceHeartbeat(
