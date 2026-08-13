@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -33,7 +32,6 @@ var localCredentialSpecs = []localCredentialSpec{
 	{Provider: "inworld", Env: "SPEKO_INWORLD_BYOK_API_KEY"},
 	{Provider: "minimax", Env: "SPEKO_MINIMAX_BYOK_API_KEY"},
 	{Provider: "openai", Env: "SPEKO_OPENAI_BYOK_API_KEY"},
-	{Provider: "playht", Env: "SPEKO_PLAYHT_BYOK_API_KEY"},
 	{Provider: "rime", Env: "SPEKO_RIME_BYOK_API_KEY"},
 	{Provider: "smallest", Env: "SPEKO_SMALLEST_BYOK_API_KEY"},
 	{Provider: "soniox", Env: "SPEKO_SONIOX_BYOK_API_KEY"},
@@ -43,9 +41,6 @@ var localCredentialSpecs = []localCredentialSpec{
 func loadLocalCredentials() (map[string]runtimepkg.LocalCredential, error) {
 	credentials := make(map[string]runtimepkg.LocalCredential)
 	for _, spec := range localCredentialSpecs {
-		if spec.Provider == "playht" {
-			continue
-		}
 		credential, configured, err := credentialFromEnv(spec.Env)
 		if err != nil {
 			return nil, err
@@ -53,13 +48,6 @@ func loadLocalCredentials() (map[string]runtimepkg.LocalCredential, error) {
 		if configured {
 			credentials[spec.Provider] = credential
 		}
-	}
-	playHT, configured, err := playHTCredentialFromEnv()
-	if err != nil {
-		return nil, err
-	}
-	if configured {
-		credentials["playht"] = playHT
 	}
 	return credentials, nil
 }
@@ -86,36 +74,6 @@ func credentialFromEnv(name string) (runtimepkg.LocalCredential, bool, error) {
 	default:
 		return runtimepkg.LocalCredential{}, false, nil
 	}
-}
-
-func playHTCredentialFromEnv() (runtimepkg.LocalCredential, bool, error) {
-	apiKey, err := secret("SPEKO_PLAYHT_BYOK_API_KEY")
-	if err != nil {
-		return runtimepkg.LocalCredential{}, false, err
-	}
-	userID, err := secret("SPEKO_PLAYHT_BYOK_USER_ID")
-	if err != nil {
-		return runtimepkg.LocalCredential{}, false, err
-	}
-	if apiKey == "" && userID == "" {
-		return runtimepkg.LocalCredential{}, false, nil
-	}
-	if userID == "" {
-		// Backward compatibility with the original packed value. New
-		// deployments should use the two vendor-native variables.
-		packedUser, packedKey, found := strings.Cut(apiKey, ":")
-		if !found || strings.TrimSpace(packedUser) == "" || strings.TrimSpace(packedKey) == "" {
-			return runtimepkg.LocalCredential{}, false, errors.New("SPEKO_PLAYHT_BYOK_USER_ID is required with SPEKO_PLAYHT_BYOK_API_KEY")
-		}
-		userID, apiKey = strings.TrimSpace(packedUser), strings.TrimSpace(packedKey)
-	}
-	if apiKey == "" {
-		return runtimepkg.LocalCredential{}, false, errors.New("SPEKO_PLAYHT_BYOK_API_KEY is required with SPEKO_PLAYHT_BYOK_USER_ID")
-	}
-	return runtimepkg.LocalCredential{
-		Kind:  protocol.CredentialBearer,
-		Value: strings.TrimSpace(userID) + ":" + strings.TrimSpace(apiKey),
-	}, true, nil
 }
 
 func loadLocalRouteOverrides() (map[string]gateway.LocalRouteOverride, error) {
