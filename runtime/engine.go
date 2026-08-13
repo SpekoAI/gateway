@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,8 +74,13 @@ func New(config Config) (*Engine, error) {
 	localCredentials := make(map[string]LocalCredential, len(config.LocalCredentials))
 	for provider, credential := range config.LocalCredentials {
 		provider = strings.TrimSpace(provider)
-		if provider == "" || credential.Kind == "" || strings.TrimSpace(credential.Value) == "" {
-			return nil, errors.New("runtime local credentials need a provider, kind, and value")
+		credential.Value = strings.TrimSpace(credential.Value)
+		credential.ValueFile = strings.TrimSpace(credential.ValueFile)
+		if provider == "" || credential.Kind == "" || (credential.Value == "") == (credential.ValueFile == "") {
+			return nil, errors.New("runtime local credentials need a provider, kind, and exactly one value source")
+		}
+		if _, err := resolveLocalCredential(credential); err != nil {
+			return nil, fmt.Errorf("runtime local credential for provider %q: %w", provider, err)
 		}
 		localCredentials[provider] = credential
 	}
@@ -110,8 +117,13 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 			cancel()
 			return nil, fmt.Errorf("runtime: BYOK credential for provider %q is not configured", request.Plan.Route.Provider)
 		}
+		value, err := resolveLocalCredential(credential)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("runtime: load BYOK credential for provider %q: %w", request.Plan.Route.Provider, err)
+		}
 		adapterPlan.Route.Credential = &protocol.DelegatedCredential{
-			Kind: credential.Kind, Value: credential.Value, ExpiresAt: request.Plan.ExpiresAt,
+			Kind: credential.Kind, Value: value, ExpiresAt: request.Plan.ExpiresAt,
 		}
 	}
 	// The caller's own voice always wins; the signed route only fills a blank.
@@ -164,6 +176,34 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	go session.runInput()
 	go session.runEvents()
 	return session, nil
+}
+
+const maxLocalCredentialBytes = 64 << 10
+
+func resolveLocalCredential(credential LocalCredential) (string, error) {
+	if credential.ValueFile == "" {
+		if credential.Value == "" {
+			return "", errors.New("credential value is empty")
+		}
+		return credential.Value, nil
+	}
+	file, err := os.Open(credential.ValueFile)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxLocalCredentialBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxLocalCredentialBytes {
+		return "", fmt.Errorf("credential file exceeds %d bytes", maxLocalCredentialBytes)
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "" {
+		return "", errors.New("credential file is empty")
+	}
+	return value, nil
 }
 
 func validateOpenRequest(request OpenRequest, now time.Time) error {

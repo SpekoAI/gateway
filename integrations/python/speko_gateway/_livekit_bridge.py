@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from .client import (
     CanonicalEvent,
@@ -40,13 +40,23 @@ class LiveKitTTSEvent:
     provider_request_id: str = ""
 
 
-def execution_from_env() -> dict[str, str]:
-    """Match the request to Gateway's configured managed or BYOK mode."""
+CredentialSource = Literal["auto", "byok", "managed"]
 
-    managed = bool(
-        os.environ.get("SPEKO_API_KEY", "").strip()
-        or os.environ.get("SPEKO_API_KEY_FILE", "").strip()
-    )
+
+def execution_from_env(
+    credential_source: CredentialSource = "auto",
+) -> dict[str, str]:
+    """Resolve an explicit credential source or infer it for compatibility."""
+
+    if credential_source not in {"auto", "byok", "managed"}:
+        raise ValueError("credential_source must be 'auto', 'byok', or 'managed'")
+
+    managed = credential_source == "managed"
+    if credential_source == "auto":
+        managed = bool(
+            os.environ.get("SPEKO_API_KEY", "").strip()
+            or os.environ.get("SPEKO_API_KEY_FILE", "").strip()
+        )
     if managed:
         return {
             "provider_route": "auto",
@@ -64,18 +74,30 @@ class LiveKitSTTBridge:
     """Map LiveKit audio-frame semantics to the canonical STT stream."""
 
     def __init__(
-        self, client: GatewayClient, *, language: str = "en", model: str = "nova-3"
+        self,
+        client: GatewayClient,
+        *,
+        language: str = "en",
+        model: str = "auto",
+        provider: str = "auto",
+        credential_source: CredentialSource = "auto",
     ) -> None:
         self._client = client
         self._language = language
         self._model = model
+        self._provider = provider
+        self._credential_source = credential_source
 
     async def start(self, frame: AudioFrameLike) -> LiveKitSTTStream:
         session = await self._client.open(
             SessionConfig(
                 kind="stt",
-                execution=execution_from_env(),
-                request={"language": self._language, "model": self._model},
+                execution=execution_from_env(self._credential_source),
+                request={
+                    "provider": self._provider,
+                    "language": self._language,
+                    "model": self._model,
+                },
                 media={
                     "encoding": "pcm_s16le",
                     "sample_rate_hz": frame.sample_rate,
@@ -105,6 +127,7 @@ class LiveKitTTSBridge:
         sample_rate: int = 24_000,
         num_channels: int = 1,
         max_input_characters: int = 100_000,
+        credential_source: CredentialSource = "auto",
     ) -> None:
         self._client = client
         self._voice = voice
@@ -114,6 +137,7 @@ class LiveKitTTSBridge:
         self._sample_rate = sample_rate
         self._num_channels = num_channels
         self._max_input_characters = max_input_characters
+        self._credential_source = credential_source
 
     async def start(self) -> LiveKitTTSStream:
         request: dict[str, Any] = {
@@ -127,7 +151,7 @@ class LiveKitTTSBridge:
         session = await self._client.open(
             SessionConfig(
                 kind="tts",
-                execution=execution_from_env(),
+                execution=execution_from_env(self._credential_source),
                 request=request,
                 media={
                     "encoding": "pcm_s16le",

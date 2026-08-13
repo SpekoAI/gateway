@@ -59,16 +59,19 @@ from speko_gateway.livekit import STT, TTS
 session = AgentSession(
     stt=STT(
         language="en",         # default
-        model="nova-3",        # default
+        provider="auto",       # default; set when several BYOK STT keys exist
+        model="auto",          # default: the provider's catalog default
+        credential_source="auto", # or "byok" / "managed"
         sample_rate=16_000,    # default
     ),
     llm=openai.LLM(model="gpt-4.1-mini"),  # any LiveKit LLM plugin
     tts=TTS(
         provider="auto",       # default: the configured BYOK vendor, or the managed plan's pick
         model="auto",          # default: the provider's catalog default
-        voice="",              # default: plan- or catalog-supplied; BYOK ElevenLabs/Cartesia need one
+        voice="",              # default: request, configured fallback, or catalog default
         language="en",         # default
         sample_rate=24_000,    # default
+        credential_source="auto", # or "byok" / "managed"
     ),
 )
 ```
@@ -122,13 +125,15 @@ lk agent update-secrets \
   --secrets "SPEKO_LOCAL_AUTH_TOKEN=$(openssl rand -hex 32)" \
   --secrets "SPEKO_API_KEY=your-speko-api-key"
 
-# Or BYOK: omit SPEKO_API_KEY and use your provider key
+# BYOK. SPEKO_API_KEY may remain set for LLM/managed traffic when the voice
+# classes use credential_source="byok".
 lk agent update-secrets \
   --secrets "SPEKO_LOCAL_AUTH_TOKEN=$(openssl rand -hex 32)" \
   --secrets "SPEKO_DEEPGRAM_BYOK_API_KEY=your-deepgram-key"
 ```
 
-Both choices use the same local socket and LiveKit integration. With BYOK,
+Both choices can coexist through the same local socket and LiveKit integration.
+With BYOK,
 provider credentials stay in the Gateway process and anonymous telemetry
 remains on unless explicitly disabled. The local image serves
 provider-direct routes; the hosted Speko relay (`relay.speko.dev`) is a
@@ -165,10 +170,9 @@ is disabled. The exact payloads and trust boundaries are documented in
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SPEKO_LOCAL_AUTH_TOKEN` | required | Local API bearer token |
-| `SPEKO_DEEPGRAM_BYOK_API_KEY` | unset | Local Deepgram key |
-| `SPEKO_ELEVENLABS_BYOK_API_KEY` | unset | Local ElevenLabs key |
-| `SPEKO_CARTESIA_BYOK_API_KEY` | unset | Local Cartesia key |
-| `SPEKO_API_KEY` | unset | Enables Speko-managed routing and billing |
+| `SPEKO_API_KEY` | unset | Enables managed routing, relay, and billing; explicit BYOK remains local |
+| `SPEKO_GOOGLE_STT_ENDPOINT` | unset | Project-scoped Google Speech V2 `:recognize` URL required for Google STT |
+| `SPEKO_<PROVIDER>_BYOK_TTS_VOICE` | catalog default | Operator-selected fallback voice; request voice wins |
 | `SPEKO_TELEMETRY_DISABLED` | `false` | Opts out of telemetry |
 | `SPEKO_SOCKET_PATH` | `/run/speko/runtime.sock` | Absolute Unix socket path |
 | `SPEKO_LOCAL_MAX_SESSION_DURATION` | `24h` | Local BYOK session ceiling |
@@ -184,6 +188,28 @@ is disabled. The exact payloads and trust boundaries are documented in
 | `SPEKO_WARM_PLAN_TARGET` | `4` | Prefetched session plans kept per route; `0` disables prefetching |
 | `SPEKO_WARM_ROUTES` | unset | Routes to warm at startup, `kind:provider[:model[:language]]`, comma-separated |
 | `SPEKO_WARM_TTS_MAX_CHARACTERS` | `100000` | Character allowance requested for warmed TTS routes |
+
+Every catalog provider has a BYOK credential variable:
+
+| Provider | Credential variable | Notes |
+| --- | --- | --- |
+| Alibaba | `SPEKO_ALIBABA_BYOK_API_KEY` | DashScope API key |
+| AssemblyAI | `SPEKO_ASSEMBLYAI_BYOK_API_KEY` | API key |
+| Cartesia | `SPEKO_CARTESIA_BYOK_API_KEY` | API key |
+| Deepgram | `SPEKO_DEEPGRAM_BYOK_API_KEY` | API key |
+| ElevenLabs | `SPEKO_ELEVENLABS_BYOK_API_KEY` | API key |
+| Gladia | `SPEKO_GLADIA_BYOK_API_KEY` | API key used for live-session initialization |
+| Google | `SPEKO_GOOGLE_BYOK_ACCESS_TOKEN` | OAuth access token; prefer `_FILE` for rotation |
+| Gradium | `SPEKO_GRADIUM_BYOK_API_KEY` | API key |
+| Hume | `SPEKO_HUME_BYOK_API_KEY` | API key |
+| Inworld | `SPEKO_INWORLD_BYOK_API_KEY` | Base64 portal credential (`key:secret`) |
+| MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
+| OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
+| PlayHT | `SPEKO_PLAYHT_BYOK_USER_ID` + `SPEKO_PLAYHT_BYOK_API_KEY` | Both vendor credential fields are required |
+| Rime | `SPEKO_RIME_BYOK_API_KEY` | API key |
+| Smallest | `SPEKO_SMALLEST_BYOK_API_KEY` | API key |
+| Soniox | `SPEKO_SONIOX_BYOK_API_KEY` | API key |
+| xAI | `SPEKO_XAI_BYOK_API_KEY` | API key |
 
 ## Zero-overhead session setup
 
@@ -215,6 +241,9 @@ and already cost nothing.
 Every secret also supports an exclusive `*_FILE` form for Docker and
 Kubernetes secrets—for example,
 `SPEKO_API_KEY_FILE=/run/secrets/speko_api_key`.
+Single-value provider credential files are reread for every new session, so an
+external refresher can replace a short-lived Google OAuth token without
+restarting the Gateway. PlayHT's two credential parts are combined at startup.
 
 ## Included provider adapters
 
@@ -222,9 +251,32 @@ Kubernetes secrets—for example,
 | --- | --- | --- | --- |
 | STT | Deepgram | `deepgram.stt.v1` | `nova-3` |
 | TTS | Deepgram | `deepgram.tts.v1` | `aura-2-thalia-en` |
+| STT | ElevenLabs | `elevenlabs.stt.v1` | `scribe_v2_realtime` |
 | TTS | ElevenLabs | `elevenlabs.tts.v1` | `eleven_flash_v2_5` |
-| TTS | Cartesia | `cartesia.tts.v1` | `sonic-3` |
 | STT | Cartesia | `cartesia.stt.v1` | `ink-2` |
+| TTS | Cartesia | `cartesia.tts.v1` | `sonic-3` |
+| STT | AssemblyAI | `assemblyai.stt.v1` | `universal-3-5-pro` |
+| STT | Gladia | `gladia.stt.v1` | `solaria-1` |
+| TTS | PlayHT | `playht.tts.v1` | `Play3.0-mini` |
+| TTS | MiniMax | `minimax.tts.v1` | `speech-2.8-hd` |
+| STT | xAI | `xai.stt.v1` | `stt` |
+| TTS | xAI | `xai.tts.v1` | `tts` |
+| STT | Google | `google.stt.v1` | `chirp_3` |
+| TTS | Google | `google.tts.v1` | `chirp-3-hd` |
+| STT | Alibaba | `alibaba.stt.v1` | `qwen3-asr-flash-realtime` |
+| TTS | Alibaba | `alibaba.tts.v1` | `qwen3-tts-flash-realtime` |
+| STT | Gradium | `gradium.stt.v1` | `default` |
+| TTS | Gradium | `gradium.tts.v1` | `default` |
+| TTS | Rime | `rime.tts.v1` | `coda` |
+| TTS | Hume | `hume.tts.v1` | `octave-2` |
+| STT | Inworld | `inworld.stt.v1` | `inworld-stt-1` |
+| TTS | Inworld | `inworld.tts.v1` | `inworld-tts-2` |
+| STT | OpenAI | `openai.stt.v1` | `gpt-live-transcribe` |
+| TTS | OpenAI | `openai.tts.v1` | `gpt-4o-mini-tts` |
+| STT | Soniox | `soniox.stt.v1` | `stt-rt-v5` |
+| TTS | Soniox | `soniox.tts.v1` | `tts-rt-v1` |
+| STT | Smallest | `smallest.stt.v1` | `pulse` |
+| TTS | Smallest | `smallest.tts.v1` | `lightning_v3.1` |
 
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.

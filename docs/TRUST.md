@@ -22,9 +22,9 @@ Provider media and text flow directly between the agent process, this gateway,
 and the selected provider. They are not proxied through Speko when the route is
 `provider_direct`.
 
-## BYOK without a Speko key
+## Local BYOK
 
-When `SPEKO_API_KEY` is absent:
+When a request selects BYOK and a matching local provider credential exists:
 
 - Plans are generated and HMAC-signed in process.
 - A request must choose BYOK, provider-direct routing, and forbid relay.
@@ -40,8 +40,10 @@ server can observe transport metadata such as the source IP address.
 
 ## With a Speko key
 
-Setting `SPEKO_API_KEY` enables setup calls to the Speko control plane. The
-gateway sends a provider-neutral session request containing:
+Setting `SPEKO_API_KEY` enables setup calls to the Speko control plane for
+managed requests. Explicit BYOK requests continue to use the in-process local
+planner and never send their setup metadata or credential to Speko. For a
+managed request, the gateway sends a provider-neutral session request containing:
 
 - session kind and protocol revision;
 - gateway version, instance identifier, installed adapters, and route support;
