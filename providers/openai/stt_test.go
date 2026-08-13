@@ -18,10 +18,9 @@ import (
 )
 
 // TestSTTOpenSendsDocumentedSessionUpdate pins the whole handshake: the path,
-// the auth header, the ABSENCE of a query string, and every field name in the
-// session.update body. Each literal below is transcribed from OpenAI's raw
-// sources rather than referenced from a package constant, so a typo in the
-// adapter fails here instead of shipping.
+// transcription intent, auth header, and every field name in the session.update
+// body. Each literal below is independent of package constants, so a typo in
+// the adapter fails here instead of shipping.
 func TestSTTOpenSendsDocumentedSessionUpdate(t *testing.T) {
 	t.Parallel()
 
@@ -37,11 +36,11 @@ func TestSTTOpenSendsDocumentedSessionUpdate(t *testing.T) {
 	if handshake.URL.Path != "/v1/realtime" {
 		t.Errorf("path = %q, want /v1/realtime", handshake.URL.Path)
 	}
-	// The TypeScript provider dials `?intent=transcription`. That parameter is in
-	// no OpenAI source; a transcription session is selected by the body. If it
-	// ever creeps back in, this fails.
-	if handshake.URL.RawQuery != "" {
-		t.Errorf("query = %q, want no query parameters", handshake.URL.RawQuery)
+	if got := handshake.URL.Query().Get("intent"); got != "transcription" {
+		t.Errorf("intent = %q, want transcription", got)
+	}
+	if len(handshake.URL.Query()) != 1 {
+		t.Errorf("query = %q, want only intent=transcription", handshake.URL.RawQuery)
 	}
 	if got := handshake.Header.Get("Authorization"); got != "Bearer customer-openai-key" {
 		t.Errorf("Authorization = %q", got)
@@ -109,8 +108,8 @@ func TestSTTRelayRouteSendsTheConnectorKeyAsBearer(t *testing.T) {
 			if got := handshake.Header.Get("Authorization"); got != "Bearer connector-openai-key" {
 				t.Errorf("Authorization = %q", got)
 			}
-			if handshake.URL.RawQuery != "" {
-				t.Errorf("relay handshake query = %q, want none", handshake.URL.RawQuery)
+			if got := handshake.URL.Query().Get("intent"); got != "transcription" {
+				t.Errorf("relay handshake intent = %q, want transcription", got)
 			}
 		})
 	}

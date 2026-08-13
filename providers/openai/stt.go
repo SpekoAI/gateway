@@ -28,15 +28,12 @@ const (
 	// OpenAPI document declares a single server, `https://api.openai.com/v1`.
 	officialAPIHost = "api.openai.com"
 
-	// sttRealtimePath is the Realtime socket. CONFIRMED raw: the WebSocket guide
-	// connects to `wss://api.openai.com/v1/realtime`.
-	//
-	// The platform's TypeScript provider dials
-	// `wss://api.openai.com/v1/realtime?intent=transcription`. `intent` appears
-	// NOWHERE in OpenAI's OpenAPI document or in any current guide — it is a
-	// leftover from the sunset beta transcription-session flow. A transcription
-	// session is selected by the `session.update` body (`session.type` =
-	// "transcription"), not by a query parameter, so this adapter sends none.
+	// sttRealtimePath is the Realtime socket. Transcription sessions require
+	// `intent=transcription` on the handshake URL in addition to
+	// `session.type="transcription"` in the update body. Without the intent the
+	// service creates a regular realtime session and rejects the update; observed
+	// live as `missing_model` followed by "Passing a transcription session update
+	// to a realtime session is not allowed" when a regular model is supplied.
 	sttRealtimePath = "/v1/realtime"
 
 	// DefaultSTTModel is OpenAI's recommended realtime transcription model.
@@ -263,6 +260,9 @@ func sttRealtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint string) (s
 	if endpoint.Path != sttRealtimePath {
 		return "", fmt.Errorf("openai stt endpoint path must be %s, got %q", sttRealtimePath, endpoint.Path)
 	}
+	query := endpoint.Query()
+	query.Set("intent", "transcription")
+	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil
 }
 
