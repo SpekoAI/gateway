@@ -25,7 +25,6 @@ const (
 var (
 	ErrLocalModeRequiresBYOK = errors.New("gateway: local routing requires provider-direct BYOK execution")
 	ErrLocalPlanSignature    = errors.New("gateway: invalid local session plan signature")
-	ErrLocalPlanRenewal      = errors.New("gateway: local session plans are not renewable")
 )
 
 // LocalPlannerConfig describes the credentials and limits available to a
@@ -134,10 +133,6 @@ func (p *LocalPlanner) CreateSessionPlan(_ context.Context, request protocol.Ses
 // prefetching it would add bookkeeping to save nothing.
 func (p *LocalPlanner) CreateSessionPlanBatch(context.Context, protocol.SessionPlanRequest, int, controlplane.CreateOptions) ([]protocol.SessionPlan, string, error) {
 	return nil, "", errors.New("gateway: local session plans are not prefetched")
-}
-
-func (p *LocalPlanner) RenewSessionLease(context.Context, protocol.SessionPlan) (protocol.SessionLease, string, error) {
-	return protocol.SessionLease{}, "", ErrLocalPlanRenewal
 }
 
 func (p *LocalPlanner) ExchangeFallbackPlan(context.Context, protocol.SessionPlan, controlplane.FallbackRequest, string) (protocol.SessionPlan, string, error) {

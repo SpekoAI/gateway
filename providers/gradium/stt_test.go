@@ -767,7 +767,6 @@ func planFor(adapterID, endpoint string) protocol.SessionPlan {
 		},
 		Reservation: protocol.Reservation{
 			ID: "res_gradium", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute),
-			RenewalURL:  "https://control.speko.test/v1/sessions/sess_gradium/lease-renewals",
 			Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_gradium", Slots: 1},
 			Usage:       protocol.UsageReservation{Unit: protocol.UsageUnitCharacters, AuthorizedUnits: 4_000},
 		},

@@ -10,8 +10,8 @@ func TestErrorCodeSetIsClosedAndValid(t *testing.T) {
 	t.Parallel()
 
 	codes := relayapi.ErrorCodes()
-	if len(codes) != 18 {
-		t.Fatalf("closed code set has %d codes, want 18", len(codes))
+	if len(codes) != 16 {
+		t.Fatalf("closed code set has %d codes, want 16", len(codes))
 	}
 	seen := make(map[relayapi.ErrorCode]bool, len(codes))
 	for _, code := range codes {

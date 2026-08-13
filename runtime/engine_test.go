@@ -368,7 +368,7 @@ func TestAbortMakesSessionTerminalWithoutGracefulDrain(t *testing.T) {
 	assertTypes(t, events, []protocol.EventType{protocol.EventSessionReady, protocol.EventError})
 }
 
-func TestSessionExpiresWhenRenewableLeaseIsNotExtended(t *testing.T) {
+func TestSessionExpiresAtFixedDeadline(t *testing.T) {
 	t.Parallel()
 
 	adapter := mock.NewSTTAdapter("mock.reservation.stt")
@@ -376,8 +376,8 @@ func TestSessionExpiresWhenRenewableLeaseIsNotExtended(t *testing.T) {
 	session := openSessionWithReservation(t, engine, protocol.SessionKindSTT, adapter.ID(), 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := session.Wait(ctx); !errors.Is(err, runtimepkg.ErrSessionLifetimeExceeded) {
-		t.Fatalf("reservation expiry error = %v, want ErrSessionLifetimeExceeded", err)
+	if err := session.Wait(ctx); !errors.Is(err, runtimepkg.ErrSessionLeaseExpired) {
+		t.Fatalf("reservation expiry error = %v, want ErrSessionLeaseExpired", err)
 	}
 	events := collectEvents(t, session)
 	assertTypes(t, events, []protocol.EventType{protocol.EventSessionReady, protocol.EventError})
@@ -392,45 +392,6 @@ func TestSessionExpiresWhenRenewableLeaseIsNotExtended(t *testing.T) {
 	if data.Code != "session_lease_expired" || data.Source != "runtime" || !data.Retryable {
 		t.Fatalf("terminal data = %+v", data)
 	}
-}
-
-func TestLeaseRenewalKeepsSameProviderStreamPastPlanAndInitialLease(t *testing.T) {
-	t.Parallel()
-
-	var opens atomic.Int32
-	adapter := mock.NewAdapter("mock.renewable.stt", func(_ runtimepkg.AdapterRequest) *mock.Stream {
-		opens.Add(1)
-		return mock.NewStream(8)
-	})
-	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), runtimepkg.NopTelemetry{})
-	plan := validPlan(protocol.SessionKindSTT, adapter.ID(), 1)
-	plan.ExpiresAt = fixedNow.Add(40 * time.Millisecond)
-	plan.Reservation.LeaseExpiresAt = fixedNow.Add(80 * time.Millisecond)
-	session, err := engine.Open(context.Background(), runtimepkg.OpenRequest{
-		Kind: protocol.SessionKindSTT, Plan: plan,
-		Media: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1},
-	})
-	if err != nil {
-		t.Fatalf("open renewable session: %v", err)
-	}
-	if err := session.RenewLease(protocol.SessionLease{
-		ReservationID: plan.Reservation.ID, SessionID: plan.SessionID, AttemptID: plan.AttemptID,
-		ConcurrencyLeaseID: plan.Reservation.Concurrency.LeaseID, Sequence: 1,
-		ExpiresAt: fixedNow.Add(250 * time.Millisecond), RenewAfter: fixedNow.Add(180 * time.Millisecond),
-	}); err != nil {
-		t.Fatalf("renew lease: %v", err)
-	}
-	time.Sleep(130 * time.Millisecond) // beyond both the grant/plan and first lease
-	select {
-	case <-session.Done():
-		t.Fatalf("renewed session ended early: %v", session.Err())
-	default:
-	}
-	if got := opens.Load(); got != 1 {
-		t.Fatalf("provider opens = %d, want the original stream only", got)
-	}
-	session.Close()
-	collectEvents(t, session)
 }
 
 func TestEngineRequiresVerifier(t *testing.T) {
@@ -672,7 +633,7 @@ func validPlan(kind protocol.SessionKind, adapterID string, leaseDurationSeconds
 			Transport: protocol.TransportWebSocket,
 			Endpoint:  "wss://mock.speko.test/session",
 		},
-		Reservation: protocol.Reservation{ID: "res_test", LeaseDurationSeconds: leaseDurationSeconds, LeaseExpiresAt: fixedNow.Add(time.Duration(leaseDurationSeconds) * time.Second), RenewalURL: "https://control.speko.test/v1/sessions/sess_test/lease-renewals", Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_test", Slots: 1}, Usage: usage},
+		Reservation: protocol.Reservation{ID: "res_test", LeaseDurationSeconds: leaseDurationSeconds, LeaseExpiresAt: fixedNow.Add(time.Duration(leaseDurationSeconds) * time.Second), Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_test", Slots: 1}, Usage: usage},
 		Telemetry: protocol.Telemetry{
 			Endpoint:        "https://control.speko.test/v1/runtime-events",
 			Token:           "telemetry-token",

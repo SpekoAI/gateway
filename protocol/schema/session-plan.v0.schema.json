@@ -16,17 +16,11 @@
     "reservation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "lease_duration_seconds", "lease_expires_at", "renewal_url", "concurrency", "usage"],
+      "required": ["id", "lease_duration_seconds", "lease_expires_at", "concurrency", "usage"],
       "properties": {
         "id": {"$ref": "#/$defs/nonEmptyString"},
         "lease_duration_seconds": {"type": "integer", "minimum": 1},
         "lease_expires_at": {"type": "string", "format": "date-time"},
-        "renewal_url": {
-          "oneOf": [
-            {"const": ""},
-            {"type": "string", "format": "uri", "pattern": "^https://"}
-          ]
-        },
         "concurrency": {
           "type": "object",
           "additionalProperties": false,

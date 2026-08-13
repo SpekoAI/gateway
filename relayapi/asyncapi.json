@@ -13,7 +13,9 @@
       "description": "Global entry point. The upgrade request authenticates with a Speko-issued bearer token and must carry an Idempotency-Key header. The idempotency content hash of a WebSocket session is the SHA-256 of the exact session.configure text-frame bytes, so a retry must reproduce the configure frame byte-for-byte; later frames are intentionally outside the hash — they are the stream's continuous content, guarded by budgets and leases, while the configure frame is the session's intent.",
       "security": [
         {
-          "bearerAuth": []
+          "bearerAuth": [
+
+          ]
         }
       ]
     }
@@ -513,11 +515,9 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. On an established WebSocket session the code arrives in a terminal error frame and no HTTP status applies; when the same code is returned over HTTP — including a rejected upgrade — it maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 403 not_entitled and preview_access_required; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable. preview_access_required dates from the relay's preview period and is no longer returned now that the relay is generally available; it stays in the closed set so deployed clients keep decoding.",
+        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. On an established WebSocket session the code arrives in a terminal error frame and no HTTP status applies; when the same code is returned over HTTP — including a rejected upgrade — it maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable.",
         "enum": [
           "authentication_failed",
-          "not_entitled",
-          "preview_access_required",
           "insufficient_credit",
           "capability_unsupported",
           "invalid_request",

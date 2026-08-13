@@ -157,19 +157,21 @@ metadata, when preserved for local consumers, lives under namespaced
 The normative signed-plan structure is
 [`protocol/schema/session-plan.v0.schema.json`](../protocol/schema/session-plan.v0.schema.json).
 
-## Protocol revision 4: relay plans
+## Protocol revision 5: relay plans
 
 The LOCAL protocol above stays at revision 3 — nothing in the routes,
-WebSocket framing, or session-plan validation changed. Revision 4 exists
+WebSocket framing, or session-plan validation changed. Revision 5 exists
 for exactly one new plan family: the **relay plan** (`protocol.RelayPlan`,
 `protocol/relay_plan.go`), the signed dispatch authorization the Speko
 control plane mints for the Global Speko Relay's connectors. The two
 revisions coexist by construction:
 
 - `CurrentRevision` remains `3` and every rev-3 validator still
-  exact-matches it; `RelayRevision` is the separate constant `4` and relay
+  exact-matches it; `RelayRevision` is the separate constant `5` and relay
   validators exact-match that. A runtime that predates the relay rejects a
   relay plan outright instead of half-understanding it.
+- Relay plans declare whether credentials are Speko-managed or supplied by
+  the organization through `credential_source`.
 - Relay plans are compact JWS with protected-header
   `typ: "speko.relay-plan+jws"` (`RelayPlanJWSType`) and audience
   `"speko-relay"` (`RelayPlanAudience`). Session plans keep their own typ

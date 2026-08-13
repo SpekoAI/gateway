@@ -16,7 +16,6 @@ import (
 //	400  capability_unsupported, invalid_request
 //	401  authentication_failed
 //	402  insufficient_credit
-//	403  not_entitled, preview_access_required
 //	409  idempotency_conflict, request_in_progress, request_already_started
 //	413  payload_too_large
 //	415  unsupported_media
@@ -31,12 +30,7 @@ import (
 type ErrorCode string
 
 const (
-	ErrorCodeAuthenticationFailed ErrorCode = "authentication_failed"
-	ErrorCodeNotEntitled          ErrorCode = "not_entitled"
-	// ErrorCodePreviewAccessRequired dates from the relay's preview period
-	// and is no longer returned now that the relay is generally available;
-	// it stays in the closed set so deployed clients keep decoding.
-	ErrorCodePreviewAccessRequired ErrorCode = "preview_access_required"
+	ErrorCodeAuthenticationFailed  ErrorCode = "authentication_failed"
 	ErrorCodeInsufficientCredit    ErrorCode = "insufficient_credit"
 	ErrorCodeCapabilityUnsupported ErrorCode = "capability_unsupported"
 	ErrorCodeInvalidRequest        ErrorCode = "invalid_request"
@@ -65,8 +59,6 @@ const (
 func ErrorCodes() []ErrorCode {
 	return []ErrorCode{
 		ErrorCodeAuthenticationFailed,
-		ErrorCodeNotEntitled,
-		ErrorCodePreviewAccessRequired,
 		ErrorCodeInsufficientCredit,
 		ErrorCodeCapabilityUnsupported,
 		ErrorCodeInvalidRequest,

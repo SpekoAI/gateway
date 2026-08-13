@@ -360,7 +360,7 @@ func planFor(now time.Time, endpoint string) protocol.SessionPlan {
 			Provider: "deepgram", Model: "nova-3", Adapter: AdapterID, Transport: protocol.TransportWebSocket, Endpoint: endpoint,
 			Credential: &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "customer-api-key", ExpiresAt: now.Add(30 * time.Minute)},
 		},
-		Reservation:  protocol.Reservation{ID: "res_deepgram", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), RenewalURL: "https://control.speko.test/v1/sessions/sess_deepgram/lease-renewals", Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_deepgram", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 60}},
+		Reservation:  protocol.Reservation{ID: "res_deepgram", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_deepgram", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 60}},
 		Telemetry:    protocol.Telemetry{Endpoint: "https://control.speko.test/v1/runtime-events", Token: "telemetry-token", FlushIntervalMS: 5_000},
 		Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: "0.1.0"},
 		Signature:    "test-signature",

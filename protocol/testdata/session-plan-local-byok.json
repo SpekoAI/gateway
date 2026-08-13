@@ -19,7 +19,6 @@
     "id": "local-session_local_123",
     "lease_duration_seconds": 3600,
     "lease_expires_at": "2026-08-01T13:00:00Z",
-    "renewal_url": "",
     "concurrency": {
       "lease_id": "local-session_local_123",
       "slots": 1

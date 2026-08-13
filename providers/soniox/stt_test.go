@@ -719,7 +719,6 @@ func sonioxPlan(now time.Time, endpoint, model string) protocol.SessionPlan {
 		},
 		Reservation: protocol.Reservation{
 			ID: "res_soniox", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute),
-			RenewalURL:  "https://control.speko.test/v1/sessions/sess_soniox/lease-renewals",
 			Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_soniox", Slots: 1},
 			Usage:       protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: 600},
 		},

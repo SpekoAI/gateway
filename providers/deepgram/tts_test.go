@@ -311,7 +311,7 @@ func deepgramTTSRequest(serverURL string, source protocol.CredentialSource) runt
 			Execution:    protocol.Execution{Placement: protocol.PlacementEmbedded, ProviderRoute: protocol.RouteProviderDirect, CredentialSource: source},
 			ExpiresAt:    now.Add(time.Hour),
 			Route:        protocol.PlanRoute{Provider: "deepgram", Model: "aura-2-thalia-en", Adapter: TTSAdapterID, Transport: protocol.TransportWebSocket, Endpoint: endpoint.String(), Credential: &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: credential, ExpiresAt: now.Add(time.Hour)}},
-			Reservation:  protocol.Reservation{ID: "res_dg_tts", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), RenewalURL: "https://control.speko.test/v1/sessions/sess_dg_tts/lease-renewals", Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_dg_tts", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitCharacters, AuthorizedUnits: 4_000}},
+			Reservation:  protocol.Reservation{ID: "res_dg_tts", LeaseDurationSeconds: 60, LeaseExpiresAt: now.Add(time.Minute), Concurrency: protocol.ConcurrencyReservation{LeaseID: "conc_dg_tts", Slots: 1}, Usage: protocol.UsageReservation{Unit: protocol.UsageUnitCharacters, AuthorizedUnits: 4_000}},
 			Telemetry:    protocol.Telemetry{Endpoint: "https://control.speko.test/v1/runtime-events", Token: "telemetry-token", FlushIntervalMS: 5_000},
 			Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: "test"}, Signature: "test",
 		},
