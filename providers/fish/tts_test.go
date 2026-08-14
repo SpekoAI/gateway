@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -126,6 +127,8 @@ func TestGenerationCompletesOnlyAfterAudioDoneIsQueued(t *testing.T) {
 	audioSent := make(chan struct{})
 	sendFinish := make(chan struct{})
 	clientClosed := make(chan struct{})
+	secondText := make(chan struct{})
+	var dials atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		conn, err := websocket.Accept(writer, request, nil)
 		if err != nil {
@@ -136,6 +139,11 @@ func TestGenerationCompletesOnlyAfterAudioDoneIsQueued(t *testing.T) {
 		ctx := context.Background()
 		_ = readClientEvent(t, ctx, conn)
 		_ = readClientEvent(t, ctx, conn)
+		if dials.Add(1) > 1 {
+			close(secondText)
+			_, _, _ = conn.Read(ctx)
+			return
+		}
 		_ = readClientEvent(t, ctx, conn)
 		writeServerEvent(t, ctx, conn, serverEvent{Event: "audio", Audio: []byte{1, 2, 3}})
 		close(audioSent)
@@ -189,6 +197,13 @@ func TestGenerationCompletesOnlyAfterAudioDoneIsQueued(t *testing.T) {
 		t.Fatal("generation completed before audio.done could be queued")
 	default:
 	}
+	nextAppend := make(chan error, 1)
+	go func() { nextAppend <- provider.AppendText(context.Background(), "next") }()
+	select {
+	case err := <-nextAppend:
+		t.Fatalf("queued append returned before audio.done: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
 	events := receiveEvents(t, provider.Events(), 3)
 	for index, want := range []protocol.EventType{protocol.EventAudioStarted, protocol.EventAudioFrame, protocol.EventAudioDone} {
 		if events[index].Type != want {
@@ -200,9 +215,20 @@ func TestGenerationCompletesOnlyAfterAudioDoneIsQueued(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("generation did not complete after audio.done was queued")
 	}
-	if err := provider.Close(context.Background()); err != nil {
-		t.Fatalf("close: %v", err)
+	select {
+	case err := <-nextAppend:
+		if err != nil {
+			t.Fatalf("queued append: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued append did not start the next generation")
 	}
+	select {
+	case <-secondText:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not receive queued text")
+	}
+	_ = provider.Cancel(context.Background())
 }
 
 func TestCloseBoundsNonResponsiveProvider(t *testing.T) {

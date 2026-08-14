@@ -193,18 +193,31 @@ func (s *stream) AppendText(ctx context.Context, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("fish tts text is empty")
 	}
-	generation, err := s.currentGeneration(ctx)
-	if err != nil {
-		return err
-	}
-	s.stateMu.Lock()
-	if generation.committed {
+	for {
+		generation, err := s.currentGeneration(ctx)
+		if err != nil {
+			return err
+		}
+		s.stateMu.Lock()
+		if !generation.committed {
+			generation.hasText = true
+			s.stateMu.Unlock()
+			return s.writeMessage(ctx, generation, clientEvent{Event: "text", Text: text})
+		}
+		done := generation.done
 		s.stateMu.Unlock()
-		return errors.New("fish tts previous utterance has not completed")
+		// Queue the next utterance behind the prior terminal event. The read
+		// loop closes done only after audio.done is enqueued, preserving event
+		// order without turning normal caller pipelining into a session error.
+		select {
+		case <-done:
+			continue
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.ctx.Done():
+			return runtimepkg.ErrSessionClosed
+		}
 	}
-	generation.hasText = true
-	s.stateMu.Unlock()
-	return s.writeMessage(ctx, generation, clientEvent{Event: "text", Text: text})
 }
 
 func (s *stream) CommitText(ctx context.Context) error {
