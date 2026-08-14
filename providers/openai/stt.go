@@ -379,10 +379,18 @@ type sttStream struct {
 	gracefulOnce sync.Once
 	abortOnce    sync.Once
 	closed       atomic.Bool
+	closing      atomic.Bool
 	closeErr     error
 	// committed records that the stream-end commit has been sent, so the benign
 	// empty-buffer error it can provoke is swallowed rather than failing a turn.
 	committed atomic.Bool
+	// commitSent prevents Close from sending a second commit immediately
+	// after the runtime already committed the batch turn. OpenAI rejects an
+	// empty second commit, and—more importantly—never closes a transcription
+	// socket on its own after a completed item.
+	commitSent    atomic.Bool
+	commitPending atomic.Bool
+	finalSeen     atomic.Bool
 
 	// partial is the running text of the CURRENT turn, owned solely by readLoop.
 	partial   string
@@ -411,6 +419,7 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 			return err
 		}
 	}
+	s.commitSent.Store(false)
 	return nil
 }
 
@@ -418,7 +427,13 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 // ONLY thing that makes the model emit an utterance final, so the runtime's
 // end-of-speech signal has to reach the provider through this method.
 func (s *sttStream) CommitAudio(ctx context.Context) error {
-	return s.writeJSON(ctx, sttControlEvent{Type: "input_audio_buffer.commit"})
+	s.commitPending.Store(true)
+	if err := s.writeJSON(ctx, sttControlEvent{Type: "input_audio_buffer.commit"}); err != nil {
+		s.commitPending.Store(false)
+		return err
+	}
+	s.commitSent.Store(true)
+	return nil
 }
 
 func (s *sttStream) AppendText(context.Context, string) error {
@@ -447,11 +462,20 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 // socket stays open so that final can land; the runtime aborts afterwards.
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
+		s.closing.Store(true)
 		s.committed.Store(true)
-		if err := s.CommitAudio(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) {
-			s.closeErr = err
+		if !s.commitSent.Load() {
+			if err := s.CommitAudio(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) {
+				s.closeErr = err
+			}
 		}
 		s.closed.Store(true)
+		// A very fast completion may land between CommitAudio and Close. In that
+		// case there is no future provider frame to wake the read loop, so cancel
+		// it here after the already-emitted final has been preserved.
+		if s.finalSeen.Load() {
+			s.cancel()
+		}
 		if s.closeErr != nil {
 			_ = s.abort()
 		}
@@ -586,11 +610,21 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// An empty transcript is still a completed turn. Silence legitimately
 		// produces one, and suppressing it leaves batch callers waiting forever
 		// for the final event that closes their response.
-		return s.emit(runtimepkg.ProviderEvent{
+		s.commitPending.Store(false)
+		s.finalSeen.Store(true)
+		err := s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventTranscriptFinal,
 			Data:       sttTranscriptData(text, true, message),
 			Extensions: sttExtension(raw),
 		})
+		// Realtime transcription has no end-session control and does not close
+		// after a committed item. Once Close has been requested, the completed
+		// item is the graceful terminal acknowledgement; canceling the read
+		// context closes Events so batch callers can return.
+		if err == nil && s.closing.Load() {
+			s.cancel()
+		}
+		return err
 	case "conversation.item.input_audio_transcription.failed":
 		// A per-item transcription failure. OpenAI separates it from the generic
 		// `error` event precisely so a client can attribute it to one item, so

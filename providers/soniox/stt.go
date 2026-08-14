@@ -298,6 +298,12 @@ type sttStream struct {
 	// commitPending makes an empty <fin> a real finalized silent turn without
 	// changing how spontaneous empty endpointer markers are handled.
 	commitPending atomic.Bool
+	// finalizeSent prevents Close from issuing a duplicate finalize after the
+	// runtime has already committed the batch turn. Soniox treats the empty
+	// binary frame as end-of-stream, so only uncommitted audio needs a finalize
+	// immediately before it.
+	finalizeSent atomic.Bool
+	finalSeen    atomic.Bool
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -309,7 +315,11 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	if len(audio) == 0 {
 		return errors.New("soniox stt audio is empty")
 	}
-	return s.write(ctx, websocket.MessageBinary, audio)
+	if err := s.write(ctx, websocket.MessageBinary, audio); err != nil {
+		return err
+	}
+	s.finalizeSent.Store(false)
+	return nil
 }
 
 // CommitAudio issues Soniox's manual finalization control. Soniox finalizes
@@ -321,6 +331,7 @@ func (s *sttStream) CommitAudio(ctx context.Context) error {
 		s.commitPending.Store(false)
 		return err
 	}
+	s.finalizeSent.Store(true)
 	return nil
 }
 
@@ -344,13 +355,20 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 
 // Close performs Soniox's documented shutdown: an empty frame, after which the
 // server replies with a finished response and closes. A finalize is sent first
-// because the empty frame has been observed in production not to flush an
-// in-flight segment, and finalize is documented as safe to repeat.
+// only when audio has not already been committed: repeating finalize between a
+// caller's commit and the empty end frame can make the provider reject the
+// otherwise valid shutdown sequence.
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
 		s.writeMu.Lock()
-		if err := sttWriteControl(ctx, s.conn, map[string]string{"type": "finalize"}); err != nil {
-			s.closeErr = err
+		if !s.finalizeSent.Load() {
+			s.commitPending.Store(true)
+			if err := sttWriteControl(ctx, s.conn, map[string]string{"type": "finalize"}); err != nil {
+				s.commitPending.Store(false)
+				s.closeErr = err
+			} else {
+				s.finalizeSent.Store(true)
+			}
 		}
 		if s.closeErr == nil {
 			if err := s.conn.Write(ctx, websocket.MessageBinary, []byte{}); err != nil {
@@ -359,6 +377,9 @@ func (s *sttStream) Close(ctx context.Context) error {
 		}
 		s.closed.Store(true)
 		s.writeMu.Unlock()
+		if s.closeErr == nil && s.finalSeen.Load() {
+			s.cancel()
+		}
 		if s.closeErr != nil {
 			_ = s.abort()
 		}
@@ -512,6 +533,9 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			}
 			if token.Text == finToken {
 				committed := s.commitPending.Swap(false)
+				if committed {
+					s.finalSeen.Store(true)
+				}
 				if emptySegment && committed {
 					if err := s.emit(runtimepkg.ProviderEvent{
 						Type:       protocol.EventTranscriptFinal,
@@ -520,6 +544,9 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 					}); err != nil {
 						return err
 					}
+				}
+				if committed && s.closed.Load() {
+					s.cancel()
 				}
 			}
 			// A provisional tail cannot outlive the boundary that closed its

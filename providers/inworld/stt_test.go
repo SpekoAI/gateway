@@ -323,6 +323,12 @@ func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
 	if got := harness.nextFrame(t); got != sttWireEndTurn {
 		t.Fatalf("commit frame = %s, want %s", got, sttWireEndTurn)
 	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireCloseFrame {
+		t.Fatalf("close frame = %s, want %s", got, sttWireCloseFrame)
+	}
 	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
 
 	final := sttNextEvent(t, stream.Events())
@@ -337,6 +343,14 @@ func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
 	}
 	if ended := sttNextEvent(t, stream.Events()); ended.Type != protocol.EventSpeechEnded {
 		t.Fatalf("second event = %q, want speech.ended", ended.Type)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after the committed final acknowledged Close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("events did not close after the committed final")
 	}
 }
 
