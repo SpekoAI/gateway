@@ -802,6 +802,8 @@ func baseRespError(status int, message string, raw json.RawMessage) *runtimepkg.
 	switch status {
 	case 1004, 2049: // not authorized / invalid API key
 		code = "authentication_failed"
+	case 1008: // account balance exhausted
+		code = "provider_quota_exceeded"
 	case 1002, 1039, 1041, 2045: // rate limit / token limit / conn limit / rate growth limit
 		code, retryable = "provider_rate_limited", true
 	case 1000, 1001, 1024, 1033: // unknown / timeout / internal / system error

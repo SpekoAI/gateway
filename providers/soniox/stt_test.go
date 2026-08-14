@@ -350,6 +350,55 @@ func TestSTTCommitAudioSendsFinalizeAndFinReturnsNoSpeechEnded(t *testing.T) {
 	}
 }
 
+// TestSTTCommitAudioEmitsAnEmptyFinalForSilence covers the batch contract: a
+// manual <fin> closes the requested turn even when Soniox produced no tokens.
+func TestSTTCommitAudioEmitsAnEmptyFinalForSilence(t *testing.T) {
+	t.Parallel()
+
+	server := newSTTServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		if _, err := readJSONObject(ctx, conn); err != nil {
+			t.Errorf("read start request: %v", err)
+			return
+		}
+		if _, err := readJSONObject(ctx, conn); err != nil {
+			t.Errorf("read finalize: %v", err)
+			return
+		}
+		if err := writeJSONFrame(ctx, conn, map[string]any{
+			"tokens": []any{map[string]any{"text": "<fin>", "is_final": true}},
+		}); err != nil {
+			t.Errorf("fin frame: %v", err)
+			return
+		}
+		if err := writeJSONFrame(ctx, conn, map[string]any{
+			"tokens": []any{}, "finished": true, "total_audio_proc_ms": 1_000,
+		}); err != nil {
+			t.Errorf("finished frame: %v", err)
+			return
+		}
+		waitForPeer(ctx, conn)
+	})
+	defer server.Close()
+
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), sttAdapterRequest(server.URL))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer abortStream(stream)
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit audio: %v", err)
+	}
+	events := collectEvents(t, stream.Events(), 2)
+	if got := strings.Join(eventTypeNames(events), ","); got != "transcript.final,usage.observed" {
+		t.Fatalf("event types = %s", got)
+	}
+	assertTranscript(t, events[0].Data, "", true)
+}
+
 // A zero-length frame is Soniox's end-of-stream signal, so forwarding one as
 // audio would go deaf mid-call. Close is the only place it may be sent.
 func TestSTTRefusesEmptyAudioAndClosesWithFinalizeThenEmptyFrame(t *testing.T) {

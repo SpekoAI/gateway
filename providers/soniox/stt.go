@@ -295,6 +295,9 @@ type sttStream struct {
 	// Read-loop owned; never touched by the write side.
 	segment   sttSegment
 	requestID string
+	// commitPending makes an empty <fin> a real finalized silent turn without
+	// changing how spontaneous empty endpointer markers are handled.
+	commitPending atomic.Bool
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -313,7 +316,12 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 // everything received so far and answers with a <fin> token, which the read
 // loop turns into a final transcript. The socket stays open for the next turn.
 func (s *sttStream) CommitAudio(ctx context.Context) error {
-	return s.writeJSON(ctx, map[string]string{"type": "finalize"})
+	s.commitPending.Store(true)
+	if err := s.writeJSON(ctx, map[string]string{"type": "finalize"}); err != nil {
+		s.commitPending.Store(false)
+		return err
+	}
+	return nil
 }
 
 func (s *sttStream) AppendText(context.Context, string) error {
@@ -498,8 +506,21 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 
 	for _, token := range message.Tokens {
 		if token.Text == endToken || token.Text == finToken {
+			emptySegment := strings.TrimSpace(s.segment.text.String()) == ""
 			if err := s.flushSegment(raw); err != nil {
 				return err
+			}
+			if token.Text == finToken {
+				committed := s.commitPending.Swap(false)
+				if emptySegment && committed {
+					if err := s.emit(runtimepkg.ProviderEvent{
+						Type:       protocol.EventTranscriptFinal,
+						Data:       sttTranscriptData("", true, nil, nil, nil, s.requestID),
+						Extensions: sttExtension(raw),
+					}); err != nil {
+						return err
+					}
+				}
 			}
 			// A provisional tail cannot outlive the boundary that closed its
 			// segment; Soniox restarts the tail from scratch afterwards.

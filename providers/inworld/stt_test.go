@@ -308,6 +308,38 @@ func TestSTTDropsTheEmptyFinalMarker(t *testing.T) {
 	}
 }
 
+// TestSTTEmitsEmptyFinalAfterExplicitCommit keeps silent batch audio from
+// hanging. The startup empty marker is noise, but the same shape after our
+// endTurn is the provider's acknowledgement that the requested turn finished.
+func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
+	t.Parallel()
+	harness := newSTTHarness(t, nil)
+	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	harness.nextFrame(t)
+
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit audio: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("commit frame = %s, want %s", got, sttWireEndTurn)
+	}
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
+
+	final := sttNextEvent(t, stream.Events())
+	if final.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("event = %q, want transcript.final", final.Type)
+	}
+	var decoded struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(final.Data, &decoded); err != nil || decoded.Text != "" {
+		t.Fatalf("empty final = %+v, err=%v", decoded, err)
+	}
+	if ended := sttNextEvent(t, stream.Events()); ended.Type != protocol.EventSpeechEnded {
+		t.Fatalf("second event = %q, want speech.ended", ended.Type)
+	}
+}
+
 // TestSTTCloseForcesAPendingTurnBeforeEndOfInput covers the most visible
 // transcriber failure: tearing down with a turn in flight. Inworld does not
 // commit on close, so the trailing utterance is lost unless endTurn goes first.

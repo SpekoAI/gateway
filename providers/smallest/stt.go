@@ -250,6 +250,9 @@ type sttStream struct {
 	stateMu           sync.Mutex
 	speechOpen        bool
 	providerRequestID string
+	// commitPending distinguishes a startup empty interim from an empty final
+	// produced in response to our explicit finalize control.
+	commitPending atomic.Bool
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -269,7 +272,12 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 // frame: it forces an immediate is_final transcript and leaves the socket warm
 // for the next turn.
 func (s *sttStream) CommitAudio(ctx context.Context) error {
-	return s.write(ctx, websocket.MessageText, []byte(sttFinalize))
+	s.commitPending.Store(true)
+	if err := s.write(ctx, websocket.MessageText, []byte(sttFinalize)); err != nil {
+		s.commitPending.Store(false)
+		return err
+	}
+	return nil
 }
 
 func (s *sttStream) AppendText(context.Context, string) error {
@@ -401,6 +409,7 @@ func (s *sttStream) handleMessage(payload []byte) (bool, error) {
 			Extensions:     extension(raw),
 		}
 	}
+	committedFinal := message.IsFinal && s.commitPending.Swap(false)
 	if message.Transcript != "" {
 		// Pulse can emit an empty-string interim at session start; the guard
 		// above keeps that from surfacing as a spurious transcript event.
@@ -423,6 +432,13 @@ func (s *sttStream) handleMessage(payload []byte) (bool, error) {
 			if err := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventSpeechEnded, Data: s.transcriptMetadata(), Extensions: extension(raw)}); err != nil {
 				return false, err
 			}
+		}
+	} else if committedFinal {
+		// Silence is a valid finalized turn. Emitting the empty final closes a
+		// batch transcription without turning Smallest's startup empty interim
+		// into a spurious utterance.
+		if err := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: s.transcriptData(message), Extensions: extension(raw)}); err != nil {
+			return false, err
 		}
 	}
 	// is_last is the session terminator and always accompanies is_final.

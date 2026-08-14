@@ -420,6 +420,10 @@ type sttStream struct {
 	// Only then does Close force a turn: an endTurn with nothing in flight just
 	// produces another empty marker.
 	turnPending atomic.Bool
+	// commitPending distinguishes the empty marker Inworld emits when a turn
+	// starts from the empty final that acknowledges our explicit endTurn. The
+	// latter must reach batch callers so silence completes instead of timing out.
+	commitPending atomic.Bool
 
 	// guard holds RIFF-stripping state. The runtime serializes WriteAudio,
 	// control methods and Close for one session, so it needs no lock of its own.
@@ -462,7 +466,12 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 // documented manual turn boundary and is what the platform's TypeScript client
 // sends at end-of-input.
 func (s *sttStream) CommitAudio(ctx context.Context) error {
-	return s.write(ctx, sttEndTurnFrame)
+	s.commitPending.Store(true)
+	if err := s.write(ctx, sttEndTurnFrame); err != nil {
+		s.commitPending.Store(false)
+		return err
+	}
+	return nil
 }
 
 // AppendText and CommitText belong to synthesis. A transcriber rejects them so
@@ -637,8 +646,12 @@ func (s *sttStream) handleMessage(payload []byte) error {
 // voice agent, answers. The platform's TypeScript client drops the same frame.
 func (s *sttStream) handleTranscription(transcription sttTranscription, raw json.RawMessage) error {
 	text := strings.TrimSpace(transcription.Transcript)
-	if text == "" {
+	committedEmptyFinal := text == "" && transcription.IsFinal && s.commitPending.Swap(false)
+	if text == "" && !committedEmptyFinal {
 		return nil
+	}
+	if transcription.IsFinal {
+		s.commitPending.Store(false)
 	}
 	kind := protocol.EventTranscriptDelta
 	if transcription.IsFinal {
