@@ -392,7 +392,7 @@ func TestAdapterMapsInBandBaseRespErrors(t *testing.T) {
 		{"internal error", 1024, "internal error", "provider_unavailable", true},
 		// 2054 is undocumented but is what a bad voice id actually returns.
 		{"voice id not exist", 2054, "voice id not exist", "invalid_request", false},
-		{"insufficient balance", 1008, "insufficient balance", "invalid_request", false},
+		{"insufficient balance", 1008, "insufficient balance", "provider_quota_exceeded", false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()

@@ -191,6 +191,34 @@ func TestSTTAdapterHandshakeAudioAndTranscriptStream(t *testing.T) {
 	}
 }
 
+// TestSTTEmitsEmptyFinalAfterExplicitCommit distinguishes a silent committed
+// turn from the empty interim Pulse sends when a socket starts. Batch callers
+// need the former to complete even though it carries no transcript text.
+func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
+	t.Parallel()
+	stream := &sttStream{ctx: context.Background(), events: make(chan runtimepkg.ProviderEvent, 1)}
+	stream.commitPending.Store(true)
+
+	terminal, err := stream.handleMessage([]byte(`{"type":"transcription","status":"success","transcript":"","is_final":true,"is_last":false}`))
+	if err != nil {
+		t.Fatalf("handle empty final: %v", err)
+	}
+	if terminal {
+		t.Fatal("a committed turn final must not terminate the warm session")
+	}
+	event := <-stream.events
+	if event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("event = %q, want transcript.final", event.Type)
+	}
+	var final struct {
+		Text    string `json:"text"`
+		IsFinal bool   `json:"is_final"`
+	}
+	if err := json.Unmarshal(event.Data, &final); err != nil || final.Text != "" || !final.IsFinal {
+		t.Fatalf("empty final = %+v, err=%v", final, err)
+	}
+}
+
 // Language handling has two traps: a region subtag Pulse does not understand,
 // and the regional aggregators whose names contain a hyphen and must survive
 // intact.
