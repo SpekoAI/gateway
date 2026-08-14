@@ -216,6 +216,20 @@ func (s *stream) AppendText(ctx context.Context, text string) error {
 			return ctx.Err()
 		case <-s.ctx.Done():
 			return runtimepkg.ErrSessionClosed
+		case <-time.After(s.shutdownTimeout):
+			// Session.Close cannot reach ProviderStream.Close while the runtime's
+			// ordered input worker is inside this method. Bound a provider that
+			// never finishes the prior generation here as well, so a pipelined
+			// utterance cannot retain the session until its lease expires.
+			select {
+			case <-done:
+				continue
+			default:
+			}
+			generation.cancelled.Store(true)
+			_ = generation.conn.CloseNow()
+			s.completeGeneration(generation)
+			return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Fish Audio did not finish the previous utterance", Retryable: true, Cause: context.DeadlineExceeded}
 		}
 	}
 }

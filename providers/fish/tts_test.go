@@ -259,6 +259,41 @@ func TestCloseBoundsNonResponsiveProvider(t *testing.T) {
 	}
 }
 
+func TestQueuedAppendBoundsNonResponsiveGeneration(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		_, _, _ = conn.Read(context.Background())
+		_, _, _ = conn.Read(context.Background())
+		_, _, _ = conn.Read(context.Background())
+		_, _, _ = conn.Read(context.Background())
+	}))
+	defer server.Close()
+	config := testConfig(server.URL)
+	config.ShutdownTimeout = 50 * time.Millisecond
+	adapter, err := New(config)
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	provider, err := adapter.Open(context.Background(), adapterRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := provider.AppendText(context.Background(), "first"); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	if err := provider.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit first: %v", err)
+	}
+	if err := provider.AppendText(context.Background(), "second"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("queued append = %v, want bounded deadline", err)
+	}
+}
+
 func TestAdapterRejectsManagedProviderDirectCredentials(t *testing.T) {
 	t.Parallel()
 	adapter, err := New(Config{})
