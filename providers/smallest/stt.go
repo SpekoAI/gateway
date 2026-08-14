@@ -254,7 +254,6 @@ type sttStream struct {
 	// commitPending distinguishes a startup empty interim from an empty final
 	// produced in response to our explicit finalize control.
 	commitPending atomic.Bool
-	readySeen     atomic.Bool
 	contentSeen   atomic.Bool
 	finalSeen     atomic.Bool
 }
@@ -315,7 +314,7 @@ func (s *sttStream) Close(ctx context.Context) error {
 		}
 		if s.finalSeen.Load() && !s.contentSeen.Load() {
 			s.cancel()
-		} else if s.readySeen.Load() && !s.contentSeen.Load() {
+		} else if !s.contentSeen.Load() {
 			go s.finishSilentClose()
 		}
 		select {
@@ -328,16 +327,16 @@ func (s *sttStream) Close(ctx context.Context) error {
 	return s.closeErr
 }
 
-// finishSilentClose handles Pulse's documented startup acknowledgement plus
-// an audio turn in which it recognizes no speech. Pulse can leave that socket
-// open without an is_last frame; after a short grace for a real final, ending
-// Events lets the batch caller return the valid empty transcript.
+// finishSilentClose handles an opened Pulse stream that accepts its control
+// writes but recognizes no speech. Pulse can leave that socket open without an
+// is_last frame; provider errors still win during the grace, then ending Events
+// lets the batch caller return the valid empty transcript.
 func (s *sttStream) finishSilentClose() {
 	timer := time.NewTimer(2 * time.Second)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		if s.closing.Load() && s.readySeen.Load() && !s.contentSeen.Load() && !s.finalSeen.Load() {
+		if s.closing.Load() && !s.contentSeen.Load() && !s.finalSeen.Load() {
 			s.cancel()
 		}
 	case <-s.ctx.Done():
@@ -435,9 +434,6 @@ func (s *sttStream) handleMessage(payload []byte) (bool, error) {
 		}
 	}
 	committedFinal := message.IsFinal && s.commitPending.Swap(false)
-	if message.Transcript == "" && !message.IsFinal {
-		s.readySeen.Store(true)
-	}
 	if message.Transcript != "" {
 		s.contentSeen.Store(true)
 		// Pulse can emit an empty-string interim at session start; the guard
