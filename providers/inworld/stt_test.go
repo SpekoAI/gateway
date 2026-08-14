@@ -354,19 +354,18 @@ func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
 	}
 }
 
-func TestSTTReadySilentSessionEventuallyCloses(t *testing.T) {
+func TestSTTSilentSessionEventuallyCloses(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stream := &sttStream{ctx: ctx, cancel: cancel}
 	stream.closing.Store(true)
-	stream.readySeen.Store(true)
 	go stream.finishSilentClose()
 
 	select {
 	case <-ctx.Done():
 	case <-time.After(3 * time.Second):
-		t.Fatal("ready silent Inworld session did not close after its grace period")
+		t.Fatal("silent Inworld session did not close after its grace period")
 	}
 }
 
