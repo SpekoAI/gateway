@@ -134,6 +134,86 @@ func TestAdapterUsesDeepgramWireContractAndMapsEvents(t *testing.T) {
 	}
 }
 
+func TestAdapterUsesFluxV2TurnProtocol(t *testing.T) {
+	t.Parallel()
+	requests := make(chan *http.Request, 1)
+	server := newListenServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+		messageType, payload, err := conn.Read(ctx)
+		if err != nil || messageType != websocket.MessageBinary || string(payload) != "\x01\x02" {
+			t.Errorf("audio message = (%v, %q, %v)", messageType, payload, err)
+			return
+		}
+		for _, message := range []map[string]any{
+			{"type": "Connected", "request_id": "flux_req_1", "sequence_id": 0},
+			{"type": "TurnInfo", "request_id": "flux_req_1", "event": "StartOfTurn", "turn_index": 0, "audio_window_start": 0.2},
+			{"type": "TurnInfo", "request_id": "flux_req_1", "event": "Update", "turn_index": 0, "audio_window_start": 0.2, "audio_window_end": 0.7, "transcript": "hello"},
+			{"type": "TurnInfo", "request_id": "flux_req_1", "event": "EagerEndOfTurn", "turn_index": 0, "transcript": "hello there"},
+			{"type": "TurnInfo", "request_id": "flux_req_1", "event": "TurnResumed", "turn_index": 0},
+			{"type": "TurnInfo", "request_id": "flux_req_1", "event": "EndOfTurn", "turn_index": 0, "audio_window_start": 0.2, "audio_window_end": 1.1, "transcript": "hello there", "end_of_turn_confidence": 0.91},
+		} {
+			if err := writeJSON(ctx, conn, message); err != nil {
+				t.Errorf("write Flux event: %v", err)
+				return
+			}
+		}
+		if err := assertControl(ctx, conn, "CloseStream"); err != nil {
+			t.Errorf("close stream: %v", err)
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	request := adapterRequest(server.URL, protocol.RequestOptions{Language: "es"})
+	request.Plan.Route.Model = fluxMultilingual
+	request.Plan.Route.Endpoint = strings.Replace(request.Plan.Route.Endpoint, "/v1/listen", "/v2/listen", 1)
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.WriteAudio(context.Background(), []byte{1, 2}); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("Flux commit is a no-op: %v", err)
+	}
+	events := collectProviderEvents(t, stream.Events(), 7)
+	wantTypes := "usage.observed,speech.started,transcript.delta,warning,warning,transcript.final,speech.ended"
+	if got := strings.Join(eventTypes(events), ","); got != wantTypes {
+		t.Fatalf("event types = %s, want %s", got, wantTypes)
+	}
+	if events[5].Extensions[fluxExtensionID] == nil {
+		t.Fatal("Flux final transcript must retain the v2 extension")
+	}
+	var final struct {
+		Text                string  `json:"text"`
+		AudioEndMS          int64   `json:"audio_end_ms"`
+		TurnIndex           int     `json:"turn_index"`
+		EndOfTurnConfidence float64 `json:"end_of_turn_confidence"`
+	}
+	if err := json.Unmarshal(events[5].Data, &final); err != nil || final.Text != "hello there" || final.AudioEndMS != 1100 || final.TurnIndex != 0 || final.EndOfTurnConfidence != 0.91 {
+		t.Fatalf("final = %+v, err=%v", final, err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	requestSeen := <-requests
+	query := requestSeen.URL.Query()
+	if query.Get("model") != fluxMultilingual || query.Get("language_hint") != "es" {
+		t.Fatalf("Flux query = %v", query)
+	}
+	for _, forbidden := range []string{"channels", "interim_results", "endpointing", "language", "extra"} {
+		if query.Has(forbidden) {
+			t.Fatalf("Flux query carries v1 parameter %q: %v", forbidden, query)
+		}
+	}
+}
+
 func TestAdapterRejectsNonBearerCredentialWithoutLeakingIt(t *testing.T) {
 	t.Parallel()
 
@@ -324,7 +404,7 @@ func newListenServer(t *testing.T, callback func(context.Context, *http.Request,
 
 func listenHandler(t *testing.T, w http.ResponseWriter, r *http.Request, callback func(context.Context, *http.Request, *websocket.Conn)) {
 	t.Helper()
-	if r.URL.Path != "/v1/listen" {
+	if r.URL.Path != "/v1/listen" && r.URL.Path != "/v2/listen" {
 		http.NotFound(w, r)
 		return
 	}

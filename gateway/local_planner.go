@@ -256,6 +256,14 @@ func (p *LocalPlanner) localRoute(kind protocol.SessionKind, provider, model str
 	if model == "" || model == "auto" {
 		model = entry.DefaultModel
 	}
+	if override.Endpoint == "" {
+		for _, modelRoute := range entry.ModelRoutes {
+			if strings.HasPrefix(model, modelRoute.ModelPrefix) {
+				endpoint = modelRoute.Endpoint
+				break
+			}
+		}
+	}
 	voice := entry.DefaultVoice
 	if override.DefaultVoice != "" {
 		voice = override.DefaultVoice
