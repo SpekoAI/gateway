@@ -234,6 +234,22 @@ func TestSTTCommittedFinalTerminatesAfterClose(t *testing.T) {
 	}
 }
 
+func TestSTTReadySilentSessionEventuallyCloses(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &sttStream{ctx: ctx, cancel: cancel}
+	stream.closing.Store(true)
+	stream.readySeen.Store(true)
+	go stream.finishSilentClose()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("ready silent Smallest session did not close after its grace period")
+	}
+}
+
 // Language handling has two traps: a region subtag Pulse does not understand,
 // and the regional aggregators whose names contain a hyphen and must survive
 // intact.
