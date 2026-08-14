@@ -2,6 +2,7 @@ package fish
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -117,6 +118,118 @@ func TestAdapterReconnectsForTheNextUtterance(t *testing.T) {
 	}
 	if len(dials) != 2 {
 		t.Fatalf("dials = %d, want one Fish connection per utterance", len(dials))
+	}
+}
+
+func TestGenerationCompletesOnlyAfterAudioDoneIsQueued(t *testing.T) {
+	t.Parallel()
+	audioSent := make(chan struct{})
+	sendFinish := make(chan struct{})
+	clientClosed := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(writer, request, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		ctx := context.Background()
+		_ = readClientEvent(t, ctx, conn)
+		_ = readClientEvent(t, ctx, conn)
+		_ = readClientEvent(t, ctx, conn)
+		writeServerEvent(t, ctx, conn, serverEvent{Event: "audio", Audio: []byte{1, 2, 3}})
+		close(audioSent)
+		<-sendFinish
+		writeServerEvent(t, ctx, conn, serverEvent{Event: "finish", Reason: "stop"})
+		_, _, _ = conn.Read(ctx)
+		close(clientClosed)
+	}))
+	defer server.Close()
+
+	config := testConfig(server.URL)
+	config.EventBuffer = 2
+	adapter, err := New(config)
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	provider, err := adapter.Open(context.Background(), adapterRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	implementation := provider.(*stream)
+	implementation.stateMu.Lock()
+	generation := implementation.active
+	implementation.stateMu.Unlock()
+	if err := provider.AppendText(context.Background(), "ordered"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := provider.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	select {
+	case <-audioSent:
+	case <-time.After(time.Second):
+		t.Fatal("server did not send audio")
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(implementation.events) != 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(implementation.events); got != 2 {
+		t.Fatalf("buffered events = %d, want audio.started and audio.frame", got)
+	}
+	close(sendFinish)
+	select {
+	case <-clientClosed:
+	case <-time.After(time.Second):
+		t.Fatal("adapter did not process finish")
+	}
+	select {
+	case <-generation.done:
+		t.Fatal("generation completed before audio.done could be queued")
+	default:
+	}
+	events := receiveEvents(t, provider.Events(), 3)
+	for index, want := range []protocol.EventType{protocol.EventAudioStarted, protocol.EventAudioFrame, protocol.EventAudioDone} {
+		if events[index].Type != want {
+			t.Fatalf("event %d = %s, want %s", index, events[index].Type, want)
+		}
+	}
+	select {
+	case <-generation.done:
+	case <-time.After(time.Second):
+		t.Fatal("generation did not complete after audio.done was queued")
+	}
+	if err := provider.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+func TestCloseBoundsNonResponsiveProvider(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		_, _, _ = conn.Read(context.Background())
+		_, _, _ = conn.Read(context.Background())
+		_, _, _ = conn.Read(context.Background())
+	}))
+	defer server.Close()
+	config := testConfig(server.URL)
+	config.ShutdownTimeout = 50 * time.Millisecond
+	adapter, err := New(config)
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	provider, err := adapter.Open(context.Background(), adapterRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := provider.Close(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close = %v, want bounded deadline", err)
 	}
 }
 

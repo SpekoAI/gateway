@@ -3,6 +3,7 @@ package modulate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -169,6 +170,33 @@ func TestProviderErrorClassification(t *testing.T) {
 		if err.Code != testCase.code || err.Retryable != testCase.retry {
 			t.Errorf("%q => %s retry=%t, want %s retry=%t", testCase.message, err.Code, err.Retryable, testCase.code, testCase.retry)
 		}
+	}
+}
+
+func TestCloseBoundsNonResponsiveProvider(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		_, _, _ = conn.Read(context.Background())
+		_, _, _ = conn.Read(context.Background())
+	}))
+	defer server.Close()
+	config := testConfig(server.URL)
+	config.ShutdownTimeout = 50 * time.Millisecond
+	adapter, err := New(config)
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	provider, err := adapter.Open(context.Background(), testRequest(server.URL, EnglishFastModel, protocol.RouteProviderDirect, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := provider.Close(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close = %v, want bounded deadline", err)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -30,12 +31,13 @@ const (
 	// leaves the separately billed enrichment signals off.
 	MultilingualModel = "velma-2-stt-streaming"
 
-	officialAPIHost       = "platform.modulate.ai"
-	englishFastPath       = "/api/velma-2-stt-streaming-english-v2"
-	multilingualPath      = "/api/velma-2-stt-streaming"
-	extensionID           = "modulate.ai/velma-2"
-	defaultEventBuffer    = 32
-	defaultMaxMessageSize = 1 << 20
+	officialAPIHost        = "platform.modulate.ai"
+	englishFastPath        = "/api/velma-2-stt-streaming-english-v2"
+	multilingualPath       = "/api/velma-2-stt-streaming"
+	extensionID            = "modulate.ai/velma-2"
+	defaultEventBuffer     = 32
+	defaultMaxMessageSize  = 1 << 20
+	defaultShutdownTimeout = 30 * time.Second
 )
 
 var (
@@ -52,6 +54,7 @@ type Config struct {
 	HTTPClient            *http.Client
 	EventBuffer           int
 	MaxMessageBytes       int64
+	ShutdownTimeout       time.Duration
 	AllowedEndpointHosts  []string
 	AllowInsecureEndpoint bool
 }
@@ -62,6 +65,7 @@ type Adapter struct {
 	httpClient      *http.Client
 	eventBuffer     int
 	maxMessageBytes int64
+	shutdownTimeout time.Duration
 	endpointPolicy  upstream.WebSocketPolicy
 }
 
@@ -75,8 +79,11 @@ func New(config Config) (*Adapter, error) {
 	if config.MaxMessageBytes == 0 {
 		config.MaxMessageBytes = defaultMaxMessageSize
 	}
-	if config.EventBuffer < 1 || config.MaxMessageBytes < 1 {
-		return nil, errors.New("modulate stt buffers must be positive")
+	if config.ShutdownTimeout == 0 {
+		config.ShutdownTimeout = defaultShutdownTimeout
+	}
+	if config.EventBuffer < 1 || config.MaxMessageBytes < 1 || config.ShutdownTimeout < 0 {
+		return nil, errors.New("modulate stt buffers and shutdown timeout must be positive")
 	}
 	policy, err := upstream.NewWebSocketPolicy(officialAPIHost, config.AllowedEndpointHosts, config.AllowInsecureEndpoint)
 	if err != nil {
@@ -85,7 +92,8 @@ func New(config Config) (*Adapter, error) {
 	return &Adapter{
 		id: config.AdapterID, httpClient: config.HTTPClient,
 		eventBuffer: config.EventBuffer, maxMessageBytes: config.MaxMessageBytes,
-		endpointPolicy: policy,
+		shutdownTimeout: config.ShutdownTimeout,
+		endpointPolicy:  policy,
 	}, nil
 }
 
@@ -142,6 +150,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	stream := &stream{
 		conn: conn, ctx: streamCtx, cancel: cancel,
 		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), done: make(chan struct{}),
+		shutdownTimeout: a.shutdownTimeout,
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -214,11 +223,12 @@ func primaryLanguage(value string) string {
 }
 
 type stream struct {
-	conn   *websocket.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
-	events chan runtimepkg.ProviderEvent
-	done   chan struct{}
+	conn            *websocket.Conn
+	ctx             context.Context
+	cancel          context.CancelFunc
+	events          chan runtimepkg.ProviderEvent
+	done            chan struct{}
+	shutdownTimeout time.Duration
 
 	writeMu    sync.Mutex
 	doneOnce   sync.Once
@@ -257,6 +267,8 @@ func (s *stream) Abort(context.Context) error              { return s.abort() }
 
 func (s *stream) Close(ctx context.Context) error {
 	s.closeOnce.Do(func() {
+		shutdownCtx, cancel := context.WithTimeout(ctx, s.shutdownTimeout)
+		defer cancel()
 		s.closing.Store(true)
 		select {
 		case <-s.done:
@@ -266,15 +278,15 @@ func (s *stream) Close(ctx context.Context) error {
 		}
 		// The empty TEXT frame is Modulate's only end-of-stream signal. A zero-
 		// length binary frame is audio and does not finish the request.
-		if err := s.write(ctx, websocket.MessageText, []byte{}); err != nil {
+		if err := s.write(shutdownCtx, websocket.MessageText, []byte{}); err != nil {
 			s.closeErr = err
 			_ = s.abort()
 			return
 		}
 		select {
 		case <-s.done:
-		case <-ctx.Done():
-			s.closeErr = ctx.Err()
+		case <-shutdownCtx.Done():
+			s.closeErr = shutdownCtx.Err()
 		}
 		_ = s.abort()
 	})

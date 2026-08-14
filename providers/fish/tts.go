@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -22,9 +23,10 @@ const (
 	// TTSAdapterID is the stable Fish Audio streaming adapter identifier.
 	TTSAdapterID = "fish.tts.v1"
 
-	officialAPIHost = "api.fish.audio"
-	endpointPath    = "/v1/tts/live"
-	extensionID     = "fish.audio/v1"
+	officialAPIHost        = "api.fish.audio"
+	endpointPath           = "/v1/tts/live"
+	extensionID            = "fish.audio/v1"
+	defaultShutdownTimeout = 30 * time.Second
 )
 
 var supportedModels = map[string]struct{}{
@@ -43,6 +45,7 @@ type Config struct {
 	HTTPClient            *http.Client
 	EventBuffer           int
 	MaxMessageBytes       int64
+	ShutdownTimeout       time.Duration
 	AllowedEndpointHosts  []string
 	AllowInsecureEndpoint bool
 }
@@ -52,6 +55,7 @@ type Adapter struct {
 	httpClient      *http.Client
 	eventBuffer     int
 	maxMessageBytes int64
+	shutdownTimeout time.Duration
 	endpointPolicy  upstream.WebSocketPolicy
 }
 
@@ -65,8 +69,11 @@ func New(config Config) (*Adapter, error) {
 	if config.MaxMessageBytes == 0 {
 		config.MaxMessageBytes = 1 << 20
 	}
-	if config.EventBuffer < 1 || config.MaxMessageBytes < 1 {
-		return nil, errors.New("fish tts buffers must be positive")
+	if config.ShutdownTimeout == 0 {
+		config.ShutdownTimeout = defaultShutdownTimeout
+	}
+	if config.EventBuffer < 1 || config.MaxMessageBytes < 1 || config.ShutdownTimeout < 0 {
+		return nil, errors.New("fish tts buffers and shutdown timeout must be positive")
 	}
 	policy, err := upstream.NewWebSocketPolicy(officialAPIHost, config.AllowedEndpointHosts, config.AllowInsecureEndpoint)
 	if err != nil {
@@ -75,7 +82,8 @@ func New(config Config) (*Adapter, error) {
 	return &Adapter{
 		id: config.AdapterID, httpClient: config.HTTPClient,
 		eventBuffer: config.EventBuffer, maxMessageBytes: config.MaxMessageBytes,
-		endpointPolicy: policy,
+		shutdownTimeout: config.ShutdownTimeout,
+		endpointPolicy:  policy,
 	}, nil
 }
 
@@ -127,6 +135,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		httpClient: a.httpClient, endpoint: endpoint.String(), apiKey: credential.Value,
 		model: model, voice: strings.TrimSpace(request.Options.Voice),
 		sampleRate: request.Media.SampleRateHz, maxMessageBytes: a.maxMessageBytes,
+		shutdownTimeout: a.shutdownTimeout,
 	}
 	if err := stream.startGeneration(ctx); err != nil {
 		cancel()
@@ -161,6 +170,7 @@ type stream struct {
 	voice           string
 	sampleRate      int
 	maxMessageBytes int64
+	shutdownTimeout time.Duration
 
 	stateMu sync.Mutex
 	active  *generation
@@ -231,6 +241,8 @@ func (s *stream) Cancel(context.Context) error {
 
 func (s *stream) Close(ctx context.Context) error {
 	s.closeOnce.Do(func() {
+		shutdownCtx, cancel := context.WithTimeout(ctx, s.shutdownTimeout)
+		defer cancel()
 		s.stateMu.Lock()
 		s.closing = true
 		generation := s.active
@@ -240,7 +252,7 @@ func (s *stream) Close(ctx context.Context) error {
 		}
 		s.stateMu.Unlock()
 		if needsStop {
-			if err := s.writeMessage(ctx, generation, clientEvent{Event: "stop"}); err != nil {
+			if err := s.writeMessage(shutdownCtx, generation, clientEvent{Event: "stop"}); err != nil {
 				s.closeErr = err
 				_ = generation.conn.CloseNow()
 				s.completeGeneration(generation)
@@ -249,8 +261,8 @@ func (s *stream) Close(ctx context.Context) error {
 		if generation != nil {
 			select {
 			case <-generation.done:
-			case <-ctx.Done():
-				s.closeErr = ctx.Err()
+			case <-shutdownCtx.Done():
+				s.closeErr = shutdownCtx.Err()
 				_ = generation.conn.CloseNow()
 				s.completeGeneration(generation)
 			}
@@ -396,14 +408,18 @@ func (s *stream) readLoop(generation *generation) {
 				return
 			}
 		case "finish":
-			s.completeGeneration(generation)
 			_ = generation.conn.CloseNow()
 			if event.Reason == "error" {
 				_ = s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: fishErrorMessage(event.Message), Retryable: false}})
 				s.terminalClose()
+				s.completeGeneration(generation)
 				return
 			}
+			// Keep this generation active until its terminal event is enqueued.
+			// Otherwise a concurrent AppendText can expose the next generation's
+			// audio.started ahead of this utterance's audio.done.
 			_ = s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Extensions: fishExtension(event)})
+			s.completeGeneration(generation)
 			return
 		default:
 			// Fish explicitly asks clients to ignore unknown server events for
