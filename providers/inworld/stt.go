@@ -426,7 +426,6 @@ type sttStream struct {
 	// latter must reach batch callers so silence completes instead of timing out.
 	commitPending atomic.Bool
 	finalSeen     atomic.Bool
-	readySeen     atomic.Bool
 
 	// guard holds RIFF-stripping state. The runtime serializes WriteAudio,
 	// control methods and Close for one session, so it needs no lock of its own.
@@ -521,7 +520,7 @@ func (s *sttStream) Close(ctx context.Context) error {
 		// socket close that Inworld does not consistently send.
 		if s.closeErr == nil && s.finalSeen.Load() {
 			s.cancel()
-		} else if s.closeErr == nil && s.readySeen.Load() && !s.turnPending.Load() {
+		} else if s.closeErr == nil && !s.turnPending.Load() {
 			go s.finishSilentClose()
 		}
 		if s.closeErr != nil {
@@ -531,17 +530,17 @@ func (s *sttStream) Close(ctx context.Context) error {
 	return s.closeErr
 }
 
-// finishSilentClose bounds providers that acknowledge the live session but do
-// not emit another frame for audio containing no recognizable speech. The
-// startup empty final is the provider's proof that the stream is usable; after
-// a short grace for a real committed result, closing Events represents the
-// legitimate empty transcription instead of stranding the batch request.
+// finishSilentClose bounds a successfully opened stream that accepts the
+// audio/finalize/close writes but emits no frame for audio containing no
+// recognizable speech. Provider errors still end the read loop during the
+// grace; absent one, closing Events represents the legitimate empty
+// transcription instead of stranding the batch request.
 func (s *sttStream) finishSilentClose() {
 	timer := time.NewTimer(2 * time.Second)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		if s.closing.Load() && s.readySeen.Load() && !s.turnPending.Load() && !s.finalSeen.Load() {
+		if s.closing.Load() && !s.turnPending.Load() && !s.finalSeen.Load() {
 			s.cancel()
 		}
 	case <-s.ctx.Done():
@@ -674,9 +673,6 @@ func (s *sttStream) handleMessage(payload []byte) error {
 // voice agent, answers. The platform's TypeScript client drops the same frame.
 func (s *sttStream) handleTranscription(transcription sttTranscription, raw json.RawMessage) error {
 	text := strings.TrimSpace(transcription.Transcript)
-	if text == "" && transcription.IsFinal {
-		s.readySeen.Store(true)
-	}
 	committedEmptyFinal := text == "" && transcription.IsFinal && s.commitPending.Swap(false)
 	if text == "" && !committedEmptyFinal {
 		return nil
