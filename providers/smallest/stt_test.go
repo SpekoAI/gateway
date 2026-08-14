@@ -219,6 +219,21 @@ func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
 	}
 }
 
+func TestSTTCommittedFinalTerminatesAfterClose(t *testing.T) {
+	t.Parallel()
+	stream := &sttStream{ctx: context.Background(), events: make(chan runtimepkg.ProviderEvent, 1)}
+	stream.commitPending.Store(true)
+	stream.closing.Store(true)
+
+	terminal, err := stream.handleMessage([]byte(`{"type":"transcription","status":"success","transcript":"","is_final":true,"is_last":false}`))
+	if err != nil {
+		t.Fatalf("handle empty final: %v", err)
+	}
+	if !terminal {
+		t.Fatal("the committed final must terminate a stream after Close")
+	}
+}
+
 // Language handling has two traps: a region subtag Pulse does not understand,
 // and the regional aggregators whose names contain a hyphen and must survive
 // intact.

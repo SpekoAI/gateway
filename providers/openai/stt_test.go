@@ -316,6 +316,7 @@ func TestSTTEmitsFinalForEmptyTranscript(t *testing.T) {
 
 	stream, cancel := newHandlerOnlySTTStream()
 	defer cancel()
+	stream.closing.Store(true)
 
 	const frame = `{"type":"conversation.item.input_audio_transcription.completed","event_id":"e1","item_id":"item_silence","transcript":""}`
 	if err := stream.handleMessage([]byte(frame)); err != nil {
@@ -330,6 +331,40 @@ func TestSTTEmitsFinalForEmptyTranscript(t *testing.T) {
 	}
 	if event.Extensions[sttExtensionID] == nil {
 		t.Fatal("empty final must retain the raw provider payload")
+	}
+	select {
+	case <-stream.ctx.Done():
+	default:
+		t.Fatal("a completed item after Close must terminate the event stream")
+	}
+}
+
+func TestSTTCloseDoesNotRepeatAnExplicitCommit(t *testing.T) {
+	t.Parallel()
+
+	handshakes := make(chan *http.Request, 1)
+	frames := make(chan []byte, 8)
+	server := newRealtimeServer(t, handshakes, frames, nil)
+	defer server.Close()
+
+	stream := openSTT(t, server.URL, nil)
+	defer func() { _ = stream.Abort(context.Background()) }()
+	receiveFrame(t, frames) // session.update
+	if err := stream.WriteAudio(context.Background(), []byte{1, 2}); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	receiveFrame(t, frames) // input_audio_buffer.append
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit audio: %v", err)
+	}
+	receiveFrame(t, frames) // input_audio_buffer.commit
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case frame := <-frames:
+		t.Fatalf("Close repeated the explicit commit with frame %s", frame)
+	case <-time.After(150 * time.Millisecond):
 	}
 }
 

@@ -442,7 +442,7 @@ func (s *sttStream) handleMessage(payload []byte) (bool, error) {
 		}
 	}
 	// is_last is the session terminator and always accompanies is_final.
-	return message.IsLast, nil
+	return message.IsLast || (message.IsFinal && s.closing.Load()), nil
 }
 
 func (s *sttStream) emit(event runtimepkg.ProviderEvent) error {

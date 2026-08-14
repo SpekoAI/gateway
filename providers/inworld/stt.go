@@ -424,6 +424,7 @@ type sttStream struct {
 	// starts from the empty final that acknowledges our explicit endTurn. The
 	// latter must reach batch callers so silence completes instead of timing out.
 	commitPending atomic.Bool
+	finalSeen     atomic.Bool
 
 	// guard holds RIFF-stripping state. The runtime serializes WriteAudio,
 	// control methods and Close for one session, so it needs no lock of its own.
@@ -512,6 +513,12 @@ func (s *sttStream) Close(ctx context.Context) error {
 			if err := s.write(ctx, sttCloseStreamFrame); err != nil {
 				s.closeErr = err
 			}
+		}
+		// The final may have raced ahead of Close. It is already queued on the
+		// event channel, so end the read loop instead of waiting for a provider
+		// socket close that Inworld does not consistently send.
+		if s.closeErr == nil && s.finalSeen.Load() {
+			s.cancel()
 		}
 		if s.closeErr != nil {
 			_ = s.abort()
@@ -652,6 +659,7 @@ func (s *sttStream) handleTranscription(transcription sttTranscription, raw json
 	}
 	if transcription.IsFinal {
 		s.commitPending.Store(false)
+		s.finalSeen.Store(true)
 	}
 	kind := protocol.EventTranscriptDelta
 	if transcription.IsFinal {
@@ -682,11 +690,15 @@ func (s *sttStream) handleTranscription(transcription sttTranscription, raw json
 	if !transcription.IsFinal {
 		return nil
 	}
-	return s.emit(runtimepkg.ProviderEvent{
+	err := s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventSpeechEnded,
 		Data:       marshalData(map[string]any{"reason": "end_of_turn"}),
 		Extensions: sttExtension(raw),
 	})
+	if err == nil && s.closing.Load() {
+		s.cancel()
+	}
+	return err
 }
 
 // emitWarning surfaces a frame this adapter does not model instead of dropping

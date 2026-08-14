@@ -399,6 +399,59 @@ func TestSTTCommitAudioEmitsAnEmptyFinalForSilence(t *testing.T) {
 	assertTranscript(t, events[0].Data, "", true)
 }
 
+func TestSTTCloseAfterCommitSendsOnlyTheEmptyEndFrame(t *testing.T) {
+	t.Parallel()
+
+	server := newSTTServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		if _, err := readJSONObject(ctx, conn); err != nil {
+			t.Errorf("read start request: %v", err)
+			return
+		}
+		if control, err := readJSONObject(ctx, conn); err != nil || control["type"] != "finalize" {
+			t.Errorf("read explicit finalize: %v, frame=%v", err, control)
+			return
+		}
+		messageType, payload, err := conn.Read(ctx)
+		if err != nil || messageType != websocket.MessageBinary || len(payload) != 0 {
+			t.Errorf("close frame = (%v, %q, %v), want empty binary", messageType, payload, err)
+			return
+		}
+		if err := writeJSONFrame(ctx, conn, map[string]any{
+			"tokens": []any{map[string]any{"text": "<fin>", "is_final": true}},
+		}); err != nil {
+			t.Errorf("write fin: %v", err)
+		}
+	})
+	defer server.Close()
+
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), sttAdapterRequest(server.URL))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer abortStream(stream)
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit audio: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if events := collectEvents(t, stream.Events(), 1); events[0].Type != protocol.EventTranscriptFinal {
+		t.Fatalf("event = %q, want transcript.final", events[0].Type)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after the committed final")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("events did not close after the committed final")
+	}
+}
+
 // A zero-length frame is Soniox's end-of-stream signal, so forwarding one as
 // audio would go deaf mid-call. Close is the only place it may be sent.
 func TestSTTRefusesEmptyAudioAndClosesWithFinalizeThenEmptyFrame(t *testing.T) {
