@@ -307,6 +307,32 @@ func TestSTTEmitsCumulativePartialsThenFinal(t *testing.T) {
 	}
 }
 
+// TestSTTEmitsFinalForEmptyTranscript protects the batch transcription path:
+// the canonical final permits empty text because silence is a valid input, and
+// dropping OpenAI's empty completion would make the batch handler wait until
+// its request deadline instead of returning an empty successful response.
+func TestSTTEmitsFinalForEmptyTranscript(t *testing.T) {
+	t.Parallel()
+
+	stream, cancel := newHandlerOnlySTTStream()
+	defer cancel()
+
+	const frame = `{"type":"conversation.item.input_audio_transcription.completed","event_id":"e1","item_id":"item_silence","transcript":""}`
+	if err := stream.handleMessage([]byte(frame)); err != nil {
+		t.Fatalf("handle empty completion: %v", err)
+	}
+	event := <-stream.events
+	if event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("event type = %q, want %q", event.Type, protocol.EventTranscriptFinal)
+	}
+	if got := transcriptText(t, event); got != "" {
+		t.Fatalf("transcript = %q, want empty", got)
+	}
+	if event.Extensions[sttExtensionID] == nil {
+		t.Fatal("empty final must retain the raw provider payload")
+	}
+}
+
 // TestSTTRestartsPartialAfterEachFinal: the socket outlives mid-session finals,
 // so without a reset the second turn would be prefixed with the first.
 func TestSTTRestartsPartialAfterEachFinal(t *testing.T) {

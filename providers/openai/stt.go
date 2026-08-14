@@ -583,9 +583,9 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// the running partial, because the socket outlives mid-session finals.
 		s.partial = ""
 		text := strings.TrimSpace(message.Transcript)
-		if text == "" {
-			return nil
-		}
+		// An empty transcript is still a completed turn. Silence legitimately
+		// produces one, and suppressing it leaves batch callers waiting forever
+		// for the final event that closes their response.
 		return s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventTranscriptFinal,
 			Data:       sttTranscriptData(text, true, message),
