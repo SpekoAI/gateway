@@ -20,9 +20,12 @@ import (
 
 const (
 	// AdapterID is the identifier returned by a Deepgram STT session plan.
-	AdapterID       = "deepgram.stt.v1"
-	extensionID     = "deepgram.com/v1"
-	officialAPIHost = "api.deepgram.com"
+	AdapterID        = "deepgram.stt.v1"
+	extensionID      = "deepgram.com/v1"
+	fluxExtensionID  = "deepgram.com/v2"
+	officialAPIHost  = "api.deepgram.com"
+	fluxEnglishModel = "flux-general-en"
+	fluxMultilingual = "flux-general-multi"
 )
 
 // Config controls local transport limits. Credentials and provider selection
@@ -36,7 +39,9 @@ type Config struct {
 	AllowInsecureEndpoint bool
 }
 
-// Adapter implements Deepgram's /v1/listen WebSocket API.
+// Adapter implements Deepgram's /v1/listen transcription API and the
+// turn-aware Flux /v2/listen API. The two paths share authentication and audio
+// framing but deliberately keep separate query and event mappings.
 type Adapter struct {
 	id              string
 	httpClient      *http.Client
@@ -143,10 +148,15 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &stream{
-		conn:   conn,
-		ctx:    streamCtx,
-		cancel: cancel,
-		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		conn:      conn,
+		ctx:       streamCtx,
+		cancel:    cancel,
+		events:    make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		flux:      isFluxModel(request.Plan.Route.Model),
+		extension: extensionID,
+	}
+	if stream.flux {
+		stream.extension = fluxExtensionID
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -177,11 +187,21 @@ func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	if err != nil {
 		return "", fmt.Errorf("deepgram endpoint: %w", err)
 	}
-	if endpoint.Path != "/v1/listen" {
-		return "", fmt.Errorf("deepgram endpoint path must be /v1/listen, got %q", endpoint.Path)
-	}
 	if strings.TrimSpace(model) == "" || model == "auto" {
 		return "", errors.New("deepgram requires a concrete model in the session plan")
+	}
+	flux := isFluxModel(model)
+	switch endpoint.Path {
+	case "/v1/listen":
+		if flux {
+			return "", errors.New("deepgram Flux models require the /v2/listen endpoint")
+		}
+	case "/v2/listen":
+		if !flux {
+			return "", errors.New("deepgram /v2/listen requires flux-general-en or flux-general-multi")
+		}
+	default:
+		return "", fmt.Errorf("deepgram endpoint path must be /v1/listen or /v2/listen, got %q", endpoint.Path)
 	}
 	encoding, err := deepgramEncoding(media.Encoding)
 	if err != nil {
@@ -191,19 +211,34 @@ func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	query.Set("model", model)
 	query.Set("encoding", encoding)
 	query.Set("sample_rate", strconv.Itoa(media.SampleRateHz))
-	query.Set("channels", strconv.Itoa(media.Channels))
-	query.Set("interim_results", "true")
-	// The framework owns VAD/turn detection by default. Explicit Deepgram
-	// endpointing support can be introduced through a validated extension later.
-	query.Set("endpointing", "false")
-	if strings.TrimSpace(options.Language) != "" {
-		query.Set("language", options.Language)
-	}
-	if strings.TrimSpace(reservationID) != "" {
-		query.Set("extra", "speko_reservation:"+reservationID)
+	if flux {
+		// Flux owns turn detection, so the v1 endpointing/interim controls are not
+		// valid here. Its multilingual model accepts repeatable language_hint;
+		// RequestOptions currently exposes one preferred language.
+		if language := strings.TrimSpace(options.Language); language != "" && model == fluxMultilingual {
+			query.Add("language_hint", language)
+		}
+		if strings.TrimSpace(reservationID) != "" {
+			query.Add("tag", "speko_reservation:"+reservationID)
+		}
+	} else {
+		query.Set("channels", strconv.Itoa(media.Channels))
+		query.Set("interim_results", "true")
+		// The framework owns VAD/turn detection for legacy Listen.
+		query.Set("endpointing", "false")
+		if strings.TrimSpace(options.Language) != "" {
+			query.Set("language", options.Language)
+		}
+		if strings.TrimSpace(reservationID) != "" {
+			query.Set("extra", "speko_reservation:"+reservationID)
+		}
 	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil
+}
+
+func isFluxModel(model string) bool {
+	return model == fluxEnglishModel || model == fluxMultilingual
 }
 
 func deepgramEncoding(encoding string) (string, error) {
@@ -230,6 +265,8 @@ type stream struct {
 	closeErr     error
 
 	requestID string
+	flux      bool
+	extension string
 }
 
 func (s *stream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -242,6 +279,11 @@ func (s *stream) WriteAudio(ctx context.Context, audio []byte) error {
 }
 
 func (s *stream) CommitAudio(ctx context.Context) error {
+	// Flux exposes no Finalize control message. Turn completion is part of the
+	// model and CloseStream is reserved for ending the whole session.
+	if s.flux {
+		return nil
+	}
 	return s.writeJSON(ctx, map[string]string{"type": "Finalize"})
 }
 
@@ -358,6 +400,9 @@ func (s *stream) handleMessage(payload []byte) error {
 		}
 	}
 	raw := json.RawMessage(append([]byte(nil), payload...))
+	if s.flux {
+		return s.handleFluxMessage(message, raw)
+	}
 	switch message.Type {
 	case "Metadata":
 		s.setRequestID(message.Metadata.RequestID)
@@ -391,6 +436,94 @@ func (s *stream) handleMessage(payload []byte) error {
 			Type:       protocol.EventWarning,
 			Data:       warningData(message.Type),
 			Extensions: extension(raw),
+		})
+	}
+}
+
+func (s *stream) handleFluxMessage(message inboundMessage, raw json.RawMessage) error {
+	if message.RequestID != "" && s.setRequestID(message.RequestID) {
+		if err := s.emit(runtimepkg.ProviderEvent{
+			Type:       protocol.EventUsageObserved,
+			Data:       usageData(message.RequestID),
+			Extensions: s.extensionPayload(raw),
+		}); err != nil {
+			return err
+		}
+	}
+	switch message.Type {
+	case "Connected":
+		return nil
+	case "TurnInfo":
+		return s.emitFluxTurn(message, raw)
+	case "ConfigureSuccess", "ConfigureFailure":
+		return s.emit(runtimepkg.ProviderEvent{
+			Type:       protocol.EventWarning,
+			Data:       warningData(message.Type),
+			Extensions: s.extensionPayload(raw),
+		})
+	case "Error":
+		return &runtimepkg.ProviderError{
+			Code:       "provider_unavailable",
+			Message:    deepgramErrorMessage(message.Description),
+			Retryable:  false,
+			Extensions: s.extensionPayload(raw),
+		}
+	default:
+		return s.emit(runtimepkg.ProviderEvent{
+			Type:       protocol.EventWarning,
+			Data:       warningData(message.Type),
+			Extensions: s.extensionPayload(raw),
+		})
+	}
+}
+
+func (s *stream) emitFluxTurn(message inboundMessage, raw json.RawMessage) error {
+	extensions := s.extensionPayload(raw)
+	switch message.Event {
+	case "StartOfTurn":
+		return s.emit(runtimepkg.ProviderEvent{
+			Type:       protocol.EventSpeechStarted,
+			Data:       speechStartedData(message.AudioWindowStart),
+			Extensions: extensions,
+		})
+	case "Update":
+		if message.Transcript == "" {
+			return nil
+		}
+		return s.emit(runtimepkg.ProviderEvent{
+			Type:       protocol.EventTranscriptDelta,
+			Data:       fluxTranscriptData(message, false, s.currentRequestID()),
+			Extensions: extensions,
+		})
+	case "EndOfTurn":
+		if message.Transcript != "" {
+			if err := s.emit(runtimepkg.ProviderEvent{
+				Type:       protocol.EventTranscriptFinal,
+				Data:       fluxTranscriptData(message, true, s.currentRequestID()),
+				Extensions: extensions,
+			}); err != nil {
+				return err
+			}
+		}
+		return s.emit(runtimepkg.ProviderEvent{
+			Type:       protocol.EventSpeechEnded,
+			Data:       marshalData(map[string]any{"audio_end_ms": milliseconds(message.AudioWindowEnd), "reason": "end_of_turn"}),
+			Extensions: extensions,
+		})
+	case "EagerEndOfTurn", "TurnResumed":
+		// These are speculative lifecycle signals. The portable protocol has no
+		// cancellable transcript/LLM-draft primitive, so preserve them as a warning
+		// and in the raw extension instead of falsely finalizing a transcript.
+		return s.emit(runtimepkg.ProviderEvent{
+			Type:       protocol.EventWarning,
+			Data:       marshalData(map[string]any{"message": "Deepgram Flux speculative turn event", "provider_event": message.Event}),
+			Extensions: extensions,
+		})
+	default:
+		return s.emit(runtimepkg.ProviderEvent{
+			Type:       protocol.EventWarning,
+			Data:       marshalData(map[string]any{"message": "ignored Deepgram Flux turn event", "provider_event": message.Event}),
+			Extensions: extensions,
 		})
 	}
 }
@@ -440,6 +573,10 @@ func (s *stream) emit(event runtimepkg.ProviderEvent) error {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
 	}
+}
+
+func (s *stream) extensionPayload(raw json.RawMessage) map[string]json.RawMessage {
+	return map[string]json.RawMessage{s.extension: raw}
 }
 
 func (s *stream) setRequestID(value string) bool {
@@ -499,6 +636,18 @@ func transcriptData(text string, message inboundMessage, requestID string) json.
 	})
 }
 
+func fluxTranscriptData(message inboundMessage, final bool, requestID string) json.RawMessage {
+	return marshalData(map[string]any{
+		"text":                   message.Transcript,
+		"is_final":               final,
+		"audio_start_ms":         milliseconds(message.AudioWindowStart),
+		"audio_end_ms":           milliseconds(message.AudioWindowEnd),
+		"provider_request_id":    requestID,
+		"turn_index":             message.TurnIndex,
+		"end_of_turn_confidence": message.EndOfTurnConfidence,
+	})
+}
+
 func warningData(messageType string) json.RawMessage {
 	return marshalData(map[string]any{"message": "ignored Deepgram message type", "provider_type": messageType})
 }
@@ -523,15 +672,22 @@ func deepgramErrorMessage(description string) string {
 }
 
 type inboundMessage struct {
-	Type        string  `json:"type"`
-	Description string  `json:"description"`
-	IsFinal     bool    `json:"is_final"`
-	SpeechFinal bool    `json:"speech_final"`
-	Start       float64 `json:"start"`
-	Duration    float64 `json:"duration"`
-	Timestamp   float64 `json:"timestamp"`
-	LastWordEnd float64 `json:"last_word_end"`
-	Channel     struct {
+	Type                string  `json:"type"`
+	Description         string  `json:"description"`
+	RequestID           string  `json:"request_id"`
+	Event               string  `json:"event"`
+	Transcript          string  `json:"transcript"`
+	TurnIndex           int     `json:"turn_index"`
+	AudioWindowStart    float64 `json:"audio_window_start"`
+	AudioWindowEnd      float64 `json:"audio_window_end"`
+	EndOfTurnConfidence float64 `json:"end_of_turn_confidence"`
+	IsFinal             bool    `json:"is_final"`
+	SpeechFinal         bool    `json:"speech_final"`
+	Start               float64 `json:"start"`
+	Duration            float64 `json:"duration"`
+	Timestamp           float64 `json:"timestamp"`
+	LastWordEnd         float64 `json:"last_word_end"`
+	Channel             struct {
 		Alternatives []struct {
 			Transcript string `json:"transcript"`
 		} `json:"alternatives"`

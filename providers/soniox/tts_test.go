@@ -52,7 +52,7 @@ func TestTTSStartRequestIsSentAtOpenWithTheDocumentedWireShape(t *testing.T) {
 	if got := start["api_key"]; got != "customer-soniox-key" {
 		t.Errorf("api_key = %v", got)
 	}
-	if got := start["model"]; got != "tts-rt-v1" {
+	if got := start["model"]; got != "tts-rt-v2" {
 		t.Errorf("model = %v", got)
 	}
 	if got := start["voice"]; got != "Adrian" {
@@ -590,7 +590,7 @@ func ttsTestConfig(serverURL string) TTSConfig {
 
 func ttsAdapterRequest(serverURL string) runtimepkg.AdapterRequest {
 	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
-	plan := sonioxPlan(now, websocketEndpointFor(serverURL, "/tts-websocket"), "tts-rt-v1")
+	plan := sonioxPlan(now, websocketEndpointFor(serverURL, "/tts-websocket"), "tts-rt-v2")
 	plan.Route.Adapter = TTSAdapterID
 	plan.Reservation.Usage = protocol.UsageReservation{Unit: protocol.UsageUnitCharacters, AuthorizedUnits: 4_000}
 	return runtimepkg.AdapterRequest{

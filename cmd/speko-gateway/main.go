@@ -25,12 +25,14 @@ import (
 	"github.com/SpekoAI/gateway/providers/cartesia"
 	"github.com/SpekoAI/gateway/providers/deepgram"
 	"github.com/SpekoAI/gateway/providers/elevenlabs"
+	"github.com/SpekoAI/gateway/providers/fish"
 	"github.com/SpekoAI/gateway/providers/gladia"
 	"github.com/SpekoAI/gateway/providers/google"
 	"github.com/SpekoAI/gateway/providers/gradium"
 	"github.com/SpekoAI/gateway/providers/hume"
 	"github.com/SpekoAI/gateway/providers/inworld"
 	"github.com/SpekoAI/gateway/providers/minimax"
+	"github.com/SpekoAI/gateway/providers/modulate"
 	"github.com/SpekoAI/gateway/providers/openai"
 	"github.com/SpekoAI/gateway/providers/rime"
 	"github.com/SpekoAI/gateway/providers/smallest"
@@ -130,6 +132,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	fishAdapter, err := fish.New(fish.Config{})
+	if err != nil {
+		return err
+	}
 	cartesiaAdapter, err := cartesia.New(cartesia.Config{})
 	if err != nil {
 		return err
@@ -139,6 +145,10 @@ func run() error {
 		return err
 	}
 	assemblyAIAdapter, err := assemblyai.New(assemblyai.Config{})
+	if err != nil {
+		return err
+	}
+	modulateAdapter, err := modulate.New(modulate.Config{})
 	if err != nil {
 		return err
 	}
@@ -224,7 +234,8 @@ func run() error {
 	}
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
-		cartesiaAdapter, cartesiaSTTAdapter, assemblyAIAdapter, gladiaAdapter,
+		fishAdapter,
+		cartesiaAdapter, cartesiaSTTAdapter, assemblyAIAdapter, modulateAdapter, gladiaAdapter,
 		googleAdapter, inworldAdapter, minimaxAdapter, xaiAdapter,
 		sonioxSTTAdapter, sonioxTTSAdapter, smallestSTTAdapter, smallestTTSAdapter,
 		openaiSTTAdapter, openaiTTSAdapter, alibabaSTTAdapter, alibabaTTSAdapter,

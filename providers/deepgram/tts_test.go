@@ -104,6 +104,66 @@ func TestTTSAdapterUsesAura2WireContractAndMapsAudio(t *testing.T) {
 	}
 }
 
+func TestTTSAdapterUsesFluxV2TurnLifecycle(t *testing.T) {
+	t.Parallel()
+	requests := make(chan *http.Request, 1)
+	server := newSpeakServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+		if message, err := readTTSControl(ctx, conn); err != nil || message.Type != "Speak" || message.Text != "Hello Flux" {
+			t.Errorf("speak = %+v, err=%v", message, err)
+			return
+		}
+		if message, err := readTTSControl(ctx, conn); err != nil || message.Type != "Flush" {
+			t.Errorf("flush = %+v, err=%v", message, err)
+			return
+		}
+		_ = writeJSON(ctx, conn, map[string]any{"type": "Connected", "request_id": "dg_flux_tts_1", "model_name": "flux-haley-en"})
+		_ = writeJSON(ctx, conn, map[string]any{"type": "SpeechStarted", "speech_id": "speech_1"})
+		_ = conn.Write(ctx, websocket.MessageBinary, []byte{1, 2})
+		_ = writeJSON(ctx, conn, map[string]any{"type": "Flushed", "speech_id": "speech_1"})
+		_ = conn.Write(ctx, websocket.MessageBinary, []byte{3, 4})
+		_ = writeJSON(ctx, conn, map[string]any{"type": "SpeechMetadata", "speech_id": "speech_1", "audio_duration_ms": 1000, "billable_character_count": 10})
+		if message, err := readTTSControl(ctx, conn); err != nil || message.Type != "Close" {
+			t.Errorf("close = %+v, err=%v", message, err)
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, err := NewTTS(testTTSConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	request := deepgramTTSRequest(server.URL, protocol.CredentialsBYOK)
+	request.Plan.Route.Model = "flux-haley-en"
+	request.Plan.Route.Endpoint = strings.Replace(request.Plan.Route.Endpoint, "/v1/speak", "/v2/speak", 1)
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "Hello Flux"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	events := collectProviderEvents(t, stream.Events(), 5)
+	if got := strings.Join(eventTypes(events), ","); got != "usage.observed,audio.started,audio.frame,audio.frame,audio.done" {
+		t.Fatalf("events = %s", got)
+	}
+	if events[4].Extensions[fluxExtensionID] == nil || string(events[2].Audio) != string([]byte{1, 2}) || string(events[3].Audio) != string([]byte{3, 4}) {
+		t.Fatalf("Flux events = %+v", events)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	requestSeen := <-requests
+	if requestSeen.URL.Path != "/v2/speak" || requestSeen.URL.Query().Get("model") != "flux-haley-en" {
+		t.Fatalf("Flux handshake = %s", requestSeen.URL.String())
+	}
+}
+
 func TestTTSAdapterCancelUsesClearAndAllowsAnotherUtterance(t *testing.T) {
 	t.Parallel()
 	server := newSpeakServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
@@ -279,7 +339,7 @@ func readTTSControl(ctx context.Context, conn *websocket.Conn) (ttsControl, erro
 func newSpeakServer(t *testing.T, callback func(context.Context, *http.Request, *websocket.Conn)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/v1/speak" {
+		if request.URL.Path != "/v1/speak" && request.URL.Path != "/v2/speak" {
 			http.NotFound(w, request)
 			return
 		}
