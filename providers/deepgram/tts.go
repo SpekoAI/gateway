@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	// TTSAdapterID is the stable Aura-2 streaming TTS adapter identifier.
+	// TTSAdapterID is the stable Deepgram streaming TTS adapter identifier.
 	TTSAdapterID = "deepgram.tts.v1"
 
 	deepgramTTSMaxCharactersPerMessage = 2_000
@@ -42,7 +42,8 @@ type TTSConfig struct {
 	AllowInsecureEndpoint bool
 }
 
-// TTSAdapter implements Deepgram Aura's stable /v1/speak WebSocket protocol.
+// TTSAdapter implements Aura's /v1/speak and Flux TTS's turn-based /v2/speak
+// WebSocket protocols.
 type TTSAdapter struct {
 	id              string
 	httpClient      *http.Client
@@ -87,7 +88,7 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	if request.Media == nil {
 		return nil, errors.New("deepgram tts requires media configuration")
 	}
-	endpoint, err := speakEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media)
+	endpoint, protocolVersion, err := speakEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +119,7 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
-	stream := &ttsStream{conn: conn, ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), now: a.now}
+	stream := &ttsStream{conn: conn, ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), now: a.now, protocolVersion: protocolVersion}
 	if response != nil {
 		stream.setRequestID(response.Header.Get("dg-request-id"))
 	}
@@ -132,31 +133,48 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	return stream, nil
 }
 
-func speakEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, media protocol.MediaFormat) (string, error) {
+func speakEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, media protocol.MediaFormat) (string, int, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
-		return "", fmt.Errorf("deepgram tts endpoint: %w", err)
+		return "", 0, fmt.Errorf("deepgram tts endpoint: %w", err)
 	}
-	if endpoint.Path != "/v1/speak" {
-		return "", fmt.Errorf("deepgram tts endpoint path must be /v1/speak, got %q", endpoint.Path)
+	model = strings.TrimSpace(model)
+	if model == "" || model == "auto" {
+		return "", 0, errors.New("deepgram tts requires a concrete model")
 	}
-	if strings.TrimSpace(model) == "" || model == "auto" || !strings.HasPrefix(model, "aura-2-") {
-		return "", errors.New("deepgram tts requires a concrete Aura-2 model")
+	protocolVersion := 0
+	switch endpoint.Path {
+	case "/v1/speak":
+		protocolVersion = 1
+		if !strings.HasPrefix(model, "aura-2-") {
+			return "", 0, errors.New("deepgram /v1/speak requires a concrete Aura-2 model")
+		}
+	case "/v2/speak":
+		protocolVersion = 2
+		if !strings.HasPrefix(model, "flux-") {
+			return "", 0, errors.New("deepgram /v2/speak requires a concrete Flux TTS model")
+		}
+	default:
+		return "", 0, fmt.Errorf("deepgram tts endpoint path must be /v1/speak or /v2/speak, got %q", endpoint.Path)
 	}
 	if media.Encoding != "pcm_s16le" || media.Channels != 1 {
-		return "", errors.New("deepgram tts requires mono pcm_s16le output")
+		return "", 0, errors.New("deepgram tts requires mono pcm_s16le output")
 	}
 	switch media.SampleRateHz {
 	case 8_000, 16_000, 24_000, 32_000, 48_000:
+	case 44_100:
+		if protocolVersion != 2 {
+			return "", 0, fmt.Errorf("deepgram tts does not support sample rate %d", media.SampleRateHz)
+		}
 	default:
-		return "", fmt.Errorf("deepgram tts does not support sample rate %d", media.SampleRateHz)
+		return "", 0, fmt.Errorf("deepgram tts does not support sample rate %d", media.SampleRateHz)
 	}
 	query := endpoint.Query()
 	query.Set("model", model)
 	query.Set("encoding", "linear16")
 	query.Set("sample_rate", strconv.Itoa(media.SampleRateHz))
 	endpoint.RawQuery = query.Encode()
-	return endpoint.String(), nil
+	return endpoint.String(), protocolVersion, nil
 }
 
 type ttsStream struct {
@@ -172,14 +190,15 @@ type ttsStream struct {
 	closed       atomic.Bool
 	closeErr     error
 
-	stateMu       sync.Mutex
-	utteranceID   string
-	committed     bool
-	audioStarted  bool
-	requestID     string
-	windowStarted time.Time
-	windowChars   int
-	windowFlushes int
+	stateMu         sync.Mutex
+	utteranceID     string
+	committed       bool
+	audioStarted    bool
+	requestID       string
+	protocolVersion int
+	windowStarted   time.Time
+	windowChars     int
+	windowFlushes   int
 }
 
 func (s *ttsStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -193,11 +212,13 @@ func (s *ttsStream) AppendText(ctx context.Context, text string) error {
 	if characters == 0 {
 		return errors.New("deepgram tts text is empty")
 	}
-	if characters > deepgramTTSMaxCharactersPerMessage {
+	if s.protocolVersion == 1 && characters > deepgramTTSMaxCharactersPerMessage {
 		return &runtimepkg.ProviderError{Code: "input_too_large", Message: "Deepgram TTS input exceeds 2000 characters", Retryable: false, ProviderStatus: http.StatusRequestEntityTooLarge}
 	}
-	if err := s.acceptCharacters(characters); err != nil {
-		return err
+	if s.protocolVersion == 1 {
+		if err := s.acceptCharacters(characters); err != nil {
+			return err
+		}
 	}
 	if _, err := s.startOrCurrentUtterance(); err != nil {
 		return err
@@ -209,9 +230,11 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 	if err := s.commitUtterance(); err != nil {
 		return err
 	}
-	if err := s.acceptFlush(); err != nil {
-		s.uncommitUtterance()
-		return err
+	if s.protocolVersion == 1 {
+		if err := s.acceptFlush(); err != nil {
+			s.uncommitUtterance()
+			return err
+		}
 	}
 	if err := s.writeJSON(ctx, map[string]string{"type": "Flush"}); err != nil {
 		s.uncommitUtterance()
@@ -223,6 +246,12 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 func (s *ttsStream) Cancel(ctx context.Context) error {
 	if !s.hasUtterance() {
 		return runtimepkg.ErrSessionClosed
+	}
+	if s.protocolVersion == 2 {
+		// Flux TTS Early Access documents Speak, Flush, and Close. Interrupt is
+		// reserved for GA, so a cancellation safely ends this provider session
+		// instead of guessing a playback offset and misreporting what was heard.
+		return s.Close(ctx)
 	}
 	if err := s.writeJSON(ctx, map[string]string{"type": "Clear"}); err != nil {
 		return err
@@ -409,6 +438,7 @@ func (s *ttsStream) handleTTSMessage(payload []byte) error {
 	var message struct {
 		Type        string `json:"type"`
 		RequestID   string `json:"request_id"`
+		SpeechID    string `json:"speech_id"`
 		SequenceID  int    `json:"sequence_id"`
 		Description string `json:"description"`
 		Code        string `json:"code"`
@@ -418,23 +448,66 @@ func (s *ttsStream) handleTTSMessage(payload []byte) error {
 	}
 	raw := json.RawMessage(append([]byte(nil), payload...))
 	switch message.Type {
-	case "Metadata":
+	case "Metadata", "Connected":
 		if s.setRequestID(message.RequestID) {
-			return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: usageData(message.RequestID), Extensions: extension(raw)})
+			return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: usageData(message.RequestID), Extensions: s.ttsExtension(raw)})
 		}
 		return nil
+	case "SpeechStarted":
+		if s.protocolVersion != 2 {
+			return nil
+		}
+		id, started := s.setServerUtteranceID(message.SpeechID)
+		if !started {
+			return nil
+		}
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: ttsContextData(id, s.currentRequestID()), Extensions: s.ttsExtension(raw)})
 	case "Flushed":
+		if s.protocolVersion == 2 {
+			// Flux may send trailing binary frames after Flushed. SpeechMetadata is
+			// the documented point at which all turn audio has arrived.
+			return nil
+		}
 		id := s.finishUtterance()
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: ttsContextData(id, s.currentRequestID()), Extensions: extension(raw)})
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: ttsContextData(id, s.currentRequestID()), Extensions: s.ttsExtension(raw)})
+	case "SpeechMetadata":
+		if s.protocolVersion != 2 {
+			return nil
+		}
+		id := s.finishUtterance()
+		if message.SpeechID != "" {
+			id = message.SpeechID
+		}
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: ttsContextData(id, s.currentRequestID()), Extensions: s.ttsExtension(raw)})
 	case "Cleared":
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"code": "provider_buffer_cleared", "sequence_id": message.SequenceID}), Extensions: extension(raw)})
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"code": "provider_buffer_cleared", "sequence_id": message.SequenceID}), Extensions: s.ttsExtension(raw)})
 	case "Warning":
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"code": message.Code, "message": message.Description}), Extensions: extension(raw)})
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"code": message.Code, "message": message.Description}), Extensions: s.ttsExtension(raw)})
 	case "Error":
 		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: deepgramTTSErrorMessage(message.Description), Retryable: false}
 	default:
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: warningData(message.Type), Extensions: extension(raw)})
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: warningData(message.Type), Extensions: s.ttsExtension(raw)})
 	}
+}
+
+func (s *ttsStream) setServerUtteranceID(value string) (string, bool) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if value != "" {
+		s.utteranceID = value
+	}
+	if s.utteranceID == "" || s.audioStarted {
+		return s.utteranceID, false
+	}
+	s.audioStarted = true
+	return s.utteranceID, true
+}
+
+func (s *ttsStream) ttsExtension(raw json.RawMessage) map[string]json.RawMessage {
+	if s.protocolVersion == 2 {
+		return map[string]json.RawMessage{fluxExtensionID: raw}
+	}
+	return extension(raw)
 }
 
 func (s *ttsStream) setRequestID(value string) bool {

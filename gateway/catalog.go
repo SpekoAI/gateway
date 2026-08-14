@@ -34,6 +34,11 @@ type CatalogEntry struct {
 	DefaultVoice string             `json:"default_voice,omitempty"`
 	Transport    protocol.Transport `json:"transport"`
 	Endpoint     string             `json:"endpoint"`
+	// ModelRoutes selects a different vendor endpoint for model families that
+	// share one provider/kind adapter but are served on a versioned path. It is
+	// local-planner metadata, not another published provider row. The first
+	// matching prefix wins; unmatched models retain Endpoint.
+	ModelRoutes []CatalogModelRoute `json:"-"`
 	// RequiresDeploymentConfig, when non-empty, says this row cannot be dialled as
 	// written and names what an operator must supply. Google STT is the case: its
 	// path embeds the caller's own GCP project
@@ -47,9 +52,14 @@ type CatalogEntry struct {
 	RequiresDeploymentConfig string `json:"requires_deployment_config,omitempty"`
 }
 
+type CatalogModelRoute struct {
+	ModelPrefix string
+	Endpoint    string
+}
+
 var providerCatalog = []CatalogEntry{
-	{Provider: "deepgram", Kind: protocol.SessionKindSTT, Adapter: "deepgram.stt.v1", DefaultModel: "nova-3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.deepgram.com/v1/listen"},
-	{Provider: "deepgram", Kind: protocol.SessionKindTTS, Adapter: "deepgram.tts.v1", DefaultModel: "aura-2-thalia-en", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.deepgram.com/v1/speak"},
+	{Provider: "deepgram", Kind: protocol.SessionKindSTT, Adapter: "deepgram.stt.v1", DefaultModel: "flux-general-en", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.deepgram.com/v2/listen", ModelRoutes: []CatalogModelRoute{{ModelPrefix: "flux-", Endpoint: "wss://api.deepgram.com/v2/listen"}, {ModelPrefix: "", Endpoint: "wss://api.deepgram.com/v1/listen"}}},
+	{Provider: "deepgram", Kind: protocol.SessionKindTTS, Adapter: "deepgram.tts.v1", DefaultModel: "flux-haley-en", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.deepgram.com/v2/speak", ModelRoutes: []CatalogModelRoute{{ModelPrefix: "flux-", Endpoint: "wss://api.deepgram.com/v2/speak"}, {ModelPrefix: "", Endpoint: "wss://api.deepgram.com/v1/speak"}}},
 	// The realtime Scribe family, NOT the batch `scribe_v2`: only this id streams
 	// over /v1/speech-to-text/realtime.
 	{Provider: "elevenlabs", Kind: protocol.SessionKindSTT, Adapter: "elevenlabs.stt.v1", DefaultModel: "scribe_v2_realtime", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/speech-to-text/realtime"},
@@ -57,6 +67,10 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "cartesia", Kind: protocol.SessionKindSTT, Adapter: "cartesia.stt.v1", DefaultModel: "ink-2", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/stt/websocket"},
 	{Provider: "cartesia", Kind: protocol.SessionKindTTS, Adapter: "cartesia.tts.v1", DefaultModel: "sonic-3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket"},
 	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "universal-3-5-pro", Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
+	// Modulate selects its two streaming transcription models by endpoint path,
+	// not a model query field. English Fast is the conversational default;
+	// multilingual remains explicitly selectable through the same adapter.
+	{Provider: "modulate", Kind: protocol.SessionKindSTT, Adapter: "modulate.stt.v1", DefaultModel: "velma-2-stt-streaming-english-v2", Transport: protocol.TransportWebSocket, Endpoint: "wss://platform.modulate.ai/api/velma-2-stt-streaming-english-v2", ModelRoutes: []CatalogModelRoute{{ModelPrefix: "velma-2-stt-streaming-english-v2", Endpoint: "wss://platform.modulate.ai/api/velma-2-stt-streaming-english-v2"}, {ModelPrefix: "velma-2-stt-streaming", Endpoint: "wss://platform.modulate.ai/api/velma-2-stt-streaming"}}},
 	// Gladia discovers its real socket at runtime: an init call returns
 	// a URL with the session token already embedded. The endpoint here is the
 	// nominal one a plan carries — the adapter derives the init call from it (BYOK)
@@ -82,12 +96,13 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "gradium", Kind: protocol.SessionKindTTS, Adapter: "gradium.tts.v1", DefaultModel: "default", DefaultVoice: "YTpq7expH9539ERJ", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/tts"},
 	{Provider: "rime", Kind: protocol.SessionKindTTS, Adapter: "rime.tts.v1", DefaultModel: "coda", DefaultVoice: "astra", Transport: protocol.TransportWebSocket, Endpoint: "wss://users-ws.rime.ai/ws3"},
 	{Provider: "hume", Kind: protocol.SessionKindTTS, Adapter: "hume.tts.v1", DefaultModel: "octave-2", DefaultVoice: "Colton Rivers", Transport: protocol.TransportHTTP, Endpoint: "https://api.hume.ai/v0/tts/stream/json"},
+	{Provider: "fish", Kind: protocol.SessionKindTTS, Adapter: "fish.tts.v1", DefaultModel: "s2.1-pro", DefaultVoice: "802e3bc2b27e49c2995d23ef70e6ac89", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.fish.audio/v1/tts/live"},
 	{Provider: "inworld", Kind: protocol.SessionKindSTT, Adapter: "inworld.stt.v1", DefaultModel: "inworld-stt-1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional"},
 	{Provider: "xai", Kind: protocol.SessionKindSTT, Adapter: "xai.stt.v1", DefaultModel: "stt", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/stt"},
 	{Provider: "openai", Kind: protocol.SessionKindSTT, Adapter: "openai.stt.v1", DefaultModel: "gpt-live-transcribe", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.openai.com/v1/realtime"},
 	{Provider: "openai", Kind: protocol.SessionKindTTS, Adapter: "openai.tts.v1", DefaultModel: "gpt-4o-mini-tts", Transport: protocol.TransportHTTP, Endpoint: "https://api.openai.com/v1/audio/speech"},
 	{Provider: "soniox", Kind: protocol.SessionKindSTT, Adapter: "soniox.stt.v1", DefaultModel: "stt-rt-v5", Transport: protocol.TransportWebSocket, Endpoint: "wss://stt-rt.soniox.com/transcribe-websocket"},
-	{Provider: "soniox", Kind: protocol.SessionKindTTS, Adapter: "soniox.tts.v1", DefaultModel: "tts-rt-v1", Transport: protocol.TransportWebSocket, Endpoint: "wss://tts-rt.soniox.com/tts-websocket"},
+	{Provider: "soniox", Kind: protocol.SessionKindTTS, Adapter: "soniox.tts.v1", DefaultModel: "tts-rt-v2", Transport: protocol.TransportWebSocket, Endpoint: "wss://tts-rt.soniox.com/tts-websocket"},
 	{Provider: "smallest", Kind: protocol.SessionKindSTT, Adapter: "smallest.stt.v1", DefaultModel: "pulse", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.smallest.ai/waves/v1/stt/live"},
 	{Provider: "smallest", Kind: protocol.SessionKindTTS, Adapter: "smallest.tts.v1", DefaultModel: "lightning_v3.1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.smallest.ai/waves/v1/tts/live"},
 	{Provider: "inworld", Kind: protocol.SessionKindTTS, Adapter: "inworld.tts.v1", DefaultModel: "inworld-tts-2", Transport: protocol.TransportHTTP, Endpoint: "https://api.inworld.ai/tts/v1/voice:stream"},

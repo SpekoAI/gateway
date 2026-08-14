@@ -198,6 +198,7 @@ Every catalog provider has a BYOK credential variable:
 | Cartesia | `SPEKO_CARTESIA_BYOK_API_KEY` | API key |
 | Deepgram | `SPEKO_DEEPGRAM_BYOK_API_KEY` | API key |
 | ElevenLabs | `SPEKO_ELEVENLABS_BYOK_API_KEY` | API key |
+| Fish Audio | `SPEKO_FISH_BYOK_API_KEY` | Team API key; `/v1/tts/live` does not accept Fish agent session tokens |
 | Gladia | `SPEKO_GLADIA_BYOK_API_KEY` | API key used for live-session initialization |
 | Google | `SPEKO_GOOGLE_BYOK_ACCESS_TOKEN` | OAuth access token; prefer `_FILE` for rotation |
 | Gradium | `SPEKO_GRADIUM_BYOK_API_KEY` | API key |
@@ -248,13 +249,14 @@ restarting the Gateway.
 
 | Capability | Provider | Adapter | Default model |
 | --- | --- | --- | --- |
-| STT | Deepgram | `deepgram.stt.v1` | `nova-3` |
-| TTS | Deepgram | `deepgram.tts.v1` | `aura-2-thalia-en` |
+| STT | Deepgram | `deepgram.stt.v1` | `flux-general-en` |
+| TTS | Deepgram | `deepgram.tts.v1` | `flux-haley-en` |
 | STT | ElevenLabs | `elevenlabs.stt.v1` | `scribe_v2_realtime` |
 | TTS | ElevenLabs | `elevenlabs.tts.v1` | `eleven_flash_v2_5` |
 | STT | Cartesia | `cartesia.stt.v1` | `ink-2` |
 | TTS | Cartesia | `cartesia.tts.v1` | `sonic-3` |
 | STT | AssemblyAI | `assemblyai.stt.v1` | `universal-3-5-pro` |
+| STT | Modulate | `modulate.stt.v1` | `velma-2-stt-streaming-english-v2` |
 | STT | Gladia | `gladia.stt.v1` | `solaria-1` |
 | TTS | MiniMax | `minimax.tts.v1` | `speech-2.8-hd` |
 | STT | xAI | `xai.stt.v1` | `stt` |
@@ -272,7 +274,8 @@ restarting the Gateway.
 | STT | OpenAI | `openai.stt.v1` | `gpt-live-transcribe` |
 | TTS | OpenAI | `openai.tts.v1` | `gpt-4o-mini-tts` |
 | STT | Soniox | `soniox.stt.v1` | `stt-rt-v5` |
-| TTS | Soniox | `soniox.tts.v1` | `tts-rt-v1` |
+| TTS | Fish Audio | `fish.tts.v1` | `s2.1-pro` |
+| TTS | Soniox | `soniox.tts.v1` | `tts-rt-v2` |
 | STT | Smallest | `smallest.stt.v1` | `pulse` |
 | TTS | Smallest | `smallest.tts.v1` | `lightning_v3.1` |
 
