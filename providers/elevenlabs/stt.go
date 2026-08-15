@@ -218,6 +218,17 @@ func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string
 		// Only the primary subtag is accepted — `es`, not `es-MX`.
 		query.Set("language_code", baseLanguageTag(language))
 	}
+	// Vocabulary biasing: repeated `keyterms`, one per term, matching how the
+	// platform's own Scribe adapter spells it on this same realtime socket.
+	for _, keyword := range options.STT.GetKeywords() {
+		query.Add("keyterms", keyword)
+	}
+	// The caller's own Scribe settings, already allow-listed by the gateway —
+	// today that is vad_silence_threshold_secs, the snappy-vs-patient commit
+	// knob whose right value is genuinely per-caller.
+	for _, key := range options.STT.ProviderKeys("elevenlabs") {
+		query.Set(key, protocol.SttOptionString(options.STT.Provider("elevenlabs")[key]))
+	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil
 }

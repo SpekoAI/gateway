@@ -316,6 +316,22 @@ func streamEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 		}
 		query.Set("language_codes", string(encoded))
 	}
+	// `keyterms_prompt` is a JSON-encoded string array (vocabulary biasing),
+	// matching how the platform's own AssemblyAI adapter spells it on this
+	// same v3 socket.
+	if keywords := options.STT.GetKeywords(); len(keywords) > 0 {
+		encoded, err := json.Marshal(keywords)
+		if err != nil {
+			return "", fmt.Errorf("assemblyai keyterms: %w", err)
+		}
+		query.Set("keyterms_prompt", string(encoded))
+	}
+	// The caller's own AssemblyAI settings, already allow-listed by the
+	// gateway (turn-detection thresholds). Set so a caller value is the only
+	// spelling of its key on the URL.
+	for _, key := range options.STT.ProviderKeys("assemblyai") {
+		query.Set(key, protocol.SttOptionString(options.STT.Provider("assemblyai")[key]))
+	}
 	// Deliberately NOT sent: a Speko reservation marker. Deepgram has an `extra`
 	// passthrough parameter for that; AssemblyAI has none, so any invented
 	// parameter would be silently dropped and the metering hint would be a lie.
