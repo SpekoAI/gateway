@@ -92,6 +92,37 @@ func TestSttOptionsKeywordBounds(t *testing.T) {
 	if err := fine.Normalize(); err != nil {
 		t.Fatalf("multi-word and non-ASCII keywords are legitimate vocabulary: %v", err)
 	}
+	// The limit is a CHARACTER count: a 40-character Cyrillic term is 80 UTF-8
+	// bytes, and a byte count would reject exactly the multilingual vocabulary
+	// these options exist to carry.
+	cyrillic := &SttOptions{Keywords: []string{strings.Repeat("д", maxSttKeywordLength)}}
+	if err := cyrillic.Normalize(); err != nil {
+		t.Fatalf("a 64-character non-ASCII keyword is within the limit: %v", err)
+	}
+	overRunes := &SttOptions{Keywords: []string{strings.Repeat("д", maxSttKeywordLength+1)}}
+	if err := overRunes.Normalize(); err == nil {
+		t.Fatal("65 characters is over the limit whatever the encoding")
+	}
+}
+
+// Two spellings folding onto one name are refused, not merged: map iteration
+// order would otherwise decide which survives, and two byte-identical bodies
+// could normalize to different settings across idempotent replays.
+func TestSttOptionsCaseFoldCollisionsAreRefused(t *testing.T) {
+	t.Parallel()
+	providers := &SttOptions{ProviderOptions: map[string]map[string]any{
+		"DeepGram": {"numerals": true},
+		"deepgram": {"punctuate": false},
+	}}
+	if err := providers.Normalize(); err == nil {
+		t.Fatal("case-distinct provider names folding together must be refused")
+	}
+	settings := &SttOptions{ProviderOptions: map[string]map[string]any{
+		"deepgram": {"Numerals": true, "numerals": false},
+	}}
+	if err := settings.Normalize(); err == nil {
+		t.Fatal("case-distinct setting names folding together must be refused")
+	}
 }
 
 func TestSttOptionsProviderOptionShape(t *testing.T) {

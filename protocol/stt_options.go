@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // SttOptions carries what a caller asked a transcription session to do beyond
@@ -146,8 +147,12 @@ func (o *SttOptions) Normalize() error {
 		return fmt.Errorf("stt options: at most %d keywords are accepted", maxSttKeywords)
 	}
 	for _, keyword := range o.Keywords {
+		// Runes, not bytes: the limit is a documented CHARACTER count, and a
+		// vocabulary term in Cyrillic or Devanagari is two to three bytes per
+		// character — a byte count would reject exactly the multilingual
+		// vocabulary these options exist to carry.
 		trimmed := strings.TrimSpace(keyword)
-		if trimmed == "" || len(trimmed) > maxSttKeywordLength || hasControlRune(trimmed) {
+		if trimmed == "" || utf8.RuneCountInString(trimmed) > maxSttKeywordLength || hasControlRune(trimmed) {
 			return fmt.Errorf("stt options: each keyword must be 1-%d characters with no control characters", maxSttKeywordLength)
 		}
 	}
@@ -163,6 +168,13 @@ func (o *SttOptions) Normalize() error {
 		if name == "" {
 			return fmt.Errorf("stt options: provider_options names an empty provider")
 		}
+		// Refused, not merged: two spellings folding onto one name would keep
+		// whichever one Go's map iteration visited last — a nondeterministic
+		// answer, and one that lets two byte-identical request bodies
+		// normalize to different settings across idempotent replays.
+		if _, collision := normalized[name]; collision {
+			return fmt.Errorf("stt options: provider_options names %q more than once across casings", name)
+		}
 		if len(settings) > maxSttOptionKeys {
 			return fmt.Errorf("stt options: provider %q may carry at most %d settings", name, maxSttOptionKeys)
 		}
@@ -171,6 +183,9 @@ func (o *SttOptions) Normalize() error {
 			folded := strings.ToLower(strings.TrimSpace(key))
 			if folded == "" {
 				return fmt.Errorf("stt options: provider %q names an empty setting", name)
+			}
+			if _, collision := kept[folded]; collision {
+				return fmt.Errorf("stt options: provider %q names setting %q more than once across casings", name, folded)
 			}
 			if _, reserved := reservedSttOptionKeys[folded]; reserved {
 				return fmt.Errorf("stt options: provider_options.%s.%s is owned by the gateway and cannot be forwarded", name, folded)
@@ -200,7 +215,7 @@ func validateSttOptionValue(provider, key string, value any) error {
 	case float64, int, int64:
 		return nil
 	case string:
-		if len(typed) > maxSttOptionStringValue || hasControlRune(typed) {
+		if utf8.RuneCountInString(typed) > maxSttOptionStringValue || hasControlRune(typed) {
 			return fmt.Errorf("stt options: provider_options.%s.%s must be a string of at most %d characters with no control characters", provider, key, maxSttOptionStringValue)
 		}
 		return nil
