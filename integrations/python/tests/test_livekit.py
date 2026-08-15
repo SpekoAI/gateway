@@ -559,3 +559,47 @@ async def test_voice_plugins_forward_provider_and_credential_source() -> None:
     assert tts_bridge._credential_source == "managed"
     await stt_stream.aclose()
     await tts_stream.aclose()
+
+
+def test_stt_options_payload_builds_the_request_block() -> None:
+    from speko_gateway._livekit_bridge import stt_options_payload
+
+    assert stt_options_payload() is None
+    assert stt_options_payload(keywords=[]) is None
+    # Explicit False IS sent: it turns a vendor default off, which is not the
+    # same as saying nothing.
+    assert stt_options_payload(diarization=False) == {"diarization": False}
+    assert stt_options_payload(
+        diarization=True,
+        keywords=["Speko", "Casey"],
+        noise_reduction=True,
+        provider_options={"deepgram": {"numerals": True}},
+    ) == {
+        "diarization": True,
+        "keywords": ["Speko", "Casey"],
+        "noise_reduction": True,
+        "provider_options": {"deepgram": {"numerals": True}},
+    }
+
+
+def test_stt_declares_the_capabilities_it_asked_for() -> None:
+    plain = STT(FakeClient())  # type: ignore[arg-type]
+    assert plain.capabilities.diarization is False
+    assert plain.capabilities.keyterms is False
+    assert plain._stt_options is None
+
+    asking = STT(  # type: ignore[arg-type]
+        FakeClient(),
+        diarization=True,
+        keywords=["Speko"],
+        provider_options={"deepgram": {"numerals": True}},
+    )
+    # Declared here, enforced at session create: a provider that cannot honor
+    # the ask refuses the session (stt_option_unsupported) before any audio.
+    assert asking.capabilities.diarization is True
+    assert asking.capabilities.keyterms is True
+    assert asking._stt_options == {
+        "diarization": True,
+        "keywords": ["Speko"],
+        "provider_options": {"deepgram": {"numerals": True}},
+    }

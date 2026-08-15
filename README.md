@@ -94,6 +94,32 @@ session = AgentSession(
 )
 ```
 
+STT accepts transcription options in the same canonical vocabulary as the
+hosted Speko API, plus a per-vendor passthrough for each provider's own
+settings:
+
+```python
+stt = STT(
+    provider="deepgram",             # pin for deterministic option support
+    diarization=True,                # speaker labels (deepgram, soniox)
+    keywords=["Speko", "Casey"],     # vocabulary biasing, every provider's own spelling
+    noise_reduction=None,            # audio enhancer (gladia)
+    provider_options={               # vendor-native settings, allow-listed per provider
+        "deepgram": {"numerals": True, "endpointing": 1200},
+        "elevenlabs": {"vad_silence_threshold_secs": 0.7},
+    },
+)
+```
+
+Options fail closed: a session routed to a provider that cannot honor a
+canonical ask is refused at create (`stt_option_unsupported`) with the option
+named, never opened with the feature silently missing. With `provider="auto"`,
+routing may pick a provider that must refuse the ask — pin the provider when
+an option is a requirement. Settings under `provider_options` never narrow
+routing; a provider the session does not reach simply ignores its entry, and a
+setting outside a provider's allow-list is refused by name. Speaker labels
+arrive on the raw vendor frames each event carries in `extensions`.
+
 `LLM()` requires `SPEKO_API_KEY` and speaks HTTPS directly to the relay —
 not the local socket — under the public [`relayapi`](relayapi/doc.go)
 contract. That crosses a different trust boundary: unlike the

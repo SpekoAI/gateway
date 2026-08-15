@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import weakref
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import aiohttp
@@ -33,6 +34,7 @@ from ._livekit_bridge import (
     LiveKitSTTStream,
     LiveKitTTSBridge,
     LiveKitTTSStream,
+    stt_options_payload,
 )
 from .client import GatewayClient, GatewayError
 from .probe import report_leg as _report_probe_leg
@@ -66,15 +68,31 @@ class STT(stt.STT):
         provider: str = "auto",
         credential_source: CredentialSource = "auto",
         sample_rate: int = 16_000,
+        diarization: bool | None = None,
+        keywords: Sequence[str] | None = None,
+        noise_reduction: bool | None = None,
+        provider_options: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
+        # Options are declared here and enforced at session create: a provider
+        # that cannot honor a canonical ask refuses the session with the option
+        # named (`stt_option_unsupported`), so the capabilities declared below
+        # are honest for every session that actually opens. With provider
+        # "auto", routing may refuse an ask nondeterministically — pin the
+        # provider for deterministic behavior.
+        self._stt_options = stt_options_payload(
+            diarization=diarization,
+            keywords=keywords,
+            noise_reduction=noise_reduction,
+            provider_options=provider_options,
+        )
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=True,
                 interim_results=True,
-                diarization=False,
+                diarization=bool(diarization),
                 aligned_transcript=False,
                 offline_recognize=True,
-                keyterms=False,
+                keyterms=bool(keywords),
                 chat_context=False,
             )
         )
@@ -131,6 +149,7 @@ class STT(stt.STT):
             model=self._model,
             provider=self._provider_name,
             credential_source=self._credential_source,
+            stt_options=self._stt_options,
         )
         stream = SpeechStream(
             stt_instance=self,
