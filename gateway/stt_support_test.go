@@ -150,3 +150,45 @@ func TestPlanRequestStripsSttOptions(t *testing.T) {
 		t.Fatal("stripping must not mutate the caller's body")
 	}
 }
+
+// AssemblyAI answers a voice_focus_threshold sent without voice focus with an
+// Error FRAME, after the handshake already succeeded — the session opens and
+// then dies mid-call. Refusing it at create turns that into an answerable
+// error naming the fix.
+func TestAssemblyAIVoiceFocusThresholdRequiresVoiceFocus(t *testing.T) {
+	t.Parallel()
+	alone := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+		"assemblyai": {"voice_focus_threshold": 0.9},
+	}}
+	err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", alone)
+	var supportError *SttSupportError
+	if !errors.As(err, &supportError) || supportError.Option != "provider_options.assemblyai.voice_focus_threshold" {
+		t.Fatalf("a threshold alone must be refused by name, got %v", err)
+	}
+	// Either way of turning voice focus on satisfies the dependency.
+	withCanonical := &protocol.SttOptions{
+		NoiseReduction:  boolPointer(true),
+		ProviderOptions: map[string]map[string]any{"assemblyai": {"voice_focus_threshold": 0.9}},
+	}
+	if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", withCanonical); err != nil {
+		t.Fatalf("noise_reduction satisfies the dependency: %v", err)
+	}
+	withProviderOption := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+		"assemblyai": {"voice_focus": "far-field", "voice_focus_threshold": 0.9},
+	}}
+	if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", withProviderOption); err != nil {
+		t.Fatalf("an explicit voice_focus satisfies the dependency: %v", err)
+	}
+}
+
+// OpenAI's realtime session takes noise reduction whatever transcription
+// model is configured, so the canonical ask is served there too.
+func TestOpenAIServesNoiseReduction(t *testing.T) {
+	t.Parallel()
+	for _, model := range []string{"gpt-live-transcribe", "gpt-4o-transcribe"} {
+		ask := &protocol.SttOptions{NoiseReduction: boolPointer(true)}
+		if err := validateSttRouteSupport("openai", model, ask); err != nil {
+			t.Fatalf("openai %s serves noise_reduction: %v", model, err)
+		}
+	}
+}

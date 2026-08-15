@@ -318,8 +318,9 @@ func sttWriteSessionUpdate(ctx context.Context, conn *websocket.Conn, model, lan
 			Type: "transcription",
 			Audio: sttAudioConfig{
 				Input: sttAudioInputConfig{
-					Format:        sttAudioFormatConfig{Type: "audio/pcm", Rate: sttSampleRateHz},
-					Transcription: transcription,
+					Format:         sttAudioFormatConfig{Type: "audio/pcm", Rate: sttSampleRateHz},
+					Transcription:  transcription,
+					NoiseReduction: sttNoiseReductionFor(sttOptions),
 					// turn_detection is explicitly null, never omitted. The
 					// framework owns turn detection, and the raw transcription
 					// guide's own example disables it so the caller commits each
@@ -832,10 +833,23 @@ type sttAudioConfig struct {
 type sttAudioInputConfig struct {
 	Format        sttAudioFormatConfig   `json:"format"`
 	Transcription sttTranscriptionConfig `json:"transcription"`
+	// NoiseReduction serves the portable noise_reduction ask. Omitted unless
+	// asked for: absent means the vendor default (off), and sending an
+	// explicit null would be a second spelling of the same thing.
+	NoiseReduction *sttNoiseReductionConfig `json:"noise_reduction,omitempty"`
 	// TurnDetection has no omitempty on purpose: `null` is a meaningful value
 	// that turns vendor turn detection off, and omitting the key leaves the
 	// session default in place instead.
 	TurnDetection *sttTurnDetectionConfig `json:"turn_detection"`
+}
+
+// sttNoiseReductionConfig is the documented shape of
+// `session.audio.input.noise_reduction`: an object with a placement type,
+// not a boolean. near_field is the conversational default — a headset or
+// phone mic — and matches how the other vendors' equivalents are defaulted
+// here; far_field is the caller's choice through provider options.
+type sttNoiseReductionConfig struct {
+	Type string `json:"type"`
 }
 
 type sttAudioFormatConfig struct {
@@ -852,6 +866,22 @@ type sttTranscriptionConfig struct {
 	Language  string   `json:"language,omitempty"`
 	Languages []string `json:"languages,omitempty"`
 	Prompt    string   `json:"prompt,omitempty"`
+}
+
+// sttNoiseReductionFor answers the portable noise_reduction ask with the
+// vendor's own object. A caller who wants the far-field model says so through
+// provider options; anything else is the near-field default.
+func sttNoiseReductionFor(options *protocol.SttOptions) *sttNoiseReductionConfig {
+	if !options.ReduceNoise() {
+		return nil
+	}
+	placement := "near_field"
+	if raw, exists := options.Provider("openai")["noise_reduction"]; exists {
+		if text := strings.TrimSpace(protocol.SttOptionString(raw)); text == "far_field" {
+			placement = text
+		}
+	}
+	return &sttNoiseReductionConfig{Type: placement}
 }
 
 // sttPromptFor merges a caller's prompt text with their keywords into the one

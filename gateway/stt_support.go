@@ -96,7 +96,9 @@ var sttOptionSupport = map[string]sttSupport{
 	// prompt setting and the keywords that fold into it are gated to those
 	// families — sending a prompt an older model ignores is the silent no-op
 	// this table refuses.
-	"openai": {keywords: true, modelKeys: []sttModelKeys{
+	// noise_reduction is session-level rather than model-gated: the realtime
+	// session object takes it whatever transcription model is configured.
+	"openai": {keywords: true, noiseReduction: true, providerKeys: []string{"noise_reduction"}, modelKeys: []sttModelKeys{
 		{prefix: "gpt-live-transcribe", keys: []string{"prompt"}},
 		{prefix: "gpt-transcribe", keys: []string{"prompt"}},
 		{prefix: "", keys: nil},
@@ -184,6 +186,18 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 	for _, key := range options.ProviderKeys(name) {
 		if !sttKeyAllowed(allowed, key) {
 			return &SttSupportError{Provider: name, Option: "provider_options." + name + "." + key, Detail: "this provider does not accept this setting on this model"}
+		}
+	}
+	// AssemblyAI validates voice_focus_threshold against voice_focus and
+	// answers a threshold sent alone with an Error FRAME — after the
+	// handshake succeeded, so the session opens and then dies. Refusing it at
+	// create turns a mid-call failure into an answerable one.
+	if name == "assemblyai" && options.Provider(name)["voice_focus_threshold"] != nil &&
+		options.Provider(name)["voice_focus"] == nil && !options.ReduceNoise() {
+		return &SttSupportError{
+			Provider: name,
+			Option:   "provider_options.assemblyai.voice_focus_threshold",
+			Detail:   "voice_focus_threshold needs voice focus on; set noise_reduction true or providerOptions.assemblyai.voice_focus",
 		}
 	}
 	return nil
