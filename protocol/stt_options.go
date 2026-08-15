@@ -64,6 +64,9 @@ const (
 var reservedSttOptionKeys = map[string]struct{}{
 	"model": {}, "model_id": {}, "speech_model": {},
 	"language": {}, "language_code": {}, "language_codes": {}, "language_hints": {},
+	// detect_language routes around the gateway-owned language pin: a vendor
+	// told to auto-detect ignores the language this gateway resolved.
+	"detect_language": {}, "language_detection": {}, "enable_language_identification": {},
 	"encoding": {}, "audio_format": {}, "sample_rate": {}, "bit_depth": {}, "channels": {},
 	"api_key": {}, "token": {}, "authorization": {},
 	"diarize": {}, "diarization": {}, "enable_speaker_diarization": {},

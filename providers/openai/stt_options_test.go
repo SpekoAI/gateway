@@ -30,6 +30,14 @@ func TestSttPromptMergesPromptAndKeywords(t *testing.T) {
 	if got := sttPromptFor(keywordsOnly); got != "Speko" {
 		t.Fatalf("prompt = %q", got)
 	}
+	// Validation admits any scalar, so a numeric prompt that validated must
+	// not vanish at a string assertion.
+	numeric := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+		"openai": {"prompt": float64(42)},
+	}}
+	if got := sttPromptFor(numeric); got != "42" {
+		t.Fatalf("a scalar prompt must survive: %q", got)
+	}
 	// No ask, no prompt — and another provider's prompt is not OpenAI's.
 	if sttPromptFor(nil) != "" {
 		t.Fatal("nil options carry no prompt")

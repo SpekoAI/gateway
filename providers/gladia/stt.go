@@ -475,8 +475,10 @@ func newInitRequest(model string, options protocol.RequestOptions, media protoco
 			ReceiveAcknowledgments:     false,
 			ReceiveLifecycleEvents:     false,
 			ReceivePreProcessingEvents: false,
-			// No realtime add-on (translation, NER, sentiment) is requested,
-			// so their event stream is switched off too.
+			// Realtime add-on events stay off even when custom vocabulary is
+			// requested below: vocabulary biases recognition inside the
+			// transcript stream rather than emitting events of its own, and
+			// no event-emitting add-on (translation, NER, sentiment) is used.
 			ReceiveRealtimeProcessingEvents: false,
 			// post_final_transcript carries Gladia's own billed duration,
 			// which is the one usage number worth reporting upstream.

@@ -26,22 +26,47 @@ type sttSupport struct {
 	keywords       bool
 	noiseReduction bool
 	providerKeys   []string
+	// modelKeys scopes settings to a model family when one provider serves
+	// two wire generations. The FIRST matching prefix contributes its keys —
+	// the same first-match rule the catalog's ModelRoutes use — and an empty
+	// prefix is the everything-else row. A setting outside the matched row is
+	// refused rather than written onto a URL the model ignores: Deepgram's
+	// Flux endpoint reads none of the v1 formatting knobs, so a model-blind
+	// list would accept `numerals` on the DEFAULT route and silently drop it.
+	modelKeys []sttModelKeys
+}
+
+type sttModelKeys struct {
+	prefix string
+	keys   []string
+}
+
+// keysFor returns the settings this provider accepts on this model.
+func (s sttSupport) keysFor(model string) []string {
+	for _, family := range s.modelKeys {
+		if strings.HasPrefix(model, family.prefix) {
+			return append(family.keys, s.providerKeys...)
+		}
+	}
+	return s.providerKeys
 }
 
 var sttOptionSupport = map[string]sttSupport{
 	// diarize / keyterm+keywords on v1 listen; keyterm on v2 (Flux). Flux owns
-	// turn detection, so its three eot_* knobs are caller-tunable; the v1
-	// endpointing controls stay gateway-owned because the framework is the
-	// endpointer on that route. Diarization is v1-only — the adapter enforces
-	// the model-level split.
-	"deepgram": {diarization: true, keywords: true, providerKeys: []string{
-		"punctuate", "numerals", "smart_format", "filler_words", "profanity_filter",
-		"dictation", "measurements", "detect_language",
-		// The v1 adapter pins endpointing=false because the framework owns turn
-		// detection by default; a caller who sets it is choosing vendor
-		// endpointing deliberately, and the caller value replaces the pin.
-		"endpointing", "utterance_end_ms",
-		"eot_threshold", "eager_eot_threshold", "eot_timeout_ms",
+	// turn detection, so its three eot_* knobs are caller-tunable there and
+	// meaningless on v1; the v1 formatting and endpointing knobs are ignored
+	// by the Flux endpoint. Diarization is v1-only. The catalog default is
+	// flux-general-en, so the split guards the DEFAULT route, not an edge.
+	"deepgram": {diarization: true, keywords: true, modelKeys: []sttModelKeys{
+		{prefix: "flux-", keys: []string{"eot_threshold", "eager_eot_threshold", "eot_timeout_ms"}},
+		{prefix: "", keys: []string{
+			"punctuate", "numerals", "smart_format", "filler_words", "profanity_filter",
+			"dictation", "measurements",
+			// The v1 adapter pins endpointing=false because the framework owns
+			// turn detection by default; a caller who sets it is choosing vendor
+			// endpointing deliberately, and the caller value replaces the pin.
+			"endpointing", "utterance_end_ms",
+		}},
 	}},
 	// keyterms_prompt on the v3 socket. No speaker labels on this transport —
 	// the polled batch API has them, the socket does not.
@@ -59,8 +84,16 @@ var sttOptionSupport = map[string]sttSupport{
 	"gladia": {keywords: true, noiseReduction: true},
 	// Keywords fold into the transcription prompt alongside a caller's own
 	// prompt text. gpt-4o-transcribe-diarize is batch-only, so no realtime
-	// diarization.
-	"openai": {keywords: true, providerKeys: []string{"prompt"}},
+	// diarization. The vendor documents `prompt` on the realtime session for
+	// the gpt-live-transcribe / gpt-transcribe generation only, so both the
+	// prompt setting and the keywords that fold into it are gated to those
+	// families — sending a prompt an older model ignores is the silent no-op
+	// this table refuses.
+	"openai": {keywords: true, modelKeys: []sttModelKeys{
+		{prefix: "gpt-live-transcribe", keys: []string{"prompt"}},
+		{prefix: "gpt-transcribe", keys: []string{"prompt"}},
+		{prefix: "", keys: nil},
+	}},
 }
 
 // SttSupportError is a session refused because the routed provider cannot
@@ -131,15 +164,28 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 	if len(options.GetKeywords()) > 0 && !support.keywords {
 		return &SttSupportError{Provider: name, Option: "keywords", Detail: "this provider has no vocabulary-biasing parameter on its streaming transport"}
 	}
+	// OpenAI keywords fold into the realtime prompt, and only the
+	// gpt-live-transcribe / gpt-transcribe generation documents that field —
+	// on an older model the folded prompt would be accepted and ignored.
+	if len(options.GetKeywords()) > 0 && name == "openai" && !openaiPromptModel(model) {
+		return &SttSupportError{Provider: name, Option: "keywords", Detail: "keywords ride the realtime prompt, which this model does not read; pin gpt-live-transcribe"}
+	}
 	if options.ReduceNoise() && !support.noiseReduction {
 		return &SttSupportError{Provider: name, Option: "noise_reduction", Detail: "this provider has no audio-enhancement parameter; gladia supports it"}
 	}
+	allowed := support.keysFor(model)
 	for _, key := range options.ProviderKeys(name) {
-		if !sttKeyAllowed(support.providerKeys, key) {
-			return &SttSupportError{Provider: name, Option: "provider_options." + name + "." + key, Detail: "this provider does not accept this setting"}
+		if !sttKeyAllowed(allowed, key) {
+			return &SttSupportError{Provider: name, Option: "provider_options." + name + "." + key, Detail: "this provider does not accept this setting on this model"}
 		}
 	}
 	return nil
+}
+
+// openaiPromptModel reports whether this model's realtime session documents
+// the transcription prompt field.
+func openaiPromptModel(model string) bool {
+	return strings.HasPrefix(model, "gpt-live-transcribe") || strings.HasPrefix(model, "gpt-transcribe")
 }
 
 func sttKeyAllowed(allowed []string, key string) bool {

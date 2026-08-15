@@ -100,11 +100,12 @@ settings:
 
 ```python
 stt = STT(
-    provider="deepgram",             # pin for deterministic option support
-    diarization=True,                # speaker labels (deepgram, soniox)
+    provider="deepgram",             # pin provider AND model when an option is a requirement:
+    model="nova-3",                  # deepgram's default is Flux, which has no diarization
+    diarization=True,                # speaker labels (deepgram nova, soniox)
     keywords=["Speko", "Casey"],     # vocabulary biasing, every provider's own spelling
     noise_reduction=None,            # audio enhancer (gladia)
-    provider_options={               # vendor-native settings, allow-listed per provider
+    provider_options={               # vendor-native settings, allow-listed per provider AND model
         "deepgram": {"numerals": True, "endpointing": 1200},
         "elevenlabs": {"vad_silence_threshold_secs": 0.7},
     },

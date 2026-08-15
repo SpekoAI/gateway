@@ -853,8 +853,10 @@ func sttPromptFor(options *protocol.SttOptions) string {
 	}
 	parts := make([]string, 0, 2)
 	if raw, exists := options.Provider("openai")["prompt"]; exists {
-		if text, ok := raw.(string); ok && strings.TrimSpace(text) != "" {
-			parts = append(parts, strings.TrimSpace(text))
+		// SttOptionString, not a string assertion: validation admits any
+		// scalar, and a numeric prompt that validated must not vanish here.
+		if text := strings.TrimSpace(protocol.SttOptionString(raw)); text != "" {
+			parts = append(parts, text)
 		}
 	}
 	if keywords := options.GetKeywords(); len(keywords) > 0 {
