@@ -828,6 +828,7 @@ func (s *Server) finishCreate(idempotencyKey string, inflight *inflightCreate, o
 func planFailure(err error, requestID string) createOutcome {
 	status := http.StatusBadGateway
 	code := "control_plane_unavailable"
+	message := "control plane did not issue a session plan"
 	if errors.Is(err, context.DeadlineExceeded) {
 		status = http.StatusGatewayTimeout
 		code = "control_plane_timeout"
@@ -836,9 +837,19 @@ func planFailure(err error, requestID string) createOutcome {
 	if errors.As(err, &controlError) {
 		status = controlError.Status
 		code = "control_plane_rejected"
+		// Surface the control plane's own refusal code: a pinned provider it
+		// cannot serve returns `no_eligible_route`, and hiding that behind a
+		// generic message made a working pin read as a gateway outage.
+		if controlError.Code != "" {
+			code = controlError.Code
+			message = "control plane refused the session plan: " + controlError.Code
+			if controlError.Code == "no_eligible_route" {
+				message += " — no route serves this provider/model on this credential source; pin a provider the deployment supports, or run it BYOK"
+			}
+		}
 	}
 	return createOutcome{
-		status: status, code: code, message: "control plane did not issue a session plan", requestID: requestID,
+		status: status, code: code, message: message, requestID: requestID,
 	}
 }
 

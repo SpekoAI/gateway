@@ -55,18 +55,26 @@ type FallbackRequest struct {
 
 // HTTPError is returned for non-2xx responses. RequestID allows live canaries
 // and support tooling to correlate the control-plane decision without logging
-// bearer credentials or response bodies.
+// bearer credentials or response bodies. Code carries the control plane's own
+// machine-readable refusal (`no_eligible_route`, `credit_exhausted`, …): a
+// caller who pinned a provider the control plane cannot serve needs to see
+// THAT, not a generic plan failure that reads like an outage.
 type HTTPError struct {
 	Status    int
 	RequestID string
+	Code      string
 	Message   string
 }
 
 func (e *HTTPError) Error() string {
-	if e.RequestID != "" {
-		return fmt.Sprintf("control plane request failed with HTTP %d (request_id=%s)", e.Status, e.RequestID)
+	detail := ""
+	if e.Code != "" {
+		detail = " (" + e.Code + ")"
 	}
-	return fmt.Sprintf("control plane request failed with HTTP %d", e.Status)
+	if e.RequestID != "" {
+		return fmt.Sprintf("control plane request failed with HTTP %d%s (request_id=%s)", e.Status, detail, e.RequestID)
+	}
+	return fmt.Sprintf("control plane request failed with HTTP %d%s", e.Status, detail)
 }
 
 // New constructs a control-plane client.
@@ -233,16 +241,17 @@ func (c *Client) post(ctx context.Context, endpoint *url.URL, value any, idempot
 		return nil, requestID, errors.New("controlplane: response exceeds size limit")
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		message := ""
+		// The hosted control plane answers refusals with `error.code` and no
+		// message; older shapes carry `error.message`. Both are bounded by the
+		// read limit above and neither is trusted for anything but display.
 		var failure struct {
 			Error struct {
+				Code    string `json:"code"`
 				Message string `json:"message"`
 			} `json:"error"`
 		}
-		if json.Unmarshal(body, &failure) == nil {
-			message = failure.Error.Message
-		}
-		return nil, requestID, &HTTPError{Status: response.StatusCode, RequestID: requestID, Message: message}
+		_ = json.Unmarshal(body, &failure)
+		return nil, requestID, &HTTPError{Status: response.StatusCode, RequestID: requestID, Code: failure.Error.Code, Message: failure.Error.Message}
 	}
 	return body, requestID, nil
 }
