@@ -70,7 +70,7 @@ var reservedSttOptionKeys = map[string]struct{}{
 	"detect_language": {}, "language_detection": {}, "enable_language_identification": {},
 	"encoding": {}, "audio_format": {}, "sample_rate": {}, "bit_depth": {}, "channels": {},
 	"api_key": {}, "token": {}, "authorization": {},
-	"diarize": {}, "diarization": {}, "enable_speaker_diarization": {},
+	"diarize": {}, "diarization": {}, "enable_speaker_diarization": {}, "speaker_labels": {},
 	"keywords": {}, "keyterm": {}, "keyterms": {}, "keyterms_prompt": {}, "custom_vocabulary": {},
 	"format_turns": {}, "interim_results": {}, "include_partial_turns": {},
 	"include_timestamps": {}, "commit_strategy": {}, "intent": {},

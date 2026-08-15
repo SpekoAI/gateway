@@ -29,8 +29,12 @@ func TestStreamEndpointCarriesKeytermsAndProviderOptions(t *testing.T) {
 		t.Fatalf("a request that asked for nothing must not mention keyterms: %s", plain)
 	}
 
+	diarize := true
+	focus := true
 	options := protocol.RequestOptions{Language: "en", STT: &protocol.SttOptions{
-		Keywords: []string{"Speko", "São Paulo"},
+		Diarization:    &diarize,
+		NoiseReduction: &focus,
+		Keywords:       []string{"Speko", "São Paulo"},
 		ProviderOptions: map[string]map[string]any{
 			"assemblyai": {"end_of_turn_confidence_threshold": 0.55},
 			// Another provider's settings must not leak onto this URL.
@@ -51,6 +55,15 @@ func TestStreamEndpointCarriesKeytermsAndProviderOptions(t *testing.T) {
 	}
 	if query.Get("end_of_turn_confidence_threshold") != "0.55" {
 		t.Fatalf("allow-listed setting must be forwarded: %s", endpoint)
+	}
+	// Streaming diarization and Voice Focus, in the v3 parameter table's own
+	// spellings. near-field is the conversational default; a provider option
+	// naming far-field would overwrite it.
+	if query.Get("speaker_labels") != "true" {
+		t.Fatalf("diarization must become speaker_labels=true: %s", endpoint)
+	}
+	if query.Get("voice_focus") != "near-field" {
+		t.Fatalf("noise_reduction must become voice_focus=near-field: %s", endpoint)
 	}
 	if query.Get("numerals") != "" {
 		t.Fatalf("another provider's setting must not leak: %s", endpoint)
