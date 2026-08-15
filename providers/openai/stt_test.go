@@ -462,26 +462,63 @@ func TestSTTMapsErrorFramesToDistinctCodes(t *testing.T) {
 	}
 }
 
-// TestSTTSwallowsEmptyBufferErrorOnlyAfterStreamEndCommit: our own end-of-stream
-// commit can hit an already-empty buffer, which errors benignly. Swallowing it
-// unconditionally would hide a real mid-stream failure, so the guard is scoped
-// to after the commit.
-func TestSTTSwallowsEmptyBufferErrorOnlyAfterStreamEndCommit(t *testing.T) {
+// TestSTTEmptyBufferCommitErrorNeverKillsTheStream: a commit that found no
+// audio — or less than the vendor's 100ms minimum — is a turn with nothing to
+// transcribe, not a session failure. Treating it as fatal mid-stream tore the
+// socket down on double VAD triggers and barge-ins into silence, and live
+// transcription cut out and back on every reconnect. Any OTHER error frame
+// stays fatal.
+func TestSTTEmptyBufferCommitErrorNeverKillsTheStream(t *testing.T) {
 	t.Parallel()
 
-	const frame = `{"type":"error","event_id":"e1","error":{"type":"invalid_request_error","code":"input_audio_buffer_commit_empty","message":"Error committing input audio buffer: the buffer is empty."}}`
+	const emptyCommit = `{"type":"error","event_id":"e1","error":{"type":"invalid_request_error","code":"input_audio_buffer_commit_empty","message":"Error committing input audio buffer: the buffer is empty."}}`
+	const tooSmall = `{"type":"error","event_id":"e2","error":{"type":"invalid_request_error","message":"Error committing input audio buffer: buffer too small. Expected at least 100ms of audio, but buffer only has 40.00ms of audio."}}`
+	const genuine = `{"type":"error","event_id":"e3","error":{"type":"invalid_request_error","code":"invalid_value","message":"bad frame"}}`
 
-	beforeCommit, cancelBefore := newHandlerOnlySTTStream()
-	defer cancelBefore()
-	if err := beforeCommit.handleMessage([]byte(frame)); err == nil {
-		t.Fatal("an empty-buffer error before our commit is a real failure and must surface")
+	for _, frame := range []string{emptyCommit, tooSmall} {
+		stream, cancel := newHandlerOnlySTTStream()
+		stream.commitPending.Store(true)
+		if err := stream.handleMessage([]byte(frame)); err != nil {
+			t.Fatalf("an empty-commit rejection must not kill the stream: %v", err)
+		}
+		if stream.commitPending.Load() {
+			t.Fatal("the rejected commit is abandoned, not left pending")
+		}
+		// The turn is skipped observably, and the stream keeps processing:
+		// a delta after the rejection still reaches the caller.
+		event := <-stream.events
+		if event.Type != protocol.EventWarning {
+			t.Fatalf("a skipped turn surfaces as a warning, got %v", event.Type)
+		}
+		const delta = `{"type":"conversation.item.input_audio_transcription.delta","delta":"still alive"}`
+		if err := stream.handleMessage([]byte(delta)); err != nil {
+			t.Fatalf("the stream must keep transcribing after a skipped turn: %v", err)
+		}
+		if event := <-stream.events; event.Type != protocol.EventTranscriptDelta {
+			t.Fatalf("delta after skipped turn = %v", event.Type)
+		}
+		cancel()
 	}
 
-	afterCommit, cancelAfter := newHandlerOnlySTTStream()
-	defer cancelAfter()
-	afterCommit.committed.Store(true)
-	if err := afterCommit.handleMessage([]byte(frame)); err != nil {
-		t.Fatalf("empty-buffer error after our own commit must be swallowed, got %v", err)
+	// A closing stream is released by the rejection exactly as a completed
+	// final would release it — no final will ever arrive for that commit.
+	closing, cancelClosing := newHandlerOnlySTTStream()
+	defer cancelClosing()
+	closing.closing.Store(true)
+	if err := closing.handleMessage([]byte(emptyCommit)); err != nil {
+		t.Fatalf("empty commit while closing must be benign: %v", err)
+	}
+	<-closing.events
+	select {
+	case <-closing.ctx.Done():
+	default:
+		t.Fatal("a closing stream must be released after the rejected commit")
+	}
+
+	fatal, cancelFatal := newHandlerOnlySTTStream()
+	defer cancelFatal()
+	if err := fatal.handleMessage([]byte(genuine)); err == nil {
+		t.Fatal("a genuine error frame must still kill the stream")
 	}
 }
 
