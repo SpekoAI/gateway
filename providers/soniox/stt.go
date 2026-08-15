@@ -159,6 +159,10 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		EnableEndpointDetection: true,
 		LanguageHints:           sttLanguageHints(request.Options.Language),
 		ClientReferenceID:       sttClientReferenceID(request.Plan),
+		// Speaker labels and vocabulary biasing both ride this one start
+		// frame; the gateway has already refused asks Soniox cannot serve.
+		EnableSpeakerDiariz: request.Options.STT.Diarize(),
+		Context:             sttContextTerms(request.Options.STT.GetKeywords()),
 	}
 	payload, err := json.Marshal(start)
 	if err != nil {
@@ -682,14 +686,44 @@ func sttExtension(raw json.RawMessage) map[string]json.RawMessage {
 }
 
 type sttStartRequest struct {
-	APIKey                  string   `json:"api_key"`
-	Model                   string   `json:"model"`
-	AudioFormat             string   `json:"audio_format"`
-	SampleRate              int      `json:"sample_rate"`
-	NumChannels             int      `json:"num_channels"`
-	EnableEndpointDetection bool     `json:"enable_endpoint_detection"`
-	LanguageHints           []string `json:"language_hints,omitempty"`
-	ClientReferenceID       string   `json:"client_reference_id,omitempty"`
+	APIKey                  string      `json:"api_key"`
+	Model                   string      `json:"model"`
+	AudioFormat             string      `json:"audio_format"`
+	SampleRate              int         `json:"sample_rate"`
+	NumChannels             int         `json:"num_channels"`
+	EnableEndpointDetection bool        `json:"enable_endpoint_detection"`
+	LanguageHints           []string    `json:"language_hints,omitempty"`
+	ClientReferenceID       string      `json:"client_reference_id,omitempty"`
+	EnableSpeakerDiariz     bool        `json:"enable_speaker_diarization,omitempty"`
+	Context                 *sttContext `json:"context,omitempty"`
+}
+
+// sttContext biases recognition toward the caller's domain terms. Soniox's
+// complete context envelope is capped at roughly 10k characters, so terms are
+// deduplicated and cut off well below that ceiling.
+type sttContext struct {
+	Terms []string `json:"terms"`
+}
+
+// sttContextTerms deduplicates the caller's keywords for the start frame's
+// context envelope. No truncation: the protocol's own bounds (at most 100
+// keywords of 64 characters) keep the total under Soniox's ~10k-character
+// context ceiling, and silently dropping a term would be the
+// accepted-but-unfulfilled outcome these options exist to prevent.
+func sttContextTerms(keywords []string) *sttContext {
+	if len(keywords) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(keywords))
+	terms := make([]string, 0, len(keywords))
+	for _, keyword := range keywords {
+		if _, duplicate := seen[keyword]; duplicate {
+			continue
+		}
+		seen[keyword] = struct{}{}
+		terms = append(terms, keyword)
+	}
+	return &sttContext{Terms: terms}
 }
 
 type sttToken struct {

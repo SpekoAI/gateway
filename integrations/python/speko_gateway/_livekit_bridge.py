@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -70,6 +70,34 @@ def execution_from_env(
     }
 
 
+def stt_options_payload(
+    *,
+    diarization: bool | None = None,
+    keywords: Sequence[str] | None = None,
+    noise_reduction: bool | None = None,
+    provider_options: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Build the request's ``stt`` block, or None when nothing was asked.
+
+    None keeps the create body byte-identical to what older gateways parse.
+    Explicit ``False`` IS sent — it means "turn the vendor default off", which
+    is not the same as saying nothing.
+    """
+
+    options: dict[str, Any] = {}
+    if diarization is not None:
+        options["diarization"] = diarization
+    if keywords:
+        options["keywords"] = [str(keyword) for keyword in keywords]
+    if noise_reduction is not None:
+        options["noise_reduction"] = noise_reduction
+    if provider_options:
+        options["provider_options"] = {
+            provider: dict(settings) for provider, settings in provider_options.items()
+        }
+    return options or None
+
+
 class LiveKitSTTBridge:
     """Map LiveKit audio-frame semantics to the canonical STT stream."""
 
@@ -81,23 +109,28 @@ class LiveKitSTTBridge:
         model: str = "auto",
         provider: str = "auto",
         credential_source: CredentialSource = "auto",
+        stt_options: dict[str, Any] | None = None,
     ) -> None:
         self._client = client
         self._language = language
         self._model = model
         self._provider = provider
         self._credential_source = credential_source
+        self._stt_options = stt_options
 
     async def start(self, frame: AudioFrameLike) -> LiveKitSTTStream:
+        request: dict[str, Any] = {
+            "provider": self._provider,
+            "language": self._language,
+            "model": self._model,
+        }
+        if self._stt_options:
+            request["stt"] = self._stt_options
         session = await self._client.open(
             SessionConfig(
                 kind="stt",
                 execution=execution_from_env(self._credential_source),
-                request={
-                    "provider": self._provider,
-                    "language": self._language,
-                    "model": self._model,
-                },
+                request=request,
                 media={
                     "encoding": "pcm_s16le",
                     "sample_rate_hz": frame.sample_rate,

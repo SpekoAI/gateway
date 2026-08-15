@@ -396,13 +396,34 @@ func (a *Adapter) sessionURL(raw string) (string, error) {
 // initRequest is the documented POST /v2/live body. Only fields this adapter
 // actually relies on are sent; every omitted field keeps its vendor default.
 type initRequest struct {
-	Encoding       string          `json:"encoding"`
-	BitDepth       int             `json:"bit_depth"`
-	SampleRate     int             `json:"sample_rate"`
-	Channels       int             `json:"channels"`
-	Model          string          `json:"model"`
-	LanguageConfig *languageConfig `json:"language_config,omitempty"`
-	MessagesConfig messagesConfig  `json:"messages_config"`
+	Encoding           string              `json:"encoding"`
+	BitDepth           int                 `json:"bit_depth"`
+	SampleRate         int                 `json:"sample_rate"`
+	Channels           int                 `json:"channels"`
+	Model              string              `json:"model"`
+	LanguageConfig     *languageConfig     `json:"language_config,omitempty"`
+	PreProcessing      *preProcessing      `json:"pre_processing,omitempty"`
+	RealtimeProcessing *realtimeProcessing `json:"realtime_processing,omitempty"`
+	MessagesConfig     messagesConfig      `json:"messages_config"`
+}
+
+// preProcessing carries the documented POST /v2/live audio clean-up options.
+// audio_enhancer is the wire shape behind the portable noise_reduction ask —
+// the one evidenced noise-removal parameter across this catalog's vendors.
+type preProcessing struct {
+	AudioEnhancer bool `json:"audio_enhancer"`
+}
+
+// realtimeProcessing switches on live add-ons. Only custom vocabulary is used:
+// the flag and its config ride together because the vendor ignores the config
+// without the flag — a silently unbiased session, not an error.
+type realtimeProcessing struct {
+	CustomVocabulary       bool                    `json:"custom_vocabulary"`
+	CustomVocabularyConfig *customVocabularyConfig `json:"custom_vocabulary_config,omitempty"`
+}
+
+type customVocabularyConfig struct {
+	Vocabulary []string `json:"vocabulary"`
 }
 
 type languageConfig struct {
@@ -454,8 +475,10 @@ func newInitRequest(model string, options protocol.RequestOptions, media protoco
 			ReceiveAcknowledgments:     false,
 			ReceiveLifecycleEvents:     false,
 			ReceivePreProcessingEvents: false,
-			// No realtime add-on (translation, NER, sentiment) is requested,
-			// so their event stream is switched off too.
+			// Realtime add-on events stay off even when custom vocabulary is
+			// requested below: vocabulary biases recognition inside the
+			// transcript stream rather than emitting events of its own, and
+			// no event-emitting add-on (translation, NER, sentiment) is used.
 			ReceiveRealtimeProcessingEvents: false,
 			// post_final_transcript carries Gladia's own billed duration,
 			// which is the one usage number worth reporting upstream.
@@ -464,6 +487,15 @@ func newInitRequest(model string, options protocol.RequestOptions, media protoco
 	}
 	if language := gladiaLanguage(options.Language); language != "" {
 		request.LanguageConfig = &languageConfig{Languages: []string{language}, CodeSwitching: false}
+	}
+	if options.STT.ReduceNoise() {
+		request.PreProcessing = &preProcessing{AudioEnhancer: true}
+	}
+	if keywords := options.STT.GetKeywords(); len(keywords) > 0 {
+		request.RealtimeProcessing = &realtimeProcessing{
+			CustomVocabulary:       true,
+			CustomVocabularyConfig: &customVocabularyConfig{Vocabulary: keywords},
+		}
 	}
 	// `endpointing` is deliberately omitted. The framework owns turn detection,
 	// and Gladia's endpointing cannot be disabled (its documented range starts
