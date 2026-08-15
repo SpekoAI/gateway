@@ -316,6 +316,19 @@ func streamEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 		}
 		query.Set("language_codes", string(encoded))
 	}
+	if options.STT.Diarize() {
+		// Streaming speaker diarization, spelled exactly as the v3 connection
+		// parameter table spells it. Per-turn speaker labels ride the turn
+		// frames each event already forwards in its extensions.
+		query.Set("speaker_labels", "true")
+	}
+	if options.STT.ReduceNoise() {
+		// Voice Focus is AssemblyAI's noise suppression, an enum rather than
+		// a flag. near-field is the conversational default (phone or headset
+		// mic); a caller who wants far-field sets it as a provider option,
+		// which overwrites this value below.
+		query.Set("voice_focus", "near-field")
+	}
 	// `keyterms_prompt` is a JSON-encoded string array (vocabulary biasing),
 	// matching how the platform's own AssemblyAI adapter spells it on this
 	// same v3 socket.

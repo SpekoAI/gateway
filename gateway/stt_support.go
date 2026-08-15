@@ -68,10 +68,17 @@ var sttOptionSupport = map[string]sttSupport{
 			"endpointing", "utterance_end_ms",
 		}},
 	}},
-	// keyterms_prompt on the v3 socket. No speaker labels on this transport —
-	// the polled batch API has them, the socket does not.
-	"assemblyai": {keywords: true, providerKeys: []string{
-		"end_of_turn_confidence_threshold", "min_end_of_turn_silence_when_confident", "max_turn_silence",
+	// All on the v3 socket's own connection parameters: keyterms_prompt,
+	// speaker_labels (streaming diarization shipped vendor-side — the old
+	// "no speakers on this transport" claim is stale), and voice_focus, which
+	// is the second provider behind the canonical noise_reduction ask.
+	// min_turn_silence is the current parameter table's spelling;
+	// min_end_of_turn_silence_when_confident stays for callers holding the
+	// earlier documented name.
+	"assemblyai": {diarization: true, keywords: true, noiseReduction: true, providerKeys: []string{
+		"end_of_turn_confidence_threshold", "min_end_of_turn_silence_when_confident",
+		"min_turn_silence", "max_turn_silence",
+		"max_speakers", "voice_focus", "voice_focus_threshold", "filter_profanity",
 	}},
 	// Scribe realtime takes repeated keyterms; vad_silence_threshold_secs is
 	// the one commit-strategy knob worth exposing (default 1.5s, and the
@@ -171,7 +178,7 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 		return &SttSupportError{Provider: name, Option: "keywords", Detail: "keywords ride the realtime prompt, which this model does not read; pin gpt-live-transcribe"}
 	}
 	if options.ReduceNoise() && !support.noiseReduction {
-		return &SttSupportError{Provider: name, Option: "noise_reduction", Detail: "this provider has no audio-enhancement parameter; gladia supports it"}
+		return &SttSupportError{Provider: name, Option: "noise_reduction", Detail: "this provider has no audio-enhancement parameter; gladia and assemblyai support it"}
 	}
 	allowed := support.keysFor(model)
 	for _, key := range options.ProviderKeys(name) {

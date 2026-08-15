@@ -102,9 +102,9 @@ settings:
 stt = STT(
     provider="deepgram",             # pin provider AND model when an option is a requirement:
     model="nova-3",                  # deepgram's default is Flux, which has no diarization
-    diarization=True,                # speaker labels (deepgram nova, soniox)
+    diarization=True,                # speaker labels (deepgram nova, assemblyai, soniox)
     keywords=["Speko", "Casey"],     # vocabulary biasing, every provider's own spelling
-    noise_reduction=None,            # audio enhancer (gladia)
+    noise_reduction=None,            # gladia audio enhancer, assemblyai voice focus
     provider_options={               # vendor-native settings, allow-listed per provider AND model
         "deepgram": {"numerals": True, "endpointing": 1200},
         "elevenlabs": {"vad_silence_threshold_secs": 0.7},
