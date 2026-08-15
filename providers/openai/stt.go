@@ -872,14 +872,24 @@ type sttTranscriptionConfig struct {
 // vendor's own object. A caller who wants the far-field model says so through
 // provider options; anything else is the near-field default.
 func sttNoiseReductionFor(options *protocol.SttOptions) *sttNoiseReductionConfig {
-	if !options.ReduceNoise() {
-		return nil
-	}
-	placement := "near_field"
+	// The provider option turns noise reduction ON by itself. A caller who
+	// names a placement has asked for it as plainly as the canonical flag
+	// does, and honoring one only when the other is also set would accept a
+	// setting and then never send it.
+	placement := ""
 	if raw, exists := options.Provider("openai")["noise_reduction"]; exists {
-		if text := strings.TrimSpace(protocol.SttOptionString(raw)); text == "far_field" {
+		switch text := strings.TrimSpace(protocol.SttOptionString(raw)); text {
+		case "near_field", "far_field":
 			placement = text
 		}
+	}
+	if placement == "" {
+		if !options.ReduceNoise() {
+			return nil
+		}
+		// near_field is the conversational default — a headset or phone mic —
+		// and matches how the other vendors' equivalents are defaulted here.
+		placement = "near_field"
 	}
 	return &sttNoiseReductionConfig{Type: placement}
 }

@@ -86,3 +86,24 @@ func TestSttNoiseReductionUsesTheVendorObjectShape(t *testing.T) {
 		t.Fatalf("unknown placement = %+v, want the near_field default", bogus)
 	}
 }
+
+// A placement named in provider options turns noise reduction on by itself.
+// Honoring it only when the canonical flag is ALSO set would accept a setting
+// and then never send it — the accepted-but-unfulfilled outcome these options
+// exist to prevent.
+func TestSttNoiseReductionHonorsAProviderPlacementAlone(t *testing.T) {
+	t.Parallel()
+	alone := sttNoiseReductionFor(&protocol.SttOptions{
+		ProviderOptions: map[string]map[string]any{"openai": {"noise_reduction": "far_field"}},
+	})
+	if alone == nil || alone.Type != "far_field" {
+		t.Fatalf("a placement alone must be honored: %+v", alone)
+	}
+	// A value outside the vendor's enum is not an ask on its own.
+	bogus := sttNoiseReductionFor(&protocol.SttOptions{
+		ProviderOptions: map[string]map[string]any{"openai": {"noise_reduction": "outer_space"}},
+	})
+	if bogus != nil {
+		t.Fatalf("an unrecognized placement alone is not an ask: %+v", bogus)
+	}
+}

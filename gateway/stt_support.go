@@ -192,8 +192,12 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 	// answers a threshold sent alone with an Error FRAME — after the
 	// handshake succeeded, so the session opens and then dies. Refusing it at
 	// create turns a mid-call failure into an answerable one.
+	// The dependency is on voice focus being ON, not on the key merely being
+	// present: `voice_focus: false` or an empty string leaves it off, and a
+	// presence-only check would pass the threshold through to the same
+	// mid-call failure.
 	if name == "assemblyai" && options.Provider(name)["voice_focus_threshold"] != nil &&
-		options.Provider(name)["voice_focus"] == nil && !options.ReduceNoise() {
+		!sttAssemblyAIVoiceFocusOn(options) {
 		return &SttSupportError{
 			Provider: name,
 			Option:   "provider_options.assemblyai.voice_focus_threshold",
@@ -201,6 +205,28 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 		}
 	}
 	return nil
+}
+
+// sttAssemblyAIVoiceFocusOn reports whether voice focus will actually be on
+// for this request — through the canonical ask, or through a provider option
+// naming one of the vendor's placements. A `false` or empty value is off.
+func sttAssemblyAIVoiceFocusOn(options *protocol.SttOptions) bool {
+	if options.ReduceNoise() {
+		return true
+	}
+	raw, exists := options.Provider("assemblyai")["voice_focus"]
+	if !exists {
+		return false
+	}
+	switch value := raw.(type) {
+	case bool:
+		return value
+	case string:
+		mode := strings.TrimSpace(strings.ToLower(value))
+		return mode == "near-field" || mode == "far-field" || mode == "true"
+	default:
+		return false
+	}
 }
 
 // openaiPromptModel reports whether this model's realtime session documents

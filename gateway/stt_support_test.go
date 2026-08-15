@@ -192,3 +192,26 @@ func TestOpenAIServesNoiseReduction(t *testing.T) {
 		}
 	}
 }
+
+// The threshold's dependency is on voice focus being ON, not on the key being
+// present: `voice_focus: false` or an empty string leaves it off, and letting
+// the threshold through lands on the same mid-call vendor error.
+func TestVoiceFocusThresholdGuardChecksTheValueNotThePresence(t *testing.T) {
+	t.Parallel()
+	for _, off := range []any{false, "", "   "} {
+		options := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+			"assemblyai": {"voice_focus": off, "voice_focus_threshold": 0.9},
+		}}
+		if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", options); err == nil {
+			t.Fatalf("voice_focus=%v leaves focus off and must not satisfy the dependency", off)
+		}
+	}
+	for _, on := range []any{"near-field", "FAR-FIELD", true} {
+		options := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+			"assemblyai": {"voice_focus": on, "voice_focus_threshold": 0.9},
+		}}
+		if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", options); err != nil {
+			t.Fatalf("voice_focus=%v turns focus on: %v", on, err)
+		}
+	}
+}
