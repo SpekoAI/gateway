@@ -104,7 +104,7 @@ stt = STT(
     model="nova-3",                  # deepgram's default is Flux, which has no diarization
     diarization=True,                # speaker labels (deepgram nova, assemblyai, soniox)
     keywords=["Speko", "Casey"],     # vocabulary biasing, every provider's own spelling
-    noise_reduction=None,            # gladia audio enhancer, assemblyai voice focus
+    noise_reduction=True,            # gladia enhancer, assemblyai voice focus, openai near-field
     provider_options={               # vendor-native settings, allow-listed per provider AND model
         "deepgram": {"numerals": True, "endpointing": 1200},
         "elevenlabs": {"vad_silence_threshold_secs": 0.7},

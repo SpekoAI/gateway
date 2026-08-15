@@ -150,3 +150,95 @@ func TestPlanRequestStripsSttOptions(t *testing.T) {
 		t.Fatal("stripping must not mutate the caller's body")
 	}
 }
+
+// AssemblyAI answers a voice_focus_threshold sent without voice focus with an
+// Error FRAME, after the handshake already succeeded — the session opens and
+// then dies mid-call. Refusing it at create turns that into an answerable
+// error naming the fix.
+func TestAssemblyAIVoiceFocusThresholdRequiresVoiceFocus(t *testing.T) {
+	t.Parallel()
+	alone := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+		"assemblyai": {"voice_focus_threshold": 0.9},
+	}}
+	err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", alone)
+	var supportError *SttSupportError
+	if !errors.As(err, &supportError) || supportError.Option != "provider_options.assemblyai.voice_focus_threshold" {
+		t.Fatalf("a threshold alone must be refused by name, got %v", err)
+	}
+	// Either way of turning voice focus on satisfies the dependency.
+	withCanonical := &protocol.SttOptions{
+		NoiseReduction:  boolPointer(true),
+		ProviderOptions: map[string]map[string]any{"assemblyai": {"voice_focus_threshold": 0.9}},
+	}
+	if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", withCanonical); err != nil {
+		t.Fatalf("noise_reduction satisfies the dependency: %v", err)
+	}
+	withProviderOption := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+		"assemblyai": {"voice_focus": "far-field", "voice_focus_threshold": 0.9},
+	}}
+	if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", withProviderOption); err != nil {
+		t.Fatalf("an explicit voice_focus satisfies the dependency: %v", err)
+	}
+}
+
+// OpenAI's realtime session takes noise reduction whatever transcription
+// model is configured, so the canonical ask is served there too.
+func TestOpenAIServesNoiseReduction(t *testing.T) {
+	t.Parallel()
+	for _, model := range []string{"gpt-live-transcribe", "gpt-4o-transcribe"} {
+		ask := &protocol.SttOptions{NoiseReduction: boolPointer(true)}
+		if err := validateSttRouteSupport("openai", model, ask); err != nil {
+			t.Fatalf("openai %s serves noise_reduction: %v", model, err)
+		}
+	}
+}
+
+// The threshold's dependency is on voice focus being ON, not on the key being
+// present: `voice_focus: false` or an empty string leaves it off, and letting
+// the threshold through lands on the same mid-call vendor error.
+func TestVoiceFocusThresholdGuardChecksTheValueNotThePresence(t *testing.T) {
+	t.Parallel()
+	for _, off := range []any{false, "", "   ", true, "near_field", "on"} {
+		options := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+			"assemblyai": {"voice_focus": off, "voice_focus_threshold": 0.9},
+		}}
+		if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", options); err == nil {
+			t.Fatalf("voice_focus=%v leaves focus off and must not satisfy the dependency", off)
+		}
+	}
+	// voice_focus is an ENUM: only the two hyphenated placements are voice
+	// focus being on. `true` opens a session that the vendor then kills.
+	for _, on := range []any{"near-field", "FAR-FIELD"} {
+		options := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+			"assemblyai": {"voice_focus": on, "voice_focus_threshold": 0.9},
+		}}
+		if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", options); err != nil {
+			t.Fatalf("voice_focus=%v turns focus on: %v", on, err)
+		}
+	}
+}
+
+// Probed against the live v3 socket: only near-field and far-field open a
+// session. `true`, `near_field` and `on` are each answered with validation
+// error 3006 after the handshake, so they are refused at create instead.
+func TestAssemblyAIVoiceFocusMustNameAPlacement(t *testing.T) {
+	t.Parallel()
+	for _, bad := range []any{true, "true", "near_field", "on", 1} {
+		options := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+			"assemblyai": {"voice_focus": bad},
+		}}
+		err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", options)
+		var supportError *SttSupportError
+		if !errors.As(err, &supportError) || supportError.Option != "provider_options.assemblyai.voice_focus" {
+			t.Fatalf("voice_focus=%v must be refused by name, got %v", bad, err)
+		}
+	}
+	for _, good := range []string{"near-field", "far-field", "Near-Field"} {
+		options := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+			"assemblyai": {"voice_focus": good},
+		}}
+		if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", options); err != nil {
+			t.Fatalf("voice_focus=%q is a documented placement: %v", good, err)
+		}
+	}
+}

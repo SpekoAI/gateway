@@ -49,3 +49,61 @@ func TestSttPromptMergesPromptAndKeywords(t *testing.T) {
 		t.Fatal("another provider's settings must not become a prompt")
 	}
 }
+
+// The portable noise_reduction ask becomes `session.audio.input.noise_reduction`,
+// an object with a placement type rather than a boolean. near_field is the
+// conversational default; a caller wanting the far-field model says so in
+// provider options. Verified against the live realtime session, which echoes
+// the value back on session.updated.
+func TestSttNoiseReductionUsesTheVendorObjectShape(t *testing.T) {
+	t.Parallel()
+	reduce := true
+	if got := sttNoiseReductionFor(nil); got != nil {
+		t.Fatalf("no ask, no noise_reduction: %+v", got)
+	}
+	off := &protocol.SttOptions{}
+	if got := sttNoiseReductionFor(off); got != nil {
+		t.Fatalf("an unset ask must stay absent: %+v", got)
+	}
+	near := sttNoiseReductionFor(&protocol.SttOptions{NoiseReduction: &reduce})
+	if near == nil || near.Type != "near_field" {
+		t.Fatalf("default placement = %+v, want near_field", near)
+	}
+	far := sttNoiseReductionFor(&protocol.SttOptions{
+		NoiseReduction:  &reduce,
+		ProviderOptions: map[string]map[string]any{"openai": {"noise_reduction": "far_field"}},
+	})
+	if far == nil || far.Type != "far_field" {
+		t.Fatalf("far-field placement = %+v", far)
+	}
+	// An unrecognized placement falls back to the default rather than sending
+	// the vendor a value its enum does not contain.
+	bogus := sttNoiseReductionFor(&protocol.SttOptions{
+		NoiseReduction:  &reduce,
+		ProviderOptions: map[string]map[string]any{"openai": {"noise_reduction": "outer_space"}},
+	})
+	if bogus == nil || bogus.Type != "near_field" {
+		t.Fatalf("unknown placement = %+v, want the near_field default", bogus)
+	}
+}
+
+// A placement named in provider options turns noise reduction on by itself.
+// Honoring it only when the canonical flag is ALSO set would accept a setting
+// and then never send it — the accepted-but-unfulfilled outcome these options
+// exist to prevent.
+func TestSttNoiseReductionHonorsAProviderPlacementAlone(t *testing.T) {
+	t.Parallel()
+	alone := sttNoiseReductionFor(&protocol.SttOptions{
+		ProviderOptions: map[string]map[string]any{"openai": {"noise_reduction": "far_field"}},
+	})
+	if alone == nil || alone.Type != "far_field" {
+		t.Fatalf("a placement alone must be honored: %+v", alone)
+	}
+	// A value outside the vendor's enum is not an ask on its own.
+	bogus := sttNoiseReductionFor(&protocol.SttOptions{
+		ProviderOptions: map[string]map[string]any{"openai": {"noise_reduction": "outer_space"}},
+	})
+	if bogus != nil {
+		t.Fatalf("an unrecognized placement alone is not an ask: %+v", bogus)
+	}
+}
