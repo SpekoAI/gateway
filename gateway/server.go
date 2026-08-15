@@ -391,6 +391,22 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 		writeError(writer, http.StatusBadRequest, "invalid_request", "invalid session request")
 		return
 	}
+	if body.Request.STT != nil {
+		if body.Kind != protocol.SessionKindSTT {
+			writeError(writer, http.StatusBadRequest, "invalid_stt_options", "stt options are valid only on stt sessions")
+			return
+		}
+		// Normalize before fingerprinting, so replays of one raw body cannot
+		// disagree about case-folded provider names.
+		if err := body.Request.STT.Normalize(); err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_stt_options", err.Error())
+			return
+		}
+		if err := validateSttOptionProviders(body.Request.STT); err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_stt_options", err.Error())
+			return
+		}
+	}
 	fingerprint, err := fingerprintCreateRequest(body)
 	if err != nil {
 		writeError(writer, http.StatusInternalServerError, "request_fingerprint_failed", "session request could not be fingerprinted")
@@ -447,6 +463,12 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 	session, plan, requestID, err := s.openWithFallback(setupCtx, body, plan, requestID, idempotencyKey)
 	if err != nil {
 		outcome := createOutcome{status: http.StatusBadGateway, code: "session_open_failed", message: "provider session could not be opened"}
+		// A refused STT ask is the caller's to fix, not a provider outage:
+		// answer 422 with the option named instead of a generic bad-gateway.
+		var supportError *SttSupportError
+		if errors.As(err, &supportError) {
+			outcome = createOutcome{status: http.StatusUnprocessableEntity, code: "stt_option_unsupported", message: supportError.Error()}
+		}
 		s.finishCreate(idempotencyKey, inflight, outcome)
 		writeCreateOutcome(writer, outcome, false)
 		return
@@ -518,7 +540,7 @@ func (s *Server) sessionPlan(ctx context.Context, request protocol.SessionPlanRe
 // whole recovery stays inside the caller's bounded setup context. A failed
 // exchange reports the original open failure; a failed reopen is terminal.
 func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest, plan protocol.SessionPlan, requestID, idempotencyKey string) (*runtimepkg.Session, protocol.SessionPlan, string, error) {
-	session, err := s.engine.Open(ctx, runtimepkg.OpenRequest{Kind: body.Kind, Plan: plan, Options: body.Request, Media: body.Media})
+	session, err := s.openSession(ctx, body, plan)
 	if err == nil {
 		return session, plan, requestID, nil
 	}
@@ -533,7 +555,7 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 	// exchange in reserve for when the pool cannot help.
 	if s.warmPlans != nil {
 		if retryPlan, warm := s.warmPlans.Take(planRequestFor(body, s.runtime, s.workload)); warm {
-			retrySession, retryErr := s.engine.Open(ctx, runtimepkg.OpenRequest{Kind: body.Kind, Plan: retryPlan, Options: body.Request, Media: body.Media})
+			retrySession, retryErr := s.openSession(ctx, body, retryPlan)
 			if retryErr == nil {
 				return retrySession, retryPlan, requestID, nil
 			}
@@ -556,11 +578,24 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 	if fallbackRequestID == "" {
 		fallbackRequestID = requestID
 	}
-	session, retryErr := s.engine.Open(ctx, runtimepkg.OpenRequest{Kind: body.Kind, Plan: fallbackPlan, Options: body.Request, Media: body.Media})
+	session, retryErr := s.openSession(ctx, body, fallbackPlan)
 	if retryErr != nil {
 		return nil, fallbackPlan, fallbackRequestID, retryErr
 	}
 	return session, fallbackPlan, fallbackRequestID, nil
+}
+
+// openSession opens a provider session, first failing closed on any caller
+// STT ask the PLANNED provider cannot honor. The check runs per plan rather
+// than per create because failover may answer from a different provider than
+// the first attempt — every provider actually dialed must pass it.
+func (s *Server) openSession(ctx context.Context, body CreateSessionRequest, plan protocol.SessionPlan) (*runtimepkg.Session, error) {
+	if body.Kind == protocol.SessionKindSTT {
+		if err := validateSttRouteSupport(plan.Route.Provider, plan.Route.Model, body.Request.STT); err != nil {
+			return nil, err
+		}
+	}
+	return s.engine.Open(ctx, runtimepkg.OpenRequest{Kind: body.Kind, Plan: plan, Options: body.Request, Media: body.Media})
 }
 
 func (s *Server) streamSession(writer http.ResponseWriter, request *http.Request) {
@@ -752,10 +787,19 @@ func (s *Server) waitForCreate(writer http.ResponseWriter, request *http.Request
 // identity and workload come from gateway configuration and are never
 // caller-supplied.
 func planRequestFor(body CreateSessionRequest, runtime protocol.RuntimeDescriptor, workload *protocol.Workload) protocol.SessionPlanRequest {
+	// STT options are a data-plane concern: adapters read them from the local
+	// request, and this gateway — not the control plane — enforces support.
+	// Stripping them here keeps every managed plan-request body byte-identical
+	// to what an older control plane already parses, and lets one warm plan
+	// serve sessions that differ only in options. The cost is that managed
+	// routing cannot narrow on an ask yet; callers who need a guarantee pin
+	// the provider, and the refusal tells them so.
+	request := body.Request
+	request.STT = nil
 	return protocol.SessionPlanRequest{
 		Kind: body.Kind, Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision,
 		Runtime: runtime, Workload: workload, Integration: body.Integration,
-		Execution: body.Execution, Request: body.Request, Media: body.Media,
+		Execution: body.Execution, Request: request, Media: body.Media,
 	}
 }
 
