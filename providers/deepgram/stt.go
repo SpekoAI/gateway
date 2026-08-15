@@ -229,9 +229,35 @@ func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 		if strings.TrimSpace(options.Language) != "" {
 			query.Set("language", options.Language)
 		}
+		if options.STT.Diarize() {
+			// Per-word speaker labels ride the same transcript frames; the
+			// gateway's support table has already refused this ask on Flux.
+			query.Set("diarize", "true")
+		}
 		if strings.TrimSpace(reservationID) != "" {
 			query.Set("extra", "speko_reservation:"+reservationID)
 		}
+	}
+	// Vocabulary biasing is spelled by model family: nova-3 and Flux take the
+	// repeatable `keyterm`, every earlier model takes repeatable `keywords`.
+	// Sending the wrong one is accepted-and-ignored by the vendor, which is
+	// exactly the silent no-op these options must never become.
+	if keywords := options.STT.GetKeywords(); len(keywords) > 0 {
+		name := "keywords"
+		if flux || strings.HasPrefix(model, "nova-3") {
+			name = "keyterm"
+		}
+		for _, keyword := range keywords {
+			query.Add(name, keyword)
+		}
+	}
+	// The caller's own Deepgram settings, already allow-listed by the gateway.
+	// Set (not Add) so a caller value replaces a gateway default above rather
+	// than arriving twice — the keys that reach here are all vendor-owned;
+	// gateway-owned ones (model, encoding, interim_results…) are reserved at
+	// validation and can never appear.
+	for _, key := range options.STT.ProviderKeys("deepgram") {
+		query.Set(key, protocol.SttOptionString(options.STT.Provider("deepgram")[key]))
 	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil

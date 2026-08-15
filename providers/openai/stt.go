@@ -216,7 +216,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
 
-	if err := sttWriteSessionUpdate(ctx, conn, model, request.Options.Language); err != nil {
+	if err := sttWriteSessionUpdate(ctx, conn, model, request.Options.Language, request.Options.STT); err != nil {
 		_ = conn.CloseNow()
 		return nil, err
 	}
@@ -293,8 +293,12 @@ func sttValidateMedia(media protocol.MediaFormat) error {
 // sttWriteSessionUpdate sends the one configuration message a transcription
 // session needs. Everything about the session lives in this body: there is no
 // query-parameter configuration channel on the Realtime socket.
-func sttWriteSessionUpdate(ctx context.Context, conn *websocket.Conn, model, language string) error {
+func sttWriteSessionUpdate(ctx context.Context, conn *websocket.Conn, model, language string, sttOptions *protocol.SttOptions) error {
 	transcription := sttTranscriptionConfig{Model: model}
+	// The caller's prompt rides `transcription.prompt`; keywords have no
+	// dedicated field on this API, so they fold into the same prompt text —
+	// the identical translation the platform's OpenAI adapter performs.
+	transcription.Prompt = sttPromptFor(sttOptions)
 	if normalized := sttLanguageTag(language); normalized != "" {
 		if model == sttLiveModel {
 			// CONFIRMED raw, Realtime transcription guide: "`gpt-live-transcribe`
@@ -837,6 +841,26 @@ type sttTranscriptionConfig struct {
 	Language  string   `json:"language,omitempty"`
 	Languages []string `json:"languages,omitempty"`
 	Prompt    string   `json:"prompt,omitempty"`
+}
+
+// sttPromptFor merges a caller's prompt text with their keywords into the one
+// prompt field this API reads. Keywords join comma-separated on their own
+// line, after the prose, so domain terms bias recognition without rewriting
+// the caller's instructions.
+func sttPromptFor(options *protocol.SttOptions) string {
+	if options == nil {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if raw, exists := options.Provider("openai")["prompt"]; exists {
+		if text, ok := raw.(string); ok && strings.TrimSpace(text) != "" {
+			parts = append(parts, strings.TrimSpace(text))
+		}
+	}
+	if keywords := options.GetKeywords(); len(keywords) > 0 {
+		parts = append(parts, strings.Join(keywords, ", "))
+	}
+	return strings.Join(parts, "\n")
 }
 
 type sttAppendEvent struct {
