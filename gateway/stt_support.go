@@ -196,6 +196,11 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 	// present: `voice_focus: false` or an empty string leaves it off, and a
 	// presence-only check would pass the threshold through to the same
 	// mid-call failure.
+	if name == "assemblyai" {
+		if err := validateAssemblyAIVoiceFocus(options); err != nil {
+			return err
+		}
+	}
 	if name == "assemblyai" && options.Provider(name)["voice_focus_threshold"] != nil &&
 		!sttAssemblyAIVoiceFocusOn(options) {
 		return &SttSupportError{
@@ -209,7 +214,13 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 
 // sttAssemblyAIVoiceFocusOn reports whether voice focus will actually be on
 // for this request — through the canonical ask, or through a provider option
-// naming one of the vendor's placements. A `false` or empty value is off.
+// naming one of the vendor's two placements.
+//
+// `voice_focus` is an ENUM, not a flag. Probed against the live v3 socket:
+// only `near-field` and `far-field` open a session; `true`, `near_field` and
+// `on` are each answered with validation error 3006 AFTER the handshake, so a
+// truthy-looking value is not voice focus being on — it is a session that
+// opens and then dies.
 func sttAssemblyAIVoiceFocusOn(options *protocol.SttOptions) bool {
 	if options.ReduceNoise() {
 		return true
@@ -218,15 +229,34 @@ func sttAssemblyAIVoiceFocusOn(options *protocol.SttOptions) bool {
 	if !exists {
 		return false
 	}
-	switch value := raw.(type) {
-	case bool:
-		return value
-	case string:
-		mode := strings.TrimSpace(strings.ToLower(value))
-		return mode == "near-field" || mode == "far-field" || mode == "true"
-	default:
+	text, isString := raw.(string)
+	if !isString {
 		return false
 	}
+	mode := strings.TrimSpace(strings.ToLower(text))
+	return mode == "near-field" || mode == "far-field"
+}
+
+// validateAssemblyAIVoiceFocus refuses a placement the vendor's enum does not
+// contain. Without this the value rides the connect URL and the session dies
+// mid-call on validation error 3006 — the create-time answer names the two
+// values that work.
+func validateAssemblyAIVoiceFocus(options *protocol.SttOptions) error {
+	raw, exists := options.Provider("assemblyai")["voice_focus"]
+	if !exists {
+		return nil
+	}
+	text, isString := raw.(string)
+	if !isString || !sttAssemblyAIVoiceFocusOn(&protocol.SttOptions{
+		ProviderOptions: map[string]map[string]any{"assemblyai": {"voice_focus": text}},
+	}) {
+		return &SttSupportError{
+			Provider: "assemblyai",
+			Option:   "provider_options.assemblyai.voice_focus",
+			Detail:   "voice focus takes near-field or far-field",
+		}
+	}
+	return nil
 }
 
 // openaiPromptModel reports whether this model's realtime session documents

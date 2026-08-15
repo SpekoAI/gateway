@@ -198,7 +198,7 @@ func TestOpenAIServesNoiseReduction(t *testing.T) {
 // the threshold through lands on the same mid-call vendor error.
 func TestVoiceFocusThresholdGuardChecksTheValueNotThePresence(t *testing.T) {
 	t.Parallel()
-	for _, off := range []any{false, "", "   "} {
+	for _, off := range []any{false, "", "   ", true, "near_field", "on"} {
 		options := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
 			"assemblyai": {"voice_focus": off, "voice_focus_threshold": 0.9},
 		}}
@@ -206,12 +206,39 @@ func TestVoiceFocusThresholdGuardChecksTheValueNotThePresence(t *testing.T) {
 			t.Fatalf("voice_focus=%v leaves focus off and must not satisfy the dependency", off)
 		}
 	}
-	for _, on := range []any{"near-field", "FAR-FIELD", true} {
+	// voice_focus is an ENUM: only the two hyphenated placements are voice
+	// focus being on. `true` opens a session that the vendor then kills.
+	for _, on := range []any{"near-field", "FAR-FIELD"} {
 		options := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
 			"assemblyai": {"voice_focus": on, "voice_focus_threshold": 0.9},
 		}}
 		if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", options); err != nil {
 			t.Fatalf("voice_focus=%v turns focus on: %v", on, err)
+		}
+	}
+}
+
+// Probed against the live v3 socket: only near-field and far-field open a
+// session. `true`, `near_field` and `on` are each answered with validation
+// error 3006 after the handshake, so they are refused at create instead.
+func TestAssemblyAIVoiceFocusMustNameAPlacement(t *testing.T) {
+	t.Parallel()
+	for _, bad := range []any{true, "true", "near_field", "on", 1} {
+		options := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+			"assemblyai": {"voice_focus": bad},
+		}}
+		err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", options)
+		var supportError *SttSupportError
+		if !errors.As(err, &supportError) || supportError.Option != "provider_options.assemblyai.voice_focus" {
+			t.Fatalf("voice_focus=%v must be refused by name, got %v", bad, err)
+		}
+	}
+	for _, good := range []string{"near-field", "far-field", "Near-Field"} {
+		options := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+			"assemblyai": {"voice_focus": good},
+		}}
+		if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", options); err != nil {
+			t.Fatalf("voice_focus=%q is a documented placement: %v", good, err)
 		}
 	}
 }
