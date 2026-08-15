@@ -385,9 +385,6 @@ type sttStream struct {
 	closed       atomic.Bool
 	closing      atomic.Bool
 	closeErr     error
-	// committed records that the stream-end commit has been sent, so the benign
-	// empty-buffer error it can provoke is swallowed rather than failing a turn.
-	committed atomic.Bool
 	// commitSent prevents Close from sending a second commit immediately
 	// after the runtime already committed the batch turn. OpenAI rejects an
 	// empty second commit, and—more importantly—never closes a transcription
@@ -467,7 +464,6 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
 		s.closing.Store(true)
-		s.committed.Store(true)
 		if !s.commitSent.Load() {
 			if err := s.CommitAudio(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) {
 				s.closeErr = err
@@ -635,11 +631,26 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// the item id is preserved in the message.
 		return sttItemFailureError(message, raw)
 	case "error":
-		// A stream-end commit with nothing buffered errors benignly: the buffer
-		// was already empty. Swallowing it only after our own commit keeps a real
-		// mid-stream error visible.
-		if s.committed.Load() && sttIsEmptyBufferError(message.Error) {
-			return nil
+		// A commit that found no audio — or less than the vendor's 100ms
+		// minimum — is not a session failure on ANY turn: there was nothing to
+		// transcribe. It happens mid-stream whenever a turn boundary lands
+		// with almost no new audio (a double VAD trigger, a barge-in into
+		// silence), and treating it as fatal tore the socket down and made
+		// live transcription cut out and back on every reconnect. The pending
+		// commit is abandoned, a warning keeps it observable, and a stream
+		// already closing is released exactly as a completed final would
+		// release it — no final will ever arrive for a rejected commit.
+		if sttIsEmptyBufferError(message.Error) {
+			s.commitPending.Store(false)
+			err := s.emit(runtimepkg.ProviderEvent{
+				Type:       protocol.EventWarning,
+				Data:       marshalData(map[string]any{"message": "OpenAI rejected a commit with no buffered audio; turn skipped"}),
+				Extensions: sttExtension(raw),
+			})
+			if err == nil && s.closing.Load() {
+				s.cancel()
+			}
+			return err
 		}
 		return sttEventError(message.Error, raw)
 	case "input_audio_buffer.committed", "input_audio_buffer.cleared",
