@@ -150,6 +150,11 @@ type RequestOptions struct {
 	RegionHint         string   `json:"region_hint,omitempty"`
 	Allow              []string `json:"allow,omitempty"`
 	Deny               []string `json:"deny,omitempty"`
+	// STT carries transcription feature asks and per-provider settings. Only
+	// ever set on STT sessions; omitempty keeps every existing payload — and
+	// every plan request an older control plane parses — byte-identical when
+	// the caller asks for nothing.
+	STT *SttOptions `json:"stt,omitempty"`
 }
 
 // UsageUnit identifies the provider quantity whose spend was authorized by a
