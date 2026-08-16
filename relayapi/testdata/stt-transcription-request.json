@@ -3,5 +3,18 @@
     "mode": "auto",
     "objective": "latency"
   },
-  "language": "en"
+  "language": "en",
+  "options": {
+    "diarization": true,
+    "keywords": [
+      "Speko",
+      "Tashkent"
+    ],
+    "noise_reduction": false,
+    "provider_options": {
+      "deepgram": {
+        "numerals": true
+      }
+    }
+  }
 }

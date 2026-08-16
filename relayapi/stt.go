@@ -18,8 +18,9 @@ const (
 // The audio container itself (WAV/PCM headers at launch) declares the media
 // format, so the metadata carries only routing and options.
 type TranscriptionRequest struct {
-	Routing  Routing `json:"routing"`
-	Language string  `json:"language,omitempty"`
+	Routing  Routing     `json:"routing"`
+	Language string      `json:"language,omitempty"`
+	Options  *STTOptions `json:"options,omitempty"`
 }
 
 // Validate checks the metadata part. Callers normalize Routing with
@@ -29,6 +30,9 @@ func (r TranscriptionRequest) Validate() error {
 	if err := r.Routing.Validate(); err != nil {
 		return fmt.Errorf("routing: %w", err)
 	}
+	if err := r.Options.Validate(); err != nil {
+		return fmt.Errorf("options: %w", err)
+	}
 	return nil
 }
 
@@ -37,6 +41,8 @@ type TranscriptSegment struct {
 	Text    string `json:"text"`
 	StartMS int64  `json:"start_ms"`
 	EndMS   int64  `json:"end_ms"`
+	// Speaker is the vendor's own label, carried verbatim.
+	Speaker string `json:"speaker,omitempty"`
 }
 
 // Validate checks that the span is a non-negative, ordered range.
@@ -110,11 +116,11 @@ type STTSessionConfigure struct {
 	Routing  Routing        `json:"routing"`
 	Audio    AudioConfig    `json:"audio"`
 	Language string         `json:"language,omitempty"`
+	Options  *STTOptions    `json:"options,omitempty"`
 }
 
-// Validate checks the frame tag, routing, and declared audio format. The
-// routing must already be normalized; the idempotency hash covers the raw
-// frame bytes as sent, before any normalization.
+// Validate checks the frame tag, routing, declared audio format, and option
+// asks. The routing must already be normalized.
 func (c STTSessionConfigure) Validate() error {
 	if c.Type != STTControlSessionConfigure {
 		return fmt.Errorf("type: got %q, want %q", c.Type, STTControlSessionConfigure)
@@ -124,6 +130,9 @@ func (c STTSessionConfigure) Validate() error {
 	}
 	if err := c.Audio.Validate(); err != nil {
 		return fmt.Errorf("audio: %w", err)
+	}
+	if err := c.Options.Validate(); err != nil {
+		return fmt.Errorf("options: %w", err)
 	}
 	return nil
 }
@@ -202,6 +211,9 @@ type STTTranscriptFinal struct {
 	Type     STTEventType        `json:"type"`
 	Text     string              `json:"text"`
 	Segments []TranscriptSegment `json:"segments,omitempty"`
+	// Speaker labels the whole finalized turn; per-span attribution rides
+	// Segments[].Speaker.
+	Speaker string `json:"speaker,omitempty"`
 }
 
 // Validate checks the frame tag and segments. Text may be empty: a
