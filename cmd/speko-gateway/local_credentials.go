@@ -29,6 +29,7 @@ var localCredentialSpecs = []localCredentialSpec{
 	{Provider: "gladia", Env: "SPEKO_GLADIA_BYOK_API_KEY"},
 	{Provider: "google", Env: "SPEKO_GOOGLE_BYOK_ACCESS_TOKEN"},
 	{Provider: "gradium", Env: "SPEKO_GRADIUM_BYOK_API_KEY"},
+	{Provider: "hamsa", Env: "SPEKO_HAMSA_BYOK_API_KEY"},
 	{Provider: "hume", Env: "SPEKO_HUME_BYOK_API_KEY"},
 	{Provider: "inworld", Env: "SPEKO_INWORLD_BYOK_API_KEY"},
 	{Provider: "minimax", Env: "SPEKO_MINIMAX_BYOK_API_KEY"},

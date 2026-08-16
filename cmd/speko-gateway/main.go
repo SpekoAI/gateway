@@ -29,6 +29,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/gladia"
 	"github.com/SpekoAI/gateway/providers/google"
 	"github.com/SpekoAI/gateway/providers/gradium"
+	"github.com/SpekoAI/gateway/providers/hamsa"
 	"github.com/SpekoAI/gateway/providers/hume"
 	"github.com/SpekoAI/gateway/providers/inworld"
 	"github.com/SpekoAI/gateway/providers/minimax"
@@ -156,6 +157,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	hamsaSTTAdapter, err := hamsa.NewSTT(hamsa.STTConfig{})
+	if err != nil {
+		return err
+	}
 	googleAdapter, err := google.New(google.Config{})
 	if err != nil {
 		return err
@@ -240,7 +245,7 @@ func run() error {
 		sonioxSTTAdapter, sonioxTTSAdapter, smallestSTTAdapter, smallestTTSAdapter,
 		openaiSTTAdapter, openaiTTSAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
-		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter,
+		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {
