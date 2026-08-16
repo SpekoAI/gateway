@@ -229,6 +229,7 @@ Every catalog provider has a BYOK credential variable:
 | Gladia | `SPEKO_GLADIA_BYOK_API_KEY` | API key used for live-session initialization |
 | Google | `SPEKO_GOOGLE_BYOK_ACCESS_TOKEN` | OAuth access token; prefer `_FILE` for rotation |
 | Gradium | `SPEKO_GRADIUM_BYOK_API_KEY` | API key |
+| Hamsa | `SPEKO_HAMSA_BYOK_API_KEY` | API key |
 | Hume | `SPEKO_HUME_BYOK_API_KEY` | API key |
 | Inworld | `SPEKO_INWORLD_BYOK_API_KEY` | Base64 portal credential (`key:secret`) |
 | MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
@@ -294,6 +295,7 @@ restarting the Gateway.
 | TTS | Alibaba | `alibaba.tts.v1` | `qwen3-tts-flash-realtime` |
 | STT | Gradium | `gradium.stt.v1` | `default` |
 | TTS | Gradium | `gradium.tts.v1` | `default` |
+| STT | Hamsa | `hamsa.stt.v1` | `s3` |
 | TTS | Rime | `rime.tts.v1` | `coda` |
 | TTS | Hume | `hume.tts.v1` | `octave-2` |
 | STT | Inworld | `inworld.stt.v1` | `inworld-stt-1` |

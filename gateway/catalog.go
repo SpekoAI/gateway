@@ -94,6 +94,11 @@ var providerCatalog = []CatalogEntry{
 		RequiresDeploymentConfig: "set SPEKO_GOOGLE_STT_ENDPOINT to a project-scoped recognize URL"},
 	{Provider: "gradium", Kind: protocol.SessionKindSTT, Adapter: "gradium.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/asr"},
 	{Provider: "gradium", Kind: protocol.SessionKindTTS, Adapter: "gradium.tts.v1", DefaultModel: "default", DefaultVoice: "YTpq7expH9539ERJ", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/tts"},
+	// Hamsa's realtime socket takes one WHOLE-UTTERANCE WAV per message — the
+	// adapter buffers each turn and answers with a single final transcript, so
+	// latency behaves like batch. Arabic-first; s2 selects the prior generation
+	// through the same socket.
+	{Provider: "hamsa", Kind: protocol.SessionKindSTT, Adapter: "hamsa.stt.v1", DefaultModel: "s3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.tryhamsa.com/v1/realtime/ws"},
 	{Provider: "rime", Kind: protocol.SessionKindTTS, Adapter: "rime.tts.v1", DefaultModel: "coda", DefaultVoice: "astra", Transport: protocol.TransportWebSocket, Endpoint: "wss://users-ws.rime.ai/ws3"},
 	{Provider: "hume", Kind: protocol.SessionKindTTS, Adapter: "hume.tts.v1", DefaultModel: "octave-2", DefaultVoice: "Colton Rivers", Transport: protocol.TransportHTTP, Endpoint: "https://api.hume.ai/v0/tts/stream/json"},
 	{Provider: "fish", Kind: protocol.SessionKindTTS, Adapter: "fish.tts.v1", DefaultModel: "s2.1-pro", DefaultVoice: "802e3bc2b27e49c2995d23ef70e6ac89", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.fish.audio/v1/tts/live"},
