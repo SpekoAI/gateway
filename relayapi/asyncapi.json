@@ -504,6 +504,10 @@
             "type": "integer",
             "minimum": 0,
             "description": "Must not precede start_ms."
+          },
+          "speaker": {
+            "type": "string",
+            "description": "Whoever said the span, present only when the request asked for diarization and the provider attributed it. The VENDOR's own label carried verbatim (\"A\" from one provider, \"1\" from another): renumbering across providers would invent an identity mapping no vendor promised. Absent means unattributed, which is not the same as a new speaker."
           }
         },
         "required": [
@@ -599,12 +603,58 @@
           "language": {
             "type": "string",
             "description": "Optional language hint."
+          },
+          "options": {
+            "$ref": "#/components/schemas/STTOptions",
+            "description": "Transcription feature asks and per-provider settings for the whole session. They ride this frame — and therefore the session's idempotency hash — because they are session intent, not stream content: later frames cannot change them."
           }
         },
         "required": [
           "type",
           "audio"
         ],
+        "additionalProperties": false
+      },
+      "STTOptions": {
+        "type": "object",
+        "description": "What a caller asked a transcription to do beyond returning text. The same object rides POST /v1/stt/transcriptions and the STT session.configure frame, in the same vocabulary the local gateway uses. The canonical asks (diarization, keywords, noise_reduction) fail closed: a session whose routed model does not advertise the matching capability in GET /v1/models is rejected with capability_unsupported, never answered with the feature quietly missing. Names arrive lower case and are rejected otherwise rather than folded, because the idempotency content hash covers the configure frame bytes exactly as sent and one intent must have one spelling.",
+        "properties": {
+          "diarization": {
+            "type": "boolean",
+            "description": "Label each transcript segment with the speaker who said it. Omitted leaves the vendor default, which is not the same as false."
+          },
+          "keywords": {
+            "type": "array",
+            "description": "Vocabulary-biasing terms (names, products, jargon), translated to each vendor's own spelling. At most 100 terms of at most 64 characters each; both bounds count CHARACTERS, which JSON Schema cannot express, so they are normative here in prose and enforced by the relay.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "noise_reduction": {
+            "type": "boolean",
+            "description": "Ask the provider to clean the audio before transcribing."
+          },
+          "provider_options": {
+            "type": "object",
+            "description": "The vendor's OWN settings, namespaced by provider name, e.g. {\"deepgram\": {\"numerals\": true}}. Values are scalars only (boolean, number, or string of at most 256 characters). At most 8 providers, each with at most 16 settings. Settings addressed to a provider the session does not reach are ignored by design, so they never narrow routing. The relay forwards only the keys the routed provider allow-lists and refuses the rest by name; keys it owns itself (model, language, encoding, sample_rate, credentials, and the canonical asks' own vendor spellings) are always refused.",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": {
+                "oneOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ]
+              }
+            }
+          }
+        },
         "additionalProperties": false
       },
       "STTInputCommit": {
@@ -701,6 +751,10 @@
             "items": {
               "$ref": "#/components/schemas/TranscriptSegment"
             }
+          },
+          "speaker": {
+            "type": "string",
+            "description": "Whoever said the whole finalized span, present only when the session asked for diarization and the provider attributed the turn. Most providers report one speaker per finalized turn rather than per span, so this is where a diarized session usually reads its labels; per-span attribution rides segments[].speaker instead. The vendor's own label, verbatim."
           }
         },
         "required": [

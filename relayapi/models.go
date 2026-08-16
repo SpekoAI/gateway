@@ -17,14 +17,32 @@ const (
 )
 
 // ModelCapabilities advertises what a model supports. Capability gating
-// happens before admission: a request using tools or structured output on a
-// model that does not advertise them is rejected with
-// capability_unsupported, never silently stripped.
+// happens before admission: a request using a capability a model does not
+// advertise is rejected with capability_unsupported, never silently stripped.
 type ModelCapabilities struct {
 	Tools            bool `json:"tools"`
 	StructuredOutput bool `json:"structured_output"`
 	CachedInput      bool `json:"cached_input"`
 	Reasoning        bool `json:"reasoning"`
+	Diarization      bool `json:"diarization"`
+	Keywords         bool `json:"keywords"`
+	NoiseReduction   bool `json:"noise_reduction"`
+}
+
+// SupportsSTTOptions reports whether this model advertises every canonical
+// ask the options carry, and names the first one it does not. Provider
+// settings are the routed vendor's own and are not checked here.
+func (c ModelCapabilities) SupportsSTTOptions(options *STTOptions) (string, bool) {
+	switch {
+	case options.Diarize() && !c.Diarization:
+		return "diarization", false
+	case len(options.GetKeywords()) > 0 && !c.Keywords:
+		return "keywords", false
+	case options.ReduceNoise() && !c.NoiseReduction:
+		return "noise_reduction", false
+	default:
+		return "", true
+	}
 }
 
 // Model is one currently routable catalog entry. Regions lists the
