@@ -1,27 +1,75 @@
 [
   {
     "type": "session.configure",
-    "routing": {"mode": "auto", "objective": "latency"},
-    "audio": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
-    "language": "en"
+    "routing": {
+      "mode": "auto",
+      "objective": "latency"
+    },
+    "audio": {
+      "encoding": "pcm_s16le",
+      "sample_rate_hz": 16000,
+      "channels": 1
+    },
+    "language": "en",
+    "options": {
+      "diarization": true,
+      "keywords": [
+        "Speko"
+      ]
+    }
   },
-  {"type": "input.commit"},
-  {"type": "session.close"},
+  {
+    "type": "input.commit"
+  },
+  {
+    "type": "session.close"
+  },
   {
     "type": "session.ready",
     "request_id": "req_3ab9e0",
-    "route": {"provider": "deepgram", "model": "nova-3", "region": "eu-west-1", "attempt_id": "att_1"}
+    "route": {
+      "provider": "deepgram",
+      "model": "nova-3",
+      "region": "eu-west-1",
+      "attempt_id": "att_1"
+    }
   },
-  {"type": "transcript.delta", "text": "hello"},
+  {
+    "type": "transcript.delta",
+    "text": "hello"
+  },
   {
     "type": "transcript.final",
     "text": "hello world",
-    "segments": [{"text": "hello world", "start_ms": 120, "end_ms": 1080}]
+    "segments": [
+      {
+        "text": "hello world",
+        "start_ms": 120,
+        "end_ms": 1080,
+        "speaker": "A"
+      }
+    ],
+    "speaker": "A"
   },
-  {"type": "usage.updated", "usage": {"duration_ms": 5000}},
-  {"type": "session.closed", "usage": {"duration_ms": 12480}},
+  {
+    "type": "usage.updated",
+    "usage": {
+      "duration_ms": 5000
+    }
+  },
+  {
+    "type": "session.closed",
+    "usage": {
+      "duration_ms": 12480
+    }
+  },
   {
     "type": "error",
-    "error": {"code": "budget_exhausted", "message": "the reserved duration budget for this session is exhausted", "retryable": false, "request_id": "req_3ab9e0"}
+    "error": {
+      "code": "budget_exhausted",
+      "message": "the reserved duration budget for this session is exhausted",
+      "retryable": false,
+      "request_id": "req_3ab9e0"
+    }
   }
 ]
