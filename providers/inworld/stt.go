@@ -437,10 +437,11 @@ type sttStream struct {
 	// Only then does Close force a turn: an endTurn with nothing in flight just
 	// produces another empty marker.
 	turnPending atomic.Bool
-	// commitPending distinguishes the empty marker Inworld emits when a turn
+	// commitsPending distinguishes the empty marker Inworld emits when a turn
 	// starts from the empty final that acknowledges our explicit endTurn. The
-	// latter must reach batch callers so silence completes instead of timing out.
-	commitPending atomic.Bool
+	// count also keeps overlapping turns distinct when the caller commits the
+	// next turn before the provider returns the previous turn's final.
+	commitsPending atomic.Int64
 
 	// guard holds RIFF-stripping state. The runtime serializes WriteAudio,
 	// control methods and Close for one session, so it needs no lock of its own.
@@ -490,9 +491,9 @@ func (s *sttStream) CommitAudio(ctx context.Context) error {
 	if !s.inputPending.CompareAndSwap(true, false) {
 		return nil
 	}
-	s.commitPending.Store(true)
+	s.commitsPending.Add(1)
 	if err := s.write(ctx, sttEndTurnFrame); err != nil {
-		s.commitPending.Store(false)
+		s.commitsPending.Add(-1)
 		s.inputPending.Store(true)
 		return err
 	}
@@ -538,10 +539,10 @@ func (s *sttStream) Close(ctx context.Context) error {
 				s.closeErr = err
 			}
 		}
-		// commitPending belongs to the current turn and is cleared only after its
-		// final events have been delivered. A final from an earlier turn must not
-		// make Close cancel the reader before the latest final arrives.
-		if s.closeErr == nil && !s.commitPending.Load() {
+		// commitsPending is decremented only after each committed turn's final
+		// events have been delivered. A final from an earlier turn therefore
+		// cannot make Close cancel the reader before the latest final arrives.
+		if s.closeErr == nil && s.commitsPending.Load() == 0 {
 			s.cancel()
 		} else if s.closeErr == nil {
 			s.closeProgressAt.Store(time.Now().UnixNano())
@@ -747,7 +748,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 // voice agent, answers. The platform's TypeScript client drops the same frame.
 func (s *sttStream) handleTranscription(transcription sttTranscription, raw json.RawMessage) error {
 	text := strings.TrimSpace(transcription.Transcript)
-	committedEmptyFinal := text == "" && transcription.IsFinal && s.commitPending.Load()
+	committedEmptyFinal := text == "" && transcription.IsFinal && s.commitsPending.Load() > 0
 	if text == "" && !committedEmptyFinal {
 		return nil
 	}
@@ -785,14 +786,26 @@ func (s *sttStream) handleTranscription(transcription sttTranscription, raw json
 		Data:       marshalData(map[string]any{"reason": "end_of_turn"}),
 		Extensions: sttExtension(raw),
 	})
-	// Keep commitPending true until both final events are visible to the
-	// consumer. Close uses it as the per-turn wait condition, so clearing it
-	// earlier creates a race where cancellation can discard a queued final.
-	s.commitPending.Store(false)
-	if err == nil && s.closing.Load() {
+	// Keep the outstanding count unchanged until both final events are visible
+	// to the consumer. Each provider final completes at most one explicit
+	// commit, so a delayed earlier final cannot satisfy a later turn as well.
+	remaining := s.completePendingCommit()
+	if err == nil && s.closing.Load() && remaining == 0 {
 		s.cancel()
 	}
 	return err
+}
+
+func (s *sttStream) completePendingCommit() int64 {
+	for {
+		pending := s.commitsPending.Load()
+		if pending == 0 {
+			return 0
+		}
+		if s.commitsPending.CompareAndSwap(pending, pending-1) {
+			return pending - 1
+		}
+	}
 }
 
 // emitWarning surfaces a frame this adapter does not model instead of dropping

@@ -548,6 +548,68 @@ func TestSTTCloseWaitsForTheLatestTurnAfterAnEarlierFinal(t *testing.T) {
 	}
 }
 
+func TestSTTCloseWaitsForEveryOverlappingCommittedTurn(t *testing.T) {
+	t.Parallel()
+	harness := newSTTHarness(t, nil)
+	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	stream.(*sttStream).closeInactivityTimeout = 200 * time.Millisecond
+	harness.nextFrame(t)
+
+	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
+		t.Fatalf("write first turn: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit first turn: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("first commit frame = %s, want %s", got, sttWireEndTurn)
+	}
+
+	// Start and close the second turn before the first final arrives. There are
+	// now two explicit commits in flight on the same provider stream.
+	if err := stream.WriteAudio(context.Background(), []byte{2, 0, 0, 0}); err != nil {
+		t.Fatalf("write second turn: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("second commit frame = %s, want %s", got, sttWireEndTurn)
+	}
+	if got := harness.nextFrame(t); got != sttWireCloseFrame {
+		t.Fatalf("close frame = %s, want %s", got, sttWireCloseFrame)
+	}
+
+	harness.push(t, `{"result":{"transcription":{"transcript":"first delayed turn","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("first delayed event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after first delayed final = %q, want speech.ended", event.Type)
+	}
+
+	// The first final consumes only the first outstanding commit. If it also
+	// satisfied the second, the reader would already be canceled here.
+	time.Sleep(20 * time.Millisecond)
+	harness.push(t, `{"result":{"transcription":{"transcript":"second latest turn","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("second latest event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after second latest final = %q, want speech.ended", event.Type)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after every committed turn finalized")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after every committed turn finalized")
+	}
+}
+
 // TestSTTCloseWithoutASpokenTurnOnlySignalsEndOfInput is the other half: an
 // endTurn with nothing in flight just makes Inworld emit another empty marker.
 func TestSTTCloseWithoutASpokenTurnOnlySignalsEndOfInput(t *testing.T) {
