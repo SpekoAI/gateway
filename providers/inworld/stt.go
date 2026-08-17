@@ -127,7 +127,10 @@ var (
 	sttWAVDataTag       = []byte("data")
 )
 
-const sttCloseInactivityTimeout = 30 * time.Second
+const (
+	sttCloseInactivityTimeout = 30 * time.Second
+	sttCloseMaximumDuration   = 60 * time.Second
+)
 
 // STTConfig controls local transport limits. Credentials and provider selection
 // always come from the signed session plan, never from this configuration.
@@ -281,6 +284,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		events:                 make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		closeProgress:          make(chan struct{}, 1),
 		closeInactivityTimeout: sttCloseInactivityTimeout,
+		closeMaximumDuration:   sttCloseMaximumDuration,
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -427,6 +431,7 @@ type sttStream struct {
 	closeProgress          chan struct{}
 	closeProgressAt        atomic.Int64
 	closeInactivityTimeout time.Duration
+	closeMaximumDuration   time.Duration
 
 	// turnPending is true once speech has been seen whose final has not landed.
 	// Only then does Close force a turn: an endTurn with nothing in flight just
@@ -552,14 +557,22 @@ func (s *sttStream) Close(ctx context.Context) error {
 // finishGracefulClose bounds a successfully opened stream after its
 // finalize/close writes. A final transcript ends the read loop immediately;
 // other provider frames reset the same 30-second inactivity deadline exposed
-// by the relay runtime, so a slow but progressing final is never discarded.
+// by the relay runtime. The separate 60-second close ceiling prevents a broken
+// provider from retaining the session forever by sending non-final frames
+// after it has accepted closeStream.
 func (s *sttStream) finishGracefulClose() {
 	timeout := s.closeInactivityTimeout
 	if timeout <= 0 {
 		timeout = sttCloseInactivityTimeout
 	}
+	maximum := s.closeMaximumDuration
+	if maximum <= 0 {
+		maximum = sttCloseMaximumDuration
+	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+	maximumTimer := time.NewTimer(maximum)
+	defer maximumTimer.Stop()
 	for {
 		select {
 		case <-timer.C:
@@ -582,6 +595,11 @@ func (s *sttStream) finishGracefulClose() {
 				}
 			}
 			timer.Reset(timeout)
+		case <-maximumTimer.C:
+			if s.closing.Load() {
+				s.cancel()
+			}
+			return
 		case <-s.ctx.Done():
 			return
 		}
