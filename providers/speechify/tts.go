@@ -123,7 +123,7 @@ func (a *Adapter) Open(_ context.Context, request runtimepkg.AdapterRequest) (ru
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
 	return &stream{
-		ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), closing: make(chan struct{}),
 		httpClient: client, endpoint: endpoint, credential: credential.Value,
 		maxResponseBytes: a.maxResponseBytes, model: model, voice: voice,
 		language: strings.TrimSpace(request.Options.Language),
@@ -180,9 +180,10 @@ func synthesisEndpoint(policy endpointPolicy, raw string) (string, error) {
 }
 
 type stream struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	events chan runtimepkg.ProviderEvent
+	ctx     context.Context
+	cancel  context.CancelFunc
+	events  chan runtimepkg.ProviderEvent
+	closing chan struct{}
 
 	httpClient       *http.Client
 	endpoint         string
@@ -378,10 +379,21 @@ func (s *stream) readResponse(response *http.Response, requestCancel context.Can
 }
 
 func (s *stream) emit(event runtimepkg.ProviderEvent) bool {
+	// Preserve graceful delivery after Close while the runtime is still
+	// consuming events. If its event buffer is already full, however, closing
+	// releases the blocked reader so shutdown cannot deadlock on an abandoned
+	// consumer.
+	select {
+	case s.events <- event:
+		return true
+	default:
+	}
 	select {
 	case s.events <- event:
 		return true
 	case <-s.ctx.Done():
+		return false
+	case <-s.closing:
 		return false
 	}
 }
@@ -422,11 +434,10 @@ func (s *stream) shutdown(ctx context.Context, graceful bool) error {
 		s.pending.Reset()
 		done := s.requestDone
 		s.stateMu.Unlock()
-		// Cancel before waiting for the active request. The response reader may
-		// be blocked publishing to a full event channel after its consumer has
-		// stopped; canceling the stream context releases that send and the HTTP
-		// read, allowing requestDone and readers to complete.
-		s.cancel()
+		close(s.closing)
+		if !graceful {
+			s.cancel()
+		}
 		if graceful && done != nil {
 			select {
 			case <-done:
@@ -434,6 +445,7 @@ func (s *stream) shutdown(ctx context.Context, graceful bool) error {
 				s.closeErr = ctx.Err()
 			}
 		}
+		s.cancel()
 		s.readers.Wait()
 		close(s.events)
 	})

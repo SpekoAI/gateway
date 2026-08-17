@@ -188,6 +188,71 @@ func TestCloseCancelsReaderBlockedOnUndrainedEvents(t *testing.T) {
 	}
 }
 
+func TestClosePreservesActiveResponseForDrainingConsumer(t *testing.T) {
+	releaseAudio := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Speechify-Request-Id", "speechify-request-graceful")
+		w.Header().Set("Content-Type", "audio/L16;rate=24000;channels=1")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-releaseAudio
+		_, _ = w.Write([]byte{0, 1, 2, 3})
+	}))
+	defer server.Close()
+	parsed, _ := url.Parse(server.URL)
+	adapter, err := New(Config{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerStream, err := adapter.Open(context.Background(), adapterRequest(server.URL+streamPath, DefaultModel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := providerStream.AppendText(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := providerStream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- providerStream.Close(context.Background()) }()
+	stream := providerStream.(*stream)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stream.stateMu.Lock()
+		closing := stream.closed
+		stream.stateMu.Unlock()
+		if closing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("close did not begin")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(releaseAudio)
+
+	wantTypes := []protocol.EventType{protocol.EventUsageObserved, protocol.EventAudioStarted, protocol.EventAudioFrame, protocol.EventAudioDone}
+	for _, want := range wantTypes {
+		event := speechifyEventWithin(t, providerStream.Events())
+		if event.Type != want {
+			t.Fatalf("event = %q, want %q", event.Type, want)
+		}
+		if want == protocol.EventAudioFrame && string(event.Audio) != string([]byte{0, 1, 2, 3}) {
+			t.Fatalf("audio = %v", event.Audio)
+		}
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("close did not finish after the response completed")
+	}
+}
+
 func adapterRequest(endpoint, model string) runtimepkg.AdapterRequest {
 	return runtimepkg.AdapterRequest{
 		Kind:    protocol.SessionKindTTS,
