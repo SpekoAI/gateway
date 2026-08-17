@@ -376,7 +376,7 @@ func TestSTTSilentSessionEventuallyCloses(t *testing.T) {
 	}
 }
 
-func TestSTTCloseProgressCannotExtendForever(t *testing.T) {
+func TestSTTCloseDuplicateProgressDoesNotExtendForever(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -384,28 +384,23 @@ func TestSTTCloseProgressCannotExtendForever(t *testing.T) {
 		ctx:                    ctx,
 		cancel:                 cancel,
 		closeProgress:          make(chan struct{}, 1),
-		closeInactivityTimeout: 40 * time.Millisecond,
-		closeMaximumDuration:   100 * time.Millisecond,
+		closeInactivityTimeout: 50 * time.Millisecond,
 	}
 	stream.closing.Store(true)
 	stream.closeProgressAt.Store(time.Now().UnixNano())
-	started := time.Now()
 	go stream.finishGracefulClose()
 
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	deadline := time.After(500 * time.Millisecond)
+	deadline := time.After(300 * time.Millisecond)
 	for {
 		select {
 		case <-ticker.C:
-			stream.noteCloseProgress()
+			stream.noteTranscriptCloseProgress("same partial", false)
 		case <-ctx.Done():
-			if elapsed := time.Since(started); elapsed < 80*time.Millisecond {
-				t.Fatalf("close ended after %s despite provider progress", elapsed)
-			}
 			return
 		case <-deadline:
-			t.Fatal("continuous non-final progress kept Inworld close alive past its hard ceiling")
+			t.Fatal("duplicate non-final progress kept Inworld close alive")
 		}
 	}
 }

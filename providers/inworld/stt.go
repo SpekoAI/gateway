@@ -127,10 +127,7 @@ var (
 	sttWAVDataTag       = []byte("data")
 )
 
-const (
-	sttCloseInactivityTimeout = 30 * time.Second
-	sttCloseMaximumDuration   = 60 * time.Second
-)
+const sttCloseInactivityTimeout = 30 * time.Second
 
 // STTConfig controls local transport limits. Credentials and provider selection
 // always come from the signed session plan, never from this configuration.
@@ -284,7 +281,6 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		events:                 make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		closeProgress:          make(chan struct{}, 1),
 		closeInactivityTimeout: sttCloseInactivityTimeout,
-		closeMaximumDuration:   sttCloseMaximumDuration,
 	}
 	// Inworld opens the first transcription turn with an empty isFinal marker.
 	// It is protocol state, not the final result of a committed silent turn.
@@ -435,7 +431,11 @@ type sttStream struct {
 	closeProgress          chan struct{}
 	closeProgressAt        atomic.Int64
 	closeInactivityTimeout time.Duration
-	closeMaximumDuration   time.Duration
+	lastCloseTranscript    string
+	lastCloseUsageMS       int64
+	closeUsageSeen         bool
+	closeSpeechStartedSeen bool
+	closeSpeechStoppedSeen bool
 
 	// turnPending is true once speech has been seen whose final has not landed.
 	// Only then does Close force a turn: an endTurn with nothing in flight just
@@ -571,23 +571,17 @@ func (s *sttStream) Close(ctx context.Context) error {
 
 // finishGracefulClose bounds a successfully opened stream after its
 // finalize/close writes. A final transcript ends the read loop immediately;
-// other provider frames reset the same 30-second inactivity deadline exposed
-// by the relay runtime. The separate 60-second close ceiling prevents a broken
-// provider from retaining the session forever by sending non-final frames
-// after it has accepted closeStream.
+// parsed provider progress resets the same 30-second inactivity deadline
+// exposed by the relay runtime, so a slow but progressing final is never
+// discarded. Unknown frames and duplicate/non-advancing signals do not reset
+// it; see the typed note*CloseProgress helpers below.
 func (s *sttStream) finishGracefulClose() {
 	timeout := s.closeInactivityTimeout
 	if timeout <= 0 {
 		timeout = sttCloseInactivityTimeout
 	}
-	maximum := s.closeMaximumDuration
-	if maximum <= 0 {
-		maximum = sttCloseMaximumDuration
-	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	maximumTimer := time.NewTimer(maximum)
-	defer maximumTimer.Stop()
 	for {
 		select {
 		case <-timer.C:
@@ -610,11 +604,6 @@ func (s *sttStream) finishGracefulClose() {
 				}
 			}
 			timer.Reset(timeout)
-		case <-maximumTimer.C:
-			if s.closing.Load() {
-				s.cancel()
-			}
-			return
 		case <-s.ctx.Done():
 			return
 		}
@@ -633,6 +622,47 @@ func (s *sttStream) noteCloseProgress() {
 	case s.closeProgress <- struct{}{}:
 	default:
 	}
+}
+
+func (s *sttStream) noteTranscriptCloseProgress(text string, final bool) {
+	if !s.closing.Load() {
+		return
+	}
+	if !final && text == s.lastCloseTranscript {
+		return
+	}
+	s.lastCloseTranscript = text
+	s.noteCloseProgress()
+}
+
+func (s *sttStream) noteUsageCloseProgress(durationMS int64) {
+	if !s.closing.Load() {
+		return
+	}
+	if s.closeUsageSeen && durationMS <= s.lastCloseUsageMS {
+		return
+	}
+	s.closeUsageSeen = true
+	s.lastCloseUsageMS = durationMS
+	s.noteCloseProgress()
+}
+
+func (s *sttStream) noteSpeechCloseProgress(started bool) {
+	if !s.closing.Load() {
+		return
+	}
+	if started {
+		if s.closeSpeechStartedSeen {
+			return
+		}
+		s.closeSpeechStartedSeen = true
+	} else {
+		if s.closeSpeechStoppedSeen {
+			return
+		}
+		s.closeSpeechStoppedSeen = true
+	}
+	s.noteCloseProgress()
 }
 
 func (s *sttStream) abort() error {
@@ -683,7 +713,6 @@ func (s *sttStream) readLoop() {
 		if messageType != websocket.MessageText {
 			continue
 		}
-		s.noteCloseProgress()
 		if err := s.handleMessage(payload); err != nil {
 			s.emit(runtimepkg.ProviderEvent{Err: err})
 			return
@@ -719,6 +748,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		return s.handleTranscription(*message.Result.Transcription, raw)
 	case message.Result.SpeechStarted != nil:
 		s.turnPending.Store(true)
+		s.noteSpeechCloseProgress(true)
 		return s.emit(runtimepkg.ProviderEvent{
 			Type: protocol.EventSpeechStarted,
 			Data: marshalData(map[string]any{
@@ -731,6 +761,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// Voice activity stopped. This is NOT the turn boundary: Inworld emits
 		// it on any detected silence, and the transcript for the turn may still
 		// be revised, so turnPending is left alone.
+		s.noteSpeechCloseProgress(false)
 		return s.emit(runtimepkg.ProviderEvent{
 			Type: protocol.EventSpeechEnded,
 			Data: marshalData(map[string]any{
@@ -740,6 +771,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			Extensions: sttExtension(raw),
 		})
 	case message.Result.Usage != nil:
+		s.noteUsageCloseProgress(message.Result.Usage.TranscribedAudioMs)
 		return s.emit(runtimepkg.ProviderEvent{
 			Type: protocol.EventUsageObserved,
 			Data: marshalData(map[string]any{
@@ -763,12 +795,14 @@ func (s *sttStream) handleMessage(payload []byte) error {
 func (s *sttStream) handleTranscription(transcription sttTranscription, raw json.RawMessage) error {
 	text := strings.TrimSpace(transcription.Transcript)
 	if text == "" && transcription.IsFinal && s.consumeEmptyStartMarker() {
+		s.noteCloseProgress()
 		return nil
 	}
 	committedEmptyFinal := text == "" && transcription.IsFinal && s.commitsPending.Load() > 0
 	if text == "" && !committedEmptyFinal {
 		return nil
 	}
+	s.noteTranscriptCloseProgress(text, transcription.IsFinal)
 	kind := protocol.EventTranscriptDelta
 	if transcription.IsFinal {
 		kind = protocol.EventTranscriptFinal
