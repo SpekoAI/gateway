@@ -497,6 +497,43 @@ func TestProviderFailureBecomesStructuredProviderError(t *testing.T) {
 	}
 }
 
+func TestProviderTerminalErrorSurvivesClosedEventChannel(t *testing.T) {
+	t.Parallel()
+
+	adapter := mock.NewAdapter("mock.terminal.stt", func(_ runtimepkg.AdapterRequest) *mock.Stream {
+		stream := mock.NewStream(1)
+		stream.SetTerminalError(&runtimepkg.ProviderError{
+			Code:      "request_timeout",
+			Message:   "provider made no progress",
+			Hint:      "Retry the request.",
+			Retryable: true,
+		})
+		if err := stream.Close(context.Background()); err != nil {
+			t.Fatalf("close mock stream: %v", err)
+		}
+		return stream
+	})
+	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), runtimepkg.NopTelemetry{})
+	session := openSession(t, engine, protocol.SessionKindSTT, adapter.ID())
+	if err := session.Wait(context.Background()); err == nil {
+		t.Fatal("expected terminal provider error")
+	}
+	events := collectEvents(t, session)
+	if got := events[len(events)-1].Type; got != protocol.EventError {
+		t.Fatalf("terminal event = %q, want error", got)
+	}
+	var data struct {
+		Code      string `json:"code"`
+		Retryable bool   `json:"retryable"`
+	}
+	if err := json.Unmarshal(events[len(events)-1].Data, &data); err != nil {
+		t.Fatalf("decode terminal error: %v", err)
+	}
+	if data.Code != "request_timeout" || !data.Retryable {
+		t.Fatalf("terminal data = %+v", data)
+	}
+}
+
 func TestEngineRecordsUsageObservedAndOpenLatencyTelemetry(t *testing.T) {
 	t.Parallel()
 

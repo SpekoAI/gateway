@@ -406,6 +406,25 @@ func TestSTTCloseDuplicateProgressDoesNotExtendForever(t *testing.T) {
 	}
 }
 
+func TestSTTCloseTimeoutPersistsWhenEventQueueIsFull(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &sttStream{
+		ctx:    ctx,
+		cancel: cancel,
+		events: make(chan runtimepkg.ProviderEvent, 1),
+	}
+	stream.events <- runtimepkg.ProviderEvent{Type: protocol.EventWarning}
+	stream.commitsPending.Store(1)
+	stream.timeoutGracefulClose()
+
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(stream.TerminalError(), &providerErr) || providerErr.Code != "request_timeout" || !providerErr.Retryable {
+		t.Fatalf("persisted terminal error = %#v", stream.TerminalError())
+	}
+}
+
 // TestSTTCloseForcesAPendingTurnBeforeEndOfInput covers the most visible
 // transcriber failure: tearing down with a turn in flight. Inworld does not
 // commit on close, so the trailing utterance is lost unless endTurn goes first.

@@ -488,6 +488,12 @@ func (s *Session) runEvents() {
 			return
 		case event, ok := <-s.providerEvents:
 			if !ok {
+				if terminal, ok := s.stream.(TerminalErrorProviderStream); ok {
+					if err := terminal.TerminalError(); err != nil {
+						s.fail(fmt.Errorf("provider stream: %w", err))
+						return
+					}
+				}
 				s.finish(nil)
 				return
 			}

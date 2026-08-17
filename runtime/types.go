@@ -137,6 +137,13 @@ type AbortingProviderStream interface {
 	Abort(context.Context) error
 }
 
+// TerminalErrorProviderStream preserves a terminal failure independently of
+// the bounded event queue. Runtimes check it when Events closes so downstream
+// backpressure cannot turn a dropped terminal event into clean completion.
+type TerminalErrorProviderStream interface {
+	TerminalError() error
+}
+
 // ProviderEvent is a provider adapter's normalized output. The adapter grants
 // ownership of Data, Extensions, and Audio to the runtime when sending the
 // event; it must not mutate any of them after delivery. Err terminates the

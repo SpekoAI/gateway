@@ -421,6 +421,7 @@ type sttStream struct {
 	events chan runtimepkg.ProviderEvent
 
 	writeMu                sync.Mutex
+	terminalMu             sync.RWMutex
 	gracefulOnce           sync.Once
 	abortOnce              sync.Once
 	closed                 atomic.Bool
@@ -437,6 +438,7 @@ type sttStream struct {
 	closeUsageSeen         bool
 	closeSpeechStartedSeen bool
 	closeSpeechStoppedSeen bool
+	terminalErr            error
 
 	// turnPending is true once speech has been seen whose final has not landed.
 	// Only then does Close force a turn: an endTurn with nothing in flight just
@@ -619,6 +621,7 @@ func (s *sttStream) finishGracefulClose() {
 func (s *sttStream) timeoutGracefulClose() {
 	if s.commitsPending.Load() > 0 {
 		s.closeTimedOut.Store(true)
+		s.setTerminalError(sttCloseTimeoutError())
 	}
 	s.cancel()
 }
@@ -630,6 +633,18 @@ func sttCloseTimeoutError() error {
 		Hint:      "Retry the request; if it recurs, route to another STT provider.",
 		Retryable: true,
 	}
+}
+
+func (s *sttStream) setTerminalError(err error) {
+	s.terminalMu.Lock()
+	s.terminalErr = err
+	s.terminalMu.Unlock()
+}
+
+func (s *sttStream) TerminalError() error {
+	s.terminalMu.RLock()
+	defer s.terminalMu.RUnlock()
+	return s.terminalErr
 }
 
 func (s *sttStream) noteCloseProgress() {
@@ -727,7 +742,7 @@ func (s *sttStream) readLoop() {
 			// error. Emitting from the reader's defer keeps this send ordered before
 			// and race-free with the channel close below.
 			select {
-			case s.events <- runtimepkg.ProviderEvent{Err: sttCloseTimeoutError()}:
+			case s.events <- runtimepkg.ProviderEvent{Err: s.TerminalError()}:
 			default:
 			}
 		}
