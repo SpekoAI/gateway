@@ -88,20 +88,14 @@ func TestSTTHandshakeAndSessionUpdateMatchTheDocumentedWireShape(t *testing.T) {
 	if !ok || transcription["language"] != "en" {
 		t.Fatalf("input_audio_transcription = %v, want the bare primary subtag", session["input_audio_transcription"])
 	}
-	turn, ok := session["turn_detection"].(map[string]any)
-	if !ok || turn["type"] != "server_vad" {
-		t.Fatalf("turn_detection = %v", session["turn_detection"])
+	if turn := session["turn_detection"]; turn != nil {
+		t.Fatalf("turn_detection = %v, want null for manual commits", turn)
 	}
 	// `modalities` appears in Alibaba's sample code but not in the documented
 	// session-configuration table, and the server reports it as fixed anyway.
 	// Sending undocumented fields on a handshake is how silent failures start.
 	if _, present := session["modalities"]; present {
 		t.Fatal("session.update sent an undocumented modalities field")
-	}
-	// threshold and silence_duration_ms have documented defaults and the
-	// framework, not the vendor, owns turn policy.
-	if _, present := turn["threshold"]; present {
-		t.Fatal("turn_detection pinned a VAD threshold the adapter does not own")
 	}
 }
 
@@ -252,18 +246,28 @@ func TestSTTEmitsPartialsWhileAudioIsStillStreaming(t *testing.T) {
 		t.Fatalf("final text = %q", got)
 	}
 
-	// In VAD mode input_audio_buffer.commit is disabled, so session.finish is
-	// the only flush the protocol offers and CommitAudio converges on it.
+	// Manual mode makes CommitAudio the per-turn boundary and leaves the session
+	// open for additional audio.
 	if err := stream.CommitAudio(context.Background()); err != nil {
 		t.Fatalf("commit audio: %v", err)
 	}
-	if got := harness.nextFrame(t)["type"]; got != "session.finish" {
-		t.Fatalf("commit sent %v, want session.finish", got)
+	if got := harness.nextFrame(t)["type"]; got != "input_audio_buffer.commit" {
+		t.Fatalf("commit sent %v, want input_audio_buffer.commit", got)
 	}
-	// The session is over upstream; accepting more audio would write into a
-	// socket DashScope has already stopped transcribing.
-	if err := stream.WriteAudio(context.Background(), []byte{0x07}); !errors.Is(err, runtimepkg.ErrSessionClosed) {
-		t.Fatalf("post-commit write = %v, want ErrSessionClosed", err)
+	if err := stream.WriteAudio(context.Background(), []byte{0x07}); err != nil {
+		t.Fatalf("post-commit write: %v", err)
+	}
+	if got := harness.nextFrame(t)["type"]; got != "input_audio_buffer.append" {
+		t.Fatalf("next turn sent %v, want input_audio_buffer.append", got)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got := harness.nextFrame(t)["type"]; got != "input_audio_buffer.commit" {
+		t.Fatalf("close committed pending turn with %v", got)
+	}
+	if got := harness.nextFrame(t)["type"]; got != "session.finish" {
+		t.Fatalf("close sent %v, want session.finish", got)
 	}
 
 	harness.send(t, map[string]any{"type": "session.finished", "event_id": "event_2239"})
@@ -447,6 +451,18 @@ func TestSTTOpenRejectsPlansItCannotHonor(t *testing.T) {
 		mutate(&request)
 		if _, err := adapter.Open(context.Background(), request); err == nil {
 			t.Errorf("%s: Open accepted an unusable plan", name)
+		}
+	}
+
+	for name, media := range map[string]protocol.MediaFormat{
+		"encoding": {Encoding: "opus", SampleRateHz: 16_000, Channels: 1},
+		"rate":     {Encoding: "pcm_s16le", SampleRateHz: 48_000, Channels: 1},
+		"channels": {Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 2},
+	} {
+		err := sttValidateMedia(media)
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) || providerErr.Code != "unsupported_media" || providerErr.Hint == "" {
+			t.Errorf("%s media error = %#v, want typed unsupported_media with hint", name, err)
 		}
 	}
 

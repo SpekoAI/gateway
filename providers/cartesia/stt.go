@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -18,7 +19,10 @@ import (
 	"github.com/coder/websocket"
 )
 
-const STTAdapterID = "cartesia.stt.v1"
+const (
+	STTAdapterID      = "cartesia.stt.v1"
+	defaultSTTVersion = "2026-08-14"
+)
 
 // STTConfig controls Cartesia's manual-finalize streaming transcription
 // adapter. Provider credentials always come from the verified session plan.
@@ -47,7 +51,7 @@ func NewSTT(config STTConfig) (*STTAdapter, error) {
 		config.AdapterID = STTAdapterID
 	}
 	if config.Version == "" {
-		config.Version = defaultVersion
+		config.Version = defaultSTTVersion
 	}
 	if config.EventBuffer == 0 {
 		config.EventBuffer = 32
@@ -130,6 +134,8 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		conn: conn, ctx: streamCtx, cancel: cancel,
 		events:         make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		seenRequestIDs: make(map[string]struct{}), speechStarted: make(map[string]struct{}),
+		delivery:   request.Delivery,
+		frameBytes: max(request.Media.SampleRateHz*request.Media.Channels*2/10, request.Media.Channels*2),
 	}
 	if response != nil {
 		stream.observeRequestID(response.Header.Get("X-Request-ID"), nil)
@@ -143,13 +149,13 @@ func validateSTTOptions(model string, options protocol.RequestOptions, media pro
 		return errors.New("cartesia STT requires a concrete model in the session plan")
 	}
 	if media.Encoding != "pcm_s16le" {
-		return fmt.Errorf("cartesia STT requires pcm_s16le, got %q", media.Encoding)
+		return &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("Cartesia STT requires pcm_s16le, got %q", media.Encoding), Hint: "Convert the input to mono pcm_s16le between 8000 and 48000 Hz and try again."}
 	}
 	if media.Channels != 1 {
-		return fmt.Errorf("cartesia STT requires mono audio, got %d channels", media.Channels)
+		return &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("Cartesia transcription cannot accept %d-channel audio", media.Channels), Hint: "Downmix the input to mono pcm_s16le and try again."}
 	}
 	if media.SampleRateHz < 8_000 || media.SampleRateHz > 48_000 {
-		return fmt.Errorf("cartesia STT sample rate must be between 8000 and 48000 Hz, got %d", media.SampleRateHz)
+		return &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("Cartesia transcription cannot accept a %d Hz sample rate", media.SampleRateHz), Hint: "Resample the mono pcm_s16le input to a rate between 8000 and 48000 Hz and try again."}
 	}
 	language := strings.TrimSpace(options.Language)
 	if language != "" && language != "en" {
@@ -190,7 +196,11 @@ type sttStream struct {
 	abortOnce    sync.Once
 	closed       atomic.Bool
 	closing      atomic.Bool
+	inputPending atomic.Bool
 	closeErr     error
+	delivery     runtimepkg.AudioDeliveryMode
+	frameBytes   int
+	nextSend     time.Time
 
 	seenRequestIDs map[string]struct{}
 	speechStarted  map[string]struct{}
@@ -202,11 +212,65 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	if len(audio) == 0 {
 		return errors.New("cartesia STT audio is empty")
 	}
-	return s.write(ctx, websocket.MessageBinary, audio)
+	frameBytes := s.frameBytes
+	if frameBytes < 2 {
+		frameBytes = 2
+	}
+	for offset := 0; offset < len(audio); offset += frameBytes {
+		end := min(offset+frameBytes, len(audio))
+		if s.delivery == runtimepkg.AudioDeliveryBuffered {
+			if err := s.waitForPacing(ctx); err != nil {
+				return err
+			}
+		}
+		if err := s.write(ctx, websocket.MessageBinary, audio[offset:end]); err != nil {
+			return err
+		}
+		if s.delivery == runtimepkg.AudioDeliveryBuffered {
+			s.advancePacing(end - offset)
+		}
+	}
+	s.inputPending.Store(true)
+	return nil
 }
 
 func (s *sttStream) CommitAudio(ctx context.Context) error {
-	return s.write(ctx, websocket.MessageText, []byte("finalize"))
+	if !s.inputPending.CompareAndSwap(true, false) {
+		return nil
+	}
+	if err := s.write(ctx, websocket.MessageText, []byte("finalize")); err != nil {
+		s.inputPending.Store(true)
+		return err
+	}
+	return nil
+}
+
+func (s *sttStream) waitForPacing(ctx context.Context) error {
+	if s.nextSend.IsZero() {
+		s.nextSend = time.Now()
+		return nil
+	}
+	wait := time.Until(s.nextSend)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *sttStream) advancePacing(bytes int) {
+	if s.nextSend.Before(time.Now()) {
+		s.nextSend = time.Now()
+	}
+	// frameBytes represents 100 ms. A short final frame advances only by its
+	// audio duration so a subsequent write remains correctly paced.
+	s.nextSend = s.nextSend.Add(time.Duration(bytes) * 100 * time.Millisecond / time.Duration(s.frameBytes))
 }
 
 func (s *sttStream) AppendText(context.Context, string) error {
@@ -220,8 +284,18 @@ func (s *sttStream) Abort(context.Context) error  { return s.abort() }
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
 		s.closing.Store(true)
-		if err := s.write(ctx, websocket.MessageText, []byte("close")); err != nil {
+		// A caller may close immediately after its last audio write without an
+		// explicit commit. Finalize that pending turn exactly once before the
+		// session-level close; CommitAudio is a no-op when it was already done.
+		if err := s.CommitAudio(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) {
 			s.closeErr = err
+		}
+		if s.closeErr == nil {
+			if err := s.write(ctx, websocket.MessageText, []byte("close")); err != nil {
+				s.closeErr = err
+			}
+		}
+		if s.closeErr != nil {
 			_ = s.abort()
 		}
 	})

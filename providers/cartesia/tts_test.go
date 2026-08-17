@@ -140,7 +140,7 @@ func TestAdapterReusesOneSocketForMultipleContextsAndMapsAudio(t *testing.T) {
 		if got := request.Header.Get("X-API-Key"); got != "customer-cartesia-key" {
 			t.Fatalf("X-API-Key = %q", got)
 		}
-		if got := request.Header.Get("Cartesia-Version"); got != defaultVersion {
+		if got := request.Header.Get("Cartesia-Version"); got != defaultTTSVersion {
 			t.Fatalf("Cartesia-Version = %q", got)
 		}
 	case <-time.After(time.Second):

@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:1e070a37022feeec37a2af0466b04dd67337a162dd393d5797d9f5d1b5a56ad2
-# yaml-body: sha256:f3d43e1780afc91d38204729a51643e4f953ef9951a5bced76f2f884b509306e
+# json-mirror: asyncapi.json sha256:0fc7d388b085571453776c71ddc980eeefebcd3c065d412d0f8073e6bf6e63b0
+# yaml-body: sha256:554694803f927b132a721f353b8c6c99d3a5f93a74f9c91fab38ffcdbfa2b9d7
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -514,7 +514,7 @@ components:
         request_in_progress, and request_already_started; 413
         payload_too_large; 415 unsupported_media; 429 rate_limited and
         concurrency_exhausted; 500 relay_error; 502 provider_error; 503
-        provider_unavailable.
+        provider_unavailable; 504 request_timeout.
       enum:
         - authentication_failed
         - insufficient_credit
@@ -532,6 +532,7 @@ components:
         - lease_expired
         - payload_too_large
         - unsupported_media
+        - request_timeout
     ErrorBody:
       type: object
       description: >-
@@ -543,6 +544,12 @@ components:
           $ref: "#/components/schemas/ErrorCode"
         message:
           type: string
+        hint:
+          type: string
+          minLength: 1
+          maxLength: 512
+          pattern: "^[^\\r\\n]+$"
+          description: Relay-authored, single-line remediation that never contains provider payloads or customer content.
         retryable:
           type: boolean
         request_id:
@@ -550,6 +557,7 @@ components:
       required:
         - code
         - message
+        - hint
         - retryable
       additionalProperties: false
     ErrorEvent:

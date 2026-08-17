@@ -29,6 +29,70 @@ type ModelCapabilities struct {
 	NoiseReduction   bool `json:"noise_reduction"`
 }
 
+// SampleRateRange is an inclusive set of sample rates accepted by one audio
+// format. It is used instead of enumerating every integer rate for providers
+// that accept a bounded continuous range.
+type SampleRateRange struct {
+	Min int `json:"min"`
+	Max int `json:"max"`
+}
+
+// AudioFormat is one exact media constraint advertised for a speech model.
+// Exactly one of SampleRatesHz and SampleRateRangeHz must be present.
+type AudioFormat struct {
+	Encoding          string           `json:"encoding"`
+	SampleRatesHz     []int            `json:"sample_rates_hz,omitempty"`
+	SampleRateRangeHz *SampleRateRange `json:"sample_rate_range_hz,omitempty"`
+	Channels          []int            `json:"channels"`
+}
+
+// Validate checks that the format is concrete and unambiguous.
+func (a AudioFormat) Validate() error {
+	if a.Encoding != "pcm_s16le" && a.Encoding != "opus" {
+		return fmt.Errorf("encoding: unsupported value %q", a.Encoding)
+	}
+	if (len(a.SampleRatesHz) == 0) == (a.SampleRateRangeHz == nil) {
+		return fmt.Errorf("exactly one of sample_rates_hz and sample_rate_range_hz is required")
+	}
+	for i, rate := range a.SampleRatesHz {
+		if rate < 8_000 || rate > 192_000 || (i > 0 && rate <= a.SampleRatesHz[i-1]) {
+			return fmt.Errorf("sample_rates_hz: values must be unique, ascending, and between 8000 and 192000")
+		}
+	}
+	if r := a.SampleRateRangeHz; r != nil && (r.Min < 8_000 || r.Max > 192_000 || r.Min > r.Max) {
+		return fmt.Errorf("sample_rate_range_hz: invalid inclusive range")
+	}
+	if len(a.Channels) == 0 {
+		return fmt.Errorf("channels: at least one value is required")
+	}
+	for i, channels := range a.Channels {
+		if channels < 1 || channels > 8 || (i > 0 && channels <= a.Channels[i-1]) {
+			return fmt.Errorf("channels: values must be unique, ascending, and between 1 and 8")
+		}
+	}
+	return nil
+}
+
+// Supports reports whether the exact request media satisfies this format.
+func (a AudioFormat) Supports(encoding string, sampleRateHz, channels int) bool {
+	if a.Encoding != encoding || !containsInt(a.Channels, channels) {
+		return false
+	}
+	if a.SampleRateRangeHz != nil {
+		return sampleRateHz >= a.SampleRateRangeHz.Min && sampleRateHz <= a.SampleRateRangeHz.Max
+	}
+	return containsInt(a.SampleRatesHz, sampleRateHz)
+}
+
+func containsInt(values []int, want int) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 // SupportsSTTOptions reports whether this model advertises every canonical
 // ask the options carry, and names the first one it does not. Provider
 // settings are the routed vendor's own and are not checked here.
@@ -54,6 +118,7 @@ type Model struct {
 	Kind         Kind              `json:"kind"`
 	Capabilities ModelCapabilities `json:"capabilities"`
 	Regions      []string          `json:"regions"`
+	AudioFormats []AudioFormat     `json:"audio_formats,omitempty"`
 }
 
 // Validate checks that a catalog entry is concrete and routable somewhere.
@@ -70,6 +135,17 @@ func (m Model) Validate() error {
 	for i, region := range m.Regions {
 		if strings.TrimSpace(region) == "" {
 			return fmt.Errorf("regions[%d]: region id must not be blank", i)
+		}
+	}
+	if m.Kind == KindLLM && len(m.AudioFormats) != 0 {
+		return fmt.Errorf("audio_formats: must be omitted for llm models")
+	}
+	if (m.Kind == KindSTT || m.Kind == KindTTS) && len(m.AudioFormats) == 0 {
+		return fmt.Errorf("audio_formats: at least one format is required for speech models")
+	}
+	for i, format := range m.AudioFormats {
+		if err := format.Validate(); err != nil {
+			return fmt.Errorf("audio_formats[%d]: %w", i, err)
 		}
 	}
 	return nil

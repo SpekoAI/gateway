@@ -134,7 +134,7 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if strings.TrimSpace(adapterOptions.Voice) == "" {
 		adapterOptions.Voice = adapterPlan.Route.Voice
 	}
-	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media})
+	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery})
 	if err != nil {
 		cancel()
 		e.recordOpenFailure(request, err)

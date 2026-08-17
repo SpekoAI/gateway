@@ -35,6 +35,18 @@
         "us-west-2",
         "eu-west-1",
         "ap-southeast-1"
+      ],
+      "audio_formats": [
+        {
+          "encoding": "pcm_s16le",
+          "sample_rate_range_hz": {
+            "min": 8000,
+            "max": 48000
+          },
+          "channels": [
+            1
+          ]
+        }
       ]
     }
   ],

@@ -261,16 +261,16 @@ func sttValidateMedia(media protocol.MediaFormat) error {
 	// 16-bit little-endian samples. `opus` is the only other accepted value and
 	// no canonical encoding maps onto it here.
 	if media.Encoding != "pcm_s16le" {
-		return fmt.Errorf("alibaba stt requires pcm_s16le, got %q", media.Encoding)
+		return &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("Alibaba STT requires pcm_s16le, got %q", media.Encoding), Hint: "Convert the input to mono pcm_s16le at 8000 or 16000 Hz and try again."}
 	}
 	// The vendor's own preparation step is `ffmpeg -ar 16000 -ac 1 -f s16le`.
 	// Interleaved stereo would be read as twice the sample rate and transcribe
 	// into gibberish while the session still looks healthy.
 	if media.Channels != 1 {
-		return fmt.Errorf("alibaba stt requires mono audio, got %d channels", media.Channels)
+		return &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("Alibaba STT requires mono audio, got %d channels", media.Channels), Hint: "Downmix the input to mono pcm_s16le and try again."}
 	}
 	if _, ok := sttSupportedSampleRates[media.SampleRateHz]; !ok {
-		return fmt.Errorf("alibaba stt does not accept a %d Hz sample rate", media.SampleRateHz)
+		return &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("Alibaba STT does not accept a %d Hz sample rate", media.SampleRateHz), Hint: "Resample the mono pcm_s16le input to 8000 or 16000 Hz and try again."}
 	}
 	return nil
 }
@@ -304,16 +304,19 @@ func baseLanguageTag(language string) string {
 //   - `modalities` is not sent. Alibaba's sample includes it but the reference
 //     session-configuration table does not document it as a client field; the
 //     server reports it as fixed to ["text"] anyway.
-//   - turn_detection carries only `type`. threshold and silence_duration_ms
-//     have documented defaults (0.2 and 800 ms) and the framework, not the
-//     vendor, owns turn policy.
+//   - turn_detection is null. The framework owns turn policy and sends an
+//     explicit input_audio_buffer.commit for each relay commit; provider VAD
+//     would race a buffered upload sent faster than real time.
 //   - input_audio_transcription is omitted entirely when no language is
 //     pinned, which is how auto-detect is requested.
 func sttSessionUpdate(eventID string, sampleRateHz int, language string) sttSessionUpdateFrame {
 	session := sttSessionConfig{
 		InputAudioFormat: "pcm",
 		SampleRate:       sampleRateHz,
-		TurnDetection:    &sttTurnDetection{Type: "server_vad"},
+		// Manual mode makes the framework's explicit CommitAudio boundary the
+		// source of truth. In VAD mode a buffered upload can reach session.finish
+		// before the provider observes a speech boundary.
+		TurnDetection: nil,
 	}
 	if language != "" {
 		session.InputAudioTranscription = &sttTranscriptionConfig{Language: language}
@@ -363,6 +366,7 @@ type sttStream struct {
 	closeErr     error
 	inputClosed  atomic.Bool
 	closed       atomic.Bool
+	inputPending atomic.Bool
 
 	// sessionID is written and read only by readLoop.
 	sessionID string
@@ -393,14 +397,23 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 			return err
 		}
 	}
+	s.inputPending.Store(true)
 	return nil
 }
 
-// CommitAudio ends the session, because in VAD mode that is the only flush the
-// protocol has. input_audio_buffer.commit is documented as disabled while
-// turn_detection is set, and session.finish is answered by a final transcript
-// followed by session.finished. See the package doc for why these converge.
-func (s *sttStream) CommitAudio(ctx context.Context) error { return s.finishSession(ctx) }
+// CommitAudio finalizes exactly the audio accumulated since the previous
+// commit. Manual mode supports multiple turns; session.finish remains a
+// session-level close signal.
+func (s *sttStream) CommitAudio(ctx context.Context) error {
+	if !s.inputPending.CompareAndSwap(true, false) {
+		return nil
+	}
+	if err := s.writeJSON(ctx, sessionFinishFrame{EventID: s.ids.next(), Type: "input_audio_buffer.commit"}); err != nil {
+		s.inputPending.Store(true)
+		return err
+	}
+	return nil
+}
 
 func (s *sttStream) AppendText(context.Context, string) error {
 	return runtimepkg.ErrUnsupportedOperation
@@ -425,8 +438,13 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 // and session.finished; the read loop ends when the server closes.
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
-		if err := s.finishSession(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		if err := s.CommitAudio(ctx); err != nil {
 			s.closeErr = err
+		}
+		if s.closeErr == nil {
+			if err := s.finishSession(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) {
+				s.closeErr = err
+			}
 		}
 		s.closed.Store(true)
 		if s.closeErr != nil {

@@ -20,6 +20,6 @@
   {"type": "session.closed", "usage": {"characters": 42}},
   {
     "type": "error",
-    "error": {"code": "lease_expired", "message": "the session lease could not be renewed before it expired", "retryable": true, "request_id": "req_5cd2f7"}
+    "error": {"code": "lease_expired", "message": "the session lease could not be renewed before it expired", "hint": "Start a new streaming session; the previous session lease cannot be renewed.", "retryable": true, "request_id": "req_5cd2f7"}
   }
 ]

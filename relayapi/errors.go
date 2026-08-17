@@ -23,6 +23,7 @@ import (
 //	500  relay_error
 //	502  provider_error
 //	503  provider_unavailable
+//	504  request_timeout
 //
 // budget_exhausted and lease_expired terminate streams that are already
 // established — an SSE error event or a WebSocket error frame after the 200
@@ -52,6 +53,7 @@ const (
 	ErrorCodeLeaseExpired          ErrorCode = "lease_expired"
 	ErrorCodePayloadTooLarge       ErrorCode = "payload_too_large"
 	ErrorCodeUnsupportedMedia      ErrorCode = "unsupported_media"
+	ErrorCodeRequestTimeout        ErrorCode = "request_timeout"
 )
 
 // ErrorCodes returns the closed code set in a stable order. It exists so
@@ -74,6 +76,57 @@ func ErrorCodes() []ErrorCode {
 		ErrorCodeLeaseExpired,
 		ErrorCodePayloadTooLarge,
 		ErrorCodeUnsupportedMedia,
+		ErrorCodeRequestTimeout,
+	}
+}
+
+// MaxErrorHintBytes bounds the caller-facing remediation text. Hints are
+// intentionally short, single-line, relay-authored strings; provider payloads
+// must never be copied into them.
+const MaxErrorHintBytes = 512
+
+// DefaultErrorHint returns the safe remediation used when a more specific
+// call-site hint is unavailable. Keeping this exhaustive beside ErrorCodes
+// guarantees older connectors can omit hint while a newer edge still emits a
+// useful public error.
+func DefaultErrorHint(code ErrorCode) string {
+	switch code {
+	case ErrorCodeAuthenticationFailed:
+		return "Check that the Bearer token is an active Speko API key and try again."
+	case ErrorCodeInsufficientCredit:
+		return "Add credit or reduce the requested work before retrying."
+	case ErrorCodeCapabilityUnsupported:
+		return "Remove the unsupported option or select a model that advertises the capability in GET /v1/models."
+	case ErrorCodeInvalidRequest:
+		return "Correct the request fields described by the message and try again."
+	case ErrorCodeRateLimited:
+		return "Retry with exponential backoff and reduce the request rate."
+	case ErrorCodeConcurrencyExhausted:
+		return "Wait for an active request to finish, then retry."
+	case ErrorCodeProviderError:
+		return "Retry the request; if it continues, choose another provider or use auto routing."
+	case ErrorCodeProviderUnavailable:
+		return "Retry after a brief delay or use auto routing so the relay can choose another provider."
+	case ErrorCodeRelayError:
+		return "Retry once; if it continues, contact support with the request_id."
+	case ErrorCodeIdempotencyConflict:
+		return "Use a new Idempotency-Key when the request content changes."
+	case ErrorCodeRequestInProgress:
+		return "Wait for the original request to finish before retrying with the same Idempotency-Key."
+	case ErrorCodeRequestAlreadyStarted:
+		return "Do not replay this request; use the returned request_id to correlate the original attempt."
+	case ErrorCodeBudgetExhausted:
+		return "Start a new request with a larger budget or reduce the requested output."
+	case ErrorCodeLeaseExpired:
+		return "Start a new streaming session; the previous session lease cannot be renewed."
+	case ErrorCodePayloadTooLarge:
+		return "Reduce the request payload to the documented size limit and try again."
+	case ErrorCodeUnsupportedMedia:
+		return "Convert the audio to a format advertised by GET /v1/models and try again."
+	case ErrorCodeRequestTimeout:
+		return "The provider made no progress for 30 seconds; retry or use auto routing."
+	default:
+		return "Retry once; if it continues, contact support with the request_id."
 	}
 }
 
@@ -83,6 +136,7 @@ func ErrorCodes() []ErrorCode {
 type ErrorBody struct {
 	Code      ErrorCode `json:"code"`
 	Message   string    `json:"message"`
+	Hint      string    `json:"hint"`
 	Retryable bool      `json:"retryable"`
 	RequestID string    `json:"request_id,omitempty"`
 }
@@ -94,6 +148,15 @@ func (b ErrorBody) Validate() error {
 	}
 	if strings.TrimSpace(b.Message) == "" {
 		return fmt.Errorf("message: required")
+	}
+	if strings.TrimSpace(b.Hint) == "" {
+		return fmt.Errorf("hint: required")
+	}
+	if b.Hint != strings.TrimSpace(b.Hint) || strings.ContainsAny(b.Hint, "\r\n") {
+		return fmt.Errorf("hint: must be a trimmed single line")
+	}
+	if len([]byte(b.Hint)) > MaxErrorHintBytes {
+		return fmt.Errorf("hint: must be at most %d bytes", MaxErrorHintBytes)
 	}
 	return nil
 }

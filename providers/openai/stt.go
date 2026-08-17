@@ -282,10 +282,16 @@ func sttValidateModel(model string) (string, error) {
 // 16-bit little-endian mono, which is exactly pcm_s16le at one channel.
 func sttValidateMedia(media protocol.MediaFormat) error {
 	if media.Encoding != "pcm_s16le" || media.Channels != 1 {
-		return fmt.Errorf("openai stt requires mono pcm_s16le input, got %s/%d channels", media.Encoding, media.Channels)
+		return &runtimepkg.ProviderError{
+			Code: "unsupported_media", Message: fmt.Sprintf("OpenAI STT requires mono pcm_s16le input, got %s/%d channels", media.Encoding, media.Channels),
+			Hint: "Convert the input to mono pcm_s16le at 24000 Hz and try again.",
+		}
 	}
 	if media.SampleRateHz != sttSampleRateHz {
-		return fmt.Errorf("openai stt requires a %d Hz sample rate, got %d", sttSampleRateHz, media.SampleRateHz)
+		return &runtimepkg.ProviderError{
+			Code: "unsupported_media", Message: fmt.Sprintf("OpenAI STT requires a 24000 Hz sample rate, got %d", media.SampleRateHz),
+			Hint: "Resample the mono pcm_s16le input to 24000 Hz or choose a model that advertises the current rate in GET /v1/models.",
+		}
 	}
 	return nil
 }

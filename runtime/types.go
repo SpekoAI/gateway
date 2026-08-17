@@ -71,10 +71,11 @@ func (l Limits) validate() error {
 // OpenRequest supplies the operation-specific information omitted from a
 // signed SessionPlan because the plan is also used by local and remote APIs.
 type OpenRequest struct {
-	Kind    protocol.SessionKind
-	Plan    protocol.SessionPlan
-	Options protocol.RequestOptions
-	Media   *protocol.MediaFormat
+	Kind     protocol.SessionKind
+	Plan     protocol.SessionPlan
+	Options  protocol.RequestOptions
+	Media    *protocol.MediaFormat
+	Delivery AudioDeliveryMode
 }
 
 // LocalCredential is a customer-owned provider credential installed in the
@@ -102,7 +103,19 @@ type AdapterRequest struct {
 	Plan    protocol.SessionPlan
 	Options protocol.RequestOptions
 	Media   *protocol.MediaFormat
+	// Delivery identifies whether audio is arriving at real-time cadence or
+	// from a buffered upload. Adapters that require real-time pacing use it to
+	// pace only buffered input and avoid adding latency to live streams.
+	Delivery AudioDeliveryMode
 }
+
+// AudioDeliveryMode describes the cadence of audio supplied to an adapter.
+type AudioDeliveryMode string
+
+const (
+	AudioDeliveryLive     AudioDeliveryMode = "live"
+	AudioDeliveryBuffered AudioDeliveryMode = "buffered"
+)
 
 // ProviderStream is serialized by the runtime: WriteAudio, control methods,
 // and Close never run concurrently for one session. Events may arrive
@@ -140,8 +153,12 @@ type ProviderEvent struct {
 // cannot continue an upstream stream. It must not contain credentials or raw
 // request URLs.
 type ProviderError struct {
-	Code           string
-	Message        string
+	Code    string
+	Message string
+	// Hint is optional inside the gateway. When set it must be a fixed,
+	// caller-safe remediation string; raw provider messages belong only in
+	// Extensions. The relay edge supplies a code-based fallback when absent.
+	Hint           string
 	Retryable      bool
 	ProviderStatus int
 	Cause          error
@@ -164,6 +181,17 @@ func (e *ProviderError) Error() string {
 }
 
 func (e *ProviderError) Unwrap() error { return e.Cause }
+
+// SafeHint exposes only the adapter-authored, caller-safe remediation. Relay
+// versions that predate the concrete Hint field can discover it through this
+// interface without coupling their provider-error classifier to a particular
+// gateway release.
+func (e *ProviderError) SafeHint() string {
+	if e == nil {
+		return ""
+	}
+	return e.Hint
+}
 
 // PlanVerifier verifies a SessionPlan signature against its trusted issuer.
 // Managed routing uses control-plane keys; local routing uses a process-local

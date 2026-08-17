@@ -35,7 +35,7 @@
   {
     "event": "error",
     "data": {
-      "error": {"code": "provider_unavailable", "message": "no eligible provider is currently routable for this request", "retryable": true, "request_id": "req_7d81b2"}
+      "error": {"code": "provider_unavailable", "message": "no eligible provider is currently routable for this request", "hint": "Retry after a brief delay or use auto routing so the relay can choose another provider.", "retryable": true, "request_id": "req_7d81b2"}
     }
   }
 ]

@@ -86,9 +86,10 @@ func TestSTTAdapterSendsBase64AudioAndMapsTranscripts(t *testing.T) {
 		t.Fatalf("commit frame = %v, want an empty chunk with commit true", commitFrame)
 	}
 
-	// session_started, the partial, and exactly ONE final — not two.
-	events := collectSTTEvents(t, providerStream.Events(), 3)
-	want := []protocol.EventType{protocol.EventUsageObserved, protocol.EventTranscriptDelta, protocol.EventTranscriptFinal}
+	// session_started, the partial, exactly one final, then a timing-only
+	// alignment for the timestamped twin.
+	events := collectSTTEvents(t, providerStream.Events(), 4)
+	want := []protocol.EventType{protocol.EventUsageObserved, protocol.EventTranscriptDelta, protocol.EventTranscriptFinal, protocol.EventAlignment}
 	for index := range want {
 		if events[index].Type != want[index] {
 			t.Fatalf("event %d = %q, want %q", index, events[index].Type, want[index])
@@ -114,16 +115,23 @@ func TestSTTAdapterSendsBase64AudioAndMapsTranscripts(t *testing.T) {
 	if final.Text != "hello world" || !final.IsFinal {
 		t.Fatalf("final = %+v, want the committed text", final)
 	}
-	// The `spacing` token must be dropped: it carries a zero-width range and would
-	// corrupt any consumer that trusts word timings.
-	if len(final.Words) != 2 || final.Words[0].Text != "hello" || final.Words[1].Text != "world" {
-		t.Fatalf("words = %+v, want the two word-typed tokens only", final.Words)
+	var alignment struct {
+		Words []struct {
+			Text    string `json:"text"`
+			StartMs int64  `json:"start_ms"`
+			EndMs   int64  `json:"end_ms"`
+		} `json:"words"`
+		StartMs int64 `json:"audio_start_ms"`
+		EndMs   int64 `json:"audio_end_ms"`
 	}
-	if final.Words[0].StartMs != 100 || final.Words[1].EndMs != 900 {
-		t.Fatalf("word timings = %+v, want seconds converted to ms", final.Words)
+	if err := json.Unmarshal(events[3].Data, &alignment); err != nil {
+		t.Fatalf("decode alignment: %v", err)
 	}
-	if final.StartMs != 100 || final.EndMs != 900 {
-		t.Fatalf("segment span = %d..%d ms, want 100..900 from the word timings", final.StartMs, final.EndMs)
+	if len(alignment.Words) != 2 || alignment.Words[0].Text != "hello" || alignment.Words[1].Text != "world" {
+		t.Fatalf("alignment words = %+v, want the two word-typed tokens only", alignment.Words)
+	}
+	if alignment.Words[0].StartMs != 100 || alignment.Words[1].EndMs != 900 || alignment.StartMs != 100 || alignment.EndMs != 900 {
+		t.Fatalf("alignment timings = %+v, want 100..900 ms", alignment)
 	}
 
 	query := (<-requests).URL.Query()
@@ -143,6 +151,34 @@ func TestSTTAdapterSendsBase64AudioAndMapsTranscripts(t *testing.T) {
 	_ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
 }
 
+func TestSTTDeduplicatesTimestampTwinWhenItArrivesFirst(t *testing.T) {
+	t.Parallel()
+	streamCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &sttStream{ctx: streamCtx, events: make(chan runtimepkg.ProviderEvent, 2)}
+	timestamped := []byte(`{"message_type":"final_transcript_with_timestamps","text":"same words","words":[{"text":"same","start":0.1,"end":0.3,"type":"word"},{"text":"words","start":0.4,"end":0.8,"type":"word"}]}`)
+	base := []byte(`{"message_type":"final_transcript","text":"same words"}`)
+	if err := stream.handleMessage(timestamped); err != nil {
+		t.Fatalf("timestamped final: %v", err)
+	}
+	if err := stream.handleMessage(base); err != nil {
+		t.Fatalf("base twin: %v", err)
+	}
+	select {
+	case event := <-stream.events:
+		if event.Type != protocol.EventTranscriptFinal || !strings.Contains(string(event.Data), `"audio_end_ms":800`) {
+			t.Fatalf("event = %s %s, want one timestamped final", event.Type, event.Data)
+		}
+	default:
+		t.Fatal("timestamped final was not emitted")
+	}
+	select {
+	case duplicate := <-stream.events:
+		t.Fatalf("duplicate event = %s %s", duplicate.Type, duplicate.Data)
+	default:
+	}
+}
+
 // Each of these arrives as a frame on an ALREADY-OPEN socket, so the code has to
 // come from the frame rather than a dial status. Collapsing them would make a dead
 // key and an empty balance indistinguishable, and only one is worth retrying.
@@ -154,10 +190,18 @@ func TestSTTAdapterKeepsTheVendorsErrorDistinction(t *testing.T) {
 		retryable bool
 	}{
 		{frame: "auth_error", code: "authentication_failed"},
+		{frame: "unaccepted_terms", code: "authentication_failed"},
 		{frame: "quota_exceeded", code: "provider_quota_exceeded"},
 		{frame: "rate_limited", code: "provider_rate_limited", retryable: true},
+		{frame: "commit_throttled", code: "provider_rate_limited", retryable: true},
 		{frame: "input_error", code: "invalid_request"},
-		{frame: "error", code: "provider_unavailable"},
+		{frame: "chunk_size_exceeded", code: "invalid_request"},
+		{frame: "queue_overflow", code: "provider_unavailable", retryable: true},
+		{frame: "resource_exhausted", code: "provider_unavailable", retryable: true},
+		{frame: "session_time_limit_exceeded", code: "provider_unavailable", retryable: true},
+		{frame: "transcriber_error", code: "provider_unavailable", retryable: true},
+		{frame: "scribe_error", code: "provider_unavailable", retryable: true},
+		{frame: "error", code: "provider_unavailable", retryable: true},
 	} {
 		t.Run(tc.frame, func(t *testing.T) {
 			t.Parallel()
@@ -240,9 +284,8 @@ func TestSTTAdapterSplitsAnOversizedWrite(t *testing.T) {
 	}
 }
 
-// Close must commit first. Dropping the socket without a commit discards whatever
-// Scribe had buffered, which silently loses the last thing the caller said.
-func TestSTTAdapterCommitsBeforeClosing(t *testing.T) {
+// A prior explicit commit followed by Close must not send a duplicate commit.
+func TestSTTAdapterDoesNotCommitTwiceOnClose(t *testing.T) {
 	t.Parallel()
 	frames := make(chan map[string]any, 2)
 	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
@@ -263,12 +306,19 @@ func TestSTTAdapterCommitsBeforeClosing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
+	if err := providerStream.WriteAudio(context.Background(), []byte{1, 2}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := providerStream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
 	if err := providerStream.Close(context.Background()); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+	<-frames // audio
 	frame := <-frames
 	if frame["commit"] != true {
-		t.Fatalf("close sent %v, want a commit frame", frame)
+		t.Fatalf("commit sent %v, want a commit frame", frame)
 	}
 	// After Close the stream is closed for writes; a further write must be refused
 	// rather than racing the teardown.

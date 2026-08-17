@@ -191,7 +191,10 @@ func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string
 		return "", errors.New("elevenlabs stt requires a concrete model in the session plan")
 	}
 	if media.Encoding != "pcm_s16le" {
-		return "", fmt.Errorf("elevenlabs stt requires pcm_s16le, got %q", media.Encoding)
+		return "", &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("ElevenLabs transcription cannot accept %s audio", media.Encoding), Hint: "Convert the input to mono pcm_s16le at 8000, 16000, 22050, 24000, 44100, or 48000 Hz and try again."}
+	}
+	if media.Channels != 1 {
+		return "", &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("ElevenLabs transcription cannot accept %d-channel audio", media.Channels), Hint: "Downmix the input to mono pcm_s16le and try again."}
 	}
 	query := endpoint.Query()
 	query.Set("model_id", model)
@@ -241,7 +244,7 @@ func sttAudioFormat(sampleRateHz int) (string, error) {
 	case 8000, 16000, 22050, 24000, 44100, 48000:
 		return "pcm_" + strconv.Itoa(sampleRateHz), nil
 	default:
-		return "", fmt.Errorf("elevenlabs stt does not accept a %d Hz sample rate", sampleRateHz)
+		return "", &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("ElevenLabs transcription cannot accept a %d Hz sample rate", sampleRateHz), Hint: "Resample the mono pcm_s16le input to 8000, 16000, 22050, 24000, 44100, or 48000 Hz and try again."}
 	}
 }
 
@@ -279,7 +282,11 @@ type sttStream struct {
 	gracefulOnce sync.Once
 	abortOnce    sync.Once
 	closed       atomic.Bool
+	inputPending atomic.Bool
 	closeErr     error
+	stateMu      sync.Mutex
+	baseFinals   []string
+	timedFinals  []string
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -306,6 +313,7 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 			return err
 		}
 	}
+	s.inputPending.Store(true)
 	return nil
 }
 
@@ -313,11 +321,18 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 // documented end-of-input signal and forces a final committed transcript for the
 // last segment; there is no separate finalize message.
 func (s *sttStream) CommitAudio(ctx context.Context) error {
-	return s.writeJSON(ctx, map[string]any{
+	if !s.inputPending.CompareAndSwap(true, false) {
+		return nil
+	}
+	if err := s.writeJSON(ctx, map[string]any{
 		"message_type":  "input_audio_chunk",
 		"audio_base_64": "",
 		"commit":        true,
-	})
+	}); err != nil {
+		s.inputPending.Store(true)
+		return err
+	}
+	return nil
 }
 
 func (s *sttStream) AppendText(context.Context, string) error {
@@ -444,25 +459,41 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			Data:       sttTranscriptData(message.Text, false, nil),
 			Extensions: sttExtension(raw),
 		})
-	case "committed_transcript":
-		// Dropped deliberately. We always connect with include_timestamps=true, so
-		// Scribe emits BOTH this frame and `committed_transcript_with_timestamps`
-		// for the SAME segment. Emitting both double-fires every finalized turn.
-		// The timestamped twin below carries identical text plus word timings. If
-		// include_timestamps is ever turned off, this case has to emit the final,
-		// because the twin will not arrive.
-		return nil
-	case "committed_transcript_with_timestamps":
+	case "final_transcript", "committed_transcript":
+		if strings.TrimSpace(message.Text) == "" {
+			return nil
+		}
+		if s.consumeTimedFinal(message.Text) {
+			// The timestamped twin already carried both text and alignment.
+			return nil
+		}
+		s.rememberBaseFinal(message.Text)
 		return s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventTranscriptFinal,
-			Data:       sttTranscriptData(message.Text, true, message.Words),
+			Data:       sttTranscriptData(message.Text, true, nil),
 			Extensions: sttExtension(raw),
 		})
-	case "error", "auth_error", "quota_exceeded", "rate_limited", "input_error":
+	case "final_transcript_with_timestamps", "committed_transcript_with_timestamps":
+		if strings.TrimSpace(message.Text) == "" {
+			return nil
+		}
+		if s.consumeBaseFinal(message.Text) {
+			return s.emit(runtimepkg.ProviderEvent{
+				Type:       protocol.EventAlignment,
+				Data:       sttAlignmentData(message.Text, message.Words),
+				Extensions: sttExtension(raw),
+			})
+		}
+		s.rememberTimedFinal(message.Text)
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: sttTranscriptData(message.Text, true, message.Words), Extensions: sttExtension(raw)})
+	case "insufficient_audio_activity":
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: sttMarshalData(map[string]any{"message": "ElevenLabs detected no transcribable speech", "provider_type": message.MessageType}), Extensions: sttExtension(raw)})
+	case "error", "scribe_error", "auth_error", "quota_exceeded", "rate_limited", "input_error", "transcriber_error", "commit_throttled", "unaccepted_terms", "queue_overflow", "resource_exhausted", "session_time_limit_exceeded", "chunk_size_exceeded":
 		return &runtimepkg.ProviderError{
 			Code:      sttErrorCode(message.MessageType),
 			Message:   sttErrorMessage(message.MessageType, message.Error),
-			Retryable: message.MessageType == "rate_limited",
+			Hint:      sttErrorHint(message.MessageType),
+			Retryable: sttErrorRetryable(message.MessageType),
 		}
 	default:
 		return s.emit(runtimepkg.ProviderEvent{
@@ -471,6 +502,48 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			Extensions: sttExtension(raw),
 		})
 	}
+}
+
+func (s *sttStream) rememberBaseFinal(text string) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.baseFinals = rememberFinal(s.baseFinals, text)
+}
+
+func (s *sttStream) consumeBaseFinal(text string) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return consumeFinal(&s.baseFinals, text)
+}
+
+func (s *sttStream) rememberTimedFinal(text string) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.timedFinals = rememberFinal(s.timedFinals, text)
+}
+
+func (s *sttStream) consumeTimedFinal(text string) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return consumeFinal(&s.timedFinals, text)
+}
+
+func rememberFinal(finals []string, text string) []string {
+	finals = append(finals, text)
+	if len(finals) > 32 {
+		finals = append([]string(nil), finals[len(finals)-32:]...)
+	}
+	return finals
+}
+
+func consumeFinal(finals *[]string, text string) bool {
+	for i, candidate := range *finals {
+		if candidate == text {
+			*finals = append((*finals)[:i], (*finals)[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 func (s *sttStream) emit(event runtimepkg.ProviderEvent) error {
@@ -503,16 +576,44 @@ func sttDialErrorCode(status int) string {
 // one of the two is worth retrying elsewhere.
 func sttErrorCode(messageType string) string {
 	switch messageType {
-	case "auth_error":
+	case "auth_error", "unaccepted_terms":
 		return "authentication_failed"
 	case "quota_exceeded":
 		return "provider_quota_exceeded"
-	case "rate_limited":
+	case "rate_limited", "commit_throttled":
 		return "provider_rate_limited"
-	case "input_error":
+	case "input_error", "chunk_size_exceeded":
 		return "invalid_request"
 	default:
 		return "provider_unavailable"
+	}
+}
+
+func sttErrorRetryable(messageType string) bool {
+	switch messageType {
+	case "rate_limited", "commit_throttled", "queue_overflow", "resource_exhausted", "session_time_limit_exceeded", "transcriber_error", "error", "scribe_error":
+		return true
+	default:
+		return false
+	}
+}
+
+func sttErrorHint(messageType string) string {
+	switch messageType {
+	case "auth_error":
+		return "Check that the ElevenLabs credential is active and authorized for realtime transcription."
+	case "unaccepted_terms":
+		return "Accept the ElevenLabs Scribe terms for the provider account, then retry."
+	case "quota_exceeded":
+		return "Add ElevenLabs quota or select another provider."
+	case "rate_limited", "commit_throttled":
+		return "Retry with backoff and reduce request or commit frequency."
+	case "queue_overflow", "resource_exhausted", "session_time_limit_exceeded", "transcriber_error", "error", "scribe_error":
+		return "Retry after a brief delay or use auto routing to select another provider."
+	case "chunk_size_exceeded":
+		return "Retry the request; the relay will split audio into smaller provider frames."
+	default:
+		return "Check the advertised media and request options, correct them, and retry."
 	}
 }
 
@@ -531,6 +632,16 @@ func sttTranscriptData(text string, final bool, words []sttWord) json.RawMessage
 	data := map[string]any{"text": text, "is_final": final, "speech_final": final}
 	// Scribe tags each token with a type and only `word` entries carry meaningful
 	// timings; `spacing` tokens would otherwise contribute zero-width ranges.
+	if timings := sttWordTimings(words); len(timings) > 0 {
+		data["words"] = timings
+		data["audio_start_ms"] = timings[0]["start_ms"]
+		data["audio_end_ms"] = timings[len(timings)-1]["end_ms"]
+	}
+	return sttMarshalData(data)
+}
+
+func sttAlignmentData(text string, words []sttWord) json.RawMessage {
+	data := map[string]any{"text": text}
 	if timings := sttWordTimings(words); len(timings) > 0 {
 		data["words"] = timings
 		data["audio_start_ms"] = timings[0]["start_ms"]

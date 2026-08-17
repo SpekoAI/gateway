@@ -1,6 +1,7 @@
 package relayapi_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/SpekoAI/gateway/relayapi"
@@ -10,8 +11,8 @@ func TestErrorCodeSetIsClosedAndValid(t *testing.T) {
 	t.Parallel()
 
 	codes := relayapi.ErrorCodes()
-	if len(codes) != 16 {
-		t.Fatalf("closed code set has %d codes, want 16", len(codes))
+	if len(codes) != 17 {
+		t.Fatalf("closed code set has %d codes, want 17", len(codes))
 	}
 	seen := make(map[relayapi.ErrorCode]bool, len(codes))
 	for _, code := range codes {
@@ -19,7 +20,7 @@ func TestErrorCodeSetIsClosedAndValid(t *testing.T) {
 			t.Fatalf("duplicate error code %q", code)
 		}
 		seen[code] = true
-		body := relayapi.ErrorBody{Code: code, Message: "detail"}
+		body := relayapi.ErrorBody{Code: code, Message: "detail", Hint: relayapi.DefaultErrorHint(code)}
 		if err := body.Validate(); err != nil {
 			t.Fatalf("code %q must validate: %v", code, err)
 		}
@@ -39,6 +40,18 @@ func TestErrorEnvelopeValidation(t *testing.T) {
 	mutated = envelope
 	mutated.Error.Message = " "
 	assertInvalid(t, mutated.Validate(), "message: required")
+
+	mutated = envelope
+	mutated.Error.Hint = " "
+	assertInvalid(t, mutated.Validate(), "hint: required")
+
+	mutated = envelope
+	mutated.Error.Hint = "line one\nline two"
+	assertInvalid(t, mutated.Validate(), "trimmed single line")
+
+	mutated = envelope
+	mutated.Error.Hint = strings.Repeat("a", relayapi.MaxErrorHintBytes+1)
+	assertInvalid(t, mutated.Validate(), "at most 512 bytes")
 }
 
 func TestErrorEventValidation(t *testing.T) {
@@ -46,7 +59,7 @@ func TestErrorEventValidation(t *testing.T) {
 
 	event := relayapi.ErrorEvent{
 		Type:  relayapi.ErrorEventType,
-		Error: relayapi.ErrorBody{Code: relayapi.ErrorCodeRelayError, Message: "detail", Retryable: true},
+		Error: relayapi.ErrorBody{Code: relayapi.ErrorCodeRelayError, Message: "detail", Hint: relayapi.DefaultErrorHint(relayapi.ErrorCodeRelayError), Retryable: true},
 	}
 	if err := event.Validate(); err != nil {
 		t.Fatalf("valid error event must validate: %v", err)

@@ -316,6 +316,10 @@ func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
 	harness := newSTTHarness(t, nil)
 	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
 	harness.nextFrame(t)
+	if err := stream.WriteAudio(context.Background(), []byte{0, 0, 0, 0}); err != nil {
+		t.Fatalf("write silent audio: %v", err)
+	}
+	harness.nextFrame(t)
 
 	if err := stream.CommitAudio(context.Background()); err != nil {
 		t.Fatalf("commit audio: %v", err)
@@ -376,6 +380,10 @@ func TestSTTCloseForcesAPendingTurnBeforeEndOfInput(t *testing.T) {
 	t.Parallel()
 	harness := newSTTHarness(t, nil)
 	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	harness.nextFrame(t)
+	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
 	harness.nextFrame(t)
 
 	harness.push(t, `{"result":{"transcription":{"transcript":"half a sen","isFinal":false,"silenceDurationMs":0}}}`)
@@ -705,10 +713,10 @@ func TestSTTDeclaresTheCallersRealMediaShape(t *testing.T) {
 	t.Parallel()
 	harness := newSTTHarness(t, nil)
 	sttOpenStream(t, harness, protocol.CredentialsManaged, func(r *runtimepkg.AdapterRequest) {
-		r.Media = &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 8_000, Channels: 2}
+		r.Media = &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 8_000, Channels: 1}
 		r.Options.Language = ""
 	})
-	want := `{"transcribeConfig":{"modelId":"inworld/inworld-stt-1","audioEncoding":"LINEAR16","sampleRateHertz":8000,"numberOfChannels":2}}`
+	want := `{"transcribeConfig":{"modelId":"inworld/inworld-stt-1","audioEncoding":"LINEAR16","sampleRateHertz":8000,"numberOfChannels":1}}`
 	if got := harness.nextFrame(t); got != want {
 		t.Fatalf("config frame =\n  %s\nwant\n  %s", got, want)
 	}

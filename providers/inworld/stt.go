@@ -369,7 +369,10 @@ func sttModelID(model string) (string, error) {
 // that work. protocol.MediaFormat.Validate already bounds the range.
 func validateSTTMedia(media protocol.MediaFormat) error {
 	if media.Encoding != "pcm_s16le" {
-		return fmt.Errorf("inworld stt requires pcm_s16le, got %q", media.Encoding)
+		return &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("Inworld STT requires pcm_s16le, got %q", media.Encoding), Hint: "Convert the input to mono LINEAR16 (pcm_s16le) and use the matching sample rate."}
+	}
+	if media.Channels != 1 {
+		return &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("Inworld transcription cannot accept %d-channel audio", media.Channels), Hint: "Downmix the input to mono LINEAR16 (pcm_s16le) and try again."}
 	}
 	return nil
 }
@@ -415,6 +418,7 @@ type sttStream struct {
 	abortOnce    sync.Once
 	closed       atomic.Bool
 	closing      atomic.Bool
+	inputPending atomic.Bool
 	closeErr     error
 
 	// turnPending is true once speech has been seen whose final has not landed.
@@ -457,7 +461,11 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	if err != nil {
 		return err
 	}
-	return s.write(ctx, payload)
+	if err := s.write(ctx, payload); err != nil {
+		return err
+	}
+	s.inputPending.Store(true)
+	return nil
 }
 
 // CommitAudio forces the pending turn to finalize with {"endTurn":{}}.
@@ -468,9 +476,13 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 // documented manual turn boundary and is what the platform's TypeScript client
 // sends at end-of-input.
 func (s *sttStream) CommitAudio(ctx context.Context) error {
+	if !s.inputPending.CompareAndSwap(true, false) {
+		return nil
+	}
 	s.commitPending.Store(true)
 	if err := s.write(ctx, sttEndTurnFrame); err != nil {
 		s.commitPending.Store(false)
+		s.inputPending.Store(true)
 		return err
 	}
 	return nil
@@ -505,8 +517,8 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
 		s.closing.Store(true)
-		if s.turnPending.Load() {
-			if err := s.write(ctx, sttEndTurnFrame); err != nil {
+		if s.inputPending.Load() {
+			if err := s.CommitAudio(ctx); err != nil {
 				s.closeErr = err
 			}
 		}
@@ -838,7 +850,13 @@ func sttStreamError(status *rpcStatus, raw json.RawMessage) *runtimepkg.Provider
 	if strings.TrimSpace(status.Message) != "" {
 		message += ": " + status.Message
 	}
-	return &runtimepkg.ProviderError{Code: code, Message: message, Retryable: retryable, Extensions: sttExtension(raw)}
+	hint := "Retry after a brief delay or use auto routing to select another provider."
+	if code == "invalid_request" {
+		hint = "Check the model, language, and mono LINEAR16 media settings, then retry."
+	} else if code == "authentication_failed" {
+		hint = "Check that the Inworld credential is active and authorized for realtime transcription."
+	}
+	return &runtimepkg.ProviderError{Code: code, Message: message, Hint: hint, Retryable: retryable, Extensions: sttExtension(raw)}
 }
 
 func sttDialErrorCode(status int) string {
