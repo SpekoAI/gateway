@@ -89,6 +89,9 @@ var sttOptionSupport = map[string]sttSupport{
 	// custom vocabulary and the audio enhancer ride the live init call. Live
 	// sessions have no diarization option at all (batch does).
 	"gladia": {keywords: true, noiseReduction: true},
+	// Speechmatics realtime maps vocabulary to additional_vocab and speaker
+	// labels to transcription_config.diarization=speaker.
+	"speechmatics": {diarization: true, keywords: true},
 	// Keywords fold into the transcription prompt alongside a caller's own
 	// prompt text. gpt-4o-transcribe-diarize is batch-only, so no realtime
 	// diarization. The vendor documents `prompt` on the realtime session for

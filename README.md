@@ -239,6 +239,7 @@ Every catalog provider has a BYOK credential variable:
 | Smallest | `SPEKO_SMALLEST_BYOK_API_KEY` | API key |
 | Soniox | `SPEKO_SONIOX_BYOK_API_KEY` | API key |
 | Speechify | `SPEKO_SPEECHIFY_BYOK_API_KEY` | API key; Build access-token minting is deprecated |
+| Speechmatics | `SPEKO_SPEECHMATICS_BYOK_API_KEY` | API key; managed direct sessions use a 60-second realtime JWT |
 | xAI | `SPEKO_XAI_BYOK_API_KEY` | API key |
 
 ## Zero-overhead session setup
@@ -309,6 +310,10 @@ restarting the Gateway.
 | TTS | Soniox | `soniox.tts.v1` | `tts-rt-v2` |
 | STT | Smallest | `smallest.stt.v1` | `pulse` |
 | TTS | Smallest | `smallest.tts.v1` | `lightning_v3.1` |
+| STT | Palabra | `palabra.stt.v1` | `default` |
+| TTS | Palabra | `palabra.tts.v1` | `auto` |
+| TTS | Speechify | `speechify.tts.v1` | `simba-3.0` |
+| STT | Speechmatics | `speechmatics.stt.v1` | `standard` |
 
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.

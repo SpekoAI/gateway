@@ -40,6 +40,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/smallest"
 	"github.com/SpekoAI/gateway/providers/soniox"
 	"github.com/SpekoAI/gateway/providers/speechify"
+	"github.com/SpekoAI/gateway/providers/speechmatics"
 	"github.com/SpekoAI/gateway/providers/xai"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -251,6 +252,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	speechmaticsSTTAdapter, err := speechmatics.New(speechmatics.Config{})
+	if err != nil {
+		return err
+	}
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
 		fishAdapter,
@@ -260,7 +265,7 @@ func run() error {
 		openaiSTTAdapter, openaiTTSAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
 		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
-		palabraSTTAdapter, palabraTTSAdapter, speechifyTTSAdapter,
+		palabraSTTAdapter, palabraTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {

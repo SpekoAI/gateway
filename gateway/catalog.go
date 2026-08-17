@@ -120,6 +120,7 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "palabra", Kind: protocol.SessionKindSTT, Adapter: "palabra.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://stream.palabra.ai/asr/v1/speech-to-text/stream"},
 	{Provider: "palabra", Kind: protocol.SessionKindTTS, Adapter: "palabra.tts.v1", DefaultModel: "auto", DefaultVoice: "default_low", Transport: protocol.TransportWebSocket, Endpoint: "wss://stream.palabra.ai/tts-api/v1/text-to-speech/stream"},
 	{Provider: "speechify", Kind: protocol.SessionKindTTS, Adapter: "speechify.tts.v1", DefaultModel: "simba-3.0", Models: []string{"simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"}, DefaultVoice: "geffen_32", Transport: protocol.TransportHTTP, Endpoint: "https://api.speechify.ai/v1/audio/stream"},
+	{Provider: "speechmatics", Kind: protocol.SessionKindSTT, Adapter: "speechmatics.stt.v1", DefaultModel: "standard", Models: []string{"standard", "enhanced"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://global.rt.speechmatics.com/v2/"},
 }
 
 // Catalog returns every (provider, modality) this build implements, ordered so the
