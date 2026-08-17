@@ -532,8 +532,8 @@ func (s *sttStream) Close(ctx context.Context) error {
 		// socket close that Inworld does not consistently send.
 		if s.closeErr == nil && s.finalSeen.Load() {
 			s.cancel()
-		} else if s.closeErr == nil && !s.turnPending.Load() {
-			go s.finishSilentClose()
+		} else if s.closeErr == nil {
+			go s.finishGracefulClose()
 		}
 		if s.closeErr != nil {
 			_ = s.abort()
@@ -542,17 +542,16 @@ func (s *sttStream) Close(ctx context.Context) error {
 	return s.closeErr
 }
 
-// finishSilentClose bounds a successfully opened stream that accepts the
-// audio/finalize/close writes but emits no frame for audio containing no
-// recognizable speech. Provider errors still end the read loop during the
-// grace; absent one, closing Events represents the legitimate empty
-// transcription instead of stranding the batch request.
-func (s *sttStream) finishSilentClose() {
+// finishGracefulClose bounds a successfully opened stream after its
+// finalize/close writes. A final transcript ends the read loop immediately;
+// absent one, closing Events lets the runtime distinguish genuine silence
+// from a provider that observed speech but failed to finalize it.
+func (s *sttStream) finishGracefulClose() {
 	timer := time.NewTimer(2 * time.Second)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		if s.closing.Load() && !s.turnPending.Load() && !s.finalSeen.Load() {
+		if s.closing.Load() && !s.finalSeen.Load() {
 			s.cancel()
 		}
 	case <-s.ctx.Done():

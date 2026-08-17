@@ -364,7 +364,7 @@ func TestSTTSilentSessionEventuallyCloses(t *testing.T) {
 	defer cancel()
 	stream := &sttStream{ctx: ctx, cancel: cancel}
 	stream.closing.Store(true)
-	go stream.finishSilentClose()
+	go stream.finishGracefulClose()
 
 	select {
 	case <-ctx.Done():
@@ -398,6 +398,14 @@ func TestSTTCloseForcesAPendingTurnBeforeEndOfInput(t *testing.T) {
 	}
 	if got := harness.nextFrame(t); got != sttWireCloseFrame {
 		t.Fatalf("second teardown frame = %s, want %s", got, sttWireCloseFrame)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after the active-turn close grace elapsed")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("active Inworld turn remained open when the provider never returned a final")
 	}
 }
 
