@@ -141,6 +141,53 @@ func TestEmptyAudioResponseIsAnErrorEvent(t *testing.T) {
 	}
 }
 
+func TestCloseCancelsReaderBlockedOnUndrainedEvents(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Speechify-Request-Id", "speechify-request-blocked")
+		w.Header().Set("Content-Type", "audio/L16;rate=24000;channels=1")
+		_, _ = w.Write([]byte{0, 1, 2, 3})
+	}))
+	defer server.Close()
+	parsed, _ := url.Parse(server.URL)
+	adapter, err := New(Config{
+		EventBuffer:           1,
+		AllowedEndpointHosts:  []string{parsed.Hostname()},
+		AllowInsecureEndpoint: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), adapterRequest(server.URL+streamPath, DefaultModel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.AppendText(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(stream.Events()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(stream.Events()) == 0 {
+		t.Fatal("reader did not fill the event channel")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- stream.Close(context.Background()) }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("close blocked on the undrained event channel")
+	}
+}
+
 func adapterRequest(endpoint, model string) runtimepkg.AdapterRequest {
 	return runtimepkg.AdapterRequest{
 		Kind:    protocol.SessionKindTTS,

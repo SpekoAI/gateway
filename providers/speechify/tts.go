@@ -422,6 +422,11 @@ func (s *stream) shutdown(ctx context.Context, graceful bool) error {
 		s.pending.Reset()
 		done := s.requestDone
 		s.stateMu.Unlock()
+		// Cancel before waiting for the active request. The response reader may
+		// be blocked publishing to a full event channel after its consumer has
+		// stopped; canceling the stream context releases that send and the HTTP
+		// read, allowing requestDone and readers to complete.
+		s.cancel()
 		if graceful && done != nil {
 			select {
 			case <-done:
@@ -429,7 +434,6 @@ func (s *stream) shutdown(ctx context.Context, graceful bool) error {
 				s.closeErr = ctx.Err()
 			}
 		}
-		s.cancel()
 		s.readers.Wait()
 		close(s.events)
 	})
