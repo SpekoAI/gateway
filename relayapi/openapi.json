@@ -839,7 +839,7 @@
       },
       "SpeechRequest": {
         "type": "object",
-        "description": "The POST /v1/tts/speech body. The response is a raw audio stream; the route and billed character count come back in headers because a byte stream has no place for a JSON envelope. The request carries no language field yet; the relay currently synthesizes English.",
+        "description": "The POST /v1/tts/speech body. The response is a raw audio stream; the route and billed character count come back in headers because a byte stream has no place for a JSON envelope.",
         "properties": {
           "routing": {
             "$ref": "#/components/schemas/Routing",
@@ -852,6 +852,10 @@
           "voice": {
             "type": "string",
             "description": "Optional: in auto mode the party that picks the provider picks a default voice for it."
+          },
+          "language": {
+            "type": "string",
+            "description": "Optional language hint. Auto routing ranks candidates on that language's benchmark board and the relay picks a voice curated for it; omitted means English."
           },
           "audio": {
             "$ref": "#/components/schemas/AudioConfig"

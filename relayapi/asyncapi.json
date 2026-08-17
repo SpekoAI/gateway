@@ -814,7 +814,7 @@
       },
       "TTSSessionConfigure": {
         "type": "object",
-        "description": "Opens a streaming synthesis session. audio is the requested output format of the binary frames the server will send. The exact frame bytes are the session's idempotency content hash; later frames are intentionally outside the hash. The frame carries no language field yet; the relay currently synthesizes English.",
+        "description": "Opens a streaming synthesis session. audio is the requested output format of the binary frames the server will send. The exact frame bytes are the session's idempotency content hash; later frames are intentionally outside the hash.",
         "properties": {
           "type": {
             "type": "string",
@@ -829,6 +829,10 @@
           "voice": {
             "type": "string",
             "description": "Optional: in auto mode the party that picks the provider picks a default voice for it."
+          },
+          "language": {
+            "type": "string",
+            "description": "Optional language hint. Auto routing ranks candidates on that language's benchmark board and the relay picks a voice curated for it; omitted means English."
           },
           "audio": {
             "$ref": "#/components/schemas/AudioConfig"

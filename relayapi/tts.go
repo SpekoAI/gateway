@@ -32,13 +32,16 @@ func (a AudioConfig) Validate() error {
 // SpeechRequest is the POST /v1/tts/speech body. The response is a raw audio
 // stream; the route and billed character count come back in headers
 // (Speko-Provider, Speko-Model, Speko-Region, Speko-Usage-Characters)
-// because a byte stream has no place for a JSON envelope. The request
-// carries no language field yet; the relay currently synthesizes English.
+// because a byte stream has no place for a JSON envelope. Language is an
+// optional hint, like the STT shapes: auto routing ranks candidates on that
+// language's board and the relay picks a voice curated for it; omitted means
+// English, which was the only behavior before the field existed.
 type SpeechRequest struct {
-	Routing Routing     `json:"routing"`
-	Input   string      `json:"input"`
-	Voice   string      `json:"voice,omitempty"`
-	Audio   AudioConfig `json:"audio"`
+	Routing  Routing     `json:"routing"`
+	Input    string      `json:"input"`
+	Voice    string      `json:"voice,omitempty"`
+	Language string      `json:"language,omitempty"`
+	Audio    AudioConfig `json:"audio"`
 }
 
 // Validate checks routing, input, and the requested output format. Voice is
@@ -88,13 +91,16 @@ const (
 	TTSEventError            TTSEventType = "error"
 )
 
-// TTSSessionConfigure opens a streaming synthesis session. The frame
-// carries no language field yet; the relay currently synthesizes English.
+// TTSSessionConfigure opens a streaming synthesis session. Language is an
+// optional hint, like the STT shapes: auto routing ranks candidates on that
+// language's board and the relay picks a voice curated for it; omitted means
+// English, which was the only behavior before the field existed.
 type TTSSessionConfigure struct {
-	Type    TTSControlType `json:"type"`
-	Routing Routing        `json:"routing"`
-	Voice   string         `json:"voice,omitempty"`
-	Audio   AudioConfig    `json:"audio"`
+	Type     TTSControlType `json:"type"`
+	Routing  Routing        `json:"routing"`
+	Voice    string         `json:"voice,omitempty"`
+	Language string         `json:"language,omitempty"`
+	Audio    AudioConfig    `json:"audio"`
 }
 
 // Validate checks the frame tag, routing, and requested output format. The
