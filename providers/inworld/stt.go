@@ -576,6 +576,11 @@ func (s *sttStream) Close(ctx context.Context) error {
 // exposed by the relay runtime, so a slow but progressing final is never
 // discarded. Unknown frames and duplicate/non-advancing signals do not reset
 // it; see the typed note*CloseProgress helpers below.
+//
+// This intentionally has no absolute deadline: the relay contract permits an
+// arbitrarily long operation while accepted progress continues. Conversely,
+// 30 seconds without that progress is intentionally terminal request_timeout;
+// a provider result arriving after cancellation cannot belong to the attempt.
 func (s *sttStream) finishGracefulClose() {
 	timeout := s.closeInactivityTimeout
 	if timeout <= 0 {

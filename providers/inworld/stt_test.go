@@ -455,7 +455,7 @@ func TestSTTCloseForcesAPendingTurnBeforeEndOfInput(t *testing.T) {
 	}
 }
 
-func TestSTTCloseKeepsAProgressingDelayedFinal(t *testing.T) {
+func TestSTTCloseAllowsChangingProgressAcrossInactivityDeadlines(t *testing.T) {
 	t.Parallel()
 	harness := newSTTHarness(t, nil)
 	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
