@@ -127,6 +127,8 @@ var (
 	sttWAVDataTag       = []byte("data")
 )
 
+const sttCloseInactivityTimeout = 30 * time.Second
+
 // STTConfig controls local transport limits. Credentials and provider selection
 // always come from the signed session plan, never from this configuration.
 type STTConfig struct {
@@ -273,10 +275,12 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &sttStream{
-		conn:   conn,
-		ctx:    streamCtx,
-		cancel: cancel,
-		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		conn:                   conn,
+		ctx:                    streamCtx,
+		cancel:                 cancel,
+		events:                 make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		closeProgress:          make(chan struct{}, 1),
+		closeInactivityTimeout: sttCloseInactivityTimeout,
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -413,13 +417,16 @@ type sttStream struct {
 	cancel context.CancelFunc
 	events chan runtimepkg.ProviderEvent
 
-	writeMu      sync.Mutex
-	gracefulOnce sync.Once
-	abortOnce    sync.Once
-	closed       atomic.Bool
-	closing      atomic.Bool
-	inputPending atomic.Bool
-	closeErr     error
+	writeMu                sync.Mutex
+	gracefulOnce           sync.Once
+	abortOnce              sync.Once
+	closed                 atomic.Bool
+	closing                atomic.Bool
+	inputPending           atomic.Bool
+	closeErr               error
+	closeProgress          chan struct{}
+	closeProgressAt        atomic.Int64
+	closeInactivityTimeout time.Duration
 
 	// turnPending is true once speech has been seen whose final has not landed.
 	// Only then does Close force a turn: an endTurn with nothing in flight just
@@ -533,6 +540,7 @@ func (s *sttStream) Close(ctx context.Context) error {
 		if s.closeErr == nil && s.finalSeen.Load() {
 			s.cancel()
 		} else if s.closeErr == nil {
+			s.closeProgressAt.Store(time.Now().UnixNano())
 			go s.finishGracefulClose()
 		}
 		if s.closeErr != nil {
@@ -544,17 +552,54 @@ func (s *sttStream) Close(ctx context.Context) error {
 
 // finishGracefulClose bounds a successfully opened stream after its
 // finalize/close writes. A final transcript ends the read loop immediately;
-// absent one, closing Events lets the runtime distinguish genuine silence
-// from a provider that observed speech but failed to finalize it.
+// other provider frames reset the same 30-second inactivity deadline exposed
+// by the relay runtime, so a slow but progressing final is never discarded.
 func (s *sttStream) finishGracefulClose() {
-	timer := time.NewTimer(2 * time.Second)
+	timeout := s.closeInactivityTimeout
+	if timeout <= 0 {
+		timeout = sttCloseInactivityTimeout
+	}
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case <-timer.C:
-		if s.closing.Load() && !s.finalSeen.Load() {
-			s.cancel()
+	for {
+		select {
+		case <-timer.C:
+			if last := s.closeProgressAt.Load(); last > 0 {
+				remaining := timeout - time.Since(time.Unix(0, last))
+				if remaining > 0 {
+					timer.Reset(remaining)
+					continue
+				}
+			}
+			if s.closing.Load() && !s.finalSeen.Load() {
+				s.cancel()
+			}
+			return
+		case <-s.closeProgress:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(timeout)
+		case <-s.ctx.Done():
+			return
 		}
-	case <-s.ctx.Done():
+	}
+}
+
+func (s *sttStream) noteCloseProgress() {
+	if !s.closing.Load() {
+		return
+	}
+	s.closeProgressAt.Store(time.Now().UnixNano())
+	if s.closeProgress == nil {
+		return
+	}
+	select {
+	case s.closeProgress <- struct{}{}:
+	default:
 	}
 }
 
@@ -606,6 +651,7 @@ func (s *sttStream) readLoop() {
 		if messageType != websocket.MessageText {
 			continue
 		}
+		s.noteCloseProgress()
 		if err := s.handleMessage(payload); err != nil {
 			s.emit(runtimepkg.ProviderEvent{Err: err})
 			return

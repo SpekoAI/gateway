@@ -362,13 +362,13 @@ func TestSTTSilentSessionEventuallyCloses(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stream := &sttStream{ctx: ctx, cancel: cancel}
+	stream := &sttStream{ctx: ctx, cancel: cancel, closeInactivityTimeout: 20 * time.Millisecond}
 	stream.closing.Store(true)
 	go stream.finishGracefulClose()
 
 	select {
 	case <-ctx.Done():
-	case <-time.After(3 * time.Second):
+	case <-time.After(time.Second):
 		t.Fatal("silent Inworld session did not close after its grace period")
 	}
 }
@@ -380,6 +380,7 @@ func TestSTTCloseForcesAPendingTurnBeforeEndOfInput(t *testing.T) {
 	t.Parallel()
 	harness := newSTTHarness(t, nil)
 	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	stream.(*sttStream).closeInactivityTimeout = 50 * time.Millisecond
 	harness.nextFrame(t)
 	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
 		t.Fatalf("write audio: %v", err)
@@ -404,8 +405,53 @@ func TestSTTCloseForcesAPendingTurnBeforeEndOfInput(t *testing.T) {
 		if ok {
 			t.Fatal("events remained open after the active-turn close grace elapsed")
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(time.Second):
 		t.Fatal("active Inworld turn remained open when the provider never returned a final")
+	}
+}
+
+func TestSTTCloseKeepsAProgressingDelayedFinal(t *testing.T) {
+	t.Parallel()
+	harness := newSTTHarness(t, nil)
+	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	stream.(*sttStream).closeInactivityTimeout = 100 * time.Millisecond
+	harness.nextFrame(t)
+	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("first teardown frame = %s, want %s", got, sttWireEndTurn)
+	}
+	if got := harness.nextFrame(t); got != sttWireCloseFrame {
+		t.Fatalf("second teardown frame = %s, want %s", got, sttWireCloseFrame)
+	}
+
+	// Each partial arrives within the inactivity window, but the final lands
+	// after the original deadline. Progress must keep the stream alive.
+	time.Sleep(60 * time.Millisecond)
+	harness.push(t, `{"result":{"transcription":{"transcript":"still working","isFinal":false,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptDelta {
+		t.Fatalf("progress event = %q, want transcript.delta", event.Type)
+	}
+	time.Sleep(60 * time.Millisecond)
+	harness.push(t, `{"result":{"transcription":{"transcript":"still working now","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("delayed event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after final = %q, want speech.ended", event.Type)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after the delayed final")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after the delayed final")
 	}
 }
 
