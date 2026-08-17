@@ -119,6 +119,7 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "inworld", Kind: protocol.SessionKindTTS, Adapter: "inworld.tts.v1", DefaultModel: "inworld-tts-2", Transport: protocol.TransportHTTP, Endpoint: "https://api.inworld.ai/tts/v1/voice:stream"},
 	{Provider: "palabra", Kind: protocol.SessionKindSTT, Adapter: "palabra.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://stream.palabra.ai/asr/v1/speech-to-text/stream"},
 	{Provider: "palabra", Kind: protocol.SessionKindTTS, Adapter: "palabra.tts.v1", DefaultModel: "auto", DefaultVoice: "default_low", Transport: protocol.TransportWebSocket, Endpoint: "wss://stream.palabra.ai/tts-api/v1/text-to-speech/stream"},
+	{Provider: "maya", Kind: protocol.SessionKindTTS, Adapter: "maya.tts.v1", DefaultModel: "Maya 2 Native", Models: []string{"Maya 2 Native", "Maya 2 Native Emotional"}, DefaultVoice: "Ananya", Transport: protocol.TransportWebSocket, Endpoint: "wss://tts.mayaresearch.ai/v1/tts/stream"},
 	{Provider: "speechify", Kind: protocol.SessionKindTTS, Adapter: "speechify.tts.v1", DefaultModel: "simba-3.0", Models: []string{"simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"}, DefaultVoice: "geffen_32", Transport: protocol.TransportHTTP, Endpoint: "https://api.speechify.ai/v1/audio/stream"},
 	{Provider: "speechmatics", Kind: protocol.SessionKindSTT, Adapter: "speechmatics.stt.v1", DefaultModel: "standard", Models: []string{"standard", "enhanced"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://global.rt.speechmatics.com/v2/"},
 }

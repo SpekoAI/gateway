@@ -232,6 +232,7 @@ Every catalog provider has a BYOK credential variable:
 | Hamsa | `SPEKO_HAMSA_BYOK_API_KEY` | API key |
 | Hume | `SPEKO_HUME_BYOK_API_KEY` | API key |
 | Inworld | `SPEKO_INWORLD_BYOK_API_KEY` | Base64 portal credential (`key:secret`) |
+| Maya Research | `SPEKO_MAYA_BYOK_API_KEY` | Permanent API key; BYOK/Relay only because Maya has no short-lived session token |
 | MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
 | OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
 | Palabra | `SPEKO_PALABRA_BYOK_API_KEY` | API key; dedicated STT/TTS sockets do not expose a scoped short-lived grant |
@@ -312,6 +313,7 @@ restarting the Gateway.
 | TTS | Smallest | `smallest.tts.v1` | `lightning_v3.1` |
 | STT | Palabra | `palabra.stt.v1` | `default` |
 | TTS | Palabra | `palabra.tts.v1` | `auto` |
+| TTS | Maya Research | `maya.tts.v1` | `Maya 2 Native` |
 | TTS | Speechify | `speechify.tts.v1` | `simba-3.0` |
 | STT | Speechmatics | `speechmatics.stt.v1` | `standard` |
 

@@ -32,6 +32,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/hamsa"
 	"github.com/SpekoAI/gateway/providers/hume"
 	"github.com/SpekoAI/gateway/providers/inworld"
+	"github.com/SpekoAI/gateway/providers/maya"
 	"github.com/SpekoAI/gateway/providers/minimax"
 	"github.com/SpekoAI/gateway/providers/modulate"
 	"github.com/SpekoAI/gateway/providers/openai"
@@ -248,6 +249,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	mayaTTSAdapter, err := maya.New(maya.Config{})
+	if err != nil {
+		return err
+	}
 	speechifyTTSAdapter, err := speechify.New(speechify.Config{})
 	if err != nil {
 		return err
@@ -265,7 +270,7 @@ func run() error {
 		openaiSTTAdapter, openaiTTSAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
 		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
-		palabraSTTAdapter, palabraTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
+		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {
