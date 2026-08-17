@@ -362,6 +362,46 @@ func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
 	}
 }
 
+func TestSTTEmitsEmptyFinalWhenCommitAckPrecedesStartMarker(t *testing.T) {
+	t.Parallel()
+	harness := newSTTHarness(t, nil)
+	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	harness.nextFrame(t)
+	if err := stream.WriteAudio(context.Background(), []byte{0, 0, 0, 0}); err != nil {
+		t.Fatalf("write silent audio: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("commit frame = %s, want %s", got, sttWireEndTurn)
+	}
+	if got := harness.nextFrame(t); got != sttWireCloseFrame {
+		t.Fatalf("close frame = %s, want %s", got, sttWireCloseFrame)
+	}
+
+	// The payloads contain no discriminator, so deliberately deliver the
+	// commit acknowledgement before the delayed start marker. The pair must
+	// still produce exactly one committed-silence final.
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after final = %q, want speech.ended", event.Type)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("reversed empty pair produced more than one final")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after the reversed empty pair")
+	}
+}
+
 func TestSTTSilentSessionEventuallyCloses(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

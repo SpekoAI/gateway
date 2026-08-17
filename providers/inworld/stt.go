@@ -840,6 +840,12 @@ func (s *sttStream) handleMessage(payload []byte) error {
 // voice agent, answers. The platform's TypeScript client drops the same frame.
 func (s *sttStream) handleTranscription(transcription sttTranscription, raw json.RawMessage) error {
 	text := strings.TrimSpace(transcription.Transcript)
+	// A silent committed turn produces two wire-identical empty finals: its
+	// start marker and its commit acknowledgement. Their labels are not
+	// observable on the wire, so consume the first against the expected marker
+	// and the second against the outstanding commit regardless of arrival order.
+	// If the counterpart never arrives, the documented inactivity watchdog
+	// returns request_timeout instead of guessing that one frame meant both.
 	if text == "" && transcription.IsFinal && s.consumeEmptyStartMarker() {
 		s.noteCloseProgress()
 		return nil
