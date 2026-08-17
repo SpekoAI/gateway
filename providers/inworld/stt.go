@@ -528,7 +528,6 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 // teardown that waits on a provider is a teardown that hangs.
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
-		s.closing.Store(true)
 		if s.inputPending.Load() {
 			if err := s.CommitAudio(ctx); err != nil {
 				s.closeErr = err
@@ -539,6 +538,11 @@ func (s *sttStream) Close(ctx context.Context) error {
 				s.closeErr = err
 			}
 		}
+		// Publish closing only after both outbound control frames are settled.
+		// Otherwise an earlier turn's final can observe closing and cancel the
+		// socket in the narrow window before this turn increments its commit count
+		// or before closeStream reaches the provider.
+		s.closing.Store(true)
 		// commitsPending is decremented only after each committed turn's final
 		// events have been delivered. A final from an earlier turn therefore
 		// cannot make Close cancel the reader before the latest final arrives.
