@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:a47c9a10fee3beaed28ce1ea2c5f98c709ec8d169afc99727f3d9636b61a6f48
-# yaml-body: sha256:8e980a8715e9534dcb0525c31bc1d6ba02567af1501f590dbf1e6de190a626c0
+# json-mirror: openapi.json sha256:b67380fa3cc307fdc9f8ea0dbb65e9f83941611314a429b87ea774cabc909580
+# yaml-body: sha256:4bc76720ec8411b34d2d4b2efd96ce9cb1159c9470523edf60f46fe166c0ba4c
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -811,8 +811,7 @@ components:
       description: >-
         The POST /v1/tts/speech body. The response is a raw audio stream; the
         route and billed character count come back in headers because a byte
-        stream has no place for a JSON envelope. The request carries no
-        language field yet; the relay currently synthesizes English.
+        stream has no place for a JSON envelope.
       properties:
         routing:
           $ref: "#/components/schemas/Routing"
@@ -826,6 +825,12 @@ components:
           description: >-
             Optional: in auto mode the party that picks the provider picks a
             default voice for it.
+        language:
+          type: string
+          description: >-
+            Optional language hint. Auto routing ranks candidates on that
+            language's benchmark board and the relay picks a voice curated
+            for it; omitted means English.
         audio:
           $ref: "#/components/schemas/AudioConfig"
       required:
