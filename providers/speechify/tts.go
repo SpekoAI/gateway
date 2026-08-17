@@ -135,7 +135,7 @@ func (a *Adapter) Open(_ context.Context, request runtimepkg.AdapterRequest) (ru
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
 	return &stream{
-		ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), closing: make(chan struct{}), responseProgress: make(chan struct{}, 1),
+		ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), responseProgress: make(chan struct{}, 1),
 		httpClient: client, endpoint: endpoint, credential: credential.Value,
 		maxResponseBytes: a.maxResponseBytes, gracefulCloseIdleTimeout: a.gracefulCloseIdleTimeout, model: model, voice: voice,
 		language: strings.TrimSpace(request.Options.Language),
@@ -195,7 +195,6 @@ type stream struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	events           chan runtimepkg.ProviderEvent
-	closing          chan struct{}
 	responseProgress chan struct{}
 
 	httpClient               *http.Client
@@ -285,7 +284,7 @@ func (s *stream) CommitText(ctx context.Context) error {
 		return err
 	}
 	s.readers.Add(1)
-	go s.readResponse(response, requestCancel, done)
+	go s.readResponse(requestCtx, response, requestCancel, done)
 	return nil
 }
 
@@ -332,7 +331,7 @@ func (s *stream) wasCanceled() bool {
 	return s.canceled
 }
 
-func (s *stream) readResponse(response *http.Response, requestCancel context.CancelFunc, done chan struct{}) {
+func (s *stream) readResponse(requestCtx context.Context, response *http.Response, requestCancel context.CancelFunc, done chan struct{}) {
 	defer func() {
 		requestCancel()
 		_ = response.Body.Close()
@@ -345,7 +344,7 @@ func (s *stream) readResponse(response *http.Response, requestCancel context.Can
 		requestID = strings.TrimSpace(response.Header.Get("X-Request-ID"))
 	}
 	if requestID != "" {
-		if !s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(map[string]any{"provider_request_id": requestID})}) {
+		if !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(map[string]any{"provider_request_id": requestID})}) {
 			return
 		}
 	}
@@ -359,17 +358,17 @@ func (s *stream) readResponse(response *http.Response, requestCancel context.Can
 			s.reportResponseProgress()
 			total += int64(count)
 			if total > s.maxResponseBytes {
-				s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Speechify TTS response exceeded the configured limit", Retryable: true}})
+				s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Speechify TTS response exceeded the configured limit", Retryable: true}})
 				return
 			}
 			if !started {
 				started = true
-				if !s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: marshalData(map[string]any{"provider_request_id": requestID})}) {
+				if !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: marshalData(map[string]any{"provider_request_id": requestID})}) {
 					return
 				}
 			}
 			audio := append([]byte(nil), buffer[:count]...)
-			if !s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: marshalData(map[string]any{"provider_request_id": requestID}), Audio: audio}) {
+			if !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: marshalData(map[string]any{"provider_request_id": requestID}), Audio: audio}) {
 				return
 			}
 		}
@@ -379,14 +378,14 @@ func (s *stream) readResponse(response *http.Response, requestCancel context.Can
 					return
 				}
 				if !started {
-					s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Speechify TTS completed without returning audio", Retryable: true}})
+					s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Speechify TTS completed without returning audio", Retryable: true}})
 					return
 				}
-				s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: marshalData(map[string]any{"provider_request_id": requestID})})
+				s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: marshalData(map[string]any{"provider_request_id": requestID})})
 				return
 			}
 			if !s.wasCanceled() && s.ctx.Err() == nil {
-				s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Speechify TTS response stream failed", Retryable: true, Cause: err}})
+				s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Speechify TTS response stream failed", Retryable: true, Cause: err}})
 			}
 			return
 		}
@@ -400,11 +399,11 @@ func (s *stream) reportResponseProgress() {
 	}
 }
 
-func (s *stream) emit(event runtimepkg.ProviderEvent) bool {
-	// Preserve graceful delivery after Close while the runtime is still
-	// consuming events. If its event buffer is already full, however, closing
-	// releases the blocked reader so shutdown cannot deadlock on an abandoned
-	// consumer.
+func (s *stream) emit(requestCtx context.Context, event runtimepkg.ProviderEvent) bool {
+	// Close deliberately does not interrupt a blocked send: a runtime that is
+	// still draining events must receive every audio frame and AudioDone. The
+	// graceful-close idle timer cancels s.ctx if the consumer is abandoned;
+	// Cancel interrupts just this request through requestCtx.
 	select {
 	case s.events <- event:
 		return true
@@ -413,9 +412,9 @@ func (s *stream) emit(event runtimepkg.ProviderEvent) bool {
 	select {
 	case s.events <- event:
 		return true
-	case <-s.ctx.Done():
+	case <-requestCtx.Done():
 		return false
-	case <-s.closing:
+	case <-s.ctx.Done():
 		return false
 	}
 }
@@ -456,7 +455,6 @@ func (s *stream) shutdown(ctx context.Context, graceful bool) error {
 		s.pending.Reset()
 		done := s.requestDone
 		s.stateMu.Unlock()
-		close(s.closing)
 		if !graceful {
 			s.cancel()
 		}

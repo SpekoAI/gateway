@@ -141,7 +141,7 @@ func TestEmptyAudioResponseIsAnErrorEvent(t *testing.T) {
 	}
 }
 
-func TestCloseCancelsReaderBlockedOnUndrainedEvents(t *testing.T) {
+func TestCloseBoundsReaderBlockedOnUndrainedEvents(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Speechify-Request-Id", "speechify-request-blocked")
 		w.Header().Set("Content-Type", "audio/L16;rate=24000;channels=1")
@@ -150,9 +150,10 @@ func TestCloseCancelsReaderBlockedOnUndrainedEvents(t *testing.T) {
 	defer server.Close()
 	parsed, _ := url.Parse(server.URL)
 	adapter, err := New(Config{
-		EventBuffer:           1,
-		AllowedEndpointHosts:  []string{parsed.Hostname()},
-		AllowInsecureEndpoint: true,
+		EventBuffer:              1,
+		GracefulCloseIdleTimeout: 25 * time.Millisecond,
+		AllowedEndpointHosts:     []string{parsed.Hostname()},
+		AllowInsecureEndpoint:    true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -180,8 +181,9 @@ func TestCloseCancelsReaderBlockedOnUndrainedEvents(t *testing.T) {
 	go func() { closed <- stream.Close(context.Background()) }()
 	select {
 	case err := <-closed:
-		if err != nil {
-			t.Fatalf("close: %v", err)
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) || providerErr.Code != "provider_unavailable" || !providerErr.Retryable {
+			t.Fatalf("close error = %v, want retryable provider_unavailable", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("close blocked on the undrained event channel")
@@ -200,7 +202,7 @@ func TestClosePreservesActiveResponseForDrainingConsumer(t *testing.T) {
 	}))
 	defer server.Close()
 	parsed, _ := url.Parse(server.URL)
-	adapter, err := New(Config{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+	adapter, err := New(Config{EventBuffer: 1, AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
 	if err != nil {
 		t.Fatal(err)
 	}
