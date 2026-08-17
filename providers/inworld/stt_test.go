@@ -455,6 +455,65 @@ func TestSTTCloseKeepsAProgressingDelayedFinal(t *testing.T) {
 	}
 }
 
+func TestSTTCloseWaitsForTheLatestTurnAfterAnEarlierFinal(t *testing.T) {
+	t.Parallel()
+	harness := newSTTHarness(t, nil)
+	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	stream.(*sttStream).closeInactivityTimeout = 100 * time.Millisecond
+	harness.nextFrame(t)
+
+	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
+		t.Fatalf("write first turn: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit first turn: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("first commit frame = %s, want %s", got, sttWireEndTurn)
+	}
+	harness.push(t, `{"result":{"transcription":{"transcript":"first turn","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("first turn event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after first final = %q, want speech.ended", event.Type)
+	}
+
+	if err := stream.WriteAudio(context.Background(), []byte{2, 0, 0, 0}); err != nil {
+		t.Fatalf("write second turn: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("second turn teardown frame = %s, want %s", got, sttWireEndTurn)
+	}
+	if got := harness.nextFrame(t); got != sttWireCloseFrame {
+		t.Fatalf("close frame = %s, want %s", got, sttWireCloseFrame)
+	}
+
+	// The earlier final must not satisfy the wait for this turn. Deliver the
+	// second final late enough to expose the old latched-final cancellation.
+	time.Sleep(50 * time.Millisecond)
+	harness.push(t, `{"result":{"transcription":{"transcript":"second turn","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("second turn event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after second final = %q, want speech.ended", event.Type)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after the latest final")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after the latest final")
+	}
+}
+
 // TestSTTCloseWithoutASpokenTurnOnlySignalsEndOfInput is the other half: an
 // endTurn with nothing in flight just makes Inworld emit another empty marker.
 func TestSTTCloseWithoutASpokenTurnOnlySignalsEndOfInput(t *testing.T) {

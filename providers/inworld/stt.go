@@ -436,7 +436,6 @@ type sttStream struct {
 	// starts from the empty final that acknowledges our explicit endTurn. The
 	// latter must reach batch callers so silence completes instead of timing out.
 	commitPending atomic.Bool
-	finalSeen     atomic.Bool
 
 	// guard holds RIFF-stripping state. The runtime serializes WriteAudio,
 	// control methods and Close for one session, so it needs no lock of its own.
@@ -534,10 +533,10 @@ func (s *sttStream) Close(ctx context.Context) error {
 				s.closeErr = err
 			}
 		}
-		// The final may have raced ahead of Close. It is already queued on the
-		// event channel, so end the read loop instead of waiting for a provider
-		// socket close that Inworld does not consistently send.
-		if s.closeErr == nil && s.finalSeen.Load() {
+		// commitPending belongs to the current turn and is cleared only after its
+		// final events have been delivered. A final from an earlier turn must not
+		// make Close cancel the reader before the latest final arrives.
+		if s.closeErr == nil && !s.commitPending.Load() {
 			s.cancel()
 		} else if s.closeErr == nil {
 			s.closeProgressAt.Store(time.Now().UnixNano())
@@ -571,7 +570,7 @@ func (s *sttStream) finishGracefulClose() {
 					continue
 				}
 			}
-			if s.closing.Load() && !s.finalSeen.Load() {
+			if s.closing.Load() {
 				s.cancel()
 			}
 			return
@@ -730,13 +729,9 @@ func (s *sttStream) handleMessage(payload []byte) error {
 // voice agent, answers. The platform's TypeScript client drops the same frame.
 func (s *sttStream) handleTranscription(transcription sttTranscription, raw json.RawMessage) error {
 	text := strings.TrimSpace(transcription.Transcript)
-	committedEmptyFinal := text == "" && transcription.IsFinal && s.commitPending.Swap(false)
+	committedEmptyFinal := text == "" && transcription.IsFinal && s.commitPending.Load()
 	if text == "" && !committedEmptyFinal {
 		return nil
-	}
-	if transcription.IsFinal {
-		s.commitPending.Store(false)
-		s.finalSeen.Store(true)
 	}
 	kind := protocol.EventTranscriptDelta
 	if transcription.IsFinal {
@@ -772,6 +767,10 @@ func (s *sttStream) handleTranscription(transcription sttTranscription, raw json
 		Data:       marshalData(map[string]any{"reason": "end_of_turn"}),
 		Extensions: sttExtension(raw),
 	})
+	// Keep commitPending true until both final events are visible to the
+	// consumer. Close uses it as the per-turn wait condition, so clearing it
+	// earlier creates a race where cancellation can discard a queued final.
+	s.commitPending.Store(false)
 	if err == nil && s.closing.Load() {
 		s.cancel()
 	}
