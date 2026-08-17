@@ -77,6 +77,12 @@ func TestSTTAdapterWholeUtteranceRoundTrip(t *testing.T) {
 			return
 		}
 
+		// A bracketed status marker precedes the transcript while the service
+		// works; it must never surface as the result.
+		if err := conn.Write(ctx, websocket.MessageText, []byte("[THINKING]")); err != nil {
+			t.Errorf("write status marker: %v", err)
+			return
+		}
 		// The transcript is a PLAIN string frame, not JSON.
 		if err := conn.Write(ctx, websocket.MessageText, []byte("مرحبا بكم")); err != nil {
 			t.Errorf("write transcript: %v", err)

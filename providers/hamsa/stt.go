@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -385,8 +386,18 @@ func (s *sttStream) transcribeUtterance(ctx context.Context, utterance []byte) (
 				continue
 			}
 		}
-		// A frame that is not a JSON control frame IS the transcript.
-		return strings.TrimSpace(string(payload)), json.RawMessage(append([]byte(nil), payload...)), nil
+		text := strings.TrimSpace(string(payload))
+		// Bracketed status markers ("[THINKING]") arrive as plain string
+		// frames while the service works on the utterance — observed live
+		// 2026-08-17, when a degraded backend sent the marker and nothing
+		// else. A marker is never the transcript: skip it and keep waiting,
+		// so a stuck session hits the timeout instead of returning the
+		// marker as a billed result.
+		if statusMarker(text) {
+			continue
+		}
+		// Any other frame that is not a JSON control frame IS the transcript.
+		return text, json.RawMessage(append([]byte(nil), payload...)), nil
 	}
 }
 
@@ -505,6 +516,12 @@ func transcriptData(text, language string) json.RawMessage {
 
 func transcriptMetadata() json.RawMessage {
 	return marshalData(map[string]any{})
+}
+
+var statusMarkerPattern = regexp.MustCompile(`^\[[A-Z_ ]+\]$`)
+
+func statusMarker(text string) bool {
+	return statusMarkerPattern.MatchString(text)
 }
 
 func sttErrorMessage(message string) string {
