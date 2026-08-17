@@ -57,8 +57,15 @@ func TestModelsPublishesEveryCatalogEntry(t *testing.T) {
 	if catalog.Protocol != string(protocol.VoiceV0) || catalog.ProtocolRevision != protocol.CurrentRevision {
 		t.Fatalf("catalog protocol = %s r%d, want %s r%d", catalog.Protocol, catalog.ProtocolRevision, protocol.VoiceV0, protocol.CurrentRevision)
 	}
-	if len(catalog.Models) != len(gateway.Catalog()) {
-		t.Fatalf("published %d models, want the %d catalog entries", len(catalog.Models), len(gateway.Catalog()))
+	wantModels := 0
+	for _, entry := range gateway.Catalog() {
+		wantModels++
+		if len(entry.Models) > 0 {
+			wantModels += len(entry.Models) - 1
+		}
+	}
+	if len(catalog.Models) != wantModels {
+		t.Fatalf("published %d models, want %d expanded catalog models", len(catalog.Models), wantModels)
 	}
 	// ElevenLabs STT is the row this endpoint exists to make discoverable: it is the
 	// board's strongest transcriber across the most languages and had no adapter at
@@ -77,6 +84,20 @@ func TestModelsPublishesEveryCatalogEntry(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("catalog does not publish elevenlabs stt")
+	}
+	wantSimba := map[string]bool{
+		"speechify:simba-3.2": false, "speechify:simba-3.0": false,
+		"speechify:simba-multilingual": false, "speechify:simba-english": false,
+	}
+	for _, model := range catalog.Models {
+		if _, ok := wantSimba[model.ID]; ok {
+			wantSimba[model.ID] = true
+		}
+	}
+	for id, present := range wantSimba {
+		if !present {
+			t.Errorf("catalog does not publish %s", id)
+		}
 	}
 	// Stable order, so a page rendering this does not reshuffle between restarts.
 	for index := 1; index < len(catalog.Models); index++ {
@@ -141,6 +162,27 @@ func TestEveryPublishedEntryIsRoutable(t *testing.T) {
 			t.Fatalf("catalog entry %+v claims a modality the gateway has no adapter shape for", entry)
 		}
 	}
+}
+
+func TestCatalogReturnsModelListsAsCopies(t *testing.T) {
+	t.Parallel()
+	entries := gateway.Catalog()
+	for index := range entries {
+		if entries[index].Provider != "speechify" || entries[index].Kind != protocol.SessionKindTTS {
+			continue
+		}
+		if len(entries[index].Models) != 4 {
+			t.Fatalf("Speechify models = %v", entries[index].Models)
+		}
+		entries[index].Models[0] = "mutated"
+		for _, fresh := range gateway.Catalog() {
+			if fresh.Provider == "speechify" && fresh.Kind == protocol.SessionKindTTS && fresh.Models[0] == "mutated" {
+				t.Fatal("caller mutation changed the embedded catalog")
+			}
+		}
+		return
+	}
+	t.Fatal("Speechify catalog entry is missing")
 }
 
 // Several TTS vendors refuse to open without a voice — Rime, Gradium and Google

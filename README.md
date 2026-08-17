@@ -234,9 +234,11 @@ Every catalog provider has a BYOK credential variable:
 | Inworld | `SPEKO_INWORLD_BYOK_API_KEY` | Base64 portal credential (`key:secret`) |
 | MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
 | OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
+| Palabra | `SPEKO_PALABRA_BYOK_API_KEY` | API key; dedicated STT/TTS sockets do not expose a scoped short-lived grant |
 | Rime | `SPEKO_RIME_BYOK_API_KEY` | API key |
 | Smallest | `SPEKO_SMALLEST_BYOK_API_KEY` | API key |
 | Soniox | `SPEKO_SONIOX_BYOK_API_KEY` | API key |
+| Speechify | `SPEKO_SPEECHIFY_BYOK_API_KEY` | API key; Build access-token minting is deprecated |
 | xAI | `SPEKO_XAI_BYOK_API_KEY` | API key |
 
 ## Zero-overhead session setup

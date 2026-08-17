@@ -35,9 +35,11 @@ var localCredentialSpecs = []localCredentialSpec{
 	{Provider: "minimax", Env: "SPEKO_MINIMAX_BYOK_API_KEY"},
 	{Provider: "modulate", Env: "SPEKO_MODULATE_BYOK_API_KEY"},
 	{Provider: "openai", Env: "SPEKO_OPENAI_BYOK_API_KEY"},
+	{Provider: "palabra", Env: "SPEKO_PALABRA_BYOK_API_KEY"},
 	{Provider: "rime", Env: "SPEKO_RIME_BYOK_API_KEY"},
 	{Provider: "smallest", Env: "SPEKO_SMALLEST_BYOK_API_KEY"},
 	{Provider: "soniox", Env: "SPEKO_SONIOX_BYOK_API_KEY"},
+	{Provider: "speechify", Env: "SPEKO_SPEECHIFY_BYOK_API_KEY"},
 	{Provider: "xai", Env: "SPEKO_XAI_BYOK_API_KEY"},
 }
 

@@ -22,6 +22,12 @@ type CatalogEntry struct {
 	Kind         protocol.SessionKind `json:"kind"`
 	Adapter      string               `json:"adapter"`
 	DefaultModel string               `json:"default_model"`
+	// Models lists every concrete model this adapter accepts when a provider
+	// exposes several models on the same wire surface. Empty means the default
+	// is the only published model. Local planning still uses DefaultModel when
+	// the caller sends auto; /v1/models expands this list so explicit choices do
+	// not disappear behind a single provider row.
+	Models []string `json:"models,omitempty"`
 	// DefaultVoice is used only in standalone BYOK mode. Several TTS vendors
 	// REFUSE to open without a voice — Rime, Gradium and Google among them — and
 	// the local planner has no benchmark board to choose from, so without this a
@@ -111,12 +117,19 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "smallest", Kind: protocol.SessionKindSTT, Adapter: "smallest.stt.v1", DefaultModel: "pulse", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.smallest.ai/waves/v1/stt/live"},
 	{Provider: "smallest", Kind: protocol.SessionKindTTS, Adapter: "smallest.tts.v1", DefaultModel: "lightning_v3.1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.smallest.ai/waves/v1/tts/live"},
 	{Provider: "inworld", Kind: protocol.SessionKindTTS, Adapter: "inworld.tts.v1", DefaultModel: "inworld-tts-2", Transport: protocol.TransportHTTP, Endpoint: "https://api.inworld.ai/tts/v1/voice:stream"},
+	{Provider: "palabra", Kind: protocol.SessionKindSTT, Adapter: "palabra.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://stream.palabra.ai/asr/v1/speech-to-text/stream"},
+	{Provider: "palabra", Kind: protocol.SessionKindTTS, Adapter: "palabra.tts.v1", DefaultModel: "auto", DefaultVoice: "default_low", Transport: protocol.TransportWebSocket, Endpoint: "wss://stream.palabra.ai/tts-api/v1/text-to-speech/stream"},
+	{Provider: "speechify", Kind: protocol.SessionKindTTS, Adapter: "speechify.tts.v1", DefaultModel: "simba-3.0", Models: []string{"simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"}, DefaultVoice: "geffen_32", Transport: protocol.TransportHTTP, Endpoint: "https://api.speechify.ai/v1/audio/stream"},
 }
 
 // Catalog returns every (provider, modality) this build implements, ordered so the
 // published list is stable across restarts.
 func Catalog() []CatalogEntry {
 	entries := append([]CatalogEntry(nil), providerCatalog...)
+	for index := range entries {
+		entries[index].Models = append([]string(nil), entries[index].Models...)
+		entries[index].ModelRoutes = append([]CatalogModelRoute(nil), entries[index].ModelRoutes...)
+	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].Provider != entries[j].Provider {
 			return entries[i].Provider < entries[j].Provider
@@ -193,15 +206,21 @@ func (s *Server) models(writer http.ResponseWriter, request *http.Request) {
 			continue
 		}
 		_, present := installed[entry.Adapter]
-		rows = append(rows, catalogModel{
-			ID:             entry.Provider + ":" + entry.DefaultModel,
-			Provider:       entry.Provider,
-			Kind:           entry.Kind,
-			Adapter:        entry.Adapter,
-			Transport:      entry.Transport,
-			Installed:      present,
-			RequiresConfig: entry.RequiresDeploymentConfig,
-		})
+		models := entry.Models
+		if len(models) == 0 {
+			models = []string{entry.DefaultModel}
+		}
+		for _, model := range models {
+			rows = append(rows, catalogModel{
+				ID:             entry.Provider + ":" + model,
+				Provider:       entry.Provider,
+				Kind:           entry.Kind,
+				Adapter:        entry.Adapter,
+				Transport:      entry.Transport,
+				Installed:      present,
+				RequiresConfig: entry.RequiresDeploymentConfig,
+			})
+		}
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"protocol":          protocol.VoiceV0,
