@@ -316,6 +316,9 @@ func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
 	harness := newSTTHarness(t, nil)
 	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
 	harness.nextFrame(t)
+	// Consume Inworld's empty start-of-turn marker before the distinct empty
+	// final that acknowledges committed silence.
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
 	if err := stream.WriteAudio(context.Background(), []byte{0, 0, 0, 0}); err != nil {
 		t.Fatalf("write silent audio: %v", err)
 	}
@@ -554,6 +557,7 @@ func TestSTTCloseWaitsForEveryOverlappingCommittedTurn(t *testing.T) {
 	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
 	stream.(*sttStream).closeInactivityTimeout = 200 * time.Millisecond
 	harness.nextFrame(t)
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
 
 	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
 		t.Fatalf("write first turn: %v", err)
@@ -582,9 +586,19 @@ func TestSTTCloseWaitsForEveryOverlappingCommittedTurn(t *testing.T) {
 		t.Fatalf("close frame = %s, want %s", got, sttWireCloseFrame)
 	}
 
+	// Turn two's empty start marker has the same shape as a committed-silence
+	// final. It must not consume either outstanding commit.
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
 	harness.push(t, `{"result":{"transcription":{"transcript":"first delayed turn","isFinal":true,"silenceDurationMs":0}}}`)
 	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
 		t.Fatalf("first delayed event = %q, want transcript.final", event.Type)
+	} else {
+		var data struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(event.Data, &data); err != nil || data.Text != "first delayed turn" {
+			t.Fatalf("first delayed transcript = %+v, err=%v", data, err)
+		}
 	}
 	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
 		t.Fatalf("event after first delayed final = %q, want speech.ended", event.Type)

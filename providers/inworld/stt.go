@@ -286,6 +286,9 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		closeInactivityTimeout: sttCloseInactivityTimeout,
 		closeMaximumDuration:   sttCloseMaximumDuration,
 	}
+	// Inworld opens the first transcription turn with an empty isFinal marker.
+	// It is protocol state, not the final result of a committed silent turn.
+	stream.emptyStartMarkers.Store(1)
 	go stream.readLoop()
 	return stream, nil
 }
@@ -427,6 +430,7 @@ type sttStream struct {
 	closed                 atomic.Bool
 	closing                atomic.Bool
 	inputPending           atomic.Bool
+	hasStartedInputTurn    atomic.Bool
 	closeErr               error
 	closeProgress          chan struct{}
 	closeProgressAt        atomic.Int64
@@ -442,6 +446,10 @@ type sttStream struct {
 	// count also keeps overlapping turns distinct when the caller commits the
 	// next turn before the provider returns the previous turn's final.
 	commitsPending atomic.Int64
+	// emptyStartMarkers counts locally started turns whose empty protocol marker
+	// has not arrived yet. Those markers take precedence over empty commit
+	// acknowledgements because both have the same Inworld payload shape.
+	emptyStartMarkers atomic.Int64
 
 	// guard holds RIFF-stripping state. The runtime serializes WriteAudio,
 	// control methods and Close for one session, so it needs no lock of its own.
@@ -476,7 +484,9 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	if err := s.write(ctx, payload); err != nil {
 		return err
 	}
-	s.inputPending.Store(true)
+	if s.inputPending.CompareAndSwap(false, true) && s.hasStartedInputTurn.Swap(true) {
+		s.emptyStartMarkers.Add(1)
+	}
 	return nil
 }
 
@@ -752,6 +762,9 @@ func (s *sttStream) handleMessage(payload []byte) error {
 // voice agent, answers. The platform's TypeScript client drops the same frame.
 func (s *sttStream) handleTranscription(transcription sttTranscription, raw json.RawMessage) error {
 	text := strings.TrimSpace(transcription.Transcript)
+	if text == "" && transcription.IsFinal && s.consumeEmptyStartMarker() {
+		return nil
+	}
 	committedEmptyFinal := text == "" && transcription.IsFinal && s.commitsPending.Load() > 0
 	if text == "" && !committedEmptyFinal {
 		return nil
@@ -808,6 +821,18 @@ func (s *sttStream) completePendingCommit() int64 {
 		}
 		if s.commitsPending.CompareAndSwap(pending, pending-1) {
 			return pending - 1
+		}
+	}
+}
+
+func (s *sttStream) consumeEmptyStartMarker() bool {
+	for {
+		pending := s.emptyStartMarkers.Load()
+		if pending == 0 {
+			return false
+		}
+		if s.emptyStartMarkers.CompareAndSwap(pending, pending-1) {
+			return true
 		}
 	}
 }
