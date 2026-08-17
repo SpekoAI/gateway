@@ -32,12 +32,16 @@ import (
 	"github.com/SpekoAI/gateway/providers/hamsa"
 	"github.com/SpekoAI/gateway/providers/hume"
 	"github.com/SpekoAI/gateway/providers/inworld"
+	"github.com/SpekoAI/gateway/providers/maya"
 	"github.com/SpekoAI/gateway/providers/minimax"
 	"github.com/SpekoAI/gateway/providers/modulate"
 	"github.com/SpekoAI/gateway/providers/openai"
+	"github.com/SpekoAI/gateway/providers/palabra"
 	"github.com/SpekoAI/gateway/providers/rime"
 	"github.com/SpekoAI/gateway/providers/smallest"
 	"github.com/SpekoAI/gateway/providers/soniox"
+	"github.com/SpekoAI/gateway/providers/speechify"
+	"github.com/SpekoAI/gateway/providers/speechmatics"
 	"github.com/SpekoAI/gateway/providers/xai"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -237,6 +241,26 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	palabraSTTAdapter, err := palabra.NewSTT(palabra.STTConfig{})
+	if err != nil {
+		return err
+	}
+	palabraTTSAdapter, err := palabra.NewTTS(palabra.TTSConfig{})
+	if err != nil {
+		return err
+	}
+	mayaTTSAdapter, err := maya.New(maya.Config{})
+	if err != nil {
+		return err
+	}
+	speechifyTTSAdapter, err := speechify.New(speechify.Config{})
+	if err != nil {
+		return err
+	}
+	speechmaticsSTTAdapter, err := speechmatics.New(speechmatics.Config{})
+	if err != nil {
+		return err
+	}
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
 		fishAdapter,
@@ -246,6 +270,7 @@ func run() error {
 		openaiSTTAdapter, openaiTTSAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
 		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
+		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {

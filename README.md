@@ -232,11 +232,15 @@ Every catalog provider has a BYOK credential variable:
 | Hamsa | `SPEKO_HAMSA_BYOK_API_KEY` | API key |
 | Hume | `SPEKO_HUME_BYOK_API_KEY` | API key |
 | Inworld | `SPEKO_INWORLD_BYOK_API_KEY` | Base64 portal credential (`key:secret`) |
+| Maya Research | `SPEKO_MAYA_BYOK_API_KEY` | Permanent API key; BYOK/Relay only because Maya has no short-lived session token |
 | MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
 | OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
+| Palabra | `SPEKO_PALABRA_BYOK_API_KEY` | API key; dedicated STT/TTS sockets do not expose a scoped short-lived grant |
 | Rime | `SPEKO_RIME_BYOK_API_KEY` | API key |
 | Smallest | `SPEKO_SMALLEST_BYOK_API_KEY` | API key |
 | Soniox | `SPEKO_SONIOX_BYOK_API_KEY` | API key |
+| Speechify | `SPEKO_SPEECHIFY_BYOK_API_KEY` | API key; Build access-token minting is deprecated |
+| Speechmatics | `SPEKO_SPEECHMATICS_BYOK_API_KEY` | API key; managed direct sessions use a 60-second realtime JWT |
 | xAI | `SPEKO_XAI_BYOK_API_KEY` | API key |
 
 ## Zero-overhead session setup
@@ -307,6 +311,11 @@ restarting the Gateway.
 | TTS | Soniox | `soniox.tts.v1` | `tts-rt-v2` |
 | STT | Smallest | `smallest.stt.v1` | `pulse` |
 | TTS | Smallest | `smallest.tts.v1` | `lightning_v3.1` |
+| STT | Palabra | `palabra.stt.v1` | `default` |
+| TTS | Palabra | `palabra.tts.v1` | `auto` |
+| TTS | Maya Research | `maya.tts.v1` | `Maya 2 Native` |
+| TTS | Speechify | `speechify.tts.v1` | `simba-3.0` |
+| STT | Speechmatics | `speechmatics.stt.v1` | `standard` |
 
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.
