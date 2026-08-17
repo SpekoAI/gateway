@@ -425,6 +425,7 @@ type sttStream struct {
 	abortOnce              sync.Once
 	closed                 atomic.Bool
 	closing                atomic.Bool
+	closeTimedOut          atomic.Bool
 	inputPending           atomic.Bool
 	hasStartedInputTurn    atomic.Bool
 	closeErr               error
@@ -593,7 +594,7 @@ func (s *sttStream) finishGracefulClose() {
 				}
 			}
 			if s.closing.Load() {
-				s.cancel()
+				s.timeoutGracefulClose()
 			}
 			return
 		case <-s.closeProgress:
@@ -607,6 +608,22 @@ func (s *sttStream) finishGracefulClose() {
 		case <-s.ctx.Done():
 			return
 		}
+	}
+}
+
+func (s *sttStream) timeoutGracefulClose() {
+	if s.commitsPending.Load() > 0 {
+		s.closeTimedOut.Store(true)
+	}
+	s.cancel()
+}
+
+func sttCloseTimeoutError() error {
+	return &runtimepkg.ProviderError{
+		Code:      "request_timeout",
+		Message:   "Inworld STT made no progress while finalizing the committed turn",
+		Hint:      "Retry the request; if it recurs, route to another STT provider.",
+		Retryable: true,
 	}
 }
 
@@ -700,6 +717,15 @@ func (s *sttStream) readLoop() {
 	defer func() {
 		s.closed.Store(true)
 		s.cancel()
+		if s.closeTimedOut.Load() {
+			// The configured event buffer reserves practical room for the terminal
+			// error. Emitting from the reader's defer keeps this send ordered before
+			// and race-free with the channel close below.
+			select {
+			case s.events <- runtimepkg.ProviderEvent{Err: sttCloseTimeoutError()}:
+			default:
+			}
+		}
 		close(s.events)
 	}()
 	for {

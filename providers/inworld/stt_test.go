@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -433,12 +434,24 @@ func TestSTTCloseForcesAPendingTurnBeforeEndOfInput(t *testing.T) {
 		t.Fatalf("second teardown frame = %s, want %s", got, sttWireCloseFrame)
 	}
 	select {
-	case _, ok := <-stream.Events():
-		if ok {
-			t.Fatal("events remained open after the active-turn close grace elapsed")
+	case event, ok := <-stream.Events():
+		if !ok {
+			t.Fatal("events closed without the inactivity timeout error")
+		}
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(event.Err, &providerErr) || providerErr.Code != "request_timeout" || !providerErr.Retryable {
+			t.Fatalf("close timeout event = %#v", event.Err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("active Inworld turn remained open when the provider never returned a final")
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after the inactivity timeout error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after the inactivity timeout error")
 	}
 }
 
@@ -446,7 +459,7 @@ func TestSTTCloseKeepsAProgressingDelayedFinal(t *testing.T) {
 	t.Parallel()
 	harness := newSTTHarness(t, nil)
 	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
-	stream.(*sttStream).closeInactivityTimeout = 100 * time.Millisecond
+	stream.(*sttStream).closeInactivityTimeout = 60 * time.Millisecond
 	harness.nextFrame(t)
 	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
 		t.Fatalf("write audio: %v", err)
@@ -462,15 +475,18 @@ func TestSTTCloseKeepsAProgressingDelayedFinal(t *testing.T) {
 		t.Fatalf("second teardown frame = %s, want %s", got, sttWireCloseFrame)
 	}
 
-	// Each partial arrives within the inactivity window, but the final lands
-	// after the original deadline. Progress must keep the stream alive.
-	time.Sleep(60 * time.Millisecond)
-	harness.push(t, `{"result":{"transcription":{"transcript":"still working","isFinal":false,"silenceDurationMs":0}}}`)
-	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptDelta {
-		t.Fatalf("progress event = %q, want transcript.delta", event.Type)
+	// Each changing partial arrives within the inactivity window, but the final
+	// lands after several original deadlines. Meaningful transcript progress is
+	// intentionally allowed to keep a request alive until its final arrives.
+	for _, partial := range []string{"still", "still working", "still working now"} {
+		time.Sleep(40 * time.Millisecond)
+		harness.push(t, fmt.Sprintf(`{"result":{"transcription":{"transcript":%q,"isFinal":false,"silenceDurationMs":0}}}`, partial))
+		if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptDelta {
+			t.Fatalf("progress event = %q, want transcript.delta", event.Type)
+		}
 	}
-	time.Sleep(60 * time.Millisecond)
-	harness.push(t, `{"result":{"transcription":{"transcript":"still working now","isFinal":true,"silenceDurationMs":0}}}`)
+	time.Sleep(40 * time.Millisecond)
+	harness.push(t, `{"result":{"transcription":{"transcript":"still working now done","isFinal":true,"silenceDurationMs":0}}}`)
 	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
 		t.Fatalf("delayed event = %q, want transcript.final", event.Type)
 	}
