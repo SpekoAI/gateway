@@ -128,6 +128,9 @@ func TestModelsEndpointsAndPlanValidation(t *testing.T) {
 	if _, ok := supportedModels["melia-1"]; ok {
 		t.Fatal("batch-only melia-1 must not be advertised as realtime")
 	}
+	if _, ok := supportedEncodings["pcm_s16le"]; !ok || len(supportedEncodings) != 1 {
+		t.Fatalf("gateway media contract must expose only pcm_s16le, got %v", supportedEncodings)
+	}
 	for name, mutate := range map[string]func(*runtimepkg.AdapterRequest){
 		"wrong kind":       func(r *runtimepkg.AdapterRequest) { r.Kind = protocol.SessionKindTTS },
 		"wrong provider":   func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Provider = "deepgram" },

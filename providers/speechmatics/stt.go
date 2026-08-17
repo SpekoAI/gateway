@@ -33,9 +33,7 @@ var supportedModels = map[string]struct{}{
 }
 
 var supportedEncodings = map[string]struct{}{
-	"pcm_f32le": {},
 	"pcm_s16le": {},
-	"mulaw":     {},
 }
 
 type Config struct {
