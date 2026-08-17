@@ -406,11 +406,13 @@ func (s *stream) emit(requestCtx context.Context, event runtimepkg.ProviderEvent
 	// Cancel interrupts just this request through requestCtx.
 	select {
 	case s.events <- event:
+		s.reportResponseProgress()
 		return true
 	default:
 	}
 	select {
 	case s.events <- event:
+		s.reportResponseProgress()
 		return true
 	case <-requestCtx.Done():
 		return false

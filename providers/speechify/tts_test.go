@@ -202,7 +202,12 @@ func TestClosePreservesActiveResponseForDrainingConsumer(t *testing.T) {
 	}))
 	defer server.Close()
 	parsed, _ := url.Parse(server.URL)
-	adapter, err := New(Config{EventBuffer: 1, AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+	adapter, err := New(Config{
+		EventBuffer:              1,
+		GracefulCloseIdleTimeout: 200 * time.Millisecond,
+		AllowedEndpointHosts:     []string{parsed.Hostname()},
+		AllowInsecureEndpoint:    true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,13 +241,18 @@ func TestClosePreservesActiveResponseForDrainingConsumer(t *testing.T) {
 	close(releaseAudio)
 
 	wantTypes := []protocol.EventType{protocol.EventUsageObserved, protocol.EventAudioStarted, protocol.EventAudioFrame, protocol.EventAudioDone}
-	for _, want := range wantTypes {
+	for index, want := range wantTypes {
 		event := speechifyEventWithin(t, providerStream.Events())
 		if event.Type != want {
 			t.Fatalf("event = %q, want %q", event.Type, want)
 		}
 		if want == protocol.EventAudioFrame && string(event.Audio) != string([]byte{0, 1, 2, 3}) {
 			t.Fatalf("audio = %v", event.Audio)
+		}
+		// Keep the reader backpressured for longer than one idle window in
+		// aggregate while still making progress inside each window.
+		if index < 2 {
+			time.Sleep(150 * time.Millisecond)
 		}
 	}
 	select {
