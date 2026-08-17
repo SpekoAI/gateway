@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/SpekoAI/gateway/protocol"
@@ -28,6 +29,7 @@ const (
 	maxInputCharacters      = 20_000
 	outputSampleRateHz      = 24_000
 	defaultMaxResponseBytes = 128 << 20
+	defaultCloseIdleTimeout = 30 * time.Second
 	// Raw HTTP callers are expected to pin a date version. This is the version
 	// used by Speechify's current official SDK examples and includes Simba 3.2.
 	apiVersion = "2026-07-07"
@@ -38,20 +40,24 @@ var simbaModels = map[string]struct{}{
 }
 
 type Config struct {
-	AdapterID             string
-	HTTPClient            *http.Client
-	EventBuffer           int
-	MaxResponseBytes      int64
-	AllowedEndpointHosts  []string
-	AllowInsecureEndpoint bool
+	AdapterID        string
+	HTTPClient       *http.Client
+	EventBuffer      int
+	MaxResponseBytes int64
+	// GracefulCloseIdleTimeout bounds inactivity after Close begins. It resets
+	// whenever response bytes arrive, so progressing synthesis is not capped.
+	GracefulCloseIdleTimeout time.Duration
+	AllowedEndpointHosts     []string
+	AllowInsecureEndpoint    bool
 }
 
 type Adapter struct {
-	id               string
-	httpClient       *http.Client
-	eventBuffer      int
-	maxResponseBytes int64
-	endpointPolicy   endpointPolicy
+	id                       string
+	httpClient               *http.Client
+	eventBuffer              int
+	maxResponseBytes         int64
+	gracefulCloseIdleTimeout time.Duration
+	endpointPolicy           endpointPolicy
 }
 
 func New(config Config) (*Adapter, error) {
@@ -64,17 +70,23 @@ func New(config Config) (*Adapter, error) {
 	if config.MaxResponseBytes == 0 {
 		config.MaxResponseBytes = defaultMaxResponseBytes
 	}
+	if config.GracefulCloseIdleTimeout == 0 {
+		config.GracefulCloseIdleTimeout = defaultCloseIdleTimeout
+	}
 	if config.EventBuffer < 1 {
 		return nil, errors.New("speechify event buffer must be positive")
 	}
 	if config.MaxResponseBytes < 1 {
 		return nil, errors.New("speechify maximum response bytes must be positive")
 	}
+	if config.GracefulCloseIdleTimeout < 0 {
+		return nil, errors.New("speechify graceful close idle timeout must be positive")
+	}
 	policy, err := newEndpointPolicy(officialAPIHost, config.AllowedEndpointHosts, config.AllowInsecureEndpoint)
 	if err != nil {
 		return nil, err
 	}
-	return &Adapter{id: config.AdapterID, httpClient: config.HTTPClient, eventBuffer: config.EventBuffer, maxResponseBytes: config.MaxResponseBytes, endpointPolicy: policy}, nil
+	return &Adapter{id: config.AdapterID, httpClient: config.HTTPClient, eventBuffer: config.EventBuffer, maxResponseBytes: config.MaxResponseBytes, gracefulCloseIdleTimeout: config.GracefulCloseIdleTimeout, endpointPolicy: policy}, nil
 }
 
 func (a *Adapter) ID() string { return a.id }
@@ -123,9 +135,9 @@ func (a *Adapter) Open(_ context.Context, request runtimepkg.AdapterRequest) (ru
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
 	return &stream{
-		ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), closing: make(chan struct{}),
+		ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), closing: make(chan struct{}), responseProgress: make(chan struct{}, 1),
 		httpClient: client, endpoint: endpoint, credential: credential.Value,
-		maxResponseBytes: a.maxResponseBytes, model: model, voice: voice,
+		maxResponseBytes: a.maxResponseBytes, gracefulCloseIdleTimeout: a.gracefulCloseIdleTimeout, model: model, voice: voice,
 		language: strings.TrimSpace(request.Options.Language),
 	}, nil
 }
@@ -180,18 +192,20 @@ func synthesisEndpoint(policy endpointPolicy, raw string) (string, error) {
 }
 
 type stream struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	events  chan runtimepkg.ProviderEvent
-	closing chan struct{}
+	ctx              context.Context
+	cancel           context.CancelFunc
+	events           chan runtimepkg.ProviderEvent
+	closing          chan struct{}
+	responseProgress chan struct{}
 
-	httpClient       *http.Client
-	endpoint         string
-	credential       string
-	maxResponseBytes int64
-	model            string
-	voice            string
-	language         string
+	httpClient               *http.Client
+	endpoint                 string
+	credential               string
+	maxResponseBytes         int64
+	gracefulCloseIdleTimeout time.Duration
+	model                    string
+	voice                    string
+	language                 string
 
 	readers       sync.WaitGroup
 	closeOnce     sync.Once
@@ -342,6 +356,7 @@ func (s *stream) readResponse(response *http.Response, requestCancel context.Can
 	for {
 		count, err := reader.Read(buffer)
 		if count > 0 {
+			s.reportResponseProgress()
 			total += int64(count)
 			if total > s.maxResponseBytes {
 				s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Speechify TTS response exceeded the configured limit", Retryable: true}})
@@ -375,6 +390,13 @@ func (s *stream) readResponse(response *http.Response, requestCancel context.Can
 			}
 			return
 		}
+	}
+}
+
+func (s *stream) reportResponseProgress() {
+	select {
+	case s.responseProgress <- struct{}{}:
+	default:
 	}
 }
 
@@ -439,17 +461,44 @@ func (s *stream) shutdown(ctx context.Context, graceful bool) error {
 			s.cancel()
 		}
 		if graceful && done != nil {
-			select {
-			case <-done:
-			case <-ctx.Done():
-				s.closeErr = ctx.Err()
-			}
+			s.closeErr = s.waitForRequest(ctx, done)
 		}
 		s.cancel()
 		s.readers.Wait()
 		close(s.events)
 	})
 	return s.closeErr
+}
+
+func (s *stream) waitForRequest(ctx context.Context, done <-chan struct{}) error {
+	timer := time.NewTimer(s.gracefulCloseIdleTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.responseProgress:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(s.gracefulCloseIdleTimeout)
+		case <-timer.C:
+			select {
+			case <-done:
+				return nil
+			default:
+			}
+			return &runtimepkg.ProviderError{
+				Code: "provider_unavailable", Message: "Speechify TTS response stalled during graceful close",
+				Retryable: true, Cause: context.DeadlineExceeded,
+			}
+		}
+	}
 }
 
 func statusError(response *http.Response) error {

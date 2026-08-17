@@ -253,6 +253,54 @@ func TestClosePreservesActiveResponseForDrainingConsumer(t *testing.T) {
 	}
 }
 
+func TestCloseCancelsStalledActiveResponse(t *testing.T) {
+	requestCanceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/L16;rate=24000;channels=1")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(requestCanceled)
+	}))
+	defer server.Close()
+	parsed, _ := url.Parse(server.URL)
+	adapter, err := New(Config{
+		GracefulCloseIdleTimeout: 25 * time.Millisecond,
+		AllowedEndpointHosts:     []string{parsed.Hostname()},
+		AllowInsecureEndpoint:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), adapterRequest(server.URL+streamPath, DefaultModel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.AppendText(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- stream.Close(context.Background()) }()
+	select {
+	case err := <-closed:
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) || providerErr.Code != "provider_unavailable" || !providerErr.Retryable {
+			t.Fatalf("close error = %v, want retryable provider_unavailable", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("close blocked on the stalled response")
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stalled provider request was not canceled")
+	}
+}
+
 func adapterRequest(endpoint, model string) runtimepkg.AdapterRequest {
 	return runtimepkg.AdapterRequest{
 		Kind:    protocol.SessionKindTTS,
