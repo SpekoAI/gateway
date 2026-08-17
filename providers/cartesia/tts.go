@@ -25,8 +25,8 @@ const (
 	AdapterID   = "cartesia.tts.v1"
 	extensionID = "cartesia.ai/v1"
 
-	defaultVersion  = "2026-03-01"
-	officialAPIHost = "api.cartesia.ai"
+	defaultTTSVersion = "2026-03-01"
+	officialAPIHost   = "api.cartesia.ai"
 )
 
 // Config controls local transport limits and the explicitly selected Cartesia
@@ -58,7 +58,7 @@ func New(config Config) (*Adapter, error) {
 		config.AdapterID = AdapterID
 	}
 	if config.Version == "" {
-		config.Version = defaultVersion
+		config.Version = defaultTTSVersion
 	}
 	if config.EventBuffer == 0 {
 		config.EventBuffer = 32

@@ -111,7 +111,22 @@ func (d *specDoc) validate(schema map[string]any, value any, path string) error 
 		return d.validate(siblings, value, path)
 	}
 	if branches, ok := schema["oneOf"].([]any); ok {
-		return d.validateOneOf(schema, branches, value, path)
+		if err := d.validateOneOf(schema, branches, value, path); err != nil {
+			return err
+		}
+		// Keywords alongside oneOf apply in conjunction with the selected
+		// branch. Validate those siblings too; AudioFormat uses this shape so
+		// its common object properties are not duplicated in both rate arms.
+		siblings := make(map[string]any, len(schema)-1)
+		for keyword, constraint := range schema {
+			if keyword != "oneOf" && keyword != "discriminator" {
+				siblings[keyword] = constraint
+			}
+		}
+		if len(siblings) == 0 {
+			return nil
+		}
+		return d.validate(siblings, value, path)
 	}
 	if typeName, ok := schema["type"].(string); ok {
 		if err := checkInstanceType(typeName, value, path); err != nil {
@@ -277,6 +292,10 @@ func (d *specDoc) propertyNames(t *testing.T, schema map[string]any) map[string]
 		}
 		return names
 	}
+	properties, _ := schema["properties"].(map[string]any)
+	for name := range properties {
+		names[name] = true
+	}
 	if branches, ok := schema["oneOf"].([]any); ok {
 		for _, branch := range branches {
 			for name := range d.propertyNames(t, branch.(map[string]any)) {
@@ -284,10 +303,6 @@ func (d *specDoc) propertyNames(t *testing.T, schema map[string]any) map[string]
 			}
 		}
 		return names
-	}
-	properties, _ := schema["properties"].(map[string]any)
-	for name := range properties {
-		names[name] = true
 	}
 	return names
 }

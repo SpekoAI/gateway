@@ -107,7 +107,7 @@ func TestSTTAdapterUsesManualFinalizeAndMapsTranscripts(t *testing.T) {
 		query := received.URL.Query()
 		for key, want := range map[string]string{
 			"model": "ink-2", "encoding": "pcm_s16le", "sample_rate": "16000",
-			"language": "en", "cartesia_version": defaultVersion, "access_token": "temporary-cartesia-token",
+			"language": "en", "cartesia_version": defaultSTTVersion, "access_token": "temporary-cartesia-token",
 		} {
 			if got := query.Get(key); got != want {
 				t.Fatalf("query %s = %q, want %q", key, got, want)
@@ -115,6 +115,53 @@ func TestSTTAdapterUsesManualFinalizeAndMapsTranscripts(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not observe handshake")
+	}
+}
+
+func TestSTTCloseFinalizesPendingAudioOnce(t *testing.T) {
+	t.Parallel()
+	sequence := make(chan []string, 1)
+	server := newCartesiaSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		var got []string
+		messageType, payload, err := conn.Read(ctx)
+		if err != nil || messageType != websocket.MessageBinary || string(payload) != "\x01\x02" {
+			sequence <- []string{"bad-audio"}
+			return
+		}
+		for range 2 {
+			messageType, payload, err = conn.Read(ctx)
+			if err != nil || messageType != websocket.MessageText {
+				sequence <- append(got, "read-error")
+				return
+			}
+			got = append(got, string(payload))
+		}
+		sequence <- got
+		_ = writeCartesiaJSON(ctx, conn, map[string]any{"type": "done"})
+	})
+	defer server.Close()
+
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), cartesiaSTTRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.WriteAudio(context.Background(), []byte{1, 2}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case got := <-sequence:
+		if strings.Join(got, ",") != "finalize,close" {
+			t.Fatalf("close sequence = %v, want finalize then close", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for close sequence")
 	}
 }
 
@@ -263,6 +310,123 @@ func TestSTTAdapterMapsProviderError(t *testing.T) {
 	if !errors.As(providerFailure.Err, &providerErr) || providerErr.ProviderStatus != 429 || providerErr.Code != "provider_rate_limited" || !providerErr.Retryable || providerErr.Extensions[extensionID] == nil {
 		t.Fatalf("provider error = %#v", providerFailure.Err)
 	}
+}
+
+func TestSTTBufferedDeliverySplitsAndPacesHundredMillisecondFrames(t *testing.T) {
+	t.Parallel()
+	received := make(chan []time.Time, 1)
+	server := newCartesiaSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		var times []time.Time
+		for range 2 {
+			messageType, payload, err := conn.Read(ctx)
+			if err != nil || messageType != websocket.MessageBinary || len(payload) != 1_600 {
+				t.Errorf("paced frame = (%v, %d bytes, %v)", messageType, len(payload), err)
+				return
+			}
+			times = append(times, time.Now())
+		}
+		received <- times
+		if err := assertCartesiaText(ctx, conn, "finalize"); err != nil {
+			t.Errorf("finalize: %v", err)
+			return
+		}
+		if err := assertCartesiaText(ctx, conn, "close"); err != nil {
+			t.Errorf("close: %v", err)
+			return
+		}
+		_ = writeCartesiaJSON(ctx, conn, map[string]any{"type": "done"})
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	request := cartesiaSTTRequest(server.URL, protocol.CredentialsBYOK)
+	request.Media.SampleRateHz = 8_000
+	request.Delivery = runtimepkg.AudioDeliveryBuffered
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.WriteAudio(context.Background(), make([]byte, 3_200)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	times := <-received
+	if gap := times[1].Sub(times[0]); gap < 75*time.Millisecond {
+		t.Fatalf("buffered frames arrived %v apart, want real-time pacing", gap)
+	}
+}
+
+func TestSTTDeliveryPacingIsCancelableAndLiveDoesNotSleep(t *testing.T) {
+	t.Parallel()
+	arrivalGaps := make(chan time.Duration, 1)
+	server := newCartesiaSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		var first time.Time
+		for index := range 2 {
+			messageType, payload, err := conn.Read(ctx)
+			if err != nil || messageType != websocket.MessageBinary || len(payload) != 1_600 {
+				return
+			}
+			if index == 0 {
+				first = time.Now()
+			} else {
+				arrivalGaps <- time.Since(first)
+			}
+		}
+		_ = assertCartesiaText(ctx, conn, "finalize")
+		_ = assertCartesiaText(ctx, conn, "close")
+		_ = writeCartesiaJSON(ctx, conn, map[string]any{"type": "done"})
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	request := cartesiaSTTRequest(server.URL, protocol.CredentialsBYOK)
+	request.Media.SampleRateHz = 8_000
+	request.Delivery = runtimepkg.AudioDeliveryLive
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open live: %v", err)
+	}
+	if err := stream.WriteAudio(context.Background(), make([]byte, 3_200)); err != nil {
+		t.Fatalf("live write: %v", err)
+	}
+	if gap := <-arrivalGaps; gap > 50*time.Millisecond {
+		t.Fatalf("live oversized frame was artificially paced by %v", gap)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close live: %v", err)
+	}
+
+	blockedServer := newCartesiaSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		_, _, _ = conn.Read(ctx)
+		_, _, _ = conn.Read(ctx)
+	})
+	defer blockedServer.Close()
+	blockedAdapter, err := NewSTT(sttTestConfig(blockedServer.URL))
+	if err != nil {
+		t.Fatalf("new buffered adapter: %v", err)
+	}
+	buffered := cartesiaSTTRequest(blockedServer.URL, protocol.CredentialsBYOK)
+	buffered.Media.SampleRateHz = 8_000
+	buffered.Delivery = runtimepkg.AudioDeliveryBuffered
+	blocked, err := blockedAdapter.Open(context.Background(), buffered)
+	if err != nil {
+		t.Fatalf("open buffered: %v", err)
+	}
+	writeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := blocked.WriteAudio(writeCtx, make([]byte, 3_200)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("paced write error = %v, want deadline exceeded", err)
+	}
+	_ = blocked.Cancel(context.Background())
 }
 
 func newCartesiaSTTServer(t *testing.T, callback func(context.Context, *http.Request, *websocket.Conn)) *httptest.Server {

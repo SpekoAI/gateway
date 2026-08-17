@@ -519,7 +519,7 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. On an established WebSocket session the code arrives in a terminal error frame and no HTTP status applies; when the same code is returned over HTTP — including a rejected upgrade — it maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable.",
+        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. On an established WebSocket session the code arrives in a terminal error frame and no HTTP status applies; when the same code is returned over HTTP — including a rejected upgrade — it maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable; 504 request_timeout.",
         "enum": [
           "authentication_failed",
           "insufficient_credit",
@@ -536,7 +536,8 @@
           "budget_exhausted",
           "lease_expired",
           "payload_too_large",
-          "unsupported_media"
+          "unsupported_media",
+          "request_timeout"
         ]
       },
       "ErrorBody": {
@@ -549,6 +550,13 @@
           "message": {
             "type": "string"
           },
+          "hint": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^[^\\r\\n]+$",
+            "description": "Relay-authored, single-line remediation that never contains provider payloads or customer content."
+          },
           "retryable": {
             "type": "boolean"
           },
@@ -559,6 +567,7 @@
         "required": [
           "code",
           "message",
+          "hint",
           "retryable"
         ],
         "additionalProperties": false

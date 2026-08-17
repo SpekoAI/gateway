@@ -134,7 +134,7 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if strings.TrimSpace(adapterOptions.Voice) == "" {
 		adapterOptions.Voice = adapterPlan.Route.Voice
 	}
-	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media})
+	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery})
 	if err != nil {
 		cancel()
 		e.recordOpenFailure(request, err)
@@ -488,6 +488,12 @@ func (s *Session) runEvents() {
 			return
 		case event, ok := <-s.providerEvents:
 			if !ok {
+				if terminal, ok := s.stream.(TerminalErrorProviderStream); ok {
+					if err := terminal.TerminalError(); err != nil {
+						s.fail(fmt.Errorf("provider stream: %w", err))
+						return
+					}
+				}
 				s.finish(nil)
 				return
 			}

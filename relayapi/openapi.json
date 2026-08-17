@@ -405,7 +405,7 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. When an error envelope travels as an HTTP response, each code maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable. budget_exhausted and lease_expired terminate streams that are already established — an SSE error event after the 200 — so no HTTP status carries them.",
+        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. When an error envelope travels as an HTTP response, each code maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable; 504 request_timeout. budget_exhausted and lease_expired terminate streams that are already established — an SSE error event after the 200 — so no HTTP status carries them.",
         "enum": [
           "authentication_failed",
           "insufficient_credit",
@@ -422,7 +422,8 @@
           "budget_exhausted",
           "lease_expired",
           "payload_too_large",
-          "unsupported_media"
+          "unsupported_media",
+          "request_timeout"
         ]
       },
       "ErrorBody": {
@@ -435,6 +436,13 @@
           "message": {
             "type": "string"
           },
+          "hint": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^[^\\r\\n]+$",
+            "description": "Relay-authored, single-line remediation that never contains provider payloads or customer content."
+          },
           "retryable": {
             "type": "boolean"
           },
@@ -445,6 +453,7 @@
         "required": [
           "code",
           "message",
+          "hint",
           "retryable"
         ],
         "additionalProperties": false
@@ -563,6 +572,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "audio_formats": {
+            "type": "array",
+            "description": "Accepted input formats for STT or output formats for TTS; omitted for LLM models.",
+            "items": {
+              "$ref": "#/components/schemas/AudioFormat"
+            }
           }
         },
         "required": [
@@ -571,6 +587,87 @@
           "kind",
           "capabilities",
           "regions"
+        ],
+        "additionalProperties": false
+      },
+      "SampleRateRange": {
+        "type": "object",
+        "properties": {
+          "min": {
+            "type": "integer",
+            "minimum": 8000,
+            "maximum": 192000
+          },
+          "max": {
+            "type": "integer",
+            "minimum": 8000,
+            "maximum": 192000
+          }
+        },
+        "required": [
+          "min",
+          "max"
+        ],
+        "additionalProperties": false
+      },
+      "AudioFormat": {
+        "type": "object",
+        "oneOf": [
+          {
+            "required": [
+              "sample_rates_hz"
+            ],
+            "not": {
+              "required": [
+                "sample_rate_range_hz"
+              ]
+            }
+          },
+          {
+            "required": [
+              "sample_rate_range_hz"
+            ],
+            "not": {
+              "required": [
+                "sample_rates_hz"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "encoding": {
+            "type": "string",
+            "enum": [
+              "pcm_s16le",
+              "opus"
+            ]
+          },
+          "sample_rates_hz": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 8000,
+              "maximum": 192000
+            },
+            "uniqueItems": true
+          },
+          "sample_rate_range_hz": {
+            "$ref": "#/components/schemas/SampleRateRange"
+          },
+          "channels": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8
+            }
+          }
+        },
+        "required": [
+          "encoding",
+          "channels"
         ],
         "additionalProperties": false
       },

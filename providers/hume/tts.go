@@ -244,10 +244,16 @@ func httpClient(client *http.Client) *http.Client {
 // would be silently served 48 kHz and play back at half speed.
 func validateMedia(media protocol.MediaFormat) error {
 	if media.Encoding != "pcm_s16le" || media.Channels != 1 {
-		return fmt.Errorf("hume tts requires mono pcm_s16le output, got %s/%d channels", media.Encoding, media.Channels)
+		return &runtimepkg.ProviderError{
+			Code: "unsupported_media", Message: fmt.Sprintf("Hume TTS requires mono pcm_s16le output, got %s/%d channels", media.Encoding, media.Channels),
+			Hint: "Request mono pcm_s16le output at 48000 Hz and try again.",
+		}
 	}
 	if media.SampleRateHz != outputSampleRateHz {
-		return fmt.Errorf("hume tts only outputs %d Hz, got %d", outputSampleRateHz, media.SampleRateHz)
+		return &runtimepkg.ProviderError{
+			Code: "unsupported_media", Message: fmt.Sprintf("Hume TTS only outputs 48000 Hz, got %d", media.SampleRateHz),
+			Hint: "Request mono pcm_s16le output at 48000 Hz or choose a model that advertises the requested rate in GET /v1/models.",
+		}
 	}
 	return nil
 }

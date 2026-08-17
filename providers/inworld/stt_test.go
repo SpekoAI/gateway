@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -316,6 +317,13 @@ func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
 	harness := newSTTHarness(t, nil)
 	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
 	harness.nextFrame(t)
+	// Consume Inworld's empty start-of-turn marker before the distinct empty
+	// final that acknowledges committed silence.
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
+	if err := stream.WriteAudio(context.Background(), []byte{0, 0, 0, 0}); err != nil {
+		t.Fatalf("write silent audio: %v", err)
+	}
+	harness.nextFrame(t)
 
 	if err := stream.CommitAudio(context.Background()); err != nil {
 		t.Fatalf("commit audio: %v", err)
@@ -354,18 +362,106 @@ func TestSTTEmitsEmptyFinalAfterExplicitCommit(t *testing.T) {
 	}
 }
 
+func TestSTTEmitsEmptyFinalWhenCommitAckPrecedesStartMarker(t *testing.T) {
+	t.Parallel()
+	harness := newSTTHarness(t, nil)
+	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	harness.nextFrame(t)
+	if err := stream.WriteAudio(context.Background(), []byte{0, 0, 0, 0}); err != nil {
+		t.Fatalf("write silent audio: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("commit frame = %s, want %s", got, sttWireEndTurn)
+	}
+	if got := harness.nextFrame(t); got != sttWireCloseFrame {
+		t.Fatalf("close frame = %s, want %s", got, sttWireCloseFrame)
+	}
+
+	// The payloads contain no discriminator, so deliberately deliver the
+	// commit acknowledgement before the delayed start marker. The pair must
+	// still produce exactly one committed-silence final.
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after final = %q, want speech.ended", event.Type)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("reversed empty pair produced more than one final")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after the reversed empty pair")
+	}
+}
+
 func TestSTTSilentSessionEventuallyCloses(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stream := &sttStream{ctx: ctx, cancel: cancel}
+	stream := &sttStream{ctx: ctx, cancel: cancel, closeInactivityTimeout: 20 * time.Millisecond}
 	stream.closing.Store(true)
-	go stream.finishSilentClose()
+	go stream.finishGracefulClose()
 
 	select {
 	case <-ctx.Done():
-	case <-time.After(3 * time.Second):
+	case <-time.After(time.Second):
 		t.Fatal("silent Inworld session did not close after its grace period")
+	}
+}
+
+func TestSTTCloseDuplicateProgressDoesNotExtendForever(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &sttStream{
+		ctx:                    ctx,
+		cancel:                 cancel,
+		closeProgress:          make(chan struct{}, 1),
+		closeInactivityTimeout: 50 * time.Millisecond,
+	}
+	stream.closing.Store(true)
+	stream.closeProgressAt.Store(time.Now().UnixNano())
+	go stream.finishGracefulClose()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(300 * time.Millisecond)
+	for {
+		select {
+		case <-ticker.C:
+			stream.noteTranscriptCloseProgress("same partial", false)
+		case <-ctx.Done():
+			return
+		case <-deadline:
+			t.Fatal("duplicate non-final progress kept Inworld close alive")
+		}
+	}
+}
+
+func TestSTTCloseTimeoutPersistsWhenEventQueueIsFull(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &sttStream{
+		ctx:    ctx,
+		cancel: cancel,
+		events: make(chan runtimepkg.ProviderEvent, 1),
+	}
+	stream.events <- runtimepkg.ProviderEvent{Type: protocol.EventWarning}
+	stream.commitsPending.Store(1)
+	stream.timeoutGracefulClose()
+
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(stream.TerminalError(), &providerErr) || providerErr.Code != "request_timeout" || !providerErr.Retryable {
+		t.Fatalf("persisted terminal error = %#v", stream.TerminalError())
 	}
 }
 
@@ -376,6 +472,11 @@ func TestSTTCloseForcesAPendingTurnBeforeEndOfInput(t *testing.T) {
 	t.Parallel()
 	harness := newSTTHarness(t, nil)
 	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	stream.(*sttStream).closeInactivityTimeout = 50 * time.Millisecond
+	harness.nextFrame(t)
+	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
 	harness.nextFrame(t)
 
 	harness.push(t, `{"result":{"transcription":{"transcript":"half a sen","isFinal":false,"silenceDurationMs":0}}}`)
@@ -390,6 +491,206 @@ func TestSTTCloseForcesAPendingTurnBeforeEndOfInput(t *testing.T) {
 	}
 	if got := harness.nextFrame(t); got != sttWireCloseFrame {
 		t.Fatalf("second teardown frame = %s, want %s", got, sttWireCloseFrame)
+	}
+	select {
+	case event, ok := <-stream.Events():
+		if !ok {
+			t.Fatal("events closed without the inactivity timeout error")
+		}
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(event.Err, &providerErr) || providerErr.Code != "request_timeout" || !providerErr.Retryable {
+			t.Fatalf("close timeout event = %#v", event.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active Inworld turn remained open when the provider never returned a final")
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after the inactivity timeout error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after the inactivity timeout error")
+	}
+}
+
+func TestSTTCloseAllowsChangingProgressAcrossInactivityDeadlines(t *testing.T) {
+	t.Parallel()
+	harness := newSTTHarness(t, nil)
+	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	stream.(*sttStream).closeInactivityTimeout = 60 * time.Millisecond
+	harness.nextFrame(t)
+	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("first teardown frame = %s, want %s", got, sttWireEndTurn)
+	}
+	if got := harness.nextFrame(t); got != sttWireCloseFrame {
+		t.Fatalf("second teardown frame = %s, want %s", got, sttWireCloseFrame)
+	}
+
+	// Each changing partial arrives within the inactivity window, but the final
+	// lands after several original deadlines. Meaningful transcript progress is
+	// intentionally allowed to keep a request alive until its final arrives.
+	for _, partial := range []string{"still", "still working", "still working now"} {
+		time.Sleep(40 * time.Millisecond)
+		harness.push(t, fmt.Sprintf(`{"result":{"transcription":{"transcript":%q,"isFinal":false,"silenceDurationMs":0}}}`, partial))
+		if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptDelta {
+			t.Fatalf("progress event = %q, want transcript.delta", event.Type)
+		}
+	}
+	time.Sleep(40 * time.Millisecond)
+	harness.push(t, `{"result":{"transcription":{"transcript":"still working now done","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("delayed event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after final = %q, want speech.ended", event.Type)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after the delayed final")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after the delayed final")
+	}
+}
+
+func TestSTTCloseWaitsForTheLatestTurnAfterAnEarlierFinal(t *testing.T) {
+	t.Parallel()
+	harness := newSTTHarness(t, nil)
+	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	stream.(*sttStream).closeInactivityTimeout = 100 * time.Millisecond
+	harness.nextFrame(t)
+
+	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
+		t.Fatalf("write first turn: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit first turn: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("first commit frame = %s, want %s", got, sttWireEndTurn)
+	}
+	harness.push(t, `{"result":{"transcription":{"transcript":"first turn","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("first turn event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after first final = %q, want speech.ended", event.Type)
+	}
+
+	if err := stream.WriteAudio(context.Background(), []byte{2, 0, 0, 0}); err != nil {
+		t.Fatalf("write second turn: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("second turn teardown frame = %s, want %s", got, sttWireEndTurn)
+	}
+	if got := harness.nextFrame(t); got != sttWireCloseFrame {
+		t.Fatalf("close frame = %s, want %s", got, sttWireCloseFrame)
+	}
+
+	// The earlier final must not satisfy the wait for this turn. Deliver the
+	// second final late enough to expose the old latched-final cancellation.
+	time.Sleep(50 * time.Millisecond)
+	harness.push(t, `{"result":{"transcription":{"transcript":"second turn","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("second turn event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after second final = %q, want speech.ended", event.Type)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after the latest final")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after the latest final")
+	}
+}
+
+func TestSTTCloseWaitsForEveryOverlappingCommittedTurn(t *testing.T) {
+	t.Parallel()
+	harness := newSTTHarness(t, nil)
+	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
+	stream.(*sttStream).closeInactivityTimeout = 200 * time.Millisecond
+	harness.nextFrame(t)
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
+
+	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
+		t.Fatalf("write first turn: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit first turn: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("first commit frame = %s, want %s", got, sttWireEndTurn)
+	}
+
+	// Start and close the second turn before the first final arrives. There are
+	// now two explicit commits in flight on the same provider stream.
+	if err := stream.WriteAudio(context.Background(), []byte{2, 0, 0, 0}); err != nil {
+		t.Fatalf("write second turn: %v", err)
+	}
+	harness.nextFrame(t)
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if got := harness.nextFrame(t); got != sttWireEndTurn {
+		t.Fatalf("second commit frame = %s, want %s", got, sttWireEndTurn)
+	}
+	if got := harness.nextFrame(t); got != sttWireCloseFrame {
+		t.Fatalf("close frame = %s, want %s", got, sttWireCloseFrame)
+	}
+
+	// Turn two's empty start marker has the same shape as a committed-silence
+	// final. It must not consume either outstanding commit.
+	harness.push(t, `{"result":{"transcription":{"transcript":"","isFinal":true,"silenceDurationMs":0}}}`)
+	harness.push(t, `{"result":{"transcription":{"transcript":"first delayed turn","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("first delayed event = %q, want transcript.final", event.Type)
+	} else {
+		var data struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(event.Data, &data); err != nil || data.Text != "first delayed turn" {
+			t.Fatalf("first delayed transcript = %+v, err=%v", data, err)
+		}
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after first delayed final = %q, want speech.ended", event.Type)
+	}
+
+	// The first final consumes only the first outstanding commit. If it also
+	// satisfied the second, the reader would already be canceled here.
+	time.Sleep(20 * time.Millisecond)
+	harness.push(t, `{"result":{"transcription":{"transcript":"second latest turn","isFinal":true,"silenceDurationMs":0}}}`)
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
+		t.Fatalf("second latest event = %q, want transcript.final", event.Type)
+	}
+	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventSpeechEnded {
+		t.Fatalf("event after second latest final = %q, want speech.ended", event.Type)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after every committed turn finalized")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after every committed turn finalized")
 	}
 }
 
@@ -705,10 +1006,10 @@ func TestSTTDeclaresTheCallersRealMediaShape(t *testing.T) {
 	t.Parallel()
 	harness := newSTTHarness(t, nil)
 	sttOpenStream(t, harness, protocol.CredentialsManaged, func(r *runtimepkg.AdapterRequest) {
-		r.Media = &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 8_000, Channels: 2}
+		r.Media = &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 8_000, Channels: 1}
 		r.Options.Language = ""
 	})
-	want := `{"transcribeConfig":{"modelId":"inworld/inworld-stt-1","audioEncoding":"LINEAR16","sampleRateHertz":8000,"numberOfChannels":2}}`
+	want := `{"transcribeConfig":{"modelId":"inworld/inworld-stt-1","audioEncoding":"LINEAR16","sampleRateHertz":8000,"numberOfChannels":1}}`
 	if got := harness.nextFrame(t); got != want {
 		t.Fatalf("config frame =\n  %s\nwant\n  %s", got, want)
 	}

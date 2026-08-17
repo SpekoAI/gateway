@@ -249,6 +249,8 @@ func wireSchemaTable() []struct {
 		{relayapi.ErrorEvent{}, asyncapi("ErrorEvent")},
 		{relayapi.Usage{}, both("Usage")},
 		{relayapi.ModelCapabilities{}, openapi("ModelCapabilities")},
+		{relayapi.SampleRateRange{}, openapi("SampleRateRange")},
+		{relayapi.AudioFormat{}, openapi("AudioFormat")},
 		{relayapi.Model{}, openapi("Model")},
 		{relayapi.ModelsResponse{}, openapi("ModelsResponse")},
 		{relayapi.TranscriptionRequest{}, openapi("TranscriptionRequest")},

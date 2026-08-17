@@ -127,6 +127,8 @@ var (
 	sttWAVDataTag       = []byte("data")
 )
 
+const sttCloseInactivityTimeout = 30 * time.Second
+
 // STTConfig controls local transport limits. Credentials and provider selection
 // always come from the signed session plan, never from this configuration.
 type STTConfig struct {
@@ -273,11 +275,16 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &sttStream{
-		conn:   conn,
-		ctx:    streamCtx,
-		cancel: cancel,
-		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		conn:                   conn,
+		ctx:                    streamCtx,
+		cancel:                 cancel,
+		events:                 make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		closeProgress:          make(chan struct{}, 1),
+		closeInactivityTimeout: sttCloseInactivityTimeout,
 	}
+	// Inworld opens the first transcription turn with an empty isFinal marker.
+	// It is protocol state, not the final result of a committed silent turn.
+	stream.emptyStartMarkers.Store(1)
 	go stream.readLoop()
 	return stream, nil
 }
@@ -369,7 +376,10 @@ func sttModelID(model string) (string, error) {
 // that work. protocol.MediaFormat.Validate already bounds the range.
 func validateSTTMedia(media protocol.MediaFormat) error {
 	if media.Encoding != "pcm_s16le" {
-		return fmt.Errorf("inworld stt requires pcm_s16le, got %q", media.Encoding)
+		return &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("Inworld STT requires pcm_s16le, got %q", media.Encoding), Hint: "Convert the input to mono LINEAR16 (pcm_s16le) and use the matching sample rate."}
+	}
+	if media.Channels != 1 {
+		return &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("Inworld transcription cannot accept %d-channel audio", media.Channels), Hint: "Downmix the input to mono LINEAR16 (pcm_s16le) and try again."}
 	}
 	return nil
 }
@@ -410,22 +420,39 @@ type sttStream struct {
 	cancel context.CancelFunc
 	events chan runtimepkg.ProviderEvent
 
-	writeMu      sync.Mutex
-	gracefulOnce sync.Once
-	abortOnce    sync.Once
-	closed       atomic.Bool
-	closing      atomic.Bool
-	closeErr     error
+	writeMu                sync.Mutex
+	terminalMu             sync.RWMutex
+	gracefulOnce           sync.Once
+	abortOnce              sync.Once
+	closed                 atomic.Bool
+	closing                atomic.Bool
+	closeTimedOut          atomic.Bool
+	inputPending           atomic.Bool
+	hasStartedInputTurn    atomic.Bool
+	closeErr               error
+	closeProgress          chan struct{}
+	closeProgressAt        atomic.Int64
+	closeInactivityTimeout time.Duration
+	lastCloseTranscript    string
+	lastCloseUsageMS       int64
+	closeUsageSeen         bool
+	closeSpeechStartedSeen bool
+	closeSpeechStoppedSeen bool
+	terminalErr            error
 
 	// turnPending is true once speech has been seen whose final has not landed.
 	// Only then does Close force a turn: an endTurn with nothing in flight just
 	// produces another empty marker.
 	turnPending atomic.Bool
-	// commitPending distinguishes the empty marker Inworld emits when a turn
+	// commitsPending distinguishes the empty marker Inworld emits when a turn
 	// starts from the empty final that acknowledges our explicit endTurn. The
-	// latter must reach batch callers so silence completes instead of timing out.
-	commitPending atomic.Bool
-	finalSeen     atomic.Bool
+	// count also keeps overlapping turns distinct when the caller commits the
+	// next turn before the provider returns the previous turn's final.
+	commitsPending atomic.Int64
+	// emptyStartMarkers counts locally started turns whose empty protocol marker
+	// has not arrived yet. Those markers take precedence over empty commit
+	// acknowledgements because both have the same Inworld payload shape.
+	emptyStartMarkers atomic.Int64
 
 	// guard holds RIFF-stripping state. The runtime serializes WriteAudio,
 	// control methods and Close for one session, so it needs no lock of its own.
@@ -457,7 +484,13 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	if err != nil {
 		return err
 	}
-	return s.write(ctx, payload)
+	if err := s.write(ctx, payload); err != nil {
+		return err
+	}
+	if s.inputPending.CompareAndSwap(false, true) && s.hasStartedInputTurn.Swap(true) {
+		s.emptyStartMarkers.Add(1)
+	}
+	return nil
 }
 
 // CommitAudio forces the pending turn to finalize with {"endTurn":{}}.
@@ -468,9 +501,13 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 // documented manual turn boundary and is what the platform's TypeScript client
 // sends at end-of-input.
 func (s *sttStream) CommitAudio(ctx context.Context) error {
-	s.commitPending.Store(true)
+	if !s.inputPending.CompareAndSwap(true, false) {
+		return nil
+	}
+	s.commitsPending.Add(1)
 	if err := s.write(ctx, sttEndTurnFrame); err != nil {
-		s.commitPending.Store(false)
+		s.commitsPending.Add(-1)
+		s.inputPending.Store(true)
 		return err
 	}
 	return nil
@@ -504,9 +541,8 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 // teardown that waits on a provider is a teardown that hangs.
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
-		s.closing.Store(true)
-		if s.turnPending.Load() {
-			if err := s.write(ctx, sttEndTurnFrame); err != nil {
+		if s.inputPending.Load() {
+			if err := s.CommitAudio(ctx); err != nil {
 				s.closeErr = err
 			}
 		}
@@ -515,13 +551,19 @@ func (s *sttStream) Close(ctx context.Context) error {
 				s.closeErr = err
 			}
 		}
-		// The final may have raced ahead of Close. It is already queued on the
-		// event channel, so end the read loop instead of waiting for a provider
-		// socket close that Inworld does not consistently send.
-		if s.closeErr == nil && s.finalSeen.Load() {
+		// Publish closing only after both outbound control frames are settled.
+		// Otherwise an earlier turn's final can observe closing and cancel the
+		// socket in the narrow window before this turn increments its commit count
+		// or before closeStream reaches the provider.
+		s.closing.Store(true)
+		// commitsPending is decremented only after each committed turn's final
+		// events have been delivered. A final from an earlier turn therefore
+		// cannot make Close cancel the reader before the latest final arrives.
+		if s.closeErr == nil && s.commitsPending.Load() == 0 {
 			s.cancel()
-		} else if s.closeErr == nil && !s.turnPending.Load() {
-			go s.finishSilentClose()
+		} else if s.closeErr == nil {
+			s.closeProgressAt.Store(time.Now().UnixNano())
+			go s.finishGracefulClose()
 		}
 		if s.closeErr != nil {
 			_ = s.abort()
@@ -530,21 +572,134 @@ func (s *sttStream) Close(ctx context.Context) error {
 	return s.closeErr
 }
 
-// finishSilentClose bounds a successfully opened stream that accepts the
-// audio/finalize/close writes but emits no frame for audio containing no
-// recognizable speech. Provider errors still end the read loop during the
-// grace; absent one, closing Events represents the legitimate empty
-// transcription instead of stranding the batch request.
-func (s *sttStream) finishSilentClose() {
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		if s.closing.Load() && !s.turnPending.Load() && !s.finalSeen.Load() {
-			s.cancel()
-		}
-	case <-s.ctx.Done():
+// finishGracefulClose bounds a successfully opened stream after its
+// finalize/close writes. A final transcript ends the read loop immediately;
+// parsed provider progress resets the same 30-second inactivity deadline
+// exposed by the relay runtime, so a slow but progressing final is never
+// discarded. Unknown frames and duplicate/non-advancing signals do not reset
+// it; see the typed note*CloseProgress helpers below.
+//
+// This intentionally has no absolute deadline: the relay contract permits an
+// arbitrarily long operation while accepted progress continues. Conversely,
+// 30 seconds without that progress is intentionally terminal request_timeout;
+// a provider result arriving after cancellation cannot belong to the attempt.
+func (s *sttStream) finishGracefulClose() {
+	timeout := s.closeInactivityTimeout
+	if timeout <= 0 {
+		timeout = sttCloseInactivityTimeout
 	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			if last := s.closeProgressAt.Load(); last > 0 {
+				remaining := timeout - time.Since(time.Unix(0, last))
+				if remaining > 0 {
+					timer.Reset(remaining)
+					continue
+				}
+			}
+			if s.closing.Load() {
+				s.timeoutGracefulClose()
+			}
+			return
+		case <-s.closeProgress:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(timeout)
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *sttStream) timeoutGracefulClose() {
+	if s.commitsPending.Load() > 0 {
+		s.closeTimedOut.Store(true)
+		s.setTerminalError(sttCloseTimeoutError())
+	}
+	s.cancel()
+}
+
+func sttCloseTimeoutError() error {
+	return &runtimepkg.ProviderError{
+		Code:      "request_timeout",
+		Message:   "Inworld STT made no progress while finalizing the committed turn",
+		Hint:      "Retry the request; if it recurs, route to another STT provider.",
+		Retryable: true,
+	}
+}
+
+func (s *sttStream) setTerminalError(err error) {
+	s.terminalMu.Lock()
+	s.terminalErr = err
+	s.terminalMu.Unlock()
+}
+
+func (s *sttStream) TerminalError() error {
+	s.terminalMu.RLock()
+	defer s.terminalMu.RUnlock()
+	return s.terminalErr
+}
+
+func (s *sttStream) noteCloseProgress() {
+	if !s.closing.Load() {
+		return
+	}
+	s.closeProgressAt.Store(time.Now().UnixNano())
+	if s.closeProgress == nil {
+		return
+	}
+	select {
+	case s.closeProgress <- struct{}{}:
+	default:
+	}
+}
+
+func (s *sttStream) noteTranscriptCloseProgress(text string, final bool) {
+	if !s.closing.Load() {
+		return
+	}
+	if !final && text == s.lastCloseTranscript {
+		return
+	}
+	s.lastCloseTranscript = text
+	s.noteCloseProgress()
+}
+
+func (s *sttStream) noteUsageCloseProgress(durationMS int64) {
+	if !s.closing.Load() {
+		return
+	}
+	if s.closeUsageSeen && durationMS <= s.lastCloseUsageMS {
+		return
+	}
+	s.closeUsageSeen = true
+	s.lastCloseUsageMS = durationMS
+	s.noteCloseProgress()
+}
+
+func (s *sttStream) noteSpeechCloseProgress(started bool) {
+	if !s.closing.Load() {
+		return
+	}
+	if started {
+		if s.closeSpeechStartedSeen {
+			return
+		}
+		s.closeSpeechStartedSeen = true
+	} else {
+		if s.closeSpeechStoppedSeen {
+			return
+		}
+		s.closeSpeechStoppedSeen = true
+	}
+	s.noteCloseProgress()
 }
 
 func (s *sttStream) abort() error {
@@ -582,6 +737,15 @@ func (s *sttStream) readLoop() {
 	defer func() {
 		s.closed.Store(true)
 		s.cancel()
+		if s.closeTimedOut.Load() {
+			// The configured event buffer reserves practical room for the terminal
+			// error. Emitting from the reader's defer keeps this send ordered before
+			// and race-free with the channel close below.
+			select {
+			case s.events <- runtimepkg.ProviderEvent{Err: s.TerminalError()}:
+			default:
+			}
+		}
 		close(s.events)
 	}()
 	for {
@@ -630,6 +794,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		return s.handleTranscription(*message.Result.Transcription, raw)
 	case message.Result.SpeechStarted != nil:
 		s.turnPending.Store(true)
+		s.noteSpeechCloseProgress(true)
 		return s.emit(runtimepkg.ProviderEvent{
 			Type: protocol.EventSpeechStarted,
 			Data: marshalData(map[string]any{
@@ -642,6 +807,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// Voice activity stopped. This is NOT the turn boundary: Inworld emits
 		// it on any detected silence, and the transcript for the turn may still
 		// be revised, so turnPending is left alone.
+		s.noteSpeechCloseProgress(false)
 		return s.emit(runtimepkg.ProviderEvent{
 			Type: protocol.EventSpeechEnded,
 			Data: marshalData(map[string]any{
@@ -651,6 +817,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			Extensions: sttExtension(raw),
 		})
 	case message.Result.Usage != nil:
+		s.noteUsageCloseProgress(message.Result.Usage.TranscribedAudioMs)
 		return s.emit(runtimepkg.ProviderEvent{
 			Type: protocol.EventUsageObserved,
 			Data: marshalData(map[string]any{
@@ -673,14 +840,21 @@ func (s *sttStream) handleMessage(payload []byte) error {
 // voice agent, answers. The platform's TypeScript client drops the same frame.
 func (s *sttStream) handleTranscription(transcription sttTranscription, raw json.RawMessage) error {
 	text := strings.TrimSpace(transcription.Transcript)
-	committedEmptyFinal := text == "" && transcription.IsFinal && s.commitPending.Swap(false)
+	// A silent committed turn produces two wire-identical empty finals: its
+	// start marker and its commit acknowledgement. Their labels are not
+	// observable on the wire, so consume the first against the expected marker
+	// and the second against the outstanding commit regardless of arrival order.
+	// If the counterpart never arrives, the documented inactivity watchdog
+	// returns request_timeout instead of guessing that one frame meant both.
+	if text == "" && transcription.IsFinal && s.consumeEmptyStartMarker() {
+		s.noteCloseProgress()
+		return nil
+	}
+	committedEmptyFinal := text == "" && transcription.IsFinal && s.commitsPending.Load() > 0
 	if text == "" && !committedEmptyFinal {
 		return nil
 	}
-	if transcription.IsFinal {
-		s.commitPending.Store(false)
-		s.finalSeen.Store(true)
-	}
+	s.noteTranscriptCloseProgress(text, transcription.IsFinal)
 	kind := protocol.EventTranscriptDelta
 	if transcription.IsFinal {
 		kind = protocol.EventTranscriptFinal
@@ -715,10 +889,38 @@ func (s *sttStream) handleTranscription(transcription sttTranscription, raw json
 		Data:       marshalData(map[string]any{"reason": "end_of_turn"}),
 		Extensions: sttExtension(raw),
 	})
-	if err == nil && s.closing.Load() {
+	// Keep the outstanding count unchanged until both final events are visible
+	// to the consumer. Each provider final completes at most one explicit
+	// commit, so a delayed earlier final cannot satisfy a later turn as well.
+	remaining := s.completePendingCommit()
+	if err == nil && s.closing.Load() && remaining == 0 {
 		s.cancel()
 	}
 	return err
+}
+
+func (s *sttStream) completePendingCommit() int64 {
+	for {
+		pending := s.commitsPending.Load()
+		if pending == 0 {
+			return 0
+		}
+		if s.commitsPending.CompareAndSwap(pending, pending-1) {
+			return pending - 1
+		}
+	}
+}
+
+func (s *sttStream) consumeEmptyStartMarker() bool {
+	for {
+		pending := s.emptyStartMarkers.Load()
+		if pending == 0 {
+			return false
+		}
+		if s.emptyStartMarkers.CompareAndSwap(pending, pending-1) {
+			return true
+		}
+	}
 }
 
 // emitWarning surfaces a frame this adapter does not model instead of dropping
@@ -838,7 +1040,13 @@ func sttStreamError(status *rpcStatus, raw json.RawMessage) *runtimepkg.Provider
 	if strings.TrimSpace(status.Message) != "" {
 		message += ": " + status.Message
 	}
-	return &runtimepkg.ProviderError{Code: code, Message: message, Retryable: retryable, Extensions: sttExtension(raw)}
+	hint := "Retry after a brief delay or use auto routing to select another provider."
+	if code == "invalid_request" {
+		hint = "Check the model, language, and mono LINEAR16 media settings, then retry."
+	} else if code == "authentication_failed" {
+		hint = "Check that the Inworld credential is active and authorized for realtime transcription."
+	}
+	return &runtimepkg.ProviderError{Code: code, Message: message, Hint: hint, Retryable: retryable, Extensions: sttExtension(raw)}
 }
 
 func sttDialErrorCode(status int) string {

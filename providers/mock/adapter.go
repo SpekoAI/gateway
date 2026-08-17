@@ -67,6 +67,7 @@ type Stream struct {
 
 	mu              sync.RWMutex
 	closed          bool
+	terminalErr     error
 	calls           []Call
 	WriteAudioHook  func(context.Context, []byte) error
 	CommitAudioHook func(context.Context) error
@@ -94,6 +95,19 @@ func NewStream(eventCapacity int) *Stream {
 }
 
 func (s *Stream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
+
+// SetTerminalError records a failure that must survive a full event queue.
+func (s *Stream) SetTerminalError(err error) {
+	s.mu.Lock()
+	s.terminalErr = err
+	s.mu.Unlock()
+}
+
+func (s *Stream) TerminalError() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.terminalErr
+}
 
 func (s *Stream) WriteAudio(ctx context.Context, audio []byte) error {
 	s.record(Call{Kind: "audio", Audio: audio})
