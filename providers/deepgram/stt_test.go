@@ -134,6 +134,48 @@ func TestAdapterUsesDeepgramWireContractAndMapsEvents(t *testing.T) {
 	}
 }
 
+func TestBufferedAdapterLeavesDeepgramEndpointingEnabled(t *testing.T) {
+	t.Parallel()
+
+	requests := make(chan *http.Request, 1)
+	done := make(chan struct{})
+	server := newListenServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+		defer close(done)
+		requests <- request.Clone(request.Context())
+		if err := assertControl(ctx, conn, "CloseStream"); err != nil {
+			t.Errorf("close stream: %v", err)
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	request := adapterRequest(server.URL, protocol.RequestOptions{})
+	request.Delivery = runtimepkg.AudioDeliveryBuffered
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	for range stream.Events() {
+	}
+	<-done
+
+	query := (<-requests).URL.Query()
+	if query.Has("endpointing") {
+		t.Fatalf("buffered query disables endpointing: %v", query)
+	}
+	if query.Get("interim_results") != "true" {
+		t.Fatalf("buffered query lost interim results: %v", query)
+	}
+}
+
 func TestAdapterUsesFluxV2TurnProtocol(t *testing.T) {
 	t.Parallel()
 	requests := make(chan *http.Request, 1)
@@ -422,10 +464,11 @@ func listenHandler(t *testing.T, w http.ResponseWriter, r *http.Request, callbac
 func adapterRequest(serverURL string, options protocol.RequestOptions) runtimepkg.AdapterRequest {
 	now := time.Date(2026, time.August, 1, 11, 59, 0, 0, time.UTC)
 	return runtimepkg.AdapterRequest{
-		Kind:    protocol.SessionKindSTT,
-		Plan:    planFor(now, endpointFromServer(serverURL)),
-		Options: options,
-		Media:   media(),
+		Kind:     protocol.SessionKindSTT,
+		Plan:     planFor(now, endpointFromServer(serverURL)),
+		Options:  options,
+		Media:    media(),
+		Delivery: runtimepkg.AudioDeliveryLive,
 	}
 }
 
@@ -530,11 +573,11 @@ func TestListenEndpointRejectsInvalidMediaAndPath(t *testing.T) {
 		t.Fatalf("endpoint policy: %v", err)
 	}
 
-	_, err = listenEndpoint(policy, "wss://api.deepgram.com/not-listen", "nova-3", protocol.RequestOptions{}, *media(), "")
+	_, err = listenEndpoint(policy, "wss://api.deepgram.com/not-listen", "nova-3", protocol.RequestOptions{}, *media(), runtimepkg.AudioDeliveryLive, "")
 	if err == nil {
 		t.Fatal("expected path validation failure")
 	}
-	_, err = listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3", protocol.RequestOptions{}, protocol.MediaFormat{Encoding: "mulaw", SampleRateHz: 8_000, Channels: 1}, "")
+	_, err = listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3", protocol.RequestOptions{}, protocol.MediaFormat{Encoding: "mulaw", SampleRateHz: 8_000, Channels: 1}, runtimepkg.AudioDeliveryLive, "")
 	if err == nil {
 		t.Fatalf("expected media validation failure, got %v", err)
 	}

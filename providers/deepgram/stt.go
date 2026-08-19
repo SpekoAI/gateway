@@ -111,7 +111,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay || request.Plan.Execution.CredentialSource == protocol.CredentialsManaged {
 		reservationID = request.Plan.Reservation.ID
 	}
-	endpoint, err := listenEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, reservationID)
+	endpoint, err := listenEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, request.Delivery, reservationID)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +182,7 @@ func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.Creden
 	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
-func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat, reservationID string) (string, error) {
+func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat, delivery runtimepkg.AudioDeliveryMode, reservationID string) (string, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
 		return "", fmt.Errorf("deepgram endpoint: %w", err)
@@ -224,8 +224,12 @@ func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	} else {
 		query.Set("channels", strconv.Itoa(media.Channels))
 		query.Set("interim_results", "true")
-		// The framework owns VAD/turn detection for legacy Listen.
-		query.Set("endpointing", "false")
+		// The framework owns VAD/turn detection for live Listen streams. Buffered
+		// uploads need Deepgram's default endpointing, however: disabling it makes
+		// nova-2-meeting finalize the short complete upload with an empty result.
+		if delivery != runtimepkg.AudioDeliveryBuffered {
+			query.Set("endpointing", "false")
+		}
 		if strings.TrimSpace(options.Language) != "" {
 			query.Set("language", options.Language)
 		}
