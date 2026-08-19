@@ -1,15 +1,17 @@
 [project]
 name = "speko-gateway"
 version = "0.1.0"
-description = "LiveKit integration for the local Speko Gateway"
+description = "Python framework integrations for the local Speko Gateway"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 dependencies = ["aiohttp>=3.10,<4"]
 
 [project.optional-dependencies]
 livekit = ["livekit-agents>=1.6.1,<2"]
+pipecat = ["pipecat-ai>=1.7,<2; python_version >= '3.11'"]
 dev = [
   "livekit-agents>=1.6.1,<2",
+  "pipecat-ai>=1.7,<2; python_version >= '3.11'",
   "pytest>=8",
   "pytest-asyncio>=0.24",
   "ruff>=0.12",
@@ -24,4 +26,3 @@ asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 88
-
