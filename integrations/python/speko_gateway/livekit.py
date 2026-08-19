@@ -28,14 +28,13 @@ from livekit.agents.llm.tool_context import get_raw_function_info
 from livekit.agents.utils import is_given
 
 from ._livekit_bridge import (
-    CredentialSource,
     LiveKitSpeechEvent,
     LiveKitSTTBridge,
     LiveKitSTTStream,
     LiveKitTTSBridge,
     LiveKitTTSStream,
-    stt_options_payload,
 )
+from ._voice import CredentialSource, stt_options_payload
 from .client import GatewayClient, GatewayError
 from .probe import report_leg as _report_probe_leg
 from .probe import report_marker as _report_probe_marker

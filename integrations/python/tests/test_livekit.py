@@ -562,7 +562,7 @@ async def test_voice_plugins_forward_provider_and_credential_source() -> None:
 
 
 def test_stt_options_payload_builds_the_request_block() -> None:
-    from speko_gateway._livekit_bridge import stt_options_payload
+    from speko_gateway._voice import stt_options_payload
 
     assert stt_options_payload() is None
     assert stt_options_payload(keywords=[]) is None

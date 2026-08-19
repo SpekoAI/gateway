@@ -61,3 +61,28 @@ HTTPS directly to `relay.speko.dev`, not the local socket — so unlike the
 provider-direct voice legs, the conversation history travels through the
 Speko relay. Function tools are supported; image and audio content is
 silently skipped — only text is forwarded.
+
+For Pipecat 1.7+:
+
+```python
+from speko_gateway.pipecat import SpekoSTTService, SpekoTTSService
+
+stt = SpekoSTTService(provider="auto", model="auto", language="en")
+tts = SpekoTTSService(provider="auto", model="auto", language="en")
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+Use a Pipecat VAD in the pipeline so `VADUserStoppedSpeakingFrame` commits the
+current Gateway STT utterance. The complete container and Pipecat Cloud setup
+is in the [Pipecat integration guide](../../docs/PIPECAT.md).

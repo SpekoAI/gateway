@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -100,6 +101,36 @@ class GatewayClient:
     async def ready(self) -> bool:
         async with self._session.get(f"{_BASE_URL}/readyz") as response:
             return response.status == 200
+
+    async def wait_until_ready(
+        self, *, timeout: float = 15.0, interval: float = 0.05
+    ) -> None:
+        """Wait for a sidecar that is starting in the same container.
+
+        Framework processes and the Gateway commonly start together. Treat a
+        missing Unix socket or a transient connector failure as startup state,
+        then fail with a bounded, credential-free error if readiness never
+        arrives.
+        """
+
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if interval <= 0:
+            raise ValueError("interval must be positive")
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if await self.ready():
+                    return
+            except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GatewayError(
+                    f"Gateway did not become ready within {timeout:g} seconds"
+                )
+            await asyncio.sleep(min(interval, remaining))
 
     async def post_turn_events(self, events: list[dict[str, Any]]) -> None:
         """POST one content-free turn-marker batch to ``/v1/turn-events``.

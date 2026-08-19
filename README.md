@@ -8,6 +8,13 @@ routing, observability, and consolidated billing.
 > Early preview: the protocol is versioned, but breaking changes may occur
 > before the first stable release.
 
+## Add Gateway to a Pipecat agent
+
+Gateway includes native Pipecat `STTService` and `TTSService` processors with
+utterance commits, streaming sentence synthesis, barge-in cancellation, and a
+Pipecat Cloud-compatible sidecar startup hook. See the complete
+[Pipecat integration guide](docs/PIPECAT.md).
+
 ## Add Gateway to a LiveKit agent
 
 The public image contains both the Gateway binary and its Python integration.
