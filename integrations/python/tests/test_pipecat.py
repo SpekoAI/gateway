@@ -112,6 +112,27 @@ async def test_gateway_readiness_wait_is_bounded() -> None:
         raise AssertionError("expected readiness timeout")
 
 
+async def test_gateway_readiness_deadline_bounds_a_stalled_request() -> None:
+    client = object.__new__(GatewayClient)
+
+    async def stalled_ready() -> bool:
+        await asyncio.Event().wait()
+        return False
+
+    client.ready = AsyncMock(side_effect=stalled_ready)
+
+    try:
+        await asyncio.wait_for(
+            client.wait_until_ready(timeout=0.01, interval=0.001), timeout=0.25
+        )
+    except GatewayError as error:
+        assert str(error) == "Gateway did not become ready within 0.01 seconds"
+    except TimeoutError as error:
+        raise AssertionError("stalled readiness request exceeded its deadline") from error
+    else:
+        raise AssertionError("expected stalled readiness request to time out")
+
+
 def test_transcription_events_map_to_native_pipecat_frames() -> None:
     interim = _transcription_frame(
         CanonicalEvent(

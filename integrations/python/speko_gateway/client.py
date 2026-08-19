@@ -120,8 +120,13 @@ class GatewayClient:
 
         deadline = time.monotonic() + timeout
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GatewayError(
+                    f"Gateway did not become ready within {timeout:g} seconds"
+                )
             try:
-                if await self.ready():
+                if await asyncio.wait_for(self.ready(), timeout=remaining):
                     return
             except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
                 pass
