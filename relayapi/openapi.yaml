@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:b67380fa3cc307fdc9f8ea0dbb65e9f83941611314a429b87ea774cabc909580
-# yaml-body: sha256:4bc76720ec8411b34d2d4b2efd96ce9cb1159c9470523edf60f46fe166c0ba4c
+# json-mirror: openapi.json sha256:f6477cd93505532bd22180a8c881c9119e4cd54e1b823c13e1672644c1d44402
+# yaml-body: sha256:081333680fba76a192995fe132b8f53d180efe793d70efb496b071101975dab7
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -24,7 +24,17 @@ info:
     server-sent events. The Go types in package relayapi are the source of
     truth for every shape in this document, and speccheck_test.go
     machine-checks the two against each other. Streaming speech travels over
-    WebSocket and is specified separately in asyncapi.yaml.
+    WebSocket and is specified separately in asyncapi.yaml. The /v1 prefix is
+    the stable major version: compatible fields and capabilities may be added,
+    while breaking changes require a new major path. Before a v1 operation or
+    field is retired, Speko documents a migration, sends the Deprecation header
+    and a Link with rel="deprecation", and provides at least 90 days of notice
+    before the Sunset date. See the public versioning policy for the complete
+    compatibility contract.
+  x-speko-versioning-policy: https://speko.ai/developers/versioning
+externalDocs:
+  description: Relay API lifecycle and deprecation policy
+  url: https://speko.ai/developers/versioning
 servers:
   - url: https://relay.speko.dev
     description: >-
@@ -35,6 +45,33 @@ servers:
 security:
   - bearerAuth: []
 paths:
+  /openapi.json:
+    get:
+      operationId: getOpenAPISpec
+      summary: Download the canonical Relay HTTP contract
+      description: >-
+        Returns this exact OpenAPI 3.1 document without authentication. Agents
+        and code generators can use it to discover every HTTP operation,
+        request shape, response shape, error code, and lifecycle convention.
+        Streaming speech operations are described by the AsyncAPI document in
+        the public Gateway repository.
+      security: []
+      responses:
+        "200":
+          description: The canonical OpenAPI 3.1 document.
+          headers:
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
+          content:
+            application/json:
+              schema:
+                type: object
+                description: An OpenAPI 3.1 document.
+                additionalProperties: true
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        default:
+          $ref: "#/components/responses/Error"
   /v1/models:
     get:
       operationId: listModels
@@ -56,10 +93,14 @@ paths:
               $ref: "#/components/headers/SpekoRequestID"
             Speko-Region:
               $ref: "#/components/headers/SpekoRegion"
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ModelsResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         default:
           $ref: "#/components/responses/Error"
   /v1/stt/transcriptions:
@@ -117,10 +158,14 @@ paths:
               $ref: "#/components/headers/SpekoModel"
             Speko-Region:
               $ref: "#/components/headers/SpekoRegion"
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/TranscriptionResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         default:
           $ref: "#/components/responses/Error"
   /v1/tts/speech:
@@ -159,12 +204,16 @@ paths:
               $ref: "#/components/headers/SpekoRegion"
             Speko-Usage-Characters:
               $ref: "#/components/headers/SpekoUsageCharacters"
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
           content:
             application/octet-stream:
               schema:
                 type: string
                 format: binary
                 description: Raw audio in the requested output format.
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         default:
           $ref: "#/components/responses/Error"
   /v1/llm/responses:
@@ -208,6 +257,8 @@ paths:
               $ref: "#/components/headers/SpekoModel"
             Speko-Region:
               $ref: "#/components/headers/SpekoRegion"
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
           content:
             application/json:
               schema:
@@ -230,6 +281,8 @@ paths:
                   success or error on failure — never both and never zero, so
                   a client that sees the connection close without a terminal
                   event knows the stream was truncated rather than finished.
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         default:
           $ref: "#/components/responses/Error"
 components:
@@ -303,6 +356,37 @@ components:
       schema:
         type: integer
         minimum: 0
+    RateLimitPolicy:
+      description: >-
+        The active infrastructure quota policy in the current HTTPAPI
+        structured-field format. The hosted Relay's default edge policy is
+        "relay-ip";q=2000;w=300: 2,000 requests in a 300-second window for
+        each public source IP. Organization and provider concurrency controls
+        can impose a lower effective limit for admitted work.
+      schema:
+        type: string
+        example: '"relay-ip";q=2000;w=300'
+    RetryAfter:
+      description: >-
+        Minimum delay, in seconds, before retrying a 429 response. Clients
+        should also use exponential backoff and honor a larger delay when one
+        is returned.
+      schema:
+        type: integer
+        minimum: 0
+    Deprecation:
+      description: >-
+        RFC 9745 deprecation signal. It is absent on current operations and
+        will be sent when an operation or field enters its announced
+        deprecation window.
+      schema:
+        type: string
+    Sunset:
+      description: >-
+        The HTTP date after which a deprecated operation may stop responding.
+        Speko announces Sunset at least 90 days in advance.
+      schema:
+        type: string
   responses:
     Error:
       description: >-
@@ -311,6 +395,24 @@ components:
       headers:
         Speko-Request-ID:
           $ref: "#/components/headers/SpekoRequestID"
+        RateLimit-Policy:
+          $ref: "#/components/headers/RateLimitPolicy"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    TooManyRequests:
+      description: >-
+        The request exceeded an edge request quota, an organization
+        concurrency limit, or a provider rate limit. The body identifies the
+        stable failure class; Retry-After gives the minimum safe delay.
+      headers:
+        Speko-Request-ID:
+          $ref: "#/components/headers/SpekoRequestID"
+        RateLimit-Policy:
+          $ref: "#/components/headers/RateLimitPolicy"
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
       content:
         application/json:
           schema:
@@ -414,6 +516,7 @@ components:
         error envelope travels as an HTTP response, each code maps to one
         canonical status: 400 capability_unsupported and invalid_request;
         401 authentication_failed; 402 insufficient_credit;
+        404 route_not_found; 405 method_not_allowed;
         409 idempotency_conflict,
         request_in_progress, and request_already_started; 413
         payload_too_large; 415 unsupported_media; 429 rate_limited and
@@ -426,6 +529,8 @@ components:
         - insufficient_credit
         - capability_unsupported
         - invalid_request
+        - route_not_found
+        - method_not_allowed
         - rate_limited
         - concurrency_exhausted
         - provider_error

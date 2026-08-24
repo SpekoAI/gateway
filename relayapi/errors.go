@@ -16,6 +16,8 @@ import (
 //	400  capability_unsupported, invalid_request
 //	401  authentication_failed
 //	402  insufficient_credit
+//	404  route_not_found
+//	405  method_not_allowed
 //	409  idempotency_conflict, request_in_progress, request_already_started
 //	413  payload_too_large
 //	415  unsupported_media
@@ -35,6 +37,8 @@ const (
 	ErrorCodeInsufficientCredit    ErrorCode = "insufficient_credit"
 	ErrorCodeCapabilityUnsupported ErrorCode = "capability_unsupported"
 	ErrorCodeInvalidRequest        ErrorCode = "invalid_request"
+	ErrorCodeRouteNotFound         ErrorCode = "route_not_found"
+	ErrorCodeMethodNotAllowed      ErrorCode = "method_not_allowed"
 	ErrorCodeRateLimited           ErrorCode = "rate_limited"
 	ErrorCodeConcurrencyExhausted  ErrorCode = "concurrency_exhausted"
 	ErrorCodeProviderError         ErrorCode = "provider_error"
@@ -64,6 +68,8 @@ func ErrorCodes() []ErrorCode {
 		ErrorCodeInsufficientCredit,
 		ErrorCodeCapabilityUnsupported,
 		ErrorCodeInvalidRequest,
+		ErrorCodeRouteNotFound,
+		ErrorCodeMethodNotAllowed,
 		ErrorCodeRateLimited,
 		ErrorCodeConcurrencyExhausted,
 		ErrorCodeProviderError,
@@ -99,6 +105,10 @@ func DefaultErrorHint(code ErrorCode) string {
 		return "Remove the unsupported option or select a model that advertises the capability in GET /v1/models."
 	case ErrorCodeInvalidRequest:
 		return "Correct the request fields described by the message and try again."
+	case ErrorCodeRouteNotFound:
+		return "Use GET /openapi.json to discover the Relay's supported paths."
+	case ErrorCodeMethodNotAllowed:
+		return "Use the method advertised by the Allow header or GET /openapi.json."
 	case ErrorCodeRateLimited:
 		return "Retry with exponential backoff and reduce the request rate."
 	case ErrorCodeConcurrencyExhausted:

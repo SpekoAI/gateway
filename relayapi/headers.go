@@ -23,6 +23,16 @@ const (
 // semantics attached to the key.
 const HeaderIdempotencyKey = "Idempotency-Key"
 
+// Agent-readable lifecycle and throttling headers. RateLimit-Policy follows
+// the current IETF HTTPAPI structured-field draft; Retry-After, Deprecation,
+// and Sunset use their standard HTTP definitions.
+const (
+	HeaderRateLimitPolicy = "RateLimit-Policy"
+	HeaderRetryAfter      = "Retry-After"
+	HeaderDeprecation     = "Deprecation"
+	HeaderSunset          = "Sunset"
+)
+
 // HeaderUsageCharacters is the TTS-only usage header on POST /v1/tts/speech
 // responses: the billed character count for the synthesized input. It exists
 // because the one-shot TTS response body is a raw audio stream with no place
