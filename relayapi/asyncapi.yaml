@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:8a51c806354ef3c0fbbde4d697e794fc4b5b5d9af37cf7cecabb9e5059fe1998
-# yaml-body: sha256:d4f6436fac3b5a7450aa6a56f30892f9e1ff002551dab034fee0c775860be317
+# json-mirror: asyncapi.json sha256:30452ab08d2df0c8ac9842376723fcc574dc6a223523c05afa3dd24d28847303
+# yaml-body: sha256:910d2062b08b72d4cae5f7fc93b681a7a3d3cc72b02d02d85437374aa32c4c4f
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -509,7 +509,8 @@ components:
         frame and no HTTP status applies; when the same code is returned over
         HTTP — including a rejected upgrade — it maps to one canonical
         status: 400 capability_unsupported and invalid_request; 401
-        authentication_failed; 402 insufficient_credit;
+        authentication_failed; 402 insufficient_credit; 404 route_not_found;
+        405 method_not_allowed;
         409 idempotency_conflict,
         request_in_progress, and request_already_started; 413
         payload_too_large; 415 unsupported_media; 429 rate_limited and
@@ -520,6 +521,8 @@ components:
         - insufficient_credit
         - capability_unsupported
         - invalid_request
+        - route_not_found
+        - method_not_allowed
         - rate_limited
         - concurrency_exhausted
         - provider_error

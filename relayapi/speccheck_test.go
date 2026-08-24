@@ -251,6 +251,9 @@ func wireSchemaTable() []struct {
 		{relayapi.ModelCapabilities{}, openapi("ModelCapabilities")},
 		{relayapi.SampleRateRange{}, openapi("SampleRateRange")},
 		{relayapi.AudioFormat{}, openapi("AudioFormat")},
+		{relayapi.BatchAudioLimits{}, openapi("BatchAudioLimits")},
+		{relayapi.BenchmarkMetadata{}, openapi("BenchmarkMetadata")},
+		{relayapi.ModelBenchmark{}, openapi("ModelBenchmark")},
 		{relayapi.Model{}, openapi("Model")},
 		{relayapi.ModelsResponse{}, openapi("ModelsResponse")},
 		{relayapi.TranscriptionRequest{}, openapi("TranscriptionRequest")},
@@ -518,6 +521,10 @@ func TestOpenAPIDeclaresRelayEnvelope(t *testing.T) {
 	if scheme["type"] != "http" || scheme["scheme"] != "bearer" {
 		t.Fatalf("bearerAuth must be an http bearer scheme, got %v", scheme)
 	}
+	publicSecurity := specNode(t, doc, "paths", "/openapi.json", "get", "security").([]any)
+	if len(publicSecurity) != 0 {
+		t.Fatalf("GET /openapi.json must override bearer auth, got %v", publicSecurity)
+	}
 
 	parameter := specNode(t, doc, "components", "parameters", "IdempotencyKey").(map[string]any)
 	if parameter["name"] != relayapi.HeaderIdempotencyKey || parameter["in"] != "header" || parameter["required"] != true {
@@ -542,13 +549,15 @@ func TestOpenAPIDeclaresRelayEnvelope(t *testing.T) {
 		relayapi.HeaderProvider,
 		relayapi.HeaderModel,
 		relayapi.HeaderRegion,
+		relayapi.HeaderRateLimitPolicy,
 	}
 	for _, tc := range []struct {
 		path    string
 		method  string
 		headers []string
 	}{
-		{"/v1/models", "get", []string{relayapi.HeaderRequestID, relayapi.HeaderRegion}},
+		{"/openapi.json", "get", []string{relayapi.HeaderRateLimitPolicy}},
+		{"/v1/models", "get", []string{relayapi.HeaderRequestID, relayapi.HeaderRegion, relayapi.HeaderRateLimitPolicy}},
 		{"/v1/stt/transcriptions", "post", routeHeaders},
 		// TTS is the only endpoint with a usage header: the raw audio
 		// body has no place for a usage object. STT deliberately has
