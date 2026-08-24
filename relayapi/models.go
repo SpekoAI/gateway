@@ -1,6 +1,7 @@
 package relayapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -44,6 +45,48 @@ type AudioFormat struct {
 	SampleRatesHz     []int            `json:"sample_rates_hz,omitempty"`
 	SampleRateRangeHz *SampleRateRange `json:"sample_rate_range_hz,omitempty"`
 	Channels          []int            `json:"channels"`
+}
+
+// BatchAudioLimits are provider-path limits for a complete batch STT upload.
+// Omitted values mean the provider path publishes no corresponding bound;
+// deployment safety ceilings are intentionally not represented here.
+type BatchAudioLimits struct {
+	MaxPCMBytes        int64 `json:"max_pcm_bytes,omitempty"`
+	MaxDurationSeconds int64 `json:"max_duration_seconds,omitempty"`
+}
+
+// BenchmarkMetadata identifies the exact public benchmark projection used to
+// order the model listing. Digest pins the source bytes used by the Relay.
+type BenchmarkMetadata struct {
+	Schema    int    `json:"schema"`
+	Source    string `json:"source"`
+	Digest    string `json:"digest"`
+	Language  string `json:"language"`
+	Objective string `json:"objective"`
+	Path      string `json:"path,omitempty"`
+}
+
+// ModelBenchmark annotates one exact route with the measurement used for the
+// requested model-list projection. Cost and Language retain the source JSON so
+// evidence fields can grow compatibly without flattening the benchmark schema
+// into the serving contract.
+type ModelBenchmark struct {
+	Rank           int             `json:"rank,omitempty"`
+	Provider       string          `json:"provider"`
+	Model          string          `json:"model"`
+	Quality        *float64        `json:"quality,omitempty"`
+	QualityAxis    string          `json:"quality_axis,omitempty"`
+	LowerIsBetter  bool            `json:"quality_lower_is_better"`
+	QualityPath    string          `json:"quality_path,omitempty"`
+	LanguageCode   string          `json:"language_code,omitempty"`
+	CarriedFrom    string          `json:"carried_from,omitempty"`
+	LatencyMS      *float64        `json:"latency_ms,omitempty"`
+	FirstPartialMS *float64        `json:"first_partial_ms,omitempty"`
+	Cost           json.RawMessage `json:"cost,omitempty"`
+	CostBasis      string          `json:"cost_basis,omitempty"`
+	Drift          *float64        `json:"drift,omitempty"`
+	BalancedScore  *float64        `json:"balanced_score,omitempty"`
+	Language       json.RawMessage `json:"language,omitempty"`
 }
 
 // Validate checks that the format is concrete and unambiguous.
@@ -113,12 +156,14 @@ func (c ModelCapabilities) SupportsSTTOptions(options *STTOptions) (string, bool
 // Speko relay regions (AWS region ids) where the model is routable right
 // now — relay locations, never provider-processing residency.
 type Model struct {
-	ID           string            `json:"id"`
-	Provider     string            `json:"provider"`
-	Kind         Kind              `json:"kind"`
-	Capabilities ModelCapabilities `json:"capabilities"`
-	Regions      []string          `json:"regions"`
-	AudioFormats []AudioFormat     `json:"audio_formats,omitempty"`
+	ID               string            `json:"id"`
+	Provider         string            `json:"provider"`
+	Kind             Kind              `json:"kind"`
+	Capabilities     ModelCapabilities `json:"capabilities"`
+	Regions          []string          `json:"regions"`
+	AudioFormats     []AudioFormat     `json:"audio_formats,omitempty"`
+	BatchAudioLimits *BatchAudioLimits `json:"batch_audio_limits,omitempty"`
+	Benchmark        *ModelBenchmark   `json:"benchmark,omitempty"`
 }
 
 // Validate checks that a catalog entry is concrete and routable somewhere.
@@ -156,8 +201,9 @@ func (m Model) Validate() error {
 // produced the listing so support can correlate a caller's view with an
 // exact release.
 type ModelsResponse struct {
-	Models        []Model `json:"models"`
-	CatalogDigest string  `json:"catalog_digest"`
+	Models        []Model           `json:"models"`
+	CatalogDigest string            `json:"catalog_digest"`
+	Benchmark     BenchmarkMetadata `json:"benchmark"`
 }
 
 // Validate checks every entry and the catalog digest format.

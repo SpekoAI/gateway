@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:f6477cd93505532bd22180a8c881c9119e4cd54e1b823c13e1672644c1d44402
-# yaml-body: sha256:081333680fba76a192995fe132b8f53d180efe793d70efb496b071101975dab7
+# json-mirror: openapi.json sha256:9774b21e73dad7a7cbf7f038dd6c41b9e3fc8d081b30e467fea4dfda85800d36
+# yaml-body: sha256:6e148308919a479d6b6c4a9336662c0079107510b65c6e60be7012a40b096734
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -84,7 +84,27 @@ paths:
         release-pinned catalog that produced the listing so support can
         correlate a caller's view with an exact release. The listing is
         advisory: admission remains the enforcement point for access gates
-        and credit.
+        and credit. Optional language, objective, and path parameters select
+        the exact benchmark projection used to order and annotate the rows.
+      parameters:
+        - name: language
+          in: query
+          description: Language code used for benchmark ranking; defaults to en.
+          schema:
+            type: string
+            maxLength: 32
+        - name: objective
+          in: query
+          description: Ranking objective; defaults to balanced.
+          schema:
+            type: string
+            enum: [quality, balanced, latency, cost]
+        - name: path
+          in: query
+          description: Speech transport projection; streaming is an alias for stream.
+          schema:
+            type: string
+            enum: [stream, streaming, batch]
       responses:
         "200":
           description: The caller's slice of the catalog.
@@ -690,6 +710,10 @@ components:
           description: Accepted input formats for STT or output formats for TTS; omitted for LLM models.
           items:
             $ref: "#/components/schemas/AudioFormat"
+        batch_audio_limits:
+          $ref: "#/components/schemas/BatchAudioLimits"
+        benchmark:
+          $ref: "#/components/schemas/ModelBenchmark"
       required:
         - id
         - provider
@@ -746,6 +770,100 @@ components:
         - encoding
         - channels
       additionalProperties: false
+    BatchAudioLimits:
+      type: object
+      description: >-
+        Provider-path limits for a complete batch STT upload. An omitted
+        property means the provider path publishes no corresponding bound;
+        deployment safety ceilings are intentionally not represented here.
+      properties:
+        max_pcm_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+        max_duration_seconds:
+          type: integer
+          format: int64
+          minimum: 1
+      additionalProperties: false
+    BenchmarkMetadata:
+      type: object
+      description: >-
+        Identifies the exact public benchmark projection used to order the
+        listing. digest pins the source bytes used by the Relay.
+      properties:
+        schema:
+          type: integer
+          minimum: 1
+        source:
+          type: string
+          format: uri
+        digest:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        language:
+          type: string
+        objective:
+          type: string
+          enum: [quality, balanced, latency, cost]
+        path:
+          type: string
+          enum: [stream, batch]
+      required:
+        - schema
+        - source
+        - digest
+        - language
+        - objective
+      additionalProperties: false
+    ModelBenchmark:
+      type: object
+      description: >-
+        Measurement annotation for one exact route in the requested model-list
+        projection. cost and language preserve their source-shaped evidence.
+      properties:
+        rank:
+          type: integer
+          minimum: 1
+        provider:
+          type: string
+        model:
+          type: string
+        quality:
+          type: number
+        quality_axis:
+          type: string
+        quality_lower_is_better:
+          type: boolean
+        quality_path:
+          type: string
+        language_code:
+          type: string
+        carried_from:
+          type: string
+        latency_ms:
+          type: number
+          minimum: 0
+        first_partial_ms:
+          type: number
+          minimum: 0
+        cost:
+          type: object
+          additionalProperties: true
+        cost_basis:
+          type: string
+        drift:
+          type: number
+        balanced_score:
+          type: number
+        language:
+          type: object
+          additionalProperties: true
+      required:
+        - provider
+        - model
+        - quality_lower_is_better
+      additionalProperties: false
     ModelsResponse:
       type: object
       description: >-
@@ -760,9 +878,12 @@ components:
         catalog_digest:
           type: string
           pattern: "^sha256:[0-9a-f]{64}$"
+        benchmark:
+          $ref: "#/components/schemas/BenchmarkMetadata"
       required:
         - models
         - catalog_digest
+        - benchmark
       additionalProperties: false
     TranscriptionRequest:
       type: object

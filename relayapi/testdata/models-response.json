@@ -16,7 +16,19 @@
       "regions": [
         "us-west-2",
         "eu-central-1"
-      ]
+      ],
+      "benchmark": {
+        "rank": 1,
+        "provider": "openai",
+        "model": "gpt-5.2",
+        "quality": 0.91,
+        "quality_axis": "score",
+        "quality_lower_is_better": false,
+        "latency_ms": 412,
+        "cost": {"per_1m_output_tokens_usd": 14},
+        "balanced_score": 0.86,
+        "language": {"score": 0.91, "measured": "2026-08-20"}
+      }
     },
     {
       "id": "nova-3",
@@ -47,8 +59,20 @@
             1
           ]
         }
-      ]
+      ],
+      "batch_audio_limits": {
+        "max_pcm_bytes": 26214400,
+        "max_duration_seconds": 3600
+      }
     }
   ],
-  "catalog_digest": "sha256:8c1f2ad94e0f6bd3fbc7d2a4f4f36f5f5f2c9f0b1d4e7a8c3b6d9e0f1a2b3c4d"
+  "catalog_digest": "sha256:8c1f2ad94e0f6bd3fbc7d2a4f4f36f5f5f2c9f0b1d4e7a8c3b6d9e0f1a2b3c4d",
+  "benchmark": {
+    "schema": 2,
+    "source": "https://benchmarks.speko.ai/data.json",
+    "digest": "sha256:7a2f1ad94e0f6bd3fbc7d2a4f4f36f5f5f2c9f0b1d4e7a8c3b6d9e0f1a2b3c4d",
+    "language": "en",
+    "objective": "balanced",
+    "path": "stream"
+  }
 }
