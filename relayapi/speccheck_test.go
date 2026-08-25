@@ -514,8 +514,8 @@ func TestOpenAPIDeclaresRelayEnvelope(t *testing.T) {
 	doc := loadSpecDoc(t, "openapi.json")
 
 	servers := specNode(t, doc, "servers").([]any)
-	if url := servers[0].(map[string]any)["url"]; url != "https://relay.speko.dev" {
-		t.Fatalf("servers[0].url = %v, want https://relay.speko.dev", url)
+	if url := servers[0].(map[string]any)["url"]; url != "https://router.speko.dev" {
+		t.Fatalf("servers[0].url = %v, want https://router.speko.dev", url)
 	}
 	scheme := specNode(t, doc, "components", "securitySchemes", "bearerAuth").(map[string]any)
 	if scheme["type"] != "http" || scheme["scheme"] != "bearer" {
@@ -593,12 +593,12 @@ func TestAsyncAPIDeclaresStreamChannels(t *testing.T) {
 
 	doc := loadSpecDoc(t, "asyncapi.json")
 
-	server := specNode(t, doc, "servers", "relay").(map[string]any)
+	server := specNode(t, doc, "servers", "router").(map[string]any)
 	if server["protocol"] != "wss" {
-		t.Fatalf("servers.relay.protocol = %v, want wss", server["protocol"])
+		t.Fatalf("servers.router.protocol = %v, want wss", server["protocol"])
 	}
 	if description, _ := server["description"].(string); !strings.Contains(description, "session.configure") {
-		t.Fatalf("servers.relay.description must carry the session.configure hashing note")
+		t.Fatalf("servers.router.description must carry the session.configure hashing note")
 	}
 
 	for _, channel := range []string{"/v1/stt/stream", "/v1/tts/stream"} {

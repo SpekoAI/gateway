@@ -1,7 +1,7 @@
 """LiveKit Agents STT, TTS, and LLM implementations backed by Speko.
 
 STT and TTS stream through the colocated local Speko Gateway socket. LLM
-talks HTTPS to the hosted Speko relay (`relay.speko.dev`) — a different
+talks HTTPS to the hosted Speko Router (`router.speko.dev`) — a different
 trust boundary: the conversation content travels to the relay.
 """
 
@@ -520,7 +520,7 @@ class SynthesisStream(tts.SynthesizeStream):
 
 
 class LLM(llm.LLM):
-    """Generate responses through the hosted Speko relay."""
+    """Generate responses through the hosted Speko Router."""
 
     def __init__(
         self,
@@ -623,7 +623,7 @@ class RelayLLMStream(llm.LLMStream):
         request = self._relay_llm._request_body(self._chat_ctx, self._tools)
         if not request["input"]:
             raise APIConnectionError(
-                "Speko relay LLM requires at least one text message in the"
+                "Speko Router LLM requires at least one text message in the"
                 " chat context",
                 retryable=False,
             )
@@ -686,11 +686,11 @@ class RelayLLMStream(llm.LLMStream):
             _report_probe_marker("llm.completed", ok=False)
             suffix = f" ({err.code})" if err.code else ""
             raise APIConnectionError(
-                f"Speko relay LLM failed{suffix}", retryable=err.retryable
+                f"Speko Router LLM failed{suffix}", retryable=err.retryable
             ) from err
         except (aiohttp.ClientError, OSError) as err:
             _report_probe_marker("llm.completed", ok=False)
-            raise APIConnectionError("Speko relay LLM transport failed") from err
+            raise APIConnectionError("Speko Router LLM transport failed") from err
         finally:
             await events.aclose()
 
@@ -751,7 +751,7 @@ def _relay_tools(tools: list[llm.Tool]) -> list[dict[str, Any]]:
             }
         else:
             raise ValueError(
-                "Speko relay LLM supports function tools only; got "
+                "Speko Router LLM supports function tools only; got "
                 f"{type(tool).__name__}"
             )
         declaration: dict[str, Any] = {"name": raw["name"]}

@@ -289,7 +289,7 @@ class FailingRelayClient(FakeRelayClient):
     async def stream_response(self, request: dict):
         self.requests.append(request)
         raise RelayError(
-            "relay rejected request (insufficient_credit, HTTP 402)",
+            "Router rejected request (insufficient_credit, HTTP 402)",
             code="insufficient_credit",
             retryable=False,
         )
@@ -435,10 +435,10 @@ async def test_llm_stream_preserves_relay_error_classification() -> None:
     try:
         _ = [chunk async for chunk in stream]
     except APIConnectionError as error:
-        assert str(error) == "Speko relay LLM failed (insufficient_credit)"
+        assert str(error) == "Speko Router LLM failed (insufficient_credit)"
         assert error.retryable is False
     else:
-        raise AssertionError("expected the relay failure to reach LiveKit")
+        raise AssertionError("expected the Router failure to reach LiveKit")
 
     await plugin.aclose()
 

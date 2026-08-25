@@ -30,7 +30,7 @@
 // ephemeral-credential channel. Branching on CredentialSource would invent a
 // split the vendor does not publish.
 //
-// Relay. Plans routed through relay.speko.dev (RouteSpekoRelay) carry the
+// Router. Plans routed through router.speko.dev (RouteSpekoRelay) carry the
 // relay connector's permanent OpenAI key. There is no separate channel for it:
 // the key travels in the identical Authorization: Bearer header, never in a
 // URL. The only relay-specific behaviour is credential-kind acceptance —

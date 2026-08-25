@@ -1,8 +1,8 @@
-"""Authenticated HTTPS client for the hosted Speko relay LLM surface.
+"""Authenticated HTTPS client for the hosted Speko Router LLM surface.
 
-Unlike the local Gateway socket, the relay is a hosted Speko service
-(`relay.speko.dev`): requests authenticate with the Speko API key and the
-conversation content travels to the relay. The wire contract is the public
+Unlike the local Gateway socket, Router is a hosted Speko service
+(`router.speko.dev`): requests authenticate with the Speko API key and the
+conversation content travels to Router. The wire contract is the public
 `relayapi` package in the Speko Gateway repository.
 """
 
@@ -19,7 +19,7 @@ import aiohttp
 from .client import _env_secret
 from .probe import report_leg as _report_probe_leg
 
-_DEFAULT_RELAY_URL = "https://relay.speko.dev"
+_DEFAULT_RELAY_URL = "https://router.speko.dev"
 _TERMINAL_EVENTS = {"response.completed", "error"}
 
 
@@ -41,7 +41,7 @@ class RelayError(RuntimeError):
 
 
 class RelayLLMClient:
-    """Own one authenticated HTTPS transport to the hosted Speko relay."""
+    """Own one authenticated HTTPS transport to the hosted Speko Router."""
 
     def __init__(self, *, api_key: str, base_url: str = _DEFAULT_RELAY_URL) -> None:
         if not api_key:
@@ -54,12 +54,20 @@ class RelayLLMClient:
 
     @classmethod
     def from_env(cls) -> RelayLLMClient:
-        """Create a client from SPEKO_API_KEY and optional SPEKO_RELAY_URL."""
+        """Create a client from SPEKO_API_KEY and optional SPEKO_ROUTER_URL.
+
+        SPEKO_RELAY_URL remains a compatibility fallback for existing
+        deployments.
+        """
 
         api_key = _env_secret("SPEKO_API_KEY")
         if not api_key:
-            raise ValueError("SPEKO_API_KEY is required for relay LLM requests")
-        base_url = os.environ.get("SPEKO_RELAY_URL", "").strip() or _DEFAULT_RELAY_URL
+            raise ValueError("SPEKO_API_KEY is required for Router LLM requests")
+        base_url = (
+            os.environ.get("SPEKO_ROUTER_URL", "").strip()
+            or os.environ.get("SPEKO_RELAY_URL", "").strip()
+            or _DEFAULT_RELAY_URL
+        )
         return cls(api_key=api_key, base_url=base_url)
 
     async def aclose(self) -> None:
@@ -162,11 +170,11 @@ def _envelope_error(status: int, body: dict[str, Any]) -> RelayError:
     error = body.get("error")
     if not isinstance(error, dict):
         return RelayError(
-            f"relay rejected request (HTTP {status})",
+            f"Router rejected request (HTTP {status})",
             retryable=status >= 500,
         )
     return RelayError(
-        f"relay rejected request ({error.get('code', '')}, HTTP {status})",
+        f"Router rejected request ({error.get('code', '')}, HTTP {status})",
         code=str(error.get("code", "")),
         retryable=bool(error.get("retryable", status >= 500)),
         request_id=str(error.get("request_id", "")),

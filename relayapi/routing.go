@@ -129,7 +129,7 @@ func (r Routing) Validate() error {
 }
 
 // Route is the response-side counterpart of Routing: the concrete decision
-// that served a request. Region is the Speko relay location, not a
+// that served a request. Region is the Speko Router location, not a
 // provider-processing residency guarantee, and AttemptID identifies the
 // (possibly post-fallback) attempt that produced the output.
 type Route struct {

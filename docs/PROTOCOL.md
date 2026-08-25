@@ -163,7 +163,7 @@ The LOCAL protocol above stays at revision 3 — nothing in the routes,
 WebSocket framing, or session-plan validation changed. Revision 5 exists
 for exactly one new plan family: the **relay plan** (`protocol.RelayPlan`,
 `protocol/relay_plan.go`), the signed dispatch authorization the Speko
-control plane mints for the Global Speko Relay's connectors. The two
+control plane mints for the hosted Speko Router's connectors. The two
 revisions coexist by construction:
 
 - `CurrentRevision` remains `3` and every rev-3 validator still
@@ -189,7 +189,7 @@ revisions coexist by construction:
   to `bearer`; BYOK and provider-direct behavior is unchanged.
 
 The relay's public customer-facing wire contract (HTTP, SSE, and WebSocket
-message shapes for `relay.speko.dev`) is the separate
+message shapes for `router.speko.dev`) is the separate
 [`relayapi`](../relayapi/doc.go) package with its OpenAPI/AsyncAPI
 documents; it is a hosted-service contract, not part of the local socket
 protocol documented above.

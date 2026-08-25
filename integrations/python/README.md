@@ -1,7 +1,7 @@
 # Speko Gateway Python integration
 
 This package connects Python voice-agent frameworks to the authenticated local
-Speko Gateway socket, and optionally to the hosted Speko relay for LLM. The
+Speko Gateway socket, and optionally to the hosted Speko Router for LLM. The
 voice classes read no Speko API key or provider credentials; only the relay
 `LLM` class authenticates with `SPEKO_API_KEY`.
 
@@ -48,7 +48,7 @@ session = AgentSession(
     stt=STT(),
     llm=LLM(
         provider="auto",          # default: relay picks; set with model= to pin a route
-        model="auto",             # default: GET relay.speko.dev/v1/models lists the options
+        model="auto",             # default: GET router.speko.dev/v1/models lists the options
         objective="balanced",     # default: or "quality", "latency", "cost"
         max_output_tokens=8_192,  # default
     ),
@@ -56,10 +56,11 @@ session = AgentSession(
 )
 ```
 
-`LLM()` requires `SPEKO_API_KEY` (plus optional `SPEKO_RELAY_URL`) and speaks
-HTTPS directly to `relay.speko.dev`, not the local socket — so unlike the
+`LLM()` requires `SPEKO_API_KEY` (plus optional `SPEKO_ROUTER_URL`; the old
+`SPEKO_RELAY_URL` remains a fallback) and speaks HTTPS directly to
+`router.speko.dev`, not the local socket — so unlike the
 provider-direct voice legs, the conversation history travels through the
-Speko relay. Function tools are supported; image and audio content is
+Speko Router. Function tools are supported; image and audio content is
 silently skipped — only text is forwarded.
 
 For Pipecat 1.7+:

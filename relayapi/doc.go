@@ -39,6 +39,6 @@
 //     session.configure text-frame bytes, and later frames are intentionally
 //     outside the hash. See idempotency.go for the full contract.
 //
-//   - Speko-Region names the Speko relay location that served a request. It
+//   - Speko-Region names the Speko Router location that served a request. It
 //     is a proximity fact, not a provider data-residency guarantee.
 package relayapi

@@ -153,7 +153,7 @@ func (c ModelCapabilities) SupportsSTTOptions(options *STTOptions) (string, bool
 }
 
 // Model is one currently routable catalog entry. Regions lists the
-// Speko relay regions (AWS region ids) where the model is routable right
+// Speko Router regions (AWS region ids) where the model is routable right
 // now — relay locations, never provider-processing residency.
 type Model struct {
 	ID               string            `json:"id"`

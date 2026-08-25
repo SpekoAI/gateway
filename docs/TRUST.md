@@ -85,7 +85,7 @@ provider socket opens.
 
 ### Relay plans (revision 5)
 
-The Global Speko Relay uses a second, deliberately isolated plan family.
+The hosted Speko Router uses a second, deliberately isolated plan family.
 Relay plans are compact JWS with protected-header typ
 `speko.relay-plan+jws` and audience `speko-relay`, signed by a dedicated
 control-plane key published on a dedicated JWKS document
@@ -227,8 +227,8 @@ Use the `_FILE` variants and a secrets manager in production.
   the relay's wire contract (`relayapi`), protocol types, verifier, and
   adapter relay arms that those hosted services import.
 - The local gateway image serves provider-direct routes; sending traffic
-  through the hosted Speko relay is a hosted-service surface
-  (`relay.speko.dev`) with its own contract in `relayapi`. The Python
+  through the hosted Speko Router is a hosted-service surface
+  (`router.speko.dev`) with its own contract in `relayapi`. The Python
   integration's `LLM` class is a client of that surface: when it is used,
   prompts and conversation history travel to the relay, authenticated with
   the Speko API key.

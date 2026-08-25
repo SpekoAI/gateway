@@ -84,7 +84,7 @@ session = AgentSession(
 ```
 
 With a Speko API key the LLM can come from Speko too, served by the hosted
-relay (`relay.speko.dev`):
+Router (`router.speko.dev`):
 
 ```python
 from speko_gateway.livekit import LLM, STT, TTS
@@ -93,7 +93,7 @@ session = AgentSession(
     stt=STT(),
     llm=LLM(
         provider="auto",          # default: relay picks; set with model= to pin a route
-        model="auto",             # default: GET relay.speko.dev/v1/models lists the options
+        model="auto",             # default: GET router.speko.dev/v1/models lists the options
         objective="balanced",     # default: or "quality", "latency", "cost"
         max_output_tokens=8_192,  # default
     ),
@@ -132,7 +132,7 @@ arrive on the raw vendor frames each event carries in `extensions`.
 not the local socket — under the public [`relayapi`](relayapi/doc.go)
 contract. That crosses a different trust boundary: unlike the
 provider-direct voice legs, the conversation history travels through the
-Speko relay.
+Speko Router.
 
 Optionally, attach the conversation profiler probe to correlate STT, LLM,
 TTS, and playback into per-turn latency traces. It emits content-free timing
@@ -170,7 +170,7 @@ Both choices can coexist through the same local socket and LiveKit integration.
 With BYOK,
 provider credentials stay in the Gateway process and anonymous telemetry
 remains on unless explicitly disabled. The local image serves
-provider-direct routes; the hosted Speko relay (`relay.speko.dev`) is a
+provider-direct routes; the hosted Speko Router (`router.speko.dev`) is a
 separate, generally available Speko-operated surface whose public wire
 contract lives in this repository's `relayapi` package (OpenAPI + AsyncAPI).
 Any Speko organization can route relay requests to any model in the
