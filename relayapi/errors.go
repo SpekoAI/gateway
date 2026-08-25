@@ -106,7 +106,7 @@ func DefaultErrorHint(code ErrorCode) string {
 	case ErrorCodeInvalidRequest:
 		return "Correct the request fields described by the message and try again."
 	case ErrorCodeRouteNotFound:
-		return "Use GET /openapi.json to discover the Relay's supported paths."
+		return "Use GET /openapi.json to discover the Router's supported paths."
 	case ErrorCodeMethodNotAllowed:
 		return "Use the method advertised by the Allow header or GET /openapi.json."
 	case ErrorCodeRateLimited:

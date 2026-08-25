@@ -1,19 +1,19 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Global Speko Relay API",
+    "title": "Speko Router API",
     "version": "1.0.0",
-    "description": "HTTP contract of the Global Speko Relay: model discovery, batch speech transcription, one-shot speech synthesis, and LLM responses over JSON or server-sent events. The Go types in package relayapi are the source of truth for every shape in this document, and speccheck_test.go machine-checks the two against each other. Streaming speech travels over WebSocket and is specified separately in asyncapi.yaml. The /v1 prefix is the stable major version: compatible fields and capabilities may be added, while breaking changes require a new major path. Before a v1 operation or field is retired, Speko documents a migration, sends the Deprecation header and a Link with rel=\"deprecation\", and provides at least 90 days of notice before the Sunset date. See the public versioning policy for the complete compatibility contract.",
+    "description": "HTTP contract of the Speko Router: model discovery, batch speech transcription, one-shot speech synthesis, and LLM responses over JSON or server-sent events. The Go types in package relayapi are the source of truth for every shape in this document, and speccheck_test.go machine-checks the two against each other. Streaming speech travels over WebSocket and is specified separately in asyncapi.yaml. The /v1 prefix is the stable major version: compatible fields and capabilities may be added, while breaking changes require a new major path. Before a v1 operation or field is retired, Speko documents a migration, sends the Deprecation header and a Link with rel=\"deprecation\", and provides at least 90 days of notice before the Sunset date. See the public versioning policy for the complete compatibility contract.",
     "x-speko-versioning-policy": "https://speko.ai/developers/versioning"
   },
   "externalDocs": {
-    "description": "Relay API lifecycle and deprecation policy",
+    "description": "Router API lifecycle and deprecation policy",
     "url": "https://speko.ai/developers/versioning"
   },
   "servers": [
     {
-      "url": "https://relay.speko.dev",
-      "description": "Global entry point. Every response names the Speko relay region that served it in Speko-Region; the region is a proximity fact about Speko infrastructure, not a guarantee about where the provider processed the content."
+      "url": "https://router.speko.dev",
+      "description": "Global entry point. Every response names the Speko Router region that served it in Speko-Region; the region is a proximity fact about Speko infrastructure, not a guarantee about where the provider processed the content."
     }
   ],
   "security": [
@@ -27,7 +27,7 @@
     "/openapi.json": {
       "get": {
         "operationId": "getOpenAPISpec",
-        "summary": "Download the canonical Relay HTTP contract",
+        "summary": "Download the canonical Router HTTP contract",
         "description": "Returns this exact OpenAPI 3.1 document without authentication. Agents and code generators can use it to discover every HTTP operation, request shape, response shape, error code, and lifecycle convention. Streaming speech operations are described by the AsyncAPI document in the public Gateway repository.",
         "security": [
 
@@ -63,7 +63,7 @@
       "get": {
         "operationId": "listModels",
         "summary": "List currently routable models",
-        "description": "Returns the slice of the model catalog that is currently routable. The relay is generally available: every organization may route to any catalog model, so the listing is shaped by routability, not by per-organization enrollment. The catalog digest identifies the release-pinned catalog that produced the listing so support can correlate a caller's view with an exact release. The listing is advisory: admission remains the enforcement point for access gates and credit. Optional language, objective, and path parameters select the exact benchmark projection used to order and annotate the rows.",
+        "description": "Returns the slice of the model catalog that is currently routable. The Router is generally available: every organization may route to any catalog model, so the listing is shaped by routability, not by per-organization enrollment. The catalog digest identifies the release-pinned catalog that produced the listing so support can correlate a caller's view with an exact release. The listing is advisory: admission remains the enforcement point for access gates and credit. Optional language, objective, and path parameters select the exact benchmark projection used to order and annotate the rows.",
         "parameters": [
           {
             "name": "language",
@@ -137,7 +137,7 @@
       "post": {
         "operationId": "createTranscription",
         "summary": "Transcribe one uploaded audio file",
-        "description": "Batch speech-to-text. The audio always travels as an uploaded part, never as a URL: the relay fetches nothing on a caller's behalf. For idempotency the content hash covers the decoded part payload bytes only — no part headers, no boundary bytes — concatenated in part order (request, then audio), so a retry hashes identically no matter what boundary string the client generates. Usage lives in the response body; there is deliberately no STT usage header.",
+        "description": "Batch speech-to-text. The audio always travels as an uploaded part, never as a URL: the Router fetches nothing on a caller's behalf. For idempotency the content hash covers the decoded part payload bytes only — no part headers, no boundary bytes — concatenated in part order (request, then audio), so a retry hashes identically no matter what boundary string the client generates. Usage lives in the response body; there is deliberately no STT usage header.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
@@ -362,7 +362,7 @@
         "name": "Idempotency-Key",
         "in": "header",
         "required": true,
-        "description": "Required on every POST. The relay persists only the key, a content hash, and the request's execution status — never the content itself. For single-part bodies the content hash covers the raw body bytes exactly as sent; for multipart bodies it covers the decoded part payload bytes only — no part headers, no boundary bytes — concatenated in part order (request, then audio), so per-retry boundary strings never change the hash. Reusing a key with the same hash while the original admission is still live returns request_in_progress (retryable); after dispatch it returns request_already_started with the original request id, because stateless mode cannot replay output; reusing a key with a different hash returns idempotency_conflict. Keys are opaque; the relay imposes no format beyond the length bound, and the normative bound is 256 BYTES — maxLength below counts code points, which JSON Schema cannot avoid, so multi-byte keys hit the byte bound first.",
+        "description": "Required on every POST. The Router persists only the key, a content hash, and the request's execution status — never the content itself. For single-part bodies the content hash covers the raw body bytes exactly as sent; for multipart bodies it covers the decoded part payload bytes only — no part headers, no boundary bytes — concatenated in part order (request, then audio), so per-retry boundary strings never change the hash. Reusing a key with the same hash while the original admission is still live returns request_in_progress (retryable); after dispatch it returns request_already_started with the original request id, because stateless mode cannot replay output; reusing a key with a different hash returns idempotency_conflict. Keys are opaque; the Router imposes no format beyond the length bound, and the normative bound is 256 BYTES — maxLength below counts code points, which JSON Schema cannot avoid, so multi-byte keys hit the byte bound first.",
         "schema": {
           "type": "string",
           "minLength": 1,
@@ -372,7 +372,7 @@
     },
     "headers": {
       "SpekoRequestID": {
-        "description": "The relay request id, also embedded in error envelopes and Speko-minted LLM response ids.",
+        "description": "The Router request id, also embedded in error envelopes and Speko-minted LLM response ids.",
         "schema": {
           "type": "string"
         }
@@ -396,7 +396,7 @@
         }
       },
       "SpekoRegion": {
-        "description": "The Speko relay location that served the request. It is a proximity fact about Speko infrastructure, not a guarantee about where the provider processed the content.",
+        "description": "The Speko Router location that served the request. It is a proximity fact about Speko infrastructure, not a guarantee about where the provider processed the content.",
         "schema": {
           "type": "string"
         }
@@ -409,7 +409,7 @@
         }
       },
       "RateLimitPolicy": {
-        "description": "The active infrastructure quota policy in the current HTTPAPI structured-field format. The hosted Relay's default edge policy is \"relay-ip\";q=2000;w=300: 2,000 requests in a 300-second window for each public source IP. Organization and provider concurrency controls can impose a lower effective limit for admitted work.",
+        "description": "The active infrastructure quota policy in the current HTTPAPI structured-field format. The hosted Router's default edge policy is \"relay-ip\";q=2000;w=300: 2,000 requests in a 300-second window for each public source IP. Organization and provider concurrency controls can impose a lower effective limit for admitted work.",
         "schema": {
           "type": "string",
           "example": "\"relay-ip\";q=2000;w=300"
@@ -437,7 +437,7 @@
     },
     "responses": {
       "Error": {
-        "description": "Normalized failure. Every non-2xx response carries this envelope; the relay never forwards a raw provider response body.",
+        "description": "Normalized failure. Every non-2xx response carries this envelope; the Router never forwards a raw provider response body.",
         "headers": {
           "Speko-Request-ID": {
             "$ref": "#/components/headers/SpekoRequestID"
@@ -497,7 +497,7 @@
       },
       "Routing": {
         "type": "object",
-        "description": "Selects how the relay picks a provider for one request. It is a tagged union over mode: auto carries the objective and optional allow/deny provider filters, explicit carries exactly a provider and model. Fields from the other arm are rejected in both directions; a present-but-empty filter array ([]) counts as present and is rejected in explicit mode, while an empty-string provider or model in auto mode is indistinguishable from omission and tolerated as such. A wholly omitted routing object means {mode: auto, objective: balanced}, and an auto routing without an objective defaults to balanced — the default exists for omission, never for partially specified routing.\nExplicit mode also accepts the combined \"provider/model\" spelling in the model field: {\"model\": \"openai/gpt-5.2\"} with no provider splits at the first slash, and a model redundantly prefixed with the stated provider has the prefix stripped. Upstream model ids that themselves contain a slash must therefore name the provider one way or the other, e.g. \"together/meta-llama/Llama-X\" or provider \"together\" with model \"meta-llama/Llama-X\".",
+        "description": "Selects how the Router picks a provider for one request. It is a tagged union over mode: auto carries the objective and optional allow/deny provider filters, explicit carries exactly a provider and model. Fields from the other arm are rejected in both directions; a present-but-empty filter array ([]) counts as present and is rejected in explicit mode, while an empty-string provider or model in auto mode is indistinguishable from omission and tolerated as such. A wholly omitted routing object means {mode: auto, objective: balanced}, and an auto routing without an objective defaults to balanced — the default exists for omission, never for partially specified routing.\nExplicit mode also accepts the combined \"provider/model\" spelling in the model field: {\"model\": \"openai/gpt-5.2\"} with no provider splits at the first slash, and a model redundantly prefixed with the stated provider has the prefix stripped. Upstream model ids that themselves contain a slash must therefore name the provider one way or the other, e.g. \"together/meta-llama/Llama-X\" or provider \"together\" with model \"meta-llama/Llama-X\".",
         "properties": {
           "mode": {
             "$ref": "#/components/schemas/RoutingMode"
@@ -532,7 +532,7 @@
       },
       "Route": {
         "type": "object",
-        "description": "The response-side counterpart of Routing: the concrete decision that served a request. region is the Speko relay location, not a provider-processing residency guarantee, and attempt_id identifies the (possibly post-fallback) attempt that produced the output.",
+        "description": "The response-side counterpart of Routing: the concrete decision that served a request. region is the Speko Router location, not a provider-processing residency guarantee, and attempt_id identifies the (possibly post-fallback) attempt that produced the output.",
         "properties": {
           "provider": {
             "type": "string"
@@ -557,7 +557,7 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "Stable, machine-readable failure class. The set is closed: the relay normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. When an error envelope travels as an HTTP response, each code maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 404 route_not_found; 405 method_not_allowed; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable; 504 request_timeout. budget_exhausted and lease_expired terminate streams that are already established — an SSE error event after the 200 — so no HTTP status carries them.",
+        "description": "Stable, machine-readable failure class. The set is closed: the Router normalizes every failure — including provider failures — to one of these codes and never forwards a raw provider response body. When an error envelope travels as an HTTP response, each code maps to one canonical status: 400 capability_unsupported and invalid_request; 401 authentication_failed; 402 insufficient_credit; 404 route_not_found; 405 method_not_allowed; 409 idempotency_conflict, request_in_progress, and request_already_started; 413 payload_too_large; 415 unsupported_media; 429 rate_limited and concurrency_exhausted; 500 relay_error; 502 provider_error; 503 provider_unavailable; 504 request_timeout. budget_exhausted and lease_expired terminate streams that are already established — an SSE error event after the 200 — so no HTTP status carries them.",
         "enum": [
           "authentication_failed",
           "insufficient_credit",
@@ -582,7 +582,7 @@
       },
       "ErrorBody": {
         "type": "object",
-        "description": "The normalized failure detail. message is human-readable and intentionally carries no provider payload; request_id is present whenever a relay request id had been minted before the failure.",
+        "description": "The normalized failure detail. message is human-readable and intentionally carries no provider payload; request_id is present whenever a Router request id had been minted before the failure.",
         "properties": {
           "code": {
             "$ref": "#/components/schemas/ErrorCode"
@@ -595,7 +595,7 @@
             "minLength": 1,
             "maxLength": 512,
             "pattern": "^[^\\r\\n]+$",
-            "description": "Relay-authored, single-line remediation that never contains provider payloads or customer content."
+            "description": "Router-authored, single-line remediation that never contains provider payloads or customer content."
           },
           "retryable": {
             "type": "boolean"
@@ -658,7 +658,7 @@
       },
       "Kind": {
         "type": "string",
-        "description": "The provider-neutral operation served by the relay. The set is deliberately smaller than the local gateway's session kinds: the relay serves stt, tts, and llm, and has no realtime kind.",
+        "description": "The provider-neutral operation served by the Router. The set is deliberately smaller than the local gateway's session kinds: the Router serves stt, tts, and llm, and has no realtime kind.",
         "enum": [
           "stt",
           "tts",
@@ -683,7 +683,7 @@
           },
           "diarization": {
             "type": "boolean",
-            "description": "Labels transcript segments by speaker on the streaming transport. A model whose vendor offers diarization only on a batch API reports false, because this advertises what the relay can serve."
+            "description": "Labels transcript segments by speaker on the streaming transport. A model whose vendor offers diarization only on a batch API reports false, because this advertises what the Router can serve."
           },
           "keywords": {
             "type": "boolean",
@@ -707,7 +707,7 @@
       },
       "Model": {
         "type": "object",
-        "description": "One currently routable catalog entry. regions lists the Speko relay regions (AWS region ids) where the model is routable right now — relay locations, never provider-processing residency.",
+        "description": "One currently routable catalog entry. regions lists the Speko Router regions (AWS region ids) where the model is routable right now — Router locations, never provider-processing residency.",
         "properties": {
           "id": {
             "type": "string"
@@ -850,7 +850,7 @@
       },
       "BenchmarkMetadata": {
         "type": "object",
-        "description": "Identifies the exact public benchmark projection used to order the listing. digest pins the source bytes used by the Relay.",
+        "description": "Identifies the exact public benchmark projection used to order the listing. digest pins the source bytes used by the Router.",
         "properties": {
           "schema": {
             "type": "integer",
@@ -1012,7 +1012,7 @@
           },
           "keywords": {
             "type": "array",
-            "description": "Vocabulary-biasing terms (names, products, jargon), translated to each vendor's own spelling. At most 100 terms of at most 64 characters each; both bounds count CHARACTERS, which JSON Schema cannot express, so they are normative here in prose and enforced by the relay.",
+            "description": "Vocabulary-biasing terms (names, products, jargon), translated to each vendor's own spelling. At most 100 terms of at most 64 characters each; both bounds count CHARACTERS, which JSON Schema cannot express, so they are normative here in prose and enforced by the Router.",
             "items": {
               "type": "string"
             }
@@ -1023,7 +1023,7 @@
           },
           "provider_options": {
             "type": "object",
-            "description": "The vendor's OWN settings, namespaced by provider name, e.g. {\"deepgram\": {\"numerals\": true}}. Values are scalars only (boolean, number, or string of at most 256 characters). At most 8 providers, each with at most 16 settings. Settings addressed to a provider the request does not reach are ignored by design, so they never narrow routing. The relay forwards only the keys the routed provider allow-lists and refuses the rest by name; keys it owns itself (model, language, encoding, sample_rate, credentials, and the canonical asks' own vendor spellings) are always refused.",
+            "description": "The vendor's OWN settings, namespaced by provider name, e.g. {\"deepgram\": {\"numerals\": true}}. Values are scalars only (boolean, number, or string of at most 256 characters). At most 8 providers, each with at most 16 settings. Settings addressed to a provider the request does not reach are ignored by design, so they never narrow routing. The Router forwards only the keys the routed provider allow-lists and refuses the rest by name; keys it owns itself (model, language, encoding, sample_rate, credentials, and the canonical asks' own vendor spellings) are always refused.",
             "additionalProperties": {
               "type": "object",
               "additionalProperties": {
@@ -1101,7 +1101,7 @@
       },
       "AudioConfig": {
         "type": "object",
-        "description": "Raw audio on a relay stream: the output format of a TTS request, or the binary input frames of an STT stream. The bounds match the local gateway's portable media contract so a caller can move between provider-direct and relay routes without re-encoding.",
+        "description": "Raw audio on a Router stream: the output format of a TTS request, or the binary input frames of an STT stream. The bounds match the local gateway's portable media contract so a caller can move between provider-direct and Router routes without re-encoding.",
         "properties": {
           "encoding": {
             "type": "string",
@@ -1146,7 +1146,7 @@
           },
           "language": {
             "type": "string",
-            "description": "Optional language hint. Auto routing ranks candidates on that language's benchmark board and the relay picks a voice curated for it; omitted means English."
+            "description": "Optional language hint. Auto routing ranks candidates on that language's benchmark board and the Router picks a voice curated for it; omitted means English."
           },
           "audio": {
             "$ref": "#/components/schemas/AudioConfig"
@@ -1361,7 +1361,7 @@
         "additionalProperties": false
       },
       "Item": {
-        "description": "The tagged union entry of LLM input and output. The union is closed and flat: exactly one variant's fields may be set, and fields from another variant are rejected rather than ignored. Callers resend full conversation history on every request — including function_call and function_result items — because the relay stores no conversation state and exposes no previous_response_id. Each direction admits a subset of the union: request input uses InputItem (no structured_json) and response output uses OutputItem (no function_result, assistant messages only); this schema documents the full item vocabulary the two narrowings share.",
+        "description": "The tagged union entry of LLM input and output. The union is closed and flat: exactly one variant's fields may be set, and fields from another variant are rejected rather than ignored. Callers resend full conversation history on every request — including function_call and function_result items — because the Router stores no conversation state and exposes no previous_response_id. Each direction admits a subset of the union: request input uses InputItem (no structured_json) and response output uses OutputItem (no function_result, assistant messages only); this schema documents the full item vocabulary the two narrowings share.",
         "oneOf": [
           {
             "$ref": "#/components/schemas/MessageItem"
@@ -1387,7 +1387,7 @@
         }
       },
       "InputItem": {
-        "description": "The item union as request input admits it: structured_json items are output-only, so the union has no branch for them — resent history represents earlier structured output as ordinary assistant text. This narrowing exists in the schema, not just in prose, so a generated client cannot construct an input the relay rejects at runtime.",
+        "description": "The item union as request input admits it: structured_json items are output-only, so the union has no branch for them — resent history represents earlier structured output as ordinary assistant text. This narrowing exists in the schema, not just in prose, so a generated client cannot construct an input the Router rejects at runtime.",
         "oneOf": [
           {
             "$ref": "#/components/schemas/MessageItem"
@@ -1409,7 +1409,7 @@
         }
       },
       "OutputItem": {
-        "description": "The item union as response output emits it: function_result items only ever travel caller-to-relay and output messages are always assistant-authored, so the union carries no function_result branch and narrows message to AssistantMessageItem. Output is server-emitted — the narrowing makes a connector normalization bug that mislabels an item a loud contract violation instead of a plausible input shape.",
+        "description": "The item union as response output emits it: function_result items only ever travel caller-to-Router and output messages are always assistant-authored, so the union carries no function_result branch and narrows message to AssistantMessageItem. Output is server-emitted — the narrowing makes a connector normalization bug that mislabels an item a loud contract violation instead of a plausible input shape.",
         "oneOf": [
           {
             "$ref": "#/components/schemas/AssistantMessageItem"
@@ -1454,7 +1454,7 @@
       },
       "FunctionTool": {
         "type": "object",
-        "description": "A caller-defined function the model may call. parameters is the function's JSON Schema; the relay passes it through and enforces only that it is well-formed JSON — schema semantics belong to the provider. Tools are admitted only on models advertising the capability.",
+        "description": "A caller-defined function the model may call. parameters is the function's JSON Schema; the Router passes it through and enforces only that it is well-formed JSON — schema semantics belong to the provider. Tools are admitted only on models advertising the capability.",
         "properties": {
           "name": {
             "type": "string"
@@ -1509,7 +1509,7 @@
       },
       "LLMRequest": {
         "type": "object",
-        "description": "The POST /v1/llm/responses body. max_output_tokens is required: the relay reserves credit for the worst-case generation before dispatch, and an unbounded generation cannot be priced.",
+        "description": "The POST /v1/llm/responses body. max_output_tokens is required: the Router reserves credit for the worst-case generation before dispatch, and an unbounded generation cannot be priced.",
         "properties": {
           "routing": {
             "$ref": "#/components/schemas/Routing",

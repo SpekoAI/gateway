@@ -12,7 +12,7 @@ const (
 	// HeaderProvider and HeaderModel name the concrete provider decision.
 	HeaderProvider = "Speko-Provider"
 	HeaderModel    = "Speko-Model"
-	// HeaderRegion names the Speko relay location that served the request.
+	// HeaderRegion names the Speko Router location that served the request.
 	// It is a proximity fact about Speko infrastructure, not a guarantee
 	// about where the provider processed the content.
 	HeaderRegion = "Speko-Region"

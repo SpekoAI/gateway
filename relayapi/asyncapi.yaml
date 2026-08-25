@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:30452ab08d2df0c8ac9842376723fcc574dc6a223523c05afa3dd24d28847303
-# yaml-body: sha256:910d2062b08b72d4cae5f7fc93b681a7a3d3cc72b02d02d85437374aa32c4c4f
+# json-mirror: asyncapi.json sha256:ed354b28c2361115635406a9bb42d75039909f6b463d9ce7c5f998da5ab0b582
+# yaml-body: sha256:4907b5a29595ff70b8be144a543fda83c35b60087e89c55f8e29318f406730be
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -16,10 +16,10 @@
 # and TestSpecMirrorFingerprints fails on any half-done edit.
 asyncapi: "2.6.0"
 info:
-  title: Global Speko Relay streaming API
+  title: Speko Router streaming API
   version: "1.0.0"
   description: >-
-    WebSocket contract of the Global Speko Relay: streaming speech-to-text and
+    WebSocket contract of the Speko Router: streaming speech-to-text and
     text-to-speech sessions. JSON text frames carry the control messages and
     events documented here; binary frames carry raw audio in the format the
     session.configure frame declared, with no JSON envelope. The Go types in
@@ -28,8 +28,8 @@ info:
     endpoints are specified separately in openapi.yaml.
 defaultContentType: application/json
 servers:
-  relay:
-    url: relay.speko.dev
+  router:
+    url: router.speko.dev
     protocol: wss
     description: >-
       Global entry point. The upgrade request authenticates with a
@@ -61,7 +61,7 @@ channels:
               minLength: 1
               maxLength: 256
               description: >-
-                Required on the upgrade request. The relay persists only the
+                Required on the upgrade request. The Router persists only the
                 key, a content hash, and the session's execution status —
                 never the content itself. The hash covers the exact
                 session.configure text-frame bytes; later frames are
@@ -89,7 +89,7 @@ channels:
           - $ref: "#/components/messages/sttAudioInput"
     subscribe:
       operationId: receiveSTTFrames
-      summary: Frames the relay sends.
+      summary: Frames the Router sends.
       description: >-
         session.ready is always the first event frame; exactly one terminal
         frame — session.closed or error — ends the session.
@@ -121,7 +121,7 @@ channels:
               minLength: 1
               maxLength: 256
               description: >-
-                Required on the upgrade request. The relay persists only the
+                Required on the upgrade request. The Router persists only the
                 key, a content hash, and the session's execution status —
                 never the content itself. The hash covers the exact
                 session.configure text-frame bytes; later frames are
@@ -150,7 +150,7 @@ channels:
           - $ref: "#/components/messages/ttsSessionClose"
     subscribe:
       operationId: receiveTTSFrames
-      summary: Frames the relay sends.
+      summary: Frames the Router sends.
       description: >-
         session.ready is always the first event frame; exactly one terminal
         frame — session.closed or error — ends the session.
@@ -351,7 +351,7 @@ components:
     Routing:
       type: object
       description: >-
-        Selects how the relay picks a provider for one session. It is a tagged
+        Selects how the Router picks a provider for one session. It is a tagged
         union over mode: auto carries the objective and optional allow/deny
         provider filters, explicit carries exactly a provider and model.
         Fields from the other arm are rejected in both directions; a
@@ -399,7 +399,7 @@ components:
       type: object
       description: >-
         The response-side counterpart of Routing: the concrete decision that
-        served a session. region is the Speko relay location, not a
+        served a session. region is the Speko Router location, not a
         provider-processing residency guarantee, and attempt_id identifies the
         (possibly post-fallback) attempt that produced the output.
       properties:
@@ -420,10 +420,10 @@ components:
     AudioConfig:
       type: object
       description: >-
-        Raw audio on a relay stream: the binary input frames of an STT
+        Raw audio on a Router stream: the binary input frames of an STT
         session, or the synthesized output frames of a TTS session. The bounds
         match the local gateway's portable media contract so a caller can move
-        between provider-direct and relay routes without re-encoding.
+        between provider-direct and Router routes without re-encoding.
       properties:
         encoding:
           type: string
@@ -502,7 +502,7 @@ components:
     ErrorCode:
       type: string
       description: >-
-        Stable, machine-readable failure class. The set is closed: the relay
+        Stable, machine-readable failure class. The set is closed: the Router
         normalizes every failure — including provider failures — to one of
         these codes and never forwards a raw provider response body. On an
         established WebSocket session the code arrives in a terminal error
@@ -541,7 +541,7 @@ components:
       description: >-
         The normalized failure detail. message is human-readable and
         intentionally carries no provider payload; request_id is present
-        whenever a relay request id had been minted before the failure.
+        whenever a Router request id had been minted before the failure.
       properties:
         code:
           $ref: "#/components/schemas/ErrorCode"
@@ -552,7 +552,7 @@ components:
           minLength: 1
           maxLength: 512
           pattern: "^[^\\r\\n]+$"
-          description: Relay-authored, single-line remediation that never contains provider payloads or customer content.
+          description: Router-authored, single-line remediation that never contains provider payloads or customer content.
         retryable:
           type: boolean
         request_id:
@@ -639,7 +639,7 @@ components:
             each vendor's own spelling. At most 100 terms of at most 64
             characters each; both bounds count CHARACTERS, which JSON Schema
             cannot express, so they are normative here in prose and enforced
-            by the relay.
+            by the Router.
           items:
             type: string
         noise_reduction:
@@ -653,7 +653,7 @@ components:
             (boolean, number, or string of at most 256 characters). At most 8
             providers, each with at most 16 settings. Settings addressed to a
             provider the session does not reach are ignored by design, so
-            they never narrow routing. The relay forwards only the keys the
+            they never narrow routing. The Router forwards only the keys the
             routed provider allow-lists and refuses the rest by name; keys it
             owns itself (model, language, encoding, sample_rate, credentials,
             and the canonical asks' own vendor spellings) are always refused.
@@ -809,7 +809,7 @@ components:
           type: string
           description: >-
             Optional language hint. Auto routing ranks candidates on that
-            language's benchmark board and the relay picks a voice curated
+            language's benchmark board and the Router picks a voice curated
             for it; omitted means English.
         audio:
           $ref: "#/components/schemas/AudioConfig"
