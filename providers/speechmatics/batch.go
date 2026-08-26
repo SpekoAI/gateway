@@ -306,9 +306,7 @@ func (a *BatchAdapter) deleteQuietly(ctx context.Context, target string, authori
 		return
 	}
 	authorize(request)
-	response, err := batchhttp.Client(a.httpClient).Do(request)
-	if err != nil {
-		return
-	}
-	response.Body.Close()
+	// Through batchhttp.Do, never the raw client: the bearer is on this
+	// request too, and only Do refuses the redirect that would replay it.
+	_, _ = batchhttp.Do(a.httpClient, request, 1<<10)
 }
