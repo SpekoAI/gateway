@@ -119,6 +119,41 @@ func TestDoBoundsBodyAndClassifiesTransport(t *testing.T) {
 	}
 }
 
+// TestDoRefusesRedirects pins the credential boundary: a provider that
+// answers an approved endpoint with a redirect does not get the request — and
+// its API-key header — replayed at the destination.
+func TestDoRefusesRedirects(t *testing.T) {
+	t.Parallel()
+	leaked := make(chan string, 1)
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked <- r.Header.Get("X-API-Key")
+	}))
+	defer destination.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, destination.URL+"/elsewhere", http.StatusFound)
+	}))
+	defer origin.Close()
+
+	request, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, origin.URL+"/v1/stt", strings.NewReader("audio"))
+	request.Header.Set("X-API-Key", "secret")
+	response, err := Do(origin.Client(), request, 1024)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if response.Status != http.StatusFound {
+		t.Fatalf("status = %d, want the 302 surfaced unfollowed", response.Status)
+	}
+	select {
+	case key := <-leaked:
+		t.Fatalf("redirect was followed; destination saw X-API-Key %q", key)
+	default:
+	}
+	failure := StatusError("x", response.Status, response.Body)
+	if failure.Code != CodeProviderError || failure.Retryable {
+		t.Fatalf("redirect classified as %+v", failure)
+	}
+}
+
 func TestMultipartStreamsFieldsThenFile(t *testing.T) {
 	t.Parallel()
 	audio := strings.NewReader("RIFF....WAVEdata")

@@ -80,11 +80,17 @@ type Response struct {
 // document parsed as if complete. Transport failures are classified: a context
 // deadline is request_timeout, anything else provider_unavailable, both
 // retryable.
+//
+// Redirects are never followed. The endpoint policy validated the URL the
+// adapter dialed, and the credential is already on the request; Go's client
+// keeps custom headers (X-API-Key, xi-api-key) on a cross-host redirect, so
+// following one would hand the provider key to whatever host the response
+// named. A 3xx comes back as itself and is classified provider_error.
 func Do(client *http.Client, request *http.Request, maxBody int64) (*Response, error) {
 	if maxBody <= 0 {
 		maxBody = DefaultMaxResponseBytes
 	}
-	response, err := Client(client).Do(request)
+	response, err := noRedirects(Client(client)).Do(request)
 	if err != nil {
 		return nil, TransportError(request.Context(), err)
 	}
@@ -97,6 +103,15 @@ func Do(client *http.Client, request *http.Request, maxBody int64) (*Response, e
 		return nil, &runtimepkg.ProviderError{Code: CodeProviderError, Message: "provider response exceeded the size bound", Retryable: false, ProviderStatus: response.StatusCode}
 	}
 	return &Response{Status: response.StatusCode, Header: response.Header, Body: body}, nil
+}
+
+// noRedirects returns a shallow copy of client that surfaces a redirect as
+// the 3xx response instead of following it. The copy shares the transport,
+// so connection pooling and any test hooks on it are unaffected.
+func noRedirects(client *http.Client) *http.Client {
+	copied := *client
+	copied.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &copied
 }
 
 // TransportError classifies a failure to complete an HTTP exchange.
@@ -116,6 +131,9 @@ func TransportError(ctx context.Context, err error) error {
 func StatusError(extension string, status int, body []byte) *runtimepkg.ProviderError {
 	failure := &runtimepkg.ProviderError{ProviderStatus: status, Message: fmt.Sprintf("provider returned HTTP %d", status)}
 	switch {
+	case status >= 300 && status < 400:
+		failure.Code = CodeProviderError
+		failure.Message = fmt.Sprintf("provider answered with a redirect (HTTP %d), which the relay does not follow", status)
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		failure.Code = CodeAuthenticationFailed
 	case status == http.StatusTooManyRequests:
