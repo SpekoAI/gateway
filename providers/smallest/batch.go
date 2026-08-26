@@ -1,7 +1,9 @@
 package smallest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -95,9 +97,15 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	query := url.Values{}
 	query.Set("model", model)
 	query.Set("word_timestamps", "true")
-	if language := strings.TrimSpace(request.Options.Language); language != "" {
-		query.Set("language", language)
+	// `language` is REQUIRED on the pre-recorded endpoint ("missing or
+	// invalid values return 400"), unlike the live socket, which defaults it.
+	// A caller who pinned nothing gets English, the vendor's own live default
+	// and the only language pulse-pro accepts at all.
+	language := normalizeLanguage(request.Options.Language)
+	if language == "" {
+		language = "en"
 	}
+	query.Set("language", language)
 	if request.Options.STT.Diarize() {
 		query.Set("diarize", "true")
 	}
@@ -129,16 +137,16 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		Transcription string `json:"transcription"`
 		Language      string `json:"language"`
 		Words         []struct {
-			Word    string  `json:"word"`
-			Start   float64 `json:"start"`
-			End     float64 `json:"end"`
-			Speaker *string `json:"speaker"`
+			Word    string          `json:"word"`
+			Start   float64         `json:"start"`
+			End     float64         `json:"end"`
+			Speaker json.RawMessage `json:"speaker"`
 		} `json:"words"`
 		Utterances []struct {
-			Text    string  `json:"text"`
-			Start   float64 `json:"start"`
-			End     float64 `json:"end"`
-			Speaker *string `json:"speaker"`
+			Text    string          `json:"text"`
+			Start   float64         `json:"start"`
+			End     float64         `json:"end"`
+			Speaker json.RawMessage `json:"speaker"`
 		} `json:"utterances"`
 		Metadata struct {
 			Duration float64 `json:"duration"`
@@ -166,20 +174,12 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 			if text == "" {
 				continue
 			}
-			speaker := ""
-			if utterance.Speaker != nil {
-				speaker = *utterance.Speaker
-			}
-			result.Segments = append(result.Segments, runtimepkg.BatchSegment{Text: text, StartMS: batchhttp.SecondsToMS(utterance.Start), EndMS: batchhttp.SecondsToMS(utterance.End), Speaker: speaker})
+			result.Segments = append(result.Segments, runtimepkg.BatchSegment{Text: text, StartMS: batchhttp.SecondsToMS(utterance.Start), EndMS: batchhttp.SecondsToMS(utterance.End), Speaker: speakerLabel(utterance.Speaker)})
 		}
 	} else {
 		words := make([]batchhttp.Word, 0, len(payload.Words))
 		for _, word := range payload.Words {
-			speaker := ""
-			if word.Speaker != nil {
-				speaker = *word.Speaker
-			}
-			words = append(words, batchhttp.Word{Text: word.Word, StartMS: batchhttp.SecondsToMS(word.Start), EndMS: batchhttp.SecondsToMS(word.End), Speaker: speaker})
+			words = append(words, batchhttp.Word{Text: word.Word, StartMS: batchhttp.SecondsToMS(word.Start), EndMS: batchhttp.SecondsToMS(word.End), Speaker: speakerLabel(word.Speaker)})
 		}
 		result.Segments = batchhttp.GroupWords(words, 0)
 	}
@@ -187,4 +187,18 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		result.Text = batchhttp.JoinSegments(result.Segments)
 	}
 	return result, nil
+}
+
+// speakerLabel renders a speaker the vendor may serialize as a number
+// ("speaker": 0) or a string, or omit.
+func speakerLabel(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text
+	}
+	return string(raw)
 }

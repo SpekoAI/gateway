@@ -139,11 +139,14 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	}
 
 	// Step 2: submit.
+	// speech_models (plural, an array) is the current parameter; the
+	// singular speech_model is deprecated and the API refuses the new model
+	// ids on it — every canary probe 400'd before this was an array.
 	submission := map[string]any{
-		"audio_url":    uploadedBody.UploadURL,
-		"speech_model": model,
-		"punctuate":    true,
-		"format_text":  true,
+		"audio_url":     uploadedBody.UploadURL,
+		"speech_models": []string{model},
+		"punctuate":     true,
+		"format_text":   true,
 	}
 	if language := strings.TrimSpace(request.Options.Language); language != "" {
 		submission["language_code"] = baseBatchLanguage(language)
