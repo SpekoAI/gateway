@@ -87,7 +87,7 @@ func TestBatchTranscribeUploadsSubmitsAndPolls(t *testing.T) {
 	if string(uploadBody) != audio {
 		t.Fatal("upload body was not the WAV container")
 	}
-	want := map[string]any{"audio_url": "https://cdn.assemblyai.com/upload/abc", "speech_model": "universal-3-5-pro", "punctuate": true, "format_text": true, "language_code": "en_us", "speaker_labels": true, "keyterms_prompt": []any{"Speko"}, "disfluencies": true}
+	want := map[string]any{"audio_url": "https://cdn.assemblyai.com/upload/abc", "speech_models": []any{"universal-3-5-pro"}, "punctuate": true, "format_text": true, "language_code": "en_us", "speaker_labels": true, "keyterms_prompt": []any{"Speko"}, "disfluencies": true}
 	if got, _ := json.Marshal(submitBody); string(got) != mustJSON(t, want) {
 		t.Fatalf("submit body = %s\nwant %s", got, mustJSON(t, want))
 	}

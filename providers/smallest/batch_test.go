@@ -63,6 +63,31 @@ func TestBatchTranscribePostsRawBody(t *testing.T) {
 	}
 }
 
+// TestBatchTranscribeDefaultsRequiredLanguageAndReadsNumericSpeakers: the
+// pre-recorded endpoint 400s without `language`, so an unpinned request sends
+// English; speaker labels arrive as integers.
+func TestBatchTranscribeDefaultsRequiredLanguageAndReadsNumericSpeakers(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("language") != "en" {
+			t.Errorf("language = %q, want the en default", r.URL.Query().Get("language"))
+		}
+		_, _ = w.Write([]byte(`{"request_id":"rq2","status":"success","transcription":"Hello there. Hi.","words":[{"word":"Hello","start":0.1,"end":0.4,"speaker":0},{"word":"there.","start":0.45,"end":0.8,"speaker":0},{"word":"Hi.","start":1.0,"end":1.2,"speaker":1}],"metadata":{"duration":1.5}}`))
+	}))
+	defer server.Close()
+	adapter, _ := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+	result, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{
+		Plan: batchPlan(server.URL + "/waves/v1/stt/"), Media: protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1},
+		Audio: strings.NewReader("RIFF"), AudioBytes: 4,
+	})
+	if err != nil {
+		t.Fatalf("transcribe: %v", err)
+	}
+	if result.Text != "Hello there. Hi." || len(result.Segments) != 2 || result.Segments[0].Speaker != "0" || result.Segments[1].Speaker != "1" || result.DurationMS != 1500 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
 func TestBatchTranscribeRefusals(t *testing.T) {
 	t.Parallel()
 	adapter, _ := NewBatch(BatchConfig{})
