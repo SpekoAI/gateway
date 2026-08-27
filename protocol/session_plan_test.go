@@ -106,6 +106,19 @@ func TestSessionPlanRequestRejectsConflictingRoutePolicy(t *testing.T) {
 	assertInvalid(t, request.Validate(), "not supported by the runtime")
 }
 
+// TestSessionPlanRequestRejectsS2SKind pins the mirror of the relay's
+// realtime refusal: s2s is a relay-only kind, so a revision-3 session plan
+// request naming it is rejected rather than admitted for a local Engine that
+// has no s2s arm. The relay's own contract accepts it (see
+// TestRelayPlanFixturesAreValid over relay-plan-s2s.json).
+func TestSessionPlanRequestRejectsS2SKind(t *testing.T) {
+	t.Parallel()
+
+	request := validRequest(t)
+	request.Kind = protocol.SessionKindS2S
+	assertInvalid(t, request.Validate(), "unsupported value")
+}
+
 func TestSessionPlanRequestValidatesOptionalWorkloadIdentity(t *testing.T) {
 	t.Parallel()
 

@@ -24,12 +24,19 @@ const (
 	SessionKindTTS      SessionKind = "tts"
 	SessionKindLLM      SessionKind = "llm"
 	SessionKindRealtime SessionKind = "realtime"
-	// SessionKindS2S is the relay's speech-to-speech kind: one bidirectional
+	// SessionKindS2S is the RELAY's speech-to-speech kind: one bidirectional
 	// audio session in which the provider model listens and speaks. It is
 	// deliberately distinct from SessionKindRealtime, the local gateway's
 	// provider-direct concept, because the relay meters and budgets it
 	// differently (connected seconds under one budget group) and the two
-	// carry different execution contracts. Realtime stays out of relay plans.
+	// carry different execution contracts.
+	//
+	// The two kinds are mirror images, and both exclusions are deliberate:
+	// relay plans reject realtime (validRelayKind), and revision-3 session
+	// plans reject s2s (validKind below). A session plan is executed by the
+	// local runtime Engine, which has no s2s arm; accepting the kind there
+	// would admit a plan the runtime cannot serve, which is worse than
+	// refusing it. Both refusals are pinned by tests.
 	SessionKindS2S SessionKind = "s2s"
 )
 
@@ -674,6 +681,9 @@ func validateSecureURL(raw, scheme string) error {
 	return nil
 }
 
+// validKind is the revision-3 SESSION-plan kind set. s2s is deliberately
+// absent: it exists only on the relay contract (validRelayKind in
+// relay_plan.go), and the local Engine cannot execute it.
 func validKind(v SessionKind) bool {
 	return v == SessionKindSTT || v == SessionKindTTS || v == SessionKindLLM || v == SessionKindRealtime
 }
