@@ -1,0 +1,41 @@
+[
+  {
+    "type": "session.configure",
+    "routing": {"mode": "explicit", "provider": "google", "model": "gemini-3.1-flash-live-preview"},
+    "audio": {
+      "input": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
+      "output": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1}
+    },
+    "language": "en",
+    "voice": "Kore",
+    "instructions": "You are a friendly kitchen assistant. Keep answers short.",
+    "temperature": 0.8
+  },
+  {"type": "input.commit"},
+  {"type": "response.cancel"},
+  {"type": "session.close"},
+  {
+    "type": "session.ready",
+    "request_id": "req_9f1c2a",
+    "route": {"provider": "google", "model": "gemini-3.1-flash-live-preview", "region": "us-west-2", "attempt_id": "att_1"}
+  },
+  {"type": "input.speech_started"},
+  {"type": "input.speech_ended"},
+  {"type": "input.transcript", "text": "what's the weather like", "final": true},
+  {"type": "response.started", "sequence": 1},
+  {"type": "response.transcript.delta", "sequence": 1, "text": "It looks sunny "},
+  {"type": "response.done", "sequence": 1},
+  {"type": "response.cancelled", "sequence": 2},
+  {"type": "usage.updated", "usage": {"duration_ms": 12000}},
+  {"type": "session.closed", "usage": {"duration_ms": 31450}},
+  {
+    "type": "error",
+    "error": {
+      "code": "lease_expired",
+      "message": "the session lease could not be renewed",
+      "hint": "Start a new streaming session; the previous session lease cannot be renewed.",
+      "retryable": true,
+      "request_id": "req_9f1c2a"
+    }
+  }
+]

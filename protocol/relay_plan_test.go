@@ -10,7 +10,7 @@ import (
 	"github.com/SpekoAI/gateway/protocol"
 )
 
-var relayPlanFixtures = []string{"relay-plan-stt.json", "relay-plan-tts.json", "relay-plan-llm.json"}
+var relayPlanFixtures = []string{"relay-plan-stt.json", "relay-plan-tts.json", "relay-plan-llm.json", "relay-plan-s2s.json"}
 
 func TestRelayPlanFixturesAreValid(t *testing.T) {
 	t.Parallel()
@@ -82,6 +82,8 @@ func TestRelayPlanRejectsInvalidMutations(t *testing.T) {
 		{"tts group on an stt plan", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.Budgets[0].Group = protocol.RelayBudgetGroupTTSCharacters }, "not valid for stt plans"},
 		{"llm group on a tts plan", "relay-plan-tts.json", func(p *protocol.RelayPlan) { p.Budgets[0].Group = protocol.RelayBudgetGroupLLMInput }, "not valid for tts plans"},
 		{"llm plan missing the output group", "relay-plan-llm.json", func(p *protocol.RelayPlan) { p.Budgets = p.Budgets[:1] }, "require both llm_input and llm_output"},
+		{"stt group on an s2s plan", "relay-plan-s2s.json", func(p *protocol.RelayPlan) { p.Budgets[0].Group = protocol.RelayBudgetGroupSTTDuration }, "not valid for s2s plans"},
+		{"s2s group on an stt plan", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.Budgets[0].Group = protocol.RelayBudgetGroupS2SDuration }, "not valid for stt plans"},
 		{"lease with non-positive duration", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.Lease.DurationSeconds = 0 }, "lease: duration_seconds: must be positive"},
 		{"lease already expired", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.Lease.ExpiresAt = now }, "lease: lease is expired"},
 		{"lease renewal over plain http", "relay-plan-stt.json", func(p *protocol.RelayPlan) { p.Lease.RenewalURL = "http://gateway.speko.dev/renew" }, "lease: renewal_url"},

@@ -166,6 +166,97 @@
           ]
         }
       }
+    },
+    "/v1/s2s/stream": {
+      "description": "Speech-to-speech. The first text frame MUST be session.configure; its exact frame bytes are the session's idempotency content hash. Audio input travels in binary frames in the declared input format, and the client must not send audio before session.ready arrives. Spoken answers travel in binary frames in the declared output format between the response.started and response.done (or response.cancelled) events that share their sequence number. The session is metered by connected wall-clock time. Exactly one terminal frame — session.closed or error — ends every session.",
+      "bindings": {
+        "ws": {
+          "method": "GET",
+          "headers": {
+            "type": "object",
+            "properties": {
+              "Idempotency-Key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Required on the upgrade request. The Router persists only the key, a content hash, and the session's execution status — never the content itself. The hash covers the exact session.configure text-frame bytes; later frames are intentionally outside the hash. Reusing a key with the same hash while the original admission is still live returns request_in_progress (retryable); after dispatch it returns request_already_started with the original request id; reusing a key with a different hash returns idempotency_conflict. Keys are opaque, and the normative length bound is 256 BYTES — maxLength below counts code points, which JSON Schema cannot avoid, so multi-byte keys hit the byte bound first."
+              }
+            },
+            "required": [
+              "Idempotency-Key"
+            ]
+          }
+        }
+      },
+      "publish": {
+        "operationId": "sendS2SFrames",
+        "summary": "Frames the client sends.",
+        "description": "JSON control frames, plus untyped binary frames carrying audio input.",
+        "message": {
+          "oneOf": [
+            {
+              "$ref": "#/components/messages/s2sSessionConfigure"
+            },
+            {
+              "$ref": "#/components/messages/s2sInputCommit"
+            },
+            {
+              "$ref": "#/components/messages/s2sResponseCancel"
+            },
+            {
+              "$ref": "#/components/messages/s2sSessionClose"
+            },
+            {
+              "$ref": "#/components/messages/s2sAudioInput"
+            }
+          ]
+        }
+      },
+      "subscribe": {
+        "operationId": "receiveS2SFrames",
+        "summary": "Frames the Router sends.",
+        "description": "session.ready is always the first event frame; exactly one terminal frame — session.closed or error — ends the session.",
+        "message": {
+          "oneOf": [
+            {
+              "$ref": "#/components/messages/s2sSessionReady"
+            },
+            {
+              "$ref": "#/components/messages/s2sInputSpeechStarted"
+            },
+            {
+              "$ref": "#/components/messages/s2sInputSpeechEnded"
+            },
+            {
+              "$ref": "#/components/messages/s2sInputTranscript"
+            },
+            {
+              "$ref": "#/components/messages/s2sResponseStarted"
+            },
+            {
+              "$ref": "#/components/messages/s2sResponseTranscriptDelta"
+            },
+            {
+              "$ref": "#/components/messages/s2sAudioOutput"
+            },
+            {
+              "$ref": "#/components/messages/s2sResponseDone"
+            },
+            {
+              "$ref": "#/components/messages/s2sResponseCancelled"
+            },
+            {
+              "$ref": "#/components/messages/s2sUsageUpdated"
+            },
+            {
+              "$ref": "#/components/messages/s2sSessionClosed"
+            },
+            {
+              "$ref": "#/components/messages/wsError"
+            }
+          ]
+        }
+      }
     }
   },
   "components": {
@@ -341,10 +432,142 @@
           "$ref": "#/components/schemas/TTSSessionClosed"
         }
       },
+      "s2sSessionConfigure": {
+        "name": "session.configure",
+        "title": "S2S session.configure",
+        "summary": "Opens a speech-to-speech session; must be the first text frame on the socket.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SSessionConfigure"
+        }
+      },
+      "s2sInputCommit": {
+        "name": "input.commit",
+        "title": "S2S input.commit",
+        "summary": "Tells the model the caller finished speaking. A hint: every routed model also detects turn ends on its own.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SInputCommit"
+        }
+      },
+      "s2sResponseCancel": {
+        "name": "response.cancel",
+        "title": "S2S response.cancel",
+        "summary": "Interrupts the answer being spoken. Audio already delivered stays delivered.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SResponseCancel"
+        }
+      },
+      "s2sSessionClose": {
+        "name": "session.close",
+        "title": "S2S session.close",
+        "summary": "Asks the server to end the session with a terminal session.closed frame.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SSessionClose"
+        }
+      },
+      "s2sAudioInput": {
+        "name": "audio",
+        "title": "S2S binary audio input frame",
+        "summary": "One binary WebSocket frame of raw caller audio in the declared input format. Binary frames are untyped: they carry no JSON envelope.",
+        "contentType": "application/octet-stream",
+        "payload": {
+          "type": "string",
+          "format": "binary"
+        }
+      },
+      "s2sSessionReady": {
+        "name": "session.ready",
+        "title": "S2S session.ready",
+        "summary": "Confirms admission and reports the concrete route; always the first event frame.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SSessionReady"
+        }
+      },
+      "s2sInputSpeechStarted": {
+        "name": "input.speech_started",
+        "title": "S2S input.speech_started",
+        "summary": "The model detected the caller speaking.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SInputSpeechStarted"
+        }
+      },
+      "s2sInputSpeechEnded": {
+        "name": "input.speech_ended",
+        "title": "S2S input.speech_ended",
+        "summary": "The model detected the end of the caller's turn.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SInputSpeechEnded"
+        }
+      },
+      "s2sInputTranscript": {
+        "name": "input.transcript",
+        "title": "S2S input.transcript",
+        "summary": "The model's transcription of what the caller said.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SInputTranscript"
+        }
+      },
+      "s2sResponseStarted": {
+        "name": "response.started",
+        "title": "S2S response.started",
+        "summary": "Announces the binary audio frames of one spoken answer.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SResponseStarted"
+        }
+      },
+      "s2sResponseTranscriptDelta": {
+        "name": "response.transcript.delta",
+        "title": "S2S response.transcript.delta",
+        "summary": "A piece of the text of the answer being spoken.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SResponseTranscriptDelta"
+        }
+      },
+      "s2sAudioOutput": {
+        "name": "audio",
+        "title": "S2S binary audio output frame",
+        "summary": "One binary WebSocket frame of the spoken answer in the declared output format, sent between the response.started and response.done (or response.cancelled) events that share its sequence number. Binary frames are untyped: they carry no JSON envelope.",
+        "contentType": "application/octet-stream",
+        "payload": {
+          "type": "string",
+          "format": "binary"
+        }
+      },
+      "s2sResponseDone": {
+        "name": "response.done",
+        "title": "S2S response.done",
+        "summary": "Marks the end of one answer's binary audio frames.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SResponseDone"
+        }
+      },
+      "s2sResponseCancelled": {
+        "name": "response.cancelled",
+        "title": "S2S response.cancelled",
+        "summary": "An answer stopped before it finished because the caller interrupted it; no response.done follows for that sequence.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SResponseCancelled"
+        }
+      },
+      "s2sUsageUpdated": {
+        "name": "usage.updated",
+        "title": "S2S usage.updated",
+        "summary": "Cumulative usage while the session is live.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SUsageUpdated"
+        }
+      },
+      "s2sSessionClosed": {
+        "name": "session.closed",
+        "title": "S2S session.closed",
+        "summary": "The clean terminal frame carrying final usage.",
+        "payload": {
+          "$ref": "#/components/schemas/S2SSessionClosed"
+        }
+      },
       "wsError": {
         "name": "error",
         "title": "Terminal error frame",
-        "summary": "The terminal error frame, shared by STT and TTS sessions. The type name matches the SSE error event deliberately: one error vocabulary across every streaming transport.",
+        "summary": "The terminal error frame, shared by STT, TTS and S2S sessions. The type name matches the SSE error event deliberately: one error vocabulary across every streaming transport.",
         "payload": {
           "$ref": "#/components/schemas/ErrorEvent"
         }
@@ -1001,6 +1224,322 @@
         "additionalProperties": false
       },
       "TTSSessionClosed": {
+        "type": "object",
+        "description": "The clean terminal frame carrying final usage.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "session.closed"
+            ]
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          }
+        },
+        "required": [
+          "type",
+          "usage"
+        ],
+        "additionalProperties": false
+      },
+      "S2SAudioConfig": {
+        "type": "object",
+        "description": "Both directions of a speech-to-speech session: the raw binary frames the client sends and the raw binary frames it wants back. They may differ — most models listen and speak at different rates. Each model's accepted input and spoken output formats are advertised by GET /v1/models as audio_formats and output_audio_formats.",
+        "properties": {
+          "input": {
+            "$ref": "#/components/schemas/AudioConfig"
+          },
+          "output": {
+            "$ref": "#/components/schemas/AudioConfig"
+          }
+        },
+        "required": [
+          "input",
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "S2SSessionConfigure": {
+        "type": "object",
+        "description": "Opens a speech-to-speech session. Voice, language, instructions and temperature are session intent: they ride this frame and the idempotency hash, and later frames cannot change them.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "session.configure"
+            ]
+          },
+          "routing": {
+            "$ref": "#/components/schemas/Routing",
+            "description": "Omitted entirely, routing means {mode: auto, objective: balanced}."
+          },
+          "audio": {
+            "$ref": "#/components/schemas/S2SAudioConfig"
+          },
+          "language": {
+            "type": "string",
+            "description": "Optional language hint. Auto routing ranks candidates on that language's benchmark board and the Router picks a voice curated for it."
+          },
+          "voice": {
+            "type": "string",
+            "description": "Optional: in auto mode the party that picks the provider picks a default voice for it."
+          },
+          "instructions": {
+            "type": "string",
+            "maxLength": 32768,
+            "description": "The system prompt the model speaks under. Customer content; the bound is 32 KiB of UTF-8 and is normative here in prose — JSON Schema counts code points."
+          },
+          "temperature": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "description": "Sampling temperature; omitted leaves the vendor default."
+          }
+        },
+        "required": [
+          "type",
+          "audio"
+        ],
+        "additionalProperties": false
+      },
+      "S2SInputCommit": {
+        "type": "object",
+        "description": "Tells the model the caller finished speaking. A hint: every routed model also detects turn ends on its own.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "input.commit"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "S2SResponseCancel": {
+        "type": "object",
+        "description": "Interrupts the answer being spoken (barge-in). Audio already delivered stays delivered and billed.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "response.cancel"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "S2SSessionClose": {
+        "type": "object",
+        "description": "Asks the server to end the session with a terminal session.closed frame.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "session.close"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "S2SSessionReady": {
+        "type": "object",
+        "description": "Confirms admission and reports the concrete route. It is always the first event frame; the client must not send audio before it.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "session.ready"
+            ]
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "route": {
+            "$ref": "#/components/schemas/Route"
+          }
+        },
+        "required": [
+          "type",
+          "request_id",
+          "route"
+        ],
+        "additionalProperties": false
+      },
+      "S2SInputSpeechStarted": {
+        "type": "object",
+        "description": "The model detected the caller speaking.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "input.speech_started"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "S2SInputSpeechEnded": {
+        "type": "object",
+        "description": "The model detected the end of the caller's turn.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "input.speech_ended"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "S2SInputTranscript": {
+        "type": "object",
+        "description": "The model's transcription of what the caller said. final marks a completed span; a non-final transcript is an interim hypothesis superseded by later frames and is never empty. A final transcript may be empty: a finalized span of silence is legitimate.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "input.transcript"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "final": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "type",
+          "text",
+          "final"
+        ],
+        "additionalProperties": false
+      },
+      "S2SResponseStarted": {
+        "type": "object",
+        "description": "Announces the binary audio frames of one spoken answer. sequence is the 1-based answer index within the session.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "response.started"
+            ]
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "type",
+          "sequence"
+        ],
+        "additionalProperties": false
+      },
+      "S2SResponseTranscriptDelta": {
+        "type": "object",
+        "description": "A piece of the text of the answer being spoken; never empty.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "response.transcript.delta"
+            ]
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "sequence",
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "S2SResponseDone": {
+        "type": "object",
+        "description": "Marks the end of one answer's binary audio frames.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "response.done"
+            ]
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "type",
+          "sequence"
+        ],
+        "additionalProperties": false
+      },
+      "S2SResponseCancelled": {
+        "type": "object",
+        "description": "An answer stopped before it finished because the caller interrupted it (barge-in or response.cancel). No response.done follows for that sequence.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "response.cancelled"
+            ]
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "type",
+          "sequence"
+        ],
+        "additionalProperties": false
+      },
+      "S2SUsageUpdated": {
+        "type": "object",
+        "description": "Cumulative usage while the session is live. For s2s, duration_ms is connected wall-clock time so far.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "usage.updated"
+            ]
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          }
+        },
+        "required": [
+          "type",
+          "usage"
+        ],
+        "additionalProperties": false
+      },
+      "S2SSessionClosed": {
         "type": "object",
         "description": "The clean terminal frame carrying final usage.",
         "properties": {

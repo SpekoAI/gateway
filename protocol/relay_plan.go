@@ -53,6 +53,12 @@ const (
 	RelayBudgetGroupTTSCharacters RelayBudgetGroup = "tts_characters"
 	RelayBudgetGroupLLMInput      RelayBudgetGroup = "llm_input"
 	RelayBudgetGroupLLMOutput     RelayBudgetGroup = "llm_output"
+	// RelayBudgetGroupS2SDuration authorizes connected seconds of a
+	// speech-to-speech session, denominated in duration_seconds like STT. The
+	// session is metered by wall clock from provider connect to close: vendor
+	// audio-token counts differ per vendor and cannot be guarded before the
+	// audio is sent, so they stay telemetry evidence rather than the unit.
+	RelayBudgetGroupS2SDuration RelayBudgetGroup = "s2s_duration"
 )
 
 // RelayBudget is one signed spend ceiling. The ceiling is the connector's
@@ -82,7 +88,8 @@ type RelayPlan struct {
 	// plans are content-free and safe to persist in the ledger.
 	OrganizationID string `json:"organization_id"`
 	PrincipalID    string `json:"principal_id"`
-	// Kind is limited to stt, tts, and llm; the relay has no realtime kind.
+	// Kind is limited to stt, tts, llm, and s2s; the local gateway's realtime
+	// kind has no relay execution contract.
 	Kind SessionKind `json:"kind"`
 	// Region is the Speko relay region (an AWS region identifier) whose
 	// connector fleet must execute this plan, not a provider residency claim.
@@ -372,11 +379,11 @@ func validateCatalogDigest(digest string) error {
 }
 
 func validRelayKind(v SessionKind) bool {
-	return v == SessionKindSTT || v == SessionKindTTS || v == SessionKindLLM
+	return v == SessionKindSTT || v == SessionKindTTS || v == SessionKindLLM || v == SessionKindS2S
 }
 
 func validRelayBudgetGroup(v RelayBudgetGroup) bool {
-	return v == RelayBudgetGroupSTTDuration || v == RelayBudgetGroupTTSCharacters || v == RelayBudgetGroupLLMInput || v == RelayBudgetGroupLLMOutput
+	return v == RelayBudgetGroupSTTDuration || v == RelayBudgetGroupTTSCharacters || v == RelayBudgetGroupLLMInput || v == RelayBudgetGroupLLMOutput || v == RelayBudgetGroupS2SDuration
 }
 
 func relayBudgetGroupLegalForKind(kind SessionKind, group RelayBudgetGroup) bool {
@@ -387,6 +394,8 @@ func relayBudgetGroupLegalForKind(kind SessionKind, group RelayBudgetGroup) bool
 		return group == RelayBudgetGroupTTSCharacters
 	case SessionKindLLM:
 		return group == RelayBudgetGroupLLMInput || group == RelayBudgetGroupLLMOutput
+	case SessionKindS2S:
+		return group == RelayBudgetGroupS2SDuration
 	}
 	return false
 }
