@@ -24,6 +24,13 @@ const (
 	SessionKindTTS      SessionKind = "tts"
 	SessionKindLLM      SessionKind = "llm"
 	SessionKindRealtime SessionKind = "realtime"
+	// SessionKindS2S is the relay's speech-to-speech kind: one bidirectional
+	// audio session in which the provider model listens and speaks. It is
+	// deliberately distinct from SessionKindRealtime, the local gateway's
+	// provider-direct concept, because the relay meters and budgets it
+	// differently (connected seconds under one budget group) and the two
+	// carry different execution contracts. Realtime stays out of relay plans.
+	SessionKindS2S SessionKind = "s2s"
 )
 
 // Placement identifies where the runtime executes.
@@ -155,6 +162,25 @@ type RequestOptions struct {
 	// every plan request an older control plane parses — byte-identical when
 	// the caller asks for nothing.
 	STT *SttOptions `json:"stt,omitempty"`
+	// S2S carries the session-level asks of a speech-to-speech session. Only
+	// ever set on s2s sessions; omitempty keeps every existing payload
+	// byte-identical when the caller asks for nothing.
+	S2S *S2SOptions `json:"s2s,omitempty"`
+}
+
+// S2SOptions are the portable session settings of a speech-to-speech
+// session: what the model is told, how deterministic it should be, and the
+// audio format the caller wants back. Voice and language ride the enclosing
+// RequestOptions like they do for TTS.
+type S2SOptions struct {
+	// Instructions is the system prompt the model speaks under. Customer
+	// content: adapters place it on the vendor wire and nothing else reads it.
+	Instructions string `json:"instructions,omitempty"`
+	// Temperature is the sampling temperature; nil leaves the vendor default.
+	Temperature *float64 `json:"temperature,omitempty"`
+	// OutputMedia is the format of the audio the model speaks back. Input
+	// audio rides AdapterRequest.Media like every speech session.
+	OutputMedia *MediaFormat `json:"output_media,omitempty"`
 }
 
 // UsageUnit identifies the provider quantity whose spend was authorized by a

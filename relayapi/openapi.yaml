@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:0af41c16c681333be1a5a2d353066e71237363f78aeb6738b7c735b9e67fce5b
-# yaml-body: sha256:fa2ba2f7449ae54ba77b2beb1dce8aa87f378d12cb76f13baa7e20f0f1500535
+# json-mirror: openapi.json sha256:64464206b2566a0859327e8cffddb28769413b06ae532217c48fa2592c528126
+# yaml-body: sha256:2f6d1c0f0c673124682f391822bd221ab3d0c4926ebf86778f0bcb908b76275d
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -635,13 +635,16 @@ components:
     Kind:
       type: string
       description: >-
-        The provider-neutral operation served by the Router. The set is
-        deliberately smaller than the local gateway's session kinds: the Router
-        serves stt, tts, and llm, and has no realtime kind.
+        The provider-neutral operation served by the Router: stt, tts, llm,
+        and s2s (speech-to-speech — one bidirectional audio session in which
+        the model listens and speaks, served on the /v1/s2s/stream WebSocket
+        channel documented in asyncapi.yaml). The local gateway's realtime
+        kind has no Router contract.
       enum:
         - stt
         - tts
         - llm
+        - s2s
     ModelCapabilities:
       type: object
       description: >-
@@ -707,11 +710,21 @@ components:
             type: string
         audio_formats:
           type: array
-          description: Accepted input formats for STT or output formats for TTS; omitted for LLM models.
+          description: >-
+            Accepted input formats for STT and s2s models, or output formats
+            for TTS; omitted for LLM models.
           items:
             $ref: "#/components/schemas/AudioFormat"
         batch_audio_limits:
           $ref: "#/components/schemas/BatchAudioLimits"
+        output_audio_formats:
+          type: array
+          description: >-
+            The formats an s2s model speaks back in; audio_formats is its
+            accepted input. Present only on s2s rows, whose two directions
+            can differ.
+          items:
+            $ref: "#/components/schemas/AudioFormat"
         benchmark:
           $ref: "#/components/schemas/ModelBenchmark"
       required:
