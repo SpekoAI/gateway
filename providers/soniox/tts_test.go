@@ -3,6 +3,7 @@ package soniox
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -71,6 +72,11 @@ func TestTTSStartRequestIsSentAtOpenWithTheDocumentedWireShape(t *testing.T) {
 	}
 	if streamID, _ := start["stream_id"].(string); streamID == "" {
 		t.Errorf("stream_id = %v, want a client-generated identifier", start["stream_id"])
+	}
+	// Timestamps are always requested: they ride the same messages as the
+	// audio and measured inside the noise, so there is only one start shape.
+	if got := start["return_timestamps"]; got != true {
+		t.Errorf("return_timestamps = %v, want true", got)
 	}
 }
 
@@ -167,6 +173,22 @@ func TestTTSCompletesOnTerminatedRatherThanAudioEnd(t *testing.T) {
 	}
 	if events[1].Extensions["soniox.com/tts/v1"] == nil {
 		t.Fatal("audio frames must retain the raw Soniox frame")
+	}
+	// Soniox measures per CHARACTER and reports start and END times in
+	// fractional seconds; the normalized reading is integer milliseconds.
+	var timings struct {
+		Granularity string                `json:"granularity"`
+		Spans       []protocol.TimingSpan `json:"spans"`
+	}
+	if err := json.Unmarshal(events[2].Data, &timings); err != nil {
+		t.Fatalf("decode alignment: %v", err)
+	}
+	if timings.Granularity != string(protocol.TimingGranularityCharacter) {
+		t.Fatalf("granularity = %q", timings.Granularity)
+	}
+	want := []protocol.TimingSpan{{Text: "H", StartMS: 0, EndMS: 100}, {Text: "i", StartMS: 100, EndMS: 200}}
+	if len(timings.Spans) != len(want) || timings.Spans[0] != want[0] || timings.Spans[1] != want[1] {
+		t.Fatalf("spans = %+v, want %+v", timings.Spans, want)
 	}
 	// audio_end has arrived, terminated has not: the stream is not done yet.
 	select {
@@ -495,10 +517,43 @@ func TestTTSRefusesTextOutsideTheVendorLimits(t *testing.T) {
 	if err := stream.AppendText(context.Background(), "   "); err == nil {
 		t.Error("blank text must be refused rather than billed as an empty chunk")
 	}
-	// Soniox caps one chunk at 5000 characters and 400s beyond it, which would
+	// Soniox caps one chunk at 5000 bytes and 400s beyond it, which would
 	// otherwise kill an in-flight utterance.
-	if err := stream.AppendText(context.Background(), strings.Repeat("a", 5_001)); err == nil {
-		t.Error("a chunk longer than Soniox's documented 5000-character cap must be refused locally")
+	err = stream.AppendText(context.Background(), strings.Repeat("a", 5_001))
+	if err == nil {
+		t.Fatal("a chunk longer than Soniox's documented 5000-byte cap must be refused locally")
+	}
+	// The refusal must name the caller as the party at fault and say how to
+	// fix it. Left to the provider this arrives as an opaque, non-retryable
+	// failure partway through synthesis, which reads as a relay fault.
+	var refusal *runtimepkg.ProviderError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("refusal = %T(%v), want a classified ProviderError", err, err)
+	}
+	if refusal.Code != "invalid_request" || refusal.Retryable {
+		t.Errorf("refusal = %+v, want a non-retryable invalid_request", refusal)
+	}
+	if !strings.Contains(refusal.Hint, "5000") {
+		t.Errorf("hint = %q, want it to name the limit", refusal.Hint)
+	}
+	// The cap is on the stream's ACCUMULATED buffer, so chunking must not
+	// slip past it: this is the failure that otherwise reaches the caller as
+	// an opaque 500 partway through a long render.
+	for i := range 2 {
+		if err := stream.AppendText(context.Background(), strings.Repeat("b", 2_000)); err != nil {
+			t.Fatalf("chunk %d within the accumulated budget = %v", i, err)
+		}
+	}
+	// 4,000 bytes are spoken for; a third 2,000-byte chunk would put the
+	// stream's buffer at 6,000, so it must be refused here rather than at
+	// the provider.
+	if err := stream.AppendText(context.Background(), strings.Repeat("b", 2_000)); err == nil {
+		t.Error("chunked text past the accumulated 5000-byte buffer cap must be refused locally")
+	}
+	// The bound is the accumulated total, not a per-chunk ceiling: a chunk
+	// that still fits must go through.
+	if err := stream.AppendText(context.Background(), strings.Repeat("b", 1_000)); err != nil {
+		t.Errorf("a chunk that still fits the accumulated budget = %v", err)
 	}
 	// This surface consumes text, never audio.
 	if err := stream.WriteAudio(context.Background(), []byte{1}); !errors.Is(err, runtimepkg.ErrUnsupportedOperation) {

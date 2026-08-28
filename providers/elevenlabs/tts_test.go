@@ -113,6 +113,23 @@ func TestAdapterReusesOneSocketForMultipleContextsAndMapsAlignment(t *testing.T)
 	if events[2].Extensions[extensionID] == nil {
 		t.Fatal("alignment must retain ElevenLabs payload")
 	}
+	// This frame carried only normalizedAlignment, whose characters are
+	// ElevenLabs' expanded reading of the text rather than the caller's own
+	// string. It is carried raw for debugging but must contribute no spans:
+	// a client walking its text against those positions desynchronizes
+	// silently, which is the one failure karaoke-style sync makes unmissable.
+	var normalizedSpans struct {
+		Granularity string `json:"granularity"`
+		Spans       []struct {
+			Text string `json:"text"`
+		} `json:"spans"`
+	}
+	if err := json.Unmarshal(events[2].Data, &normalizedSpans); err != nil {
+		t.Fatalf("decode spans: %v", err)
+	}
+	if len(normalizedSpans.Spans) != 0 || normalizedSpans.Granularity != "" {
+		t.Fatalf("normalized alignment must emit no spans, got %+v", normalizedSpans)
+	}
 	if err := stream.AppendText(context.Background(), "Again"); err != nil {
 		t.Fatalf("append second utterance: %v", err)
 	}
@@ -418,4 +435,96 @@ func eventTypes(events []runtimepkg.ProviderEvent) []string {
 		types[index] = string(event.Type)
 	}
 	return types
+}
+
+// The raw alignment is the reading over the caller's OWN text, so it is the
+// one that becomes spans. ElevenLabs measures per character and sends start
+// times with DURATIONS; the normalized event must carry end TIMES.
+func TestAdapterMapsRawAlignmentToCharacterSpans(t *testing.T) {
+	t.Parallel()
+
+	server := newMultiContextServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		appendMessage, err := readClientMessage(ctx, conn)
+		if err != nil {
+			t.Errorf("append: %v", err)
+			return
+		}
+		if _, err := readClientMessage(ctx, conn); err != nil { // flush
+			t.Errorf("flush: %v", err)
+			return
+		}
+		if _, err := readClientMessage(ctx, conn); err != nil { // close context
+			t.Errorf("close context: %v", err)
+			return
+		}
+		if err := writeServerJSON(ctx, conn, map[string]any{
+			"contextId": appendMessage.ContextID,
+			"audio":     base64.StdEncoding.EncodeToString([]byte{1}),
+			"alignment": map[string]any{
+				"chars":            []string{"T", "h", "e", " "},
+				"charStartTimesMs": []int{0, 93, 139, 186},
+				"charDurationsMs":  []int{93, 46, 47, 93},
+			},
+			"isFinal": true,
+		}); err != nil {
+			t.Errorf("write response: %v", err)
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), elevenLabsRequest(server.URL, protocol.CredentialsManaged))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "The "); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	events := collectEvents(t, stream.Events(), 4)
+
+	var payload struct {
+		Normalized  bool                  `json:"normalized"`
+		Granularity string                `json:"granularity"`
+		Spans       []protocol.TimingSpan `json:"spans"`
+	}
+	if err := json.Unmarshal(events[2].Data, &payload); err != nil {
+		t.Fatalf("decode alignment: %v", err)
+	}
+	if payload.Normalized {
+		t.Fatal("raw alignment must not be flagged normalized")
+	}
+	if payload.Granularity != string(protocol.TimingGranularityCharacter) {
+		t.Fatalf("granularity = %q", payload.Granularity)
+	}
+	want := []protocol.TimingSpan{
+		{Text: "T", StartMS: 0, EndMS: 93},
+		{Text: "h", StartMS: 93, EndMS: 139},
+		{Text: "e", StartMS: 139, EndMS: 186},
+		{Text: " ", StartMS: 186, EndMS: 279},
+	}
+	if len(payload.Spans) != len(want) {
+		t.Fatalf("spans = %+v", payload.Spans)
+	}
+	for i := range want {
+		if payload.Spans[i] != want[i] {
+			t.Errorf("spans[%d] = %+v, want %+v", i, payload.Spans[i], want[i])
+		}
+	}
+	// The spans must reconstruct the caller's text exactly: that invariant is
+	// what lets a client fold its own tokens onto them by character index.
+	var text string
+	for _, span := range payload.Spans {
+		text += span.Text
+	}
+	if text != "The " {
+		t.Fatalf("spans concatenate to %q, want the source text", text)
+	}
 }

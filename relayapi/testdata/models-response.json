@@ -11,7 +11,9 @@
         "reasoning": true,
         "diarization": false,
         "keywords": false,
-        "noise_reduction": false
+        "noise_reduction": false,
+        "word_timings": false,
+        "character_timings": false
       },
       "regions": [
         "us-west-2",
@@ -41,7 +43,9 @@
         "reasoning": false,
         "diarization": true,
         "keywords": true,
-        "noise_reduction": false
+        "noise_reduction": false,
+        "word_timings": false,
+        "character_timings": false
       },
       "regions": [
         "us-west-2",

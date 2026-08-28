@@ -580,8 +580,28 @@ func (s *stream) contextData(contextID string) json.RawMessage {
 	return marshalData(map[string]any{"context_id": contextID, "provider_request_id": s.currentProviderRequestID()})
 }
 
+// alignmentData carries Cartesia's own word_timestamps block verbatim and
+// adds the normalized span reading beside it. Cartesia measures per WORD and
+// reports start and END times in fractional seconds.
+//
+// A block that does not parse, or whose three parallel arrays disagree, is
+// carried raw with no spans: the consumer's contract is that absent spans
+// mean "nothing measured", so a garbled frame goes out silent rather than
+// wrong.
 func (s *stream) alignmentData(contextID string, timestamps json.RawMessage) json.RawMessage {
-	return marshalData(map[string]any{"context_id": contextID, "word_timestamps": timestamps, "provider_request_id": s.currentProviderRequestID()})
+	payload := map[string]any{"context_id": contextID, "word_timestamps": timestamps, "provider_request_id": s.currentProviderRequestID()}
+	var block struct {
+		Words []string  `json:"words"`
+		Start []float64 `json:"start"`
+		End   []float64 `json:"end"`
+	}
+	if err := json.Unmarshal(timestamps, &block); err == nil {
+		timings := protocol.TimingSpansFromSeconds(block.Words, block.Start, block.End, protocol.TimingGranularityWord)
+		if len(timings.Spans) > 0 {
+			payload["granularity"], payload["spans"] = timings.Granularity, timings.Spans
+		}
+	}
+	return marshalData(payload)
 }
 
 func (s *stream) warningData(contextID, messageType string) json.RawMessage {

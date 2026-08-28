@@ -78,13 +78,17 @@ const (
 
 // TTSEventType tags every server-to-client JSON text frame on
 // GET /v1/tts/stream. Synthesized audio travels in binary frames between
-// utterance.started and utterance.done. Exactly one terminal frame —
-// session.closed or error — ends every session. The set is closed.
+// utterance.started and utterance.done, and utterance.timings — when the
+// caller's model measures speech timings and the client asked for them —
+// travels alongside that audio, before the utterance.done that closes it.
+// Exactly one terminal frame — session.closed or error — ends every session.
+// The set is closed.
 type TTSEventType string
 
 const (
 	TTSEventSessionReady     TTSEventType = "session.ready"
 	TTSEventUtteranceStarted TTSEventType = "utterance.started"
+	TTSEventUtteranceTimings TTSEventType = "utterance.timings"
 	TTSEventUtteranceDone    TTSEventType = "utterance.done"
 	TTSEventUsageUpdated     TTSEventType = "usage.updated"
 	TTSEventSessionClosed    TTSEventType = "session.closed"
@@ -234,6 +238,88 @@ func (e TTSUtteranceDone) Validate() error {
 	}
 	if e.Sequence < 1 {
 		return fmt.Errorf("sequence: must be at least 1")
+	}
+	return nil
+}
+
+// TimingGranularity says what unit a TimingSpan measures.
+//
+// Synthesis always reports word. A character-level engine still measures
+// characters, and the adapters still report exactly what it gave them, but
+// the relay groups that reading into words before it reaches a caller — so
+// the fold is written once, here, instead of once per client per provider.
+//
+// character stays in the set for a reading passed through ungrouped. The set
+// is closed.
+type TimingGranularity string
+
+const (
+	TimingGranularityWord      TimingGranularity = "word"
+	TimingGranularityCharacter TimingGranularity = "character"
+)
+
+// TimingSpan is one time-aligned span of synthesized speech, measured from
+// the start of the utterance. Field names and validation mirror
+// TranscriptSegment: end_ms is an end time, never a duration.
+//
+// Spans describe the caller's OWN text — a provider that also reports
+// timings over its normalized reading ("five dollars" for "$5") has that
+// reading dropped rather than carried, because a client walking its own
+// string against normalized spans desynchronizes silently.
+type TimingSpan struct {
+	Text    string `json:"text"`
+	StartMS int64  `json:"start_ms"`
+	EndMS   int64  `json:"end_ms"`
+}
+
+// Validate checks that the span is a non-negative, ordered range.
+func (s TimingSpan) Validate() error {
+	if s.StartMS < 0 || s.EndMS < s.StartMS {
+		return fmt.Errorf("start_ms and end_ms must form a non-negative ordered range")
+	}
+	return nil
+}
+
+// TTSUtteranceTimings carries time-aligned spans for the utterance sharing
+// its sequence number. It is emitted only when the route's model measures
+// timings; a model that does not advertise word_timings or character_timings
+// never sends it.
+//
+// One utterance may produce SEVERAL of these events, all carrying the same
+// sequence: a long render's spans are flushed as they accumulate rather than
+// held for one frame that could exceed the stream's frame ceiling. The
+// client concatenates them in arrival order. Every event for an utterance
+// arrives before the utterance.done that closes it.
+type TTSUtteranceTimings struct {
+	Type        TTSEventType      `json:"type"`
+	Sequence    int               `json:"sequence"`
+	Granularity TimingGranularity `json:"granularity"`
+	Spans       []TimingSpan      `json:"spans"`
+}
+
+// Validate checks the frame tag, sequence, granularity, and every span.
+//
+// Spans are checked INDIVIDUALLY and never against each other: engines
+// legitimately return adjacent spans that overlap, where one sound is still
+// being articulated as the next begins, and a monotonicity rule would reject
+// those valid frames.
+func (e TTSUtteranceTimings) Validate() error {
+	if e.Type != TTSEventUtteranceTimings {
+		return fmt.Errorf("type: got %q, want %q", e.Type, TTSEventUtteranceTimings)
+	}
+	if e.Sequence < 1 {
+		return fmt.Errorf("sequence: must be at least 1")
+	}
+	if e.Granularity != TimingGranularityWord && e.Granularity != TimingGranularityCharacter {
+		return fmt.Errorf("granularity: got %q, want %q or %q", e.Granularity, TimingGranularityWord, TimingGranularityCharacter)
+	}
+	if len(e.Spans) == 0 {
+		return fmt.Errorf("spans: required")
+	}
+	for i, span := range e.Spans {
+		if err := span.Validate(); err != nil {
+			return fmt.Errorf("spans[%d]: %w", i, err)
+		}
 	}
 	return nil
 }

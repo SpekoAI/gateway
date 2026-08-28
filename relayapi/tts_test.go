@@ -34,6 +34,8 @@ func TestTTSWebSocketFixturesRoundTrip(t *testing.T) {
 			assertGoldenValue[relayapi.TTSSessionReady](t, name, frame)
 		case string(relayapi.TTSEventUtteranceStarted):
 			assertGoldenValue[relayapi.TTSUtteranceStarted](t, name, frame)
+		case string(relayapi.TTSEventUtteranceTimings):
+			assertGoldenValue[relayapi.TTSUtteranceTimings](t, name, frame)
 		case string(relayapi.TTSEventUtteranceDone):
 			assertGoldenValue[relayapi.TTSUtteranceDone](t, name, frame)
 		case string(relayapi.TTSEventUsageUpdated):
@@ -56,6 +58,7 @@ func TestTTSWebSocketFixturesRoundTrip(t *testing.T) {
 		string(relayapi.TTSControlSessionClose),
 		string(relayapi.TTSEventSessionReady),
 		string(relayapi.TTSEventUtteranceStarted),
+		string(relayapi.TTSEventUtteranceTimings),
 		string(relayapi.TTSEventUtteranceDone),
 		string(relayapi.TTSEventUsageUpdated),
 		string(relayapi.TTSEventSessionClosed),

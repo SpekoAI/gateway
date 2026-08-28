@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:ed354b28c2361115635406a9bb42d75039909f6b463d9ce7c5f998da5ab0b582
-# yaml-body: sha256:4907b5a29595ff70b8be144a543fda83c35b60087e89c55f8e29318f406730be
+# json-mirror: asyncapi.json sha256:62dfac05ddea3eee54b0fbb608d119cfd052179ba4bb829ac58f43ef6de3bbc4
+# yaml-body: sha256:494bc8a60385bf8974db22cef60bc65d711a935f66c0e65f74ab63141fc20ef1
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -108,8 +108,10 @@ channels:
       content hash. The client must not append text before session.ready
       arrives. Synthesized audio travels in binary frames between the
       utterance.started and utterance.done events that share its sequence
-      number. Exactly one terminal frame — session.closed or error — ends
-      every session.
+      number. utterance.timings, when the route's model measures speech
+      timings, carries time-aligned spans for that same sequence and arrives
+      before its utterance.done. Exactly one terminal frame — session.closed
+      or error — ends every session.
     bindings:
       ws:
         method: GET
@@ -159,6 +161,7 @@ channels:
           - $ref: "#/components/messages/ttsSessionReady"
           - $ref: "#/components/messages/ttsUtteranceStarted"
           - $ref: "#/components/messages/ttsAudioOutput"
+          - $ref: "#/components/messages/ttsUtteranceTimings"
           - $ref: "#/components/messages/ttsUtteranceDone"
           - $ref: "#/components/messages/ttsUsageUpdated"
           - $ref: "#/components/messages/ttsSessionClosed"
@@ -300,6 +303,14 @@ components:
       payload:
         type: string
         format: binary
+    ttsUtteranceTimings:
+      name: utterance.timings
+      title: TTS utterance.timings
+      summary: >-
+        Time-aligned spans for the utterance sharing its sequence number,
+        sent only when the route's model measures them.
+      payload:
+        $ref: "#/components/schemas/TTSUtteranceTimings"
     ttsUtteranceDone:
       name: utterance.done
       title: TTS utterance.done
@@ -908,6 +919,78 @@ components:
       required:
         - type
         - sequence
+      additionalProperties: false
+    TimingGranularity:
+      type: string
+      description: >-
+        The unit a TimingSpan measures. Synthesis always reports word, even
+        where the engine measured characters: the relay groups a
+        character-level reading into words on the way out, so one client does
+        not have to write that fold once per provider. character remains in
+        the set for readings that are passed through ungrouped. The set is
+        closed.
+      enum:
+        - word
+        - character
+    TimingSpan:
+      type: object
+      description: >-
+        One time-aligned span of synthesized speech, measured from the start
+        of the utterance. end_ms is an end time, never a duration. Spans
+        describe the caller's OWN text: a provider that also reports timings
+        over its normalized reading ("five dollars" for "$5") has that
+        reading dropped rather than carried, because a client walking its own
+        string against normalized spans desynchronizes silently.
+      properties:
+        text:
+          type: string
+        start_ms:
+          type: integer
+          minimum: 0
+        end_ms:
+          type: integer
+          minimum: 0
+          description: Must not precede start_ms.
+      required:
+        - text
+        - start_ms
+        - end_ms
+      additionalProperties: false
+    TTSUtteranceTimings:
+      type: object
+      description: >-
+        Time-aligned spans for the utterance sharing its sequence number,
+        emitted only when the route's model measures timings; a model that
+        advertises neither word_timings nor character_timings never sends it.
+        One utterance may produce SEVERAL of these events, all carrying the
+        same sequence: a long render's spans are flushed as they accumulate
+        rather than held for one frame that could exceed the stream's frame
+        ceiling. The client concatenates them in arrival order. Every event
+        for an utterance arrives before the utterance.done that closes it.
+        Spans are individually well-formed but are NOT guaranteed to be
+        mutually ordered: engines legitimately return adjacent spans that
+        overlap, where one sound is still being articulated as the next
+        begins.
+      properties:
+        type:
+          type: string
+          enum:
+            - utterance.timings
+        sequence:
+          type: integer
+          minimum: 1
+        granularity:
+          $ref: "#/components/schemas/TimingGranularity"
+        spans:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/TimingSpan"
+      required:
+        - type
+        - sequence
+        - granularity
+        - spans
       additionalProperties: false
     TTSUtteranceDone:
       type: object

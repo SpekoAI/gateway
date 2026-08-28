@@ -667,7 +667,7 @@
       },
       "ModelCapabilities": {
         "type": "object",
-        "description": "What a model supports. Capability gating happens before admission: a request using tools or structured output on a model that does not advertise them is rejected with capability_unsupported, never silently stripped. The set is flat rather than split by kind, so every model answers every question: an LLM model reports false for the transcription capabilities and an STT model reports false for the generation ones, and false always means \"asking for this here is an error\", never \"unknown\". The transcription capabilities correspond one-to-one with the canonical asks in STTOptions, which is what makes those asks fail closed; per-provider settings are deliberately not advertised here, being vendor-specific rather than portable.",
+        "description": "What a model supports. Capability gating happens before admission: a request using tools or structured output on a model that does not advertise them is rejected with capability_unsupported, never silently stripped. The set is flat rather than split by kind, so every model answers every question: an LLM model reports false for the transcription and synthesis capabilities, an STT model reports false for the generation ones, and false always means \"asking for this here is an error\", never \"unknown\". The transcription capabilities correspond one-to-one with the canonical asks in STTOptions, which is what makes those asks fail closed; per-provider settings are deliberately not advertised here, being vendor-specific rather than portable.",
         "properties": {
           "tools": {
             "type": "boolean"
@@ -692,6 +692,14 @@
           "noise_reduction": {
             "type": "boolean",
             "description": "Accepts an audio-enhancement ask."
+          },
+          "word_timings": {
+            "type": "boolean",
+            "description": "Reports time-aligned spans of synthesized speech measured per WORD, on the utterance.timings event of GET /v1/tts/stream."
+          },
+          "character_timings": {
+            "type": "boolean",
+            "description": "Reports time-aligned spans of synthesized speech measured per CHARACTER, on the utterance.timings event of GET /v1/tts/stream. A character-level model reports false for word_timings: the Router emits what the engine measured and never groups characters into words, because only the caller knows where the words are in the text it sent."
           }
         },
         "required": [
@@ -701,7 +709,9 @@
           "reasoning",
           "diarization",
           "keywords",
-          "noise_reduction"
+          "noise_reduction",
+          "word_timings",
+          "character_timings"
         ],
         "additionalProperties": false
       },

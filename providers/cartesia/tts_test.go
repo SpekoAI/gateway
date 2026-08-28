@@ -105,6 +105,21 @@ func TestAdapterReusesOneSocketForMultipleContextsAndMapsAudio(t *testing.T) {
 	if events[3].Extensions[extensionID] == nil {
 		t.Fatal("alignment must retain Cartesia extension data")
 	}
+	// Cartesia measures per WORD and reports start and END times in
+	// fractional seconds; the normalized reading is integer milliseconds.
+	var timings struct {
+		Granularity string                `json:"granularity"`
+		Spans       []protocol.TimingSpan `json:"spans"`
+	}
+	if err := json.Unmarshal(events[3].Data, &timings); err != nil {
+		t.Fatalf("decode alignment: %v", err)
+	}
+	if timings.Granularity != string(protocol.TimingGranularityWord) {
+		t.Fatalf("granularity = %q", timings.Granularity)
+	}
+	if want := []protocol.TimingSpan{{Text: "Hello", StartMS: 0, EndMS: 200}}; len(timings.Spans) != 1 || timings.Spans[0] != want[0] {
+		t.Fatalf("spans = %+v, want %+v", timings.Spans, want)
+	}
 	var usage struct {
 		ProviderRequestID string `json:"provider_request_id"`
 	}
