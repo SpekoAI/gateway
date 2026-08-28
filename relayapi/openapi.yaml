@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:0af41c16c681333be1a5a2d353066e71237363f78aeb6738b7c735b9e67fce5b
-# yaml-body: sha256:fa2ba2f7449ae54ba77b2beb1dce8aa87f378d12cb76f13baa7e20f0f1500535
+# json-mirror: openapi.json sha256:890238de6e30e3826cd8e0c00d26156d5ec7a17ec68bf3c3b0d45b95d18856e4
+# yaml-body: sha256:13516d2665963c08337d23bc4d23e715b9c69b05ecb2190d0d00e50959b71a37
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -650,9 +650,9 @@ components:
         advertise them is rejected with capability_unsupported, never silently
         stripped. The set is flat rather than split by kind, so every model
         answers every question: an LLM model reports false for the
-        transcription capabilities and an STT model reports false for the
-        generation ones, and false always means "asking for this here is an
-        error", never "unknown". The transcription capabilities correspond
+        transcription and synthesis capabilities, an STT model reports false
+        for the generation ones, and false always means "asking for this here
+        is an error", never "unknown". The transcription capabilities correspond
         one-to-one with the canonical asks in STTOptions, which is what makes
         those asks fail closed; per-provider settings are deliberately not
         advertised here, being vendor-specific rather than portable.
@@ -677,6 +677,20 @@ components:
         noise_reduction:
           type: boolean
           description: Accepts an audio-enhancement ask.
+        word_timings:
+          type: boolean
+          description: >-
+            Reports time-aligned spans of synthesized speech measured per
+            WORD, on the utterance.timings event of GET /v1/tts/stream.
+        character_timings:
+          type: boolean
+          description: >-
+            Reports time-aligned spans of synthesized speech measured per
+            CHARACTER, on the utterance.timings event of GET /v1/tts/stream.
+            A character-level model reports false for word_timings: the
+            Router emits what the engine measured and never groups
+            characters into words, because only the caller knows where the
+            words are in the text it sent.
       required:
         - tools
         - structured_output
@@ -685,6 +699,8 @@ components:
         - diarization
         - keywords
         - noise_reduction
+        - word_timings
+        - character_timings
       additionalProperties: false
     Model:
       type: object

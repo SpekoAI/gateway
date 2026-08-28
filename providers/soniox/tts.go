@@ -27,9 +27,17 @@ const (
 	ttsOfficialHost = "tts-rt.soniox.com"
 	ttsEndpointPath = "/tts-websocket"
 
-	// Soniox rejects a longer text chunk with HTTP 400
-	// "Text is too long (max length 5000)."
-	ttsMaxTextCharacters = 5_000
+	// Soniox caps the text it will accept on ONE stream at 5,000 bytes, and
+	// the cap is on the stream's ACCUMULATED input buffer rather than on any
+	// single message: splitting a long input into small chunks does not lift
+	// it, and a chunked feed fails partway through with "input buffer error:
+	// input text too long (limit: 5000 bytes)" once the running total passes
+	// the bound. The per-chunk rejection is the same bound seen from the
+	// other side ("Text is too long (max length 5000).").
+	//
+	// This is a short-form engine, and the accumulated bound is what the
+	// adapter enforces so a caller learns it before paying for a socket.
+	ttsMaxTextBytes = 5_000
 )
 
 // ttsSampleRates are the output rates Soniox documents for pcm_s16le. Anything
@@ -222,6 +230,10 @@ type ttsStream struct {
 	textEnded    bool
 	audioStarted bool
 	requestID    string
+	// textBytes is the running total this stream has sent, against the
+	// vendor's accumulated-buffer cap. It resets with the stream, not with
+	// the chunk.
+	textBytes int
 }
 
 func (s *ttsStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -232,14 +244,40 @@ func (s *ttsStream) WriteAudio(context.Context, []byte) error {
 
 func (s *ttsStream) CommitAudio(context.Context) error { return runtimepkg.ErrUnsupportedOperation }
 
+// reserveTextBytes charges one chunk against this stream's accumulated input
+// budget, refusing it if the running total would pass the vendor's cap.
+//
+// The refusal is a ProviderError rather than a bare error so the relay
+// classifies it as the caller's mistake and says how to fix it: the same
+// input against the provider produces an opaque failure partway through
+// synthesis, which reads as a relay fault and tells the caller nothing.
+//
+// The budget is charged BEFORE the socket work, so an over-budget request
+// costs no provider round trip.
+func (s *ttsStream) reserveTextBytes(text string) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	pending := s.textBytes + len(text)
+	if pending > ttsMaxTextBytes {
+		return &runtimepkg.ProviderError{
+			Code:      "invalid_request",
+			Message:   fmt.Sprintf("soniox tts accepts at most %d bytes of text per utterance", ttsMaxTextBytes),
+			Hint:      fmt.Sprintf("Send at most %d bytes of text per utterance; Soniox counts the whole utterance, so splitting it across appends does not raise the limit.", ttsMaxTextBytes),
+			Retryable: false,
+		}
+	}
+	s.textBytes = pending
+	return nil
+}
+
 // AppendText sends one text chunk for the active stream. A stream that already
 // received text_end is closed for input, so a new one is started first.
 func (s *ttsStream) AppendText(ctx context.Context, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("soniox tts text is empty")
 	}
-	if len(text) > ttsMaxTextCharacters {
-		return fmt.Errorf("soniox tts text exceeds %d characters", ttsMaxTextCharacters)
+	if err := s.reserveTextBytes(text); err != nil {
+		return err
 	}
 	streamID, needsStart, err := s.currentOrNewStream()
 	if err != nil {
@@ -334,13 +372,14 @@ func (s *ttsStream) startStream(ctx context.Context) (string, error) {
 	s.stateMu.Unlock()
 
 	if err := s.writeJSON(ctx, ttsStartRequest{
-		APIKey:      s.apiKey,
-		StreamID:    streamID,
-		Model:       s.model,
-		Language:    s.language,
-		Voice:       s.voice,
-		AudioFormat: "pcm_s16le",
-		SampleRate:  s.sampleRate,
+		APIKey:           s.apiKey,
+		StreamID:         streamID,
+		Model:            s.model,
+		Language:         s.language,
+		Voice:            s.voice,
+		AudioFormat:      "pcm_s16le",
+		SampleRate:       s.sampleRate,
+		ReturnTimestamps: true,
 	}); err != nil {
 		s.finishStream(streamID)
 		return "", err
@@ -398,6 +437,10 @@ func (s *ttsStream) finishStream(streamID string) {
 	s.streamDone = nil
 	s.textEnded = false
 	s.audioStarted = false
+	// The input budget belongs to the stream, so it is released with the
+	// stream id: the next utterance opens a new Soniox stream and gets the
+	// whole cap again.
+	s.textBytes = 0
 }
 
 func (s *ttsStream) markAudioStarted(streamID string) bool {
@@ -580,12 +623,31 @@ func (s *ttsStream) ttsStreamData(streamID string) json.RawMessage {
 	return sonioxMarshalData(map[string]any{"stream_id": streamID, "provider_request_id": s.currentRequestID()})
 }
 
+// ttsAlignmentData carries Soniox's own timestamps block verbatim and adds
+// the normalized span reading beside it. Soniox measures per CHARACTER and
+// reports start and END times in fractional seconds.
+//
+// A block that does not parse, or whose three parallel arrays disagree, is
+// carried raw with no spans, so a garbled frame goes out silent rather than
+// wrong.
 func (s *ttsStream) ttsAlignmentData(streamID string, timestamps json.RawMessage) json.RawMessage {
-	return sonioxMarshalData(map[string]any{
+	payload := map[string]any{
 		"stream_id":            streamID,
 		"character_timestamps": timestamps,
 		"provider_request_id":  s.currentRequestID(),
-	})
+	}
+	var block struct {
+		Characters []string  `json:"characters"`
+		Start      []float64 `json:"character_start_times_seconds"`
+		End        []float64 `json:"character_end_times_seconds"`
+	}
+	if err := json.Unmarshal(timestamps, &block); err == nil {
+		timings := protocol.TimingSpansFromSeconds(block.Characters, block.Start, block.End, protocol.TimingGranularityCharacter)
+		if len(timings.Spans) > 0 {
+			payload["granularity"], payload["spans"] = timings.Granularity, timings.Spans
+		}
+	}
+	return sonioxMarshalData(payload)
 }
 
 func ttsExtension(raw json.RawMessage) map[string]json.RawMessage {
@@ -608,6 +670,11 @@ type ttsStartRequest struct {
 	Voice       string `json:"voice"`
 	AudioFormat string `json:"audio_format"`
 	SampleRate  int    `json:"sample_rate"`
+	// ReturnTimestamps asks for the per-character timing block. It is always
+	// on: the timestamps ride the same messages as the audio, and measuring
+	// five runs each way found the cost inside the noise, so making it
+	// conditional would buy nothing and add a second start-frame shape.
+	ReturnTimestamps bool `json:"return_timestamps"`
 }
 
 type ttsTextRequest struct {

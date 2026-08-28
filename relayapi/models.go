@@ -28,6 +28,13 @@ type ModelCapabilities struct {
 	Diarization      bool `json:"diarization"`
 	Keywords         bool `json:"keywords"`
 	NoiseReduction   bool `json:"noise_reduction"`
+	// WordTimings and CharacterTimings say whether a TTS model reports
+	// time-aligned speech spans, and at which granularity it MEASURES them.
+	// They are separate bits rather than one enum because a model may report
+	// both, and neither is derived from the other: the relay never groups
+	// characters into words on the caller's behalf.
+	WordTimings      bool `json:"word_timings"`
+	CharacterTimings bool `json:"character_timings"`
 }
 
 // SampleRateRange is an inclusive set of sample rates accepted by one audio

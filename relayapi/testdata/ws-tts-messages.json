@@ -15,6 +15,15 @@
     "route": {"provider": "cartesia", "model": "sonic-3", "region": "ap-northeast-1", "attempt_id": "att_1"}
   },
   {"type": "utterance.started", "sequence": 1},
+  {
+    "type": "utterance.timings",
+    "sequence": 1,
+    "granularity": "word",
+    "spans": [
+      {"text": "Welcome", "start_ms": 119, "end_ms": 280},
+      {"text": " to", "start_ms": 280, "end_ms": 402}
+    ]
+  },
   {"type": "utterance.done", "sequence": 1},
   {"type": "usage.updated", "usage": {"characters": 42}},
   {"type": "session.closed", "usage": {"characters": 42}},

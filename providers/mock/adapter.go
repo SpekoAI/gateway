@@ -229,6 +229,58 @@ func NewSTTAdapter(id string) *Adapter {
 	})
 }
 
+// NewTimedTTSAdapter creates a TTS adapter that also reports timing spans,
+// for exercising the consumers of alignment events. It is a separate
+// constructor rather than an option on NewTTSAdapter so that tests which
+// have nothing to do with timings keep seeing the plain event sequence.
+//
+// Spans are emitted in SEVERAL alignment events — one per character of the
+// committed text — because real engines disagree about cadence and a
+// consumer that assumed one event per utterance would pass against a single
+// combined frame and fail against a provider. Each span is 100ms wide and
+// they abut, so a test can predict every number.
+func NewTimedTTSAdapter(id string) *Adapter {
+	return NewAdapter(id, func(_ runtimepkg.AdapterRequest) *Stream {
+		stream := NewStream(256)
+		var parts []string
+		stream.AppendTextHook = func(_ context.Context, text string) error {
+			parts = append(parts, text)
+			return nil
+		}
+		stream.CommitTextHook = func(_ context.Context) error {
+			text := strings.Join(parts, "")
+			parts = nil
+			if err := stream.Emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted}); err != nil {
+				return err
+			}
+			if err := stream.Emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Audio: []byte("mock-audio:" + text)}); err != nil {
+				return err
+			}
+			for i, character := range []rune(text) {
+				data, err := json.Marshal(map[string]any{
+					"granularity": protocol.TimingGranularityCharacter,
+					"spans": []protocol.TimingSpan{{
+						Text:    string(character),
+						StartMS: int64(i) * 100,
+						EndMS:   int64(i)*100 + 100,
+					}},
+				})
+				if err != nil {
+					return err
+				}
+				if err := stream.Emit(runtimepkg.ProviderEvent{Type: protocol.EventAlignment, Data: data}); err != nil {
+					return err
+				}
+			}
+			return stream.Emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone})
+		}
+		stream.CancelHook = func(_ context.Context) error {
+			return stream.Emit(runtimepkg.ProviderEvent{Type: protocol.EventResponseCanceled})
+		}
+		return stream
+	})
+}
+
 // NewTTSAdapter creates an adapter that emits one deterministic synthetic
 // audio frame per committed text utterance. The bytes are test fixtures, not
 // playable audio.

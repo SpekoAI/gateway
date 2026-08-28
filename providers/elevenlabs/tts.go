@@ -426,6 +426,17 @@ func (s *stream) emit(event runtimepkg.ProviderEvent) error {
 	}
 }
 
+// alignmentData carries ElevenLabs' own character arrays and adds the
+// normalized span reading beside them. ElevenLabs measures per CHARACTER and
+// reports start times with DURATIONS, both in whole milliseconds.
+//
+// Spans are emitted only for the RAW alignment. ElevenLabs also offers
+// normalizedAlignment, whose characters are its expanded reading of the text
+// ("five dollars" where the caller wrote "$5"), and those positions do not
+// correspond to the caller's own string. A client walking its text against
+// them desynchronizes silently, which is the one failure that karaoke-style
+// sync makes unmissable, so the normalized reading is carried raw for
+// debugging and deliberately produces no spans.
 func alignmentData(contextID string, value *alignment, normalized bool) json.RawMessage {
 	if value == nil {
 		return marshalData(map[string]any{"context_id": contextID})
@@ -438,11 +449,18 @@ func alignmentData(contextID string, value *alignment, normalized bool) json.Raw
 	if len(durations) == 0 {
 		durations = value.DurationsSnake
 	}
-	return marshalData(map[string]any{
+	payload := map[string]any{
 		"context_id": contextID, "characters": value.Characters,
 		"character_start_times_ms": starts, "character_durations_ms": durations,
 		"normalized": normalized,
-	})
+	}
+	if !normalized {
+		timings := protocol.TimingSpansFromMillisecondDurations(value.Characters, starts, durations, protocol.TimingGranularityCharacter)
+		if len(timings.Spans) > 0 {
+			payload["granularity"], payload["spans"] = timings.Granularity, timings.Spans
+		}
+	}
+	return marshalData(payload)
 }
 
 func contextData(contextID string) json.RawMessage {
