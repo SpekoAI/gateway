@@ -100,10 +100,8 @@ func (f *fakeRealtime) handle(writer http.ResponseWriter, request *http.Request)
 			f.mu.Lock()
 			f.commits++
 			f.mu.Unlock()
-		case "response.create":
-			f.mu.Lock()
-			f.creates++
-			f.mu.Unlock()
+			// server_vad owns response creation once the committed turn reaches
+			// the provider. The client must not also send response.create.
 			for _, message := range []string{
 				`{"type":"input_audio_buffer.speech_started"}`,
 				`{"type":"conversation.item.input_audio_transcription.completed","transcript":"hello"}`,
@@ -115,6 +113,10 @@ func (f *fakeRealtime) handle(writer http.ResponseWriter, request *http.Request)
 					return
 				}
 			}
+		case "response.create":
+			f.mu.Lock()
+			f.creates++
+			f.mu.Unlock()
 		case "response.cancel":
 			f.mu.Lock()
 			f.cancels++
@@ -223,7 +225,7 @@ func TestProviderDirectRoundTrip(t *testing.T) {
 
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if len(fake.appends) != 1 || fake.commits != 1 || fake.creates != 1 {
+	if len(fake.appends) != 1 || fake.commits != 1 || fake.creates != 0 {
 		t.Fatalf("wire counts appends=%d commits=%d creates=%d", len(fake.appends), fake.commits, fake.creates)
 	}
 }

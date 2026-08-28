@@ -272,7 +272,6 @@ type realtimeStream struct {
 	closeErr     error
 	setupOnce    sync.Once
 	ready        atomic.Bool
-	responding   atomic.Bool
 
 	terminalMu  sync.Mutex
 	terminalErr error
@@ -294,13 +293,11 @@ func (s *realtimeStream) WriteAudio(ctx context.Context, audio []byte) error {
 }
 
 func (s *realtimeStream) CommitAudio(ctx context.Context) error {
-	if err := s.writeJSON(ctx, map[string]any{"type": "input_audio_buffer.commit"}); err != nil {
-		return err
-	}
-	if s.responding.Load() {
-		return nil
-	}
-	return s.writeJSON(ctx, map[string]any{"type": "response.create"})
+	// Both provider profiles are configured with server_vad. Committing the
+	// buffer is therefore the complete end-of-turn signal: the provider creates
+	// the response when it detects the speech boundary. Sending response.create
+	// as well races that automatic response and can produce duplicate turns.
+	return s.writeJSON(ctx, map[string]any{"type": "input_audio_buffer.commit"})
 }
 
 func (s *realtimeStream) AppendText(context.Context, string) error {
@@ -446,7 +443,6 @@ func (s *realtimeStream) handle(event serverEvent, raw []byte) {
 	case "conversation.item.input_audio_transcription.completed":
 		s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: marshalData(map[string]string{"text": event.Transcript})})
 	case "response.created":
-		s.responding.Store(true)
 		s.emit(runtimepkg.ProviderEvent{Type: protocol.EventResponseStarted})
 	case "response.output_audio.delta", "response.audio.delta":
 		audio, err := base64.StdEncoding.DecodeString(event.Delta)
@@ -458,7 +454,6 @@ func (s *realtimeStream) handle(event serverEvent, raw []byte) {
 			s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTextDelta, Data: marshalData(map[string]string{"text": event.Delta})})
 		}
 	case "response.done":
-		s.responding.Store(false)
 		if event.Response != nil && len(event.Response.Usage) > 0 {
 			s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(map[string]string{"provider_request_id": event.Response.ID}), Extensions: s.extension(event.Response.Usage)})
 		}
