@@ -186,29 +186,10 @@ func TestWSMessageSamplesMatchAsyncAPISchemas(t *testing.T) {
 		relayapi.ErrorEventType:                     "ErrorEvent",
 	}
 
-	s2sSchemaByType := map[string]string{
-		string(relayapi.S2SControlSessionConfigure):      "S2SSessionConfigure",
-		string(relayapi.S2SControlInputCommit):           "S2SInputCommit",
-		string(relayapi.S2SControlResponseCancel):        "S2SResponseCancel",
-		string(relayapi.S2SControlSessionClose):          "S2SSessionClose",
-		string(relayapi.S2SEventSessionReady):            "S2SSessionReady",
-		string(relayapi.S2SEventInputSpeechStarted):      "S2SInputSpeechStarted",
-		string(relayapi.S2SEventInputSpeechEnded):        "S2SInputSpeechEnded",
-		string(relayapi.S2SEventInputTranscript):         "S2SInputTranscript",
-		string(relayapi.S2SEventResponseStarted):         "S2SResponseStarted",
-		string(relayapi.S2SEventResponseTranscriptDelta): "S2SResponseTranscriptDelta",
-		string(relayapi.S2SEventResponseDone):            "S2SResponseDone",
-		string(relayapi.S2SEventResponseCancelled):       "S2SResponseCancelled",
-		string(relayapi.S2SEventUsageUpdated):            "S2SUsageUpdated",
-		string(relayapi.S2SEventSessionClosed):           "S2SSessionClosed",
-		relayapi.ErrorEventType:                          "ErrorEvent",
-	}
-
 	doc := loadSpecDoc(t, "asyncapi.json")
 	for fixture, schemaByType := range map[string]map[string]string{
 		"ws-stt-messages.json": sttSchemaByType,
 		"ws-tts-messages.json": ttsSchemaByType,
-		"ws-s2s-messages.json": s2sSchemaByType,
 	} {
 		var frames []json.RawMessage
 		decodeFixture(t, fixture, &frames)
@@ -311,21 +292,6 @@ func wireSchemaTable() []struct {
 		{relayapi.TTSUtteranceDone{}, asyncapi("TTSUtteranceDone")},
 		{relayapi.TTSUsageUpdated{}, asyncapi("TTSUsageUpdated")},
 		{relayapi.TTSSessionClosed{}, asyncapi("TTSSessionClosed")},
-		{relayapi.S2SAudioConfig{}, asyncapi("S2SAudioConfig")},
-		{relayapi.S2SSessionConfigure{}, asyncapi("S2SSessionConfigure")},
-		{relayapi.S2SInputCommit{}, asyncapi("S2SInputCommit")},
-		{relayapi.S2SResponseCancel{}, asyncapi("S2SResponseCancel")},
-		{relayapi.S2SSessionClose{}, asyncapi("S2SSessionClose")},
-		{relayapi.S2SSessionReady{}, asyncapi("S2SSessionReady")},
-		{relayapi.S2SInputSpeechStarted{}, asyncapi("S2SInputSpeechStarted")},
-		{relayapi.S2SInputSpeechEnded{}, asyncapi("S2SInputSpeechEnded")},
-		{relayapi.S2SInputTranscript{}, asyncapi("S2SInputTranscript")},
-		{relayapi.S2SResponseStarted{}, asyncapi("S2SResponseStarted")},
-		{relayapi.S2SResponseTranscriptDelta{}, asyncapi("S2SResponseTranscriptDelta")},
-		{relayapi.S2SResponseDone{}, asyncapi("S2SResponseDone")},
-		{relayapi.S2SResponseCancelled{}, asyncapi("S2SResponseCancelled")},
-		{relayapi.S2SUsageUpdated{}, asyncapi("S2SUsageUpdated")},
-		{relayapi.S2SSessionClosed{}, asyncapi("S2SSessionClosed")},
 	}
 }
 
@@ -399,6 +365,12 @@ func TestSpecCoversEveryWireStruct(t *testing.T) {
 
 	inSource := wireStructNames(t)
 	for name := range inSource {
+		// These structs remain temporarily for Runtime connector wire
+		// compatibility. They are not part of the public Relay API now that
+		// the Router speech-to-speech media route has been removed.
+		if strings.HasPrefix(name, "S2S") {
+			continue
+		}
 		if !inTable[name] {
 			t.Errorf("exported wire struct %s has no wireSchemaTable entry — add it and its spec schema", name)
 		}

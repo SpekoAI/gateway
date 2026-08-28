@@ -26,6 +26,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/deepgram"
 	"github.com/SpekoAI/gateway/providers/elevenlabs"
 	"github.com/SpekoAI/gateway/providers/fish"
+	"github.com/SpekoAI/gateway/providers/geminirealtime"
 	"github.com/SpekoAI/gateway/providers/gladia"
 	"github.com/SpekoAI/gateway/providers/google"
 	"github.com/SpekoAI/gateway/providers/gradium"
@@ -36,6 +37,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/minimax"
 	"github.com/SpekoAI/gateway/providers/modulate"
 	"github.com/SpekoAI/gateway/providers/openai"
+	"github.com/SpekoAI/gateway/providers/openairealtime"
 	"github.com/SpekoAI/gateway/providers/palabra"
 	"github.com/SpekoAI/gateway/providers/rime"
 	"github.com/SpekoAI/gateway/providers/smallest"
@@ -225,6 +227,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	openaiRealtimeAdapter, err := openairealtime.New(openairealtime.Config{Provider: "openai"})
+	if err != nil {
+		return err
+	}
+	xaiRealtimeAdapter, err := openairealtime.New(openairealtime.Config{Provider: "xai"})
+	if err != nil {
+		return err
+	}
+	googleRealtimeAdapter, err := geminirealtime.New(geminirealtime.Config{})
+	if err != nil {
+		return err
+	}
 	sonioxSTTAdapter, err := soniox.NewSTT(soniox.STTConfig{})
 	if err != nil {
 		return err
@@ -267,7 +281,7 @@ func run() error {
 		cartesiaAdapter, cartesiaSTTAdapter, assemblyAIAdapter, modulateAdapter, gladiaAdapter,
 		googleAdapter, inworldAdapter, minimaxAdapter, xaiAdapter,
 		sonioxSTTAdapter, sonioxTTSAdapter, smallestSTTAdapter, smallestTTSAdapter,
-		openaiSTTAdapter, openaiTTSAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
+		openaiSTTAdapter, openaiTTSAdapter, openaiRealtimeAdapter, xaiRealtimeAdapter, googleRealtimeAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
 		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,

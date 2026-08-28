@@ -407,6 +407,23 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 			return
 		}
 	}
+	if body.Request.S2S != nil {
+		if body.Kind != protocol.SessionKindRealtime {
+			writeError(writer, http.StatusBadRequest, "invalid_realtime_options", "s2s options are valid only on realtime sessions")
+			return
+		}
+		if body.Request.S2S.OutputMedia == nil {
+			writeError(writer, http.StatusBadRequest, "invalid_realtime_options", "output_media is required for realtime sessions")
+			return
+		}
+		if err := body.Request.S2S.OutputMedia.Validate(); err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_realtime_options", err.Error())
+			return
+		}
+	} else if body.Kind == protocol.SessionKindRealtime {
+		writeError(writer, http.StatusBadRequest, "invalid_realtime_options", "s2s options are required for realtime sessions")
+		return
+	}
 	fingerprint, err := fingerprintCreateRequest(body)
 	if err != nil {
 		writeError(writer, http.StatusInternalServerError, "request_fingerprint_failed", "session request could not be fingerprinted")
@@ -787,7 +804,7 @@ func (s *Server) waitForCreate(writer http.ResponseWriter, request *http.Request
 // identity and workload come from gateway configuration and are never
 // caller-supplied.
 func planRequestFor(body CreateSessionRequest, runtime protocol.RuntimeDescriptor, workload *protocol.Workload) protocol.SessionPlanRequest {
-	// STT options are a data-plane concern: adapters read them from the local
+	// STT and realtime S2S options are data-plane concerns: adapters read them from the local
 	// request, and this gateway — not the control plane — enforces support.
 	// Stripping them here keeps every managed plan-request body byte-identical
 	// to what an older control plane already parses, and lets one warm plan
@@ -796,6 +813,10 @@ func planRequestFor(body CreateSessionRequest, runtime protocol.RuntimeDescripto
 	// the provider, and the refusal tells them so.
 	request := body.Request
 	request.STT = nil
+	// Instructions and other realtime configuration are customer content. A
+	// hosted plan needs only provider/model/media capability metadata; it must
+	// never receive the prompt merely to choose a route or mint a credential.
+	request.S2S = nil
 	return protocol.SessionPlanRequest{
 		Kind: body.Kind, Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision,
 		Runtime: runtime, Workload: workload, Integration: body.Integration,

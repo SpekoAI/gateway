@@ -24,12 +24,9 @@ const (
 	SessionKindTTS      SessionKind = "tts"
 	SessionKindLLM      SessionKind = "llm"
 	SessionKindRealtime SessionKind = "realtime"
-	// SessionKindS2S is the RELAY's speech-to-speech kind: one bidirectional
-	// audio session in which the provider model listens and speaks. It is
-	// deliberately distinct from SessionKindRealtime, the local gateway's
-	// provider-direct concept, because the relay meters and budgets it
-	// differently (connected seconds under one budget group) and the two
-	// carry different execution contracts.
+	// SessionKindS2S is a reserved legacy wire value with no public Relay route.
+	// New speech-to-speech sessions use SessionKindRealtime and execute in the
+	// customer-side gateway with a provider-direct SessionPlan.
 	//
 	// The two kinds are mirror images, and both exclusions are deliberate:
 	// relay plans reject realtime (validRelayKind), and revision-3 session
@@ -156,6 +153,14 @@ type ExecutionRequest struct {
 // RequestOptions contains portable, provider-neutral session options.
 type RequestOptions struct {
 	Provider           string   `json:"provider,omitempty"`
+	// ClientSessionID lets a trusted setup service allocate the public session
+	// identifier before asking the control plane for a plan. The control plane
+	// still binds it to the authenticated principal and idempotency key; it is
+	// never accepted as billing identity on its own.
+	ClientSessionID    string   `json:"client_session_id,omitempty"`
+	// MaxSessionSeconds is the customer-visible hard ceiling requested by the
+	// setup service. Policy may shorten it, but may never extend it.
+	MaxSessionSeconds  int      `json:"max_session_seconds,omitempty"`
 	MaxInputCharacters int64    `json:"max_input_characters,omitempty"`
 	Language           string   `json:"language,omitempty"`
 	Objective          string   `json:"objective,omitempty"`
@@ -169,8 +174,9 @@ type RequestOptions struct {
 	// every plan request an older control plane parses — byte-identical when
 	// the caller asks for nothing.
 	STT *SttOptions `json:"stt,omitempty"`
-	// S2S carries the session-level asks of a speech-to-speech session. Only
-	// ever set on s2s sessions; omitempty keeps every existing payload
+	// S2S carries the local session-level asks of a provider-direct realtime
+	// session. The gateway strips this content before requesting a hosted plan;
+	// only the selected provider adapter reads it. Omitempty keeps every existing payload
 	// byte-identical when the caller asks for nothing.
 	S2S *S2SOptions `json:"s2s,omitempty"`
 }
@@ -283,6 +289,20 @@ type Reservation struct {
 	LeaseExpiresAt       time.Time              `json:"lease_expires_at"`
 	Concurrency          ConcurrencyReservation `json:"concurrency"`
 	Usage                UsageReservation       `json:"usage"`
+	Billing              *BillingAuthorization  `json:"billing,omitempty"`
+}
+
+// BillingAuthorization is the customer-visible financial authority attached
+// to a managed provider-direct session. "estimated" means the maximum has
+// been reserved but provider-authoritative reconciliation has not completed;
+// "final" is only emitted by a settlement read, never by browser telemetry.
+type BillingAuthorization struct {
+	Mode                string    `json:"mode"`
+	State               string    `json:"state"`
+	MaximumAmountMicros int64     `json:"maximum_amount_micros"`
+	Currency            string    `json:"currency"`
+	RenewalURL          string    `json:"renewal_url,omitempty"`
+	RenewableUntil      time.Time `json:"renewable_until,omitempty"`
 }
 
 // ConcurrencyReservation identifies the capacity lease consumed by this
@@ -372,12 +392,29 @@ func (r SessionPlanRequest) Validate() error {
 	if strings.ContainsAny(provider, " \t\r\n") {
 		return fmt.Errorf("request.provider: must be a provider id or auto")
 	}
+	if r.Request.ClientSessionID != "" {
+		clientSessionID := strings.TrimSpace(r.Request.ClientSessionID)
+		if clientSessionID != r.Request.ClientSessionID || len(clientSessionID) > 128 || strings.ContainsAny(clientSessionID, " \t\r\n/\\") {
+			return fmt.Errorf("request.client_session_id: invalid value")
+		}
+	}
+	if r.Request.MaxSessionSeconds < 0 || r.Request.MaxSessionSeconds > 14_400 {
+		return fmt.Errorf("request.max_session_seconds: must be between 1 and 14400 when set")
+	}
 	if r.Kind == SessionKindTTS {
 		if r.Request.MaxInputCharacters <= 0 {
 			return fmt.Errorf("request.max_input_characters: positive value is required for tts")
 		}
 	} else if r.Request.MaxInputCharacters != 0 {
 		return fmt.Errorf("request.max_input_characters: valid only for tts")
+	}
+	if r.Request.S2S != nil {
+		if r.Kind != SessionKindRealtime {
+			return fmt.Errorf("request.s2s: valid only for realtime")
+		}
+		if err := r.Request.S2S.validate(); err != nil {
+			return fmt.Errorf("request.s2s: %w", err)
+		}
 	}
 	if needsMedia(r.Kind) {
 		if r.Media == nil {
@@ -386,6 +423,19 @@ func (r SessionPlanRequest) Validate() error {
 		if err := r.Media.validate(); err != nil {
 			return fmt.Errorf("media: %w", err)
 		}
+	}
+	return nil
+}
+
+func (o S2SOptions) validate() error {
+	if o.Temperature != nil && (*o.Temperature < 0 || *o.Temperature > 2) {
+		return fmt.Errorf("temperature: must be between 0 and 2")
+	}
+	if o.OutputMedia == nil {
+		return fmt.Errorf("output_media: required")
+	}
+	if err := o.OutputMedia.validate(); err != nil {
+		return fmt.Errorf("output_media: %w", err)
 	}
 	return nil
 }
@@ -426,6 +476,20 @@ func (p SessionPlan) Validate(now time.Time) error {
 	}
 	if err := p.Reservation.Usage.validate(); err != nil {
 		return fmt.Errorf("reservation.usage: %w", err)
+	}
+	if p.Reservation.Billing != nil {
+		billing := p.Reservation.Billing
+		if billing.Mode != "direct_entitlement" || billing.State != "estimated" || billing.MaximumAmountMicros <= 0 || strings.TrimSpace(billing.Currency) == "" {
+			return fmt.Errorf("reservation.billing: invalid direct entitlement")
+		}
+		if billing.RenewalURL != "" {
+			if err := validateSecureURL(billing.RenewalURL, "https"); err != nil {
+				return fmt.Errorf("reservation.billing.renewal_url: %w", err)
+			}
+			if billing.RenewableUntil.IsZero() || !billing.RenewableUntil.After(p.Reservation.LeaseExpiresAt) {
+				return fmt.Errorf("reservation.billing.renewable_until: must follow the current lease")
+			}
+		}
 	}
 	if p.Reservation.LeaseExpiresAt.IsZero() || !p.Reservation.LeaseExpiresAt.After(now) {
 		return fmt.Errorf("reservation: lease is expired")

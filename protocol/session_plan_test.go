@@ -119,6 +119,24 @@ func TestSessionPlanRequestRejectsS2SKind(t *testing.T) {
 	assertInvalid(t, request.Validate(), "unsupported value")
 }
 
+func TestRealtimePlanRequestKeepsLocalS2SOptionsOptional(t *testing.T) {
+	request := validRequest(t)
+	request.Kind = protocol.SessionKindRealtime
+	request.Request.STT = nil
+	request.Request.S2S = nil
+	if err := request.Validate(); err != nil {
+		t.Fatalf("content-free realtime plan request: %v", err)
+	}
+	request.Request.S2S = &protocol.S2SOptions{OutputMedia: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1}}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("valid realtime request: %v", err)
+	}
+	request.Kind = protocol.SessionKindSTT
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "valid only for realtime") {
+		t.Fatalf("cross-kind realtime options error = %v", err)
+	}
+}
+
 func TestSessionPlanRequestValidatesOptionalWorkloadIdentity(t *testing.T) {
 	t.Parallel()
 

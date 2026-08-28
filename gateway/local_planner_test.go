@@ -119,6 +119,10 @@ func TestLocalPlannerRoutesEveryCatalogEntryWithBYOK(t *testing.T) {
 				request.Request.MaxInputCharacters = 1_000
 				request.Request.Voice = "test-voice"
 			}
+			if entry.Kind == protocol.SessionKindRealtime {
+				request.Request.Voice = "test-voice"
+				request.Request.S2S = &protocol.S2SOptions{OutputMedia: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1}}
+			}
 			plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
 			if err != nil {
 				t.Fatalf("create local plan: %v", err)

@@ -658,12 +658,11 @@
       },
       "Kind": {
         "type": "string",
-        "description": "The provider-neutral operation served by the Router: stt, tts, llm, and s2s (speech-to-speech — one bidirectional audio session in which the model listens and speaks, served on the /v1/s2s/stream WebSocket channel documented in asyncapi.yaml). The local gateway's realtime kind has no Router contract.",
+        "description": "The provider-neutral operation served by the Router. The set is deliberately smaller than the local gateway's session kinds: the Router serves stt, tts, and llm, and has no realtime kind.",
         "enum": [
           "stt",
           "tts",
-          "llm",
-          "s2s"
+          "llm"
         ]
       },
       "ModelCapabilities": {
@@ -730,20 +729,13 @@
           },
           "audio_formats": {
             "type": "array",
-            "description": "Accepted input formats for STT and s2s models, or output formats for TTS; omitted for LLM models.",
+            "description": "Accepted input formats for STT or output formats for TTS; omitted for LLM models.",
             "items": {
               "$ref": "#/components/schemas/AudioFormat"
             }
           },
           "batch_audio_limits": {
             "$ref": "#/components/schemas/BatchAudioLimits"
-          },
-          "output_audio_formats": {
-            "type": "array",
-            "description": "The formats an s2s model speaks back in; audio_formats is its accepted input. Present only on s2s rows, whose two directions can differ.",
-            "items": {
-              "$ref": "#/components/schemas/AudioFormat"
-            }
           },
           "benchmark": {
             "$ref": "#/components/schemas/ModelBenchmark"

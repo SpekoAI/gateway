@@ -6,17 +6,15 @@ import (
 	"strings"
 )
 
-// Kind selects the provider-neutral operation served by the relay: stt, tts,
-// llm, and s2s (speech-to-speech — one bidirectional audio session in which
-// the model listens and speaks). The local gateway's realtime kind has no
-// relay contract.
+// Kind selects the provider-neutral operation served by the relay. The set
+// is deliberately smaller than the local gateway's session kinds: the relay
+// serves stt, tts, and llm, and has no realtime kind.
 type Kind string
 
 const (
 	KindSTT Kind = "stt"
 	KindTTS Kind = "tts"
 	KindLLM Kind = "llm"
-	KindS2S Kind = "s2s"
 )
 
 // ModelCapabilities advertises what a model supports. Capability gating
@@ -165,12 +163,7 @@ type Model struct {
 	Regions          []string          `json:"regions"`
 	AudioFormats     []AudioFormat     `json:"audio_formats,omitempty"`
 	BatchAudioLimits *BatchAudioLimits `json:"batch_audio_limits,omitempty"`
-	// OutputAudioFormats lists the formats an s2s model speaks back in;
-	// AudioFormats is its accepted input. Present only on s2s rows, whose two
-	// directions can differ (Gemini Live listens at 16 kHz and answers at
-	// 24 kHz).
-	OutputAudioFormats []AudioFormat   `json:"output_audio_formats,omitempty"`
-	Benchmark          *ModelBenchmark `json:"benchmark,omitempty"`
+	Benchmark        *ModelBenchmark   `json:"benchmark,omitempty"`
 }
 
 // Validate checks that a catalog entry is concrete and routable somewhere.
@@ -192,23 +185,12 @@ func (m Model) Validate() error {
 	if m.Kind == KindLLM && len(m.AudioFormats) != 0 {
 		return fmt.Errorf("audio_formats: must be omitted for llm models")
 	}
-	if (m.Kind == KindSTT || m.Kind == KindTTS || m.Kind == KindS2S) && len(m.AudioFormats) == 0 {
+	if (m.Kind == KindSTT || m.Kind == KindTTS) && len(m.AudioFormats) == 0 {
 		return fmt.Errorf("audio_formats: at least one format is required for speech models")
 	}
 	for i, format := range m.AudioFormats {
 		if err := format.Validate(); err != nil {
 			return fmt.Errorf("audio_formats[%d]: %w", i, err)
-		}
-	}
-	if m.Kind != KindS2S && len(m.OutputAudioFormats) != 0 {
-		return fmt.Errorf("output_audio_formats: must be omitted for %s models", m.Kind)
-	}
-	if m.Kind == KindS2S && len(m.OutputAudioFormats) == 0 {
-		return fmt.Errorf("output_audio_formats: at least one format is required for s2s models")
-	}
-	for i, format := range m.OutputAudioFormats {
-		if err := format.Validate(); err != nil {
-			return fmt.Errorf("output_audio_formats[%d]: %w", i, err)
 		}
 	}
 	return nil
@@ -238,5 +220,5 @@ func (m ModelsResponse) Validate() error {
 }
 
 func validKind(v Kind) bool {
-	return v == KindSTT || v == KindTTS || v == KindLLM || v == KindS2S
+	return v == KindSTT || v == KindTTS || v == KindLLM
 }
