@@ -122,6 +122,10 @@ func (p *LocalPlanner) CreateSessionPlan(_ context.Context, request protocol.Ses
 		return protocol.SessionPlan{}, "", err
 	}
 	now := p.now().UTC()
+	sessionDuration := p.maxSessionDuration
+	if requested := time.Duration(request.Request.MaxSessionSeconds) * time.Second; requested > 0 && requested < sessionDuration {
+		sessionDuration = requested
+	}
 	planID, err := localID("plan")
 	if err != nil {
 		return protocol.SessionPlan{}, "", err
@@ -134,7 +138,7 @@ func (p *LocalPlanner) CreateSessionPlan(_ context.Context, request protocol.Ses
 	if err != nil {
 		return protocol.SessionPlan{}, "", err
 	}
-	usage := protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: int64(p.maxSessionDuration / time.Second)}
+	usage := protocol.UsageReservation{Unit: protocol.UsageUnitDurationSeconds, AuthorizedUnits: int64(sessionDuration / time.Second)}
 	if request.Kind == protocol.SessionKindTTS {
 		usage = protocol.UsageReservation{Unit: protocol.UsageUnitCharacters, AuthorizedUnits: request.Request.MaxInputCharacters}
 	}
@@ -144,7 +148,7 @@ func (p *LocalPlanner) CreateSessionPlan(_ context.Context, request protocol.Ses
 		ExpiresAt: now.Add(time.Minute),
 		Route:     route,
 		Reservation: protocol.Reservation{
-			ID: "local-" + sessionID, LeaseDurationSeconds: int(p.maxSessionDuration / time.Second), LeaseExpiresAt: now.Add(p.maxSessionDuration),
+			ID: "local-" + sessionID, LeaseDurationSeconds: int(sessionDuration / time.Second), LeaseExpiresAt: now.Add(sessionDuration),
 			Concurrency: protocol.ConcurrencyReservation{LeaseID: "local-" + sessionID, Slots: 1}, Usage: usage,
 		},
 		Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: request.Runtime.Version},

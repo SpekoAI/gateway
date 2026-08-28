@@ -5,9 +5,8 @@ import (
 	"strings"
 )
 
-// S2SControlType tags every client-to-server JSON text frame on
-// GET /v1/s2s/stream. Audio input travels in binary frames and is
-// deliberately untyped here. The set is closed.
+// S2SControlType is retained for decoding legacy internal connector frames.
+// The Relay exposes no public speech-to-speech media route.
 type S2SControlType string
 
 const (
@@ -24,11 +23,7 @@ const (
 	S2SControlSessionClose   S2SControlType = "session.close"
 )
 
-// S2SEventType tags every server-to-client JSON text frame on
-// GET /v1/s2s/stream. Spoken answers travel in binary frames between the
-// response.started and response.done events that share their sequence
-// number. Exactly one terminal frame — session.closed or error — ends every
-// session. The set is closed.
+// S2SEventType is retained for decoding legacy internal connector frames.
 type S2SEventType string
 
 const (

@@ -158,7 +158,7 @@ func TestEveryPublishedEntryIsRoutable(t *testing.T) {
 		if entry.DefaultModel == "" || entry.Endpoint == "" || entry.Adapter == "" {
 			t.Fatalf("catalog entry is incomplete: %+v", entry)
 		}
-		if entry.Kind != protocol.SessionKindSTT && entry.Kind != protocol.SessionKindTTS {
+		if entry.Kind != protocol.SessionKindSTT && entry.Kind != protocol.SessionKindTTS && entry.Kind != protocol.SessionKindRealtime {
 			t.Fatalf("catalog entry %+v claims a modality the gateway has no adapter shape for", entry)
 		}
 	}

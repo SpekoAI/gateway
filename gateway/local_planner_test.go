@@ -52,6 +52,29 @@ func TestLocalPlannerIssuesVerifiableCredentialFreeBYOKPlan(t *testing.T) {
 	}
 }
 
+func TestLocalPlannerHonorsRequestedSessionCeiling(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.August, 28, 12, 0, 0, 0, time.UTC)
+	planner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{
+		Providers: []string{"deepgram"}, Now: func() time.Time { return now }, MaxSessionDuration: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("new local planner: %v", err)
+	}
+	request := localPlanRequest()
+	request.Request.MaxSessionSeconds = 90
+	plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create local plan: %v", err)
+	}
+	if plan.Reservation.LeaseDurationSeconds != 90 || plan.Reservation.Usage.AuthorizedUnits != 90 {
+		t.Fatalf("reservation = %+v, want 90-second caller ceiling", plan.Reservation)
+	}
+	if want := now.Add(90 * time.Second); !plan.Reservation.LeaseExpiresAt.Equal(want) {
+		t.Fatalf("lease expiry = %s, want %s", plan.Reservation.LeaseExpiresAt, want)
+	}
+}
+
 func TestLocalPlannerRequiresBYOKAndUnambiguousProvider(t *testing.T) {
 	t.Parallel()
 	planner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{Providers: []string{"deepgram", "elevenlabs"}})
@@ -118,6 +141,10 @@ func TestLocalPlannerRoutesEveryCatalogEntryWithBYOK(t *testing.T) {
 			if entry.Kind == protocol.SessionKindTTS {
 				request.Request.MaxInputCharacters = 1_000
 				request.Request.Voice = "test-voice"
+			}
+			if entry.Kind == protocol.SessionKindRealtime {
+				request.Request.Voice = "test-voice"
+				request.Request.S2S = &protocol.S2SOptions{OutputMedia: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1}}
 			}
 			plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
 			if err != nil {
