@@ -242,11 +242,15 @@ func (e TTSUtteranceDone) Validate() error {
 	return nil
 }
 
-// TimingGranularity says what unit a TimingSpan measures. It is the
-// provider's OWN granularity, never a conversion: a character-level engine
-// reports character, and grouping those characters into words is the
-// client's call because only the client knows where the words are in the
-// text it sent. The set is closed.
+// TimingGranularity says what unit a TimingSpan measures.
+//
+// Synthesis always reports word. A character-level engine still measures
+// characters, and the adapters still report exactly what it gave them, but
+// the relay groups that reading into words before it reaches a caller — so
+// the fold is written once, here, instead of once per client per provider.
+//
+// character stays in the set for a reading passed through ungrouped. The set
+// is closed.
 type TimingGranularity string
 
 const (

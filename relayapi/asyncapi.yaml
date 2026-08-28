@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:1ec9a7803bc728db35993bda924c100e794f866ec9a357c9842b208146a10033
-# yaml-body: sha256:25a22a3043348bf90102b525e7ad9c80dfa058821c6e8c9b6736686ba137dae3
+# json-mirror: asyncapi.json sha256:62dfac05ddea3eee54b0fbb608d119cfd052179ba4bb829ac58f43ef6de3bbc4
+# yaml-body: sha256:494bc8a60385bf8974db22cef60bc65d711a935f66c0e65f74ab63141fc20ef1
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -923,11 +923,12 @@ components:
     TimingGranularity:
       type: string
       description: >-
-        The unit a TimingSpan measures. It is the provider's OWN granularity,
-        never a conversion: a character-level engine reports character, and
-        grouping those characters into words is the client's call because
-        only the client knows where the words are in the text it sent. The
-        set is closed.
+        The unit a TimingSpan measures. Synthesis always reports word, even
+        where the engine measured characters: the relay groups a
+        character-level reading into words on the way out, so one client does
+        not have to write that fold once per provider. character remains in
+        the set for readings that are passed through ungrouped. The set is
+        closed.
       enum:
         - word
         - character

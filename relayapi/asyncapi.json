@@ -972,7 +972,7 @@
       },
       "TimingGranularity": {
         "type": "string",
-        "description": "The unit a TimingSpan measures. It is the provider's OWN granularity, never a conversion: a character-level engine reports character, and grouping those characters into words is the client's call because only the client knows where the words are in the text it sent. The set is closed.",
+        "description": "The unit a TimingSpan measures. Synthesis always reports word, even where the engine measured characters: the relay groups a character-level reading into words on the way out, so one client does not have to write that fold once per provider. character remains in the set for readings that are passed through ungrouped. The set is closed.",
         "enum": [
           "word",
           "character"
