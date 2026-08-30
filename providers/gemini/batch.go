@@ -23,11 +23,25 @@ const (
 	// transcription model.
 	BatchEndpoint = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
+	// BatchModel is the model id the interactions endpoint serves. It differs
+	// from the catalog's customer-facing row id, which names the live socket.
+	BatchModel = "gemini-3.5-transcribe"
+
 	// batchRequestCeilingBytes is the documented ceiling on a whole inline
 	// request ("under 20MB total request size"). It bounds the BASE64 payload,
-	// not the audio, which is why the catalog's byte limit is three quarters
-	// of it less slack for the surrounding JSON.
+	// not the audio, which is why the usable audio limit below is three
+	// quarters of it less slack for the surrounding JSON.
 	batchRequestCeilingBytes int64 = 20 << 20
+	// BatchMaxAudioBytes is the whole-file ceiling that follows: base64 expands
+	// by 4/3, and a 16 KiB reserve covers the JSON envelope and the WAV header.
+	// The catalog restates this expression rather than importing it — the
+	// control plane consumes the catalog too — and a connector test pins the
+	// two together.
+	BatchMaxAudioBytes int64 = (20<<20)/4*3 - (16 << 10)
+	// BatchMaxDurationSeconds is not documented separately; the byte cap binds
+	// first at every rate the relay carries (eight minutes of 16 kHz mono is
+	// already inside it). It is what transcription jobs chunk to.
+	BatchMaxDurationSeconds int64 = 480
 
 	batchExtensionID = "generativelanguage.googleapis.com/v1beta/interactions"
 )
@@ -37,7 +51,7 @@ const (
 // no Interactions counterpart, so routing it here would bill a request the
 // service refuses.
 var batchModels = map[string]struct{}{
-	"gemini-3.5-transcribe": {},
+	BatchModel: {},
 }
 
 // BatchConfig controls local transport limits for the Interactions adapter.
@@ -110,10 +124,9 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 			Hint:    "Use the gemini-3.5-transcribe-live route for diarized transcription, or drop the diarization option.",
 		}
 	}
-	// base64 expands by 4/3, and the ceiling is on the whole request. Refuse
-	// before reading the file rather than after building a payload the service
-	// will reject.
-	if encodedLen(request.AudioBytes) > batchRequestCeilingBytes {
+	// Refuse before reading the file rather than after building a payload the
+	// service will reject.
+	if request.AudioBytes > BatchMaxAudioBytes {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInputTooLarge, Message: "the upload exceeds the Gemini inline request limit"}
 	}
 	credential, err := batchhttp.Credential(request.Plan)
@@ -127,11 +140,13 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if err := batchhttp.Rewind(request.Audio); err != nil {
 		return nil, err
 	}
-	audio, err := io.ReadAll(io.LimitReader(request.Audio, batchRequestCeilingBytes+1))
+	audio, err := io.ReadAll(io.LimitReader(request.Audio, BatchMaxAudioBytes+1))
 	if err != nil {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeProviderError, Message: "the audio could not be read", Cause: err}
 	}
-	if encodedLen(int64(len(audio))) > batchRequestCeilingBytes {
+	// AudioBytes is a declaration; this is the file. A stream longer than the
+	// declaration must not slip past the check above.
+	if int64(len(audio)) > BatchMaxAudioBytes {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInputTooLarge, Message: "the upload exceeds the Gemini inline request limit"}
 	}
 	body, err := json.Marshal(map[string]any{
@@ -195,13 +210,4 @@ func (r batchResponse) transcript() string {
 		return text
 	}
 	return strings.TrimSpace(r.OutputTextCamel)
-}
-
-// encodedLen is the base64 size of n bytes, saturating rather than overflowing
-// on a nonsense length.
-func encodedLen(n int64) int64 {
-	if n < 0 || n > (1<<62)/2 {
-		return 1 << 62
-	}
-	return (n + 2) / 3 * 4
 }

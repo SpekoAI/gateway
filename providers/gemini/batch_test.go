@@ -161,7 +161,7 @@ func TestBatchRefusesOversizedInlineRequest(t *testing.T) {
 	request := batchRequest(server.URL, []byte("wav"))
 	// Declared size crosses the ceiling once base64 expansion is applied, so
 	// the refusal must happen before the file is read.
-	request.AudioBytes = batchRequestCeilingBytes
+	request.AudioBytes = BatchMaxAudioBytes + 1
 	_, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
 	if err == nil || !strings.Contains(err.Error(), "inline request limit") {
 		t.Fatalf("Transcribe error = %v, want an input_too_large refusal", err)
@@ -188,12 +188,28 @@ func TestBatchRefusesEmptyTranscript(t *testing.T) {
 	}
 }
 
-func TestEncodedLenSaturates(t *testing.T) {
+// The declared size gates the read, but the bytes actually delivered are
+// checked too: a reader that outruns its declaration must not slip through.
+func TestBatchRefusesAudioLongerThanItsDeclaration(t *testing.T) {
 	t.Parallel()
-	if got := encodedLen(3); got != 4 {
-		t.Fatalf("encodedLen(3) = %d, want 4", got)
+	server, _ := newFakeInteractions(t, http.StatusOK, `{"output_text":"x"}`)
+	request := batchRequest(server.URL, bytes.Repeat([]byte("a"), int(BatchMaxAudioBytes)+1))
+	request.AudioBytes = 16
+	_, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
+	if err == nil || !strings.Contains(err.Error(), "inline request limit") {
+		t.Fatalf("Transcribe error = %v, want an input_too_large refusal", err)
 	}
-	if got := encodedLen(-1); got != 1<<62 {
-		t.Fatalf("encodedLen(-1) = %d, want the saturating ceiling", got)
+}
+
+// The byte ceiling is what the catalog restates and the connector pins.
+func TestBatchLimitsFollowTheInlineRequestCeiling(t *testing.T) {
+	t.Parallel()
+	if want := batchRequestCeilingBytes/4*3 - (16 << 10); BatchMaxAudioBytes != want {
+		t.Fatalf("BatchMaxAudioBytes = %d, want %d", BatchMaxAudioBytes, want)
+	}
+	// Eight minutes of 16 kHz mono s16le must fit inside the byte cap, or the
+	// duration bound would be the lie rather than the slack.
+	if seconds := BatchMaxAudioBytes / (16_000 * 2); seconds < BatchMaxDurationSeconds {
+		t.Fatalf("byte cap holds only %d s of 16 kHz mono, less than the %d s duration bound", seconds, BatchMaxDurationSeconds)
 	}
 }
