@@ -26,6 +26,7 @@ var localCredentialSpecs = []localCredentialSpec{
 	{Provider: "deepgram", Env: "SPEKO_DEEPGRAM_BYOK_API_KEY"},
 	{Provider: "elevenlabs", Env: "SPEKO_ELEVENLABS_BYOK_API_KEY"},
 	{Provider: "fish", Env: "SPEKO_FISH_BYOK_API_KEY"},
+	{Provider: "gemini", Env: "SPEKO_GEMINI_BYOK_API_KEY"},
 	{Provider: "gladia", Env: "SPEKO_GLADIA_BYOK_API_KEY"},
 	{Provider: "google", Env: "SPEKO_GOOGLE_BYOK_ACCESS_TOKEN"},
 	{Provider: "gradium", Env: "SPEKO_GRADIUM_BYOK_API_KEY"},
