@@ -26,6 +26,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/deepgram"
 	"github.com/SpekoAI/gateway/providers/elevenlabs"
 	"github.com/SpekoAI/gateway/providers/fish"
+	"github.com/SpekoAI/gateway/providers/gemini"
 	"github.com/SpekoAI/gateway/providers/geminirealtime"
 	"github.com/SpekoAI/gateway/providers/gladia"
 	"github.com/SpekoAI/gateway/providers/google"
@@ -235,6 +236,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	geminiSTTAdapter, err := gemini.NewSTT(gemini.STTConfig{})
+	if err != nil {
+		return err
+	}
 	googleRealtimeAdapter, err := geminirealtime.New(geminirealtime.Config{})
 	if err != nil {
 		return err
@@ -285,6 +290,7 @@ func run() error {
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
 		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
+		geminiSTTAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {

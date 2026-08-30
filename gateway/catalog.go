@@ -98,6 +98,14 @@ var providerCatalog = []CatalogEntry{
 	// a dialable URL — `eu` because Chirp 3 wins hi/ta/te only from that region.
 	{Provider: "google", Kind: protocol.SessionKindSTT, Adapter: "google.stt.v1", DefaultModel: "chirp_3", Transport: protocol.TransportHTTP, Endpoint: "https://speech.googleapis.com/v2/projects/PROJECT_ID/locations/eu/recognizers/_:recognize",
 		RequiresDeploymentConfig: "set SPEKO_GOOGLE_STT_ENDPOINT to a project-scoped recognize URL"},
+	// Gemini speech is a SEPARATE provider from google: the AI Studio surface
+	// authenticates with an API key and is global, where Cloud Speech V2 above
+	// is project-scoped and takes an ADC bearer. One adapter per (provider,
+	// kind) is what the relay connector dispatches on, so the split is what
+	// lets both exist. This row is the Live API transcription socket; the
+	// prerecorded sibling (gemini-3.5-transcribe) is a BatchTranscriber, which
+	// this catalog does not publish.
+	{Provider: "gemini", Kind: protocol.SessionKindSTT, Adapter: "gemini.stt.v1", DefaultModel: "gemini-3.5-transcribe-live", Transport: protocol.TransportWebSocket, Endpoint: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"},
 	{Provider: "gradium", Kind: protocol.SessionKindSTT, Adapter: "gradium.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/asr"},
 	{Provider: "gradium", Kind: protocol.SessionKindTTS, Adapter: "gradium.tts.v1", DefaultModel: "default", DefaultVoice: "YTpq7expH9539ERJ", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/tts"},
 	// Hamsa's realtime socket takes one WHOLE-UTTERANCE WAV per message — the
