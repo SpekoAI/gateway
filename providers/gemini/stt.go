@@ -222,6 +222,11 @@ func (a *STTAdapter) parseEndpoint(raw string) (*url.URL, error) {
 // publishes as current are sent. languageHints, languageAuto and
 // adaptationPhrases are marked deprecated there and are omitted rather than
 // mirrored, so a caller's language ask rides languageCodes alone.
+//
+// `mode` is deliberately not sent. This socket documents VERBATIM as its
+// default and states that timestamps and diarization are incompatible with
+// SMART, so a diarization ask is served by setting diarization alone; naming
+// the mode would only risk selecting one that contradicts it.
 func buildSTTSetup(vendorModel string, options protocol.RequestOptions) map[string]any {
 	transcription := map[string]any{}
 	if language := strings.TrimSpace(options.Language); language != "" {

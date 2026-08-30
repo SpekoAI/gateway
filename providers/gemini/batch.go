@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -8,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
 
@@ -44,6 +47,11 @@ const (
 	BatchMaxDurationSeconds int64 = 480
 
 	batchExtensionID = "generativelanguage.googleapis.com/v1beta/interactions"
+
+	// Wire literals from the generated Interactions types.
+	stepModelOutput    = "model_output"
+	contentText        = "text"
+	annotationWordInfo = "word_info"
 )
 
 // batchModels are the model ids this endpoint serves. The live-only id is
@@ -101,14 +109,17 @@ func (a *BatchAdapter) ID() string { return a.id }
 
 // Transcribe POSTs the WAV inline as one interaction.
 //
-// The request is deliberately MINIMAL: model and audio, nothing else. The
-// Interactions API is absent from every published discovery document, so its
-// TranscriptionConfig field spellings are documented prose rather than a
-// machine-readable schema, and Google's JSON surfaces reject unknown fields
-// with 400 INVALID_ARGUMENT. Sending a guessed field name would therefore
-// fail every request rather than degrade. Feature asks the config would carry
-// are refused below instead of being silently dropped; the live route, whose
-// config IS schema-published, serves them.
+// Request and response field names come from the generated Interactions types
+// in Google's own genai SDK (google-genai 2.20.0,
+// google/genai/_gaos/types/interactions), which is the machine-readable schema
+// the REST discovery documents do not publish for this surface.
+//
+// Transcription settings ride generation_config.transcription_config, NOT the
+// request root. Of its fields, language_codes and custom_vocabulary are
+// current, while adaptation_phrases and the ROOT-level diarization_mode and
+// timestamp_granularities are all marked deprecated in favour of the
+// discriminated `mode` object — so this adapter sends the mode object and none
+// of the deprecated spellings.
 func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchTranscribeRequest) (*runtimepkg.BatchTranscription, error) {
 	if request.Plan.Route.Provider != ProviderName {
 		return nil, fmt.Errorf("gemini batch adapter cannot serve provider %q", request.Plan.Route.Provider)
@@ -116,13 +127,6 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	model := strings.TrimSpace(request.Plan.Route.Model)
 	if _, ok := batchModels[model]; !ok {
 		return nil, fmt.Errorf("gemini batch adapter cannot serve model %q on the interactions endpoint", model)
-	}
-	if request.Options.STT.Diarize() {
-		return nil, &runtimepkg.ProviderError{
-			Code:    batchhttp.CodeInvalidRequest,
-			Message: "speaker diarization is not available on Gemini prerecorded transcription",
-			Hint:    "Use the gemini-3.5-transcribe-live route for diarized transcription, or drop the diarization option.",
-		}
 	}
 	// Refuse before reading the file rather than after building a payload the
 	// service will reject.
@@ -149,18 +153,22 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if int64(len(audio)) > BatchMaxAudioBytes {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInputTooLarge, Message: "the upload exceeds the Gemini inline request limit"}
 	}
-	body, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"model": model,
-		"input": []map[string]string{{
+		"input": []map[string]any{{
 			"type":      "audio",
 			"data":      base64.StdEncoding.EncodeToString(audio),
 			"mime_type": "audio/wav",
 		}},
-	})
+	}
+	if transcription := transcriptionConfig(request.Options); len(transcription) > 0 {
+		payload["generation_config"] = map[string]any{"transcription_config": transcription}
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), strings.NewReader(string(body)))
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -176,38 +184,149 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if response.Status < 200 || response.Status >= 300 {
 		return nil, batchhttp.StatusError(batchExtensionID, response.Status, response.Body)
 	}
-	var payload batchResponse
-	if err := batchhttp.DecodeJSON(response.Body, &payload); err != nil {
+	var decoded interaction
+	if err := batchhttp.DecodeJSON(response.Body, &decoded); err != nil {
 		return nil, err
 	}
-	text := payload.transcript()
+	text := decoded.transcript()
 	if text == "" {
 		return nil, batchhttp.Failed(batchExtensionID, "the response carried no transcript")
 	}
 	return &runtimepkg.BatchTranscription{
 		Text: text,
-		// Segments stay empty. Word-level annotations are returned only when
-		// the request enables them, and this request cannot: see Transcribe's
-		// comment on unpinned config spellings. BatchTranscription documents
-		// empty segments as the honest shape for untimed text, and the caller
-		// meters from the audio it sent when DurationMS is likewise absent.
-		ProviderRequestID: response.Header.Get("x-request-id"),
+		// Words are annotations on the transcript text, present only when the
+		// request asked for verbatim mode above. Absent, Segments stays empty,
+		// which BatchTranscription documents as the honest shape for untimed
+		// text.
+		Segments: batchhttp.GroupWords(decoded.words(), 0),
+		// DurationMS stays zero: the interaction's usage block reports tokens
+		// by modality and no audio duration at all, so the caller meters from
+		// the audio it sent rather than from a number this response invents.
+		ProviderRequestID: decoded.ID,
 		Extensions:        batchhttp.RawExtension(batchExtensionID, response.Body),
 	}, nil
 }
 
-// batchResponse reads the transcript from an interaction. Both spellings are
-// accepted because the REST documentation shows the snake_case field while
-// Google's JSON surfaces normally emit camelCase, and no discovery document
-// settles which this endpoint returns.
-type batchResponse struct {
-	OutputTextSnake string `json:"output_text"`
-	OutputTextCamel string `json:"outputText"`
+// transcriptionConfig renders the caller's asks onto
+// generation_config.transcription_config, or nil when they asked for nothing.
+//
+// `mode` is left unset unless diarization was requested. The two modes are
+// verbatim and smart, and only verbatim carries speaker labels and word
+// timings — the Live API's twin of this field states the incompatibility
+// outright ("Timestamps and diarization are incompatible with mode SMART"),
+// and the smart mode object here carries neither field to set.
+//
+// Which mode this endpoint defaults to is NOT documented in the generated
+// types, so the adapter does not assume: naming a mode when the caller has no
+// need of one could silently switch every transcript between verbatim output
+// and smart's disfluency removal and auto-formatting. Leaving it unset keeps
+// whichever default the service has, and the one case that genuinely requires
+// verbatim asks for it explicitly.
+func transcriptionConfig(options protocol.RequestOptions) map[string]any {
+	config := map[string]any{}
+	if language := strings.TrimSpace(options.Language); language != "" {
+		config["language_codes"] = []string{language}
+	}
+	if options.STT != nil {
+		if keywords := trimmedKeywords(options.STT.Keywords); len(keywords) > 0 {
+			config["custom_vocabulary"] = keywords
+		}
+	}
+	if options.STT.Diarize() {
+		config["mode"] = map[string]any{
+			"type":                    "verbatim",
+			"diarization_mode":        "speaker",
+			"timestamp_granularities": []string{"word"},
+		}
+	}
+	if len(config) == 0 {
+		return nil
+	}
+	return config
 }
 
-func (r batchResponse) transcript() string {
-	if text := strings.TrimSpace(r.OutputTextSnake); text != "" {
-		return text
+// interaction is the subset of the Interactions response this adapter reads.
+//
+// output_text is documented as "concatenated text from the last model output",
+// but Google's own SDK does not trust it: it recomputes the value from steps
+// on every parse. This decoder does the same in reverse — steps first, the
+// flat field only as a fallback — so a response that omits the convenience
+// field still yields a transcript.
+type interaction struct {
+	ID         string `json:"id"`
+	OutputText string `json:"output_text"`
+	Steps      []struct {
+		Type    string `json:"type"`
+		Content []struct {
+			Type        string `json:"type"`
+			Text        string `json:"text"`
+			Annotations []struct {
+				Type        string `json:"type"`
+				Text        string `json:"text"`
+				StartOffset string `json:"start_offset"`
+				EndOffset   string `json:"end_offset"`
+				Speaker     string `json:"speaker"`
+			} `json:"annotations"`
+		} `json:"content"`
+	} `json:"steps"`
+}
+
+func (i interaction) transcript() string {
+	var parts []string
+	for _, step := range i.Steps {
+		if step.Type != stepModelOutput {
+			continue
+		}
+		for _, content := range step.Content {
+			if content.Type == contentText && content.Text != "" {
+				parts = append(parts, content.Text)
+			}
+		}
 	}
-	return strings.TrimSpace(r.OutputTextCamel)
+	if joined := strings.TrimSpace(strings.Join(parts, "")); joined != "" {
+		return joined
+	}
+	return strings.TrimSpace(i.OutputText)
+}
+
+// words flattens the word_info annotations across the model output. Other
+// annotation kinds (url_citation, file_citation, place_citation) share the
+// list and are skipped by type.
+func (i interaction) words() []batchhttp.Word {
+	var words []batchhttp.Word
+	for _, step := range i.Steps {
+		if step.Type != stepModelOutput {
+			continue
+		}
+		for _, content := range step.Content {
+			for _, annotation := range content.Annotations {
+				if annotation.Type != annotationWordInfo || strings.TrimSpace(annotation.Text) == "" {
+					continue
+				}
+				words = append(words, batchhttp.Word{
+					Text:    annotation.Text,
+					StartMS: offsetMS(annotation.StartOffset),
+					EndMS:   offsetMS(annotation.EndOffset),
+					Speaker: annotation.Speaker,
+				})
+			}
+		}
+	}
+	return words
+}
+
+// offsetMS reads a protobuf Duration in its JSON form — a decimal number of
+// seconds with a trailing "s", such as "1.500s". An unparseable or absent
+// offset yields zero rather than an error: a missing timestamp is a degraded
+// segment, not a failed transcription.
+func offsetMS(offset string) int64 {
+	offset = strings.TrimSuffix(strings.TrimSpace(offset), "s")
+	if offset == "" {
+		return 0
+	}
+	seconds, err := strconv.ParseFloat(offset, 64)
+	if err != nil {
+		return 0
+	}
+	return batchhttp.SecondsToMS(seconds)
 }

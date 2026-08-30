@@ -47,14 +47,25 @@
 //     :streamingRecognize does NOT exist over REST, read in the opposite
 //     direction.
 //
-// # What is not pinned here
+// # Where the Interactions schema comes from
 //
-// The Interactions API response field names are documented but not published
-// in a machine-readable schema, so the batch decoder accepts both the
-// snake_case spelling the REST documentation shows and the camelCase spelling
-// Google's JSON surfaces normally emit, and treats word-level annotations as
-// optional. A response carrying only transcript text yields a transcription
-// with no segments, which BatchTranscription explicitly allows. Neither model
-// id is routable until its live canary passes, which is the gate that catches
-// a wrong id before a customer pays admission latency for it.
+// The REST discovery documents publish no Interactions surface, so its request
+// and response field names are taken from the generated types in Google's own
+// genai SDK (google-genai 2.20.0, google/genai/_gaos/types/interactions),
+// which is machine-readable and versioned. Three things it settles that the
+// prose documentation does not:
+//
+//   - Transcription settings ride generation_config.transcription_config, not
+//     the request root.
+//   - Within TranscriptionConfig, language_codes and custom_vocabulary are
+//     current, while adaptation_phrases and the root-level diarization_mode and
+//     timestamp_granularities are deprecated in favour of a discriminated
+//     `mode` object. Only the verbatim mode carries diarization and word
+//     timestamps; the smart mode carries neither.
+//   - output_text is documented as the concatenated last model output, but the
+//     SDK recomputes it from `steps` on every parse rather than trusting it, so
+//     the decoder here reads steps first and falls back to the flat field.
+//
+// Neither model id is routable until its live canary passes, which is the gate
+// that catches a wrong id before a customer pays admission latency for it.
 package gemini
