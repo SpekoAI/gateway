@@ -324,3 +324,66 @@ func TestTranscribeRefusesForeignEndpointsAndMedia(t *testing.T) {
 		t.Fatal("accepted a non-stt session kind")
 	}
 }
+
+// A session that establishes inputTranscription and then carries a turn on the
+// model channel alone must still publish that turn. Suppressing the fallback
+// for the whole session drops such a turn silently — no delta, no final — and
+// silence is indistinguishable from "the caller said nothing".
+func TestTranscribeDoesNotDropAModelChannelTurnAfterAnInputChannelTurn(t *testing.T) {
+	t.Parallel()
+	fake := newFakeTranscribe(t,
+		`{"serverContent":{"inputTranscription":{"text":"first turn"}}}`,
+		`{"serverContent":{"turnComplete":true}}`,
+		`{"serverContent":{"modelTurn":{"parts":[{"text":"second turn"}]}}}`,
+		`{"serverContent":{"turnComplete":true}}`,
+	)
+	stream, ctx := openTranscribe(t, fake, transcribeRequest(fake.endpoint()))
+	if err := stream.CommitAudio(ctx); err != nil {
+		t.Fatalf("CommitAudio: %v", err)
+	}
+	events := expectEvents(t, stream, ctx, []protocol.EventType{
+		protocol.EventSessionReady,
+		protocol.EventTranscriptDelta, protocol.EventTranscriptFinal,
+		protocol.EventTranscriptFinal,
+	})
+	if text := eventText(t, events[2]); text != "first turn" {
+		t.Fatalf("first final = %q", text)
+	}
+	if text := eventText(t, events[3]); text != "second turn" {
+		t.Fatalf("second final = %q, want the model-channel turn published", text)
+	}
+}
+
+// The retained model text must not become a second publication of a turn the
+// dedicated channel already covered — the duplicate guard has to survive the
+// per-turn fallback, on later turns as much as the first.
+func TestTranscribeStillDeduplicatesOnALaterTurn(t *testing.T) {
+	t.Parallel()
+	fake := newFakeTranscribe(t,
+		`{"serverContent":{"inputTranscription":{"text":"one"}}}`,
+		`{"serverContent":{"turnComplete":true}}`,
+		`{"serverContent":{"inputTranscription":{"text":"two"}}}`,
+		`{"serverContent":{"modelTurn":{"parts":[{"text":"two"}]}}}`,
+		`{"serverContent":{"turnComplete":true}}`,
+		`{"serverContent":{"inputTranscription":{"text":"three"}}}`,
+		`{"serverContent":{"turnComplete":true}}`,
+	)
+	stream, ctx := openTranscribe(t, fake, transcribeRequest(fake.endpoint()))
+	if err := stream.CommitAudio(ctx); err != nil {
+		t.Fatalf("CommitAudio: %v", err)
+	}
+	events := expectEvents(t, stream, ctx, []protocol.EventType{
+		protocol.EventSessionReady,
+		protocol.EventTranscriptDelta, protocol.EventTranscriptFinal,
+		protocol.EventTranscriptDelta, protocol.EventTranscriptFinal,
+		protocol.EventTranscriptDelta, protocol.EventTranscriptFinal,
+	})
+	if text := eventText(t, events[4]); text != "two" {
+		t.Fatalf("second final = %q, want the echoed model text dropped", text)
+	}
+	// The third turn proves the retained text did not survive the flush and
+	// leak into a later turn's final.
+	if text := eventText(t, events[6]); text != "three" {
+		t.Fatalf("third final = %q, want no carry-over from the retained buffer", text)
+	}
+}

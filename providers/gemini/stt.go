@@ -281,6 +281,7 @@ type sttStream struct {
 	// adapter presents.
 	turnMu       sync.Mutex
 	pending      strings.Builder
+	pendingModel strings.Builder
 	sawInputText bool
 
 	terminalMu  sync.Mutex
@@ -474,13 +475,18 @@ func (s *sttStream) handleContent(message sttServerMessage, raw []byte) {
 		s.appendFragment(content.InputTranscription.Text, raw, true)
 	}
 	// A transcription model asked for TEXT may answer with the transcript as
-	// its model turn rather than as an input transcription. Those parts are
-	// read only while no inputTranscription has ever arrived on this stream:
-	// once the service has shown it uses the dedicated channel, treating model
-	// text as transcript too would publish every fragment twice.
+	// its model turn rather than as an input transcription. Until the stream
+	// has shown it uses the dedicated channel, those parts ARE the transcript
+	// and are published as they arrive. Afterwards they are only retained:
+	// publishing them too would emit every fragment twice, but discarding them
+	// outright would lose any turn the dedicated channel does not cover.
 	if content.ModelTurn != nil {
 		for _, part := range content.ModelTurn.Parts {
-			if part.Text == "" || s.inputChannelActive() {
+			if part.Text == "" {
+				continue
+			}
+			if s.inputChannelActive() {
+				s.retainModelText(part.Text)
 				continue
 			}
 			s.appendFragment(part.Text, raw, false)
@@ -499,6 +505,15 @@ func (s *sttStream) inputChannelActive() bool {
 	s.turnMu.Lock()
 	defer s.turnMu.Unlock()
 	return s.sawInputText
+}
+
+// retainModelText keeps model-turn text for the current turn without
+// publishing it, for a stream whose transcripts arrive on the dedicated input
+// channel. flushTurn decides per turn whether it is needed.
+func (s *sttStream) retainModelText(text string) {
+	s.turnMu.Lock()
+	s.pendingModel.WriteString(text)
+	s.turnMu.Unlock()
 }
 
 // appendFragment publishes one incremental transcript fragment and retains it
@@ -520,10 +535,22 @@ func (s *sttStream) appendFragment(text string, raw []byte, fromInputChannel boo
 // flushTurn publishes the joined text of the turn as its final. A turn that
 // carried no text publishes nothing: an empty final is indistinguishable from
 // silence to a caller.
+//
+// The model channel is the fallback for THIS TURN, not merely for the stream's
+// first one. A stream that has already used inputTranscription can still carry
+// a turn the dedicated channel does not cover, and a session-wide suppression
+// would drop that turn silently — no delta, no final, nothing for a caller to
+// notice. Such a turn publishes a final without preceding deltas, since its
+// fragments were retained rather than emitted; a final alone is a shape the
+// relay's STT contract already carries (the Google adapter emits nothing else).
 func (s *sttStream) flushTurn(raw []byte) {
 	s.turnMu.Lock()
 	text := strings.TrimSpace(s.pending.String())
+	if text == "" {
+		text = strings.TrimSpace(s.pendingModel.String())
+	}
 	s.pending.Reset()
+	s.pendingModel.Reset()
 	s.turnMu.Unlock()
 	if text == "" {
 		return
