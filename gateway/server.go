@@ -766,12 +766,12 @@ func (s *Server) releaseSessionAttachment(id string, session *runtimepkg.Session
 				s.expireUnattached(id, session)
 			})
 		} else {
-			expired = session
+			expired, _ = s.detachSessionLocked(id, session)
 		}
 	}
 	s.mu.Unlock()
 	if expired != nil {
-		expired.Close()
+		expired.Abort()
 	}
 }
 

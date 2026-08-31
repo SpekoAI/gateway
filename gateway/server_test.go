@@ -288,6 +288,55 @@ func TestGatewayAttachmentClaimSurvivesAttachmentTimeout(t *testing.T) {
 	expectEvent(t, connection, protocol.EventTranscriptDelta)
 }
 
+func TestGatewayReleaseSessionAttachmentAfterTimeoutReclaimsCapacityAndDrains(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	gatewayServer, _ := newServerWithOptions(t, 1, 50*time.Millisecond)
+	httpServer := httptest.NewServer(gatewayServer.Handler())
+	t.Cleanup(httpServer.Close)
+
+	created := postJSON(t, httpServer.URL+"/v1/sessions", gatewayRequestBody(), "local-token", "attachment-release-expired")
+	defer created.Body.Close()
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d", created.StatusCode)
+	}
+	var response struct {
+		StreamURL string `json:"stream_url"`
+	}
+	if err := json.NewDecoder(created.Body).Decode(&response); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	// Wait past the attachment timeout so remaining time is <= 0 when WebSocket fails.
+	time.Sleep(100 * time.Millisecond)
+
+	// Attempt a WebSocket dial with an invalid subprotocol, causing websocket.Accept to fail
+	// and invoke releaseSessionAttachment with remaining <= 0.
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer local-token")
+	_, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(httpServer.URL, "http")+response.StreamURL, &websocket.DialOptions{
+		HTTPHeader:   headers,
+		Subprotocols: []string{"invalid-subprotocol"},
+	})
+	if err == nil {
+		t.Fatal("expected websocket dial with invalid subprotocol to fail")
+	}
+
+	// Verify that the session was immediately detached and drained without hanging.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := gatewayServer.Drain(ctx); err != nil {
+		t.Fatalf("gateway failed to drain after attachment release: %v", err)
+	}
+
+	stats := gatewayServer.Stats()
+	if stats.ActiveSessions != 0 {
+		t.Fatalf("active sessions = %d, want 0", stats.ActiveSessions)
+	}
+	_ = now
+}
+
+
 func TestGatewayCoalescesConcurrentIdempotentCreates(t *testing.T) {
 	t.Parallel()
 	gatewayServer, plans := newServer(t)
