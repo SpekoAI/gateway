@@ -428,3 +428,47 @@ func TestInputCapIsEnforcedBeforeTheRequest(t *testing.T) {
 		t.Fatalf("error = %v, want input_too_large", err)
 	}
 }
+
+func TestUndecodableAudioFailsTheUtterance(t *testing.T) {
+	stream, cleanup := newTTSFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sseFrame(t, []byte{1, 2}, ""))
+		_, _ = io.WriteString(w, `data: {"candidates":[{"content":{"parts":[{"inlineData":{"data":"%%not-base64%%"}}]}}]}`+"\n\n")
+	})
+	defer cleanup()
+	if err := stream.AppendText(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if event := ttsEventWithin(t, stream.Events()); event.Type != protocol.EventAudioStarted {
+		t.Fatalf("event = %q", event.Type)
+	}
+	if event := ttsEventWithin(t, stream.Events()); event.Type != protocol.EventAudioFrame {
+		t.Fatalf("event = %q", event.Type)
+	}
+	// The corrupt frame fails the utterance rather than splicing a gap into
+	// the audio and reporting the clip complete.
+	if providerErr := ttsErrorWithin(t, stream.Events()); providerErr.Code != "provider_unavailable" {
+		t.Fatalf("error = %+v, want provider_unavailable", providerErr)
+	}
+}
+
+func TestUndecodableBlobAudioIsAnError(t *testing.T) {
+	stream, cleanup := newTTSFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"candidates":[{"content":{"parts":[{"inlineData":{"data":"%%not-base64%%"}}]},"finishReason":"STOP"}]}`)
+	})
+	defer cleanup()
+	long := strings.Repeat("a long sentence. ", ttsStreamMaxChars/16+1)
+	if err := stream.AppendText(context.Background(), long); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if providerErr := ttsErrorWithin(t, stream.Events()); providerErr.Code != "provider_unavailable" {
+		t.Fatalf("error = %+v, want provider_unavailable", providerErr)
+	}
+}

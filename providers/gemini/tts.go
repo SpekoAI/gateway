@@ -238,9 +238,11 @@ type ttsStream struct {
 	canceled      bool
 }
 
-func (s *ttsStream) Events() <-chan runtimepkg.ProviderEvent  { return s.events }
-func (s *ttsStream) WriteAudio(context.Context, []byte) error { return runtimepkg.ErrUnsupportedOperation }
-func (s *ttsStream) CommitAudio(context.Context) error        { return runtimepkg.ErrUnsupportedOperation }
+func (s *ttsStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
+func (s *ttsStream) WriteAudio(context.Context, []byte) error {
+	return runtimepkg.ErrUnsupportedOperation
+}
+func (s *ttsStream) CommitAudio(context.Context) error { return runtimepkg.ErrUnsupportedOperation }
 
 func (s *ttsStream) AppendText(_ context.Context, text string) error {
 	if text == "" {
@@ -431,7 +433,11 @@ func (s *ttsStream) readSSE(requestCtx context.Context, body io.Reader) {
 						s.emit(requestCtx, runtimepkg.ProviderEvent{Err: payloadError(payload)})
 						return
 					}
-					audio, finish := payloadAudio(payload)
+					audio, finish, decodeErr := payloadAudio(payload)
+					if decodeErr != nil {
+						s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini TTS returned undecodable audio", Retryable: true, Cause: decodeErr}})
+						return
+					}
 					if finish != "" {
 						finishReason = finish
 					}
@@ -493,7 +499,11 @@ func (s *ttsStream) readBlob(requestCtx context.Context, body io.Reader) {
 		s.emit(requestCtx, runtimepkg.ProviderEvent{Err: payloadError(payload)})
 		return
 	}
-	audio, finishReason := payloadAudio(payload)
+	audio, finishReason, decodeErr := payloadAudio(payload)
+	if decodeErr != nil {
+		s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini TTS returned undecodable audio", Retryable: true, Cause: decodeErr}})
+		return
+	}
 	if len(audio) == 0 {
 		s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini TTS returned no audio", Retryable: true}})
 		return
@@ -509,8 +519,10 @@ func (s *ttsStream) readBlob(requestCtx context.Context, body io.Reader) {
 
 // payloadAudio concatenates every inline part's PCM and reports the last
 // non-empty finishReason. The SSE arm delivers one part per frame in
-// practice; tolerating several keeps a multi-part blob response whole.
-func payloadAudio(payload ttsPayload) ([]byte, string) {
+// practice; tolerating several keeps a multi-part blob response whole. An
+// undecodable part fails the whole payload: dropping it would splice the
+// surrounding audio together and report the gapped clip as a success.
+func payloadAudio(payload ttsPayload) ([]byte, string, error) {
 	var audio []byte
 	finish := ""
 	for _, candidate := range payload.Candidates {
@@ -520,7 +532,7 @@ func payloadAudio(payload ttsPayload) ([]byte, string) {
 			}
 			decoded, err := base64.StdEncoding.DecodeString(part.InlineData.Data)
 			if err != nil {
-				continue
+				return nil, "", fmt.Errorf("undecodable inline audio: %w", err)
 			}
 			audio = append(audio, decoded...)
 		}
@@ -528,7 +540,7 @@ func payloadAudio(payload ttsPayload) ([]byte, string) {
 			finish = candidate.FinishReason
 		}
 	}
-	return audio, finish
+	return audio, finish, nil
 }
 
 // doneData records a truncated generation on the AudioDone event. A STOP (or
