@@ -4,6 +4,10 @@ import asyncio
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
+pytest.importorskip("pipecat")
+
 from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     TranscriptionFrame,
