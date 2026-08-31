@@ -290,7 +290,6 @@ func TestGatewayAttachmentClaimSurvivesAttachmentTimeout(t *testing.T) {
 
 func TestGatewayReleaseSessionAttachmentAfterTimeoutReclaimsCapacityAndDrains(t *testing.T) {
 	t.Parallel()
-	now := time.Now()
 	gatewayServer, _ := newServerWithOptions(t, 1, 50*time.Millisecond)
 	httpServer := httptest.NewServer(gatewayServer.Handler())
 	t.Cleanup(httpServer.Close)
@@ -333,7 +332,6 @@ func TestGatewayReleaseSessionAttachmentAfterTimeoutReclaimsCapacityAndDrains(t 
 	if stats.ActiveSessions != 0 {
 		t.Fatalf("active sessions = %d, want 0", stats.ActiveSessions)
 	}
-	_ = now
 }
 
 
