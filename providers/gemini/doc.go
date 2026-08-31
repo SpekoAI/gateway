@@ -1,7 +1,8 @@
-// Package geminitranscribe is the relay's speech-to-text integration for
-// Google's Gemini 3.5 Transcribe family, which is a different product from the
-// Cloud Speech-to-Text V2 recognizer behind provider "google". The two are
-// deliberately separate provider keys:
+// Package gemini is the relay's integration for Google's AI Studio speech
+// surface: the Gemini 3.5 Transcribe family (speech-to-text, live and
+// prerecorded) and Gemini Flash speech generation (text-to-speech). Both are
+// different products from the Cloud Speech and Cloud Text-to-Speech services
+// behind provider "google". The two are deliberately separate provider keys:
 //
 //   - "google" is Cloud Speech V2 (Chirp), a project-scoped regional endpoint
 //     authenticated with an OAuth bearer minted from the relay's
@@ -65,6 +66,18 @@
 //   - output_text is documented as the concatenated last model output, but the
 //     SDK recomputes it from `steps` on every parse rather than trusting it, so
 //     the decoder here reads steps first and falls back to the flat field.
+//
+// # Speech generation
+//
+// TTS rides the same surface and credential as everything above, on the
+// generateContent pair: `:streamGenerateContent?alt=sse` streams the clip as
+// base64 16-bit mono 24 kHz PCM chunks, and `:generateContent` returns it
+// whole. The streaming arm intermittently truncates generations past ~60s of
+// speech (finishReason OTHER on HTTP 200), so the adapter streams short
+// utterances for time-to-first-audio and routes long text through the
+// non-streaming arm — the same split the platform's google-gemini-tts adapter
+// ships. Voice selection is prebuiltVoiceConfig only; there is no language
+// field, and style is steered by the text itself.
 //
 // Neither model id is routable until its live canary passes, which is the gate
 // that catches a wrong id before a customer pays admission latency for it.

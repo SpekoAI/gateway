@@ -106,6 +106,12 @@ var providerCatalog = []CatalogEntry{
 	// prerecorded sibling (gemini-3.5-transcribe) is a BatchTranscriber, which
 	// this catalog does not publish.
 	{Provider: "gemini", Kind: protocol.SessionKindSTT, Adapter: "gemini.stt.v1", DefaultModel: "gemini-3.5-transcribe-live", Transport: protocol.TransportWebSocket, Endpoint: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"},
+	// Gemini speech generation on the same AI Studio surface and credential.
+	// The endpoint is the bare models collection: the adapter appends the
+	// model id and picks the arm per utterance — SSE streaming for short text,
+	// the non-streaming blob for text long enough to hit the streaming arm's
+	// >60s truncation.
+	{Provider: "gemini", Kind: protocol.SessionKindTTS, Adapter: "gemini.tts.v1", DefaultModel: "gemini-3.1-flash-tts-preview", DefaultVoice: "Aoede", Transport: protocol.TransportHTTP, Endpoint: "https://generativelanguage.googleapis.com/v1beta/models"},
 	{Provider: "gradium", Kind: protocol.SessionKindSTT, Adapter: "gradium.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/asr"},
 	{Provider: "gradium", Kind: protocol.SessionKindTTS, Adapter: "gradium.tts.v1", DefaultModel: "default", DefaultVoice: "YTpq7expH9539ERJ", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/tts"},
 	// Hamsa's realtime socket takes one WHOLE-UTTERANCE WAV per message — the

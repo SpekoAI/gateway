@@ -240,6 +240,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	geminiTTSAdapter, err := gemini.NewTTS(gemini.TTSConfig{})
+	if err != nil {
+		return err
+	}
 	googleRealtimeAdapter, err := geminirealtime.New(geminirealtime.Config{})
 	if err != nil {
 		return err
@@ -290,7 +294,7 @@ func run() error {
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
 		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
-		geminiSTTAdapter,
+		geminiSTTAdapter, geminiTTSAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {
