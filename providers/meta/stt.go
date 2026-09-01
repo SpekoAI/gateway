@@ -568,10 +568,11 @@ func (s *sttStream) flushTurn(message serverMessage, raw []byte) {
 	}
 	s.lastPartial = ""
 	s.turnMu.Unlock()
-	if text == "" {
-		return
+	if text != "" {
+		s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: s.transcriptData(text, true, message), Extensions: extension(raw)})
 	}
-	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: s.transcriptData(text, true, message), Extensions: extension(raw)})
+	// The speaker label belongs to the turn that just ended, whether or not it
+	// carried text: a silent diarized turn must not lend its label to the next.
 	s.turnMu.Lock()
 	s.currentSpeaker = ""
 	s.turnMu.Unlock()

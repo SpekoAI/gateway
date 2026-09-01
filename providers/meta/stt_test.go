@@ -322,6 +322,37 @@ func TestTranscribeDiarizationCarriesTheSpeakerLabel(t *testing.T) {
 	}
 }
 
+// A diarized turn that ends without text still releases its speaker label, so
+// the next turn is not attributed to the previous speaker.
+func TestTranscribeSilentDiarizedTurnReleasesTheSpeaker(t *testing.T) {
+	t.Parallel()
+	fake := newFakeRealtime(t,
+		`{"type":"speechStart","turnId":1,"audioProcessedMs":100}`,
+		`{"type":"speaker","label":"A","audioProcessedMs":200}`,
+		`{"type":"speechComplete","turnId":1,"transcript":"","audioProcessedMs":400}`,
+		`{"type":"speechStart","turnId":2,"audioProcessedMs":900}`,
+		`{"type":"transcript","transcript":"hi","final":false,"audioProcessedMs":1100}`,
+		`{"type":"speechComplete","turnId":2,"transcript":"Hi.","audioProcessedMs":1300}`,
+	)
+	request := realtimeRequest(fake.endpoint())
+	diarize := true
+	request.Options.STT = &protocol.SttOptions{Diarization: &diarize}
+	stream, ctx := openRealtime(t, fake, request)
+	if err := stream.WriteAudio(ctx, []byte("pcm")); err != nil {
+		t.Fatalf("WriteAudio: %v", err)
+	}
+	events := expectEvents(t, stream, ctx, []protocol.EventType{
+		protocol.EventSessionReady, protocol.EventUsageObserved,
+		protocol.EventSpeechStarted, protocol.EventSpeechStarted,
+		protocol.EventTranscriptDelta, protocol.EventTranscriptFinal,
+	})
+	for _, event := range events[4:] {
+		if data := eventData(t, event); data["speaker"] != nil {
+			t.Fatalf("event %s = %v, want no speaker carried over from the silent turn", event.Type, data)
+		}
+	}
+}
+
 // A turn whose speechComplete arrives empty falls back to its last partial;
 // a turn that carried no text at all publishes no final.
 func TestTranscribeFallsBackToTheLastPartialAndSuppressesEmptyTurns(t *testing.T) {
