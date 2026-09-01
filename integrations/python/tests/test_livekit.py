@@ -603,3 +603,38 @@ def test_stt_declares_the_capabilities_it_asked_for() -> None:
         "keywords": ["Speko"],
         "provider_options": {"deepgram": {"numerals": True}},
     }
+
+
+async def test_gateway_session_send_audio_guards_closed_state() -> None:
+    import pytest
+
+    from speko_gateway.client import GatewaySession
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent_bytes: list[bytes] = []
+            self.sent_json: list[dict] = []
+            self.closed = False
+
+        async def send_bytes(self, data: bytes) -> None:
+            self.sent_bytes.append(data)
+
+        async def send_json(self, data: dict) -> None:
+            self.sent_json.append(data)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    ws = FakeWS()
+    session = GatewaySession(ws, {})  # type: ignore[arg-type]
+    await session.send_audio(b"\x01\x02")
+    assert ws.sent_bytes == [b"\x01\x02"]
+
+    await session.finish()
+    with pytest.raises(GatewayError, match="Gateway session is finishing"):
+        await session.send_audio(b"\x03\x04")
+
+    await session.aclose()
+    with pytest.raises(GatewayError, match="Gateway session is closed"):
+        await session.send_audio(b"\x05\x06")
+
