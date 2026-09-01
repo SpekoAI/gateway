@@ -1,9 +1,9 @@
 // Package palabra implements Palabra's provider-direct realtime speech-to-text
 // and text-to-speech WebSocket APIs.
 //
-// Both dedicated sockets authenticate in the standard Authorization bearer
-// header. The value may be a customer-owned account key or an interim publisher
-// JWT from a manually managed Palabra session. Publisher JWT support remains a
-// live-canary-gated managed route because the credential is reusable across
-// modalities rather than scoped to one dedicated ASR or TTS connection.
+// Both dedicated sockets document account-key authentication in the standard
+// Authorization bearer header. The adapter transports the bearer selected by
+// the signed plan but does not decide whether Palabra grants that credential
+// access to a product. Publisher-JWT compatibility with these dedicated sockets
+// therefore remains a staging live-canary gate in managed routing policy.
 package palabra
