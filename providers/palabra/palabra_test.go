@@ -144,6 +144,71 @@ func TestTTSInitStreamingAndAudioEvents(t *testing.T) {
 	}
 }
 
+func TestBYOKAccountKeyUsesBearerHeaderForDedicatedSockets(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		path string
+		open func(string) (runtimepkg.ProviderStream, error)
+	}{
+		{
+			name: "stt", path: sttPath,
+			open: func(endpoint string) (runtimepkg.ProviderStream, error) {
+				adapter, err := NewSTT(STTConfig{AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+				if err != nil {
+					return nil, err
+				}
+				request := sttRequest(endpoint)
+				request.Plan.Execution.CredentialSource = protocol.CredentialsBYOK
+				request.Plan.Route.Credential.Value = "palabra-account-key"
+				return adapter.Open(context.Background(), request)
+			},
+		},
+		{
+			name: "tts", path: ttsPath,
+			open: func(endpoint string) (runtimepkg.ProviderStream, error) {
+				adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+				if err != nil {
+					return nil, err
+				}
+				request := ttsRequest(endpoint)
+				request.Plan.Execution.CredentialSource = protocol.CredentialsBYOK
+				request.Plan.Route.Credential.Value = "palabra-account-key"
+				return adapter.Open(context.Background(), request)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "Bearer palabra-account-key" {
+					t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+				}
+				if r.URL.Query().Get("token") != "" || r.URL.Query().Get("api_key") != "" {
+					t.Errorf("credential leaked into query: %v", r.URL.Query())
+				}
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					t.Errorf("accept: %v", err)
+					return
+				}
+				if test.path == ttsPath {
+					if _, _, err := conn.Read(r.Context()); err != nil {
+						t.Errorf("read TTS init: %v", err)
+					}
+				}
+				_ = conn.Close(websocket.StatusNormalClosure, "")
+			}))
+			t.Cleanup(server.Close)
+
+			stream, err := test.open(wsURL(server.URL) + test.path)
+			if err != nil {
+				t.Fatalf("open BYOK %s: %v", test.name, err)
+			}
+			_ = stream.Close(context.Background())
+		})
+	}
+}
+
 func TestTTSRejectsUnpublishedModel(t *testing.T) {
 	adapter, err := NewTTS(TTSConfig{})
 	if err != nil {

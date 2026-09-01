@@ -120,7 +120,9 @@ func TestManagedPalabraTTSSessionReportsUnicodeCharacters(t *testing.T) {
 	}
 	session.Close()
 	collectEvents(t, session)
-	assertUsageReported(t, telemetry.snapshot(), protocol.UsageUnitCharacters, 3_000, true)
+	recorded := telemetry.snapshot()
+	assertUsageReported(t, recorded, protocol.UsageUnitCharacters, 3_000, true)
+	assertAuthenticatedUsageDestination(t, recorded)
 }
 
 func TestManagedPalabraSTTSessionReportsAcceptedPCMDuration(t *testing.T) {
@@ -144,7 +146,9 @@ func TestManagedPalabraSTTSessionReportsAcceptedPCMDuration(t *testing.T) {
 	}
 	session.Close()
 	collectEvents(t, session)
-	assertUsageReported(t, telemetry.snapshot(), protocol.UsageUnitDurationSeconds, 1_000, true)
+	recorded := telemetry.snapshot()
+	assertUsageReported(t, recorded, protocol.UsageUnitDurationSeconds, 1_000, true)
+	assertAuthenticatedUsageDestination(t, recorded)
 }
 
 func TestEngineInjectsBYOKCredentialOnlyIntoAdapterRequest(t *testing.T) {
@@ -637,13 +641,26 @@ func assertUsageReported(t *testing.T, events []runtimepkg.TelemetryEvent, unit 
 			Unit           protocol.UsageUnit `json:"unit"`
 			QuantityMillis int64              `json:"quantity_millis"`
 		}
-		if err := json.Unmarshal(event.Data, &payload); err != nil || payload.Unit != unit || payload.QuantityMillis != quantityMillis || event.Required != required || event.Destination.Endpoint == "" || event.Destination.Token == "" {
+		if err := json.Unmarshal(event.Data, &payload); err != nil || payload.Unit != unit || payload.QuantityMillis != quantityMillis || event.Required != required {
 			t.Fatalf("usage.reported = %+v payload=%+v err=%v", event, payload, err)
 		}
 	}
 	if count != 1 {
 		t.Fatalf("usage.reported count = %d, events=%v", count, names(events))
 	}
+}
+
+func assertAuthenticatedUsageDestination(t *testing.T, events []runtimepkg.TelemetryEvent) {
+	t.Helper()
+	for _, event := range events {
+		if event.Name == "usage.reported" {
+			if event.Destination.Endpoint == "" || event.Destination.Token == "" {
+				t.Fatalf("managed usage destination = %+v, want authenticated endpoint", event.Destination)
+			}
+			return
+		}
+	}
+	t.Fatal("usage.reported event not found")
 }
 
 type collectingTelemetry struct {
