@@ -16,6 +16,13 @@ import (
 	"github.com/coder/websocket"
 )
 
+func TestOpaqueBearerCredentialUsesAuthorizationHeader(t *testing.T) {
+	headers := authHeaders("publisher.jwt")
+	if got := headers.Get("Authorization"); got != "Bearer publisher.jwt" {
+		t.Fatalf("Authorization = %q", got)
+	}
+}
+
 func TestSTTDialsWithBearerAndNormalizesTranscript(t *testing.T) {
 	observed := make(chan *http.Request, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

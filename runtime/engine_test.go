@@ -91,13 +91,14 @@ func TestTTSSessionEmitsBinaryAudioWithoutProviderLogicInEngine(t *testing.T) {
 	}
 }
 
-func TestTTSSessionEnforcesFixedUnicodeCharacterAllowance(t *testing.T) {
+func TestManagedPalabraTTSSessionReportsUnicodeCharacters(t *testing.T) {
 	t.Parallel()
 
-	adapter := mock.NewTTSAdapter("mock.limited.tts")
+	adapter := mock.NewTTSAdapter("palabra.tts.v1")
 	telemetry := &collectingTelemetry{}
 	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), telemetry)
 	plan := validPlan(protocol.SessionKindTTS, adapter.ID(), 60)
+	plan.Route.Provider = "palabra"
 	plan.Reservation.Usage.AuthorizedUnits = 3
 	plan.Execution.CredentialSource = protocol.CredentialsManaged
 	plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "short-lived", ExpiresAt: fixedNow.Add(time.Minute)}
@@ -119,15 +120,18 @@ func TestTTSSessionEnforcesFixedUnicodeCharacterAllowance(t *testing.T) {
 	}
 	session.Close()
 	collectEvents(t, session)
-	assertUsageReported(t, telemetry.snapshot(), protocol.UsageUnitCharacters, 3_000, true)
+	recorded := telemetry.snapshot()
+	assertUsageReported(t, recorded, protocol.UsageUnitCharacters, 3_000, true)
+	assertAuthenticatedUsageDestination(t, recorded)
 }
 
-func TestSTTSessionReportsAcceptedPCMDurationFromCompleteSamples(t *testing.T) {
+func TestManagedPalabraSTTSessionReportsAcceptedPCMDuration(t *testing.T) {
 	t.Parallel()
-	adapter := mock.NewSTTAdapter("mock.usage-duration.stt")
+	adapter := mock.NewSTTAdapter("palabra.stt.v1")
 	telemetry := &collectingTelemetry{}
 	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), telemetry)
 	plan := validPlan(protocol.SessionKindSTT, adapter.ID(), 60)
+	plan.Route.Provider = "palabra"
 	plan.Execution.CredentialSource = protocol.CredentialsManaged
 	plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "short-lived", ExpiresAt: fixedNow.Add(time.Minute)}
 	session, err := engine.Open(context.Background(), runtimepkg.OpenRequest{
@@ -142,7 +146,9 @@ func TestSTTSessionReportsAcceptedPCMDurationFromCompleteSamples(t *testing.T) {
 	}
 	session.Close()
 	collectEvents(t, session)
-	assertUsageReported(t, telemetry.snapshot(), protocol.UsageUnitDurationSeconds, 1_000, true)
+	recorded := telemetry.snapshot()
+	assertUsageReported(t, recorded, protocol.UsageUnitDurationSeconds, 1_000, true)
+	assertAuthenticatedUsageDestination(t, recorded)
 }
 
 func TestEngineInjectsBYOKCredentialOnlyIntoAdapterRequest(t *testing.T) {
@@ -642,6 +648,19 @@ func assertUsageReported(t *testing.T, events []runtimepkg.TelemetryEvent, unit 
 	if count != 1 {
 		t.Fatalf("usage.reported count = %d, events=%v", count, names(events))
 	}
+}
+
+func assertAuthenticatedUsageDestination(t *testing.T, events []runtimepkg.TelemetryEvent) {
+	t.Helper()
+	for _, event := range events {
+		if event.Name == "usage.reported" {
+			if event.Destination.Endpoint == "" || event.Destination.Token == "" {
+				t.Fatalf("managed usage destination = %+v, want authenticated endpoint", event.Destination)
+			}
+			return
+		}
+	}
+	t.Fatal("usage.reported event not found")
 }
 
 type collectingTelemetry struct {
