@@ -92,6 +92,10 @@ var sttOptionSupport = map[string]sttSupport{
 	// Speechmatics realtime maps vocabulary to additional_vocab and speaker
 	// labels to transcription_config.diarization=speaker.
 	"speechmatics": {diarization: true, keywords: true},
+	// Muse Voice Transcribe takes speaker labels as its DIARIZATION mode and
+	// vocabulary as the handshake's keywords list. Nothing else is tunable on
+	// the documented handshake, so no vendor settings are forwarded.
+	"meta": {diarization: true, keywords: true},
 	// Keywords fold into the transcription prompt alongside a caller's own
 	// prompt text. gpt-4o-transcribe-diarize is batch-only, so no realtime
 	// diarization. The vendor documents `prompt` on the realtime session for
