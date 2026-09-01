@@ -91,13 +91,14 @@ func TestTTSSessionEmitsBinaryAudioWithoutProviderLogicInEngine(t *testing.T) {
 	}
 }
 
-func TestTTSSessionEnforcesFixedUnicodeCharacterAllowance(t *testing.T) {
+func TestManagedPalabraTTSSessionReportsUnicodeCharacters(t *testing.T) {
 	t.Parallel()
 
-	adapter := mock.NewTTSAdapter("mock.limited.tts")
+	adapter := mock.NewTTSAdapter("palabra.tts.v1")
 	telemetry := &collectingTelemetry{}
 	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), telemetry)
 	plan := validPlan(protocol.SessionKindTTS, adapter.ID(), 60)
+	plan.Route.Provider = "palabra"
 	plan.Reservation.Usage.AuthorizedUnits = 3
 	plan.Execution.CredentialSource = protocol.CredentialsManaged
 	plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "short-lived", ExpiresAt: fixedNow.Add(time.Minute)}
@@ -122,12 +123,13 @@ func TestTTSSessionEnforcesFixedUnicodeCharacterAllowance(t *testing.T) {
 	assertUsageReported(t, telemetry.snapshot(), protocol.UsageUnitCharacters, 3_000, true)
 }
 
-func TestSTTSessionReportsAcceptedPCMDurationFromCompleteSamples(t *testing.T) {
+func TestManagedPalabraSTTSessionReportsAcceptedPCMDuration(t *testing.T) {
 	t.Parallel()
-	adapter := mock.NewSTTAdapter("mock.usage-duration.stt")
+	adapter := mock.NewSTTAdapter("palabra.stt.v1")
 	telemetry := &collectingTelemetry{}
 	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), telemetry)
 	plan := validPlan(protocol.SessionKindSTT, adapter.ID(), 60)
+	plan.Route.Provider = "palabra"
 	plan.Execution.CredentialSource = protocol.CredentialsManaged
 	plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "short-lived", ExpiresAt: fixedNow.Add(time.Minute)}
 	session, err := engine.Open(context.Background(), runtimepkg.OpenRequest{
@@ -635,7 +637,7 @@ func assertUsageReported(t *testing.T, events []runtimepkg.TelemetryEvent, unit 
 			Unit           protocol.UsageUnit `json:"unit"`
 			QuantityMillis int64              `json:"quantity_millis"`
 		}
-		if err := json.Unmarshal(event.Data, &payload); err != nil || payload.Unit != unit || payload.QuantityMillis != quantityMillis || event.Required != required {
+		if err := json.Unmarshal(event.Data, &payload); err != nil || payload.Unit != unit || payload.QuantityMillis != quantityMillis || event.Required != required || event.Destination.Endpoint == "" || event.Destination.Token == "" {
 			t.Fatalf("usage.reported = %+v payload=%+v err=%v", event, payload, err)
 		}
 	}

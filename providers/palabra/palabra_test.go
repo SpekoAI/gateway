@@ -55,7 +55,7 @@ func TestSTTDialsWithBearerAndNormalizesTranscript(t *testing.T) {
 	}
 
 	gotRequest := <-observed
-	if gotRequest.Header.Get("Authorization") != "Bearer palabra-key" {
+	if gotRequest.Header.Get("Authorization") != "Bearer publisher.jwt" {
 		t.Errorf("Authorization = %q", gotRequest.Header.Get("Authorization"))
 	}
 	if gotRequest.URL.Query().Get("format") != "pcm_s16le" || gotRequest.URL.Query().Get("sample_rate") != "16000" || gotRequest.URL.Query().Get("language") != "en" {
@@ -81,7 +81,7 @@ func TestSTTDialsWithBearerAndNormalizesTranscript(t *testing.T) {
 func TestTTSInitStreamingAndAudioEvents(t *testing.T) {
 	frames := make(chan map[string]any, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer palabra-key" || r.URL.RawQuery != "" {
+		if r.Header.Get("Authorization") != "Bearer publisher.jwt" || r.URL.RawQuery != "" {
 			t.Errorf("auth=%q query=%q", r.Header.Get("Authorization"), r.URL.RawQuery)
 		}
 		conn, err := websocket.Accept(w, r, nil)
@@ -159,7 +159,7 @@ func TestTTSRejectsUnpublishedModel(t *testing.T) {
 func sttRequest(endpoint string) runtimepkg.AdapterRequest {
 	return runtimepkg.AdapterRequest{
 		Kind:    protocol.SessionKindSTT,
-		Plan:    protocol.SessionPlan{Execution: protocol.Execution{ProviderRoute: protocol.RouteProviderDirect, CredentialSource: protocol.CredentialsBYOK}, Route: protocol.PlanRoute{Provider: "palabra", Model: "default", Adapter: STTAdapterID, Transport: protocol.TransportWebSocket, Endpoint: endpoint, Credential: &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "palabra-key"}}},
+		Plan:    protocol.SessionPlan{Execution: protocol.Execution{ProviderRoute: protocol.RouteProviderDirect, CredentialSource: protocol.CredentialsManaged}, Route: protocol.PlanRoute{Provider: "palabra", Model: "default", Adapter: STTAdapterID, Transport: protocol.TransportWebSocket, Endpoint: endpoint, Credential: &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "publisher.jwt"}}},
 		Options: protocol.RequestOptions{Language: "en-US"},
 		Media:   &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1},
 	}
@@ -168,7 +168,7 @@ func sttRequest(endpoint string) runtimepkg.AdapterRequest {
 func ttsRequest(endpoint string) runtimepkg.AdapterRequest {
 	return runtimepkg.AdapterRequest{
 		Kind:    protocol.SessionKindTTS,
-		Plan:    protocol.SessionPlan{Execution: protocol.Execution{ProviderRoute: protocol.RouteProviderDirect, CredentialSource: protocol.CredentialsBYOK}, Route: protocol.PlanRoute{Provider: "palabra", Model: "auto", Voice: "default_low", Adapter: TTSAdapterID, Transport: protocol.TransportWebSocket, Endpoint: endpoint, Credential: &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "palabra-key"}}},
+		Plan:    protocol.SessionPlan{Execution: protocol.Execution{ProviderRoute: protocol.RouteProviderDirect, CredentialSource: protocol.CredentialsManaged}, Route: protocol.PlanRoute{Provider: "palabra", Model: "auto", Voice: "default_low", Adapter: TTSAdapterID, Transport: protocol.TransportWebSocket, Endpoint: endpoint, Credential: &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "publisher.jwt"}}},
 		Options: protocol.RequestOptions{Language: "en"},
 		Media:   &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1},
 	}
