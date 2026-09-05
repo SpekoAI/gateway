@@ -133,6 +133,14 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if request.AudioBytes > BatchMaxAudioBytes {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInputTooLarge, Message: "the upload exceeds the Gemini inline request limit"}
 	}
+	// Google refuses custom_vocabulary alongside the verbatim mode's speaker
+	// labels or word timings ("custom_vocabulary is incompatible with
+	// timestamps", HTTP 400, observed live 2026-09-05). Refuse here with the
+	// conflict named rather than sending a request the service rejects, and
+	// never drop one ask to satisfy the other.
+	if verbatimModeRequested(request.Options) && len(trimmedKeywords(request.Options.STT.GetKeywords())) > 0 {
+		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInvalidRequest, Message: "Gemini cannot combine keywords with diarization or word timestamps; drop one of the asks"}
+	}
 	credential, err := batchhttp.Credential(request.Plan)
 	if err != nil {
 		return nil, err
@@ -192,13 +200,17 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if text == "" {
 		return nil, batchhttp.Failed(batchExtensionID, "the response carried no transcript")
 	}
+	words := decoded.words()
 	return &runtimepkg.BatchTranscription{
 		Text: text,
 		// Words are annotations on the transcript text, present only when the
 		// request asked for verbatim mode above. Absent, Segments stays empty,
 		// which BatchTranscription documents as the honest shape for untimed
 		// text.
-		Segments: batchhttp.GroupWords(decoded.words(), 0),
+		Segments: batchhttp.GroupWords(words, 0),
+		// Per-word timings surface only when the caller asked for them; a
+		// diarization-only request keeps its segments and nothing more.
+		Words: wordTimings(words, request.Options),
 		// DurationMS stays zero: the interaction's usage block reports tokens
 		// by modality and no audio duration at all, so the caller meters from
 		// the audio it sent rather than from a number this response invents.
@@ -232,17 +244,45 @@ func transcriptionConfig(options protocol.RequestOptions) map[string]any {
 			config["custom_vocabulary"] = keywords
 		}
 	}
-	if options.STT.Diarize() {
-		config["mode"] = map[string]any{
+	// Both asks ride the same verbatim mode object. Word timings are always
+	// requested inside it: diarization needs them to build speaker segments,
+	// and word_timestamps is nothing else. Which of the two the caller asked
+	// for decides what the RESULT exposes (see wordTimings), not the wire.
+	if verbatimModeRequested(options) {
+		mode := map[string]any{
 			"type":                    "verbatim",
-			"diarization_mode":        "speaker",
 			"timestamp_granularities": []string{"word"},
 		}
+		if options.STT.Diarize() {
+			mode["diarization_mode"] = "speaker"
+		}
+		config["mode"] = mode
 	}
 	if len(config) == 0 {
 		return nil
 	}
 	return config
+}
+
+// verbatimModeRequested reports whether the caller asked for something only
+// the verbatim mode carries: speaker labels or per-word timings.
+func verbatimModeRequested(options protocol.RequestOptions) bool {
+	return options.STT.Diarize() || options.STT.WantsWordTimestamps()
+}
+
+// wordTimings maps the annotations onto the result's Words when, and only
+// when, the caller asked for word_timestamps. Every word_info annotation
+// carries both offsets, so a word with none is a degraded reading (offsetMS
+// yields zero), kept rather than dropped so the word list stays complete.
+func wordTimings(words []batchhttp.Word, options protocol.RequestOptions) []runtimepkg.BatchWord {
+	if !options.STT.WantsWordTimestamps() || len(words) == 0 {
+		return nil
+	}
+	timed := make([]runtimepkg.BatchWord, 0, len(words))
+	for _, word := range words {
+		timed = append(timed, runtimepkg.BatchWord{Text: word.Text, StartMS: word.StartMS, EndMS: word.EndMS, Speaker: word.Speaker})
+	}
+	return timed
 }
 
 // interaction is the subset of the Interactions response this adapter reads.

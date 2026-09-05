@@ -639,7 +639,7 @@
       },
       "STTOptions": {
         "type": "object",
-        "description": "What a caller asked a transcription to do beyond returning text. The same object rides POST /v1/stt/transcriptions and the STT session.configure frame, in the same vocabulary the local gateway uses. The canonical asks (diarization, keywords, noise_reduction) fail closed: a session whose routed model does not advertise the matching capability in GET /v1/models is rejected with capability_unsupported, never answered with the feature quietly missing. Names arrive lower case and are rejected otherwise rather than folded, because the idempotency content hash covers the configure frame bytes exactly as sent and one intent must have one spelling.",
+        "description": "What a caller asked a transcription to do beyond returning text. The same object rides POST /v1/stt/transcriptions and the STT session.configure frame, in the same vocabulary the local gateway uses. The canonical asks (diarization, keywords, noise_reduction, word_timestamps) fail closed: a session whose routed model does not advertise the matching capability in GET /v1/models is rejected with capability_unsupported, never answered with the feature quietly missing. Names arrive lower case and are rejected otherwise rather than folded, because the idempotency content hash covers the configure frame bytes exactly as sent and one intent must have one spelling.",
         "properties": {
           "diarization": {
             "type": "boolean",
@@ -655,6 +655,10 @@
           "noise_reduction": {
             "type": "boolean",
             "description": "Ask the provider to clean the audio before transcribing."
+          },
+          "word_timestamps": {
+            "type": "boolean",
+            "description": "Return per-word timings on the batch transcription result. No streaming route advertises it, so on session.configure it is refused capability_unsupported."
           },
           "provider_options": {
             "type": "object",

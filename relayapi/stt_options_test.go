@@ -23,6 +23,15 @@ func TestSTTOptionsValidation(t *testing.T) {
 	if !absent.IsZero() {
 		t.Fatal("absent options must report zero")
 	}
+	// A word_timestamps ask alone is an ask: it must survive IsZero, or the
+	// edge would forward nothing and the caller would get untimed text.
+	wordsOnly := relayapi.STTOptions{WordTimestamps: boolPointer(true)}
+	if wordsOnly.IsZero() || !wordsOnly.WantsWordTimestamps() {
+		t.Fatal("a word_timestamps ask must not report zero")
+	}
+	if (&relayapi.STTOptions{WordTimestamps: boolPointer(false)}).WantsWordTimestamps() {
+		t.Fatal("an explicit false is not an ask")
+	}
 
 	full := relayapi.STTOptions{
 		Diarization:     boolPointer(true),
@@ -187,11 +196,12 @@ func TestSTTOptionsRideBothSTTSurfaces(t *testing.T) {
 func TestModelCapabilitiesGateSTTOptions(t *testing.T) {
 	t.Parallel()
 
-	capable := relayapi.ModelCapabilities{Diarization: true, Keywords: true, NoiseReduction: true}
+	capable := relayapi.ModelCapabilities{Diarization: true, Keywords: true, NoiseReduction: true, WordTimestamps: true}
 	if ask, ok := capable.SupportsSTTOptions(&relayapi.STTOptions{
 		Diarization:    boolPointer(true),
 		Keywords:       []string{"Speko"},
 		NoiseReduction: boolPointer(true),
+		WordTimestamps: boolPointer(true),
 	}); !ok {
 		t.Fatalf("a fully capable model must serve every ask, refused %q", ask)
 	}
@@ -220,6 +230,7 @@ func TestModelCapabilitiesGateSTTOptions(t *testing.T) {
 		{"diarization", relayapi.ModelCapabilities{Keywords: true, NoiseReduction: true}, relayapi.STTOptions{Diarization: boolPointer(true)}, "diarization"},
 		{"keywords", relayapi.ModelCapabilities{Diarization: true, NoiseReduction: true}, relayapi.STTOptions{Keywords: []string{"Speko"}}, "keywords"},
 		{"noise reduction", relayapi.ModelCapabilities{Diarization: true, Keywords: true}, relayapi.STTOptions{NoiseReduction: boolPointer(true)}, "noise_reduction"},
+		{"word timestamps", relayapi.ModelCapabilities{Diarization: true, Keywords: true, NoiseReduction: true}, relayapi.STTOptions{WordTimestamps: boolPointer(true)}, "word_timestamps"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -69,6 +69,10 @@ func TestSttOptionsZeroState(t *testing.T) {
 	if explicit.IsZero() {
 		t.Fatal("an explicit false is a statement, not silence")
 	}
+	words := &SttOptions{WordTimestamps: boolPtr(true)}
+	if words.IsZero() || !words.WantsWordTimestamps() || nilOptions.WantsWordTimestamps() {
+		t.Fatal("a word_timestamps ask must be visible and nil-safe")
+	}
 }
 
 func TestSttOptionsKeywordBounds(t *testing.T) {

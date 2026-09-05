@@ -10,9 +10,13 @@ import (
 
 // STTOptions carries caller transcription options for both STT surfaces.
 type STTOptions struct {
-	Diarization     *bool                     `json:"diarization,omitempty"`
-	Keywords        []string                  `json:"keywords,omitempty"`
-	NoiseReduction  *bool                     `json:"noise_reduction,omitempty"`
+	Diarization    *bool    `json:"diarization,omitempty"`
+	Keywords       []string `json:"keywords,omitempty"`
+	NoiseReduction *bool    `json:"noise_reduction,omitempty"`
+	// WordTimestamps asks for per-word start/end timings on the batch result
+	// (TranscriptionResponse.Words). A pointer like Diarization: nil is
+	// silence, false is a statement.
+	WordTimestamps  *bool                     `json:"word_timestamps,omitempty"`
 	ProviderOptions map[string]map[string]any `json:"provider_options,omitempty"`
 }
 
@@ -36,12 +40,18 @@ var reservedSTTOptionKeys = map[string]struct{}{
 	"keywords": {}, "keyterm": {}, "keyterms": {}, "keyterms_prompt": {}, "custom_vocabulary": {},
 	"format_turns": {}, "interim_results": {}, "include_partial_turns": {},
 	"include_timestamps": {}, "commit_strategy": {}, "intent": {},
+	"word_timestamps": {}, "timestamp_granularities": {}, "timestamps": {},
 }
 
 // IsZero reports whether the caller asked for nothing.
 func (o *STTOptions) IsZero() bool {
 	return o == nil ||
-		(o.Diarization == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && len(o.ProviderOptions) == 0)
+		(o.Diarization == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && o.WordTimestamps == nil && len(o.ProviderOptions) == 0)
+}
+
+// WantsWordTimestamps reports whether the caller asked for per-word timings.
+func (o *STTOptions) WantsWordTimestamps() bool {
+	return o != nil && o.WordTimestamps != nil && *o.WordTimestamps
 }
 
 // Diarize reports whether the caller asked for speaker labels.

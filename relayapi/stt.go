@@ -53,21 +53,51 @@ func (s TranscriptSegment) Validate() error {
 	return nil
 }
 
+// TranscriptWord is one word of the transcript with its own timing. Present
+// only when the request asked for word_timestamps and the routed model
+// advertises it; the vendor's own speaker label rides along when the request
+// also asked for diarization.
+type TranscriptWord struct {
+	Text    string `json:"text"`
+	StartMS int64  `json:"start_ms"`
+	EndMS   int64  `json:"end_ms"`
+	Speaker string `json:"speaker,omitempty"`
+}
+
+// Validate checks that the word is a non-negative, ordered range with text.
+func (w TranscriptWord) Validate() error {
+	if strings.TrimSpace(w.Text) == "" {
+		return fmt.Errorf("text is required")
+	}
+	if w.StartMS < 0 || w.EndMS < w.StartMS {
+		return fmt.Errorf("start_ms and end_ms must form a non-negative ordered range")
+	}
+	return nil
+}
+
 // TranscriptionResponse is the batch transcription result. Usage carries the
 // billed duration; there is deliberately no STT usage header.
 type TranscriptionResponse struct {
 	Text     string              `json:"text"`
 	Segments []TranscriptSegment `json:"segments,omitempty"`
-	Route    Route               `json:"route"`
-	Usage    Usage               `json:"usage"`
+	// Words are per-word timings, present only when word_timestamps was asked
+	// for. Omitted otherwise, so every existing response is byte-identical.
+	Words []TranscriptWord `json:"words,omitempty"`
+	Route Route            `json:"route"`
+	Usage Usage            `json:"usage"`
 }
 
-// Validate checks segments, route, and usage. Text may be empty: silent
-// audio legitimately transcribes to nothing.
+// Validate checks segments, words, route, and usage. Text may be empty:
+// silent audio legitimately transcribes to nothing.
 func (r TranscriptionResponse) Validate() error {
 	for i, segment := range r.Segments {
 		if err := segment.Validate(); err != nil {
 			return fmt.Errorf("segments[%d]: %w", i, err)
+		}
+	}
+	for i, word := range r.Words {
+		if err := word.Validate(); err != nil {
+			return fmt.Errorf("words[%d]: %w", i, err)
 		}
 	}
 	if err := r.Route.Validate(); err != nil {

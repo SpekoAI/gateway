@@ -61,6 +61,10 @@ type BatchTranscribeRequest struct {
 type BatchTranscription struct {
 	Text     string
 	Segments []BatchSegment
+	// Words are the provider's per-word timings, populated only when the
+	// request asked for them (SttOptions.WordTimestamps) and the provider
+	// returned them. Segments stay the coarser unit; Words never replace it.
+	Words []BatchWord
 	// Language is the BCP-47 tag the provider reported using or detecting;
 	// empty when it reported none.
 	Language string
@@ -80,6 +84,16 @@ type BatchTranscription struct {
 // vendor's own label carried verbatim (a number, "A", "speaker_1"), empty when
 // the provider did not diarize.
 type BatchSegment struct {
+	Text    string
+	StartMS int64
+	EndMS   int64
+	Speaker string
+}
+
+// BatchWord is one word of the transcript with its own timing. Speaker is
+// the vendor's own label carried verbatim, empty when the provider did not
+// diarize.
+type BatchWord struct {
 	Text    string
 	StartMS int64
 	EndMS   int64

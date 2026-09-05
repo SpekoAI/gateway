@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:890238de6e30e3826cd8e0c00d26156d5ec7a17ec68bf3c3b0d45b95d18856e4
-# yaml-body: sha256:13516d2665963c08337d23bc4d23e715b9c69b05ecb2190d0d00e50959b71a37
+# json-mirror: openapi.json sha256:d2a4bb833330a1a6de678f560898a5302f91ce30584094ff7b83a311a7d73cd1
+# yaml-body: sha256:de09241ec33b6d23a43e2da56401ddd20eab7e689021fa5e1f62cb7f12228a5c
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -677,6 +677,12 @@ components:
         noise_reduction:
           type: boolean
           description: Accepts an audio-enhancement ask.
+        word_timestamps:
+          type: boolean
+          description: >-
+            Accepts a word_timestamps ask on POST /v1/stt/transcriptions and
+            returns per-word timings as `words`. Batch only. Distinct from
+            word_timings, which describes what a TTS route emits unasked.
         word_timings:
           type: boolean
           description: >-
@@ -699,6 +705,7 @@ components:
         - diarization
         - keywords
         - noise_reduction
+        - word_timestamps
         - word_timings
         - character_timings
       additionalProperties: false
@@ -927,8 +934,8 @@ components:
         What a caller asked a transcription to do beyond returning text. The
         same object rides POST /v1/stt/transcriptions and the STT
         session.configure frame, in the same vocabulary the local gateway
-        uses. The canonical asks (diarization, keywords, noise_reduction)
-        fail closed: a request whose routed model does not advertise the
+        uses. The canonical asks (diarization, keywords, noise_reduction,
+        word_timestamps) fail closed: a request whose routed model does not advertise the
         matching capability in GET /v1/models is rejected with
         capability_unsupported, never answered 200 with the feature quietly
         missing. Names arrive lower case and are rejected otherwise rather
@@ -953,6 +960,13 @@ components:
         noise_reduction:
           type: boolean
           description: Ask the provider to clean the audio before transcribing.
+        word_timestamps:
+          type: boolean
+          description: >-
+            Return per-word start/end timings as `words` on the batch
+            transcription result. Batch only: no streaming route advertises
+            it. Omitted leaves the result without words, which is not the same
+            as false.
         provider_options:
           type: object
           description: >-
@@ -972,6 +986,30 @@ components:
                 - type: boolean
                 - type: number
                 - type: string
+      additionalProperties: false
+    TranscriptWord:
+      type: object
+      description: >-
+        One word of the transcript with its own timing, present only when the
+        request asked for word_timestamps. speaker follows the same rule as on
+        TranscriptSegment: the vendor's own label, only when diarization was
+        also asked for.
+      properties:
+        text:
+          type: string
+        start_ms:
+          type: integer
+          minimum: 0
+        end_ms:
+          type: integer
+          minimum: 0
+          description: Must not precede start_ms.
+        speaker:
+          type: string
+      required:
+        - text
+        - start_ms
+        - end_ms
       additionalProperties: false
     TranscriptSegment:
       type: object
@@ -1013,6 +1051,13 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/TranscriptSegment"
+        words:
+          type: array
+          description: >-
+            Per-word timings, present only when the request asked for
+            word_timestamps and the routed model advertises it.
+          items:
+            $ref: "#/components/schemas/TranscriptWord"
         route:
           $ref: "#/components/schemas/Route"
         usage:
