@@ -96,6 +96,12 @@ func TestTranscriptionResponseValidation(t *testing.T) {
 		{"negative segment start", func(r *relayapi.TranscriptionResponse) { r.Segments[0].StartMS = -1 }, "segments[0]"},
 		{"segment ends before start", func(r *relayapi.TranscriptionResponse) { r.Segments[0].EndMS = r.Segments[0].StartMS - 1 }, "segments[0]"},
 		{"incomplete route", func(r *relayapi.TranscriptionResponse) { r.Route.AttemptID = "" }, "route:"},
+		{"word ends before start", func(r *relayapi.TranscriptionResponse) {
+			r.Words = []relayapi.TranscriptWord{{Text: "hello", StartMS: 500, EndMS: 400}}
+		}, "words[0]"},
+		{"blank word", func(r *relayapi.TranscriptionResponse) {
+			r.Words = []relayapi.TranscriptWord{{Text: " ", StartMS: 0, EndMS: 400}}
+		}, "words[0]"},
 		{"negative usage", func(r *relayapi.TranscriptionResponse) { r.Usage.DurationMS = -1 }, "must not be negative"},
 	}
 	for _, tc := range cases {

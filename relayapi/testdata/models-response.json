@@ -12,6 +12,7 @@
         "diarization": false,
         "keywords": false,
         "noise_reduction": false,
+        "word_timestamps": false,
         "word_timings": false,
         "character_timings": false
       },
@@ -44,6 +45,7 @@
         "diarization": true,
         "keywords": true,
         "noise_reduction": false,
+        "word_timestamps": false,
         "word_timings": false,
         "character_timings": false
       },

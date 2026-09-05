@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:62dfac05ddea3eee54b0fbb608d119cfd052179ba4bb829ac58f43ef6de3bbc4
-# yaml-body: sha256:494bc8a60385bf8974db22cef60bc65d711a935f66c0e65f74ab63141fc20ef1
+# json-mirror: asyncapi.json sha256:7db721459496d2c36260fc18f8064debd3e128e7db125a3945c585bf74261e72
+# yaml-body: sha256:33368ad81580f2caaaee805d0c587e4bd7a09f5411c511445166a04415d26a34
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -629,8 +629,8 @@ components:
         What a caller asked a transcription to do beyond returning text. The
         same object rides POST /v1/stt/transcriptions and the STT
         session.configure frame, in the same vocabulary the local gateway
-        uses. The canonical asks (diarization, keywords, noise_reduction)
-        fail closed: a session whose routed model does not advertise the
+        uses. The canonical asks (diarization, keywords, noise_reduction,
+        word_timestamps) fail closed: a session whose routed model does not advertise the
         matching capability in GET /v1/models is rejected with
         capability_unsupported, never answered with the feature quietly
         missing. Names arrive lower case and are rejected otherwise rather
@@ -656,6 +656,12 @@ components:
         noise_reduction:
           type: boolean
           description: Ask the provider to clean the audio before transcribing.
+        word_timestamps:
+          type: boolean
+          description: >-
+            Return per-word timings on the batch transcription result. No
+            streaming route advertises it, so on session.configure it is
+            refused capability_unsupported.
         provider_options:
           type: object
           description: >-

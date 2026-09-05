@@ -28,6 +28,11 @@ type ModelCapabilities struct {
 	Diarization      bool `json:"diarization"`
 	Keywords         bool `json:"keywords"`
 	NoiseReduction   bool `json:"noise_reduction"`
+	// WordTimestamps says whether an STT model can be ASKED for per-word
+	// start/end timings on the batch transcription result
+	// (STTOptions.WordTimestamps → TranscriptionResponse.Words). Distinct
+	// from WordTimings, which describes what a TTS route emits unasked.
+	WordTimestamps bool `json:"word_timestamps"`
 	// WordTimings and CharacterTimings say whether a TTS model reports
 	// time-aligned speech spans, and at which granularity it MEASURES them.
 	// They are separate bits rather than one enum because a model may report
@@ -154,6 +159,8 @@ func (c ModelCapabilities) SupportsSTTOptions(options *STTOptions) (string, bool
 		return "keywords", false
 	case options.ReduceNoise() && !c.NoiseReduction:
 		return "noise_reduction", false
+	case options.WantsWordTimestamps() && !c.WordTimestamps:
+		return "word_timestamps", false
 	default:
 		return "", true
 	}

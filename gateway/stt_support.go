@@ -25,6 +25,10 @@ type sttSupport struct {
 	diarization    bool
 	keywords       bool
 	noiseReduction bool
+	// wordTimestamps is a batch-only ask; no streaming adapter returns
+	// per-word timings, so no row here advertises it and every ask on this
+	// gateway's streaming sessions fails closed with the option named.
+	wordTimestamps bool
 	providerKeys   []string
 	// modelKeys scopes settings to a model family when one provider serves
 	// two wire generations. The FIRST matching prefix contributes its keys —
@@ -189,6 +193,9 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 	if options.ReduceNoise() && !support.noiseReduction {
 		return &SttSupportError{Provider: name, Option: "noise_reduction", Detail: "this provider has no audio-enhancement parameter; gladia and assemblyai support it"}
 	}
+	if options.WantsWordTimestamps() && !support.wordTimestamps {
+		return &SttSupportError{Provider: name, Option: "word_timestamps", Detail: "per-word timings are a batch transcription result; no streaming transport returns them"}
+	}
 	allowed := support.keysFor(model)
 	for _, key := range options.ProviderKeys(name) {
 		if !sttKeyAllowed(allowed, key) {
@@ -292,6 +299,8 @@ func firstSttAsk(options *protocol.SttOptions) string {
 		return "keywords"
 	case options.ReduceNoise():
 		return "noise_reduction"
+	case options.WantsWordTimestamps():
+		return "word_timestamps"
 	default:
 		return ""
 	}

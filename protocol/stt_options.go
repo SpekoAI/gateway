@@ -39,6 +39,11 @@ type SttOptions struct {
 	// shape (Gladia pre_processing.audio_enhancer) is a nested object, and
 	// provider option values are deliberately scalar-only.
 	NoiseReduction *bool `json:"noise_reduction,omitempty"`
+	// WordTimestamps asks for per-word start/end timings on a batch
+	// transcription. Fails closed like Diarization: a route whose adapter
+	// cannot return them is refused with the option named. Only prerecorded
+	// (batch) adapters can honor it today.
+	WordTimestamps *bool `json:"word_timestamps,omitempty"`
 	// ProviderOptions maps a provider name to that vendor's own settings,
 	// e.g. {"deepgram": {"numerals": true}, "elevenlabs":
 	// {"vad_silence_threshold_secs": 0.7}}. Scalars only; each adapter
@@ -74,13 +79,19 @@ var reservedSttOptionKeys = map[string]struct{}{
 	"keywords": {}, "keyterm": {}, "keyterms": {}, "keyterms_prompt": {}, "custom_vocabulary": {},
 	"format_turns": {}, "interim_results": {}, "include_partial_turns": {},
 	"include_timestamps": {}, "commit_strategy": {}, "intent": {},
+	"word_timestamps": {}, "timestamp_granularities": {}, "timestamps": {},
 }
 
 // IsZero reports whether the caller asked for nothing, which is every request
 // that predates this type.
 func (o *SttOptions) IsZero() bool {
 	return o == nil ||
-		(o.Diarization == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && len(o.ProviderOptions) == 0)
+		(o.Diarization == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && o.WordTimestamps == nil && len(o.ProviderOptions) == 0)
+}
+
+// WantsWordTimestamps reports whether the caller asked for per-word timings.
+func (o *SttOptions) WantsWordTimestamps() bool {
+	return o != nil && o.WordTimestamps != nil && *o.WordTimestamps
 }
 
 // Diarize reports whether the caller asked for speaker labels.
