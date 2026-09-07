@@ -16,6 +16,7 @@ from typing import Any
 
 import aiohttp
 
+from ._user_agent import USER_AGENT
 from .client import _env_secret
 from .probe import report_leg as _report_probe_leg
 
@@ -48,7 +49,10 @@ class RelayLLMClient:
             raise ValueError("api_key is required")
         self._base_url = base_url.rstrip("/")
         self._session = aiohttp.ClientSession(
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": USER_AGENT,
+            },
             raise_for_status=False,
         )
 
