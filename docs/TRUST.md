@@ -18,6 +18,14 @@ The local API is served on an owner-only Unix socket and still requires a
 local bearer token. Health and readiness are the only unauthenticated routes.
 The container exposes no TCP port.
 
+The Python helper sends `User-Agent: speko-gateway/<installed package version>`
+on its local Gateway HTTP requests and WebSocket handshake, and on its hosted
+Router LLM requests. This package marker contains no account or installation
+identifier. It is an observed client label, not proof of identity. It adds no
+request, body field, or provider header. Local Gateway and hosted Router remain
+separate receivers; this marker does not establish Platform analytics coverage.
+Source or vendored copies without distribution metadata use `speko-gateway/unknown`.
+
 Provider media and text flow directly between the agent process, this gateway,
 and the selected provider. They are not proxied through Speko when the route is
 `provider_direct`.

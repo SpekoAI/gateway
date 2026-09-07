@@ -14,6 +14,8 @@ from typing import Any
 
 import aiohttp
 
+from ._user_agent import USER_AGENT
+
 _SUBPROTOCOL = "speko.voice.v0.r3"
 _BASE_URL = "http://speko-gateway"
 _DEFAULT_SOCKET_PATH = "/run/speko/runtime.sock"
@@ -78,7 +80,10 @@ class GatewayClient:
     def __init__(self, *, socket_path: str, local_auth_token: str) -> None:
         if not socket_path or not local_auth_token:
             raise ValueError("socket_path and local_auth_token are required")
-        self._headers = {"Authorization": f"Bearer {local_auth_token}"}
+        self._headers = {
+            "Authorization": f"Bearer {local_auth_token}",
+            "User-Agent": USER_AGENT,
+        }
         self._session = aiohttp.ClientSession(
             connector=aiohttp.UnixConnector(path=socket_path),
             headers=self._headers,

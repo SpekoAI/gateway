@@ -1,6 +1,6 @@
 [project]
 name = "speko-gateway"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python framework integrations for the local Speko Gateway"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
