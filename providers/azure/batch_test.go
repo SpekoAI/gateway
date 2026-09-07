@@ -233,15 +233,19 @@ func TestBatchJoinsPhrasesWhenTheCombinedTranscriptIsEmpty(t *testing.T) {
 	}
 }
 
-func TestBatchRefusesAnEmptyTranscript(t *testing.T) {
+// Silent audio comes back as HTTP 200 with empty phrases. That is an empty
+// success the caller can act on (text ""), not a provider failure.
+func TestBatchReturnsAnEmptyTranscriptForSilence(t *testing.T) {
 	t.Parallel()
 	server, _ := newFakeTranscribe(t, http.StatusOK, `{"durationMilliseconds":3000,"combinedPhrases":[{"channel":0,"text":""}],"phrases":[]}`)
 	adapter := newBatchAdapter(t, server)
 
-	_, err := adapter.Transcribe(context.Background(), batchRequest(server.URL, []byte("RIFF")))
-	var providerErr *runtimepkg.ProviderError
-	if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeProviderError {
-		t.Fatalf("err = %v, want a provider_error for the empty transcript", err)
+	result, err := adapter.Transcribe(context.Background(), batchRequest(server.URL, []byte("RIFF")))
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if result.Text != "" || len(result.Segments) != 0 || result.DurationMS != 3000 {
+		t.Fatalf("result = %+v, want an empty transcript with the duration preserved", result)
 	}
 }
 

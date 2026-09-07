@@ -191,14 +191,22 @@ func TestBatchJoinsTurnsWhenTheTranscriptIsEmpty(t *testing.T) {
 	}
 }
 
-func TestBatchRefusesAnEmptyTranscript(t *testing.T) {
+// Silent audio comes back as HTTP 200 with no transcript. That is an empty
+// success the caller can act on (text ""), not a provider failure: turning it
+// into a 502 made Muse the only route that refused a silent clip.
+func TestBatchReturnsAnEmptyTranscriptForSilence(t *testing.T) {
 	t.Parallel()
 	server, _ := newFakeTranscribe(t, http.StatusOK, `{"sessionId":"s","transcript":"  ","audioDurationMs":900,"turns":[]}`)
 	adapter := newBatchAdapter(t, server)
-	_, err := adapter.Transcribe(context.Background(), batchRequest(server.URL, []byte("RIFF")))
-	var failure *runtimepkg.ProviderError
-	if !errors.As(err, &failure) || failure.Code != batchhttp.CodeProviderError {
-		t.Fatalf("err = %v, want a provider error for the empty transcript", err)
+	result, err := adapter.Transcribe(context.Background(), batchRequest(server.URL, []byte("RIFF")))
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if result.Text != "" || len(result.Segments) != 0 {
+		t.Fatalf("Text = %q, Segments = %+v, want an empty transcript", result.Text, result.Segments)
+	}
+	if result.DurationMS != 900 || result.ProviderRequestID != "s" {
+		t.Fatalf("DurationMS = %d, ProviderRequestID = %q, want the metering fields preserved", result.DurationMS, result.ProviderRequestID)
 	}
 }
 

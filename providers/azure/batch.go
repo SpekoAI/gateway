@@ -172,9 +172,9 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if text == "" {
 		text = batchhttp.JoinSegments(segments)
 	}
-	if text == "" {
-		return nil, batchhttp.Failed(batchExtensionID, "the response carried no transcript")
-	}
+	// An empty transcript is an empty success, not a failure: silent or
+	// speech-free audio legitimately yields no text, and the other batch
+	// adapters surface that as text "" rather than a provider error.
 	return &runtimepkg.BatchTranscription{
 		Text:              text,
 		Segments:          segments,

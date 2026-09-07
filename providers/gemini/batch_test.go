@@ -326,13 +326,18 @@ func TestBatchClassifiesUpstreamFailure(t *testing.T) {
 	}
 }
 
-// An empty transcript is a failure, not an empty success: it would settle as a
-// billed request that produced nothing the caller can use.
-func TestBatchRefusesEmptyTranscript(t *testing.T) {
+// An empty transcript is an empty success, not a failure: silent audio
+// legitimately transcribes to nothing, and the caller is metered for the audio
+// it sent regardless. The other batch adapters surface it as text "".
+func TestBatchReturnsAnEmptyTranscriptForSilence(t *testing.T) {
 	t.Parallel()
 	server, _ := newFakeInteractions(t, http.StatusOK, `{"id":"i1","steps":[{"type":"model_output","content":[{"type":"text","text":"   "}]}]}`)
-	if _, err := newBatchAdapter(t, server).Transcribe(context.Background(), batchRequest(server.URL, []byte("wav"))); err == nil {
-		t.Fatal("accepted a response with no transcript")
+	result, err := newBatchAdapter(t, server).Transcribe(context.Background(), batchRequest(server.URL, []byte("wav")))
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if result.Text != "" || len(result.Segments) != 0 || result.ProviderRequestID != "i1" {
+		t.Fatalf("result = %+v, want an empty transcript with the interaction id preserved", result)
 	}
 }
 

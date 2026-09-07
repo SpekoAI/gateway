@@ -196,10 +196,10 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if err := batchhttp.DecodeJSON(response.Body, &decoded); err != nil {
 		return nil, err
 	}
+	// An empty transcript is an empty success, not a failure: silent or
+	// speech-free audio legitimately yields no text, and the other batch
+	// adapters surface that as text "" rather than a provider error.
 	text := decoded.transcript()
-	if text == "" {
-		return nil, batchhttp.Failed(batchExtensionID, "the response carried no transcript")
-	}
 	words := decoded.words()
 	return &runtimepkg.BatchTranscription{
 		Text: text,
