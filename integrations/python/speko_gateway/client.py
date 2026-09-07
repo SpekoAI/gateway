@@ -195,7 +195,12 @@ class GatewaySession:
         self._write_lock = asyncio.Lock()
 
     async def send_audio(self, data: bytes | bytearray | memoryview) -> None:
-        await self._websocket.send_bytes(bytes(data))
+        async with self._write_lock:
+            if self._closed:
+                raise GatewayError("Gateway session is closed")
+            if self._close_requested:
+                raise GatewayError("Gateway session is finishing")
+            await self._websocket.send_bytes(bytes(data))
 
     async def commit_audio(self) -> None:
         await self._command("audio.commit")
