@@ -143,15 +143,20 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if err := batchhttp.DecodeJSON(response.Body, &decoded); err != nil {
 		return nil, err
 	}
+	// A completed transcription always names its session; a 200 without one
+	// is a response shape this adapter does not understand, not silence.
+	if decoded.SessionID == "" {
+		return nil, batchhttp.Malformed(errors.New("meta transcription carries no session id"))
+	}
 	segments := decoded.segments()
 	text := strings.TrimSpace(decoded.Transcript)
 	if text == "" {
 		text = batchhttp.JoinSegments(segments)
 	}
-	// An empty transcript is an empty success, not a failure: Meta answers
-	// silent or speech-free audio with HTTP 200 and no text, exactly as the
-	// other batch adapters surface it (text ""), and the caller is metered
-	// for the audio it sent either way.
+	// An empty transcript on a well-formed response is an empty success, not
+	// a failure: Meta answers silent or speech-free audio with HTTP 200 and
+	// no text, exactly as the other batch adapters surface it (text ""), and
+	// the caller is metered for the audio it sent either way.
 	return &runtimepkg.BatchTranscription{
 		Text:              text,
 		Segments:          segments,

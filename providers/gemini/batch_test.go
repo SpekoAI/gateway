@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -338,6 +339,19 @@ func TestBatchReturnsAnEmptyTranscriptForSilence(t *testing.T) {
 	}
 	if result.Text != "" || len(result.Segments) != 0 || result.ProviderRequestID != "i1" {
 		t.Fatalf("result = %+v, want an empty transcript with the interaction id preserved", result)
+	}
+}
+
+// A decodable 200 with neither a model_output step nor output_text shows no
+// evidence the model ran: it is a response shape the adapter does not
+// understand, not silence, and must not settle as an empty success.
+func TestBatchRefusesAStructurallyIncompleteResponse(t *testing.T) {
+	t.Parallel()
+	server, _ := newFakeInteractions(t, http.StatusOK, `{"id":"i1"}`)
+	_, err := newBatchAdapter(t, server).Transcribe(context.Background(), batchRequest(server.URL, []byte("wav")))
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeProviderError || !providerErr.Retryable {
+		t.Fatalf("err = %v, want a retryable provider error for the incomplete response", err)
 	}
 }
 

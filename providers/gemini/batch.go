@@ -196,9 +196,16 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if err := batchhttp.DecodeJSON(response.Body, &decoded); err != nil {
 		return nil, err
 	}
-	// An empty transcript is an empty success, not a failure: silent or
-	// speech-free audio legitimately yields no text, and the other batch
-	// adapters surface that as text "" rather than a provider error.
+	// A completed interaction carries a model_output step (or at least the
+	// flat output_text); a 200 with neither is a response shape this adapter
+	// does not understand, not silence.
+	if !decoded.completed() {
+		return nil, batchhttp.Malformed(errors.New("gemini interaction carries no model output"))
+	}
+	// An empty transcript on a well-formed response is an empty success, not
+	// a failure: silent or speech-free audio legitimately yields no text, and
+	// the other batch adapters surface that as text "" rather than a
+	// provider error.
 	text := decoded.transcript()
 	words := decoded.words()
 	return &runtimepkg.BatchTranscription{
@@ -309,6 +316,21 @@ type interaction struct {
 			} `json:"annotations"`
 		} `json:"content"`
 	} `json:"steps"`
+}
+
+// completed reports whether the interaction shows evidence the model ran: a
+// model_output step (present even when the transcript is empty) or the flat
+// output_text convenience field.
+func (i interaction) completed() bool {
+	if i.OutputText != "" {
+		return true
+	}
+	for _, step := range i.Steps {
+		if step.Type == stepModelOutput {
+			return true
+		}
+	}
+	return false
 }
 
 func (i interaction) transcript() string {

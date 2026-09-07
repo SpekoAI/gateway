@@ -210,6 +210,20 @@ func TestBatchReturnsAnEmptyTranscriptForSilence(t *testing.T) {
 	}
 }
 
+// A decodable 200 with none of the fields a completed transcription carries is
+// a response shape the adapter does not understand, not silence: it must not
+// settle as an empty success.
+func TestBatchRefusesAStructurallyIncompleteResponse(t *testing.T) {
+	t.Parallel()
+	server, _ := newFakeTranscribe(t, http.StatusOK, `{}`)
+	adapter := newBatchAdapter(t, server)
+	_, err := adapter.Transcribe(context.Background(), batchRequest(server.URL, []byte("RIFF")))
+	var failure *runtimepkg.ProviderError
+	if !errors.As(err, &failure) || failure.Code != batchhttp.CodeProviderError || !failure.Retryable {
+		t.Fatalf("err = %v, want a retryable provider error for the incomplete response", err)
+	}
+}
+
 func TestBatchRefusesForeignProviderAndModel(t *testing.T) {
 	t.Parallel()
 	server, _ := newFakeTranscribe(t, http.StatusOK, `{}`)

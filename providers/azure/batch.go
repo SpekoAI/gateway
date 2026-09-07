@@ -167,14 +167,21 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if err := batchhttp.DecodeJSON(response.Body, &decoded); err != nil {
 		return nil, err
 	}
+	// A completed transcription reports the audio duration it processed
+	// (and, for silence, an empty phrase list); a 200 with none of those is a
+	// response shape this adapter does not understand, not silence.
+	if decoded.DurationMilliseconds <= 0 && len(decoded.CombinedPhrases) == 0 && len(decoded.Phrases) == 0 {
+		return nil, batchhttp.Malformed(errors.New("azure transcription carries neither duration nor phrases"))
+	}
 	segments := decoded.segments()
 	text := decoded.combinedText()
 	if text == "" {
 		text = batchhttp.JoinSegments(segments)
 	}
-	// An empty transcript is an empty success, not a failure: silent or
-	// speech-free audio legitimately yields no text, and the other batch
-	// adapters surface that as text "" rather than a provider error.
+	// An empty transcript on a well-formed response is an empty success, not
+	// a failure: silent or speech-free audio legitimately yields no text, and
+	// the other batch adapters surface that as text "" rather than a
+	// provider error.
 	return &runtimepkg.BatchTranscription{
 		Text:              text,
 		Segments:          segments,
