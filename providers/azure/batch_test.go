@@ -233,15 +233,34 @@ func TestBatchJoinsPhrasesWhenTheCombinedTranscriptIsEmpty(t *testing.T) {
 	}
 }
 
-func TestBatchRefusesAnEmptyTranscript(t *testing.T) {
+// Silent audio comes back as HTTP 200 with empty phrases. That is an empty
+// success the caller can act on (text ""), not a provider failure.
+func TestBatchReturnsAnEmptyTranscriptForSilence(t *testing.T) {
 	t.Parallel()
 	server, _ := newFakeTranscribe(t, http.StatusOK, `{"durationMilliseconds":3000,"combinedPhrases":[{"channel":0,"text":""}],"phrases":[]}`)
 	adapter := newBatchAdapter(t, server)
 
+	result, err := adapter.Transcribe(context.Background(), batchRequest(server.URL, []byte("RIFF")))
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if result.Text != "" || len(result.Segments) != 0 || result.DurationMS != 3000 {
+		t.Fatalf("result = %+v, want an empty transcript with the duration preserved", result)
+	}
+}
+
+// A decodable 200 with none of the fields a completed transcription carries is
+// a response shape the adapter does not understand, not silence: it must not
+// settle as an empty success.
+func TestBatchRefusesAStructurallyIncompleteResponse(t *testing.T) {
+	t.Parallel()
+	server, _ := newFakeTranscribe(t, http.StatusOK, `{}`)
+	adapter := newBatchAdapter(t, server)
+
 	_, err := adapter.Transcribe(context.Background(), batchRequest(server.URL, []byte("RIFF")))
 	var providerErr *runtimepkg.ProviderError
-	if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeProviderError {
-		t.Fatalf("err = %v, want a provider_error for the empty transcript", err)
+	if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeProviderError || !providerErr.Retryable {
+		t.Fatalf("err = %v, want a retryable provider_error for the incomplete response", err)
 	}
 }
 
