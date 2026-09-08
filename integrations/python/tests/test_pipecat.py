@@ -91,11 +91,20 @@ async def _run_once(generator):
 
 
 async def test_gateway_readiness_wait_tolerates_sidecar_startup_race() -> None:
+    # The subject is the RETRY, not the deadline: a missing socket and a
+    # not-ready answer are both startup state, so the third probe is the one
+    # that returns. The timeout is deliberately far larger than the work it
+    # bounds, because a tight budget here measures the CI runner's scheduler
+    # instead of the client. At 0.1s this asserted that three mocked awaits
+    # and two 1ms sleeps all landed inside 100ms of wall clock, and it failed
+    # on loaded runners while passing locally on the same commit. The deadline
+    # is covered by the two tests below, which assert the error and the bound
+    # without racing anything.
     client = object.__new__(GatewayClient)
     ready = AsyncMock(side_effect=[OSError("socket not created"), False, True])
     client.ready = ready
 
-    await client.wait_until_ready(timeout=0.1, interval=0.001)
+    await client.wait_until_ready(timeout=30, interval=0.001)
 
     assert ready.await_count == 3
 
