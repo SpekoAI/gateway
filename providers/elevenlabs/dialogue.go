@@ -372,11 +372,26 @@ func (s *dialogueStream) readLoop() {
 // decoding it into the struct would fail the whole frame, taking the audio in
 // it down with it, so it is forwarded verbatim in the extension instead.
 type dialogueInbound struct {
-	Audio        string          `json:"audio"`
-	IsFinal      bool            `json:"is_final"`
-	IsFinalCamel bool            `json:"isFinal"`
-	Alignment    json.RawMessage `json:"alignment"`
-	Error        json.RawMessage `json:"error"`
+	Audio string `json:"audio"`
+	// The dialogue socket ends a turn with `is_final_audio_for_turn`, NOT the
+	// text-to-speech socket's `is_final` — measured against the live endpoint
+	// on 2026-09-08, where the frame arrived and the adapter did not know it.
+	// Without this field a session emits audio and then never emits
+	// audio.done, so a consumer waits out its own timeout on every turn. The
+	// other two spellings are kept as fallbacks: `is_final` is what the
+	// vendor's own websocket guide documents, so it may appear on some
+	// deployments, and camelCase is what the text-to-speech socket sends.
+	IsFinalForTurn bool            `json:"is_final_audio_for_turn"`
+	IsFinal        bool            `json:"is_final"`
+	IsFinalCamel   bool            `json:"isFinal"`
+	Alignment      json.RawMessage `json:"alignment"`
+	Error          json.RawMessage `json:"error"`
+}
+
+// finishesTurn reports whether the frame ends the utterance under any of the
+// spellings the endpoint has been observed or documented to use.
+func (m dialogueInbound) finishesTurn() bool {
+	return m.IsFinalForTurn || m.IsFinal || m.IsFinalCamel
 }
 
 func (s *dialogueStream) handleMessage(payload []byte) error {
@@ -386,7 +401,13 @@ func (s *dialogueStream) handleMessage(payload []byte) error {
 	}
 	raw := json.RawMessage(append([]byte(nil), payload...))
 	if len(message.Error) > 0 && string(message.Error) != "null" {
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue reported a streaming error", Retryable: false}
+		// Carry the vendor's own text. The first version of this adapter
+		// discarded it, and a live probe then reported only "reported a
+		// streaming error" with no way to tell a bad voice from a bad model
+		// from an exhausted quota. The error field is the vendor's own
+		// message, never the credential, which rides the handshake and the
+		// request header.
+		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: fmt.Sprintf("ElevenLabs dialogue reported a streaming error: %s", strings.TrimSpace(string(message.Error))), Retryable: false}
 	}
 	if message.Audio != "" {
 		audio, err := base64.StdEncoding.DecodeString(message.Audio)
@@ -411,7 +432,7 @@ func (s *dialogueStream) handleMessage(payload []byte) error {
 			return err
 		}
 	}
-	if message.IsFinal || message.IsFinalCamel {
+	if message.finishesTurn() {
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: contextData(""), Extensions: extension(raw)})
 	}
 	if message.Audio == "" && len(message.Alignment) == 0 {

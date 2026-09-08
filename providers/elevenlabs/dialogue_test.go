@@ -249,6 +249,103 @@ func TestDialogueAdapterForwardsArrayAlignmentWithoutSpans(t *testing.T) {
 	}
 }
 
+// The turn-final spelling, measured against the live endpoint on 2026-09-08:
+// the dialogue socket ends a turn with `is_final_audio_for_turn`, NOT the
+// text-to-speech socket's `is_final`. The first version of this adapter knew
+// only the latter, so a live session emitted audio and then never emitted
+// audio.done — the consumer waited out its own timeout on every turn. All
+// three spellings must finish the turn, and the vendor's own error text must
+// reach the caller rather than being flattened to "an error occurred".
+func TestDialogueAdapterFinishesTheTurnOnEverySpelling(t *testing.T) {
+	t.Parallel()
+	for _, field := range []string{"is_final_audio_for_turn", "is_final", "isFinal"} {
+		final := field
+		t.Run(final, func(t *testing.T) {
+			t.Parallel()
+			server := newDialogueServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+				if _, err := readDialogueMessage(ctx, conn); err != nil {
+					return
+				}
+				if _, err := readDialogueMessage(ctx, conn); err != nil {
+					return
+				}
+				if err := writeServerJSON(ctx, conn, map[string]any{"audio": base64.StdEncoding.EncodeToString([]byte{7, 7})}); err != nil {
+					return
+				}
+				if err := writeServerJSON(ctx, conn, map[string]any{final: true}); err != nil {
+					return
+				}
+				<-ctx.Done()
+			})
+			defer server.Close()
+
+			adapter, err := NewDialogue(testConfig(server.URL))
+			if err != nil {
+				t.Fatalf("new dialogue adapter: %v", err)
+			}
+			stream, err := adapter.Open(context.Background(), dialogueRequest(server.URL, "eleven_v3_conversational"))
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			if err := stream.AppendText(context.Background(), "Hi"); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+			events := collectEvents(t, stream.Events(), 3)
+			if got := eventTypes(events); strings.Join(got, ",") != "audio.started,audio.frame,audio.done" {
+				t.Fatalf("%s produced %v, want the turn to finish", final, got)
+			}
+			if aborting, ok := stream.(runtimepkg.AbortingProviderStream); ok {
+				_ = aborting.Abort(context.Background())
+			}
+		})
+	}
+}
+
+// The vendor's error text is the only thing that separates a bad voice from an
+// exhausted quota, so it must survive into the ProviderError.
+func TestDialogueAdapterCarriesTheVendorErrorText(t *testing.T) {
+	t.Parallel()
+	server := newDialogueServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if _, err := readDialogueMessage(ctx, conn); err != nil {
+			return
+		}
+		if _, err := readDialogueMessage(ctx, conn); err != nil {
+			return
+		}
+		if err := writeServerJSON(ctx, conn, map[string]any{"error": "voice_not_found"}); err != nil {
+			return
+		}
+		<-ctx.Done()
+	})
+	defer server.Close()
+
+	adapter, err := NewDialogue(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new dialogue adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), dialogueRequest(server.URL, "eleven_v3_conversational"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "Hi"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	select {
+	case event, ok := <-stream.Events():
+		if !ok || event.Err == nil {
+			t.Fatalf("event = %+v, ok=%v, want a provider error", event, ok)
+		}
+		if !strings.Contains(event.Err.Error(), "voice_not_found") {
+			t.Fatalf("error lost the vendor text: %v", event.Err)
+		}
+		if strings.Contains(event.Err.Error(), "customer-elevenlabs-key") {
+			t.Fatalf("error leaked the credential: %v", event.Err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no error event")
+	}
+}
+
 // Media guards: the relay only ever asks for mono pcm_s16le, and the dialogue
 // endpoint's pcm set is the text-to-speech set plus 32 kHz.
 func TestDialogueAdapterMediaGuards(t *testing.T) {
