@@ -51,8 +51,15 @@ const (
 
 // supportedModels is the current Inworld TTS lineup. Kept as an explicit set so
 // a typo in a plan fails at Open rather than as an upstream 400 mid-call.
+//
+// The TTS-2 family is the current generation and has two tiers: inworld-tts-2
+// is the quality model, inworld-tts-2-flash the latency and cost tier. The 1.5
+// pair is deprecated rather than discontinued — Inworld still serves it, so a
+// caller already pinning one keeps working and it stays here; only the
+// discontinued ids below are refused with their successor named.
 var supportedModels = map[string]struct{}{
 	"inworld-tts-2":        {},
+	"inworld-tts-2-flash":  {},
 	"inworld-tts-1.5-max":  {},
 	"inworld-tts-1.5-mini": {},
 }
