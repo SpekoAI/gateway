@@ -296,15 +296,14 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 //     — the value Inworld's docs call $INWORLD_API_KEY. It is a Basic
 //     credential. Inworld's own STT WebSocket sample sends exactly
 //     `Authorization: Basic <key>`.
-//   - Managed: the control plane mints a short-lived JWT at
-//     POST /auth/v1/tokens/token:generate, whose response is typed
-//     `"type": "Bearer"`. Inworld documents `Authorization: Bearer $JWT` as the
-//     way to open a WebSocket with a minted token.
+//   - Managed: the control plane mints a reservation-bound, single-use token at
+//     POST /auth/v1/tokens. `Authorization: Bearer <token>` consumes it once
+//     when this WebSocket connection authenticates.
 //
 // A relay plan is managed for billing purposes but carries the relay
 // connector's permanent portal key — the same Base64 "<key>:<secret>" value a
 // customer holds — so it takes the Basic channel exactly like BYOK. Bearer
-// stays reserved for the short-lived JWTs the control plane mints on managed
+// stays reserved for the one-time tokens the control plane mints on managed
 // provider-direct routes.
 //
 // Both travel in the request HEADER, and that is the deliberate choice here.
