@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"strings"
@@ -14,6 +16,11 @@ const (
 	// runtime must reject a plan built for any other revision before media is
 	// accepted.
 	CurrentRevision = 3
+	// SessionPlanCredentialDigestJWSType identifies a session-plan JWS whose
+	// enclosed credential value is a SHA-256 binding rather than the bearer
+	// itself. This keeps large one-time provider tokens inside AWS KMS's raw
+	// Ed25519 signing limit without weakening their binding to the plan.
+	SessionPlanCredentialDigestJWSType = "speko.session-plan+credential-digest+jws"
 )
 
 // SessionKind selects the provider-neutral operation requested by a session.
@@ -152,12 +159,12 @@ type ExecutionRequest struct {
 
 // RequestOptions contains portable, provider-neutral session options.
 type RequestOptions struct {
-	Provider           string   `json:"provider,omitempty"`
+	Provider string `json:"provider,omitempty"`
 	// ClientSessionID lets a trusted setup service allocate the public session
 	// identifier before asking the control plane for a plan. The control plane
 	// still binds it to the authenticated principal and idempotency key; it is
 	// never accepted as billing identity on its own.
-	ClientSessionID    string   `json:"client_session_id,omitempty"`
+	ClientSessionID string `json:"client_session_id,omitempty"`
 	// MaxSessionSeconds is the customer-visible hard ceiling requested by the
 	// setup service. Policy may shorten it, but may never extend it.
 	MaxSessionSeconds  int      `json:"max_session_seconds,omitempty"`
@@ -358,6 +365,24 @@ type SessionPlanEnvelope struct {
 func (p SessionPlan) Unsigned() SessionPlan {
 	p.Signature = ""
 	return p
+}
+
+// CredentialDigestBoundUnsigned returns the non-executable plan
+// representation used only inside a credential-digest JWS envelope. The
+// delegated credential value is replaced with a deterministic SHA-256
+// binding; a verifier repeats this transformation over the supplied plan, so
+// changing the bearer still invalidates the signature without placing the
+// potentially large bearer in the KMS signing input.
+func (p SessionPlan) CredentialDigestBoundUnsigned() (SessionPlan, error) {
+	p.Signature = ""
+	if p.Route.Credential == nil || strings.TrimSpace(p.Route.Credential.Value) == "" {
+		return SessionPlan{}, fmt.Errorf("credential digest binding requires a delegated credential")
+	}
+	digest := sha256.Sum256([]byte(p.Route.Credential.Value))
+	credential := *p.Route.Credential
+	credential.Value = "sha256:" + base64.RawURLEncoding.EncodeToString(digest[:])
+	p.Route.Credential = &credential
+	return p, nil
 }
 
 // Validate rejects a request before any media is accepted or a plan is sought.

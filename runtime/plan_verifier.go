@@ -25,7 +25,11 @@ import (
 const (
 	// SessionPlanJWSType prevents a key intended for another control-plane
 	// artifact from being used to authorize a provider connection.
-	SessionPlanJWSType     = "speko.session-plan+jws"
+	SessionPlanJWSType = "speko.session-plan+jws"
+	// SessionPlanCredentialDigestJWSType is accepted only for session plans
+	// and binds the actual delegated credential through its SHA-256 digest.
+	SessionPlanCredentialDigestJWSType = protocol.SessionPlanCredentialDigestJWSType
+
 	defaultJWKSCacheTTL    = 5 * time.Minute
 	defaultMaxJWKSCacheTTL = time.Hour
 	defaultClockSkew       = 30 * time.Second
@@ -191,7 +195,7 @@ func (v *JWKSPlanVerifier) Verify(ctx context.Context, plan protocol.SessionPlan
 	if err := envelope.Validate(now, v.config.Issuer, v.config.Audience, v.config.ClockSkew); err != nil {
 		return fmt.Errorf("%w: envelope validation: %v", ErrPlanSignature, err)
 	}
-	if err := planMatchesEnvelope(plan, envelope.Plan); err != nil {
+	if err := planMatchesEnvelope(plan, envelope.Plan, header.Type); err != nil {
 		return err
 	}
 	accepted, err := v.config.ReplayCache.TryUse(ctx, envelope.ID, envelope.ExpiresAt.Add(v.config.ClockSkew))
@@ -214,7 +218,7 @@ type compactJWSHeader struct {
 }
 
 func parseCompactJWS(compact string) (compactJWSHeader, []byte, []byte, error) {
-	return parseCompactJWSWithType(compact, SessionPlanJWSType)
+	return parseCompactJWSWithTypes(compact, SessionPlanJWSType, SessionPlanCredentialDigestJWSType)
 }
 
 // parseCompactJWSWithType splits and vets a compact JWS whose protected
@@ -223,6 +227,10 @@ func parseCompactJWS(compact string) (compactJWSHeader, []byte, []byte, error) {
 // unacceptable: this header check is what stops a signature minted for one
 // artifact from authorizing the other, even under a shared signing key.
 func parseCompactJWSWithType(compact, expectedType string) (compactJWSHeader, []byte, []byte, error) {
+	return parseCompactJWSWithTypes(compact, expectedType)
+}
+
+func parseCompactJWSWithTypes(compact string, expectedTypes ...string) (compactJWSHeader, []byte, []byte, error) {
 	parts := strings.Split(compact, ".")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 		return compactJWSHeader{}, nil, nil, fmt.Errorf("%w: expected compact serialization", ErrPlanSignature)
@@ -238,7 +246,14 @@ func parseCompactJWSWithType(compact, expectedType string) (compactJWSHeader, []
 	if header.Algorithm != "EdDSA" && header.Algorithm != "RS256" {
 		return compactJWSHeader{}, nil, nil, fmt.Errorf("%w: unsupported algorithm", ErrPlanSignature)
 	}
-	if header.Type != expectedType || strings.TrimSpace(header.KeyID) == "" || len(header.Critical) != 0 || header.B64Payload != nil {
+	typeAccepted := false
+	for _, expectedType := range expectedTypes {
+		if header.Type == expectedType {
+			typeAccepted = true
+			break
+		}
+	}
+	if !typeAccepted || strings.TrimSpace(header.KeyID) == "" || len(header.Critical) != 0 || header.B64Payload != nil {
 		return compactJWSHeader{}, nil, nil, fmt.Errorf("%w: unsafe or incomplete protected header", ErrPlanSignature)
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -280,8 +295,16 @@ func verifyJWS(publicKey crypto.PublicKey, algorithm string, signingInput, signa
 	return nil
 }
 
-func planMatchesEnvelope(plan, enclosed protocol.SessionPlan) error {
-	want, err := json.Marshal(plan.Unsigned())
+func planMatchesEnvelope(plan, enclosed protocol.SessionPlan, envelopeType string) error {
+	wantPlan := plan.Unsigned()
+	if envelopeType == SessionPlanCredentialDigestJWSType {
+		var err error
+		wantPlan, err = plan.CredentialDigestBoundUnsigned()
+		if err != nil {
+			return fmt.Errorf("%w: credential digest envelope requires a managed credential", ErrPlanSignature)
+		}
+	}
+	want, err := json.Marshal(wantPlan)
 	if err != nil {
 		return fmt.Errorf("%w: encode plan", ErrPlanSignature)
 	}

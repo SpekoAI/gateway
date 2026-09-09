@@ -60,6 +60,43 @@ func TestPlanVerifierRejectsTamperedWrongAudienceExpiredAndReplayedPlans(t *test
 	})
 }
 
+func TestPlanVerifierAcceptsCredentialDigestEnvelopeAndBindsBearer(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	server := newJWKSFixture(t, "key-digest", public)
+	verifier := newVerifier(t, server.URL, now)
+
+	plan := testBYOKPlan(now, now.Add(time.Minute))
+	plan.Execution.CredentialSource = protocol.CredentialsManaged
+	plan.Route.Credential = &protocol.DelegatedCredential{
+		Kind: protocol.CredentialBearer, Value: "large-one-time-provider-bearer", ExpiresAt: plan.ExpiresAt,
+	}
+	bound, err := plan.CredentialDigestBoundUnsigned()
+	if err != nil {
+		t.Fatalf("bind credential digest: %v", err)
+	}
+	envelope := protocol.SessionPlanEnvelope{
+		Issuer: "https://control.speko.test", Audience: []string{"speko-runtime"}, IssuedAt: now.Add(-time.Second),
+		ExpiresAt: plan.ExpiresAt, ID: "jti-credential-digest", Plan: bound,
+	}
+	plan = resignPlanWithType(t, private, "key-digest", runtimepkg.SessionPlanCredentialDigestJWSType, envelope, plan)
+	if err := verifier.Verify(context.Background(), plan); err != nil {
+		t.Fatalf("verify credential digest envelope: %v", err)
+	}
+
+	tampered := plan
+	credential := *plan.Route.Credential
+	credential.Value = "different-provider-bearer"
+	tampered.Route.Credential = &credential
+	if err := verifier.Verify(context.Background(), tampered); !errors.Is(err, runtimepkg.ErrPlanSignature) {
+		t.Fatalf("Verify tampered credential = %v, want ErrPlanSignature", err)
+	}
+}
+
 func TestPlanVerifierCachesJWKSAndRefreshesForSigningKeyRotation(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
@@ -153,11 +190,16 @@ func signedPlan(t *testing.T, private ed25519.PrivateKey, keyID string, now time
 
 func resignPlan(t *testing.T, private ed25519.PrivateKey, keyID string, envelope protocol.SessionPlanEnvelope, plan protocol.SessionPlan) protocol.SessionPlan {
 	t.Helper()
+	return resignPlanWithType(t, private, keyID, runtimepkg.SessionPlanJWSType, envelope, plan)
+}
+
+func resignPlanWithType(t *testing.T, private ed25519.PrivateKey, keyID, envelopeType string, envelope protocol.SessionPlanEnvelope, plan protocol.SessionPlan) protocol.SessionPlan {
+	t.Helper()
 	payload, err := json.Marshal(envelope)
 	if err != nil {
 		t.Fatalf("marshal envelope: %v", err)
 	}
-	header, err := json.Marshal(map[string]string{"alg": "EdDSA", "kid": keyID, "typ": runtimepkg.SessionPlanJWSType})
+	header, err := json.Marshal(map[string]string{"alg": "EdDSA", "kid": keyID, "typ": envelopeType})
 	if err != nil {
 		t.Fatalf("marshal header: %v", err)
 	}
