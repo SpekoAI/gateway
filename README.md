@@ -311,7 +311,7 @@ restarting the Gateway.
 | TTS | Rime | `rime.tts.v1` | `coda` |
 | TTS | Hume | `hume.tts.v1` | `octave-2` |
 | STT | Inworld | `inworld.stt.v1` | `inworld-stt-1` |
-| TTS | Inworld | `inworld.tts.v1` | `inworld-tts-2` |
+| TTS | Inworld | `inworld.tts.v2` | `inworld-tts-2` |
 | STT | OpenAI | `openai.stt.v1` | `gpt-live-transcribe` |
 | TTS | OpenAI | `openai.tts.v1` | `gpt-4o-mini-tts` |
 | STT | Soniox | `soniox.stt.v1` | `stt-rt-v5` |
