@@ -50,8 +50,12 @@ const (
 
 	// Wire literals from the generated Interactions types.
 	stepModelOutput    = "model_output"
+	stepUserInput      = "user_input"
 	contentText        = "text"
 	annotationWordInfo = "word_info"
+	// statusCompleted is the interaction's terminal status. Over speech-free
+	// audio it is the only evidence in the body that the model ran.
+	statusCompleted = "completed"
 )
 
 // batchModels are the model ids this endpoint serves. The live-only id is
@@ -196,11 +200,12 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if err := batchhttp.DecodeJSON(response.Body, &decoded); err != nil {
 		return nil, err
 	}
-	// A completed interaction carries a model_output step (or at least the
-	// flat output_text); a 200 with neither is a response shape this adapter
-	// does not understand, not silence.
+	// A completed interaction reports status "completed", and over speech it
+	// also carries a model_output step (or at least the flat output_text). A
+	// 200 with none of those is a response shape this adapter does not
+	// understand, not silence — see interaction.completed.
 	if !decoded.completed() {
-		return nil, batchhttp.Malformed(errors.New("gemini interaction carries no model output"))
+		return nil, batchhttp.Malformed(fmt.Errorf("gemini interaction carries no model output (status %q)", decoded.Status))
 	}
 	// An empty transcript on a well-formed response is an empty success, not
 	// a failure: silent or speech-free audio legitimately yields no text, and
@@ -301,6 +306,7 @@ func wordTimings(words []batchhttp.Word, options protocol.RequestOptions) []runt
 // field still yields a transcript.
 type interaction struct {
 	ID         string `json:"id"`
+	Status     string `json:"status"`
 	OutputText string `json:"output_text"`
 	Steps      []struct {
 		Type    string `json:"type"`
@@ -318,19 +324,39 @@ type interaction struct {
 	} `json:"steps"`
 }
 
-// completed reports whether the interaction shows evidence the model ran: a
-// model_output step (present even when the transcript is empty) or the flat
-// output_text convenience field.
+// completed reports whether the interaction shows evidence the model ran.
+//
+// Speech-free audio decides the shape. A completed interaction over silence
+// carries no steps at all — no model_output step, no output_text — only
+// status "completed" and an audio-only usage block with zero output tokens
+// (measured 2026-09-09 against v1beta/interactions with 30 s of digital
+// silence and with a 30 s 440 Hz tone; the same request over speech returned
+// a model_output step). So a model_output step or output_text is sufficient
+// evidence but not necessary: the terminal status stands in for it when the
+// body carries no structured output at all.
+//
+// The status is NOT allowed to vouch for steps this decoder does not read. The
+// only step kinds it knows are user_input (the echoed request, which says
+// nothing about the output) and model_output. A completed interaction that
+// carries any other step kind is structured output the adapter does not
+// understand — a refusal, an error step, a future shape — and settling that
+// as an empty transcript would mask a real failure as silence. Such a body
+// stays a malformed refusal, with the status named.
 func (i interaction) completed() bool {
 	if i.OutputText != "" {
 		return true
 	}
+	unknownStep := false
 	for _, step := range i.Steps {
-		if step.Type == stepModelOutput {
+		switch step.Type {
+		case stepModelOutput:
 			return true
+		case stepUserInput:
+		default:
+			unknownStep = true
 		}
 	}
-	return false
+	return i.Status == statusCompleted && !unknownStep
 }
 
 func (i interaction) transcript() string {
