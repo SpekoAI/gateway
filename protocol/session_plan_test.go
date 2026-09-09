@@ -69,6 +69,32 @@ func TestSessionPlanRejectsCredentialPolicyViolations(t *testing.T) {
 	assertInvalid(t, plan.Validate(now), "managed plans require")
 }
 
+func TestCredentialDigestBindingDoesNotExposeOrMutateCredential(t *testing.T) {
+	t.Parallel()
+
+	var plan protocol.SessionPlan
+	decodeFixture(t, "session-plan-provider-direct-managed.json", &plan)
+	original := plan.Route.Credential.Value
+	bound, err := plan.CredentialDigestBoundUnsigned()
+	if err != nil {
+		t.Fatalf("credential digest binding: %v", err)
+	}
+	if plan.Route.Credential.Value != original {
+		t.Fatal("credential digest binding mutated the executable plan")
+	}
+	if bound.Route.Credential.Value == original || !strings.HasPrefix(bound.Route.Credential.Value, "sha256:") || strings.Contains(bound.Route.Credential.Value, original) {
+		t.Fatalf("credential digest binding = %q", bound.Route.Credential.Value)
+	}
+	if bound.Signature != "" {
+		t.Fatal("credential digest binding retained the outer signature")
+	}
+
+	plan.Route.Credential = nil
+	if _, err := plan.CredentialDigestBoundUnsigned(); err == nil {
+		t.Fatal("credential digest binding accepted a plan without a credential")
+	}
+}
+
 func TestSessionPlanRejectsRevisionAndExpirationMismatches(t *testing.T) {
 	t.Parallel()
 
