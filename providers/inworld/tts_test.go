@@ -275,6 +275,44 @@ func TestTTSCloseWaitsForFlushThenClosesContext(t *testing.T) {
 	}
 }
 
+func TestTTSCloseBoundsAnAbandonedEventConsumer(t *testing.T) {
+	t.Parallel()
+	providerResponded := make(chan struct{})
+	harness := newTTSHarness(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		create := readTTSJSON(t, ctx, conn)
+		contextID := create["context_id"].(string)
+		_ = readTTSJSON(t, ctx, conn)
+		writeTTSJSON(t, ctx, conn, map[string]any{"result": map[string]any{
+			"contextId": contextID, "audioChunk": map[string]any{"audioContent": base64.StdEncoding.EncodeToString([]byte{1})},
+		}})
+		writeTTSJSON(t, ctx, conn, map[string]any{"result": map[string]any{"contextId": contextID, "flushCompleted": map[string]any{}}})
+		close(providerResponded)
+	})
+	defer harness.Close()
+
+	stream := openTTSStreamWithConfig(t, harness, Config{
+		EventBuffer: 1, GracefulCloseIdleTimeout: 25 * time.Millisecond,
+	}, nil)
+	synthesizeTTS(t, stream, "backpressured")
+	select {
+	case <-providerResponded:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider did not send the response")
+	}
+
+	started := time.Now()
+	err := stream.Close(context.Background())
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != "provider_unavailable" || !strings.Contains(providerErr.Message, "stalled during graceful close") {
+		t.Fatalf("close error = %#v, want a retryable close-stall error", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("close took %s with an abandoned event consumer", elapsed)
+	}
+	for range stream.Events() {
+	}
+}
+
 func TestTTSInBandErrorsAreClassified(t *testing.T) {
 	t.Parallel()
 	for _, testCase := range []struct {
@@ -449,9 +487,15 @@ func newTTSHarness(t *testing.T, respond func(context.Context, *websocket.Conn, 
 func (h *ttsHarness) Close() { h.server.Close() }
 
 func openTTSStream(t *testing.T, harness *ttsHarness, mutate func(*runtimepkg.AdapterRequest)) ttsTestStream {
+	return openTTSStreamWithConfig(t, harness, Config{}, mutate)
+}
+
+func openTTSStreamWithConfig(t *testing.T, harness *ttsHarness, config Config, mutate func(*runtimepkg.AdapterRequest)) ttsTestStream {
 	t.Helper()
 	parsed, _ := url.Parse(harness.endpoint)
-	adapter, err := New(Config{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+	config.AllowedEndpointHosts = []string{parsed.Hostname()}
+	config.AllowInsecureEndpoint = true
+	adapter, err := New(config)
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}

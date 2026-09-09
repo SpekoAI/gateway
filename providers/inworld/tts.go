@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
@@ -31,9 +32,10 @@ const (
 	officialAPIHost = "api.inworld.ai"
 	streamPath      = "/tts/v1/voice:streamBidirectional"
 
-	DefaultModel           = "inworld-tts-2"
-	maxInputCharacters     = 2_000
-	defaultMaxMessageBytes = 64 << 20
+	DefaultModel            = "inworld-tts-2"
+	maxInputCharacters      = 2_000
+	defaultMaxMessageBytes  = 64 << 20
+	defaultCloseIdleTimeout = 30 * time.Second
 )
 
 var supportedModels = map[string]struct{}{
@@ -52,6 +54,9 @@ type Config struct {
 	HTTPClient      *http.Client
 	EventBuffer     int
 	MaxMessageBytes int64
+	// GracefulCloseIdleTimeout bounds a Close whose provider reader cannot
+	// make progress, including when downstream has stopped draining Events.
+	GracefulCloseIdleTimeout time.Duration
 	// MaxResponseBytes is retained as a compatibility alias from v1. New code
 	// should use MaxMessageBytes; if both are set MaxMessageBytes wins.
 	MaxResponseBytes      int64
@@ -61,11 +66,12 @@ type Config struct {
 
 // Adapter implements Inworld's /tts/v1/voice:streamBidirectional API.
 type Adapter struct {
-	id              string
-	httpClient      *http.Client
-	eventBuffer     int
-	maxMessageBytes int64
-	endpointPolicy  upstream.WebSocketPolicy
+	id                       string
+	httpClient               *http.Client
+	eventBuffer              int
+	maxMessageBytes          int64
+	gracefulCloseIdleTimeout time.Duration
+	endpointPolicy           upstream.WebSocketPolicy
 }
 
 func New(config Config) (*Adapter, error) {
@@ -81,17 +87,27 @@ func New(config Config) (*Adapter, error) {
 	if config.MaxMessageBytes == 0 {
 		config.MaxMessageBytes = defaultMaxMessageBytes
 	}
+	if config.GracefulCloseIdleTimeout == 0 {
+		config.GracefulCloseIdleTimeout = defaultCloseIdleTimeout
+	}
 	if config.EventBuffer < 1 {
 		return nil, errors.New("inworld event buffer must be positive")
 	}
 	if config.MaxMessageBytes < 1 {
 		return nil, errors.New("inworld maximum message bytes must be positive")
 	}
+	if config.GracefulCloseIdleTimeout < 0 {
+		return nil, errors.New("inworld graceful close idle timeout must be positive")
+	}
 	policy, err := upstream.NewWebSocketPolicy(officialAPIHost, config.AllowedEndpointHosts, config.AllowInsecureEndpoint)
 	if err != nil {
 		return nil, err
 	}
-	return &Adapter{id: config.AdapterID, httpClient: config.HTTPClient, eventBuffer: config.EventBuffer, maxMessageBytes: config.MaxMessageBytes, endpointPolicy: policy}, nil
+	return &Adapter{
+		id: config.AdapterID, httpClient: config.HTTPClient, eventBuffer: config.EventBuffer,
+		maxMessageBytes: config.MaxMessageBytes, gracefulCloseIdleTimeout: config.GracefulCloseIdleTimeout,
+		endpointPolicy: policy,
+	}, nil
 }
 
 func (a *Adapter) ID() string { return a.id }
@@ -151,8 +167,9 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	streamCtx, cancel := context.WithCancel(context.Background())
 	s := &stream{
 		conn: conn, ctx: streamCtx, cancel: cancel,
-		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), readDone: make(chan struct{}),
-		model: model, voice: voice, language: strings.TrimSpace(request.Options.Language), media: *request.Media,
+		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), readDone: make(chan struct{}), responseProgress: make(chan struct{}, 1),
+		gracefulCloseIdleTimeout: a.gracefulCloseIdleTimeout,
+		model:                    model, voice: voice, language: strings.TrimSpace(request.Options.Language), media: *request.Media,
 	}
 	go s.readLoop()
 	return s, nil
@@ -226,11 +243,14 @@ type generation struct {
 }
 
 type stream struct {
-	conn     *websocket.Conn
-	ctx      context.Context
-	cancel   context.CancelFunc
-	events   chan runtimepkg.ProviderEvent
-	readDone chan struct{}
+	conn             *websocket.Conn
+	ctx              context.Context
+	cancel           context.CancelFunc
+	events           chan runtimepkg.ProviderEvent
+	readDone         chan struct{}
+	responseProgress chan struct{}
+
+	gracefulCloseIdleTimeout time.Duration
 
 	model    string
 	voice    string
@@ -347,11 +367,7 @@ func (s *stream) Close(ctx context.Context) error {
 		generationDone := s.activeGenerationDoneLocked()
 		s.stateMu.Unlock()
 		if generationDone != nil {
-			select {
-			case <-generationDone:
-			case <-ctx.Done():
-				s.closeErr = ctx.Err()
-			}
+			s.closeErr = s.waitForCloseProgress(ctx, generationDone, "synthesis")
 		}
 		if s.closeErr == nil {
 			contextID, contextDone, shouldWrite := s.beginContextClose()
@@ -359,11 +375,7 @@ func (s *stream) Close(ctx context.Context) error {
 				if err := s.writeJSON(ctx, closeContextRequest{ContextID: contextID, CloseContext: struct{}{}}); err != nil {
 					s.closeErr = err
 				} else {
-					select {
-					case <-contextDone:
-					case <-ctx.Done():
-						s.closeErr = ctx.Err()
-					}
+					s.closeErr = s.waitForCloseProgress(ctx, contextDone, "context shutdown")
 				}
 			}
 		}
@@ -387,6 +399,41 @@ func (s *stream) Close(ctx context.Context) error {
 		}
 	})
 	return s.closeErr
+}
+
+// waitForCloseProgress preserves graceful delivery while bounding abandoned
+// consumers. A blocked event send prevents the socket reader from reaching the
+// flush or context-close acknowledgement, so a caller using Background cannot
+// rely on its context alone to break the runtime/provider lock cycle.
+func (s *stream) waitForCloseProgress(ctx context.Context, done <-chan struct{}, phase string) error {
+	timer := time.NewTimer(s.gracefulCloseIdleTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.responseProgress:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(s.gracefulCloseIdleTimeout)
+		case <-timer.C:
+			select {
+			case <-done:
+				return nil
+			default:
+			}
+			return &runtimepkg.ProviderError{
+				Code: "provider_unavailable", Message: "Inworld TTS " + phase + " stalled during graceful close",
+				Retryable: true, Cause: context.DeadlineExceeded,
+			}
+		}
+	}
 }
 
 func (s *stream) Abort(context.Context) error {
@@ -513,6 +560,7 @@ func (s *stream) readLoop() {
 		if messageType != websocket.MessageText {
 			continue
 		}
+		s.reportResponseProgress()
 		if err := s.handleMessage(payload); err != nil {
 			s.emit(runtimepkg.ProviderEvent{Err: err})
 			return
@@ -694,9 +742,17 @@ func (s *stream) handleContextClosed(contextID string, raw json.RawMessage) erro
 func (s *stream) emit(event runtimepkg.ProviderEvent) bool {
 	select {
 	case s.events <- event:
+		s.reportResponseProgress()
 		return true
 	case <-s.ctx.Done():
 		return false
+	}
+}
+
+func (s *stream) reportResponseProgress() {
+	select {
+	case s.responseProgress <- struct{}{}:
+	default:
 	}
 }
 
