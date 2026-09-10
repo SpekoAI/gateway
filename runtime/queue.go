@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"sync"
+
+	"github.com/SpekoAI/gateway/protocol"
 )
 
 type inputKind uint8
@@ -13,6 +15,7 @@ const (
 	inputTextAppend
 	inputTextCommit
 	inputCancel
+	inputProviderControl
 )
 
 type audioInput struct {
@@ -21,9 +24,10 @@ type audioInput struct {
 }
 
 type inputMessage struct {
-	kind  inputKind
-	audio audioInput
-	text  string
+	kind    inputKind
+	audio   audioInput
+	text    string
+	control protocol.ProviderControl
 }
 
 // inputQueue is a fixed-capacity ring. It never copies audio data and makes no

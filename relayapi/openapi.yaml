@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:d2a4bb833330a1a6de678f560898a5302f91ce30584094ff7b83a311a7d73cd1
-# yaml-body: sha256:de09241ec33b6d23a43e2da56401ddd20eab7e689021fa5e1f62cb7f12228a5c
+# json-mirror: openapi.json sha256:78c827085004d77f2797ac67714eb81c78a15d3bbf601d8ee70b85f8d2e0970f
+# yaml-body: sha256:b83e138c9bf1b5757e4acf9f523df1d0658879e5bdc8a6c08d8e7cdd5545e583
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -631,17 +631,25 @@ components:
         reasoning_tokens:
           type: integer
           minimum: 0
+        tool_calls:
+          type: integer
+          minimum: 0
+          description: >-
+            Billable hosted tool invocations (web search) performed by a
+            delegated GPT-Live backend; omitted for every other route.
       additionalProperties: false
     Kind:
       type: string
       description: >-
-        The provider-neutral operation served by the Router. The set is
-        deliberately smaller than the local gateway's session kinds: the Router
-        serves stt, tts, and llm, and has no realtime kind.
+        The provider-neutral operation served by the Router: stt, tts, llm,
+        and s2s. Speech-to-speech models are served on protocol-specific
+        WebSocket routes (Model.endpoint) that speak the vendor's native event
+        protocol (Model.protocol), documented in asyncapi.yaml.
       enum:
         - stt
         - tts
         - llm
+        - s2s
     ModelCapabilities:
       type: object
       description: >-
@@ -730,11 +738,35 @@ components:
             type: string
         audio_formats:
           type: array
-          description: Accepted input formats for STT or output formats for TTS; omitted for LLM models.
+          description: >-
+            Accepted input formats for STT and S2S models, or output formats
+            for TTS models; omitted for LLM models.
+          items:
+            $ref: "#/components/schemas/AudioFormat"
+        output_audio_formats:
+          type: array
+          description: >-
+            The formats an S2S model speaks in; omitted for every other kind.
           items:
             $ref: "#/components/schemas/AudioFormat"
         batch_audio_limits:
           $ref: "#/components/schemas/BatchAudioLimits"
+        endpoint:
+          type: string
+          enum: [/v1/realtime, /v1/live]
+          description: >-
+            The public Router WebSocket route an S2S model is served on;
+            omitted for every other kind, whose routes are fixed per kind.
+            Select the model exactly: /v1/realtime takes it as the `model`
+            query parameter, /v1/live in the first session.start frame. A
+            model sent to the other route is refused with
+            capability_unsupported.
+        protocol:
+          type: string
+          enum: [openai.realtime.v1, openai.live.v1]
+          description: >-
+            The native event protocol the S2S route speaks; omitted for every
+            other kind.
         benchmark:
           $ref: "#/components/schemas/ModelBenchmark"
       required:

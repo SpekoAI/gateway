@@ -40,6 +40,9 @@ const (
 	RelayUsageUnitCachedInputTokens RelayUsageUnit = "cached_input_tokens"
 	RelayUsageUnitOutputTokens      RelayUsageUnit = "output_tokens"
 	RelayUsageUnitReasoningTokens   RelayUsageUnit = "reasoning_tokens"
+	// RelayUsageUnitToolCalls counts billable hosted tool invocations (web
+	// search) a delegated GPT-Live backend performs. One call is one unit.
+	RelayUsageUnitToolCalls RelayUsageUnit = "tool_calls"
 )
 
 // RelayBudgetGroup names an authorized spend bucket in a relay plan. Groups
@@ -59,6 +62,18 @@ const (
 	// audio-token counts differ per vendor and cannot be guarded before the
 	// audio is sent, so they stay telemetry evidence rather than the unit.
 	RelayBudgetGroupS2SDuration RelayBudgetGroup = "s2s_duration"
+	// RelayBudgetGroupBackendInput and RelayBudgetGroupBackendOutput authorize
+	// the token spend of a GPT-Live Responses backend, denominated like the
+	// llm groups (fresh + cached input; output + reasoning). They are separate
+	// groups from s2s_duration so a Live reservation carries the voice lease
+	// and the backend exposure as distinct, separately settled ceilings, and
+	// separate from llm_input/llm_output so an s2s plan can never be read as
+	// an LLM plan.
+	RelayBudgetGroupBackendInput  RelayBudgetGroup = "backend_input"
+	RelayBudgetGroupBackendOutput RelayBudgetGroup = "backend_output"
+	// RelayBudgetGroupBackendTools authorizes billable hosted tool calls of a
+	// GPT-Live Responses backend, in tool_calls.
+	RelayBudgetGroupBackendTools RelayBudgetGroup = "backend_tools"
 )
 
 // RelayBudget is one signed spend ceiling. The ceiling is the connector's
@@ -98,6 +113,12 @@ type RelayPlan struct {
 	Model     string    `json:"model"`
 	Endpoint  string    `json:"endpoint"`
 	Transport Transport `json:"transport"`
+	// Protocol names the native speech protocol the model speaks; required
+	// for s2s plans and absent otherwise. The connector verifies it against
+	// its embedded catalog descriptor before any credential is read and
+	// dispatches the matching adapter, so a plan can never make a Realtime
+	// connector speak Live or vice versa.
+	Protocol SpeechProtocol `json:"protocol,omitempty"`
 	// CatalogDigest pins the release catalog the endpoint and model were
 	// selected from, in "sha256:<64 hex>" form. A connector running a
 	// different catalog release rejects the plan instead of guessing.
@@ -221,6 +242,13 @@ func (p RelayPlan) Validate(now time.Time) error {
 	}
 	if err := validateEndpoint(p.Endpoint, p.Transport); err != nil {
 		return fmt.Errorf("endpoint: %w", err)
+	}
+	if p.Kind == SessionKindS2S {
+		if !ValidSpeechProtocol(p.Protocol) {
+			return fmt.Errorf("protocol: s2s plans require a known speech protocol, got %q", p.Protocol)
+		}
+	} else if p.Protocol != "" {
+		return fmt.Errorf("protocol: valid only for s2s plans")
 	}
 	if err := validateCatalogDigest(p.CatalogDigest); err != nil {
 		return fmt.Errorf("catalog_digest: %w", err)
@@ -362,6 +390,17 @@ func validateRelayBudgets(kind SessionKind, budgets []RelayBudget) error {
 	if kind == SessionKindLLM && (!seen[RelayBudgetGroupLLMInput] || !seen[RelayBudgetGroupLLMOutput]) {
 		return fmt.Errorf("llm plans require both llm_input and llm_output groups")
 	}
+	if kind == SessionKindS2S {
+		if !seen[RelayBudgetGroupS2SDuration] {
+			return fmt.Errorf("s2s plans require the s2s_duration group")
+		}
+		if seen[RelayBudgetGroupBackendInput] != seen[RelayBudgetGroupBackendOutput] {
+			return fmt.Errorf("s2s plans carry backend_input and backend_output together or not at all")
+		}
+		if seen[RelayBudgetGroupBackendTools] && !seen[RelayBudgetGroupBackendOutput] {
+			return fmt.Errorf("backend_tools requires the backend token groups")
+		}
+	}
 	return nil
 }
 
@@ -383,7 +422,12 @@ func validRelayKind(v SessionKind) bool {
 }
 
 func validRelayBudgetGroup(v RelayBudgetGroup) bool {
-	return v == RelayBudgetGroupSTTDuration || v == RelayBudgetGroupTTSCharacters || v == RelayBudgetGroupLLMInput || v == RelayBudgetGroupLLMOutput || v == RelayBudgetGroupS2SDuration
+	switch v {
+	case RelayBudgetGroupSTTDuration, RelayBudgetGroupTTSCharacters, RelayBudgetGroupLLMInput, RelayBudgetGroupLLMOutput,
+		RelayBudgetGroupS2SDuration, RelayBudgetGroupBackendInput, RelayBudgetGroupBackendOutput, RelayBudgetGroupBackendTools:
+		return true
+	}
+	return false
 }
 
 func relayBudgetGroupLegalForKind(kind SessionKind, group RelayBudgetGroup) bool {
@@ -395,7 +439,8 @@ func relayBudgetGroupLegalForKind(kind SessionKind, group RelayBudgetGroup) bool
 	case SessionKindLLM:
 		return group == RelayBudgetGroupLLMInput || group == RelayBudgetGroupLLMOutput
 	case SessionKindS2S:
-		return group == RelayBudgetGroupS2SDuration
+		return group == RelayBudgetGroupS2SDuration || group == RelayBudgetGroupBackendInput ||
+			group == RelayBudgetGroupBackendOutput || group == RelayBudgetGroupBackendTools
 	}
 	return false
 }

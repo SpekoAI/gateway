@@ -201,6 +201,11 @@ type S2SOptions struct {
 	// OutputMedia is the format of the audio the model speaks back. Input
 	// audio rides AdapterRequest.Media like every speech session.
 	OutputMedia *MediaFormat `json:"output_media,omitempty"`
+	// Live carries the GPT-Live-only configuration: seeded history and the
+	// delegation mode with its backend settings. Nil on every other
+	// speech-to-speech protocol; a Live adapter treats nil as client
+	// delegation with no history.
+	Live *LiveOptions `json:"live,omitempty"`
 }
 
 // UsageUnit identifies the provider quantity whose spend was authorized by a
@@ -461,6 +466,11 @@ func (o S2SOptions) validate() error {
 	}
 	if err := o.OutputMedia.validate(); err != nil {
 		return fmt.Errorf("output_media: %w", err)
+	}
+	if o.Live != nil {
+		if err := o.Live.Validate(); err != nil {
+			return fmt.Errorf("live: %w", err)
+		}
 	}
 	return nil
 }

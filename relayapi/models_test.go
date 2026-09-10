@@ -32,6 +32,15 @@ func TestModelsResponseRejectsEachRuleViolation(t *testing.T) {
 		{"format without channels", func(r *relayapi.ModelsResponse) {
 			r.Models[1].AudioFormats[0].Channels = nil
 		}, "channels"},
+		{"s2s without output formats", func(r *relayapi.ModelsResponse) { r.Models[2].OutputAudioFormats = nil }, "output_audio_formats"},
+		{"s2s without endpoint", func(r *relayapi.ModelsResponse) { r.Models[2].Endpoint = "" }, "endpoint"},
+		{"s2s on a foreign route", func(r *relayapi.ModelsResponse) { r.Models[2].Endpoint = "/v1/stt/stream" }, "endpoint"},
+		{"s2s without protocol", func(r *relayapi.ModelsResponse) { r.Models[3].Protocol = "" }, "protocol"},
+		{"s2s with batch limits", func(r *relayapi.ModelsResponse) {
+			r.Models[3].BatchAudioLimits = &relayapi.BatchAudioLimits{MaxPCMBytes: 1}
+		}, "batch_audio_limits"},
+		{"stt with output formats", func(r *relayapi.ModelsResponse) { r.Models[1].OutputAudioFormats = r.Models[2].OutputAudioFormats }, "output_audio_formats: valid only"},
+		{"llm with endpoint", func(r *relayapi.ModelsResponse) { r.Models[0].Endpoint = "/v1/live" }, "endpoint and protocol"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -10,3 +10,6 @@ coverage.out
 .venv/
 __pycache__/
 *.py[cod]
+
+# compiled cmd binary (build output, never committed)
+/speko-gateway

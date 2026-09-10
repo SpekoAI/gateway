@@ -34,6 +34,11 @@ const (
 	EventUsageReported EventType = "usage.reported"
 	EventWarning       EventType = "warning"
 	EventError         EventType = "error"
+	// EventProviderEvent surfaces one native provider event verbatim on a
+	// speech-to-speech session (Data is a ProviderEvent envelope). It carries
+	// delegation notices, nested Responses events, command acknowledgments,
+	// and session updates whose native identifiers must survive untouched.
+	EventProviderEvent EventType = "provider.event"
 )
 
 // Event is the canonical in-memory representation of a streaming server

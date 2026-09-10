@@ -187,10 +187,18 @@ func TestWSMessageSamplesMatchAsyncAPISchemas(t *testing.T) {
 		relayapi.ErrorEventType:                     "ErrorEvent",
 	}
 
+	// The Live route is vendor-native: only the first frame and the Router's
+	// own error frame are Router-defined shapes.
+	liveSchemaByType := map[string]string{
+		relayapi.LiveSessionStartType: "LiveSessionStart",
+		relayapi.ErrorEventType:       "ErrorEvent",
+	}
+
 	doc := loadSpecDoc(t, "asyncapi.json")
 	for fixture, schemaByType := range map[string]map[string]string{
-		"ws-stt-messages.json": sttSchemaByType,
-		"ws-tts-messages.json": ttsSchemaByType,
+		"ws-stt-messages.json":  sttSchemaByType,
+		"ws-tts-messages.json":  ttsSchemaByType,
+		"ws-live-messages.json": liveSchemaByType,
 	} {
 		var frames []json.RawMessage
 		decodeFixture(t, fixture, &frames)
@@ -296,6 +304,15 @@ func wireSchemaTable() []struct {
 		{relayapi.TTSUtteranceDone{}, asyncapi("TTSUtteranceDone")},
 		{relayapi.TTSUsageUpdated{}, asyncapi("TTSUsageUpdated")},
 		{relayapi.TTSSessionClosed{}, asyncapi("TTSSessionClosed")},
+		{relayapi.LiveSessionStart{}, asyncapi("LiveSessionStart")},
+		{relayapi.LiveSessionConfig{}, asyncapi("LiveSessionConfig")},
+		{relayapi.LiveAudioConfig{}, asyncapi("LiveAudioConfig")},
+		{relayapi.LiveAudioFormat{}, asyncapi("LiveAudioFormat")},
+		{relayapi.LiveAudioOutput{}, asyncapi("LiveAudioOutput")},
+		{relayapi.LiveInputItem{}, asyncapi("LiveInputItem")},
+		{relayapi.LiveContentPart{}, asyncapi("LiveContentPart")},
+		{relayapi.LiveDelegationConfig{}, asyncapi("LiveDelegationConfig")},
+		{relayapi.LiveResponsesConfig{}, asyncapi("LiveResponsesConfig")},
 	}
 }
 

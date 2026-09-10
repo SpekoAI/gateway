@@ -39,6 +39,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/minimax"
 	"github.com/SpekoAI/gateway/providers/modulate"
 	"github.com/SpekoAI/gateway/providers/openai"
+	"github.com/SpekoAI/gateway/providers/openailive"
 	"github.com/SpekoAI/gateway/providers/openairealtime"
 	"github.com/SpekoAI/gateway/providers/palabra"
 	"github.com/SpekoAI/gateway/providers/rime"
@@ -237,6 +238,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	openaiLiveAdapter, err := openailive.New(openailive.Config{RelayEndpointHosts: liveRelayHosts()})
+	if err != nil {
+		return err
+	}
 	geminiSTTAdapter, err := gemini.NewSTT(gemini.STTConfig{})
 	if err != nil {
 		return err
@@ -295,7 +300,7 @@ func run() error {
 		cartesiaAdapter, cartesiaSTTAdapter, assemblyAIAdapter, modulateAdapter, gladiaAdapter,
 		googleAdapter, inworldAdapter, minimaxAdapter, xaiAdapter,
 		sonioxSTTAdapter, sonioxTTSAdapter, smallestSTTAdapter, smallestTTSAdapter,
-		openaiSTTAdapter, openaiTTSAdapter, openaiRealtimeAdapter, xaiRealtimeAdapter, googleRealtimeAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
+		openaiSTTAdapter, openaiTTSAdapter, openaiRealtimeAdapter, openaiLiveAdapter, xaiRealtimeAdapter, googleRealtimeAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
 		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
@@ -702,4 +707,18 @@ func secret(name string) (string, error) {
 		return "", fmt.Errorf("%s_FILE is empty", name)
 	}
 	return value, nil
+}
+
+// liveRelayHosts names the Speko Router hosts a managed GPT-Live session may
+// be routed through on a speko_relay plan. The production Router is always
+// allowed; SPEKO_LIVE_RELAY_HOSTS adds staging or regional hostnames as a
+// comma-separated list.
+func liveRelayHosts() []string {
+	hosts := []string{"router.speko.dev"}
+	for _, host := range strings.Split(os.Getenv("SPEKO_LIVE_RELAY_HOSTS"), ",") {
+		if host = strings.TrimSpace(host); host != "" {
+			hosts = append(hosts, host)
+		}
+	}
+	return hosts
 }

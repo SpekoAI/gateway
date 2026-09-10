@@ -137,7 +137,15 @@ func TestLocalPlannerRoutesEveryCatalogEntryWithBYOK(t *testing.T) {
 			request.Kind = entry.Kind
 			request.Runtime.Adapters = []string{entry.Adapter}
 			request.Request.Provider = entry.Provider
+			// "auto" resolves to the provider's first row for the kind; a
+			// provider with several rows (openai realtime vs live) reaches
+			// the later ones only by naming their model.
 			request.Request.Model = "auto"
+			for _, sibling := range gateway.Catalog() {
+				if sibling.Provider == entry.Provider && sibling.Kind == entry.Kind && sibling.Adapter != entry.Adapter {
+					request.Request.Model = entry.DefaultModel
+				}
+			}
 			if entry.Kind == protocol.SessionKindTTS {
 				request.Request.MaxInputCharacters = 1_000
 				request.Request.Voice = "test-voice"
@@ -194,5 +202,41 @@ func localPlanRequest() protocol.SessionPlanRequest {
 		Execution: protocol.ExecutionRequest{ProviderRoute: protocol.RouteProviderDirect, CredentialSource: protocol.CredentialsBYOK, RelayPolicy: protocol.RelayForbidden},
 		Request:   protocol.RequestOptions{Provider: "deepgram", Model: "nova-3"},
 		Media:     &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1},
+	}
+}
+
+// The openai/realtime pair is the one (provider, kind) with two rows, and
+// they differ by protocol. "auto" and every Realtime model must stay on the
+// Realtime adapter; gpt-live-1 must reach the Live adapter by name and never
+// by default.
+func TestLocalPlannerResolvesOpenAIRealtimeRowsByModel(t *testing.T) {
+	t.Parallel()
+	planner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{Providers: []string{"openai"}})
+	if err != nil {
+		t.Fatalf("new local planner: %v", err)
+	}
+	for _, tc := range []struct {
+		model, wantAdapter, wantModel, wantEndpoint string
+	}{
+		{"auto", "openai.realtime.v1", "gpt-realtime-2.1", "wss://api.openai.com/v1/realtime"},
+		{"", "openai.realtime.v1", "gpt-realtime-2.1", "wss://api.openai.com/v1/realtime"},
+		{"gpt-realtime-2", "openai.realtime.v1", "gpt-realtime-2", "wss://api.openai.com/v1/realtime"},
+		{"gpt-realtime-2.1", "openai.realtime.v1", "gpt-realtime-2.1", "wss://api.openai.com/v1/realtime"},
+		{"gpt-live-1", "openai.live.v1", "gpt-live-1", "wss://api.openai.com/v1/live/sessions"},
+	} {
+		request := localPlanRequest()
+		request.Kind = protocol.SessionKindRealtime
+		request.Runtime.Adapters = []string{"openai.realtime.v1", "openai.live.v1"}
+		request.Request.Provider = "openai"
+		request.Request.Model = tc.model
+		request.Request.Voice = "marin"
+		request.Request.S2S = &protocol.S2SOptions{OutputMedia: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1}}
+		plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
+		if err != nil {
+			t.Fatalf("model %q: create local plan: %v", tc.model, err)
+		}
+		if plan.Route.Adapter != tc.wantAdapter || plan.Route.Model != tc.wantModel || plan.Route.Endpoint != tc.wantEndpoint {
+			t.Fatalf("model %q: route = %+v", tc.model, plan.Route)
+		}
 	}
 }

@@ -1,0 +1,35 @@
+[
+  {
+    "type": "session.start",
+    "event_id": "event_start",
+    "session": {
+      "model": "gpt-live-1",
+      "instructions": "Be concise. Delegate requests needing current information to the backend.",
+      "audio": {
+        "format": {"type": "audio/pcm", "rate": 24000},
+        "output": {"voice": "marin"}
+      },
+      "input": [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "My order number is A0042."}]},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Thanks, I have your order."}]}
+      ],
+      "delegation": {
+        "type": "responses",
+        "responses": {
+          "model": "gpt-5.6-luna",
+          "instructions": "Use the order tools. Return verified status only.",
+          "tools": [{"type": "web_search"}, {"type": "function", "name": "lookup_order", "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}}}],
+          "tool_choice": "auto",
+          "parallel_tool_calls": false,
+          "max_output_tokens": 1024,
+          "service_tier": "auto"
+        }
+      },
+      "store": false
+    }
+  },
+  {
+    "type": "error",
+    "error": {"code": "budget_exhausted", "message": "the session budget was exhausted", "hint": "Add credit or start a new session with a smaller backend budget.", "retryable": false, "request_id": "req_5cd2f7"}
+  }
+]

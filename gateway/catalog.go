@@ -45,6 +45,11 @@ type CatalogEntry struct {
 	// local-planner metadata, not another published provider row. The first
 	// matching prefix wins; unmatched models retain Endpoint.
 	ModelRoutes []CatalogModelRoute `json:"-"`
+	// Protocol names the native speech protocol a realtime entry speaks. It
+	// is what lets two OpenAI realtime adapters coexist: the openai/realtime
+	// pair has one row per protocol, and resolution reads the requested model
+	// to pick between them. Empty for stt and tts.
+	Protocol protocol.SpeechProtocol `json:"protocol,omitempty"`
 	// RequiresDeploymentConfig, when non-empty, says this row cannot be dialled as
 	// written and names what an operator must supply. Google STT is the case: its
 	// path embeds the caller's own GCP project
@@ -125,9 +130,16 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "inworld", Kind: protocol.SessionKindSTT, Adapter: "inworld.stt.v1", DefaultModel: "inworld-stt-1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional"},
 	{Provider: "xai", Kind: protocol.SessionKindSTT, Adapter: "xai.stt.v1", DefaultModel: "stt", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/stt"},
 	{Provider: "openai", Kind: protocol.SessionKindSTT, Adapter: "openai.stt.v1", DefaultModel: "gpt-live-transcribe", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.openai.com/v1/realtime"},
-	{Provider: "openai", Kind: protocol.SessionKindRealtime, Adapter: "openai.realtime.v1", DefaultModel: "gpt-realtime-2.1", Models: []string{"gpt-realtime-2.1", "gpt-realtime-2.1-mini", "gpt-realtime-2", "gpt-realtime-1.5", "gpt-realtime", "gpt-realtime-mini"}, DefaultVoice: "marin", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.openai.com/v1/realtime"},
-	{Provider: "google", Kind: protocol.SessionKindRealtime, Adapter: "google.live.v1", DefaultModel: "gemini-3.1-flash-live-preview", DefaultVoice: "Puck", Transport: protocol.TransportWebSocket, Endpoint: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained"},
-	{Provider: "xai", Kind: protocol.SessionKindRealtime, Adapter: "xai.realtime.v1", DefaultModel: "grok-voice-latest", Models: []string{"grok-voice-latest", "grok-voice-think-fast-2.0", "grok-voice-think-fast-1.0", "grok-voice-fast-1.0"}, DefaultVoice: "eve", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/realtime"},
+	{Provider: "openai", Kind: protocol.SessionKindRealtime, Adapter: "openai.realtime.v1", Protocol: protocol.SpeechProtocolOpenAIRealtimeV1, DefaultModel: "gpt-realtime-2.1", Models: []string{"gpt-realtime-2.1", "gpt-realtime-2.1-mini", "gpt-realtime-2", "gpt-realtime-1.5", "gpt-realtime", "gpt-realtime-mini"}, DefaultVoice: "marin", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.openai.com/v1/realtime"},
+	// GPT-Live is a SECOND OpenAI realtime row, not another model on the
+	// Realtime row: it speaks a different protocol on a different socket
+	// (session.start on /v1/live/sessions with no query parameters, continuous
+	// audio without commits, delegation instead of tool calls). The model is
+	// explicitly selectable only — it never joins automatic selection — so
+	// the row lists exactly its one model and resolution reaches it by name.
+	{Provider: "openai", Kind: protocol.SessionKindRealtime, Adapter: "openai.live.v1", Protocol: protocol.SpeechProtocolOpenAILiveV1, DefaultModel: "gpt-live-1", Models: []string{"gpt-live-1"}, DefaultVoice: "marin", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.openai.com/v1/live/sessions"},
+	{Provider: "google", Kind: protocol.SessionKindRealtime, Adapter: "google.live.v1", Protocol: protocol.SpeechProtocolGoogleLiveV1, DefaultModel: "gemini-3.1-flash-live-preview", DefaultVoice: "Puck", Transport: protocol.TransportWebSocket, Endpoint: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained"},
+	{Provider: "xai", Kind: protocol.SessionKindRealtime, Adapter: "xai.realtime.v1", Protocol: protocol.SpeechProtocolXAIRealtimeV1, DefaultModel: "grok-voice-latest", Models: []string{"grok-voice-latest", "grok-voice-think-fast-2.0", "grok-voice-think-fast-1.0", "grok-voice-fast-1.0"}, DefaultVoice: "eve", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/realtime"},
 	{Provider: "openai", Kind: protocol.SessionKindTTS, Adapter: "openai.tts.v1", DefaultModel: "gpt-4o-mini-tts", Transport: protocol.TransportHTTP, Endpoint: "https://api.openai.com/v1/audio/speech"},
 	{Provider: "soniox", Kind: protocol.SessionKindSTT, Adapter: "soniox.stt.v1", DefaultModel: "stt-rt-v5", Transport: protocol.TransportWebSocket, Endpoint: "wss://stt-rt.soniox.com/transcribe-websocket"},
 	{Provider: "soniox", Kind: protocol.SessionKindTTS, Adapter: "soniox.tts.v1", DefaultModel: "tts-rt-v2", Transport: protocol.TransportWebSocket, Endpoint: "wss://tts-rt.soniox.com/tts-websocket"},
@@ -154,7 +166,10 @@ func Catalog() []CatalogEntry {
 		entries[index].Models = append([]string(nil), entries[index].Models...)
 		entries[index].ModelRoutes = append([]CatalogModelRoute(nil), entries[index].ModelRoutes...)
 	}
-	sort.Slice(entries, func(i, j int) bool {
+	// Stable: a provider may publish several rows for one kind (openai
+	// realtime vs live), and catalog order between them is what resolution
+	// and automatic selection read.
+	sort.SliceStable(entries, func(i, j int) bool {
 		if entries[i].Provider != entries[j].Provider {
 			return entries[i].Provider < entries[j].Provider
 		}
@@ -173,13 +188,59 @@ func catalogHasProvider(provider string) bool {
 	return false
 }
 
-func catalogEntryFor(kind protocol.SessionKind, provider string) (CatalogEntry, bool) {
-	for _, entry := range providerCatalog {
-		if entry.Provider == provider && entry.Kind == kind {
-			return entry, true
+// catalogEntryFor resolves the catalog row for a (kind, provider, model)
+// request. A provider may publish several rows for one kind when its models
+// speak different protocols (openai realtime vs live), so the model decides:
+// an exact model match wins; an empty or "auto" model takes the provider's
+// FIRST row for the kind, which is the row that participates in automatic
+// selection (rows added for explicit-only models come after it); a model no
+// row lists resolves to the first row so that provider-local model ids the
+// catalog does not enumerate keep working exactly as before.
+func catalogEntryFor(kind protocol.SessionKind, provider, model string) (CatalogEntry, bool) {
+	model = strings.TrimSpace(model)
+	var first *CatalogEntry
+	for index := range providerCatalog {
+		entry := &providerCatalog[index]
+		if entry.Provider != provider || entry.Kind != kind {
+			continue
+		}
+		if first == nil {
+			first = entry
+		}
+		if model != "" && model != "auto" && entry.ServesModel(model) {
+			return *entry, true
 		}
 	}
-	return CatalogEntry{}, false
+	if first == nil {
+		return CatalogEntry{}, false
+	}
+	return *first, true
+}
+
+// catalogEntriesFor returns every row a provider publishes for a kind, in
+// catalog order.
+func catalogEntriesFor(kind protocol.SessionKind, provider string) []CatalogEntry {
+	var entries []CatalogEntry
+	for _, entry := range providerCatalog {
+		if entry.Provider == provider && entry.Kind == kind {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+// ServesModel reports whether the row lists the model explicitly (its
+// default or one of Models).
+func (e CatalogEntry) ServesModel(model string) bool {
+	if model == e.DefaultModel {
+		return true
+	}
+	for _, candidate := range e.Models {
+		if candidate == model {
+			return true
+		}
+	}
+	return false
 }
 
 func catalogEntryForAdapter(adapter string) (CatalogEntry, bool) {
@@ -193,11 +254,12 @@ func catalogEntryForAdapter(adapter string) (CatalogEntry, bool) {
 
 // catalogModel is one published model row.
 type catalogModel struct {
-	ID        string               `json:"id"`
-	Provider  string               `json:"provider"`
-	Kind      protocol.SessionKind `json:"kind"`
-	Adapter   string               `json:"adapter"`
-	Transport protocol.Transport   `json:"transport"`
+	ID        string                  `json:"id"`
+	Provider  string                  `json:"provider"`
+	Kind      protocol.SessionKind    `json:"kind"`
+	Adapter   string                  `json:"adapter"`
+	Protocol  protocol.SpeechProtocol `json:"protocol,omitempty"`
+	Transport protocol.Transport      `json:"transport"`
 	// Installed reports whether THIS process has the adapter loaded. A model can be
 	// in the catalog and absent from a given deployment, and a caller needs to tell
 	// those apart before wiring an id: only an installed row can open a session
@@ -240,6 +302,7 @@ func (s *Server) models(writer http.ResponseWriter, request *http.Request) {
 				Provider:       entry.Provider,
 				Kind:           entry.Kind,
 				Adapter:        entry.Adapter,
+				Protocol:       entry.Protocol,
 				Transport:      entry.Transport,
 				Installed:      present,
 				RequiresConfig: entry.RequiresDeploymentConfig,

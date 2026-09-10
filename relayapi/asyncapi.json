@@ -3,7 +3,7 @@
   "info": {
     "title": "Speko Router streaming API",
     "version": "1.0.0",
-    "description": "WebSocket contract of the Speko Router: streaming speech-to-text and text-to-speech sessions. JSON text frames carry the control messages and events documented here; binary frames carry raw audio in the format the session.configure frame declared, with no JSON envelope. The Go types in package relayapi are the source of truth for every shape in this document, and speccheck_test.go machine-checks the two against each other. The HTTP endpoints are specified separately in openapi.yaml."
+    "description": "WebSocket contract of the Speko Router: streaming speech-to-text and text-to-speech sessions, plus the two native speech-to-speech routes. On the STT and TTS routes JSON text frames carry the control messages and events documented here and binary frames carry raw audio in the format the session.configure frame declared, with no JSON envelope. On /v1/realtime and /v1/live the Router speaks the OpenAI Realtime and GPT-Live event protocols natively: audio travels base64-encoded inside the vendor's own JSON events, the Router forwards a bounded set of vendor commands and every vendor server event verbatim, and only its own error frame is Router-shaped. The Go types in package relayapi are the source of truth for every Router-defined shape in this document, and speccheck_test.go machine-checks the two against each other. The HTTP endpoints are specified separately in openapi.yaml."
   },
   "defaultContentType": "application/json",
   "servers": {
@@ -13,9 +13,7 @@
       "description": "Global entry point. The upgrade request authenticates with a Speko-issued bearer token and must carry an Idempotency-Key header. The idempotency content hash of a WebSocket session is the SHA-256 of the exact session.configure text-frame bytes, so a retry must reproduce the configure frame byte-for-byte; later frames are intentionally outside the hash — they are the stream's continuous content, guarded by budgets and leases, while the configure frame is the session's intent.",
       "security": [
         {
-          "bearerAuth": [
-
-          ]
+          "bearerAuth": []
         }
       ]
     }
@@ -162,6 +160,122 @@
             },
             {
               "$ref": "#/components/messages/ttsSessionClosed"
+            },
+            {
+              "$ref": "#/components/messages/wsError"
+            }
+          ]
+        }
+      }
+    },
+    "/v1/realtime": {
+      "description": "OpenAI Realtime speech-to-speech, spoken natively. The model is selected exactly with the `model` query parameter (GET /v1/realtime?model=gpt-realtime-2.1); the idempotency content hash is the SHA-256 of that model value. Once the session is admitted the Router relays the vendor protocol: the client sends Realtime client events (session.update, input_audio_buffer.append with base64 PCM, input_audio_buffer.commit, conversation.item.create, response.create, response.cancel, ...) and receives every Realtime server event (session.created, session.updated, input_audio_buffer.speech_started, response.output_audio.delta, response.done, ...) verbatim. The Router pins the admitted model and mono PCM16 at 24 kHz: a session.update that names another model or audio format is refused with invalid_request, and GPT-Live-only commands are refused the same way. Audio is base64-encoded inside JSON text frames; binary frames are not accepted. The Router's own terminal error frame (lease_expired, budget_exhausted, provider_unavailable) uses the shared ErrorEvent shape; vendor `error` events pass through unchanged.",
+      "parameters": {
+        "model": {
+          "description": "Exact Realtime model id from GET /v1/models rows whose endpoint is /v1/realtime.",
+          "schema": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      },
+      "bindings": {
+        "ws": {
+          "method": "GET",
+          "query": {
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              }
+            },
+            "required": [
+              "model"
+            ]
+          },
+          "headers": {
+            "type": "object",
+            "properties": {
+              "Idempotency-Key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Required on the upgrade request. The content hash covers the exact `model` query value."
+              }
+            },
+            "required": [
+              "Idempotency-Key"
+            ]
+          }
+        }
+      },
+      "publish": {
+        "operationId": "sendRealtimeEvents",
+        "summary": "OpenAI Realtime client events, forwarded to the model.",
+        "message": {
+          "$ref": "#/components/messages/nativeClientEvent"
+        }
+      },
+      "subscribe": {
+        "operationId": "receiveRealtimeEvents",
+        "summary": "OpenAI Realtime server events, plus the Router error frame.",
+        "message": {
+          "oneOf": [
+            {
+              "$ref": "#/components/messages/nativeServerEvent"
+            },
+            {
+              "$ref": "#/components/messages/wsError"
+            }
+          ]
+        }
+      }
+    },
+    "/v1/live": {
+      "description": "GPT-Live speech-to-speech, spoken natively. The first text frame MUST be the vendor's session.start command naming the exact model (gpt-live-1); its exact frame bytes are the idempotency content hash and the Router validates it strictly before admission — unknown fields, audio formats other than mono PCM16 at 16 or 24 kHz, store=true, and a responses delegation without a backend model are refused. After session.started the Router relays the vendor protocol: the client streams session.input_audio.append (base64 PCM, continuous — GPT-Live decides when to speak, there is no commit), forwards the bounded command set (session.update, session.instructions.append, session.thinking.append, session.commentary.append, session.input_audio.mute/unmute, response.item.create, response.create) and receives every server event verbatim: session.started, session.output_audio.delta, session.input_transcript.delta and session.output_transcript.delta with their start_ms/end_ms session-timeline intervals preserved (they may overlap and are not turn boundaries), session.delegation.created, response.event envelopes carrying nested Responses events, the append acknowledgments, session.usage.updated cumulative snapshots, and the final session.closed with its usage. Realtime-only commands (input_audio_buffer.commit, response.cancel) are refused with invalid_request. Send session.close and keep reading until session.closed; the Router drains up to 15 seconds and otherwise ends the session with its own error frame, which means final vendor usage was not confirmed.",
+      "bindings": {
+        "ws": {
+          "method": "GET",
+          "headers": {
+            "type": "object",
+            "properties": {
+              "Idempotency-Key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Required on the upgrade request. The content hash covers the exact session.start text-frame bytes."
+              }
+            },
+            "required": [
+              "Idempotency-Key"
+            ]
+          }
+        }
+      },
+      "publish": {
+        "operationId": "sendLiveEvents",
+        "summary": "GPT-Live client events, forwarded to the model.",
+        "message": {
+          "oneOf": [
+            {
+              "$ref": "#/components/messages/liveSessionStart"
+            },
+            {
+              "$ref": "#/components/messages/nativeClientEvent"
+            }
+          ]
+        }
+      },
+      "subscribe": {
+        "operationId": "receiveLiveEvents",
+        "summary": "GPT-Live server events, plus the Router error frame.",
+        "message": {
+          "oneOf": [
+            {
+              "$ref": "#/components/messages/nativeServerEvent"
             },
             {
               "$ref": "#/components/messages/wsError"
@@ -352,6 +466,30 @@
           "$ref": "#/components/schemas/TTSSessionClosed"
         }
       },
+      "liveSessionStart": {
+        "name": "session.start",
+        "title": "GPT-Live session.start",
+        "summary": "Opens a GPT-Live session; must be the first text frame on the socket and names the exact model.",
+        "payload": {
+          "$ref": "#/components/schemas/LiveSessionStart"
+        }
+      },
+      "nativeClientEvent": {
+        "name": "native client event",
+        "title": "Vendor client event",
+        "summary": "One vendor client event forwarded verbatim within the route's bounded command set. Its shape is the vendor's; the Router reads only the type tag.",
+        "payload": {
+          "$ref": "#/components/schemas/NativeEvent"
+        }
+      },
+      "nativeServerEvent": {
+        "name": "native server event",
+        "title": "Vendor server event",
+        "summary": "One vendor server event delivered verbatim, native identifiers included.",
+        "payload": {
+          "$ref": "#/components/schemas/NativeEvent"
+        }
+      },
       "wsError": {
         "name": "error",
         "title": "Terminal error frame",
@@ -496,6 +634,11 @@
           "reasoning_tokens": {
             "type": "integer",
             "minimum": 0
+          },
+          "tool_calls": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Billable hosted tool invocations (web search) performed by a delegated GPT-Live backend; omitted for every other route."
           }
         },
         "additionalProperties": false
@@ -1097,6 +1240,266 @@
         "required": [
           "type",
           "usage"
+        ],
+        "additionalProperties": false
+      },
+      "NativeEvent": {
+        "type": "object",
+        "description": "A vendor-native JSON event. The Router reads only `type`; every other property is the vendor's and passes through unchanged.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": true
+      },
+      "LiveSessionStart": {
+        "type": "object",
+        "description": "The first frame of a /v1/live session: the native GPT-Live session.start command, validated strictly by the Router.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "session.start"
+            ]
+          },
+          "event_id": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "session": {
+            "$ref": "#/components/schemas/LiveSessionConfig"
+          }
+        },
+        "required": [
+          "type",
+          "session"
+        ],
+        "additionalProperties": false
+      },
+      "LiveSessionConfig": {
+        "type": "object",
+        "description": "The session object of session.start. model is the exact GPT-Live model id. instructions steer the live voice model and are never merged with delegation.responses.instructions. store must be omitted or false.",
+        "properties": {
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "audio": {
+            "$ref": "#/components/schemas/LiveAudioConfig"
+          },
+          "input": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "$ref": "#/components/schemas/LiveInputItem"
+            }
+          },
+          "delegation": {
+            "$ref": "#/components/schemas/LiveDelegationConfig"
+          },
+          "store": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "additionalProperties": false
+      },
+      "LiveAudioConfig": {
+        "type": "object",
+        "description": "One PCM16 format for both directions, and the output voice.",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/LiveAudioFormat"
+          },
+          "output": {
+            "$ref": "#/components/schemas/LiveAudioOutput"
+          }
+        },
+        "additionalProperties": false
+      },
+      "LiveAudioFormat": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "audio/pcm"
+            ]
+          },
+          "rate": {
+            "type": "integer",
+            "enum": [
+              16000,
+              24000
+            ]
+          }
+        },
+        "required": [
+          "type",
+          "rate"
+        ],
+        "additionalProperties": false
+      },
+      "LiveAudioOutput": {
+        "type": "object",
+        "properties": {
+          "voice": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "The output voice; marin when omitted."
+          }
+        },
+        "additionalProperties": false
+      },
+      "LiveInputItem": {
+        "type": "object",
+        "description": "One seeded prior text message.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "message"
+            ]
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant",
+              "system",
+              "developer"
+            ]
+          },
+          "content": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/LiveContentPart"
+            }
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "LiveContentPart": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "input_text",
+              "output_text"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "type",
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "LiveDelegationConfig": {
+        "type": "object",
+        "description": "client hands delegations to the application; responses lets GPT-Live call the configured Responses backend, whose model is required.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "client",
+              "responses"
+            ]
+          },
+          "responses": {
+            "$ref": "#/components/schemas/LiveResponsesConfig"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "LiveResponsesConfig": {
+        "type": "object",
+        "description": "The Responses backend GPT-Live delegates to. tools are Responses function definitions or web_search entries kept verbatim; tool_choice, reasoning, and text are forwarded verbatim within their size bounds. Managed sessions additionally require max_output_tokens and a priced backend model.",
+        "properties": {
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "tools": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "function",
+                    "web_search"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "tool_choice": {},
+          "parallel_tool_calls": {
+            "type": "boolean"
+          },
+          "max_output_tokens": {
+            "type": "integer",
+            "minimum": 16,
+            "maximum": 131072
+          },
+          "service_tier": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "default",
+              "flex",
+              "priority"
+            ]
+          },
+          "reasoning": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "text": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "model"
         ],
         "additionalProperties": false
       }
