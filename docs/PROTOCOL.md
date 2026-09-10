@@ -140,7 +140,9 @@ Client to gateway:
 - `{"type":"audio.commit"}`;
 - `{"type":"text.append","data":{"text":"Hello"}}`;
 - `{"type":"text.commit"}`;
-- `{"type":"response.cancel"}`; and
+- `{"type":"response.cancel"}`;
+- `{"type":"provider.control","data":{"type":"<native type>","payload":{...}}}`
+  on realtime sessions only (see below); and
 - `{"type":"session.close"}`.
 
 Gateway to client:
@@ -153,6 +155,83 @@ Representative JSON event types are `session.ready`, `speech.started`,
 `usage.observed`, `warning`, `error`, and `session.closed`. Provider-specific
 metadata, when preserved for local consumers, lives under namespaced
 `extensions` and is never copied into telemetry.
+
+### Realtime sessions: OpenAI Realtime and GPT-Live
+
+`kind: "realtime"` opens a speech-to-speech session. The setup body carries
+`request.s2s` with `output_media` (required), `instructions` for the voice
+model, and — for GPT-Live only — `live` with seeded `history` and the
+`delegation` mode:
+
+```json
+{
+  "kind": "realtime",
+  "request": {
+    "provider": "openai",
+    "model": "gpt-live-1",
+    "voice": "marin",
+    "s2s": {
+      "instructions": "Be concise. Delegate lookups to the backend.",
+      "output_media": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
+      "live": {
+        "history": [{"role": "user", "text": "My order is A0042."}],
+        "delegation": {
+          "type": "responses",
+          "responses": {"model": "gpt-5.6-luna", "instructions": "Backend rules.", "tools": [{"type": "web_search"}], "max_output_tokens": 1024}
+        }
+      }
+    }
+  },
+  "media": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1}
+}
+```
+
+The model selects the protocol. `gpt-realtime-*` models resolve to the
+`openai.realtime.v1` adapter (OpenAI Realtime on `wss://api.openai.com/v1/realtime`,
+24 kHz mono PCM16, server VAD, `audio.commit` marks the turn). `gpt-live-1`
+resolves to `openai.live.v1` (GPT-Live on `wss://api.openai.com/v1/live/sessions`,
+matching mono PCM16 at 16 or 24 kHz in both directions, `marin` by default).
+`provider: "openai"` with `model: "auto"` stays on Realtime: GPT-Live is
+explicitly selectable only and never joins automatic selection. `delegation`
+omitted selects client delegation; `responses` delegation requires an explicit
+backend `model`. Voice instructions and backend instructions are never merged.
+
+Both adapters surface every non-audio vendor event verbatim as a
+`provider.event` whose `data` is `{"type": "<vendor type>", "payload": {...}}`,
+so native identifiers — `event_id`, `delegation_id`, `response_id`, `call_id`
+— and nested Responses events (`response.event`) survive untouched beside the
+canonical translations. GPT-Live transcript deltas keep their `start_ms` and
+`end_ms` session-timeline intervals in `transcript.delta` / `text.delta` data;
+they may overlap and are not turn boundaries, and the adapter never
+manufactures `speech.started`, `speech.ended`, or `response.done` for a Live
+session. Backend usage is observed once per backend response id.
+
+`provider.control` forwards one bounded native command
+(`protocol.ProviderControl`, at most 64 KiB, payload type tag equal to the
+envelope type). The allowlist is per protocol (`protocol.ProviderControlTypes`):
+GPT-Live accepts `session.update`, `session.instructions.append`,
+`session.thinking.append`, `session.commentary.append`,
+`session.input_audio.mute`, `session.input_audio.unmute`,
+`response.item.create`, and `response.create`; Realtime accepts
+`session.update`, `input_audio_buffer.commit`, `input_audio_buffer.clear`,
+`conversation.item.*`, `response.create`, `response.cancel`, and
+`output_audio_buffer.clear`. A control from the other protocol, a
+`session.update` that moves the model or audio format, and `audio.commit` /
+`response.cancel` on a Live session are refused: GPT-Live streams audio
+continuously and has no turn commit or response cancel.
+
+Closing a Live session sends `session.close` and drains up to 15 seconds for
+the vendor's `session.closed`, whose cumulative `usage.seconds` is the final
+voice usage (snapshots replace one another; they are never summed). Without
+that event the session ends with a `finalization_incomplete` error: a
+transport disconnect is never reported as confirmed completion.
+
+Managed GPT-Live sessions never carry a vendor credential — the Live primary
+WebSocket authenticates with a server-side project key and mints no ephemeral
+client secret — so the control plane routes them on a `speko_relay` plan whose
+endpoint is the Speko Router's `/v1/live`, which speaks the same protocol. BYOK
+sessions dial the vendor directly with the customer's key. Existing managed
+Realtime sessions keep their ephemeral client secrets and sideband accounting.
 
 The normative signed-plan structure is
 [`protocol/schema/session-plan.v0.schema.json`](../protocol/schema/session-plan.v0.schema.json).
@@ -187,6 +266,15 @@ revisions coexist by construction:
   session-scoped control token for the edge's follow-up ledger calls.
 - Relay-route adapters accept credential kind `relay_access` in addition
   to `bearer`; BYOK and provider-direct behavior is unchanged.
+- Speech-to-speech relay plans (`kind: "s2s"`) additionally assert the
+  native `protocol` the model speaks (`protocol.SpeechProtocol`:
+  `openai.realtime.v1`, `openai.live.v1`, `google.live.v1`,
+  `xai.realtime.v1`). The connector verifies it against its embedded catalog
+  before reading a credential and dispatches the matching adapter, so one
+  provider can serve two protocols. Live plans may carry the
+  `backend_input`, `backend_output`, and `backend_tools` budget groups
+  beside the renewable `s2s_duration` lease, reserving a delegated Responses
+  backend's tokens and billable tool calls separately from voice time.
 
 The relay's public customer-facing wire contract (HTTP, SSE, and WebSocket
 message shapes for `router.speko.dev`) is the separate

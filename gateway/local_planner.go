@@ -235,12 +235,12 @@ func (p *LocalPlanner) selectProvider(kind protocol.SessionKind, requested strin
 // hardcoded provider lists, which is how a published id and an openable route can
 // drift apart.
 func supportsLocalKind(provider string, kind protocol.SessionKind) bool {
-	_, ok := catalogEntryFor(kind, provider)
+	_, ok := catalogEntryFor(kind, provider, "")
 	return ok
 }
 
 func (p *LocalPlanner) localRoute(kind protocol.SessionKind, provider, model string) (protocol.PlanRoute, error) {
-	entry, ok := catalogEntryFor(kind, provider)
+	entry, ok := catalogEntryFor(kind, provider, model)
 	if !ok {
 		return protocol.PlanRoute{}, fmt.Errorf("gateway: unsupported local route provider=%q kind=%q", provider, kind)
 	}

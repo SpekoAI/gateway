@@ -23,6 +23,7 @@ type catalogResponse struct {
 		Provider  string `json:"provider"`
 		Kind      string `json:"kind"`
 		Adapter   string `json:"adapter"`
+		Protocol  string `json:"protocol"`
 		Transport string `json:"transport"`
 		Installed bool   `json:"installed"`
 	} `json:"models"`
@@ -264,6 +265,33 @@ func TestEveryVoiceDemandingTTSHasADefaultOrAStatedReason(t *testing.T) {
 			if entry.DefaultVoice != "" {
 				t.Fatalf("google TTS carries default voice %q despite language-specific naming", entry.DefaultVoice)
 			}
+		}
+	}
+}
+
+// The native speech protocol must reach /v1/models discovery: gpt-live-1
+// advertises openai.live.v1 and the Realtime models openai.realtime.v1, so a
+// client can tell the two OpenAI voice protocols apart from discovery alone.
+func TestModelsDiscoveryCarriesSpeechProtocol(t *testing.T) {
+	t.Parallel()
+	catalog := fetchCatalog(t, "/v1/models")
+	want := map[string]string{
+		"openai:gpt-live-1":       "openai.live.v1",
+		"openai:gpt-realtime-2.1": "openai.realtime.v1",
+		"openai:gpt-realtime-2":   "openai.realtime.v1",
+	}
+	seen := map[string]string{}
+	for _, model := range catalog.Models {
+		if _, ok := want[model.ID]; ok {
+			seen[model.ID] = model.Protocol
+		}
+		if model.Kind != "realtime" && model.Protocol != "" {
+			t.Fatalf("%s (%s) carries a protocol %q", model.ID, model.Kind, model.Protocol)
+		}
+	}
+	for id, protocol := range want {
+		if seen[id] != protocol {
+			t.Fatalf("%s protocol = %q, want %q", id, seen[id], protocol)
 		}
 	}
 }

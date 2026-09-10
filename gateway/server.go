@@ -420,6 +420,12 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 			writeError(writer, http.StatusBadRequest, "invalid_realtime_options", err.Error())
 			return
 		}
+		if body.Request.S2S.Live != nil {
+			if err := body.Request.S2S.Live.Validate(); err != nil {
+				writeError(writer, http.StatusBadRequest, "invalid_realtime_options", "live: "+err.Error())
+				return
+			}
+		}
 	} else if body.Kind == protocol.SessionKindRealtime {
 		writeError(writer, http.StatusBadRequest, "invalid_realtime_options", "s2s options are required for realtime sessions")
 		return
@@ -950,6 +956,19 @@ func readSessionInput(ctx context.Context, connection *websocket.Conn, session *
 			err = session.CommitText()
 		case "response.cancel":
 			err = session.Cancel()
+		case "provider.control":
+			// A bounded native provider command on a realtime session:
+			// {"type":"provider.control","data":{"type":"<native type>","payload":{...}}}.
+			// The runtime validates the envelope against the route's speech
+			// protocol; a refused control fails the command, not the session.
+			if len(command.Data) > protocol.MaxProviderControlBytes+1024 {
+				return errors.New("gateway: provider.control exceeds the control size bound")
+			}
+			var control protocol.ProviderControl
+			if json.Unmarshal(command.Data, &control) != nil {
+				return errors.New("gateway: provider.control requires data.type and data.payload")
+			}
+			err = session.SendProviderControl(control)
 		case "session.close":
 			session.Close()
 			return nil

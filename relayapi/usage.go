@@ -19,6 +19,9 @@ type Usage struct {
 	CachedInputTokens int64 `json:"cached_input_tokens,omitempty"`
 	OutputTokens      int64 `json:"output_tokens,omitempty"`
 	ReasoningTokens   int64 `json:"reasoning_tokens,omitempty"`
+	// ToolCalls counts billable hosted tool invocations (web search) a
+	// delegated GPT-Live backend performed. Zero for every other route.
+	ToolCalls int64 `json:"tool_calls,omitempty"`
 }
 
 // TotalInputTokens is the full prompt size: uncached plus cached input.
@@ -47,6 +50,7 @@ func (u Usage) Validate() error {
 		{"cached_input_tokens", u.CachedInputTokens},
 		{"output_tokens", u.OutputTokens},
 		{"reasoning_tokens", u.ReasoningTokens},
+		{"tool_calls", u.ToolCalls},
 	} {
 		if line.value < 0 {
 			return fmt.Errorf("%s: must not be negative", line.field)

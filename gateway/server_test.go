@@ -334,7 +334,6 @@ func TestGatewayReleaseSessionAttachmentAfterTimeoutReclaimsCapacityAndDrains(t 
 	}
 }
 
-
 func TestGatewayCoalescesConcurrentIdempotentCreates(t *testing.T) {
 	t.Parallel()
 	gatewayServer, plans := newServer(t)

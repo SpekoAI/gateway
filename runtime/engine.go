@@ -372,6 +372,24 @@ func (s *Session) Cancel() error {
 	return s.input.tryPush(inputMessage{kind: inputCancel})
 }
 
+// SendProviderControl queues one native provider command for a realtime
+// session. The envelope is validated against the route's speech protocol
+// before it is queued, so a Realtime-only control on a Live session — or an
+// unknown command on either — is refused synchronously with
+// ErrUnsupportedOperation rather than reaching the provider.
+func (s *Session) SendProviderControl(control protocol.ProviderControl) error {
+	if s.kind != protocol.SessionKindRealtime {
+		return ErrUnsupportedOperation
+	}
+	if _, ok := s.stream.(ProviderControlStream); !ok {
+		return ErrUnsupportedOperation
+	}
+	if err := control.Validate(protocol.SpeechProtocol(s.plan.Route.Adapter)); err != nil {
+		return fmt.Errorf("%w: %v", ErrUnsupportedOperation, err)
+	}
+	return s.input.tryPush(inputMessage{kind: inputProviderControl, control: control})
+}
+
 // Close begins a graceful close. Queued input is sent in order and the stream
 // then receives Close. It never waits for provider or telemetry I/O.
 func (s *Session) Close() {
@@ -476,6 +494,12 @@ func (s *Session) dispatch(message inputMessage) error {
 		return s.stream.CommitText(s.ctx)
 	case inputCancel:
 		return s.stream.Cancel(s.ctx)
+	case inputProviderControl:
+		controls, ok := s.stream.(ProviderControlStream)
+		if !ok {
+			return ErrUnsupportedOperation
+		}
+		return controls.SendProviderControl(s.ctx, message.control)
 	default:
 		return errors.New("runtime: unknown input message")
 	}

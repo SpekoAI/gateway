@@ -18,9 +18,7 @@
   ],
   "security": [
     {
-      "bearerAuth": [
-
-      ]
+      "bearerAuth": []
     }
   ],
   "paths": {
@@ -29,9 +27,7 @@
         "operationId": "getOpenAPISpec",
         "summary": "Download the canonical Router HTTP contract",
         "description": "Returns this exact OpenAPI 3.1 document without authentication. Agents and code generators can use it to discover every HTTP operation, request shape, response shape, error code, and lifecycle convention. Streaming speech operations are described by the AsyncAPI document in the public Gateway repository.",
-        "security": [
-
-        ],
+        "security": [],
         "responses": {
           "200": {
             "description": "The canonical OpenAPI 3.1 document.",
@@ -652,17 +648,23 @@
           "reasoning_tokens": {
             "type": "integer",
             "minimum": 0
+          },
+          "tool_calls": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Billable hosted tool invocations (web search) performed by a delegated GPT-Live backend; omitted for every other route."
           }
         },
         "additionalProperties": false
       },
       "Kind": {
         "type": "string",
-        "description": "The provider-neutral operation served by the Router. The set is deliberately smaller than the local gateway's session kinds: the Router serves stt, tts, and llm, and has no realtime kind.",
+        "description": "The provider-neutral operation served by the Router: stt, tts, llm, and s2s. Speech-to-speech models are served on protocol-specific WebSocket routes (Model.endpoint) that speak the vendor's native event protocol (Model.protocol), documented in asyncapi.yaml.",
         "enum": [
           "stt",
           "tts",
-          "llm"
+          "llm",
+          "s2s"
         ]
       },
       "ModelCapabilities": {
@@ -744,13 +746,36 @@
           },
           "audio_formats": {
             "type": "array",
-            "description": "Accepted input formats for STT or output formats for TTS; omitted for LLM models.",
+            "description": "Accepted input formats for STT and S2S models, or output formats for TTS models; omitted for LLM models.",
+            "items": {
+              "$ref": "#/components/schemas/AudioFormat"
+            }
+          },
+          "output_audio_formats": {
+            "type": "array",
+            "description": "The formats an S2S model speaks in; omitted for every other kind.",
             "items": {
               "$ref": "#/components/schemas/AudioFormat"
             }
           },
           "batch_audio_limits": {
             "$ref": "#/components/schemas/BatchAudioLimits"
+          },
+          "endpoint": {
+            "type": "string",
+            "enum": [
+              "/v1/realtime",
+              "/v1/live"
+            ],
+            "description": "The public Router WebSocket route an S2S model is served on; omitted for every other kind, whose routes are fixed per kind. Select the model exactly: /v1/realtime takes it as the `model` query parameter, /v1/live in the first session.start frame. A model sent to the other route is refused with capability_unsupported."
+          },
+          "protocol": {
+            "type": "string",
+            "enum": [
+              "openai.realtime.v1",
+              "openai.live.v1"
+            ],
+            "description": "The native event protocol the S2S route speaks; omitted for every other kind."
           },
           "benchmark": {
             "$ref": "#/components/schemas/ModelBenchmark"

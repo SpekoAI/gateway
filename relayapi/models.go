@@ -6,15 +6,17 @@ import (
 	"strings"
 )
 
-// Kind selects the provider-neutral operation served by the relay. The set
-// is deliberately smaller than the local gateway's session kinds: the relay
-// serves stt, tts, and llm, and has no realtime kind.
+// Kind selects the provider-neutral operation served by the relay: stt, tts,
+// llm, and s2s. Speech-to-speech rows are served on protocol-specific public
+// routes (Model.Endpoint) speaking the vendor's native event protocol
+// (Model.Protocol) rather than a Router-neutral envelope.
 type Kind string
 
 const (
 	KindSTT Kind = "stt"
 	KindTTS Kind = "tts"
 	KindLLM Kind = "llm"
+	KindS2S Kind = "s2s"
 )
 
 // ModelCapabilities advertises what a model supports. Capability gating
@@ -170,14 +172,26 @@ func (c ModelCapabilities) SupportsSTTOptions(options *STTOptions) (string, bool
 // Speko Router regions (AWS region ids) where the model is routable right
 // now — relay locations, never provider-processing residency.
 type Model struct {
-	ID               string            `json:"id"`
-	Provider         string            `json:"provider"`
-	Kind             Kind              `json:"kind"`
-	Capabilities     ModelCapabilities `json:"capabilities"`
-	Regions          []string          `json:"regions"`
-	AudioFormats     []AudioFormat     `json:"audio_formats,omitempty"`
-	BatchAudioLimits *BatchAudioLimits `json:"batch_audio_limits,omitempty"`
-	Benchmark        *ModelBenchmark   `json:"benchmark,omitempty"`
+	ID           string            `json:"id"`
+	Provider     string            `json:"provider"`
+	Kind         Kind              `json:"kind"`
+	Capabilities ModelCapabilities `json:"capabilities"`
+	Regions      []string          `json:"regions"`
+	// AudioFormats lists accepted input formats for STT and S2S models and
+	// output formats for TTS models.
+	AudioFormats []AudioFormat `json:"audio_formats,omitempty"`
+	// OutputAudioFormats lists the formats an S2S model speaks in; omitted
+	// for every other kind.
+	OutputAudioFormats []AudioFormat     `json:"output_audio_formats,omitempty"`
+	BatchAudioLimits   *BatchAudioLimits `json:"batch_audio_limits,omitempty"`
+	// Endpoint is the public Router route an S2S model is served on
+	// (/v1/realtime or /v1/live); omitted for every other kind, whose routes
+	// are fixed per kind.
+	Endpoint string `json:"endpoint,omitempty"`
+	// Protocol names the native event protocol an S2S route speaks
+	// (openai.realtime.v1, openai.live.v1); omitted for every other kind.
+	Protocol  string          `json:"protocol,omitempty"`
+	Benchmark *ModelBenchmark `json:"benchmark,omitempty"`
 }
 
 // Validate checks that a catalog entry is concrete and routable somewhere.
@@ -199,12 +213,38 @@ func (m Model) Validate() error {
 	if m.Kind == KindLLM && len(m.AudioFormats) != 0 {
 		return fmt.Errorf("audio_formats: must be omitted for llm models")
 	}
-	if (m.Kind == KindSTT || m.Kind == KindTTS) && len(m.AudioFormats) == 0 {
+	if (m.Kind == KindSTT || m.Kind == KindTTS || m.Kind == KindS2S) && len(m.AudioFormats) == 0 {
 		return fmt.Errorf("audio_formats: at least one format is required for speech models")
 	}
 	for i, format := range m.AudioFormats {
 		if err := format.Validate(); err != nil {
 			return fmt.Errorf("audio_formats[%d]: %w", i, err)
+		}
+	}
+	if m.Kind == KindS2S {
+		if len(m.OutputAudioFormats) == 0 {
+			return fmt.Errorf("output_audio_formats: at least one format is required for s2s models")
+		}
+		if m.Endpoint != RealtimeRoutePath && m.Endpoint != LiveRoutePath {
+			return fmt.Errorf("endpoint: s2s models are served on %s or %s, got %q", RealtimeRoutePath, LiveRoutePath, m.Endpoint)
+		}
+		if strings.TrimSpace(m.Protocol) == "" || strings.ContainsAny(m.Protocol, " \t\r\n") {
+			return fmt.Errorf("protocol: required for s2s models")
+		}
+		if m.BatchAudioLimits != nil {
+			return fmt.Errorf("batch_audio_limits: must be omitted for s2s models")
+		}
+	} else {
+		if len(m.OutputAudioFormats) != 0 {
+			return fmt.Errorf("output_audio_formats: valid only for s2s models")
+		}
+		if m.Endpoint != "" || m.Protocol != "" {
+			return fmt.Errorf("endpoint and protocol: valid only for s2s models")
+		}
+	}
+	for i, format := range m.OutputAudioFormats {
+		if err := format.Validate(); err != nil {
+			return fmt.Errorf("output_audio_formats[%d]: %w", i, err)
 		}
 	}
 	return nil
@@ -234,5 +274,5 @@ func (m ModelsResponse) Validate() error {
 }
 
 func validKind(v Kind) bool {
-	return v == KindSTT || v == KindTTS || v == KindLLM
+	return v == KindSTT || v == KindTTS || v == KindLLM || v == KindS2S
 }
