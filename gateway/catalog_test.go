@@ -211,6 +211,20 @@ func TestCatalogCarriesADefaultVoiceWhereTheVendorDemandsOne(t *testing.T) {
 	}
 }
 
+func TestMayaCatalogUsesCurrentCalyxDefaults(t *testing.T) {
+	t.Parallel()
+	for _, entry := range gateway.Catalog() {
+		if entry.Provider != "maya" || entry.Kind != protocol.SessionKindTTS {
+			continue
+		}
+		if entry.DefaultModel != "Maya Calyx" || entry.DefaultVoice != "Aarav" || len(entry.Models) != 0 {
+			t.Fatalf("Maya catalog entry = %+v, want the single Calyx model with Aarav", entry)
+		}
+		return
+	}
+	t.Fatal("Maya TTS catalog entry is missing")
+}
+
 // Greptile caught both of these on review, and both were real: a published route
 // that cannot possibly dial is worse than an absent one, because an integrator
 // wires the id and gets a vendor error instead of ours.

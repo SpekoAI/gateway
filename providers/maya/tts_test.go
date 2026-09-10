@@ -193,6 +193,34 @@ func TestPublishedVoiceRoster(t *testing.T) {
 			t.Errorf("retired voice %q is still accepted", retired)
 		}
 	}
+
+	starts := make(chan map[string]any, 1)
+	server := mayaServer(t, func(conn *websocket.Conn, _ *http.Request) {
+		starts <- readFrame(t, conn)
+		writeFrame(t, conn, map[string]any{"type": "metadata", "sample_rate": 24000, "channels": 1, "encoding": "pcm_s16le", "session_id": "maya-voice-roster"})
+		waitForClose(conn)
+	})
+	defer server.Close()
+	adapter := testAdapter(t, server)
+	request := mayaRequest(wsURL(server), DefaultModel)
+	request.Options.Voice = "Vance"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open current non-default voice: %v", err)
+	}
+	start := <-starts
+	if start["model"] != DefaultModel || start["voice"] != "Vance" {
+		t.Fatalf("start = %#v, want Maya Calyx with Vance", start)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	retired := mayaRequest(wsURL(server), DefaultModel)
+	retired.Options.Voice = "Ananya"
+	if _, err := adapter.Open(context.Background(), retired); err == nil || !strings.Contains(err.Error(), "does not support voice") {
+		t.Fatalf("retired voice error = %v", err)
+	}
 }
 
 func TestCloseBoundsUndrainedEventBackpressure(t *testing.T) {

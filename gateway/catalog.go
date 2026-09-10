@@ -136,7 +136,7 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "inworld", Kind: protocol.SessionKindTTS, Adapter: "inworld.tts.v2", DefaultModel: "inworld-tts-2", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.inworld.ai/tts/v1/voice:streamBidirectional"},
 	{Provider: "palabra", Kind: protocol.SessionKindSTT, Adapter: "palabra.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://stream.palabra.ai/asr/v1/speech-to-text/stream"},
 	{Provider: "palabra", Kind: protocol.SessionKindTTS, Adapter: "palabra.tts.v1", DefaultModel: "auto", DefaultVoice: "default_low", Transport: protocol.TransportWebSocket, Endpoint: "wss://stream.palabra.ai/tts-api/v1/text-to-speech/stream"},
-	{Provider: "maya", Kind: protocol.SessionKindTTS, Adapter: "maya.tts.v1", DefaultModel: "Maya 2 Native", Models: []string{"Maya 2 Native", "Maya 2 Native Emotional"}, DefaultVoice: "Ananya", Transport: protocol.TransportWebSocket, Endpoint: "wss://tts.mayaresearch.ai/v1/tts/stream"},
+	{Provider: "maya", Kind: protocol.SessionKindTTS, Adapter: "maya.tts.v1", DefaultModel: "Maya Calyx", DefaultVoice: "Aarav", Transport: protocol.TransportWebSocket, Endpoint: "wss://tts.mayaresearch.ai/v1/tts/stream"},
 	// Meta Muse Voice Transcribe: realtime ASR over a JSON-handshake socket
 	// with binary PCM frames, bearer API key carried in the handshake. The
 	// prerecorded sibling (POST /v1/asr/transcribe) is a BatchTranscriber,
