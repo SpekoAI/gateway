@@ -60,7 +60,7 @@ func TestRealtimeTurnStreamsAudioAndClosesWithContextID(t *testing.T) {
 	}
 
 	start := <-frames
-	if start["type"] != "start" || start["v2"] != true || start["voice"] != "Ananya" || start["language"] != "hi" || start["model"] != DefaultModel {
+	if start["type"] != "start" || start["v2"] != true || start["voice"] != "Aarav" || start["language"] != "hi" || start["model"] != DefaultModel {
 		t.Fatalf("start = %#v", start)
 	}
 	first := <-frames
@@ -155,21 +155,43 @@ func TestStreamingModelsAndFixedOutputAreValidatedBeforeDial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, model := range []string{"Maya 2 Native", "Maya 2 Native Emotional"} {
-		request := mayaRequest("wss://tts.mayaresearch.ai/v1/tts/stream", model)
-		request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
-		if _, err := adapter.Open(context.Background(), request); err == nil || !strings.Contains(err.Error(), "short-lived") {
-			t.Errorf("model %q did not pass model validation first: %v", model, err)
-		}
+	request := mayaRequest("wss://tts.mayaresearch.ai/v1/tts/stream", DefaultModel)
+	request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+	if _, err := adapter.Open(context.Background(), request); err == nil || !strings.Contains(err.Error(), "short-lived") {
+		t.Errorf("model %q did not pass model validation first: %v", DefaultModel, err)
 	}
-	request := mayaRequest("wss://tts.mayaresearch.ai/v1/tts/stream", "Maya 2 Global")
-	if _, err := adapter.Open(context.Background(), request); err == nil || !strings.Contains(err.Error(), "does not support model") {
-		t.Fatalf("HTTP-only model error = %v", err)
+	for _, model := range []string{"Maya 2 Native", "Maya 2 Native Emotional", "Maya 2 Global"} {
+		request := mayaRequest("wss://tts.mayaresearch.ai/v1/tts/stream", model)
+		if _, err := adapter.Open(context.Background(), request); err == nil || !strings.Contains(err.Error(), "does not support model") {
+			t.Errorf("retired model %q error = %v", model, err)
+		}
 	}
 	request = mayaRequest("wss://tts.mayaresearch.ai/v1/tts/stream", DefaultModel)
 	request.Media.SampleRateHz = 16_000
 	if _, err := adapter.Open(context.Background(), request); err == nil || !strings.Contains(err.Error(), "24000") {
 		t.Fatalf("sample rate error = %v", err)
+	}
+}
+
+func TestPublishedVoiceRoster(t *testing.T) {
+	want := []string{
+		"Aarav", "Kabir", "Rohan", "Amit", "Kavita", "Sagar", "Arushi", "Neeraj", "SagarM",
+		"Diya", "Neha", "Samar", "Gargi", "Nila", "Sana", "Rahul", "Rehan", "Seema", "Riya",
+		"Shailika", "Shreeraj", "Tarini", "Tripti", "Vikas", "Vikram", "Zara", "Riley",
+		"Christine", "Jackson", "Christopher", "Vance",
+	}
+	if len(voices) != len(want) {
+		t.Fatalf("voice roster has %d entries, want %d", len(voices), len(want))
+	}
+	for _, voice := range want {
+		if _, ok := voices[voice]; !ok {
+			t.Errorf("published voice %q is missing", voice)
+		}
+	}
+	for _, retired := range []string{"Ananya", "Arjun", "Neha P"} {
+		if _, ok := voices[retired]; ok {
+			t.Errorf("retired voice %q is still accepted", retired)
+		}
 	}
 }
 

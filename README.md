@@ -321,7 +321,7 @@ restarting the Gateway.
 | TTS | Smallest | `smallest.tts.v1` | `lightning_v3.1` |
 | STT | Palabra | `palabra.stt.v1` | `default` |
 | TTS | Palabra | `palabra.tts.v1` | `auto` |
-| TTS | Maya Research | `maya.tts.v1` | `Maya 2 Native` |
+| TTS | Maya Research | `maya.tts.v1` | `Maya Calyx` |
 | TTS | Speechify | `speechify.tts.v1` | `simba-3.0` |
 | STT | Speechmatics | `speechmatics.stt.v1` | `standard` |
 | STT | Meta | `meta.stt.v1` | `muse-voice-transcribe-1.0` |

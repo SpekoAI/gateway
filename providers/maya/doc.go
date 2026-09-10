@@ -1,5 +1,5 @@
 // Package maya implements Maya Research's realtime WebSocket v2 text-to-speech
-// protocol for the Maya 2 Native model family.
+// protocol for Maya Calyx.
 //
 // Maya currently authenticates with a permanent API key. It does not publish
 // a short-lived or session-scoped credential exchange, and its own browser
