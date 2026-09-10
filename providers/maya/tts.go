@@ -22,8 +22,8 @@ import (
 
 const (
 	AdapterID               = "maya.tts.v1"
-	DefaultModel            = "Maya 2 Native"
-	DefaultVoice            = "Ananya"
+	DefaultModel            = "Maya Calyx"
+	DefaultVoice            = "Aarav"
 	officialHost            = "tts.mayaresearch.ai"
 	streamPath              = "/v1/tts/stream"
 	extensionID             = "mayaresearch.ai/tts/v2"
@@ -34,9 +34,21 @@ const (
 
 var (
 	streamingModels = map[string]struct{}{
-		"Maya 2 Native": {}, "Maya 2 Native Emotional": {},
+		"Maya Calyx": {},
 	}
-	voices    = map[string]struct{}{"Ananya": {}, "Arjun": {}}
+	voices = map[string]struct{}{
+		"Aarav": {}, "Kabir": {}, "Rohan": {},
+		"Amit": {}, "Kavita": {}, "Sagar": {},
+		"Arushi": {}, "Neeraj": {}, "SagarM": {},
+		"Diya": {}, "Neha": {}, "Samar": {},
+		"Gargi": {}, "Nila": {}, "Sana": {},
+		"Rahul": {}, "Rehan": {}, "Seema": {},
+		"Riya": {}, "Shailika": {}, "Shreeraj": {},
+		"Tarini": {}, "Tripti": {}, "Vikas": {},
+		"Vikram": {}, "Zara": {},
+		"Riley": {}, "Christine": {}, "Jackson": {},
+		"Christopher": {}, "Vance": {},
+	}
 	languages = map[string]struct{}{
 		"hi": {}, "te": {}, "bn": {}, "gu": {}, "kn": {}, "ml": {},
 		"mr": {}, "or": {}, "pa": {}, "ta": {}, "en": {},
