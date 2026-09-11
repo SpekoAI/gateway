@@ -153,7 +153,7 @@ async def test_stream_preserves_safe_gateway_error_classification() -> None:
         _ = [event async for event in stream]
     except APIConnectionError as error:
         assert (
-            str(error) == "Speko Gateway STT failed (runtime/session_lifetime_exceeded)"
+            error.message == "Speko Gateway STT failed (runtime/session_lifetime_exceeded)"
         )
         assert error.retryable is True
     else:
@@ -260,7 +260,7 @@ async def test_tts_stream_preserves_safe_gateway_error_classification() -> None:
         _ = [event async for event in stream]
     except APIConnectionError as error:
         assert (
-            str(error)
+            error.message
             == "Speko Gateway TTS failed (runtime/usage_reservation_exhausted)"
         )
         assert error.retryable is False
@@ -435,7 +435,7 @@ async def test_llm_stream_preserves_relay_error_classification() -> None:
     try:
         _ = [chunk async for chunk in stream]
     except APIConnectionError as error:
-        assert str(error) == "Speko Router LLM failed (insufficient_credit)"
+        assert error.message == "Speko Router LLM failed (insufficient_credit)"
         assert error.retryable is False
     else:
         raise AssertionError("expected the Router failure to reach LiveKit")
