@@ -284,7 +284,13 @@ async def _decode_json(response: aiohttp.ClientResponse) -> dict[str, Any]:
 def _error_message(status: int, body: dict[str, Any]) -> str:
     error = body.get("error")
     if isinstance(error, dict) and isinstance(error.get("code"), str):
-        return f"Gateway rejected request ({error['code']}, HTTP {status})"
+        detail = f"{error['code']}, HTTP {status}"
+        provider = error.get("provider")
+        if isinstance(provider, dict) and isinstance(provider.get("code"), str):
+            detail += f", provider {provider['code']}"
+            if type(provider.get("status")) is int and provider["status"]:
+                detail += f" HTTP {provider['status']}"
+        return f"Gateway rejected request ({detail})"
     return f"Gateway rejected request (HTTP {status})"
 
 

@@ -32,6 +32,13 @@ func TestAdapterReusesOneSocketForMultipleContextsAndMapsAudio(t *testing.T) {
 			t.Errorf("first generation = %+v", first)
 			return
 		}
+		for _, fragment := range []string{" ", "\n", "\t", "world"} {
+			next, err := readGeneration(ctx, conn)
+			if err != nil || next.Transcript != fragment || !next.Continue || next.ContextID != first.ContextID {
+				t.Errorf("streamed fragment = %+v, err=%v; want %q on same context", next, err, fragment)
+				return
+			}
+		}
 		second, err := readGeneration(ctx, conn)
 		if err != nil {
 			t.Errorf("final generation: %v", err)
@@ -85,6 +92,11 @@ func TestAdapterReusesOneSocketForMultipleContextsAndMapsAudio(t *testing.T) {
 	}
 	if err := providerStream.AppendText(context.Background(), "Hello, "); err != nil {
 		t.Fatalf("append text: %v", err)
+	}
+	for _, fragment := range []string{" ", "\n", "\t", "world"} {
+		if err := providerStream.AppendText(context.Background(), fragment); err != nil {
+			t.Fatalf("append streamed fragment %q: %v", fragment, err)
+		}
 	}
 	if err := providerStream.CommitText(context.Background()); err != nil {
 		t.Fatalf("commit text: %v", err)

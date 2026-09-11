@@ -251,3 +251,31 @@ async def test_gateway_admission_error_preserves_code_and_retryability(status, c
             assert caught.value.retryable is retryable
         finally:
             await client.aclose()
+
+
+@pytest.mark.parametrize("retryable", [False, True])
+async def test_gateway_provider_open_error_details(retryable):
+    from speko_gateway.client import GatewayError
+
+    async def reject(request):
+        return web.json_response({"error": {
+            "code": "session_open_failed", "source": "provider",
+            "retryable": retryable,
+            "provider": {"code": "provider_unavailable", "status": 503},
+            "message": "private upstream message",
+        }}, status=502)
+
+    app = web.Application()
+    app.router.add_post("/v1/sessions", reject)
+    async with server(app, unix=True) as socket:
+        client = GatewayClient(socket_path=socket, local_auth_token="fixture")
+        try:
+            with pytest.raises(GatewayError) as caught:
+                await client.open(SessionConfig(kind="tts", execution={}, request={}))
+            assert caught.value.code == "session_open_failed"
+            assert caught.value.source == "provider"
+            assert caught.value.retryable is retryable
+            assert "provider provider_unavailable HTTP 503" in str(caught.value)
+            assert "private upstream message" not in str(caught.value)
+        finally:
+            await client.aclose()
