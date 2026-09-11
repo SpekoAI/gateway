@@ -1080,3 +1080,53 @@ func expectEvent(t *testing.T, connection *websocket.Conn, wanted protocol.Event
 		t.Fatalf("event type = %q, want %q", event.Type, wanted)
 	}
 }
+
+func TestGatewayProviderOpenErrorPreservesClassificationOnly(t *testing.T) {
+	for _, retryable := range []bool{false, true} {
+		t.Run(fmt.Sprint(retryable), func(t *testing.T) {
+			adapter := &flakyOpenAdapter{
+				inner: mock.NewSTTAdapter("mock.stt.v1"), failures: 1,
+				openErr: fmt.Errorf("wrapped: %w", &runtimepkg.ProviderError{
+					Code: "provider_unavailable", ProviderStatus: 503, Retryable: retryable,
+					Message: "private message", Cause: errors.New("secret-token"),
+					Extensions: map[string]json.RawMessage{"private": json.RawMessage(`"private-payload"`)},
+				}),
+			}
+			gatewayServer, _ := newServerWithAdapter(t, adapter, 0, 0, 0, 0)
+			httpServer := httptest.NewServer(gatewayServer.Handler())
+			defer httpServer.Close()
+			response := postJSON(t, httpServer.URL+"/v1/sessions", gatewayRequestBody(), "local-token", "classified-error")
+			defer response.Body.Close()
+			payload, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != 502 {
+				t.Fatalf("status = %d", response.StatusCode)
+			}
+			for _, secret := range []string{"private message", "secret-token", "private-payload"} {
+				if bytes.Contains(payload, []byte(secret)) {
+					t.Fatal("provider internals leaked")
+				}
+			}
+			var body struct {
+				Error struct {
+					Code      string `json:"code"`
+					Source    string `json:"source"`
+					Retryable *bool  `json:"retryable"`
+					Provider  struct {
+						Code   string `json:"code"`
+						Status int    `json:"status"`
+					} `json:"provider"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(payload, &body); err != nil {
+				t.Fatal(err)
+			}
+			e := body.Error
+			if e.Code != "session_open_failed" || e.Source != "provider" || e.Retryable == nil || *e.Retryable != retryable || e.Provider.Code != "provider_unavailable" || e.Provider.Status != 503 {
+				t.Fatalf("classification = %s", payload)
+			}
+		})
+	}
+}

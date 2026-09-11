@@ -157,11 +157,20 @@ type idempotencyRecord struct {
 }
 
 type createOutcome struct {
-	response  createResponse
-	status    int
-	code      string
-	message   string
-	requestID string
+	response      createResponse
+	status        int
+	code          string
+	message       string
+	requestID     string
+	providerError *providerOpenError
+}
+
+// Only classified fields cross the local API boundary; causes and provider
+// payloads may contain credentials or user content.
+type providerOpenError struct {
+	Code      string `json:"code"`
+	Status    int    `json:"status,omitempty"`
+	Retryable bool   `json:"retryable"`
 }
 
 // CreateSessionRequest contains caller-selectable, provider-neutral data.
@@ -485,7 +494,11 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 	}
 	session, plan, requestID, err := s.openWithFallback(setupCtx, body, plan, requestID, idempotencyKey)
 	if err != nil {
-		outcome := createOutcome{status: http.StatusBadGateway, code: "session_open_failed", message: "provider session could not be opened"}
+		outcome := createOutcome{status: http.StatusBadGateway, code: "session_open_failed", message: "provider session could not be opened", requestID: requestID}
+		var providerError *runtimepkg.ProviderError
+		if errors.As(err, &providerError) {
+			outcome.providerError = &providerOpenError{Code: providerError.Code, Status: providerError.ProviderStatus, Retryable: providerError.Retryable}
+		}
 		// A refused STT ask is the caller's to fix, not a provider outage:
 		// answer 422 with the option named instead of a generic bad-gateway.
 		var supportError *SttSupportError
@@ -885,7 +898,14 @@ func writeCreateOutcome(writer http.ResponseWriter, outcome createOutcome, repla
 		if outcome.requestID != "" {
 			writer.Header().Set("X-Control-Plane-Request-ID", outcome.requestID)
 		}
-		writeError(writer, outcome.status, outcome.code, outcome.message)
+		if outcome.providerError != nil {
+			writeJSON(writer, outcome.status, map[string]any{"error": map[string]any{
+				"code": outcome.code, "message": outcome.message, "source": "provider",
+				"retryable": outcome.providerError.Retryable, "provider": outcome.providerError,
+			}})
+		} else {
+			writeError(writer, outcome.status, outcome.code, outcome.message)
+		}
 		return
 	}
 	status := outcome.status
