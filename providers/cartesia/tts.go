@@ -268,7 +268,9 @@ func (s *stream) CommitAudio(context.Context) error { return runtimepkg.ErrUnsup
 // AppendText starts or continues the current Cartesia context. It deliberately
 // sets continue=true until CommitText supplies the explicit utterance boundary.
 func (s *stream) AppendText(ctx context.Context, text string) error {
-	if strings.TrimSpace(text) == "" {
+	// A streaming LLM may emit word separators as their own chunks. Preserve
+	// them exactly: trimming or rejecting them breaks valid streamed speech.
+	if text == "" {
 		return errors.New("cartesia transcript is empty")
 	}
 	contextID, err := s.startOrCurrentContext()
