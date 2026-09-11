@@ -233,3 +233,21 @@ async def test_marker_is_not_a_global_aiohttp_default() -> None:
     assert len(seen) == 1
     assert seen[0].getall("User-Agent") == ["caller-fixture"]
     assert "Authorization" not in seen[0]
+
+
+@pytest.mark.parametrize('status,code,retryable', [(403,'provider_not_entitled',False),(401,'authentication_failed',False),(429,'rate_limited',True),(503,'service_unavailable',True)])
+async def test_gateway_admission_error_preserves_code_and_retryability(status, code, retryable):
+    from speko_gateway.client import GatewayError
+    async def reject(request):
+        return web.json_response({'error': {'code': code}}, status=status)
+    app = web.Application()
+    app.router.add_post('/v1/sessions', reject)
+    async with server(app, unix=True) as socket:
+        client = GatewayClient(socket_path=socket, local_auth_token='fixture')
+        try:
+            with pytest.raises(GatewayError) as caught:
+                await client.open(SessionConfig(kind='stt',execution={},request={}))
+            assert caught.value.code == code
+            assert caught.value.retryable is retryable
+        finally:
+            await client.aclose()

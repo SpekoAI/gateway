@@ -164,7 +164,18 @@ class GatewayClient:
         ) as response:
             body = await _decode_json(response)
         if response.status not in (200, 201):
-            raise GatewayError(_error_message(response.status, body))
+            error = body.get("error")
+            error = error if isinstance(error, dict) else {}
+            # Admission denials cannot recover by replaying the same request.
+            retryable = response.status in (408, 429) or response.status >= 500
+            if retryable and isinstance(error.get("retryable"), bool):
+                retryable = error["retryable"]
+            raise GatewayError(
+                _error_message(response.status, body),
+                code=error.get("code", "") if isinstance(error.get("code"), str) else "",
+                source=error.get("source", "") if isinstance(error.get("source"), str) else "",
+                retryable=retryable,
+            )
         stream_url = body.get("stream_url")
         if not isinstance(stream_url, str) or not stream_url.startswith(
             "/v1/sessions/"
