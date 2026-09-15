@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.frames.frames import (
+    ErrorFrame,
     InterimTranscriptionFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -14,7 +15,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.settings import LLMSettings
+from pipecat.services.settings import LLMSettings, STTSettings, TTSSettings
 from pipecat.services.stt_service import STTService as PipecatSTTService
 
 from speko_gateway.client import (
@@ -387,6 +388,42 @@ async def test_stt_streams_audio_and_commits_before_vad_stop() -> None:
     await service._finish(graceful=False)
 
 
+def test_voice_services_initialize_complete_pipecat_settings() -> None:
+    session = FakeGatewaySession()
+    client = FakeGatewayClient(session)
+
+    stt = SpekoSTTService(  # type: ignore[arg-type]
+        client, model="nova-3", language="en"
+    )
+    tts = SpekoTTSService(  # type: ignore[arg-type]
+        client, model="sonic-3", voice="amy", language="en"
+    )
+
+    assert stt._settings == STTSettings(model="nova-3", language="en")
+    assert tts._settings == TTSSettings(model="sonic-3", voice="amy", language="en")
+
+
+async def test_stt_start_surfaces_gateway_admission_failure_as_fatal() -> None:
+    client = FakeGatewayClient(FakeGatewaySession())
+    service = SpekoSTTService(client)  # type: ignore[arg-type]
+    failure = GatewayError(
+        "Gateway rejected request (no_eligible_route, HTTP 422)",
+        code="no_eligible_route",
+        retryable=False,
+    )
+    service._connect = AsyncMock(side_effect=failure)  # type: ignore[method-assign]
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+
+    with patch.object(PipecatSTTService, "start", AsyncMock()):
+        await service.start(object())  # type: ignore[arg-type]
+
+    service.push_error.assert_awaited_once_with(
+        "Speko Gateway STT failed (no_eligible_route)",
+        exception=failure,
+        fatal=True,
+    )
+
+
 async def test_tts_streams_sentences_in_one_turn_and_closes_context() -> None:
     session = FakeGatewaySession(
         [
@@ -429,6 +466,23 @@ async def test_tts_streams_sentences_in_one_turn_and_closes_context() -> None:
     assert session.finishes == 1
     assert session.closed is True
     assert client.ready_timeouts == [15.0]
+
+
+async def test_tts_admission_failure_is_fatal() -> None:
+    client = FakeGatewayClient(FakeGatewaySession())
+    service = SpekoTTSService(client)  # type: ignore[arg-type]
+    failure = GatewayError(
+        "Gateway rejected request (no_eligible_route, HTTP 422)",
+        code="no_eligible_route",
+        retryable=False,
+    )
+    service._context = AsyncMock(side_effect=failure)  # type: ignore[method-assign]
+
+    frames = await _run_once(service.run_tts("Hello", "turn-failed"))
+
+    error = next(frame for frame in frames if isinstance(frame, ErrorFrame))
+    assert error.fatal is True
+    assert error.error == "Speko Gateway TTS failed (no_eligible_route)"
 
 
 async def test_tts_interruption_cancels_only_the_active_turn() -> None:

@@ -27,7 +27,7 @@ from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext, is_given
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
-from pipecat.services.settings import LLMSettings
+from pipecat.services.settings import LLMSettings, STTSettings, TTSSettings
 from pipecat.services.stt_service import STTService as PipecatSTTService
 from pipecat.services.tts_service import TTSService as PipecatTTSService
 from pipecat.transcriptions.language import Language
@@ -68,7 +68,11 @@ class SpekoSTTService(PipecatSTTService):
         session_id: str = "",
         **kwargs: Any,
     ) -> None:
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        super().__init__(
+            sample_rate=sample_rate,
+            settings=STTSettings(model=model, language=language),
+            **kwargs,
+        )
         if num_channels < 1:
             raise ValueError("num_channels must be positive")
         self._client = client or GatewayClient.from_env()
@@ -92,7 +96,12 @@ class SpekoSTTService(PipecatSTTService):
 
     async def start(self, frame: StartFrame) -> None:
         await super().start(frame)
-        await self._connect()
+        try:
+            await self._connect()
+        except (GatewayError, OSError) as error:
+            await self.push_error(
+                _gateway_failure("STT", error), exception=error, fatal=True
+            )
 
     async def stop(self, frame: EndFrame) -> None:
         await self._finish(graceful=True)
@@ -260,7 +269,11 @@ class SpekoTTSService(PipecatTTSService):
         kwargs.setdefault("push_start_frame", True)
         kwargs.setdefault("push_stop_frames", False)
         kwargs.setdefault("stop_frame_timeout_s", 15.0)
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        super().__init__(
+            sample_rate=sample_rate,
+            settings=TTSSettings(model=model, voice=voice, language=language),
+            **kwargs,
+        )
         if num_channels < 1:
             raise ValueError("num_channels must be positive")
         self._client = client or GatewayClient.from_env()
@@ -318,6 +331,7 @@ class SpekoTTSService(PipecatTTSService):
                 await self._close_state(context_id, state, interrupted=True)
             yield ErrorFrame(
                 error=_gateway_failure("TTS", error),
+                fatal=True,
                 processor=self,
                 exception=error,
             )
