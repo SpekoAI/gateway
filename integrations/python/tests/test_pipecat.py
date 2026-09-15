@@ -403,6 +403,25 @@ def test_voice_services_initialize_complete_pipecat_settings() -> None:
     assert tts._settings == TTSSettings(model="sonic-3", voice="amy", language="en")
 
 
+def test_voice_services_honor_caller_supplied_pipecat_settings() -> None:
+    session = FakeGatewaySession()
+    client = FakeGatewayClient(session)
+
+    stt = SpekoSTTService(  # type: ignore[arg-type]
+        client, settings=STTSettings(model="whisper-1", language="fr")
+    )
+    tts = SpekoTTSService(  # type: ignore[arg-type]
+        client,
+        settings=TTSSettings(model="sonic-3", voice="amy", language="fr"),
+    )
+
+    assert stt._model == "whisper-1"
+    assert stt._language == "fr"
+    assert tts._model == "sonic-3"
+    assert tts._voice == "amy"
+    assert tts._language == "fr"
+
+
 async def test_stt_start_surfaces_gateway_admission_failure_as_fatal() -> None:
     client = FakeGatewayClient(FakeGatewaySession())
     service = SpekoSTTService(client)  # type: ignore[arg-type]

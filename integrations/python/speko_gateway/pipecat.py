@@ -68,9 +68,21 @@ class SpekoSTTService(PipecatSTTService):
         session_id: str = "",
         **kwargs: Any,
     ) -> None:
+        native_settings = kwargs.pop("settings", None)
+        if native_settings is not None:
+            if not isinstance(native_settings, STTSettings):
+                raise TypeError("settings must be an STTSettings instance")
+            if is_given(native_settings.model) and native_settings.model is not None:
+                model = native_settings.model
+            if is_given(native_settings.language) and native_settings.language is not None:
+                language = str(native_settings.language)
         super().__init__(
             sample_rate=sample_rate,
-            settings=STTSettings(model=model, language=language),
+            settings=STTSettings(
+                model=model,
+                language=language,
+                extra=dict(native_settings.extra) if native_settings else {},
+            ),
             **kwargs,
         )
         if num_channels < 1:
@@ -266,12 +278,27 @@ class SpekoTTSService(PipecatTTSService):
         session_id: str = "",
         **kwargs: Any,
     ) -> None:
+        native_settings = kwargs.pop("settings", None)
+        if native_settings is not None:
+            if not isinstance(native_settings, TTSSettings):
+                raise TypeError("settings must be a TTSSettings instance")
+            if is_given(native_settings.model) and native_settings.model is not None:
+                model = native_settings.model
+            if is_given(native_settings.voice) and native_settings.voice is not None:
+                voice = native_settings.voice
+            if is_given(native_settings.language) and native_settings.language is not None:
+                language = str(native_settings.language)
         kwargs.setdefault("push_start_frame", True)
         kwargs.setdefault("push_stop_frames", False)
         kwargs.setdefault("stop_frame_timeout_s", 15.0)
         super().__init__(
             sample_rate=sample_rate,
-            settings=TTSSettings(model=model, voice=voice, language=language),
+            settings=TTSSettings(
+                model=model,
+                voice=voice,
+                language=language,
+                extra=dict(native_settings.extra) if native_settings else {},
+            ),
             **kwargs,
         )
         if num_channels < 1:
