@@ -465,6 +465,61 @@ func TestSTTCloseAfterCommitWaitsForFinishedUsage(t *testing.T) {
 	}
 }
 
+func TestSTTCloseTimesOutWhenFinishedNeverArrives(t *testing.T) {
+	t.Parallel()
+
+	server := newSTTServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		if _, err := readJSONObject(ctx, conn); err != nil {
+			t.Errorf("read start request: %v", err)
+			return
+		}
+		if control, err := readJSONObject(ctx, conn); err != nil || control["type"] != "finalize" {
+			t.Errorf("read explicit finalize: %v, frame=%v", err, control)
+			return
+		}
+		messageType, payload, err := conn.Read(ctx)
+		if err != nil || messageType != websocket.MessageBinary || len(payload) != 0 {
+			t.Errorf("close frame = (%v, %q, %v), want empty binary", messageType, payload, err)
+			return
+		}
+		waitForPeer(ctx, conn)
+	})
+	defer server.Close()
+
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), sttAdapterRequest(server.URL))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer abortStream(stream)
+	stream.(*sttStream).closeTimeout = 20 * time.Millisecond
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatalf("commit audio: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	providerErr := awaitProviderError(t, stream.Events())
+	if providerErr.Code != "request_timeout" || !providerErr.Retryable {
+		t.Fatalf("close timeout error = %#v", providerErr)
+	}
+	select {
+	case _, ok := <-stream.Events():
+		if ok {
+			t.Fatal("events remained open after the graceful-close timeout")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not close after the graceful-close timeout")
+	}
+	terminal := stream.(runtimepkg.TerminalErrorProviderStream).TerminalError()
+	if !errors.As(terminal, &providerErr) || providerErr.Code != "request_timeout" {
+		t.Fatalf("terminal error = %v, want request_timeout", terminal)
+	}
+}
+
 // A zero-length frame is Soniox's end-of-stream signal, so forwarding one as
 // audio would go deaf mid-call. Close is the only place it may be sent.
 func TestSTTRefusesEmptyAudioAndClosesWithFinalizeThenEmptyFrame(t *testing.T) {
