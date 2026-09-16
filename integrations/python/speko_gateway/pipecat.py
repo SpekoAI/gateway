@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -45,6 +46,7 @@ from .client import (
 from .relay import RelayError, RelayLLMClient
 
 _INTEGRATION_VERSION = "0.1.0"
+_logger = logging.getLogger(__name__)
 
 
 class SpekoSTTService(PipecatSTTService):
@@ -66,6 +68,7 @@ class SpekoSTTService(PipecatSTTService):
         provider_options: Mapping[str, Mapping[str, Any]] | None = None,
         ready_timeout: float = 15.0,
         session_id: str = "",
+        fallback_to_auto_on_no_eligible_route: bool = False,
         **kwargs: Any,
     ) -> None:
         native_settings = kwargs.pop("settings", None)
@@ -96,6 +99,9 @@ class SpekoSTTService(PipecatSTTService):
         self._num_channels = num_channels
         self._ready_timeout = ready_timeout
         self._platform_session_id = session_id
+        self._fallback_to_auto_on_no_eligible_route = (
+            fallback_to_auto_on_no_eligible_route
+        )
         self._stt_options = stt_options_payload(
             diarization=diarization,
             keywords=keywords,
@@ -161,16 +167,35 @@ class SpekoSTTService(PipecatSTTService):
         if self._session is not None:
             return
         await self._client.wait_until_ready(timeout=self._ready_timeout)
+        try:
+            self._session = await self._open_session(
+                provider=self._provider, model=self._model
+            )
+        except GatewayError as error:
+            if not self._can_fallback_to_auto(error):
+                raise
+            _logger.warning(
+                "Speko Gateway rejected the configured STT route %s/%s; "
+                "retrying with managed auto routing",
+                self._provider,
+                self._model,
+            )
+            self._session = await self._open_session(provider="auto", model="auto")
+        self._receive_task = asyncio.create_task(
+            self._receive_events(), name="speko.pipecat.stt.receive"
+        )
+
+    async def _open_session(self, *, provider: str, model: str) -> GatewaySession:
         request: dict[str, Any] = {
-            "provider": self._provider,
+            "provider": provider,
             "language": self._language,
-            "model": self._model,
+            "model": model,
         }
         if self._platform_session_id:
             request["client_session_id"] = self._platform_session_id
         if self._stt_options:
             request["stt"] = self._stt_options
-        self._session = await self._client.open(
+        return await self._client.open(
             SessionConfig(
                 kind="stt",
                 execution=execution_from_env(self._credential_source),
@@ -187,8 +212,13 @@ class SpekoSTTService(PipecatSTTService):
                 },
             )
         )
-        self._receive_task = asyncio.create_task(
-            self._receive_events(), name="speko.pipecat.stt.receive"
+
+    def _can_fallback_to_auto(self, error: GatewayError) -> bool:
+        return (
+            self._fallback_to_auto_on_no_eligible_route
+            and self._credential_source == "managed"
+            and error.code == "no_eligible_route"
+            and (self._provider != "auto" or self._model != "auto")
         )
 
     async def _commit_audio(self) -> None:
@@ -276,6 +306,7 @@ class SpekoTTSService(PipecatTTSService):
         max_input_characters: int = 100_000,
         ready_timeout: float = 15.0,
         session_id: str = "",
+        fallback_to_auto_on_no_eligible_route: bool = False,
         **kwargs: Any,
     ) -> None:
         native_settings = kwargs.pop("settings", None)
@@ -314,6 +345,10 @@ class SpekoTTSService(PipecatTTSService):
         self._max_input_characters = max_input_characters
         self._ready_timeout = ready_timeout
         self._platform_session_id = session_id
+        self._fallback_to_auto_on_no_eligible_route = (
+            fallback_to_auto_on_no_eligible_route
+        )
+        self._auto_fallback_active = False
         self._contexts: dict[str, _TTSContextState] = {}
         self._ready = False
 
@@ -390,17 +425,50 @@ class SpekoTTSService(PipecatTTSService):
         if state is not None:
             return state
         await self._ensure_ready()
+        if self._auto_fallback_active:
+            session = await self._open_session(
+                provider="auto", model="auto", voice=""
+            )
+        else:
+            try:
+                session = await self._open_session(
+                    provider=self._provider, model=self._model, voice=self._voice
+                )
+            except GatewayError as error:
+                if not self._can_fallback_to_auto(error):
+                    raise
+                _logger.warning(
+                    "Speko Gateway rejected the configured TTS route %s/%s; "
+                    "retrying with managed auto routing",
+                    self._provider,
+                    self._model,
+                )
+                session = await self._open_session(
+                    provider="auto", model="auto", voice=""
+                )
+                self._auto_fallback_active = True
+        state = _TTSContextState(session=session)
+        self._contexts[context_id] = state
+        state.task = asyncio.create_task(
+            self._receive_audio(context_id, state),
+            name=f"speko.pipecat.tts.receive.{context_id}",
+        )
+        return state
+
+    async def _open_session(
+        self, *, provider: str, model: str, voice: str
+    ) -> GatewaySession:
         request: dict[str, Any] = {
-            "provider": self._provider,
+            "provider": provider,
             "language": self._language,
-            "model": self._model,
+            "model": model,
             "max_input_characters": self._max_input_characters,
         }
         if self._platform_session_id:
             request["client_session_id"] = self._platform_session_id
-        if self._voice:
-            request["voice"] = self._voice
-        session = await self._client.open(
+        if voice:
+            request["voice"] = voice
+        return await self._client.open(
             SessionConfig(
                 kind="tts",
                 execution=execution_from_env(self._credential_source),
@@ -417,13 +485,14 @@ class SpekoTTSService(PipecatTTSService):
                 },
             )
         )
-        state = _TTSContextState(session=session)
-        self._contexts[context_id] = state
-        state.task = asyncio.create_task(
-            self._receive_audio(context_id, state),
-            name=f"speko.pipecat.tts.receive.{context_id}",
+
+    def _can_fallback_to_auto(self, error: GatewayError) -> bool:
+        return (
+            self._fallback_to_auto_on_no_eligible_route
+            and self._credential_source == "managed"
+            and error.code == "no_eligible_route"
+            and (self._provider != "auto" or self._model != "auto")
         )
-        return state
 
     async def _receive_audio(self, context_id: str, state: _TTSContextState) -> None:
         try:

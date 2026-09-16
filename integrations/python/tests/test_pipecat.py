@@ -89,7 +89,7 @@ class FakeGatewaySession:
 
 
 class FakeGatewayClient:
-    def __init__(self, *sessions: FakeGatewaySession) -> None:
+    def __init__(self, *sessions: FakeGatewaySession | BaseException) -> None:
         self._sessions = list(sessions)
         self.ready_timeouts: list[float] = []
         self.opened: list[SessionConfig] = []
@@ -100,7 +100,10 @@ class FakeGatewayClient:
 
     async def open(self, config: SessionConfig) -> FakeGatewaySession:
         self.opened.append(config)
-        return self._sessions.pop(0)
+        result = self._sessions.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     async def aclose(self) -> None:
         self.closed = True
@@ -443,6 +446,37 @@ async def test_stt_start_surfaces_gateway_admission_failure_as_fatal() -> None:
     )
 
 
+async def test_stt_can_fallback_to_managed_auto_when_explicit_route_is_ineligible() -> None:
+    failure = GatewayError(
+        "Gateway rejected request (no_eligible_route, HTTP 422)",
+        code="no_eligible_route",
+        retryable=False,
+    )
+    session = FakeGatewaySession()
+    client = FakeGatewayClient(failure, session)
+    service = SpekoSTTService(  # type: ignore[arg-type]
+        client,
+        provider="meta",
+        model="muse-voice-transcribe-1.0",
+        credential_source="managed",
+        fallback_to_auto_on_no_eligible_route=True,
+        sample_rate=16_000,
+    )
+    service._sample_rate = 16_000
+
+    await service._connect()
+
+    assert [config.request for config in client.opened] == [
+        {
+            "provider": "meta",
+            "language": "en",
+            "model": "muse-voice-transcribe-1.0",
+        },
+        {"provider": "auto", "language": "en", "model": "auto"},
+    ]
+    await service._finish(graceful=False)
+
+
 async def test_tts_streams_sentences_in_one_turn_and_closes_context() -> None:
     session = FakeGatewaySession(
         [
@@ -502,6 +536,54 @@ async def test_tts_admission_failure_is_fatal() -> None:
     error = next(frame for frame in frames if isinstance(frame, ErrorFrame))
     assert error.fatal is True
     assert error.error == "Speko Gateway TTS failed (no_eligible_route)"
+
+
+async def test_tts_can_fallback_to_managed_auto_without_vendor_voice() -> None:
+    failure = GatewayError(
+        "Gateway rejected request (no_eligible_route, HTTP 422)",
+        code="no_eligible_route",
+        retryable=False,
+    )
+    first = FakeGatewaySession()
+    second = FakeGatewaySession()
+    client = FakeGatewayClient(failure, first, second)
+    service = SpekoTTSService(  # type: ignore[arg-type]
+        client,
+        provider="openai",
+        model="gpt-4o-mini-tts",
+        voice="coral",
+        credential_source="managed",
+        fallback_to_auto_on_no_eligible_route=True,
+        sample_rate=24_000,
+    )
+    service._sample_rate = 24_000
+
+    first_state = await service._context("turn-1")
+    second_state = await service._context("turn-2")
+
+    assert [config.request for config in client.opened] == [
+        {
+            "provider": "openai",
+            "language": "en",
+            "model": "gpt-4o-mini-tts",
+            "max_input_characters": 100_000,
+            "voice": "coral",
+        },
+        {
+            "provider": "auto",
+            "language": "en",
+            "model": "auto",
+            "max_input_characters": 100_000,
+        },
+        {
+            "provider": "auto",
+            "language": "en",
+            "model": "auto",
+            "max_input_characters": 100_000,
+        },
+    ]
+    await service._close_state("turn-1", first_state, interrupted=True)
+    await service._close_state("turn-2", second_state, interrupted=True)
 
 
 async def test_tts_interruption_cancels_only_the_active_turn() -> None:
