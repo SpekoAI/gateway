@@ -306,6 +306,7 @@ type sttStream struct {
 	closeErr     error
 	closeTimeout time.Duration
 	closeState   atomic.Uint32
+	finishedSeen atomic.Bool
 	terminalMu   sync.RWMutex
 	terminalErr  error
 
@@ -394,7 +395,11 @@ func (s *sttStream) Close(ctx context.Context) error {
 		s.closed.Store(true)
 		s.writeMu.Unlock()
 		if s.closeErr == nil {
-			go s.finishGracefulClose()
+			if s.finishedSeen.Load() {
+				s.completeGracefulClose()
+			} else {
+				go s.finishGracefulClose()
+			}
 		} else {
 			_ = s.abort()
 		}
@@ -428,6 +433,13 @@ func (s *sttStream) finishGracefulClose() {
 		s.setTerminal(sttCloseTimeoutError())
 		s.cancel()
 	case <-s.ctx.Done():
+	}
+}
+
+func (s *sttStream) completeGracefulClose() {
+	s.closeState.CompareAndSwap(sttClosePending, sttCloseFinished)
+	if s.closeState.Load() == sttCloseFinished {
+		s.cancel()
 	}
 }
 
@@ -582,8 +594,9 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		}); err != nil {
 			return err
 		}
+		s.finishedSeen.Store(true)
 		if s.closed.Load() {
-			s.cancel()
+			s.completeGracefulClose()
 		}
 		return nil
 	}
