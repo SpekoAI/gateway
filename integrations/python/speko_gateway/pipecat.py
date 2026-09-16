@@ -216,7 +216,8 @@ class SpekoSTTService(PipecatSTTService):
     def _can_fallback_to_auto(self, error: GatewayError) -> bool:
         return (
             self._fallback_to_auto_on_no_eligible_route
-            and self._credential_source == "managed"
+            and execution_from_env(self._credential_source)["credential_source"]
+            == "managed"
             and error.code == "no_eligible_route"
             and (self._provider != "auto" or self._model != "auto")
         )
@@ -489,7 +490,8 @@ class SpekoTTSService(PipecatTTSService):
     def _can_fallback_to_auto(self, error: GatewayError) -> bool:
         return (
             self._fallback_to_auto_on_no_eligible_route
-            and self._credential_source == "managed"
+            and execution_from_env(self._credential_source)["credential_source"]
+            == "managed"
             and error.code == "no_eligible_route"
             and (self._provider != "auto" or self._model != "auto")
         )

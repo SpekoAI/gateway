@@ -209,6 +209,16 @@ Options fail closed when the chosen provider cannot honor them. Pin both
 `provider` and `model` when an option is a hard requirement; with `auto`, the
 router is otherwise free to choose another compatible catalog route.
 
+Managed deployments can opt into availability-first routing with
+`fallback_to_auto_on_no_eligible_route=True` on `SpekoSTTService` and
+`SpekoTTSService`. When an explicit provider/model is rejected with
+`no_eligible_route`, the service retries once with automatic provider and model
+selection. This applies to `credential_source="managed"` and to
+`credential_source="auto"` when it resolves to managed routing. TTS omits the
+configured voice on fallback because voices are provider-specific, and later
+contexts on the same TTS service continue using automatic routing. The option
+is disabled by default and never changes BYOK or other error handling.
+
 Each STT pipeline gets one long-lived Gateway stream. Each TTS bot turn gets a
 fresh stream, allowing the route to be selected per response and ensuring a
 barge-in only cancels the interrupted turn. Both services close their streams

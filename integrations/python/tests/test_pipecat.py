@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.frames.frames import (
     ErrorFrame,
@@ -446,7 +447,10 @@ async def test_stt_start_surfaces_gateway_admission_failure_as_fatal() -> None:
     )
 
 
-async def test_stt_can_fallback_to_managed_auto_when_explicit_route_is_ineligible() -> None:
+async def test_stt_can_fallback_to_managed_auto_when_explicit_route_is_ineligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SPEKO_API_KEY", "test-managed-key")
     failure = GatewayError(
         "Gateway rejected request (no_eligible_route, HTTP 422)",
         code="no_eligible_route",
@@ -458,7 +462,7 @@ async def test_stt_can_fallback_to_managed_auto_when_explicit_route_is_ineligibl
         client,
         provider="meta",
         model="muse-voice-transcribe-1.0",
-        credential_source="managed",
+        credential_source="auto",
         fallback_to_auto_on_no_eligible_route=True,
         sample_rate=16_000,
     )
@@ -538,7 +542,10 @@ async def test_tts_admission_failure_is_fatal() -> None:
     assert error.error == "Speko Gateway TTS failed (no_eligible_route)"
 
 
-async def test_tts_can_fallback_to_managed_auto_without_vendor_voice() -> None:
+async def test_tts_can_fallback_to_managed_auto_without_vendor_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SPEKO_API_KEY", "test-managed-key")
     failure = GatewayError(
         "Gateway rejected request (no_eligible_route, HTTP 422)",
         code="no_eligible_route",
@@ -552,7 +559,7 @@ async def test_tts_can_fallback_to_managed_auto_without_vendor_voice() -> None:
         provider="openai",
         model="gpt-4o-mini-tts",
         voice="coral",
-        credential_source="managed",
+        credential_source="auto",
         fallback_to_auto_on_no_eligible_route=True,
         sample_rate=24_000,
     )
