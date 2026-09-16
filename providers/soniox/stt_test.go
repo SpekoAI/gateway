@@ -399,7 +399,7 @@ func TestSTTCommitAudioEmitsAnEmptyFinalForSilence(t *testing.T) {
 	assertTranscript(t, events[0].Data, "", true)
 }
 
-func TestSTTCloseAfterCommitSendsOnlyTheEmptyEndFrame(t *testing.T) {
+func TestSTTCloseAfterCommitWaitsForFinishedUsage(t *testing.T) {
 	t.Parallel()
 
 	server := newSTTServer(t, func(ctx context.Context, conn *websocket.Conn) {
@@ -420,6 +420,12 @@ func TestSTTCloseAfterCommitSendsOnlyTheEmptyEndFrame(t *testing.T) {
 			"tokens": []any{map[string]any{"text": "<fin>", "is_final": true}},
 		}); err != nil {
 			t.Errorf("write fin: %v", err)
+			return
+		}
+		if err := writeJSONFrame(ctx, conn, map[string]any{
+			"tokens": []any{}, "finished": true, "total_audio_proc_ms": 1_680,
+		}); err != nil {
+			t.Errorf("write finished: %v", err)
 		}
 	})
 	defer server.Close()
@@ -439,8 +445,15 @@ func TestSTTCloseAfterCommitSendsOnlyTheEmptyEndFrame(t *testing.T) {
 	if err := stream.Close(context.Background()); err != nil {
 		t.Fatalf("close stream: %v", err)
 	}
-	if events := collectEvents(t, stream.Events(), 1); events[0].Type != protocol.EventTranscriptFinal {
-		t.Fatalf("event = %q, want transcript.final", events[0].Type)
+	events := collectEvents(t, stream.Events(), 2)
+	if got := strings.Join(eventTypeNames(events), ","); got != "transcript.final,usage.observed" {
+		t.Fatalf("event types = %s", got)
+	}
+	var usage struct {
+		AudioProcessedMS int64 `json:"audio_processed_ms"`
+	}
+	if err := json.Unmarshal(events[1].Data, &usage); err != nil || usage.AudioProcessedMS != 1_680 {
+		t.Fatalf("usage = %+v, err=%v", usage, err)
 	}
 	select {
 	case _, ok := <-stream.Events():

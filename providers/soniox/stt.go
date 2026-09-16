@@ -307,7 +307,6 @@ type sttStream struct {
 	// binary frame as end-of-stream, so only uncommitted audio needs a finalize
 	// immediately before it.
 	finalizeSent atomic.Bool
-	finalSeen    atomic.Bool
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -381,9 +380,6 @@ func (s *sttStream) Close(ctx context.Context) error {
 		}
 		s.closed.Store(true)
 		s.writeMu.Unlock()
-		if s.closeErr == nil && s.finalSeen.Load() {
-			s.cancel()
-		}
 		if s.closeErr != nil {
 			_ = s.abort()
 		}
@@ -512,11 +508,17 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			return err
 		}
 		processed := message.TotalAudioProcMS
-		return s.emit(runtimepkg.ProviderEvent{
+		if err := s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventUsageObserved,
 			Data:       sonioxUsageData(s.requestID, &processed),
 			Extensions: sttExtension(raw),
-		})
+		}); err != nil {
+			return err
+		}
+		if s.closed.Load() {
+			s.cancel()
+		}
+		return nil
 	}
 	return nil
 }
@@ -537,9 +539,6 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			}
 			if token.Text == finToken {
 				committed := s.commitPending.Swap(false)
-				if committed {
-					s.finalSeen.Store(true)
-				}
 				if emptySegment && committed {
 					if err := s.emit(runtimepkg.ProviderEvent{
 						Type:       protocol.EventTranscriptFinal,
@@ -548,9 +547,6 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 					}); err != nil {
 						return err
 					}
-				}
-				if committed && s.closed.Load() {
-					s.cancel()
 				}
 			}
 			// A provisional tail cannot outlive the boundary that closed its
