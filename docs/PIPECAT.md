@@ -73,9 +73,11 @@ pipeline = Pipeline(
 Keep the generated `SileroVADAnalyzer` on the user aggregator (or another
 Pipecat VAD that emits `VADUserStoppedSpeakingFrame`). The Speko STT service
 uses that frame to commit each utterance before Pipecat's turn aggregator waits
-for the final transcript. TTS commits each aggregated sentence immediately,
-keeps one Gateway session for the whole bot turn, and maps Pipecat interruption
-events to Gateway cancellation for barge-in.
+for the final transcript. TTS commits the first aggregated sentence immediately
+and waits for Gateway's `audio.done` before submitting the next sentence, while
+audio streams to Pipecat on the receiver task. It keeps one Gateway session for
+the whole bot turn and maps Pipecat interruption events to Gateway cancellation
+for barge-in. Interruption or stream termination also releases a waiting sentence.
 
 Pipecat supplies the pipeline input and output sample rates at startup, so you
 normally should not set `sample_rate`. If a custom transport forces a specific

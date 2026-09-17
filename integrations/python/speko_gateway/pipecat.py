@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pipecat.frames.frames import (
@@ -288,6 +288,8 @@ class _TTSContextState:
     task: asyncio.Task[None] | None = None
     finishing: bool = False
     interrupted: bool = False
+    closed: bool = False
+    utterance_done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class SpekoTTSService(PipecatTTSService):
@@ -383,6 +385,14 @@ class SpekoTTSService(PipecatTTSService):
         state: _TTSContextState | None = None
         try:
             state = await self._context(context_id)
+            # Gateway accepts one committed utterance at a time. Its command
+            # acknowledgement only queues synthesis; audio.done releases the
+            # stream for the next sentence. Audio keeps flowing on the receiver
+            # task while this producer waits.
+            await state.utterance_done.wait()
+            if state.interrupted or state.closed or state.finishing:
+                return
+            state.utterance_done.clear()
             await state.session.append_text(text)
             # Commit each Pipecat sentence so synthesis starts while the LLM is
             # still producing the remainder of the response.
@@ -449,6 +459,7 @@ class SpekoTTSService(PipecatTTSService):
                 )
                 self._auto_fallback_active = True
         state = _TTSContextState(session=session)
+        state.utterance_done.set()
         self._contexts[context_id] = state
         state.task = asyncio.create_task(
             self._receive_audio(context_id, state),
@@ -501,6 +512,8 @@ class SpekoTTSService(PipecatTTSService):
             async for event in state.session.events():
                 if event.type == "error":
                     raise _stream_error(event)
+                if event.type == "audio.done":
+                    state.utterance_done.set()
                 if event.type == "audio.frame" and event.audio:
                     await self.append_to_audio_context(
                         context_id,
@@ -516,6 +529,8 @@ class SpekoTTSService(PipecatTTSService):
         except (GatewayError, OSError) as error:
             await self.push_error(_gateway_failure("TTS", error), exception=error)
         finally:
+            state.closed = True
+            state.utterance_done.set()
             if not state.interrupted and self.audio_context_available(context_id):
                 await self.append_to_audio_context(
                     context_id, TTSStoppedFrame(context_id=context_id)
@@ -549,6 +564,7 @@ class SpekoTTSService(PipecatTTSService):
         self, context_id: str, state: _TTSContextState, *, interrupted: bool
     ) -> None:
         state.interrupted = interrupted
+        state.utterance_done.set()
         try:
             await state.session.cancel()
         except (GatewayError, OSError):

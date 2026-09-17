@@ -607,3 +607,118 @@ async def test_tts_interruption_cancels_only_the_active_turn() -> None:
     assert session.cancels == 1
     assert session.closed is True
     assert context_id not in service._contexts
+
+
+class SequentialTTSGatewaySession(FakeGatewaySession):
+    """A Gateway stream whose next utterance requires the previous audio.done."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending: asyncio.Queue[CanonicalEvent | None] = asyncio.Queue()
+        self.active = False
+        self.overlapped = False
+
+    async def append_text(self, text: str) -> None:
+        if self.active:
+            self.overlapped = True
+            await self.pending.put(
+                CanonicalEvent(
+                    type="error",
+                    data={"source": "runtime", "code": "internal"},
+                )
+            )
+        await super().append_text(text)
+
+    async def commit_text(self) -> None:
+        self.active = True
+        await super().commit_text()
+
+    async def complete_utterance(self) -> None:
+        self.active = False
+        await self.pending.put(CanonicalEvent(type="audio.done"))
+
+    async def finish(self) -> None:
+        await super().finish()
+        await self.pending.put(None)
+
+    async def events(self) -> AsyncIterator[CanonicalEvent]:
+        while (event := await self.pending.get()) is not None:
+            yield event
+
+
+async def test_tts_waits_for_audio_done_before_submitting_next_sentence() -> None:
+    session = SequentialTTSGatewaySession()
+    service = SpekoTTSService(FakeGatewayClient(session), sample_rate=24_000)
+    service._sample_rate = 24_000
+    service.push_error = AsyncMock()
+    context_id = "turn-sequential"
+    await service.create_audio_context(context_id)
+    await _run_once(service.run_tts("Hi there!", context_id))
+    state = service._contexts[context_id]
+    await session.pending.put(CanonicalEvent(type="audio.frame", audio=b"\x01\x00"))
+    # Audio must stream while synthesis is still in progress.
+    first_audio = await asyncio.wait_for(service._audio_contexts[context_id].get(), 2)
+    assert isinstance(first_audio, TTSAudioRawFrame)
+    second = asyncio.create_task(
+        _run_once(service.run_tts("Thanks for calling.", context_id))
+    )
+    try:
+        await asyncio.sleep(0)
+        assert not second.done()
+        assert session.appended_text == ["Hi there!"]
+        assert not session.overlapped
+        await session.complete_utterance()
+        assert await asyncio.wait_for(second, 2) == [None]
+        assert session.appended_text == ["Hi there!", "Thanks for calling."]
+        assert session.text_commits == 2
+        await session.complete_utterance()
+        await service.flush_audio(context_id)
+        await asyncio.wait_for(state.task, 2)
+        service.push_error.assert_not_awaited()
+        assert session.finishes == 1
+        assert session.closed
+    finally:
+        second.cancel()
+        await asyncio.gather(second, return_exceptions=True)
+        await service._finish_all(interrupted=True)
+
+
+@pytest.mark.parametrize("terminal", ["interrupt", "error", "eof"])
+async def test_tts_waiting_sentence_is_released_on_terminal_event(terminal: str) -> None:
+    session = SequentialTTSGatewaySession()
+    service = SpekoTTSService(FakeGatewayClient(session), sample_rate=24_000)
+    service._sample_rate = 24_000
+    service.push_error = AsyncMock()
+    context_id = "turn-terminal"
+    await service.create_audio_context(context_id)
+    await _run_once(service.run_tts("First sentence.", context_id))
+    state = service._contexts[context_id]
+    second = asyncio.create_task(
+        _run_once(service.run_tts("Queued sentence.", context_id))
+    )
+    try:
+        await asyncio.sleep(0)
+        assert not second.done()
+        if terminal == "interrupt":
+            await service.on_audio_context_interrupted(context_id)
+        elif terminal == "error":
+            await session.pending.put(
+                CanonicalEvent(
+                    type="error",
+                    data={"source": "provider", "code": "provider_unavailable"},
+                )
+            )
+        else:
+            await session.pending.put(None)
+        await asyncio.wait_for(second, 2)
+        await asyncio.wait_for(
+            asyncio.gather(state.task, return_exceptions=True), 2
+        )
+        assert state.task.done()
+        assert session.appended_text == ["First sentence."]
+        assert not session.overlapped
+        assert service.push_error.await_count == (1 if terminal == "error" else 0)
+    finally:
+        second.cancel()
+        await asyncio.gather(second, return_exceptions=True)
+        await service._finish_all(interrupted=True)
