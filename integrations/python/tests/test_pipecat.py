@@ -2,22 +2,29 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.audio.turn.base_turn_analyzer import BaseTurnAnalyzer, EndOfTurnState
 from pipecat.frames.frames import (
     ErrorFrame,
     InterimTranscriptionFrame,
+    STTMetadataFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStoppedFrame,
+    VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import LLMSettings, STTSettings, TTSSettings
 from pipecat.services.stt_service import STTService as PipecatSTTService
+from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
+    TurnAnalyzerUserTurnStopStrategy,
+)
+from pipecat.utils.asyncio.task_manager import TaskManager
 
 from speko_gateway.client import (
     CanonicalEvent,
@@ -722,3 +729,63 @@ async def test_tts_waiting_sentence_is_released_on_terminal_event(terminal: str)
         second.cancel()
         await asyncio.gather(second, return_exceptions=True)
         await service._finish_all(interrupted=True)
+
+
+@pytest.mark.parametrize("speech_final", [True, False, None])
+async def test_stt_completion_releases_turn_without_waiting_for_safety_timer(
+    speech_final: bool | None,
+) -> None:
+    # Exercise the Gateway receive loop and Pipecat's actual turn strategy.
+    # The analyzer verdict and safety timer are controlled independently: an
+    # utterance final must release the turn now, a stable chunk must still wait.
+    analyzer = Mock(spec=BaseTurnAnalyzer)
+    analyzer.analyze_end_of_turn = AsyncMock(
+        return_value=(EndOfTurnState.COMPLETE, None)
+    )
+    analyzer.cleanup = AsyncMock()
+    strategy = TurnAnalyzerUserTurnStopStrategy(turn_analyzer=analyzer)
+    await strategy.setup(TaskManager())
+    stopped = AsyncMock()
+    strategy.add_event_handler("on_user_turn_stopped", stopped)
+    timer = asyncio.Event()
+    timer_started = asyncio.Event()
+
+    async def pending_timer(_timeout: float) -> None:
+        timer_started.set()
+        await timer.wait()
+
+    data = {"text": "Hello there", "is_final": True}
+    if speech_final is not None:
+        data["speech_final"] = speech_final
+    session = FakeGatewaySession([
+        CanonicalEvent(type="transcript.final", data=data),
+        CanonicalEvent(type="speech.ended"),
+    ])
+    service = SpekoSTTService(FakeGatewayClient(session), sample_rate=16_000)
+    received = []
+
+    async def receive_frame(frame):
+        received.append(frame)
+        await strategy.process_frame(frame)
+
+    service.push_frame = AsyncMock(side_effect=receive_frame)
+    try:
+        with patch.object(strategy, "_timeout_handler", pending_timer):
+            await strategy.process_frame(
+                STTMetadataFrame(service_name="SpekoSTT", ttfs_p99_latency=1.0)
+            )
+            await strategy.process_frame(VADUserStartedSpeakingFrame(start_secs=0.2))
+            await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+            await timer_started.wait()
+            await service._connect()
+            await service._receive_task
+
+        assert [frame.text for frame in received] == ["Hello there"]
+        assert received[0].finalized is (speech_final is True)
+        if speech_final:
+            stopped.assert_awaited_once()
+        else:
+            stopped.assert_not_awaited()
+    finally:
+        await service.cleanup()
+        await strategy.cleanup()

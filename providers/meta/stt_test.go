@@ -227,7 +227,7 @@ func TestTranscribeStreamsPartialsThenTurnFinal(t *testing.T) {
 		t.Fatalf("speech.ended = %v", data)
 	}
 	final := eventData(t, events[6])
-	if final["text"] != "How is the weather?" || final["is_final"] != true || final["turn_id"] != float64(1) || final["provider_request_id"] != "sess-1" {
+	if final["speech_final"] != true || final["text"] != "How is the weather?" || final["is_final"] != true || final["turn_id"] != float64(1) || final["provider_request_id"] != "sess-1" {
 		t.Fatalf("final = %v, want the cleaned speechComplete text", final)
 	}
 	if _, present := final["speaker"]; present {

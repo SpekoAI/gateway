@@ -233,12 +233,13 @@ func TestAdapterUsesFluxV2TurnProtocol(t *testing.T) {
 		t.Fatal("Flux final transcript must retain the v2 extension")
 	}
 	var final struct {
+		SpeechFinal         bool    `json:"speech_final"`
 		Text                string  `json:"text"`
 		AudioEndMS          int64   `json:"audio_end_ms"`
 		TurnIndex           int     `json:"turn_index"`
 		EndOfTurnConfidence float64 `json:"end_of_turn_confidence"`
 	}
-	if err := json.Unmarshal(events[5].Data, &final); err != nil || final.Text != "hello there" || final.AudioEndMS != 1100 || final.TurnIndex != 0 || final.EndOfTurnConfidence != 0.91 {
+	if err := json.Unmarshal(events[5].Data, &final); err != nil || !final.SpeechFinal || final.Text != "hello there" || final.AudioEndMS != 1100 || final.TurnIndex != 0 || final.EndOfTurnConfidence != 0.91 {
 		t.Fatalf("final = %+v, err=%v", final, err)
 	}
 	if err := stream.Close(context.Background()); err != nil {
@@ -580,5 +581,34 @@ func TestListenEndpointRejectsInvalidMediaAndPath(t *testing.T) {
 	_, err = listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3", protocol.RequestOptions{}, protocol.MediaFormat{Encoding: "mulaw", SampleRateHz: 8_000, Channels: 1}, runtimepkg.AudioDeliveryLive, "")
 	if err == nil {
 		t.Fatalf("expected media validation failure, got %v", err)
+	}
+}
+
+func TestNovaChunkFinalDoesNotFinalizeUtterance(t *testing.T) {
+	t.Parallel()
+	s := &stream{ctx: context.Background(), events: make(chan runtimepkg.ProviderEvent, 8)}
+	raw := json.RawMessage(`{"type":"Results","is_final":true,"speech_final":false,"channel":{"alternatives":[{"transcript":"A stable chunk"}]}}`)
+	var message inboundMessage
+	if err := json.Unmarshal(raw, &message); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.emitResults(message, raw); err != nil {
+		t.Fatal(err)
+	}
+	event := <-s.events
+	var data struct {
+		Text        string `json:"text"`
+		SpeechFinal bool   `json:"speech_final"`
+	}
+	if err := json.Unmarshal(event.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != protocol.EventTranscriptFinal || data.Text != "A stable chunk" || data.SpeechFinal {
+		t.Fatalf("chunk final must stay non-terminal: %s %s", event.Type, event.Data)
+	}
+	select {
+	case extra := <-s.events:
+		t.Fatalf("unexpected event after chunk final: %s", extra.Type)
+	default:
 	}
 }

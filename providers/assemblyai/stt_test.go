@@ -135,6 +135,7 @@ func TestManagedSessionTokenAuthQueryAndRealtimePartials(t *testing.T) {
 		t.Fatal("final transcript did not retain the AssemblyAI raw frame")
 	}
 	var final struct {
+		SpeechFinal       bool    `json:"speech_final"`
 		Text              string  `json:"text"`
 		IsFinal           bool    `json:"is_final"`
 		Confidence        float64 `json:"end_of_turn_confidence"`
@@ -147,7 +148,7 @@ func TestManagedSessionTokenAuthQueryAndRealtimePartials(t *testing.T) {
 	// The formatted twin wins. Seeing the rough text here would mean the
 	// unformatted final leaked through, which is the exact defect that cost the
 	// platform 2.0% -> 5.7% word error rate.
-	if final.Text != "My name is Keanu Reeves." || !final.IsFinal || final.Confidence != 0.93 || final.Language != "en" || final.ProviderRequestID != "session-aai-1" {
+	if !final.SpeechFinal || final.Text != "My name is Keanu Reeves." || !final.IsFinal || final.Confidence != 0.93 || final.Language != "en" || final.ProviderRequestID != "session-aai-1" {
 		t.Fatalf("final = %+v", final)
 	}
 

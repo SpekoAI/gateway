@@ -736,7 +736,10 @@ func (a *sttSegment) flush() (string, *float64, *int64, *int64) {
 }
 
 func sttTranscriptData(text string, isFinal bool, startMS, endMS *int64, confidence *float64, requestID string) json.RawMessage {
-	data := map[string]any{"text": text, "is_final": isFinal, "provider_request_id": requestID}
+	// Finals are emitted only after <end>, <fin>, or stream completion has
+	// flushed the segment. Unlike locked token chunks, these complete an
+	// utterance and let consumers skip their missing-final safety timeout.
+	data := map[string]any{"text": text, "is_final": isFinal, "speech_final": isFinal, "provider_request_id": requestID}
 	if startMS != nil {
 		data["audio_start_ms"] = *startMS
 	}

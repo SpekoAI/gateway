@@ -670,6 +670,7 @@ func fluxTranscriptData(message inboundMessage, final bool, requestID string) js
 	return marshalData(map[string]any{
 		"text":                   message.Transcript,
 		"is_final":               final,
+		"speech_final":           final,
 		"audio_start_ms":         milliseconds(message.AudioWindowStart),
 		"audio_end_ms":           milliseconds(message.AudioWindowEnd),
 		"provider_request_id":    requestID,

@@ -250,12 +250,16 @@ func TestSTTEmitsPartialsDuringTheAudioStreamAndFinalsAtBoundaries(t *testing.T)
 	// a whole is trimmed.
 	assertTranscript(t, events[0].Data, "What's the time", true)
 	var final struct {
+		SpeechFinal  bool    `json:"speech_final"`
 		Confidence   float64 `json:"confidence"`
 		AudioStartMS int64   `json:"audio_start_ms"`
 		AudioEndMS   int64   `json:"audio_end_ms"`
 	}
 	if err := json.Unmarshal(events[0].Data, &final); err != nil {
 		t.Fatalf("decode final: %v", err)
+	}
+	if !final.SpeechFinal {
+		t.Fatal("completed Soniox utterance must carry speech_final for turn consumers")
 	}
 	if final.Confidence < 0.79 || final.Confidence > 0.81 {
 		t.Errorf("segment confidence = %v, want the mean of 0.9 and 0.7", final.Confidence)
@@ -1119,13 +1123,14 @@ func eventTypeNames(events []runtimepkg.ProviderEvent) []string {
 func assertTranscript(t *testing.T, data json.RawMessage, wantText string, wantFinal bool) {
 	t.Helper()
 	var transcript struct {
-		Text    string `json:"text"`
-		IsFinal bool   `json:"is_final"`
+		SpeechFinal bool   `json:"speech_final"`
+		Text        string `json:"text"`
+		IsFinal     bool   `json:"is_final"`
 	}
 	if err := json.Unmarshal(data, &transcript); err != nil {
 		t.Fatalf("decode transcript: %v", err)
 	}
-	if transcript.Text != wantText || transcript.IsFinal != wantFinal {
+	if transcript.SpeechFinal != wantFinal || transcript.Text != wantText || transcript.IsFinal != wantFinal {
 		t.Fatalf("transcript = %+v, want %q final=%v", transcript, wantText, wantFinal)
 	}
 }

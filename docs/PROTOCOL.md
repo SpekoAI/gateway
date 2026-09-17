@@ -156,6 +156,14 @@ Representative JSON event types are `session.ready`, `speech.started`,
 metadata, when preserved for local consumers, lives under namespaced
 `extensions` and is never copied into telemetry.
 
+STT transcript data may include `speech_final`. A `true` value means the
+utterance's transcript is complete, including completion of an explicit
+`audio.commit`; turn consumers can stop waiting for further transcript text.
+A `transcript.final` without this flag can still be only a stable chunk within
+an unfinished utterance (for example, Deepgram Nova's `is_final: true,
+speech_final: false`). Do not infer utterance completion from `is_final` alone,
+and do not substitute `speech.ended`, which can precede the last transcript.
+
 ### Realtime sessions: OpenAI Realtime and GPT-Live
 
 `kind: "realtime"` opens a speech-to-speech session. The setup body carries

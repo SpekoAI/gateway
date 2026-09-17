@@ -743,6 +743,7 @@ func (s *stream) transcriptData(message inboundMessage) json.RawMessage {
 	data := map[string]any{
 		"text":                   message.Transcript,
 		"is_final":               message.EndOfTurn,
+		"speech_final":           message.EndOfTurn,
 		"turn_order":             message.TurnOrder,
 		"end_of_turn_confidence": message.EndOfTurnConfidence,
 		"provider_request_id":    s.sessionID,

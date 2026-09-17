@@ -579,7 +579,7 @@ func (s *sttStream) flushTurn(message serverMessage, raw []byte) {
 }
 
 func (s *sttStream) transcriptData(text string, isFinal bool, message serverMessage) json.RawMessage {
-	return s.turnData(message, map[string]any{"text": text, "is_final": isFinal})
+	return s.turnData(message, map[string]any{"text": text, "is_final": isFinal, "speech_final": isFinal})
 }
 
 // turnData is the common envelope: the session id as provider_request_id,
