@@ -956,3 +956,37 @@ func concatAudio(events []runtimepkg.ProviderEvent) []byte {
 	}
 	return audio
 }
+
+func TestGoogleTTSStreamIdleCancelDoesNotCloseSession(t *testing.T) {
+	t.Parallel()
+	pcm := samplePCM(2048)
+	server := newSynthesizeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+		writeAudioResponse(t, w, wavContainer(pcm, 24_000), 0, nil)
+	})
+	defer server.Close()
+
+	stream := openStream(t, server, protocol.CredentialsBYOK, nil)
+
+	// An idle cancel (no text buffered, no request in flight) must return nil
+	// so that barge-in does not terminate the session.
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("idle Cancel returned %v, want nil", err)
+	}
+
+	// Stream should remain completely usable for subsequent synthesis.
+	speak(t, stream, "hello")
+	events := collectEvents(t, stream.Events(), 3)
+	if got := strings.Join(eventTypes(events), ","); got != "audio.started,audio.frame,audio.done" {
+		t.Fatalf("event order after idle cancel = %s, want audio.started,audio.frame,audio.done", got)
+	}
+
+	// Once closed, Cancel must report ErrSessionClosed.
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := stream.Cancel(context.Background()); !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		t.Fatalf("Cancel after Close = %v, want ErrSessionClosed", err)
+	}
+}
+

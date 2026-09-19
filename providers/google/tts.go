@@ -632,17 +632,17 @@ func (s *stream) wasCancelled() bool {
 // how Deepgram's Clear behaves and what a barge-in needs.
 func (s *stream) Cancel(context.Context) error {
 	s.stateMu.Lock()
+	if s.closed {
+		s.stateMu.Unlock()
+		return runtimepkg.ErrSessionClosed
+	}
 	cancel := s.requestCancel
-	buffered := s.buffer.Len() > 0
 	s.buffer.Reset()
 	if cancel != nil {
 		s.requestCancelled = true
 	}
 	s.stateMu.Unlock()
 
-	if cancel == nil && !buffered {
-		return runtimepkg.ErrSessionClosed
-	}
 	if cancel != nil {
 		cancel()
 	}
