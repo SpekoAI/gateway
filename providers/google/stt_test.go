@@ -1363,3 +1363,37 @@ func sttEventTypes(events []runtimepkg.ProviderEvent) []string {
 	}
 	return types
 }
+
+func TestGoogleSTTStreamIdleCancelDoesNotCloseSession(t *testing.T) {
+	t.Parallel()
+	pcm := sttSamplePCM(3_200)
+	server := newRecognizeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+		writeRecognizeResponse(t, w, `{"results":[{"alternatives":[{"transcript":"hello"}],"resultEndOffset":"1.500s"}],"metadata":{"requestId":"req-cancel-test"}}`)
+	})
+	defer server.Close()
+
+	stream := openSTTStream(t, server, protocol.CredentialsBYOK, nil)
+
+	// An idle cancel (no audio buffered, no request in flight) must return nil
+	// so that barge-in does not terminate the session.
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("idle Cancel returned %v, want nil", err)
+	}
+
+	// Stream should remain completely usable for subsequent speech.
+	sttListen(t, stream, pcm)
+	events := collectSTTEvents(t, stream.Events(), 3)
+	if types := sttEventTypes(events); !reflect.DeepEqual(types, []string{"transcript.final", "usage.observed", "speech.ended"}) {
+		t.Fatalf("events after idle cancel = %v, want [transcript.final, usage.observed, speech.ended]", types)
+	}
+
+	// Once closed, Cancel must report ErrSessionClosed.
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := stream.Cancel(context.Background()); !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		t.Fatalf("Cancel after Close = %v, want ErrSessionClosed", err)
+	}
+}
+
