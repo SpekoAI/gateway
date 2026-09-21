@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:4456a1f8c29509324d1fb90fd7ee9e52ae8888e5415c1d33351f9dc324e2a7c3
-# yaml-body: sha256:a9cead491e44f4d68985260095552fc65aada4055c8030b41a4859c7c08ed30e
+# json-mirror: asyncapi.json sha256:242942b57b61fa7fcd17486943cccf2f2f7ccbbdb61199b5ce195b2e63b5d8df
+# yaml-body: sha256:5f38b028573e0b942e673a96cf82ceef13464aff853abfd9c6dc2ae7040256f7
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -716,6 +716,17 @@ components:
         cached_input_tokens:
           type: integer
           minimum: 0
+        cache_write_5m_tokens:
+          type: integer
+          minimum: 0
+          description: Disjoint cache-write input tokens for 5-minute retention.
+        cache_write_1h_tokens:
+          type: integer
+          minimum: 0
+          description: Disjoint cache-write input tokens for 1-hour retention.
+        incomplete:
+          type: boolean
+          description: Terminal billing quantities are missing or inconsistent; do not interpret missing evidence as zero usage.
         output_tokens:
           type: integer
           minimum: 0
