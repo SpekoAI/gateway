@@ -50,3 +50,19 @@ func TestBillingEvidenceValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestBillingQuantityPrecisionCanIncreaseWithoutDoubleCounting(t *testing.T) {
+	old := BillingObservation{OperationID: "request", Model: "asr", Mode: "batch", Quantities: map[string]int64{"duration_seconds": 1000}}
+	next := old.Clone()
+	next.Quantities["duration_seconds"] = 1000125000
+	next.QuantityDenominators = map[string]int64{"duration_seconds": 1000000000}
+	next.Complete = true
+	merged, err := MergeBillingObservation(old, next)
+	if err != nil || merged.QuantityDenominator("duration_seconds") != 1000000000 {
+		t.Fatalf("%+v %v", merged, err)
+	}
+	next.QuantityDenominators["duration_seconds"] = 100000000
+	if _, err := MergeBillingObservation(merged, next); err == nil {
+		t.Fatal("accepted changed final duration")
+	}
+}

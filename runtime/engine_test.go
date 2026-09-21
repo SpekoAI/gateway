@@ -849,3 +849,26 @@ func TestEngineFallsBackToThePlanVoiceOnlyWhenTheCallerSentNone(t *testing.T) {
 		t.Fatalf("adapter voice = %q, want the caller's override to win", got)
 	}
 }
+
+func TestInternalBillingEvidenceDoesNotChangePublicEvents(t *testing.T) {
+	adapter := mock.NewAdapter("mock.billing", func(_ runtimepkg.AdapterRequest) *mock.Stream {
+		stream := mock.NewStream(8)
+		stream.CommitTextHook = func(context.Context) error {
+			if err := stream.Emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: &protocol.BillingObservation{OperationID: "internal", Model: "model", Mode: "streaming", Quantities: map[string]int64{}}}); err != nil {
+				return err
+			}
+			return stream.Emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone})
+		}
+		return stream
+	})
+	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), runtimepkg.NopTelemetry{})
+	session := openSession(t, engine, protocol.SessionKindTTS, adapter.ID())
+	if err := session.AppendText("hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.CommitText(); err != nil {
+		t.Fatal(err)
+	}
+	session.Close()
+	assertTypes(t, collectEvents(t, session), []protocol.EventType{protocol.EventSessionReady, protocol.EventAudioDone, protocol.EventSessionClosed})
+}

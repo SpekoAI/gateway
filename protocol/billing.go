@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"errors"
+	"math/big"
 	"slices"
 	"strings"
 )
@@ -12,6 +13,7 @@ const BillingRevision = 1
 
 // BillingObservation is the cumulative quantity snapshot of one upstream
 // operation. Distinct responses/utterances/chunks require distinct OperationIDs.
+// An incomplete observation can omit Model until the provider identifies it.
 // A Complete observation is immutable; retrying it is harmless. Quantities are
 // thousandths of the named billable unit, including explicitly measured zeros.
 // Metadata contains classifications only, never request or response content.
@@ -22,11 +24,13 @@ type BillingObservation struct {
 	Model              string           `json:"model"`
 	Mode               string           `json:"mode"`
 	Quantities         map[string]int64 `json:"quantities"`
-	Complete           bool             `json:"complete"`
-	ContextTokens      int64            `json:"context_tokens,omitempty"`
-	Channels           int64            `json:"channels,omitempty"`
-	Language           string           `json:"language,omitempty"`
-	Features           []string         `json:"features,omitempty"`
+	// QuantityDenominators overrides the default 1000 for fractional duration or credits.
+	QuantityDenominators map[string]int64 `json:"quantity_denominators,omitempty"`
+	Complete             bool             `json:"complete"`
+	ContextTokens        int64            `json:"context_tokens,omitempty"`
+	Channels             int64            `json:"channels,omitempty"`
+	Language             string           `json:"language,omitempty"`
+	Features             []string         `json:"features,omitempty"`
 }
 
 // BillingReport is the terminal, normalized evidence for an attempt. Complete
@@ -51,7 +55,7 @@ func ValidBillingUnit(unit string) bool {
 }
 
 func (o BillingObservation) Validate() error {
-	if strings.TrimSpace(o.OperationID) == "" || len(o.OperationID) > 512 || strings.TrimSpace(o.Model) == "" || len(o.Model) > 256 {
+	if strings.TrimSpace(o.OperationID) == "" || len(o.OperationID) > 512 || (o.Complete && strings.TrimSpace(o.Model) == "") || (o.Model != "" && strings.TrimSpace(o.Model) == "") || len(o.Model) > 256 {
 		return errors.New("billing: operation and model identities required")
 	}
 	switch o.Mode {
@@ -61,6 +65,11 @@ func (o BillingObservation) Validate() error {
 	}
 	if len(o.ProviderRequestID) > 512 || len(o.ProviderResponseID) > 512 || o.ContextTokens < 0 || o.Channels < 0 || o.Channels > 64 || len(o.Language) > 64 || len(o.Features) > 32 || len(o.Quantities) > 32 {
 		return errors.New("billing: invalid operation metadata")
+	}
+	for u, d := range o.QuantityDenominators {
+		if _, ok := o.Quantities[u]; !ok || (u != "duration_seconds" && u != "credits") || d < 1 || d > 1_000_000_000 {
+			return errors.New("billing: invalid quantity denominator")
+		}
 	}
 	for u, q := range o.Quantities {
 		if !ValidBillingUnit(u) || q < 0 || (u != "duration_seconds" && u != "credits" && q%1000 != 0) {
@@ -103,6 +112,12 @@ func (o BillingObservation) Clone() BillingObservation {
 	for u, n := range o.Quantities {
 		q.Quantities[u] = n
 	}
+	if o.QuantityDenominators != nil {
+		q.QuantityDenominators = make(map[string]int64, len(o.QuantityDenominators))
+		for u, d := range o.QuantityDenominators {
+			q.QuantityDenominators[u] = d
+		}
+	}
 	q.Features = slices.Clone(o.Features)
 	return q
 }
@@ -116,7 +131,7 @@ func MergeBillingObservation(previous, next BillingObservation) (BillingObservat
 	if previous.OperationID == "" {
 		return next.Clone(), nil
 	}
-	if previous.OperationID != next.OperationID || previous.Model != next.Model || previous.Mode != next.Mode || previous.Channels != next.Channels || previous.Language != next.Language || !slices.Equal(previous.Features, next.Features) {
+	if previous.OperationID != next.OperationID || (previous.Model != "" && previous.Model != next.Model) || previous.Mode != next.Mode || previous.Channels != next.Channels || previous.Language != next.Language || !slices.Equal(previous.Features, next.Features) {
 		return BillingObservation{}, errors.New("billing: operation identity changed")
 	}
 	if (previous.Complete && (previous.ProviderRequestID != next.ProviderRequestID || previous.ProviderResponseID != next.ProviderResponseID)) || (previous.ProviderRequestID != "" && previous.ProviderRequestID != next.ProviderRequestID) || (previous.ProviderResponseID != "" && previous.ProviderResponseID != next.ProviderResponseID) {
@@ -127,9 +142,17 @@ func MergeBillingObservation(previous, next BillingObservation) (BillingObservat
 	}
 	for u, n := range previous.Quantities {
 		v, ok := next.Quantities[u]
-		if !ok || v < n || (previous.Complete && v != n) {
+		comparison := new(big.Rat).SetFrac(big.NewInt(v), big.NewInt(next.QuantityDenominator(u))).Cmp(new(big.Rat).SetFrac(big.NewInt(n), big.NewInt(previous.QuantityDenominator(u))))
+		if !ok || comparison < 0 || (previous.Complete && comparison != 0) {
 			return BillingObservation{}, errors.New("billing: quantities regressed or changed after completion")
 		}
 	}
 	return next.Clone(), nil
+}
+
+func (o BillingObservation) QuantityDenominator(unit string) int64 {
+	if d := o.QuantityDenominators[unit]; d > 0 {
+		return d
+	}
+	return 1000
 }

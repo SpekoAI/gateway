@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"github.com/coder/websocket"
@@ -233,6 +234,8 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &stream{
+		billingModel:    strings.TrimSpace(request.Plan.Route.Model),
+		billingFeatures: billingFeatures(request.Options, false),
 		conn:            conn,
 		ctx:             streamCtx,
 		cancel:          cancel,
@@ -414,10 +417,12 @@ func audioBytes(sampleRateHz, milliseconds int) int {
 }
 
 type stream struct {
-	conn   *websocket.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
-	events chan runtimepkg.ProviderEvent
+	billingModel    string
+	billingFeatures []string
+	conn            *websocket.Conn
+	ctx             context.Context
+	cancel          context.CancelFunc
+	events          chan runtimepkg.ProviderEvent
 
 	minAudioBytes   int
 	batchAudioBytes int
@@ -645,12 +650,16 @@ func (s *stream) handleMessage(payload []byte) (bool, error) {
 	}
 	switch message.Type {
 	case "Begin":
+		billing := metering.Duration("stream", s.billingModel, "streaming", nil, 1000, "session_duration_seconds")
+		billing.ProviderRequestID = message.ID
+		billing.Features = s.billingFeatures
 		// Server-confirmed session start. `id` is the only identifier the
 		// session ever gets, so every later event is tagged with it.
 		s.sessionID = message.ID
 		return false, s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventUsageObserved,
 			Data:       marshalData(map[string]any{"provider_request_id": message.ID, "expires_at_unix": message.ExpiresAt}),
+			Billing:    billing,
 			Extensions: extension(raw),
 		})
 	case "SpeechStarted":
@@ -662,9 +671,13 @@ func (s *stream) handleMessage(payload []byte) (bool, error) {
 	case "Turn":
 		return false, s.handleTurn(message, raw)
 	case "Termination":
+		billing := metering.Duration("stream", s.billingModel, "streaming", raw, 1000, "session_duration_seconds")
+		billing.ProviderRequestID = s.sessionID
+		billing.Features = s.billingFeatures
 		// The session's own accounting, and the last frame on the socket.
 		if err := s.emit(runtimepkg.ProviderEvent{
-			Type: protocol.EventUsageObserved,
+			Type:    protocol.EventUsageObserved,
+			Billing: billing,
 			Data: marshalData(map[string]any{
 				"provider_request_id": s.sessionID,
 				"audio_duration_ms":   milliseconds(message.AudioDurationSeconds),

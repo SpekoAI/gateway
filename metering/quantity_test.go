@@ -20,3 +20,13 @@ func TestExactQuantityPresence(t *testing.T) {
 		}
 	}
 }
+
+func TestDurationPreservesSubMillisecondEvidence(t *testing.T) {
+	got := Duration("request", "asr", "batch", []byte(`{"duration":1.000125}`), 1000, "duration")
+	if !got.Complete || got.Quantities["duration_seconds"] != 1000125000 || got.QuantityDenominator("duration_seconds") != 1000000000 {
+		t.Fatalf("%+v", got)
+	}
+	if got := Duration("request", "asr", "batch", []byte(`{"duration":0.0000000001}`), 1000, "duration"); got.Complete {
+		t.Fatal("silently rounded provider duration")
+	}
+}

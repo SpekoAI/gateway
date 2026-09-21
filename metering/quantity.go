@@ -42,6 +42,10 @@ func Duration(id, model, mode string, raw []byte, scale int64, path ...string) *
 	if n, ok := Quantity(raw, scale, path...); ok {
 		o.Quantities["duration_seconds"] = n
 		o.Complete = true
+	} else if n, ok := Quantity(raw, scale*1_000_000, path...); ok {
+		o.Quantities["duration_seconds"] = n
+		o.QuantityDenominators = map[string]int64{"duration_seconds": 1_000_000_000}
+		o.Complete = true
 	}
 	return o
 }

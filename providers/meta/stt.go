@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"github.com/coder/websocket"
@@ -186,6 +187,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		setupDone:    make(chan error, 1),
 		done:         make(chan struct{}),
 		drainTimeout: a.closeDrainTimeout,
+		billing:      protocol.BillingObservation{OperationID: "session", Model: model, Mode: "streaming", Quantities: map[string]int64{}},
 	}
 	if err := stream.writeJSON(ctx, buildHandshake(credential.Value, model, encoding, request.Options)); err != nil {
 		stream.abort()
@@ -234,8 +236,7 @@ func (a *STTAdapter) parseEndpoint(raw string) (*url.URL, error) {
 //
 // partialMode is CUMULATIVE so each partial is the whole turn so far, the
 // shape transcript.delta already carries for Deepgram's interim results.
-// emitAudioProgress stays off: the progress events carry no transcript and
-// would only be dropped.
+// Progress measures processed audio for hosted billing, independently of transcripts.
 func buildHandshake(apiKey, model, encoding string, options protocol.RequestOptions) map[string]any {
 	frame := map[string]any{
 		"authorization":     map[string]string{"accessToken": "Bearer " + apiKey},
@@ -243,7 +244,7 @@ func buildHandshake(apiKey, model, encoding string, options protocol.RequestOpti
 		"model":             model,
 		"mode":              modeFor(options),
 		"partialMode":       partialCumulative,
-		"emitAudioProgress": false,
+		"emitAudioProgress": true,
 	}
 	if bias := languageBias(options.Language); bias != "" {
 		frame["languageBias"] = []string{bias}
@@ -275,13 +276,17 @@ func trimmedKeywords(keywords []string) []string {
 
 // sttStream is one open Muse Voice Transcribe realtime socket.
 type sttStream struct {
-	conn         *websocket.Conn
-	ctx          context.Context
-	cancel       context.CancelFunc
-	events       chan runtimepkg.ProviderEvent
-	setupDone    chan error
-	done         chan struct{}
-	drainTimeout time.Duration
+	// Billing state is owned by readLoop.
+	billing             protocol.BillingObservation
+	billingInvalid      bool
+	billingDurationSeen bool
+	conn                *websocket.Conn
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	events              chan runtimepkg.ProviderEvent
+	setupDone           chan error
+	done                chan struct{}
+	drainTimeout        time.Duration
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -499,12 +504,30 @@ func (s *sttStream) handle(message serverMessage, raw []byte) {
 			s.turnMu.Lock()
 			s.sessionID = message.SessionID
 			s.turnMu.Unlock()
+			s.billing.ProviderRequestID = message.SessionID
+			s.emitBilling(false)
 			s.settleSetup(nil)
 		}
 		return
 	}
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &fields)
+	if _, present := fields["audioProcessedMs"]; present {
+		next := metering.Duration("session", s.billing.Model, "streaming", raw, 1, "audioProcessedMs")
+		next.ProviderRequestID = s.billing.ProviderRequestID
+		next.Complete = false
+		merged, err := protocol.MergeBillingObservation(s.billing, *next)
+		_, measured := next.Quantities["duration_seconds"]
+		s.billingInvalid = s.billingInvalid || err != nil || !measured
+		if err == nil {
+			s.billing = merged
+			s.billingDurationSeen = s.billingDurationSeen || measured
+		}
+		s.emitBilling(false)
+	}
 	switch message.Type {
 	case eventError:
+		s.billingInvalid = true
 		err := &runtimepkg.ProviderError{
 			Code: "provider_rejected_request", Message: "Meta transcribe reported an error",
 			Retryable: false, Extensions: extension(raw),
@@ -531,8 +554,7 @@ func (s *sttStream) handle(message serverMessage, raw []byte) {
 	case eventSpeechComplete:
 		s.flushTurn(message, raw)
 	case eventAudioProgress:
-		// Progress carries no transcript; it is not requested and is ignored
-		// if it arrives anyway.
+		// Billing was recorded above; no public transcript event is needed.
 	}
 }
 
@@ -611,7 +633,16 @@ func (s *sttStream) turnData(message serverMessage, fields map[string]any) json.
 // finish classifies how the socket ended. A clean close after the caller
 // closed is normal; anything else is a provider failure whose close code is
 // the only diagnostic the service offers.
+func (s *sttStream) emitBilling(complete bool) {
+	o := s.billing.Clone()
+	o.Complete = complete && s.billingDurationSeen && !s.billingInvalid
+	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: &o})
+}
+
 func (s *sttStream) finish(err error) {
+	// Only a provider's clean close after endStream confirms the final total.
+	// A locally forced drain timeout or cancellation retains partial evidence.
+	s.emitBilling(websocket.CloseStatus(err) == websocket.StatusNormalClosure && s.inputClosed.Load() && !s.closed.Load())
 	if isNormalClose(err) || (s.closed.Load() && s.ctx.Err() != nil) || (s.inputClosed.Load() && isNormalClose(err)) {
 		return
 	}

@@ -464,15 +464,16 @@ type UsageStream interface {
 }
 
 type liveStream struct {
-	billingModel string
-	conn         *websocket.Conn
-	ctx          context.Context
-	cancel       context.CancelFunc
-	nativeEvents bool
-	drainTimeout time.Duration
-	events       chan runtimepkg.ProviderEvent
-	setupDone    chan error
-	closedEvent  chan struct{}
+	billingModel         string
+	billingBackendModels map[string]string
+	conn                 *websocket.Conn
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	nativeEvents         bool
+	drainTimeout         time.Duration
+	events               chan runtimepkg.ProviderEvent
+	setupDone            chan error
+	closedEvent          chan struct{}
 
 	writeMu      sync.Mutex
 	pending      []byte
@@ -797,18 +798,32 @@ func (s *liveStream) handle(event serverEvent, raw []byte) {
 		// Retain a pending operation rather than letting a complete voice counter
 		// imply that an unpriced backend response was free.
 		var nested struct {
-			Response *struct {
+			ResponseID string `json:"response_id"`
+			Response   *struct {
 				ID    string `json:"id"`
 				Model string `json:"model"`
 			} `json:"response"`
 		}
 		var observation *protocol.BillingObservation
-		if json.Unmarshal(event.Event, &nested) == nil && nested.Response != nil && nested.Response.ID != "" {
-			model := nested.Response.Model
-			if model == "" {
-				model = "unknown-backend"
+		if json.Unmarshal(event.Event, &nested) == nil {
+			id, model := nested.ResponseID, ""
+			if nested.Response != nil {
+				if nested.Response.ID != "" {
+					id = nested.Response.ID
+				}
+				model = nested.Response.Model
 			}
-			observation = &protocol.BillingObservation{OperationID: "backend/" + nested.Response.ID, ProviderResponseID: nested.Response.ID, Model: model, Mode: "backend", Quantities: map[string]int64{}}
+			if id != "" {
+				if s.billingBackendModels == nil {
+					s.billingBackendModels = map[string]string{}
+				}
+				if model == "" {
+					model = s.billingBackendModels[id]
+				} else if s.billingBackendModels[id] == "" {
+					s.billingBackendModels[id] = model
+				}
+				observation = &protocol.BillingObservation{OperationID: "backend/" + id, ProviderResponseID: id, Model: model, Mode: "backend", Quantities: map[string]int64{}}
+			}
 		}
 		s.providerEvent(event.Type, raw, observation)
 		s.recordBackendUsage(event)

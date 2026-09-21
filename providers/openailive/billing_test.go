@@ -3,6 +3,7 @@ package openailive
 import (
 	"context"
 	"encoding/json"
+	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"testing"
 )
@@ -35,5 +36,33 @@ func TestNativeLiveBillingPresenceAndPendingBackend(t *testing.T) {
 		if err := json.Unmarshal(forwarded.Data, &envelope); err != nil || string(envelope.Payload) != tc.raw {
 			t.Fatalf("native event changed: %s %v", forwarded.Data, err)
 		}
+	}
+}
+
+func TestBackendModelCanArriveAfterResponseIdentity(t *testing.T) {
+	s := &liveStream{ctx: context.Background(), billingModel: "gpt-live-1", events: make(chan runtimepkg.ProviderEvent, 16), usage: Usage{Backend: map[string]BackendUsage{}}}
+	var previous protocol.BillingObservation
+	for _, raw := range []string{
+		`{"type":"response.event","event":{"type":"response.created","response":{"id":"r1"}}}`,
+		`{"type":"response.event","event":{"type":"response.completed","response":{"id":"r1","model":"gpt-5.6-luna"}}}`,
+		`{"type":"response.event","event":{"type":"response.output_item.done","response_id":"r1"}}`,
+	} {
+		var event serverEvent
+		if err := json.Unmarshal([]byte(raw), &event); err != nil {
+			t.Fatal(err)
+		}
+		s.handle(event, []byte(raw))
+		observed := (<-s.events).Billing
+		if observed == nil {
+			t.Fatal("lost pending operation")
+		}
+		merged, err := protocol.MergeBillingObservation(previous, *observed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		previous = merged
+	}
+	if previous.Model != "gpt-5.6-luna" || previous.Complete {
+		t.Fatalf("%+v", previous)
 	}
 }

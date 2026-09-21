@@ -316,12 +316,14 @@ func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.Creden
 }
 
 type stream struct {
-	billingSequence   uint64
-	billingCharacters *int64
-	conn              *websocket.Conn
-	ctx               context.Context
-	cancel            context.CancelFunc
-	events            chan runtimepkg.ProviderEvent
+	billingSequence  uint64
+	billingSubmitted int
+	billingChunks    map[string]billingChunk
+	billingInvalid   bool
+	conn             *websocket.Conn
+	ctx              context.Context
+	cancel           context.CancelFunc
+	events           chan runtimepkg.ProviderEvent
 
 	model string
 	voice string
@@ -369,7 +371,9 @@ func (s *stream) handshake(ctx context.Context) error {
 	}
 	s.stateMu.Lock()
 	s.billingSequence++
-	s.billingCharacters = nil
+	s.billingSubmitted = 0
+	s.billingChunks = make(map[string]billingChunk)
+	s.billingInvalid = false
 	s.taskActive = true
 	s.stateMu.Unlock()
 	return nil
@@ -415,6 +419,9 @@ func (s *stream) AppendText(ctx context.Context, text string) error {
 	if err := s.ensureTask(ctx); err != nil {
 		return err
 	}
+	s.stateMu.Lock()
+	s.billingSubmitted++
+	s.stateMu.Unlock()
 	return s.writeJSON(ctx, taskContinue{Event: eventTaskContinue, Text: text})
 }
 
@@ -437,7 +444,9 @@ func (s *stream) ensureTask(ctx context.Context) error {
 		return nil
 	}
 	s.billingSequence++
-	s.billingCharacters = nil
+	s.billingSubmitted = 0
+	s.billingChunks = make(map[string]billingChunk)
+	s.billingInvalid = false
 	s.taskActive = true
 	s.taskCommit = false
 	s.taskCanceled = false
@@ -678,10 +687,10 @@ func (s *stream) handleMessage(payload []byte) error {
 	}
 	raw := json.RawMessage(append([]byte(nil), payload...))
 	if message.ExtraInfo != nil && message.ExtraInfo.UsageCharacters != nil {
-		s.stateMu.Lock()
-		n := *message.ExtraInfo.UsageCharacters
-		s.billingCharacters = &n
-		s.stateMu.Unlock()
+		s.observeBillingChunk(message)
+		if err := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billingObservation(false)}); err != nil {
+			return err
+		}
 	}
 
 	if message.TraceID != "" && s.setTraceID(message.TraceID) {
@@ -920,13 +929,52 @@ func (m inbound) err(raw json.RawMessage) *runtimepkg.ProviderError {
 	return nil
 }
 
+// usage_characters belongs to each task_continue result, not task_finished.
+// Keep one cumulative counter per provider trace; a repeated final cannot add
+// characters. A reused/missing trace or missing chunk keeps the task unresolved.
+// MiniMax charges characters without a per-chunk quantity increment, so summing
+// these quantities within one task preserves the provider's billing scope.
+type billingChunk struct {
+	characters int64
+	final      bool
+}
+
+func (s *stream) observeBillingChunk(message inbound) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	n := *message.ExtraInfo.UsageCharacters
+	if message.TraceID == "" || n < 0 || n > math.MaxInt64/1000 {
+		s.billingInvalid = true
+		return
+	}
+	if s.billingChunks == nil {
+		s.billingChunks = make(map[string]billingChunk)
+	}
+	previous, exists := s.billingChunks[message.TraceID]
+	if exists && (n < previous.characters || (previous.final && n != previous.characters)) {
+		s.billingInvalid = true
+		return
+	}
+	s.billingChunks[message.TraceID] = billingChunk{characters: n, final: previous.final || (message.IsFinal && message.err(nil) == nil)}
+}
+
 func (s *stream) billingObservation(complete bool) *protocol.BillingObservation {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	result := &protocol.BillingObservation{OperationID: fmt.Sprintf("task-%d", s.billingSequence), Model: s.model, Mode: "streaming", Quantities: map[string]int64{}}
-	if s.billingCharacters != nil && *s.billingCharacters >= 0 && *s.billingCharacters <= math.MaxInt64/1000 {
-		result.Quantities["characters"] = *s.billingCharacters * 1000
-		result.Complete = complete
+	var total int64
+	allFinal := true
+	for _, chunk := range s.billingChunks {
+		if chunk.characters > math.MaxInt64/1000-total {
+			s.billingInvalid = true
+			return result
+		}
+		total += chunk.characters
+		allFinal = allFinal && chunk.final
+	}
+	if len(s.billingChunks) > 0 {
+		result.Quantities["characters"] = total * 1000
+		result.Complete = complete && !s.billingInvalid && allFinal && len(s.billingChunks) == s.billingSubmitted
 	}
 	return result
 }
