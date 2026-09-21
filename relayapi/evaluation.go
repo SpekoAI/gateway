@@ -236,7 +236,7 @@ func (r EvaluationResponse) ValidateFor(request EvaluationRequest) error {
 	if err := r.Usage.Validate(); err != nil {
 		return fmt.Errorf("usage: %w", err)
 	}
-	if r.Usage.InputTokens <= 0 || r.Usage.CachedInputTokens != 0 || r.Usage.DurationMS != 0 || r.Usage.Characters != 0 || r.Usage.ReasoningTokens != 0 || r.Usage.ToolCalls != 0 {
+	if r.Usage.Incomplete || r.Usage.InputTokens <= 0 || r.Usage.CachedInputTokens != 0 || r.Usage.CacheWrite5mTokens != 0 || r.Usage.CacheWrite1hTokens != 0 || r.Usage.DurationMS != 0 || r.Usage.Characters != 0 || r.Usage.ReasoningTokens != 0 || r.Usage.ToolCalls != 0 {
 		return fmt.Errorf("usage: evaluation usage requires positive input_tokens and optional output_tokens only")
 	}
 	for id, question := range request.Questions {

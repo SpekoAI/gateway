@@ -714,6 +714,20 @@
             "type": "integer",
             "minimum": 0
           },
+          "cache_write_5m_tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Disjoint cache-write input tokens for 5-minute retention."
+          },
+          "cache_write_1h_tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Disjoint cache-write input tokens for 1-hour retention."
+          },
+          "incomplete": {
+            "type": "boolean",
+            "description": "Terminal billing quantities are missing or inconsistent; do not interpret missing evidence as zero usage."
+          },
           "output_tokens": {
             "type": "integer",
             "minimum": 0

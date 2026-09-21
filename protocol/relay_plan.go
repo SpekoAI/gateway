@@ -38,8 +38,12 @@ const (
 	RelayUsageUnitCharacters        RelayUsageUnit = "characters"
 	RelayUsageUnitInputTokens       RelayUsageUnit = "input_tokens"
 	RelayUsageUnitCachedInputTokens RelayUsageUnit = "cached_input_tokens"
-	RelayUsageUnitOutputTokens      RelayUsageUnit = "output_tokens"
-	RelayUsageUnitReasoningTokens   RelayUsageUnit = "reasoning_tokens"
+	// Cache writes are disjoint from ordinary input and cache reads. They
+	// consume the same input budget, with prices depending on retention.
+	RelayUsageUnitCacheWrite5mTokens RelayUsageUnit = "cache_write_5m_tokens"
+	RelayUsageUnitCacheWrite1hTokens RelayUsageUnit = "cache_write_1h_tokens"
+	RelayUsageUnitOutputTokens       RelayUsageUnit = "output_tokens"
+	RelayUsageUnitReasoningTokens    RelayUsageUnit = "reasoning_tokens"
 	// RelayUsageUnitToolCalls counts billable hosted tool invocations (web
 	// search) a delegated GPT-Live backend performs. One call is one unit.
 	RelayUsageUnitToolCalls RelayUsageUnit = "tool_calls"
@@ -47,7 +51,7 @@ const (
 
 // RelayBudgetGroup names an authorized spend bucket in a relay plan. Groups
 // are deliberately coarser than units: settlement can split one group across
-// several usage-line units (llm_input covers fresh and cached input tokens),
+// several usage-line units (llm_input covers fresh input, cache reads and writes),
 // but authorization is granted and capped per group.
 type RelayBudgetGroup string
 

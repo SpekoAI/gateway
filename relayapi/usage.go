@@ -13,21 +13,26 @@ import "fmt"
 // no split report all-uncached / all-visible: everything lands in
 // input_tokens and output_tokens with the split lines at zero.
 type Usage struct {
-	DurationMS        int64 `json:"duration_ms,omitempty"`
-	Characters        int64 `json:"characters,omitempty"`
-	InputTokens       int64 `json:"input_tokens,omitempty"`
-	CachedInputTokens int64 `json:"cached_input_tokens,omitempty"`
-	OutputTokens      int64 `json:"output_tokens,omitempty"`
-	ReasoningTokens   int64 `json:"reasoning_tokens,omitempty"`
+	// Incomplete means a terminal provider response omitted or contradicted
+	// billing quantities. Missing evidence must not be treated as zero usage.
+	Incomplete         bool  `json:"incomplete,omitempty"`
+	DurationMS         int64 `json:"duration_ms,omitempty"`
+	Characters         int64 `json:"characters,omitempty"`
+	InputTokens        int64 `json:"input_tokens,omitempty"`
+	CachedInputTokens  int64 `json:"cached_input_tokens,omitempty"`
+	CacheWrite5mTokens int64 `json:"cache_write_5m_tokens,omitempty"`
+	CacheWrite1hTokens int64 `json:"cache_write_1h_tokens,omitempty"`
+	OutputTokens       int64 `json:"output_tokens,omitempty"`
+	ReasoningTokens    int64 `json:"reasoning_tokens,omitempty"`
 	// ToolCalls counts billable hosted tool invocations (web search) a
 	// delegated GPT-Live backend performed. Zero for every other route.
 	ToolCalls int64 `json:"tool_calls,omitempty"`
 }
 
-// TotalInputTokens is the full prompt size: uncached plus cached input.
+// TotalInputTokens is the full prompt size: ordinary input, cache reads, and cache writes.
 // It is a sum precisely because the split lines are mutually exclusive.
 func (u Usage) TotalInputTokens() int64 {
-	return u.InputTokens + u.CachedInputTokens
+	return u.InputTokens + u.CachedInputTokens + u.CacheWrite5mTokens + u.CacheWrite1hTokens
 }
 
 // TotalOutputTokens is the full generation size: visible output plus
@@ -48,6 +53,8 @@ func (u Usage) Validate() error {
 		{"characters", u.Characters},
 		{"input_tokens", u.InputTokens},
 		{"cached_input_tokens", u.CachedInputTokens},
+		{"cache_write_5m_tokens", u.CacheWrite5mTokens},
+		{"cache_write_1h_tokens", u.CacheWrite1hTokens},
 		{"output_tokens", u.OutputTokens},
 		{"reasoning_tokens", u.ReasoningTokens},
 		{"tool_calls", u.ToolCalls},

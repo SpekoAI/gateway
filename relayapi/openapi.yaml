@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:434d20e38f5aec6ea5489470ab14daa1f9f63260a36dca7c95d0ba88a552fc60
-# yaml-body: sha256:985bbb886d7fe9a47ec938e326d5d566e2179e30046ee68d75aeaa86311e42a9
+# json-mirror: openapi.json sha256:30faf7b06721ee0f408db3ee704d3705cd81d8a8d70882c392aa2f8cadf32d99
+# yaml-body: sha256:f1d5f9e071d6468dd22ff260af463cb7e8d2f47f38ed8410a9d644fc92f232e0
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -711,6 +711,17 @@ components:
         cached_input_tokens:
           type: integer
           minimum: 0
+        cache_write_5m_tokens:
+          type: integer
+          minimum: 0
+          description: Disjoint cache-write input tokens for 5-minute retention.
+        cache_write_1h_tokens:
+          type: integer
+          minimum: 0
+          description: Disjoint cache-write input tokens for 1-hour retention.
+        incomplete:
+          type: boolean
+          description: Terminal billing quantities are missing or inconsistent; do not interpret missing evidence as zero usage.
         output_tokens:
           type: integer
           minimum: 0
