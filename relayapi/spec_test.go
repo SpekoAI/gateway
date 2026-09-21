@@ -30,3 +30,25 @@ func TestEmbeddedOpenAPISpecMatchesNormativeMirror(t *testing.T) {
 		t.Fatal("OpenAPISpecJSON returned mutable shared storage")
 	}
 }
+
+func TestEmbeddedAsyncAPISpecMatchesNormativeMirror(t *testing.T) {
+	t.Parallel()
+
+	want, err := os.ReadFile("asyncapi.json")
+	if err != nil {
+		t.Fatalf("read normative mirror: %v", err)
+	}
+	got := relayapi.AsyncAPISpecJSON()
+	if !bytes.Equal(got, want) {
+		t.Fatal("embedded AsyncAPI document differs from asyncapi.json")
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(got, &doc); err != nil {
+		t.Fatalf("embedded AsyncAPI document is invalid JSON: %v", err)
+	}
+
+	got[0] ^= 0xff
+	if bytes.Equal(relayapi.AsyncAPISpecJSON(), got) {
+		t.Fatal("AsyncAPISpecJSON returned mutable shared storage")
+	}
+}
