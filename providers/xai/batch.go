@@ -9,6 +9,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	billing "github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -135,7 +136,10 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		}
 		words = append(words, batchhttp.Word{Text: word.Text, StartMS: batchhttp.SecondsToMS(word.Start), EndMS: batchhttp.SecondsToMS(word.End), Speaker: speaker})
 	}
+	observation := billing.Duration("request", request.Plan.Route.Model, "batch", response.Body, 1000, "duration")
+	observation.ProviderRequestID = response.Header.Get("x-request-id")
 	return &runtimepkg.BatchTranscription{
+		Billing:           billing.Report(observation),
 		Text:              strings.TrimSpace(payload.Text),
 		Segments:          batchhttp.GroupWords(words, 0),
 		Language:          payload.Language,

@@ -212,6 +212,10 @@ func (a *TTSAdapter) parseEndpoint(raw string) (*url.URL, error) {
 }
 
 type ttsStream struct {
+	billingSequence  uint64
+	billing          *protocol.BillingObservation
+	billingInvalid   bool
+	billingValid     bool
 	ctx              context.Context
 	cancel           context.CancelFunc
 	events           chan runtimepkg.ProviderEvent
@@ -273,6 +277,17 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		return err
 	}
 	streaming := utf8.RuneCountInString(text) <= ttsStreamMaxChars
+	s.stateMu.Lock()
+	s.billingSequence++
+	mode := "sync"
+	if streaming {
+		mode = "streaming"
+	}
+	s.billing = &protocol.BillingObservation{OperationID: fmt.Sprintf("generation-%d", s.billingSequence), Model: s.model, Mode: mode, Quantities: map[string]int64{}}
+	s.billingValid = false
+	s.billingInvalid = false
+	s.stateMu.Unlock()
+	s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billingSnapshot(false)})
 	body, err := json.Marshal(map[string]any{
 		"contents": []map[string]any{{"parts": []map[string]any{{"text": text}}}},
 		"generationConfig": map[string]any{
@@ -429,6 +444,7 @@ func (s *ttsStream) readSSE(requestCtx context.Context, body io.Reader) {
 						s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini TTS returned an undecodable stream frame", Retryable: true, Cause: decodeErr}})
 						return
 					}
+					s.observeTTSBilling(requestCtx, []byte(frame))
 					if payload.Error != nil {
 						s.emit(requestCtx, runtimepkg.ProviderEvent{Err: payloadError(payload)})
 						return
@@ -464,7 +480,7 @@ func (s *ttsStream) readSSE(requestCtx context.Context, body io.Reader) {
 					s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini TTS returned no audio", Retryable: true}})
 					return
 				}
-				s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: doneData(finishReason)})
+				s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: doneData(finishReason), Billing: s.billingSnapshot(finishReason != "")})
 				return
 			}
 			if !s.wasCanceled() && s.ctx.Err() == nil {
@@ -495,6 +511,7 @@ func (s *ttsStream) readBlob(requestCtx context.Context, body io.Reader) {
 		s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini TTS returned an undecodable response", Retryable: true, Cause: err}})
 		return
 	}
+	s.observeTTSBilling(requestCtx, raw)
 	if payload.Error != nil {
 		s.emit(requestCtx, runtimepkg.ProviderEvent{Err: payloadError(payload)})
 		return
@@ -583,6 +600,9 @@ func (s *ttsStream) reportResponseProgress() {
 }
 
 func (s *ttsStream) emit(requestCtx context.Context, event runtimepkg.ProviderEvent) bool {
+	if event.Billing == nil && (event.Type == protocol.EventAudioDone || event.Err != nil) {
+		event.Billing = s.billingSnapshot(event.Type == protocol.EventAudioDone)
+	}
 	// Close deliberately does not interrupt a blocked send: a runtime that is
 	// still draining events must receive every audio frame and AudioDone. The
 	// graceful-close idle timer cancels s.ctx if the consumer is abandoned;

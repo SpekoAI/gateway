@@ -570,7 +570,7 @@ func TestAdapterCancelStopsTheTaskAndDropsLateAudio(t *testing.T) {
 	// Nothing more may reach the caller: not the late frame, not audio.done.
 	select {
 	case event, ok := <-stream.Events():
-		if ok {
+		if ok && !(event.Type == protocol.EventUsageObserved && event.Billing != nil) {
 			t.Fatalf("cancelled utterance emitted %q", event.Type)
 		}
 	case <-time.After(250 * time.Millisecond):
@@ -1040,6 +1040,9 @@ func collectEvents(t *testing.T, events <-chan runtimepkg.ProviderEvent, want in
 			}
 			if event.Err != nil {
 				t.Fatalf("provider event error: %v", event.Err)
+			}
+			if event.Type == protocol.EventUsageObserved && event.Billing != nil && len(event.Data) == 0 {
+				continue
 			}
 			collected = append(collected, event)
 		case <-timer.C:

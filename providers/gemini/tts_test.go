@@ -40,6 +40,9 @@ func ttsEventWithin(t *testing.T, events <-chan runtimepkg.ProviderEvent) runtim
 		if !ok {
 			t.Fatal("events closed")
 		}
+		if event.Type == protocol.EventUsageObserved && event.Billing != nil && len(event.Data) == 0 {
+			return ttsEventWithin(t, events)
+		}
 		if event.Err != nil {
 			t.Fatalf("provider event error: %v", event.Err)
 		}
@@ -56,6 +59,9 @@ func ttsErrorWithin(t *testing.T, events <-chan runtimepkg.ProviderEvent) *runti
 	case event, ok := <-events:
 		if !ok {
 			t.Fatal("events closed before an error event")
+		}
+		if event.Type == protocol.EventUsageObserved && event.Billing != nil && len(event.Data) == 0 {
+			return ttsErrorWithin(t, events)
 		}
 		if event.Err == nil {
 			t.Fatalf("event = %q, want an error event", event.Type)

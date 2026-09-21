@@ -13,6 +13,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
 
@@ -208,9 +209,9 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		if err := batchhttp.DecodeJSON(polled.Body, &current); err != nil {
 			return false, err
 		}
+		final, finalBody = current, polled.Body
 		switch current.Status {
 		case batchStatusDone:
-			final, finalBody = current, polled.Body
 			return true, nil
 		case batchStatusError:
 			return false, batchhttp.Failed(batchExtensionID, current.Error)
@@ -220,10 +221,16 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 			return false, batchhttp.Malformed(fmt.Errorf("assemblyai transcript status %q", current.Status))
 		}
 	})
-	if err != nil {
-		return nil, err
+	result := final.result(finalBody)
+	if result.ProviderRequestID == "" {
+		result.ProviderRequestID = job.ID
 	}
-	return final.result(finalBody), nil
+	billing := metering.Duration("batch", model, "batch", finalBody, 1000, "audio_duration")
+	billing.ProviderRequestID = result.ProviderRequestID
+	billing.Features = billingFeatures(request.Options, true)
+	billing.Complete = billing.Complete && err == nil && final.Status == batchStatusDone
+	result.Billing = metering.Report(billing)
+	return result, err
 }
 
 type batchTranscript struct {
