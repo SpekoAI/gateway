@@ -59,6 +59,8 @@ type BatchTranscribeRequest struct {
 // grouped into utterances where the vendor gives no coarser unit) and may be
 // empty when a provider returns untimed text.
 type BatchTranscription struct {
+	// Billing preserves provider quantities separately from audio authorization.
+	Billing  *protocol.BillingReport
 	Text     string
 	Segments []BatchSegment
 	// Words are the provider's per-word timings, populated only when the

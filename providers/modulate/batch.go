@@ -9,6 +9,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	billing "github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -144,7 +145,16 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if err := batchhttp.DecodeJSON(response.Body, &payload); err != nil {
 		return nil, err
 	}
+	observation := billing.Duration("request", model, "batch", response.Body, 1, "duration_ms")
+	observation.ProviderRequestID = response.Header.Get("x-request-id")
+	// All currently exposed provider options must be represented before pricing.
+	for _, key := range request.Options.STT.ProviderKeys("modulate") {
+		if protocol.SttOptionString(request.Options.STT.Provider("modulate")[key]) != "false" {
+			observation.Features = append(observation.Features, key)
+		}
+	}
 	result := &runtimepkg.BatchTranscription{
+		Billing:           billing.Report(observation),
 		Text:              strings.TrimSpace(payload.Text),
 		DurationMS:        payload.DurationMS,
 		ProviderRequestID: response.Header.Get("x-request-id"),

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -238,6 +239,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		_ = stream.abort()
 		return nil, err
 	}
+	_ = stream.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: stream.billingObservation(false)})
 	go stream.readLoop()
 	return stream, nil
 }
@@ -314,10 +316,12 @@ func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.Creden
 }
 
 type stream struct {
-	conn   *websocket.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
-	events chan runtimepkg.ProviderEvent
+	billingSequence   uint64
+	billingCharacters *int64
+	conn              *websocket.Conn
+	ctx               context.Context
+	cancel            context.CancelFunc
+	events            chan runtimepkg.ProviderEvent
 
 	model string
 	voice string
@@ -364,6 +368,8 @@ func (s *stream) handshake(ctx context.Context) error {
 		return err
 	}
 	s.stateMu.Lock()
+	s.billingSequence++
+	s.billingCharacters = nil
 	s.taskActive = true
 	s.stateMu.Unlock()
 	return nil
@@ -430,12 +436,17 @@ func (s *stream) ensureTask(ctx context.Context) error {
 		s.stateMu.Unlock()
 		return nil
 	}
+	s.billingSequence++
+	s.billingCharacters = nil
 	s.taskActive = true
 	s.taskCommit = false
 	s.taskCanceled = false
 	s.audioStarted = false
 	s.taskAck = make(chan struct{})
 	s.stateMu.Unlock()
+	if err := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billingObservation(false)}); err != nil {
+		return err
+	}
 	return s.writeJSON(ctx, s.taskStart())
 }
 
@@ -666,6 +677,12 @@ func (s *stream) handleMessage(payload []byte) error {
 		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "MiniMax sent malformed streaming JSON", Retryable: true, Cause: err}
 	}
 	raw := json.RawMessage(append([]byte(nil), payload...))
+	if message.ExtraInfo != nil && message.ExtraInfo.UsageCharacters != nil {
+		s.stateMu.Lock()
+		n := *message.ExtraInfo.UsageCharacters
+		s.billingCharacters = &n
+		s.stateMu.Unlock()
+	}
 
 	if message.TraceID != "" && s.setTraceID(message.TraceID) {
 		if err := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: usageData(message.TraceID)}); err != nil {
@@ -682,13 +699,15 @@ func (s *stream) handleMessage(payload []byte) error {
 	case eventTaskContinued:
 		return s.handleAudio(message, raw)
 	case eventTaskFinished:
+		billing := s.billingObservation(true)
 		canceled := s.finishTask()
 		if canceled {
+			_ = s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: billing})
 			// A cancelled utterance is not a completed one; emitting audio.done
 			// would tell the caller a barge-in actually played to the end.
 			return nil
 		}
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.contextData(), Extensions: extension(raw)})
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.contextData(), Extensions: extension(raw), Billing: billing})
 	case eventTaskStarted, eventConnectedSuccess:
 		// Acknowledgements for a restarted task carry no caller-visible state.
 		return nil
@@ -869,6 +888,9 @@ type baseResp struct {
 // inbound mirrors the documented server frames. Data is nullable, so it is a
 // value type: a JSON null decodes to the zero value rather than panicking.
 type inbound struct {
+	ExtraInfo *struct {
+		UsageCharacters *int64 `json:"usage_characters"`
+	} `json:"extra_info"`
 	Event     string `json:"event"`
 	TraceID   string `json:"trace_id"`
 	SessionID string `json:"session_id"`
@@ -896,4 +918,15 @@ func (m inbound) err(raw json.RawMessage) *runtimepkg.ProviderError {
 		}
 	}
 	return nil
+}
+
+func (s *stream) billingObservation(complete bool) *protocol.BillingObservation {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	result := &protocol.BillingObservation{OperationID: fmt.Sprintf("task-%d", s.billingSequence), Model: s.model, Mode: "streaming", Quantities: map[string]int64{}}
+	if s.billingCharacters != nil && *s.billingCharacters >= 0 && *s.billingCharacters <= math.MaxInt64/1000 {
+		result.Quantities["characters"] = *s.billingCharacters * 1000
+		result.Complete = complete
+	}
+	return result
 }

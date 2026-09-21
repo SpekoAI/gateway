@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
+	billing "github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"github.com/coder/websocket"
@@ -206,6 +207,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		cancel:               cancel,
 		events:               make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		maxPendingAudioBytes: a.maxPendingAudioBytes,
+		billingModel:         request.Plan.Route.Model,
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -337,10 +339,11 @@ func sttEncoding(encoding string) (string, error) {
 // ---------------------------------------------------------------------------
 
 type sttStream struct {
-	conn   *websocket.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
-	events chan runtimepkg.ProviderEvent
+	billingModel string
+	conn         *websocket.Conn
+	ctx          context.Context
+	cancel       context.CancelFunc
+	events       chan runtimepkg.ProviderEvent
 
 	maxPendingAudioBytes int
 
@@ -752,6 +755,7 @@ func (s *sttStream) handleDone(message sttInbound, raw json.RawMessage) error {
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventUsageObserved,
 		Data:       marshalData(map[string]any{"provider_request_id": s.currentSessionID(), "audio_duration_ms": sttMilliseconds(message.Duration)}),
+		Billing:    billing.Duration("stream", s.billingModel, "streaming", raw, 1000, "duration"),
 		Extensions: extension(raw),
 	})
 }

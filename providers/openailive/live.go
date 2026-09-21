@@ -39,6 +39,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	billing "github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	"github.com/SpekoAI/gateway/relayapi"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
@@ -240,6 +241,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	stream := &liveStream{
 		conn: conn, ctx: streamCtx, cancel: cancel, nativeEvents: a.nativeEvents,
 		drainTimeout: a.closeDrainTimeout,
+		billingModel: model,
 		events:       make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		setupDone:    make(chan error, 1),
 		closedEvent:  make(chan struct{}),
@@ -462,6 +464,7 @@ type UsageStream interface {
 }
 
 type liveStream struct {
+	billingModel string
 	conn         *websocket.Conn
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -743,18 +746,22 @@ func (s *liveStream) readLoop() {
 	}
 }
 
-func (s *liveStream) providerEvent(eventType string, raw []byte) {
+func (s *liveStream) providerEvent(eventType string, raw []byte, observations ...*protocol.BillingObservation) {
+	var observation *protocol.BillingObservation
+	if len(observations) > 0 {
+		observation = observations[0]
+	}
 	envelope, err := json.Marshal(protocol.ProviderEvent{Type: eventType, Payload: append(json.RawMessage(nil), raw...)})
 	if err != nil {
 		return
 	}
-	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventProviderEvent, Data: envelope})
+	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventProviderEvent, Data: envelope, Billing: observation})
 }
 
 func (s *liveStream) handle(event serverEvent, raw []byte) {
 	switch event.Type {
 	case "session.started":
-		s.providerEvent(event.Type, raw)
+		s.providerEvent(event.Type, raw, &protocol.BillingObservation{OperationID: "voice", Model: s.billingModel, Mode: "streaming", Quantities: map[string]int64{}})
 		s.settleSetup(nil)
 	case "error":
 		s.handleError(event, raw)
@@ -778,16 +785,35 @@ func (s *liveStream) handle(event serverEvent, raw []byte) {
 			s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTextDelta, Data: transcriptData(event)})
 		}
 	case "session.usage.updated":
-		s.providerEvent(event.Type, raw)
+		observation := billing.Duration("voice", s.billingModel, "streaming", raw, 1000, "usage", "seconds")
+		observation.Complete = false
+		s.providerEvent(event.Type, raw, observation)
 		if event.Usage != nil {
 			s.recordVoiceSnapshot(event.Usage.Seconds, false, "")
 			s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(map[string]string{"provider_request_id": s.sessionRequestID(event)}), Extensions: s.extension(raw)})
 		}
 	case "response.event":
-		s.providerEvent(event.Type, raw)
+		// Delegated response metering must be completed independently of voice.
+		// Retain a pending operation rather than letting a complete voice counter
+		// imply that an unpriced backend response was free.
+		var nested struct {
+			Response *struct {
+				ID    string `json:"id"`
+				Model string `json:"model"`
+			} `json:"response"`
+		}
+		var observation *protocol.BillingObservation
+		if json.Unmarshal(event.Event, &nested) == nil && nested.Response != nil && nested.Response.ID != "" {
+			model := nested.Response.Model
+			if model == "" {
+				model = "unknown-backend"
+			}
+			observation = &protocol.BillingObservation{OperationID: "backend/" + nested.Response.ID, ProviderResponseID: nested.Response.ID, Model: model, Mode: "backend", Quantities: map[string]int64{}}
+		}
+		s.providerEvent(event.Type, raw, observation)
 		s.recordBackendUsage(event)
 	case "session.closed":
-		s.providerEvent(event.Type, raw)
+		s.providerEvent(event.Type, raw, billing.Duration("voice", s.billingModel, "streaming", raw, 1000, "usage", "seconds"))
 		seconds := 0.0
 		if event.Usage != nil {
 			seconds = event.Usage.Seconds

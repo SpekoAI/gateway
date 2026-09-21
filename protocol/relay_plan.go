@@ -13,6 +13,9 @@ const (
 	// use. A connector that does not understand this revision rejects the plan
 	// outright instead of guessing how to authenticate to a provider.
 	RelayRevision = 5
+	// RelayBillingRevision requires operation metering. Revision 5 remains
+	// accepted for already-issued plans and routes not yet converted.
+	RelayBillingRevision = 6
 	// RelayPlanJWSType is the protected-header typ required on a relay-plan
 	// compact JWS. Even under a shared signing key, the typ check stops a
 	// session-plan signature from authorizing a relay dispatch and a
@@ -258,6 +261,9 @@ func (p RelayPlan) Validate(now time.Time) error {
 	if err := validateCatalogDigest(p.CatalogDigest); err != nil {
 		return fmt.Errorf("catalog_digest: %w", err)
 	}
+	if strings.HasPrefix(p.RateCardVersion, "list-plus-5-billing-") && (!strings.HasPrefix(p.RateCardVersion, "list-plus-5-billing-v1:") || p.Requirements.ProtocolRevision != RelayBillingRevision) {
+		return fmt.Errorf("rate_card_version: unsupported billing contract")
+	}
 	if strings.TrimSpace(p.RateCardVersion) == "" {
 		return fmt.Errorf("rate_card_version: required")
 	}
@@ -343,7 +349,7 @@ func (r RelayRequirements) validate() error {
 	if r.Protocol != VoiceV0 {
 		return fmt.Errorf("protocol: got %q, want %q", r.Protocol, VoiceV0)
 	}
-	if r.ProtocolRevision != RelayRevision {
+	if r.ProtocolRevision != RelayRevision && r.ProtocolRevision != RelayBillingRevision {
 		return fmt.Errorf("protocol_revision: got %d, want %d", r.ProtocolRevision, RelayRevision)
 	}
 	return nil

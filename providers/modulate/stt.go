@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
+	billing "github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"github.com/coder/websocket"
@@ -151,6 +152,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		conn: conn, ctx: streamCtx, cancel: cancel,
 		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), done: make(chan struct{}),
 		shutdownTimeout: a.shutdownTimeout,
+		billingModel:    request.Plan.Route.Model,
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -223,6 +225,7 @@ func primaryLanguage(value string) string {
 }
 
 type stream struct {
+	billingModel    string
 	conn            *websocket.Conn
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -387,7 +390,7 @@ func (s *stream) handleMessage(raw json.RawMessage) (bool, error) {
 		}
 		return true, nil
 	case "done":
-		return false, s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(map[string]any{"duration_ms": message.DurationMS}), Extensions: extension(raw)})
+		return false, s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: billing.Duration("stream", s.billingModel, "streaming", raw, 1, "duration_ms"), Data: marshalData(map[string]any{"duration_ms": message.DurationMS}), Extensions: extension(raw)})
 	case "error":
 		return false, providerMessageError(message.Error)
 	default:

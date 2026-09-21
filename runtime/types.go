@@ -157,6 +157,9 @@ type TerminalErrorProviderStream interface {
 // event; it must not mutate any of them after delivery. Err terminates the
 // attempt and is never emitted as a normal event.
 type ProviderEvent struct {
+	// Billing is trusted normalized usage, independent of public event forwarding.
+	Billing *protocol.BillingObservation `json:"-"`
+
 	Type       protocol.EventType
 	Data       json.RawMessage
 	Extensions map[string]json.RawMessage
