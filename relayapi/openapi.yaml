@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:5081adba9f2b7e6b1e400519ed6102065a210e8f8453858f1f2986b4698d94ac
-# yaml-body: sha256:d0d17e4f5e8bdc0a691bef6ef6ae5d982186a599766bda2b7d7f9c7739ad7d96
+# json-mirror: openapi.json sha256:434d20e38f5aec6ea5489470ab14daa1f9f63260a36dca7c95d0ba88a552fc60
+# yaml-body: sha256:985bbb886d7fe9a47ec938e326d5d566e2179e30046ee68d75aeaa86311e42a9
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -19,18 +19,21 @@ info:
   title: Speko Router API
   version: "1.0.0"
   description: >-
-    HTTP contract of the Speko Router: model discovery, batch speech
-    transcription, one-shot speech synthesis, and LLM responses over JSON or
-    server-sent events. The Go types in package relayapi are the source of
-    truth for every shape in this document, and speccheck_test.go
-    machine-checks the two against each other. Streaming speech travels over
-    WebSocket and is specified separately in asyncapi.yaml. The /v1 prefix is
-    the stable major version: compatible fields and capabilities may be added,
-    while breaking changes require a new major path. Before a v1 operation or
-    field is retired, Speko documents a migration, sends the Deprecation header
-    and a Link with rel="deprecation", and provides at least 90 days of notice
-    before the Sunset date. See the public versioning policy for the complete
-    compatibility contract.
+    The Speko Router is streaming-first: live speech-to-text and
+    text-to-speech sessions, and the three native speech-to-speech routes,
+    all run over WebSocket and are specified in asyncapi.yaml, which this
+    Router serves at /asyncapi.json. This document is the HTTP contract, the
+    request/response surface beside those sockets: model discovery, batch
+    speech transcription, one-shot speech synthesis, LLM responses over JSON
+    or server-sent events, and Jev evaluations. The Go types in package
+    relayapi are the source of truth for every shape in this document, and
+    speccheck_test.go machine-checks the two against each other. The /v1
+    prefix is the stable major version: compatible fields and capabilities
+    may be added, while breaking changes require a new major path. Before a
+    v1 operation or field is retired, Speko documents a migration, sends the
+    Deprecation header and a Link with rel="deprecation", and provides at
+    least 90 days of notice before the Sunset date. See the public
+    versioning policy for the complete compatibility contract.
   x-speko-versioning-policy: https://speko.ai/developers/versioning
 externalDocs:
   description: Router API lifecycle and deprecation policy
@@ -53,8 +56,8 @@ paths:
         Returns this exact OpenAPI 3.1 document without authentication. Agents
         and code generators can use it to discover every HTTP operation,
         request shape, response shape, error code, and lifecycle convention.
-        Streaming speech operations are described by the AsyncAPI document in
-        the public Gateway repository.
+        Streaming speech operations are described by the AsyncAPI document,
+        which this Router serves at /asyncapi.json.
       security: []
       responses:
         "200":
@@ -67,6 +70,33 @@ paths:
               schema:
                 type: object
                 description: An OpenAPI 3.1 document.
+                additionalProperties: true
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        default:
+          $ref: "#/components/responses/Error"
+  /asyncapi.json:
+    get:
+      operationId: getAsyncAPISpec
+      summary: Download the canonical Router streaming contract
+      description: >-
+        Returns the canonical AsyncAPI 2.6 document without authentication.
+        It specifies every WebSocket operation the Router serves: the
+        streaming speech-to-text and text-to-speech sessions, and the three
+        native speech-to-speech routes. This OpenAPI document describes the
+        HTTP operations.
+      security: []
+      responses:
+        "200":
+          description: The canonical AsyncAPI 2.6 document.
+          headers:
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
+          content:
+            application/json:
+              schema:
+                type: object
+                description: An AsyncAPI 2.6 document.
                 additionalProperties: true
         "429":
           $ref: "#/components/responses/TooManyRequests"
@@ -137,8 +167,11 @@ paths:
       operationId: createTranscription
       summary: Transcribe one uploaded audio file
       description: >-
-        Batch speech-to-text. The audio always travels as an uploaded part,
-        never as a URL: the Router fetches nothing on a caller's behalf. For
+        For live audio, open the streaming socket at /v1/stt/stream,
+        specified in asyncapi.yaml. This operation is the batch path, for a
+        recording that already exists. The audio always travels as an
+        uploaded part, never as a URL: the Router fetches nothing on a
+        caller's behalf. For
         idempotency the content hash covers the decoded part payload bytes
         only — no part headers, no boundary bytes — concatenated in part
         order (request, then audio), so a retry hashes identically no matter
@@ -202,7 +235,10 @@ paths:
       operationId: createSpeech
       summary: Synthesize one utterance to a raw audio stream
       description: >-
-        One-shot text-to-speech. The response body is a raw audio stream in
+        For speech that starts playing before the text is finished, open the
+        streaming socket at /v1/tts/stream, specified in asyncapi.yaml. This
+        operation is the one-shot path, synthesizing a single utterance in
+        full. The response body is a raw audio stream in
         the requested output format; the route and the billed character count
         come back in headers (Speko-Provider, Speko-Model, Speko-Region,
         Speko-Usage-Characters) because a byte stream has no place for a JSON

@@ -3,7 +3,7 @@
   "info": {
     "title": "Speko Router API",
     "version": "1.0.0",
-    "description": "HTTP contract of the Speko Router: model discovery, batch speech transcription, one-shot speech synthesis, and LLM responses over JSON or server-sent events. The Go types in package relayapi are the source of truth for every shape in this document, and speccheck_test.go machine-checks the two against each other. Streaming speech travels over WebSocket and is specified separately in asyncapi.yaml. The /v1 prefix is the stable major version: compatible fields and capabilities may be added, while breaking changes require a new major path. Before a v1 operation or field is retired, Speko documents a migration, sends the Deprecation header and a Link with rel=\"deprecation\", and provides at least 90 days of notice before the Sunset date. See the public versioning policy for the complete compatibility contract.",
+    "description": "The Speko Router is streaming-first: live speech-to-text and text-to-speech sessions, and the three native speech-to-speech routes, all run over WebSocket and are specified in asyncapi.yaml, which this Router serves at /asyncapi.json. This document is the HTTP contract, the request/response surface beside those sockets: model discovery, batch speech transcription, one-shot speech synthesis, LLM responses over JSON or server-sent events, and Jev evaluations. The Go types in package relayapi are the source of truth for every shape in this document, and speccheck_test.go machine-checks the two against each other. The /v1 prefix is the stable major version: compatible fields and capabilities may be added, while breaking changes require a new major path. Before a v1 operation or field is retired, Speko documents a migration, sends the Deprecation header and a Link with rel=\"deprecation\", and provides at least 90 days of notice before the Sunset date. See the public versioning policy for the complete compatibility contract.",
     "x-speko-versioning-policy": "https://speko.ai/developers/versioning"
   },
   "externalDocs": {
@@ -18,9 +18,7 @@
   ],
   "security": [
     {
-      "bearerAuth": [
-
-      ]
+      "bearerAuth": []
     }
   ],
   "paths": {
@@ -28,10 +26,8 @@
       "get": {
         "operationId": "getOpenAPISpec",
         "summary": "Download the canonical Router HTTP contract",
-        "description": "Returns this exact OpenAPI 3.1 document without authentication. Agents and code generators can use it to discover every HTTP operation, request shape, response shape, error code, and lifecycle convention. Streaming speech operations are described by the AsyncAPI document in the public Gateway repository.",
-        "security": [
-
-        ],
+        "description": "Returns this exact OpenAPI 3.1 document without authentication. Agents and code generators can use it to discover every HTTP operation, request shape, response shape, error code, and lifecycle convention. Streaming speech operations are described by the AsyncAPI document, which this Router serves at /asyncapi.json.",
+        "security": [],
         "responses": {
           "200": {
             "description": "The canonical OpenAPI 3.1 document.",
@@ -45,6 +41,39 @@
                 "schema": {
                   "type": "object",
                   "description": "An OpenAPI 3.1 document.",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/asyncapi.json": {
+      "get": {
+        "operationId": "getAsyncAPISpec",
+        "summary": "Download the canonical Router streaming contract",
+        "description": "Returns the canonical AsyncAPI 2.6 document without authentication. It specifies every WebSocket operation the Router serves: the streaming speech-to-text and text-to-speech sessions, and the three native speech-to-speech routes. This OpenAPI document describes the HTTP operations.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The canonical AsyncAPI 2.6 document.",
+            "headers": {
+              "RateLimit-Policy": {
+                "$ref": "#/components/headers/RateLimitPolicy"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "An AsyncAPI 2.6 document.",
                   "additionalProperties": true
                 }
               }
@@ -146,7 +175,7 @@
       "post": {
         "operationId": "createTranscription",
         "summary": "Transcribe one uploaded audio file",
-        "description": "Batch speech-to-text. The audio always travels as an uploaded part, never as a URL: the Router fetches nothing on a caller's behalf. For idempotency the content hash covers the decoded part payload bytes only — no part headers, no boundary bytes — concatenated in part order (request, then audio), so a retry hashes identically no matter what boundary string the client generates. Usage lives in the response body; there is deliberately no STT usage header.",
+        "description": "For live audio, open the streaming socket at /v1/stt/stream, specified in asyncapi.yaml. This operation is the batch path, for a recording that already exists. The audio always travels as an uploaded part, never as a URL: the Router fetches nothing on a caller's behalf. For idempotency the content hash covers the decoded part payload bytes only — no part headers, no boundary bytes — concatenated in part order (request, then audio), so a retry hashes identically no matter what boundary string the client generates. Usage lives in the response body; there is deliberately no STT usage header.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
@@ -230,7 +259,7 @@
       "post": {
         "operationId": "createSpeech",
         "summary": "Synthesize one utterance to a raw audio stream",
-        "description": "One-shot text-to-speech. The response body is a raw audio stream in the requested output format; the route and the billed character count come back in headers (Speko-Provider, Speko-Model, Speko-Region, Speko-Usage-Characters) because a byte stream has no place for a JSON envelope.",
+        "description": "For speech that starts playing before the text is finished, open the streaming socket at /v1/tts/stream, specified in asyncapi.yaml. This operation is the one-shot path, synthesizing a single utterance in full. The response body is a raw audio stream in the requested output format; the route and the billed character count come back in headers (Speko-Provider, Speko-Model, Speko-Region, Speko-Usage-Characters) because a byte stream has no place for a JSON envelope.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
@@ -1750,8 +1779,7 @@
               },
               {
                 "type": "array",
-                "items": {
-                }
+                "items": {}
               }
             ]
           },
@@ -1773,26 +1801,55 @@
       "EvaluationRouting": {
         "type": "object",
         "properties": {
-          "mode": {"type": "string", "enum": ["explicit"]},
-          "provider": {"type": "string", "minLength": 1},
-          "model": {"type": "string", "minLength": 1}
+          "mode": {
+            "type": "string",
+            "enum": [
+              "explicit"
+            ]
+          },
+          "provider": {
+            "type": "string",
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          }
         },
-        "required": ["mode", "provider", "model"],
+        "required": [
+          "mode",
+          "provider",
+          "model"
+        ],
         "additionalProperties": false
       },
       "EvaluationQuestion": {
         "description": "A noul, choice, or score question. Instructions may be structured JSON. Choice criteria contain 2-255 keyed options; Score criteria contain 2-10 ordered levels; Noul criteria may describe true and/or false.",
         "oneOf": [
-          {"$ref": "#/components/schemas/NoulQuestion"},
-          {"$ref": "#/components/schemas/ChoiceQuestion"},
-          {"$ref": "#/components/schemas/ScoreQuestion"}
+          {
+            "$ref": "#/components/schemas/NoulQuestion"
+          },
+          {
+            "$ref": "#/components/schemas/ChoiceQuestion"
+          },
+          {
+            "$ref": "#/components/schemas/ScoreQuestion"
+          }
         ]
       },
       "EvaluationJSONStructure": {
         "oneOf": [
-          {"type": "string"},
-          {"type": "object", "additionalProperties": true},
-          {"type": "array", "items": {}}
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "additionalProperties": true
+          },
+          {
+            "type": "array",
+            "items": {}
+          }
         ]
       },
       "NoulQuestion": {
@@ -1800,7 +1857,9 @@
         "properties": {
           "type": {
             "type": "string",
-            "enum": ["noul"]
+            "enum": [
+              "noul"
+            ]
           },
           "instructions": {
             "$ref": "#/components/schemas/EvaluationJSONStructure"
@@ -1809,91 +1868,207 @@
             "type": "object",
             "minProperties": 1,
             "properties": {
-              "true": {"oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/EvaluationJSONStructure"}]},
-              "false": {"oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/EvaluationJSONStructure"}]}
+              "true": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/EvaluationJSONStructure"
+                  }
+                ]
+              },
+              "false": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/EvaluationJSONStructure"
+                  }
+                ]
+              }
             },
             "additionalProperties": false
           }
         },
-        "required": ["type", "instructions"],
+        "required": [
+          "type",
+          "instructions"
+        ],
         "additionalProperties": false
       },
       "ChoiceQuestion": {
         "type": "object",
         "properties": {
-          "type": {"type": "string", "enum": ["choice"]},
-          "instructions": {"$ref": "#/components/schemas/EvaluationJSONStructure"},
+          "type": {
+            "type": "string",
+            "enum": [
+              "choice"
+            ]
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/EvaluationJSONStructure"
+          },
           "criteria": {
             "type": "object",
             "minProperties": 2,
             "maxProperties": 255,
             "additionalProperties": {
-              "oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/EvaluationJSONStructure"}]
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/EvaluationJSONStructure"
+                }
+              ]
             }
           }
         },
-        "required": ["type", "instructions", "criteria"],
+        "required": [
+          "type",
+          "instructions",
+          "criteria"
+        ],
         "additionalProperties": false
       },
       "ScoreQuestion": {
         "type": "object",
         "properties": {
-          "type": {"type": "string", "enum": ["score"]},
-          "instructions": {"$ref": "#/components/schemas/EvaluationJSONStructure"},
+          "type": {
+            "type": "string",
+            "enum": [
+              "score"
+            ]
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/EvaluationJSONStructure"
+          },
           "criteria": {
             "type": "array",
             "minItems": 2,
             "maxItems": 10,
-            "items": {"$ref": "#/components/schemas/EvaluationJSONStructure"}
+            "items": {
+              "$ref": "#/components/schemas/EvaluationJSONStructure"
+            }
           }
         },
-        "required": ["type", "instructions", "criteria"],
+        "required": [
+          "type",
+          "instructions",
+          "criteria"
+        ],
         "additionalProperties": false
       },
       "EvaluationAnswer": {
         "description": "One native Jev answer. Noul is a numeric yes probability. Choice and Score confidence is a separate distribution statistic and must not be multiplied into the selected answer probability.",
         "oneOf": [
-          {"$ref": "#/components/schemas/NoulAnswer"},
-          {"$ref": "#/components/schemas/ChoiceAnswer"},
-          {"$ref": "#/components/schemas/ScoreAnswer"}
+          {
+            "$ref": "#/components/schemas/NoulAnswer"
+          },
+          {
+            "$ref": "#/components/schemas/ChoiceAnswer"
+          },
+          {
+            "$ref": "#/components/schemas/ScoreAnswer"
+          }
         ]
       },
       "NoulAnswer": {
         "type": "object",
         "properties": {
-          "type": {"type": "string", "enum": ["noul"]},
-          "noul": {"type": "number", "minimum": 0, "maximum": 1}
+          "type": {
+            "type": "string",
+            "enum": [
+              "noul"
+            ]
+          },
+          "noul": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
         },
-        "required": ["type", "noul"],
+        "required": [
+          "type",
+          "noul"
+        ],
         "additionalProperties": false
       },
       "ChoiceAnswer": {
         "type": "object",
         "properties": {
-          "type": {"type": "string", "enum": ["choice"]},
-          "choice": {"type": "string"},
+          "type": {
+            "type": "string",
+            "enum": [
+              "choice"
+            ]
+          },
+          "choice": {
+            "type": "string"
+          },
           "probabilities": {
             "type": "object",
-            "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}
+            "additionalProperties": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
           },
-          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
         },
-        "required": ["type", "choice", "probabilities", "confidence"],
+        "required": [
+          "type",
+          "choice",
+          "probabilities",
+          "confidence"
+        ],
         "additionalProperties": false
       },
       "ScoreAnswer": {
         "type": "object",
         "properties": {
-          "type": {"type": "string", "enum": ["score"]},
-          "score": {"type": "number", "minimum": 0, "maximum": 9},
+          "type": {
+            "type": "string",
+            "enum": [
+              "score"
+            ]
+          },
+          "score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 9
+          },
           "probabilities": {
             "type": "object",
-            "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}
+            "additionalProperties": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
           },
-          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-          "legend": {"type": "object", "additionalProperties": true}
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "legend": {
+            "type": "object",
+            "additionalProperties": true
+          }
         },
-        "required": ["type", "score", "probabilities", "confidence", "legend"],
+        "required": [
+          "type",
+          "score",
+          "probabilities",
+          "confidence",
+          "legend"
+        ],
         "additionalProperties": false
       },
       "EvaluationResponse": {
