@@ -364,6 +364,7 @@ func (p *PlanPool) prefetchRequest(request protocol.SessionPlanRequest) protocol
 	prefetch.Runtime = p.runtime
 	prefetch.Workload = p.workload
 	prefetch.Integration = request.Integration
+	prefetch.Request.ClientSessionID = ""
 	return prefetch
 }
 
@@ -398,6 +399,7 @@ func poolKeyFor(request protocol.SessionPlanRequest) (planKey, bool) {
 // it. Provider matching in LaunchPolicy is case-insensitive and trims space;
 // this mirrors that and nothing more.
 func normalizedRequestOptions(options protocol.RequestOptions) protocol.RequestOptions {
+	options.ClientSessionID = ""
 	options.Provider = strings.ToLower(strings.TrimSpace(options.Provider))
 	options.Model = strings.ToLower(strings.TrimSpace(options.Model))
 	options.Language = strings.ToLower(strings.TrimSpace(options.Language))
