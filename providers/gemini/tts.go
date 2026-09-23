@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,8 +33,15 @@ const (
 	// ride the path per request, so the catalog pins only the collection.
 	TTSEndpoint = "https://generativelanguage.googleapis.com/v1beta/models"
 
-	// TTSModel is the one model this adapter serves.
+	// TTSModel is the default model: the preview the boards have measured.
 	TTSModel = "gemini-3.1-flash-tts-preview"
+
+	// TTSModelFlash38 and TTSModelFlashLite38 are the stable Gemini 3.8 pair.
+	// They take the same generateContent body and prebuilt voice roster as the
+	// preview; the one wire difference is that a unary response now defaults
+	// to audio/wav (see ttsPCM).
+	TTSModelFlash38     = "gemini-3.8-flash-tts"
+	TTSModelFlashLite38 = "gemini-3.8-flash-lite-tts"
 
 	// TTSDefaultVoice matches the platform adapter's default so a bare relay
 	// request and a bare provider-direct request speak with the same voice.
@@ -72,7 +80,9 @@ const (
 
 // ttsModels are the model ids this adapter serves.
 var ttsModels = map[string]struct{}{
-	TTSModel: {},
+	TTSModel:            {},
+	TTSModelFlash38:     {},
+	TTSModelFlashLite38: {},
 }
 
 // TTSConfig controls local transport bounds. Provider identity, model,
@@ -551,13 +561,54 @@ func payloadAudio(payload ttsPayload) ([]byte, string, error) {
 			if err != nil {
 				return nil, "", fmt.Errorf("undecodable inline audio: %w", err)
 			}
-			audio = append(audio, decoded...)
+			pcm, err := ttsPCM(decoded)
+			if err != nil {
+				return nil, "", err
+			}
+			audio = append(audio, pcm...)
 		}
 		if candidate.FinishReason != "" {
 			finish = candidate.FinishReason
 		}
 	}
 	return audio, finish, nil
+}
+
+// ttsPCM returns the raw pcm_s16le inside one decoded inline part. The
+// preview answers with headerless audio/L16 on both arms; the 3.8 models wrap a
+// unary response in a RIFF/WAVE container by default, and a header spliced
+// into the canonical stream is an audible click. A headerless part passes
+// through untouched, which also covers a stream that headers only its first
+// part. The fmt chunk is checked because a container is the one place the
+// service can say it produced something other than the 24 kHz the plan pinned.
+func ttsPCM(audio []byte) ([]byte, error) {
+	if len(audio) < 12 || string(audio[0:4]) != "RIFF" || string(audio[8:12]) != "WAVE" {
+		return audio, nil
+	}
+	for offset := 12; offset+8 <= len(audio); {
+		size := int(binary.LittleEndian.Uint32(audio[offset+4 : offset+8]))
+		body := offset + 8
+		switch string(audio[offset : offset+4]) {
+		case "fmt ":
+			if size < 16 || body+16 > len(audio) {
+				return nil, errors.New("inline WAV audio has a truncated fmt chunk")
+			}
+			format := binary.LittleEndian.Uint16(audio[body:])
+			channels := binary.LittleEndian.Uint16(audio[body+2:])
+			rate := binary.LittleEndian.Uint32(audio[body+4:])
+			bits := binary.LittleEndian.Uint16(audio[body+14:])
+			// 0xFFFE is WAVE_FORMAT_EXTENSIBLE, which still carries plain PCM.
+			if (format != 1 && format != 0xFFFE) || channels != 1 || rate != ttsOutputSampleRateHz || bits != 16 {
+				return nil, fmt.Errorf("inline WAV audio is format %d, %d channel(s), %d Hz, %d-bit; want mono 16-bit PCM at %d Hz", format, channels, rate, bits, ttsOutputSampleRateHz)
+			}
+		case "data":
+			// A streamed container may carry a placeholder length, so the
+			// samples are everything after the chunk header.
+			return audio[body:], nil
+		}
+		offset = body + size + size&1
+	}
+	return nil, errors.New("inline WAV audio has no data chunk")
 }
 
 // doneData records a truncated generation on the AudioDone event. A STOP (or

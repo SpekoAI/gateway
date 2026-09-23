@@ -86,16 +86,18 @@ func TestModelsPublishesEveryCatalogEntry(t *testing.T) {
 	if !found {
 		t.Fatal("catalog does not publish elevenlabs stt")
 	}
-	wantSimba := map[string]bool{
+	wantMultiModel := map[string]bool{
 		"speechify:simba-3.2": false, "speechify:simba-3.0": false,
 		"speechify:simba-multilingual": false, "speechify:simba-english": false,
+		"gemini:gemini-3.1-flash-tts-preview": false, "gemini:gemini-3.8-flash-tts": false,
+		"gemini:gemini-3.8-flash-lite-tts": false,
 	}
 	for _, model := range catalog.Models {
-		if _, ok := wantSimba[model.ID]; ok {
-			wantSimba[model.ID] = true
+		if _, ok := wantMultiModel[model.ID]; ok {
+			wantMultiModel[model.ID] = true
 		}
 	}
-	for id, present := range wantSimba {
+	for id, present := range wantMultiModel {
 		if !present {
 			t.Errorf("catalog does not publish %s", id)
 		}
