@@ -115,8 +115,9 @@ var providerCatalog = []CatalogEntry{
 	// The endpoint is the bare models collection: the adapter appends the
 	// model id and picks the arm per utterance — SSE streaming for short text,
 	// the non-streaming blob for text long enough to hit the streaming arm's
-	// >60s truncation.
-	{Provider: "gemini", Kind: protocol.SessionKindTTS, Adapter: "gemini.tts.v1", DefaultModel: "gemini-3.1-flash-tts-preview", DefaultVoice: "Aoede", Transport: protocol.TransportHTTP, Endpoint: "https://generativelanguage.googleapis.com/v1beta/models"},
+	// >60s truncation. The 3.8 pair shares the body, roster and credential;
+	// the preview stays the default because it is the one the boards measured.
+	{Provider: "gemini", Kind: protocol.SessionKindTTS, Adapter: "gemini.tts.v1", DefaultModel: "gemini-3.1-flash-tts-preview", Models: []string{"gemini-3.1-flash-tts-preview", "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"}, DefaultVoice: "Aoede", Transport: protocol.TransportHTTP, Endpoint: "https://generativelanguage.googleapis.com/v1beta/models"},
 	{Provider: "gradium", Kind: protocol.SessionKindSTT, Adapter: "gradium.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/asr"},
 	{Provider: "gradium", Kind: protocol.SessionKindTTS, Adapter: "gradium.tts.v1", DefaultModel: "default", DefaultVoice: "YTpq7expH9539ERJ", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/tts"},
 	// Hamsa's realtime socket takes one WHOLE-UTTERANCE WAV per message — the

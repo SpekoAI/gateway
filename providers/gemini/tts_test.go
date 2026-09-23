@@ -1,8 +1,10 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,13 +98,18 @@ func sseFrame(t *testing.T, audio []byte, finishReason string) string {
 
 func newTTSFixture(t *testing.T, handler http.HandlerFunc) (runtimepkg.ProviderStream, func()) {
 	t.Helper()
+	return newTTSFixtureFor(t, TTSModel, handler)
+}
+
+func newTTSFixtureFor(t *testing.T, model string, handler http.HandlerFunc) (runtimepkg.ProviderStream, func()) {
+	t.Helper()
 	server := httptest.NewServer(handler)
 	parsed, _ := url.Parse(server.URL)
 	adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	stream, err := adapter.Open(context.Background(), ttsAdapterRequest(server.URL+"/v1beta/models", TTSModel, ""))
+	stream, err := adapter.Open(context.Background(), ttsAdapterRequest(server.URL+"/v1beta/models", model, ""))
 	if err != nil {
 		server.Close()
 		t.Fatalf("open: %v", err)
@@ -476,5 +483,159 @@ func TestUndecodableBlobAudioIsAnError(t *testing.T) {
 	}
 	if providerErr := ttsErrorWithin(t, stream.Events()); providerErr.Code != "provider_unavailable" {
 		t.Fatalf("error = %+v, want provider_unavailable", providerErr)
+	}
+}
+
+// wavClip wraps pcm in the RIFF/WAVE container the 3.8 models return for a
+// unary request: a LIST chunk ahead of data, so the walk cannot assume the
+// canonical 44-byte layout, and the C2PA provenance chunk Gemini appends after
+// data, which must never reach the stream as samples.
+func wavClip(pcm []byte, sampleRate uint32) []byte {
+	return wavClipFormat(pcm, sampleRate, 1)
+}
+
+func wavClipFormat(pcm []byte, sampleRate uint32, formatTag uint16) []byte {
+	var chunks bytes.Buffer
+	chunk := func(id string, body []byte) {
+		chunks.WriteString(id)
+		_ = binary.Write(&chunks, binary.LittleEndian, uint32(len(body)))
+		chunks.Write(body)
+		if len(body)%2 == 1 {
+			chunks.WriteByte(0)
+		}
+	}
+	format := make([]byte, 16)
+	binary.LittleEndian.PutUint16(format[0:], formatTag)
+	binary.LittleEndian.PutUint16(format[2:], 1) // mono
+	binary.LittleEndian.PutUint32(format[4:], sampleRate)
+	binary.LittleEndian.PutUint32(format[8:], sampleRate*2)
+	binary.LittleEndian.PutUint16(format[12:], 2)
+	binary.LittleEndian.PutUint16(format[14:], 16)
+	chunk("fmt ", format)
+	chunk("LIST", []byte("INFOx"))
+	chunk("data", pcm)
+	chunk("C2PA", bytes.Repeat([]byte{0xC2}, 33))
+	var clip bytes.Buffer
+	clip.WriteString("RIFF")
+	_ = binary.Write(&clip, binary.LittleEndian, uint32(4+chunks.Len()))
+	clip.WriteString("WAVE")
+	clip.Write(chunks.Bytes())
+	return clip.Bytes()
+}
+
+func blobResponse(t *testing.T, mimeType string, audio []byte) []byte {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"candidates": []any{map[string]any{
+		"content":      map[string]any{"parts": []any{map[string]any{"inlineData": map[string]any{"mimeType": mimeType, "data": base64.StdEncoding.EncodeToString(audio)}}}},
+		"finishReason": finishReasonStop,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func TestGemini38ModelsDialTheirOwnModelPath(t *testing.T) {
+	for _, model := range []string{TTSModelFlash38, TTSModelFlashLite38} {
+		t.Run(model, func(t *testing.T) {
+			paths := make(chan string, 1)
+			stream, cleanup := newTTSFixtureFor(t, model, func(w http.ResponseWriter, r *http.Request) {
+				paths <- r.URL.Path
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, sseFrame(t, []byte{1, 2}, finishReasonStop))
+			})
+			defer cleanup()
+			if err := stream.AppendText(context.Background(), "hello"); err != nil {
+				t.Fatal(err)
+			}
+			if err := stream.CommitText(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := <-paths, "/v1beta/models/"+model+streamGenerateContentSuffix; got != want {
+				t.Fatalf("path = %q, want %q", got, want)
+			}
+			if event := ttsEventWithin(t, stream.Events()); event.Type != protocol.EventAudioStarted {
+				t.Fatalf("event = %q", event.Type)
+			}
+			if event := ttsEventWithin(t, stream.Events()); string(event.Audio) != string([]byte{1, 2}) {
+				t.Fatalf("audio = %v", event.Audio)
+			}
+		})
+	}
+}
+
+// A unary 3.8 response is audio/wav by default. Only the samples may reach the
+// canonical pcm_s16le stream; the header would play as a click.
+func TestWAVWrappedBlobIsStrippedToPCM(t *testing.T) {
+	pcm := []byte{9, 8, 7, 6, 5, 4}
+	stream, cleanup := newTTSFixtureFor(t, TTSModelFlash38, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(blobResponse(t, "audio/wav", wavClip(pcm, ttsOutputSampleRateHz)))
+	})
+	defer cleanup()
+	long := strings.Repeat("a long sentence. ", ttsStreamMaxChars/16+1)
+	if err := stream.AppendText(context.Background(), long); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if event := ttsEventWithin(t, stream.Events()); event.Type != protocol.EventAudioStarted {
+		t.Fatalf("event = %q", event.Type)
+	}
+	if event := ttsEventWithin(t, stream.Events()); event.Type != protocol.EventAudioFrame || string(event.Audio) != string(pcm) {
+		t.Fatalf("frame = %q %v, want the bare samples %v", event.Type, event.Audio, pcm)
+	}
+	if event := ttsEventWithin(t, stream.Events()); event.Type != protocol.EventAudioDone {
+		t.Fatalf("event = %q", event.Type)
+	}
+}
+
+func TestWAVAtAnotherRateFailsTheUtterance(t *testing.T) {
+	stream, cleanup := newTTSFixtureFor(t, TTSModelFlashLite38, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(blobResponse(t, "audio/wav", wavClip([]byte{1, 2}, 16_000)))
+	})
+	defer cleanup()
+	long := strings.Repeat("a long sentence. ", ttsStreamMaxChars/16+1)
+	if err := stream.AppendText(context.Background(), long); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if providerErr := ttsErrorWithin(t, stream.Events()); providerErr.Code != "provider_unavailable" {
+		t.Fatalf("error = %+v, want provider_unavailable", providerErr)
+	}
+}
+
+func TestTTSPCMPassesHeaderlessAudioAndRejectsAHollowContainer(t *testing.T) {
+	raw := []byte{1, 2, 3, 4}
+	if got, err := ttsPCM(raw); err != nil || string(got) != string(raw) {
+		t.Fatalf("headerless = %v, %v; want it unchanged", got, err)
+	}
+	full := wavClip(nil, ttsOutputSampleRateHz)
+	dataAt := bytes.Index(full, []byte("data"))
+	if _, err := ttsPCM(full[:dataAt]); err == nil {
+		t.Fatal("a container with no data chunk was accepted")
+	}
+}
+
+// A placeholder length (a streamed container that could not know its size)
+// runs past the part, so the samples are everything after the chunk header.
+func TestTTSPCMTreatsAnOverrunningDataLengthAsAPlaceholder(t *testing.T) {
+	pcm := []byte{1, 2, 3, 4}
+	clip := wavClip(pcm, ttsOutputSampleRateHz)
+	dataAt := bytes.Index(clip, []byte("data"))
+	clip = clip[:dataAt+8+len(pcm)] // no trailing chunk
+	binary.LittleEndian.PutUint32(clip[dataAt+4:], 0xFFFFFFFF)
+	if got, err := ttsPCM(clip); err != nil || string(got) != string(pcm) {
+		t.Fatalf("placeholder = %v, %v; want %v", got, err, pcm)
+	}
+}
+
+func TestTTSPCMRejectsAnExtensibleContainer(t *testing.T) {
+	if _, err := ttsPCM(wavClipFormat([]byte{1, 2}, ttsOutputSampleRateHz, 0xFFFE)); err == nil {
+		t.Fatal("a WAVE_FORMAT_EXTENSIBLE container was accepted as plain PCM")
 	}
 }
