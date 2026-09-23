@@ -575,8 +575,8 @@ func payloadAudio(payload ttsPayload) ([]byte, string, error) {
 }
 
 // ttsPCM returns the raw pcm_s16le inside one decoded inline part. The
-// preview answers with headerless audio/L16 on both arms; the 3.8 models wrap a
-// unary response in a RIFF/WAVE container by default, and a header spliced
+// preview answers with headerless audio/L16 on both arms, and so does a 3.8
+// stream. A 3.8 unary response is a RIFF/WAVE container, and a header spliced
 // into the canonical stream is an audible click. A headerless part passes
 // through untouched, which also covers a stream that headers only its first
 // part. The fmt chunk is checked because a container is the one place the
@@ -597,13 +597,21 @@ func ttsPCM(audio []byte) ([]byte, error) {
 			channels := binary.LittleEndian.Uint16(audio[body+2:])
 			rate := binary.LittleEndian.Uint32(audio[body+4:])
 			bits := binary.LittleEndian.Uint16(audio[body+14:])
-			// 0xFFFE is WAVE_FORMAT_EXTENSIBLE, which still carries plain PCM.
-			if (format != 1 && format != 0xFFFE) || channels != 1 || rate != ttsOutputSampleRateHz || bits != 16 {
+			// Plain PCM only. Gemini sends format 1 (observed 2026-09-24).
+			// WAVE_FORMAT_EXTENSIBLE would need its SubFormat GUID checked
+			// before it could be trusted as PCM.
+			if format != 1 || channels != 1 || rate != ttsOutputSampleRateHz || bits != 16 {
 				return nil, fmt.Errorf("inline WAV audio is format %d, %d channel(s), %d Hz, %d-bit; want mono 16-bit PCM at %d Hz", format, channels, rate, bits, ttsOutputSampleRateHz)
 			}
 		case "data":
-			// A streamed container may carry a placeholder length, so the
-			// samples are everything after the chunk header.
+			// A complete container is not over at its samples: Gemini 3.8
+			// appends a C2PA provenance chunk after data (observed
+			// 2026-09-24), so a declared length that fits is honored. A length
+			// that overruns the part is a streaming placeholder, and the
+			// samples then run to the end.
+			if size <= len(audio)-body {
+				return audio[body : body+size], nil
+			}
 			return audio[body:], nil
 		}
 		offset = body + size + size&1

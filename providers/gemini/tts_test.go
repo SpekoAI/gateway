@@ -487,9 +487,14 @@ func TestUndecodableBlobAudioIsAnError(t *testing.T) {
 }
 
 // wavClip wraps pcm in the RIFF/WAVE container the 3.8 models return for a
-// unary request, with a LIST chunk ahead of data so the walk cannot assume the
-// canonical 44-byte layout.
+// unary request: a LIST chunk ahead of data, so the walk cannot assume the
+// canonical 44-byte layout, and the C2PA provenance chunk Gemini appends after
+// data, which must never reach the stream as samples.
 func wavClip(pcm []byte, sampleRate uint32) []byte {
+	return wavClipFormat(pcm, sampleRate, 1)
+}
+
+func wavClipFormat(pcm []byte, sampleRate uint32, formatTag uint16) []byte {
 	var chunks bytes.Buffer
 	chunk := func(id string, body []byte) {
 		chunks.WriteString(id)
@@ -500,7 +505,7 @@ func wavClip(pcm []byte, sampleRate uint32) []byte {
 		}
 	}
 	format := make([]byte, 16)
-	binary.LittleEndian.PutUint16(format[0:], 1) // PCM
+	binary.LittleEndian.PutUint16(format[0:], formatTag)
 	binary.LittleEndian.PutUint16(format[2:], 1) // mono
 	binary.LittleEndian.PutUint32(format[4:], sampleRate)
 	binary.LittleEndian.PutUint32(format[8:], sampleRate*2)
@@ -509,6 +514,7 @@ func wavClip(pcm []byte, sampleRate uint32) []byte {
 	chunk("fmt ", format)
 	chunk("LIST", []byte("INFOx"))
 	chunk("data", pcm)
+	chunk("C2PA", bytes.Repeat([]byte{0xC2}, 33))
 	var clip bytes.Buffer
 	clip.WriteString("RIFF")
 	_ = binary.Write(&clip, binary.LittleEndian, uint32(4+chunks.Len()))
@@ -608,9 +614,28 @@ func TestTTSPCMPassesHeaderlessAudioAndRejectsAHollowContainer(t *testing.T) {
 	if got, err := ttsPCM(raw); err != nil || string(got) != string(raw) {
 		t.Fatalf("headerless = %v, %v; want it unchanged", got, err)
 	}
-	hollow := wavClip(nil, ttsOutputSampleRateHz)
-	hollow = hollow[:len(hollow)-8] // drop the data chunk header
-	if _, err := ttsPCM(hollow); err == nil {
+	full := wavClip(nil, ttsOutputSampleRateHz)
+	dataAt := bytes.Index(full, []byte("data"))
+	if _, err := ttsPCM(full[:dataAt]); err == nil {
 		t.Fatal("a container with no data chunk was accepted")
+	}
+}
+
+// A placeholder length (a streamed container that could not know its size)
+// runs past the part, so the samples are everything after the chunk header.
+func TestTTSPCMTreatsAnOverrunningDataLengthAsAPlaceholder(t *testing.T) {
+	pcm := []byte{1, 2, 3, 4}
+	clip := wavClip(pcm, ttsOutputSampleRateHz)
+	dataAt := bytes.Index(clip, []byte("data"))
+	clip = clip[:dataAt+8+len(pcm)] // no trailing chunk
+	binary.LittleEndian.PutUint32(clip[dataAt+4:], 0xFFFFFFFF)
+	if got, err := ttsPCM(clip); err != nil || string(got) != string(pcm) {
+		t.Fatalf("placeholder = %v, %v; want %v", got, err, pcm)
+	}
+}
+
+func TestTTSPCMRejectsAnExtensibleContainer(t *testing.T) {
+	if _, err := ttsPCM(wavClipFormat([]byte{1, 2}, ttsOutputSampleRateHz, 0xFFFE)); err == nil {
+		t.Fatal("a WAVE_FORMAT_EXTENSIBLE container was accepted as plain PCM")
 	}
 }
