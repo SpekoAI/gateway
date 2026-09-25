@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -82,12 +83,51 @@ func TestTTSCommitTextSendsDocumentedRequest(t *testing.T) {
 		// `pcm` is documented as raw 24 kHz 16-bit signed little-endian with no
 		// header — the one format that needs no container stripping.
 		"response_format": "pcm",
-		// `audio` streams the samples themselves under chunked transfer encoding;
-		// `sse` would base64-inflate them and is rejected for tts-1/tts-1-hd.
-		"stream_format": "audio",
+		// `sse` base64-inflates the same PCM samples, and it is the ONLY arm
+		// that returns the input-text and output-audio token counts this model
+		// is billed on; `audio` returns no usage at all.
+		"stream_format": "sse",
 	}
 	if !reflect.DeepEqual(body, want) {
 		t.Fatalf("request body =\n%#v\nwant\n%#v", body, want)
+	}
+	if want := "text/event-stream, application/json"; got.header.Get("Accept") != want {
+		t.Errorf("Accept = %q, want %q", got.header.Get("Accept"), want)
+	}
+}
+
+// TestTTSLegacyModelsKeepTheRawAudioArm: the vendor documents `sse` as
+// unsupported for tts-1 and tts-1-hd, so asking for token usage on those two
+// would turn every synthesis into a 400. They keep the raw arm — and they are
+// also the two models with no published per-token price, so nothing is lost.
+func TestTTSLegacyModelsKeepTheRawAudioArm(t *testing.T) {
+	t.Parallel()
+
+	for _, model := range []string{"tts-1", "tts-1-hd"} {
+		t.Run(model, func(t *testing.T) {
+			t.Parallel()
+			bodies := make(chan []byte, 1)
+			server := newSpeechServer(t, func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				bodies <- body
+				_, _ = w.Write([]byte{1, 2, 3, 4})
+			})
+			defer server.Close()
+
+			stream := openTTS(t, server.URL, nil, func(request *runtimepkg.AdapterRequest) {
+				request.Plan.Route.Model = model
+			})
+			defer func() { _ = stream.Abort(context.Background()) }()
+			synthesizeTTS(t, stream, "Hello")
+
+			var body map[string]any
+			if err := json.Unmarshal(<-bodies, &body); err != nil {
+				t.Fatalf("request body is not JSON: %v", err)
+			}
+			if body["stream_format"] != "audio" {
+				t.Fatalf("%s stream_format = %v, want audio", model, body["stream_format"])
+			}
+		})
 	}
 }
 
@@ -150,7 +190,7 @@ func TestTTSStreamsFramesBeforeSynthesisCompletes(t *testing.T) {
 			t.Error("test server response does not support flushing")
 			return
 		}
-		_, _ = w.Write([]byte{1, 2, 3, 4})
+		_, _ = w.Write(speechDeltaFrame([]byte{1, 2, 3, 4}))
 		flusher.Flush()
 		select {
 		case <-firstFrameSeen:
@@ -158,14 +198,14 @@ func TestTTSStreamsFramesBeforeSynthesisCompletes(t *testing.T) {
 			t.Error("adapter never emitted a frame from the first flush")
 			return
 		}
-		_, _ = w.Write([]byte{5, 6, 7, 8})
+		_, _ = w.Write(speechDeltaFrame([]byte{5, 6, 7, 8}))
 		flusher.Flush()
-		_, _ = w.Write([]byte{9, 10, 11, 12})
+		_, _ = w.Write(speechDeltaFrame([]byte{9, 10, 11, 12}))
+		_, _ = w.Write(speechDoneFrame(14, 101))
 	})
 	defer server.Close()
 
-	// A 4-byte read window makes the frame count deterministic.
-	stream := openTTS(t, server.URL, func(config *TTSConfig) { config.AudioChunkBytes = 4 }, nil)
+	stream := openTTS(t, server.URL, nil, nil)
 	defer func() { _ = stream.Abort(context.Background()) }()
 
 	synthesizeTTS(t, stream, "Hello, world!")
@@ -202,6 +242,33 @@ func TestTTSStreamsFramesBeforeSynthesisCompletes(t *testing.T) {
 	if utteranceID(t, started) == "" || utteranceID(t, started) != utteranceID(t, done) {
 		t.Fatalf("utterance ids differ: %q vs %q", utteranceID(t, started), utteranceID(t, done))
 	}
+	// The terminal frame's token counts ride out with the same event. Nothing
+	// derives them from the synthesized text or from the audio byte count.
+	assertTTSBilling(t, done.Billing, "gpt-4o-mini-tts", map[string]int64{"input_tokens": 14_000, "output_audio_tokens": 101_000}, true)
+}
+
+// TestTTSWithoutATerminalUsageFrameWithholdsTheCharge: audio that arrives with
+// no speech.audio.done carries no token counts, and the character count the
+// caller submitted is not a substitute for either of them. The observation
+// stays incomplete so the attempt becomes an unresolved obligation instead of
+// being priced on an invented quantity.
+func TestTTSWithoutATerminalUsageFrameWithholdsTheCharge(t *testing.T) {
+	t.Parallel()
+
+	server := newSpeechServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(speechDeltaFrame([]byte{1, 2, 3, 4}))
+	})
+	defer server.Close()
+
+	stream := openTTS(t, server.URL, nil, nil)
+	defer func() { _ = stream.Abort(context.Background()) }()
+	synthesizeTTS(t, stream, "Hello, world!")
+
+	var done runtimepkg.ProviderEvent
+	for done.Type != protocol.EventAudioDone {
+		done = nextTTS(t, stream.Events())
+	}
+	assertTTSBilling(t, done.Billing, "gpt-4o-mini-tts", map[string]int64{}, false)
 }
 
 // TestTTSClassifiesRejections keeps a dead key, an exhausted balance, a
@@ -569,7 +636,7 @@ func TestTTSCancelStopsSynthesisWithoutReportingAFault(t *testing.T) {
 	release := make(chan struct{})
 	server := newSpeechServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		flusher, _ := w.(http.Flusher)
-		_, _ = w.Write([]byte{1, 2, 3, 4})
+		_, _ = w.Write(speechDeltaFrame([]byte{1, 2, 3, 4}))
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -578,7 +645,7 @@ func TestTTSCancelStopsSynthesisWithoutReportingAFault(t *testing.T) {
 	defer server.Close()
 	defer close(release)
 
-	stream := openTTS(t, server.URL, func(config *TTSConfig) { config.AudioChunkBytes = 4 }, nil)
+	stream := openTTS(t, server.URL, nil, nil)
 	defer func() { _ = stream.Abort(context.Background()) }()
 	synthesizeTTS(t, stream, "Hello")
 
@@ -602,6 +669,47 @@ func TestTTSCancelStopsSynthesisWithoutReportingAFault(t *testing.T) {
 }
 
 // --- helpers -------------------------------------------------------------
+
+// speechDeltaFrame and speechDoneFrame build the two /v1/audio/speech SSE
+// events verbatim: an `event:` name line, a `data:` JSON line, and the blank
+// line that terminates the frame. The literals are transcribed rather than
+// referenced from package constants so a renamed event type fails here.
+func speechDeltaFrame(pcm []byte) []byte {
+	payload, _ := json.Marshal(map[string]any{"type": "speech.audio.delta", "audio": base64.StdEncoding.EncodeToString(pcm)})
+	return []byte("event: speech.audio.delta\ndata: " + string(payload) + "\n\n")
+}
+
+func speechDoneFrame(inputTokens, outputTokens int) []byte {
+	payload, _ := json.Marshal(map[string]any{
+		"type": "speech.audio.done",
+		"usage": map[string]any{
+			"input_tokens": inputTokens, "output_tokens": outputTokens, "total_tokens": inputTokens + outputTokens,
+			"input_token_details": map[string]any{"text_tokens": inputTokens, "audio_tokens": 0},
+		},
+	})
+	return []byte("event: speech.audio.done\ndata: " + string(payload) + "\n\n")
+}
+
+func assertTTSBilling(t *testing.T, observation *protocol.BillingObservation, model string, quantities map[string]int64, complete bool) {
+	t.Helper()
+	if observation == nil {
+		t.Fatalf("event carries no billing observation")
+	}
+	if observation.Model != model || observation.Mode != "streaming" {
+		t.Errorf("billing identity = %q/%q, want %q/streaming", observation.Model, observation.Mode, model)
+	}
+	if observation.Complete != complete {
+		t.Errorf("billing complete = %v, want %v", observation.Complete, complete)
+	}
+	if !reflect.DeepEqual(observation.Quantities, quantities) {
+		t.Errorf("billing quantities = %v, want %v", observation.Quantities, quantities)
+	}
+	if complete {
+		if err := observation.Validate(); err != nil {
+			t.Errorf("observation does not validate: %v", err)
+		}
+	}
+}
 
 func newSpeechServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()

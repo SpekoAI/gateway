@@ -1,9 +1,11 @@
 package openai
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -55,14 +57,20 @@ const (
 	// 24 kHz audio mislabelled as its requested rate — audible as a pitch shift.
 	ttsSampleRateHz = 24_000
 
-	// ttsStreamFormat selects the raw chunked audio body rather than SSE.
-	// CONFIRMED raw: `stream_format` is `sse` | `audio`, defaults to `audio`,
-	// and "`sse` is not supported for `tts-1` or `tts-1-hd`". The `audio` form
-	// streams the samples themselves under `Transfer-Encoding: chunked`, so
-	// reading the body incrementally yields audio frames with no base64
-	// inflation and works for every model. It is sent explicitly so the wire
-	// stays deterministic if the vendor default ever changes.
-	ttsStreamFormat = "audio"
+	// stream_format is `sse` | `audio`, defaults to `audio`, and "`sse` is not
+	// supported for `tts-1` or `tts-1-hd`". Both are sent explicitly so the
+	// wire stays deterministic if the vendor default ever changes.
+	//
+	// The `audio` arm streams the samples themselves under
+	// `Transfer-Encoding: chunked` with no base64 inflation — but it returns NO
+	// usage at all, and gpt-4o-mini-tts is billed per input TEXT token and
+	// output AUDIO token, neither of which the accepted character count can
+	// stand in for. The `sse` arm carries the same PCM samples base64-encoded
+	// inside `speech.audio.delta` frames and ends with `speech.audio.done`,
+	// which carries those two token counts. So every model that supports SSE
+	// uses it, and the two legacy models that cannot keep the raw arm.
+	ttsStreamFormatAudio = "audio"
+	ttsStreamFormatSSE   = "sse"
 
 	// ttsMaxInputCharacters is the documented ceiling on `input`.
 	ttsMaxInputCharacters = 4_096
@@ -90,6 +98,18 @@ var ttsSupportedModels = map[string]struct{}{
 	"tts-1-hd":                   {},
 	"gpt-4o-mini-tts":            {},
 	"gpt-4o-mini-tts-2025-12-15": {},
+}
+
+// ttsSSEUnsupportedModels are the two models the vendor documents as unable to
+// serve `stream_format: "sse"`. They are also the two with no per-token price,
+// so nothing is lost by leaving them on the raw arm.
+var ttsSSEUnsupportedModels = map[string]struct{}{"tts-1": {}, "tts-1-hd": {}}
+
+func ttsStreamFormatFor(model string) string {
+	if _, legacy := ttsSSEUnsupportedModels[model]; legacy {
+		return ttsStreamFormatAudio
+	}
+	return ttsStreamFormatSSE
 }
 
 // TTSConfig controls local transport limits. Provider identity, model, voice,
@@ -412,12 +432,13 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		return err
 	}
 
+	streamFormat := ttsStreamFormatFor(s.model)
 	payload, err := json.Marshal(ttsSpeechRequest{
 		Model:          s.model,
 		Input:          text,
 		Voice:          s.voice,
 		ResponseFormat: ttsResponseFormat,
-		StreamFormat:   ttsStreamFormat,
+		StreamFormat:   streamFormat,
 	})
 	if err != nil {
 		s.abandonUtterance(utteranceID, requestCancel, done)
@@ -431,9 +452,14 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 	}
 	request.Header.Set("Authorization", s.authorization)
 	request.Header.Set("Content-Type", "application/json")
-	// The success body is raw samples; a failure body is JSON. Accepting both
-	// keeps an error response parseable instead of arriving as opaque bytes.
-	request.Header.Set("Accept", "application/octet-stream, application/json")
+	// The success body is raw samples on the audio arm and an event stream on
+	// the SSE one; a failure body is JSON on both. Accepting the failure shape
+	// too keeps an error response parseable instead of arriving as opaque bytes.
+	if streamFormat == ttsStreamFormatSSE {
+		request.Header.Set("Accept", "text/event-stream, application/json")
+	} else {
+		request.Header.Set("Accept", "application/octet-stream, application/json")
+	}
 
 	response, err := s.httpClient.Do(request)
 	if err != nil {
@@ -588,6 +614,10 @@ func (s *ttsStream) readResponse(utteranceID string, response *http.Response, re
 	}()
 
 	body := io.LimitReader(response.Body, s.maxResponseBytes)
+	if ttsStreamFormatFor(s.model) == ttsStreamFormatSSE {
+		s.readEventStream(utteranceID, body)
+		return
+	}
 	buffer := make([]byte, s.audioChunkBytes)
 	audioStarted := false
 	audioBytes := 0
@@ -650,6 +680,146 @@ func (s *ttsStream) readResponse(utteranceID string, response *http.Response, re
 		return
 	}
 	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: ttsUtteranceData(utteranceID)})
+}
+
+// ttsEventStreamProgress is the state one SSE response accumulates. It is owned
+// by the single reader goroutine, so it needs no lock.
+type ttsEventStreamProgress struct {
+	started bool
+	bytes   int
+	stopped bool
+	usage   json.RawMessage
+}
+
+// readEventStream consumes `stream_format: "sse"`. The frames carry the same
+// PCM samples as the raw arm, base64-encoded, and the terminal
+// `speech.audio.done` frame carries the token counts this route is billed on.
+// Audio still leaves this function frame by frame as it arrives.
+func (s *ttsStream) readEventStream(utteranceID string, body io.Reader) {
+	reader := bufio.NewReader(body)
+	progress := &ttsEventStreamProgress{}
+	var frame []byte
+	for {
+		line, readErr := reader.ReadString('\n')
+		// An event ends at a blank line; `data:` lines carry its payload and
+		// every other field (`event:`, `id:`, comments) is redundant here
+		// because each payload names its own `type`.
+		switch text := strings.TrimRight(line, "\r\n"); {
+		case text == "":
+			if !s.handleSpeechEvent(utteranceID, frame, progress) {
+				return
+			}
+			frame = frame[:0]
+		case strings.HasPrefix(text, "data:"):
+			frame = append(frame, strings.TrimPrefix(strings.TrimPrefix(text, "data:"), " ")...)
+		}
+		if readErr == nil {
+			continue
+		}
+		if !errors.Is(readErr, io.EOF) {
+			// A cancelled request tears the body mid-read. That is the caller's
+			// own Cancel/Abort, not a provider fault, so it stays silent.
+			if s.wasCanceled() || s.ctx.Err() != nil {
+				return
+			}
+			s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{
+				Code:      "provider_unavailable",
+				Message:   "OpenAI TTS audio stream ended unexpectedly",
+				Retryable: true,
+				Cause:     readErr,
+			}})
+			return
+		}
+		// A final frame with no trailing blank line still counts.
+		if !s.handleSpeechEvent(utteranceID, frame, progress) {
+			return
+		}
+		break
+	}
+
+	if s.wasCanceled() || s.ctx.Err() != nil || progress.stopped {
+		return
+	}
+	// A 200 that produced no audio is a failed synthesis wearing a success
+	// status. Reporting it keeps failure distinguishable from a short utterance.
+	if progress.bytes == 0 {
+		s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{
+			Code:      "provider_unavailable",
+			Message:   "OpenAI TTS completed without returning audio",
+			Retryable: true,
+		}})
+		return
+	}
+	// A stream that produced audio but no `speech.audio.done` carries no usage,
+	// so the observation stays incomplete and the charge is withheld rather
+	// than estimated from the audio that did arrive.
+	s.emit(runtimepkg.ProviderEvent{
+		Type:    protocol.EventAudioDone,
+		Data:    ttsUtteranceData(utteranceID),
+		Billing: ttsBilling(utteranceID, s.model, progress.usage),
+	})
+}
+
+// handleSpeechEvent processes one decoded SSE payload. It reports whether the
+// reader should keep going.
+func (s *ttsStream) handleSpeechEvent(utteranceID string, frame []byte, progress *ttsEventStreamProgress) bool {
+	if len(bytes.TrimSpace(frame)) == 0 {
+		return true
+	}
+	var event struct {
+		Type  string          `json:"type"`
+		Audio string          `json:"audio"`
+		Usage json.RawMessage `json:"usage"`
+		Error *sttErrorDetail `json:"error"`
+	}
+	if err := json.Unmarshal(frame, &event); err != nil {
+		progress.stopped = true
+		s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{
+			Code:      "provider_unavailable",
+			Message:   "OpenAI TTS sent a malformed audio event",
+			Retryable: true,
+			Cause:     err,
+		}})
+		return false
+	}
+	switch event.Type {
+	case "speech.audio.delta":
+		chunk, err := base64.StdEncoding.DecodeString(event.Audio)
+		if err != nil {
+			progress.stopped = true
+			s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{
+				Code:      "provider_unavailable",
+				Message:   "OpenAI TTS sent undecodable audio",
+				Retryable: true,
+				Cause:     err,
+			}})
+			return false
+		}
+		if len(chunk) == 0 {
+			return true
+		}
+		if !progress.started {
+			progress.started = true
+			if !s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: ttsUtteranceData(utteranceID)}) {
+				return false
+			}
+		}
+		progress.bytes += len(chunk)
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: ttsUtteranceData(utteranceID), Audio: chunk})
+	case "speech.audio.done":
+		progress.usage = append(json.RawMessage(nil), event.Usage...)
+	case "speech.audio.error":
+		progress.stopped = true
+		providerErr := &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "OpenAI TTS failed mid-synthesis", Retryable: true}
+		if event.Error != nil {
+			providerErr.Code = sttErrorCode(event.Error.Type, event.Error.Code)
+			providerErr.Retryable = providerErr.Code == "provider_rate_limited" || providerErr.Code == "provider_unavailable"
+		}
+		providerErr.Extensions = ttsExtension(append(json.RawMessage(nil), frame...))
+		s.emit(runtimepkg.ProviderEvent{Err: providerErr})
+		return false
+	}
+	return true
 }
 
 // emit reports whether the event was delivered. A false result means the stream
