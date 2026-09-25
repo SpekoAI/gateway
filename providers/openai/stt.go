@@ -227,6 +227,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		ctx:    streamCtx,
 		cancel: cancel,
 		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		model:  model,
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -403,6 +404,13 @@ type sttStream struct {
 	// partial is the running text of the CURRENT turn, owned solely by readLoop.
 	partial   string
 	sessionID string
+	// model is the transcription model the session was opened with. It names
+	// the operation the vendor billed, so it is kept rather than re-read from
+	// a frame: the socket never repeats it.
+	model string
+	// billedItems counts completed transcription items, so an item that
+	// arrives without an id still gets a distinct billing OperationID.
+	billedItems int64
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -622,6 +630,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		err := s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventTranscriptFinal,
 			Data:       sttTranscriptData(text, true, message),
+			Billing:    s.itemBilling(message),
 			Extensions: sttExtension(raw),
 		})
 		// Realtime transcription has no end-session control and does not close
@@ -672,6 +681,23 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			Extensions: sttExtension(raw),
 		})
 	}
+}
+
+// itemBilling records what the vendor says it billed for ONE completed
+// transcription item. The Realtime socket reports usage per item rather than
+// per session, so each item is its own operation and nothing is accumulated;
+// an item whose frame carries no usage — or usage in the other arm of the
+// vendor's union — stays incomplete, which withholds the charge instead of
+// inventing a quantity. Called only from readLoop, which owns this state.
+func (s *sttStream) itemBilling(message sttInboundMessage) *protocol.BillingObservation {
+	s.billedItems++
+	id := message.ItemID
+	if id == "" {
+		id = fmt.Sprintf("item-%d", s.billedItems)
+	}
+	observation := transcriptionBilling("item/"+id, s.model, "streaming", message.Usage)
+	observation.ProviderRequestID = s.sessionID
+	return observation
 }
 
 func (s *sttStream) emit(event runtimepkg.ProviderEvent) error {

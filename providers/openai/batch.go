@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -157,14 +159,20 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 			End     float64 `json:"end"`
 			Speaker string  `json:"speaker"`
 		} `json:"segments"`
-		Usage struct {
-			Type    string  `json:"type"`
-			Seconds float64 `json:"seconds"`
-		} `json:"usage"`
+		// Usage stays raw because it is a UNION: `{"type":"tokens",...}` for the
+		// per-token models and `{"type":"duration","seconds":n}` for the
+		// per-minute ones. Decoding it into one struct is what silently
+		// discarded input_tokens/output_tokens before.
+		Usage json.RawMessage `json:"usage"`
 	}
 	if err := batchhttp.DecodeJSON(response.Body, &payload); err != nil {
 		return nil, err
 	}
+	var usage struct {
+		Type    string  `json:"type"`
+		Seconds float64 `json:"seconds"`
+	}
+	_ = json.Unmarshal(payload.Usage, &usage)
 	result := &runtimepkg.BatchTranscription{
 		Text:              strings.TrimSpace(payload.Text),
 		Language:          payload.Language,
@@ -172,9 +180,12 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		ProviderRequestID: response.Header.Get("x-request-id"),
 		Extensions:        batchhttp.RawExtension(batchExtensionID, response.Body),
 	}
-	if result.DurationMS == 0 && payload.Usage.Type == "duration" {
-		result.DurationMS = batchhttp.SecondsToMS(payload.Usage.Seconds)
+	if result.DurationMS == 0 && usage.Type == "duration" {
+		result.DurationMS = batchhttp.SecondsToMS(usage.Seconds)
 	}
+	observation := batchBilling(model, payload.Usage, response.Body)
+	observation.ProviderRequestID = result.ProviderRequestID
+	result.Billing = metering.Report(observation)
 	for _, segment := range payload.Segments {
 		text := strings.TrimSpace(segment.Text)
 		if text == "" {
@@ -183,6 +194,22 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		result.Segments = append(result.Segments, runtimepkg.BatchSegment{Text: text, StartMS: batchhttp.SecondsToMS(segment.Start), EndMS: batchhttp.SecondsToMS(segment.End), Speaker: segment.Speaker})
 	}
 	return result, nil
+}
+
+// batchBilling normalizes the file endpoint's usage object for one request.
+//
+// The whisper-1 arm has a second provider-reported source: `verbose_json`
+// declares the processed audio as a top-level `duration`, which is the same
+// quantity the per-minute price is charged against. It is consulted only when
+// the response carries NO usage object at all, so a present-but-unreadable
+// usage still withholds the charge rather than being talked around. Neither
+// branch ever falls back to the audio the caller uploaded.
+func batchBilling(model string, usage, body json.RawMessage) *protocol.BillingObservation {
+	observation := transcriptionBilling("request", model, "batch", usage)
+	if observation.Complete || len(usage) > 0 || sttBillingBasis(model) != "duration" {
+		return observation
+	}
+	return metering.Duration("request", model, "batch", body, 1000, "duration")
 }
 
 // baseBatchLanguage lowers a BCP-47 tag to the ISO-639-1 code the `language`
