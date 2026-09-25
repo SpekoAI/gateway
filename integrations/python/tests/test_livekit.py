@@ -115,6 +115,80 @@ async def test_stream_maps_gateway_events_to_livekit() -> None:
     assert client.closed is False
 
 
+class SpeechEndedBeforeFinalStream(FakeStream):
+    async def events(self) -> AsyncIterator[LiveKitSpeechEvent]:
+        yield LiveKitSpeechEvent(type="speech.started", provider_request_id="dg-order-test")
+        yield LiveKitSpeechEvent(type="transcript.delta", text="hello")
+        await self.finished.wait()
+        self.final_received_while_open = not self.closed
+        # speech.ended arrives BEFORE transcript.final
+        yield LiveKitSpeechEvent(type="speech.ended")
+        yield LiveKitSpeechEvent(type="transcript.final", text="hello world")
+
+
+async def test_stream_handles_speech_ended_before_final_transcript() -> None:
+    client = FakeClient()
+    plugin = STT(client)  # type: ignore[arg-type]
+    fake_stream = SpeechEndedBeforeFinalStream()
+    stream = plugin.stream()
+    stream._bridge = FakeBridge(fake_stream)  # type: ignore[assignment]
+
+    stream.push_frame(frame())
+    stream.flush()
+    stream.end_input()
+    events = [event async for event in stream]
+
+    assert [event.type for event in events] == [
+        agents_stt.SpeechEventType.START_OF_SPEECH,
+        agents_stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        agents_stt.SpeechEventType.END_OF_SPEECH,
+        agents_stt.SpeechEventType.FINAL_TRANSCRIPT,
+    ]
+    assert events[3].alternatives[0].text == "hello world"
+    assert events[3].request_id == "dg-order-test"
+    assert stream._speaking is False
+
+    await plugin.aclose()
+
+
+class GoogleMultiTurnStream(FakeStream):
+    async def events(self) -> AsyncIterator[LiveKitSpeechEvent]:
+        # Turn 1: transcript.final followed by speech.ended
+        yield LiveKitSpeechEvent(type="transcript.final", text="turn one", provider_request_id="google-1")
+        yield LiveKitSpeechEvent(type="speech.ended")
+        # Turn 2: transcript.final followed by speech.ended
+        yield LiveKitSpeechEvent(type="transcript.final", text="turn two", provider_request_id="google-2")
+        yield LiveKitSpeechEvent(type="speech.ended")
+
+
+async def test_stream_handles_multi_turn_transcript_led_events() -> None:
+    client = FakeClient()
+    plugin = STT(client)  # type: ignore[arg-type]
+    fake_stream = GoogleMultiTurnStream()
+    stream = plugin.stream()
+    stream._bridge = FakeBridge(fake_stream)  # type: ignore[assignment]
+
+    stream.push_frame(frame())
+    stream.flush()
+    stream.end_input()
+    events = [event async for event in stream]
+
+    # Both turns must receive balanced START_OF_SPEECH, FINAL_TRANSCRIPT, and END_OF_SPEECH
+    assert [event.type for event in events] == [
+        agents_stt.SpeechEventType.START_OF_SPEECH,
+        agents_stt.SpeechEventType.FINAL_TRANSCRIPT,
+        agents_stt.SpeechEventType.END_OF_SPEECH,
+        agents_stt.SpeechEventType.START_OF_SPEECH,
+        agents_stt.SpeechEventType.FINAL_TRANSCRIPT,
+        agents_stt.SpeechEventType.END_OF_SPEECH,
+    ]
+    assert events[1].alternatives[0].text == "turn one"
+    assert events[4].alternatives[0].text == "turn two"
+    assert stream._speaking is False
+
+    await plugin.aclose()
+
+
 async def test_end_input_flushes_and_drains_final_events_before_close() -> None:
     plugin = STT(FakeClient())  # type: ignore[arg-type]
     fake_stream = FakeStream()
