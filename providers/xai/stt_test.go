@@ -74,10 +74,19 @@ func TestSTTHandshakeSendsDocumentedQueryParameters(t *testing.T) {
 				t.Errorf("query %s = %q, want %q", parameter, got, want)
 			}
 		}
-		// xAI's transcription API has no model field on either surface. Sending
-		// the plan's Speko catalog key would be inventing a parameter.
-		if got := query.Get("model"); got != "" {
-			t.Errorf("query model = %q, want it absent", got)
+		// The recogniser is PINNED. Omitting `model` does not keep serving the
+		// model we measured; it serves whatever xAI defaults to that day, which
+		// is how every Speko xAI transcription silently moved to 2.0 on
+		// 2026-09-18. The literal is spelled out rather than read from
+		// STTVendorModel, because a test that asks the adapter what it sent
+		// agrees with a typo.
+		if got := query.Get("model"); got != "grok-voice-transcribe-2.0" {
+			t.Errorf("query model = %q, want grok-voice-transcribe-2.0", got)
+		}
+		// And it must never be the plan's Speko catalog key, which xAI rejects
+		// as a model that does not exist.
+		if got := query.Get("model"); got == STTDefaultModel || got == "grok-stt" {
+			t.Errorf("query model = %q, which is a relay-side label, not an xAI model", got)
 		}
 		// endpointing has no documented "off" value (0 means "fire on any VAD
 		// boundary", not "never"), so the adapter must not guess one.
@@ -100,6 +109,47 @@ func TestSTTHandshakeSendsDocumentedQueryParameters(t *testing.T) {
 // credential-kind spellings: protocol.SessionPlan validation labels a relay
 // credential relay_access, while the relay connector that synthesizes plans
 // and drives this adapter directly labels the same key bearer.
+// TestSTTBillingNamesTheVendorModelNotTheCatalogLabel is the socket twin of
+// TestBatchBillingNamesTheVendorModelNotTheCatalogLabel. The plan this fake
+// runs names the catalog label "grok-stt"; the frozen billing variant is keyed
+// on what xAI actually ran, so an observation echoing the label would key a
+// charge on a model that never executed. The two surfaces are also priced
+// differently -- $0.20/hr streaming against $0.10/hr REST -- so Mode is
+// load-bearing too, and a streaming session mislabelled "batch" would bill
+// half.
+func TestSTTBillingNamesTheVendorModelNotTheCatalogLabel(t *testing.T) {
+	t.Parallel()
+
+	events := runSTTFrames(t, []map[string]any{
+		{"type": "transcript.created", "id": "xai-stt-session"},
+		{"type": "transcript.partial", "text": "hola mundo", "is_final": true, "speech_final": true, "start": 0.0, "duration": 1.2},
+		{"type": "transcript.done", "text": "Hola mundo.", "duration": 9.75},
+	})
+
+	var observed int
+	for _, event := range events {
+		if event.Billing == nil {
+			continue
+		}
+		observed++
+		if err := event.Billing.Validate(); err != nil {
+			t.Fatalf("observation does not validate: %v", err)
+		}
+		if event.Billing.Model != "grok-voice-transcribe-2.0" {
+			t.Fatalf("observation model = %q, want the executed xAI id", event.Billing.Model)
+		}
+		if event.Billing.Mode != "streaming" {
+			t.Fatalf("observation mode = %q, want streaming", event.Billing.Mode)
+		}
+		if !event.Billing.Complete || event.Billing.Quantities["duration_seconds"] != 9_750 {
+			t.Fatalf("observation = %+v, want a complete 9.75s", event.Billing)
+		}
+	}
+	if observed != 1 {
+		t.Fatalf("billing observations = %d, want exactly one from transcript.done", observed)
+	}
+}
+
 func TestSTTCredentialSourcesShareTheBearerHeader(t *testing.T) {
 	t.Parallel()
 

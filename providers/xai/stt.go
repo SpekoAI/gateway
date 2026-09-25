@@ -56,14 +56,45 @@ const (
 
 	// STTDefaultModel is a Speko catalog key, NOT an xAI model id.
 	//
-	// CONFIRMED (by absence): xAI's transcription API has no model parameter on
-	// either surface — the batch multipart field list and the streaming query
-	// parameter list both omit one — and the STT models page publishes no slug,
-	// only per-hour prices. A signed plan still has to name a concrete,
-	// non-"auto" model, so this string exists to satisfy that contract and to
-	// key telemetry. It is deliberately never sent upstream, exactly like
-	// DefaultModel on the TTS side.
+	// A signed plan has to name a concrete, non-"auto" model, so this string
+	// exists to satisfy that contract and to key telemetry. It is never sent
+	// upstream and it is not what the vendor bills; STTVendorModel is.
+	//
+	// The 2026-08-07 reading of this file recorded "CONFIRMED (by absence):
+	// xAI's transcription API has no model parameter on either surface". That
+	// was true of the documentation then and is false now — see STTVendorModel.
 	STTDefaultModel = "stt"
+
+	// STTVendorModel is the xAI model id this adapter pins on BOTH surfaces.
+	//
+	// CONFIRMED on docs.x.ai/developers/model-capabilities/audio/speech-to-text
+	// (read 2026-09-25): the model table lists grok-voice-transcribe-2.0, "Our
+	// best transcription model. Default when `model` is omitted", alongside
+	// grok-voice-transcribe-1.0, "Original model. Pin this slug to keep it."
+	// The parameter table carries `model` with a default of
+	// grok-voice-transcribe-2.0 and an enum of those two ids.
+	//
+	// Sending nothing is NOT "keep serving what we benchmarked", it is "serve
+	// whatever xAI defaults to today". That default already moved once, on
+	// 2026-09-18, and switched every Speko xAI transcription onto 2.0 with no
+	// deploy, no changelog and no board row. The vendor's own wording ("Pin
+	// this slug to keep it") says it will move again.
+	//
+	// The value pinned here is 2.0, which is what the endpoint already serves,
+	// so this changes the billed IDENTITY and not the served model. Whether 2.0
+	// is the right model is a separate, measured question -- it loses 2-3 WER
+	// points against 1.0 on spontaneous accented English while winning heavily
+	// on ja/ko -- and belongs to whoever owns routing, not to a billing fix.
+	//
+	// Pricing does not depend on which of the two is pinned: the Voice API
+	// price table (docs.x.ai/developers/pricing) splits Speech to Text by
+	// TRANSPORT only, "$0.10 / hr (REST), $0.20 / hr (Streaming)", and names no
+	// model -- unlike the Speech to Speech row directly beneath it, which does.
+	//
+	// It is exported because the control plane's frozen billing variants have
+	// to name the same id this adapter sends: a variant keyed on anything else
+	// fails settlement closed.
+	STTVendorModel = "grok-voice-transcribe-2.0"
 
 	// sttInterimResults pins xAI's `interim_results` query parameter on.
 	//
@@ -207,7 +238,6 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		cancel:               cancel,
 		events:               make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		maxPendingAudioBytes: a.maxPendingAudioBytes,
-		billingModel:         request.Plan.Route.Model,
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -268,8 +298,9 @@ func sttEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, opt
 	if endpoint.Path != sttPath {
 		return "", fmt.Errorf("xai stt endpoint path must be %s, got %q", sttPath, endpoint.Path)
 	}
-	// The model never reaches the wire (see STTDefaultModel), but a signed plan
-	// must still commit to one so telemetry and billing have a stable key.
+	// The catalog model is a relay-side label and never reaches the wire (see
+	// STTDefaultModel), but a signed plan must still commit to one so telemetry
+	// has a stable key. What reaches the wire is STTVendorModel, below.
 	if strings.TrimSpace(model) == "" || model == "auto" {
 		return "", errors.New("xai stt requires a concrete model in the session plan")
 	}
@@ -290,6 +321,9 @@ func sttEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, opt
 	}
 
 	query := endpoint.Query()
+	// Pin the recogniser. Omitting `model` floats every request onto whatever
+	// xAI defaults to on the day it runs; see STTVendorModel.
+	query.Set("model", STTVendorModel)
 	query.Set("sample_rate", strconv.Itoa(media.SampleRateHz))
 	query.Set("encoding", encoding)
 	query.Set("interim_results", sttInterimResults)
@@ -339,11 +373,10 @@ func sttEncoding(encoding string) (string, error) {
 // ---------------------------------------------------------------------------
 
 type sttStream struct {
-	billingModel string
-	conn         *websocket.Conn
-	ctx          context.Context
-	cancel       context.CancelFunc
-	events       chan runtimepkg.ProviderEvent
+	conn   *websocket.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+	events chan runtimepkg.ProviderEvent
 
 	maxPendingAudioBytes int
 
@@ -752,10 +785,14 @@ func (s *sttStream) handleDone(message sttInbound, raw json.RawMessage) error {
 	}
 	// `duration` is the total audio the session processed, which is the only
 	// metering quantity xAI reports for transcription.
+	//
+	// The observation names STTVendorModel, not the plan's catalog model: the
+	// frozen billing variant has to be keyed on the id the vendor ran, and
+	// "grok-stt" is a relay-side label xAI has never heard of.
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventUsageObserved,
 		Data:       marshalData(map[string]any{"provider_request_id": s.currentSessionID(), "audio_duration_ms": sttMilliseconds(message.Duration)}),
-		Billing:    billing.Duration("stream", s.billingModel, "streaming", raw, 1000, "duration"),
+		Billing:    billing.Duration("stream", STTVendorModel, "streaming", raw, 1000, "duration"),
 		Extensions: extension(raw),
 	})
 }
