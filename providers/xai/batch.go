@@ -18,8 +18,10 @@ const (
 	// BatchAdapterID identifies the xAI REST /v1/stt implementation.
 	BatchAdapterID = "xai.stt.batch.v1"
 	// BatchEndpoint is the REST twin of the wss://api.x.ai/v1/stt socket. xAI
-	// exposes one Grok STT service over both transports and takes no model
-	// parameter; the catalog's model id is a relay-side label.
+	// exposes one Grok STT service over both transports, priced by transport
+	// rather than by model ($0.10/hr REST, $0.20/hr streaming). The catalog's
+	// model id is a relay-side label; the id that reaches xAI on BOTH
+	// transports is STTVendorModel.
 	BatchEndpoint = "https://api.x.ai/v1/stt"
 	// BatchMaxAudioBytes is the documented ceiling ("500 MB", HTTP 413 above).
 	BatchMaxAudioBytes int64 = 500_000_000
@@ -84,7 +86,17 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if err != nil {
 		return nil, err
 	}
-	var fields []batchhttp.MultipartField
+	// `model` FIRST, and not merely for tidiness. xAI streams the upload into
+	// whichever recogniser it has already selected, so a `model` that arrives
+	// after `file` is rejected with "The 'model' field must be sent before
+	// 'file'". batchhttp.Multipart writes every field in slice order and the
+	// file part last, so leading the slice is what satisfies that rule.
+	//
+	// The failure this ordering prevents is invisible in the ordinary case: a
+	// wrong-order request naming the CURRENT DEFAULT still succeeds, so the bug
+	// only surfaces once someone pins the non-default model -- which is exactly
+	// the control arm a quality comparison needs.
+	fields := []batchhttp.MultipartField{{Name: "model", Value: STTVendorModel}}
 	if language := strings.TrimSpace(request.Options.Language); language != "" {
 		fields = append(fields, batchhttp.MultipartField{Name: "language", Value: language})
 	}
@@ -136,7 +148,10 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		}
 		words = append(words, batchhttp.Word{Text: word.Text, StartMS: batchhttp.SecondsToMS(word.Start), EndMS: batchhttp.SecondsToMS(word.End), Speaker: speaker})
 	}
-	observation := billing.Duration("request", request.Plan.Route.Model, "batch", response.Body, 1000, "duration")
+	// STTVendorModel, not the plan's catalog model: the frozen billing variant
+	// is keyed on the id xAI ran, and the catalog's "grok-stt" is a relay-side
+	// label on both the realtime and the batch row.
+	observation := billing.Duration("request", STTVendorModel, "batch", response.Body, 1000, "duration")
 	observation.ProviderRequestID = response.Header.Get("x-request-id")
 	return &runtimepkg.BatchTranscription{
 		Billing:           billing.Report(observation),
