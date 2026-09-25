@@ -164,6 +164,10 @@ var providerCatalog = []CatalogEntry{
 	// which this catalog does not publish.
 	{Provider: "meta", Kind: protocol.SessionKindSTT, Adapter: "meta.stt.v1", DefaultModel: "muse-voice-transcribe-1.0", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.meta.ai/v1/asr/realtime"},
 	{Provider: "speechify", Kind: protocol.SessionKindTTS, Adapter: "speechify.tts.v1", DefaultModel: "simba-3.0", Models: []string{"simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"}, DefaultVoice: "geffen_32", Transport: protocol.TransportHTTP, Endpoint: "https://api.speechify.ai/v1/audio/stream"},
+	// Nari Labs serves Qwen3-ASR and Qwen3-TTS in two serving classes each;
+	// the realtime socket adds intent=transcription itself.
+	{Provider: "nari", Kind: protocol.SessionKindSTT, Adapter: "nari.stt.v1", DefaultModel: "qwen3-asr-fast", Models: []string{"qwen3-asr-fast", "qwen3-asr"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.narilabs.com/v1/realtime"},
+	{Provider: "nari", Kind: protocol.SessionKindTTS, Adapter: "nari.tts.v1", DefaultModel: "qwen3-tts-fast", Models: []string{"qwen3-tts-fast", "qwen3-tts"}, DefaultVoice: "claire", Transport: protocol.TransportHTTP, Endpoint: "https://api.narilabs.com/v1/audio/speech"},
 	{Provider: "speechmatics", Kind: protocol.SessionKindSTT, Adapter: "speechmatics.stt.v1", DefaultModel: "standard", Models: []string{"standard", "enhanced"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://global.rt.speechmatics.com/v2/"},
 }
 

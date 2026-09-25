@@ -38,6 +38,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/meta"
 	"github.com/SpekoAI/gateway/providers/minimax"
 	"github.com/SpekoAI/gateway/providers/modulate"
+	"github.com/SpekoAI/gateway/providers/nari"
 	"github.com/SpekoAI/gateway/providers/openai"
 	"github.com/SpekoAI/gateway/providers/openailive"
 	"github.com/SpekoAI/gateway/providers/openairealtime"
@@ -294,6 +295,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	nariSTTAdapter, err := nari.NewSTT(nari.STTConfig{})
+	if err != nil {
+		return err
+	}
+	nariTTSAdapter, err := nari.NewTTS(nari.TTSConfig{})
+	if err != nil {
+		return err
+	}
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
 		fishAdapter,
@@ -304,7 +313,7 @@ func run() error {
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
 		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
-		geminiSTTAdapter, geminiTTSAdapter, metaSTTAdapter,
+		geminiSTTAdapter, geminiTTSAdapter, metaSTTAdapter, nariSTTAdapter, nariTTSAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {
