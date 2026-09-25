@@ -284,6 +284,9 @@ type sttStream struct {
 	uncommitted    bool
 	pendingCommits int
 	openItems      map[string]struct{}
+	// drainErr is set when Close gives up on finals still owed. The reader
+	// reports it: only the reader may send once it can close the events.
+	drainErr *runtimepkg.ProviderError
 
 	terminalMu  sync.Mutex
 	terminalErr error
@@ -398,19 +401,31 @@ func (s *sttStream) drainThenClose() {
 	}
 	// A commit or item still open here is a final the caller never gets, so
 	// the session must not end as a success.
+	owed := false
 	if timedOut {
-		if commits, items := s.outstanding(); commits > 0 || items > 0 {
-			s.fail(&runtimepkg.ProviderError{
+		s.stateMu.Lock()
+		if s.pendingCommits > 0 || len(s.openItems) > 0 {
+			owed = true
+			s.drainErr = &runtimepkg.ProviderError{
 				Code:      "request_timeout",
-				Message:   fmt.Sprintf("Nari STT did not finalize %d commit(s) and %d item(s) within %s of close", commits, items, s.drainTimeout),
+				Message:   fmt.Sprintf("Nari STT did not finalize %d commit(s) and %d item(s) within %s of close", s.pendingCommits, len(s.openItems), s.drainTimeout),
 				Retryable: false,
-			})
+			}
 		}
+		s.stateMu.Unlock()
 	}
 	s.closed.Store(true)
 	s.writeMu.Lock()
 	_ = s.conn.Close(websocket.StatusNormalClosure, "")
 	s.writeMu.Unlock()
+	// The close ends the reader's Read; give it a moment to report drainErr
+	// before the context cancels its send.
+	if owed {
+		select {
+		case <-s.done:
+		case <-time.After(time.Second):
+		}
+	}
 	s.cancel()
 }
 
@@ -418,12 +433,6 @@ func (s *sttStream) drained() bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	return s.pendingCommits == 0 && len(s.openItems) == 0
-}
-
-func (s *sttStream) outstanding() (commits, items int) {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	return s.pendingCommits, len(s.openItems)
 }
 
 // Abort tears the socket down immediately after a terminal runtime failure.
@@ -646,6 +655,14 @@ func (s *sttStream) transcriptData(message serverMessage, text string, final boo
 // reported twice; anything else is classified from the close frame, whose
 // reason carries the error code when the service sets one.
 func (s *sttStream) finish(err error) {
+	s.stateMu.Lock()
+	drainErr := s.drainErr
+	s.stateMu.Unlock()
+	if drainErr != nil {
+		drainErr.Cause = err
+		s.fail(drainErr)
+		return
+	}
 	if s.closed.Load() || (s.inputClosed.Load() && isNormalClose(err)) {
 		s.settleSetup(&runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Nari STT closed before the session was configured", Retryable: true, Cause: err})
 		return

@@ -196,7 +196,7 @@ func TestTruncatedStreamIsAFailureNotAShortUtterance(t *testing.T) {
 	}
 }
 
-func TestInputLimitCountsBufferedCodePoints(t *testing.T) {
+func TestInputLimitCountsTrimmedCodePoints(t *testing.T) {
 	t.Parallel()
 	adapter, err := NewTTS(TTSConfig{})
 	if err != nil {
@@ -207,8 +207,10 @@ func TestInputLimitCountsBufferedCodePoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
-	if err := stream.AppendText(context.Background(), strings.Repeat("é", maxInputCodePoints)); err != nil {
-		t.Fatalf("2048 code points must fit: %v", err)
+	// Nari trims surrounding whitespace before counting, so padding around
+	// 2048 code points still fits.
+	if err := stream.AppendText(context.Background(), "  "+strings.Repeat("é", maxInputCodePoints)+"\n"); err != nil {
+		t.Fatalf("2048 code points with surrounding whitespace must fit: %v", err)
 	}
 	var providerErr *runtimepkg.ProviderError
 	if err := stream.AppendText(context.Background(), "x"); !errors.As(err, &providerErr) || providerErr.Code != "input_too_large" {
@@ -216,8 +218,8 @@ func TestInputLimitCountsBufferedCodePoints(t *testing.T) {
 	}
 }
 
-// Whitespace counts toward the buffer, so a client cannot grow it without
-// bound by appending fragments the vendor would trim.
+// Whitespace the vendor would trim still counts toward the byte bound, so a
+// client cannot grow the buffer without limit.
 func TestWhitespaceFloodIsBounded(t *testing.T) {
 	t.Parallel()
 	adapter, err := NewTTS(TTSConfig{})
@@ -229,18 +231,20 @@ func TestWhitespaceFloodIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+	chunk := strings.Repeat(" ", 1<<10)
+	appends := maxInputBytes / len(chunk)
 	var providerErr *runtimepkg.ProviderError
-	for i := 0; i <= maxInputCodePoints; i++ {
-		err := stream.AppendText(context.Background(), " ")
+	for i := 0; i <= appends; i++ {
+		err := stream.AppendText(context.Background(), chunk)
 		if err == nil {
 			continue
 		}
-		if !errors.As(err, &providerErr) || providerErr.Code != "input_too_large" || i != maxInputCodePoints {
-			t.Fatalf("append %d: error = %v, want input_too_large at %d", i, err, maxInputCodePoints)
+		if !errors.As(err, &providerErr) || providerErr.Code != "input_too_large" || i != appends {
+			t.Fatalf("append %d: error = %v, want input_too_large at %d", i, err, appends)
 		}
 		return
 	}
-	t.Fatal("whitespace appends past the cap were accepted")
+	t.Fatal("whitespace appends past the byte bound were accepted")
 }
 
 // A vendor that accepts the connection but never answers must not hold

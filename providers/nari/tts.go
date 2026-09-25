@@ -31,6 +31,9 @@ const (
 
 	speechPath         = "/v1/audio/speech"
 	maxInputCodePoints = 2_048
+	// maxInputBytes keeps the JSON body under Nari's 64 KiB limit with room
+	// for the other fields.
+	maxInputBytes      = 60 << 10
 	outputSampleRateHz = 24_000
 
 	defaultTTSEventBuffer   = 32
@@ -233,7 +236,13 @@ func (s *ttsStream) AppendText(_ context.Context, text string) error {
 	if s.inFlight {
 		return errors.New("nari tts previous utterance has not completed")
 	}
-	if utf8.RuneCountInString(s.pending.String())+utf8.RuneCountInString(text) > maxInputCodePoints {
+	// Nari counts code points after trimming surrounding whitespace, so the
+	// buffer is checked the same way. The raw byte bound stops whitespace from
+	// growing it past what the 64 KiB request body can carry.
+	if s.pending.Len()+len(text) > maxInputBytes {
+		return &runtimepkg.ProviderError{Code: "input_too_large", Message: "Nari TTS input exceeds the request size limit", Retryable: false, ProviderStatus: http.StatusRequestEntityTooLarge}
+	}
+	if utf8.RuneCountInString(strings.TrimSpace(s.pending.String()+text)) > maxInputCodePoints {
 		return &runtimepkg.ProviderError{Code: "input_too_large", Message: "Nari TTS input exceeds 2048 characters", Retryable: false, ProviderStatus: http.StatusRequestEntityTooLarge}
 	}
 	s.pending.WriteString(text)
@@ -279,7 +288,16 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		requestCancel()
 	})
 	response, err := s.httpClient.Do(request)
-	headerTimer.Stop()
+	// Stop reporting false means the callback ran or is running, so the
+	// request context is cancelled even if headers arrived: that context also
+	// carries the audio body, so the response cannot be used.
+	if !headerTimer.Stop() {
+		headerTimedOut.Store(true)
+		if err == nil {
+			_ = response.Body.Close()
+			err = context.Canceled
+		}
+	}
 	if err != nil {
 		s.abandonRequest(requestCancel, done)
 		if headerTimedOut.Load() {
