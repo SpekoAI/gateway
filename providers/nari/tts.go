@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -37,6 +38,7 @@ const (
 	defaultMaxErrorBytes    = 8 << 10
 	defaultAudioChunkBytes  = 8 << 10
 	defaultCloseIdleTimeout = 30 * time.Second
+	defaultHeaderTimeout    = 10 * time.Second
 )
 
 // ttsModels are the two serving classes of Qwen3-TTS 1.7B. They share one
@@ -55,8 +57,11 @@ type TTSConfig struct {
 	// GracefulCloseIdleTimeout bounds inactivity after Close begins. It resets
 	// whenever response bytes arrive, so progressing synthesis is not capped.
 	GracefulCloseIdleTimeout time.Duration
-	AllowedEndpointHosts     []string
-	AllowInsecureEndpoint    bool
+	// HeaderTimeout bounds the wait for the response status line. It does not
+	// bound the streamed body, which lasts as long as the utterance.
+	HeaderTimeout         time.Duration
+	AllowedEndpointHosts  []string
+	AllowInsecureEndpoint bool
 }
 
 // TTSAdapter implements POST /v1/audio/speech with a streamed PCM body.
@@ -68,6 +73,7 @@ type TTSAdapter struct {
 	maxResponseBytes         int64
 	maxErrorBytes            int64
 	gracefulCloseIdleTimeout time.Duration
+	headerTimeout            time.Duration
 	endpointPolicy           upstream.HTTPPolicy
 }
 
@@ -91,8 +97,11 @@ func NewTTS(config TTSConfig) (*TTSAdapter, error) {
 	if config.GracefulCloseIdleTimeout == 0 {
 		config.GracefulCloseIdleTimeout = defaultCloseIdleTimeout
 	}
-	if config.EventBuffer < 1 || config.AudioChunkBytes < 1 || config.MaxResponseBytes < 1 || config.MaxErrorBytes < 1 || config.GracefulCloseIdleTimeout < 0 {
-		return nil, errors.New("nari tts: event buffer, chunk size, response bounds and close timeout must be positive")
+	if config.HeaderTimeout == 0 {
+		config.HeaderTimeout = defaultHeaderTimeout
+	}
+	if config.EventBuffer < 1 || config.AudioChunkBytes < 1 || config.MaxResponseBytes < 1 || config.MaxErrorBytes < 1 || config.GracefulCloseIdleTimeout < 0 || config.HeaderTimeout < 0 {
+		return nil, errors.New("nari tts: event buffer, chunk size, response bounds and timeouts must be positive")
 	}
 	policy, err := upstream.NewHTTPPolicy(officialHost, config.AllowedEndpointHosts, config.AllowInsecureEndpoint)
 	if err != nil {
@@ -101,7 +110,7 @@ func NewTTS(config TTSConfig) (*TTSAdapter, error) {
 	return &TTSAdapter{
 		id: config.AdapterID, httpClient: config.HTTPClient, eventBuffer: config.EventBuffer,
 		audioChunkBytes: config.AudioChunkBytes, maxResponseBytes: config.MaxResponseBytes, maxErrorBytes: config.MaxErrorBytes,
-		gracefulCloseIdleTimeout: config.GracefulCloseIdleTimeout, endpointPolicy: policy,
+		gracefulCloseIdleTimeout: config.GracefulCloseIdleTimeout, headerTimeout: config.HeaderTimeout, endpointPolicy: policy,
 	}, nil
 }
 
@@ -157,7 +166,7 @@ func (a *TTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequest) 
 		ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), responseProgress: make(chan struct{}, 1),
 		httpClient: client, endpoint: endpoint.String(), credential: credential.Value,
 		audioChunkBytes: a.audioChunkBytes, maxResponseBytes: a.maxResponseBytes, maxErrorBytes: a.maxErrorBytes,
-		gracefulCloseIdleTimeout: a.gracefulCloseIdleTimeout, model: model, voice: ttsVoice(request.Options.Voice, request.Plan.Route.Voice),
+		gracefulCloseIdleTimeout: a.gracefulCloseIdleTimeout, headerTimeout: a.headerTimeout, model: model, voice: ttsVoice(request.Options.Voice, request.Plan.Route.Voice),
 	}, nil
 }
 
@@ -186,6 +195,7 @@ type ttsStream struct {
 	maxResponseBytes         int64
 	maxErrorBytes            int64
 	gracefulCloseIdleTimeout time.Duration
+	headerTimeout            time.Duration
 	model                    string
 	voice                    string
 
@@ -208,8 +218,9 @@ func (s *ttsStream) WriteAudio(context.Context, []byte) error {
 func (s *ttsStream) CommitAudio(context.Context) error { return runtimepkg.ErrUnsupportedOperation }
 
 // AppendText buffers a fragment: the endpoint takes the whole utterance in
-// one request. The limit is counted the way the vendor counts it, in code
-// points after trimming surrounding whitespace.
+// one request. The vendor counts code points after trimming surrounding
+// whitespace; the raw count is checked instead, so whitespace-only appends
+// cannot grow the buffer past the cap.
 func (s *ttsStream) AppendText(_ context.Context, text string) error {
 	if text == "" {
 		return errors.New("nari tts text is empty")
@@ -222,7 +233,7 @@ func (s *ttsStream) AppendText(_ context.Context, text string) error {
 	if s.inFlight {
 		return errors.New("nari tts previous utterance has not completed")
 	}
-	if utf8.RuneCountInString(strings.TrimSpace(s.pending.String()+text)) > maxInputCodePoints {
+	if utf8.RuneCountInString(s.pending.String())+utf8.RuneCountInString(text) > maxInputCodePoints {
 		return &runtimepkg.ProviderError{Code: "input_too_large", Message: "Nari TTS input exceeds 2048 characters", Retryable: false, ProviderStatus: http.StatusRequestEntityTooLarge}
 	}
 	s.pending.WriteString(text)
@@ -260,9 +271,20 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 	request.Header.Set("Authorization", "Bearer "+s.credential)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "audio/pcm, application/json")
+	// The runtime holds its provider lock across CommitText, so a vendor that
+	// accepts the connection but never answers would wedge the session.
+	var headerTimedOut atomic.Bool
+	headerTimer := time.AfterFunc(s.headerTimeout, func() {
+		headerTimedOut.Store(true)
+		requestCancel()
+	})
 	response, err := s.httpClient.Do(request)
+	headerTimer.Stop()
 	if err != nil {
 		s.abandonRequest(requestCancel, done)
+		if headerTimedOut.Load() {
+			return &runtimepkg.ProviderError{Code: "request_timeout", Message: fmt.Sprintf("Nari TTS sent no response headers within %s", s.headerTimeout), Retryable: true, Cause: err}
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}

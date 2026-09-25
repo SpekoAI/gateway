@@ -385,14 +385,27 @@ func (s *sttStream) Close(ctx context.Context) error {
 func (s *sttStream) drainThenClose() {
 	timer := time.NewTimer(s.drainTimeout)
 	defer timer.Stop()
+	timedOut := false
 	for !s.drained() {
 		select {
 		case <-s.settled:
 			continue
 		case <-s.done:
 		case <-timer.C:
+			timedOut = true
 		}
 		break
+	}
+	// A commit or item still open here is a final the caller never gets, so
+	// the session must not end as a success.
+	if timedOut {
+		if commits, items := s.outstanding(); commits > 0 || items > 0 {
+			s.fail(&runtimepkg.ProviderError{
+				Code:      "request_timeout",
+				Message:   fmt.Sprintf("Nari STT did not finalize %d commit(s) and %d item(s) within %s of close", commits, items, s.drainTimeout),
+				Retryable: false,
+			})
+		}
 	}
 	s.closed.Store(true)
 	s.writeMu.Lock()
@@ -405,6 +418,12 @@ func (s *sttStream) drained() bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	return s.pendingCommits == 0 && len(s.openItems) == 0
+}
+
+func (s *sttStream) outstanding() (commits, items int) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.pendingCommits, len(s.openItems)
 }
 
 // Abort tears the socket down immediately after a terminal runtime failure.

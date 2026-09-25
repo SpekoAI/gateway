@@ -196,7 +196,7 @@ func TestTruncatedStreamIsAFailureNotAShortUtterance(t *testing.T) {
 	}
 }
 
-func TestInputLimitCountsTrimmedCodePoints(t *testing.T) {
+func TestInputLimitCountsBufferedCodePoints(t *testing.T) {
 	t.Parallel()
 	adapter, err := NewTTS(TTSConfig{})
 	if err != nil {
@@ -207,13 +207,76 @@ func TestInputLimitCountsTrimmedCodePoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
-	if err := stream.AppendText(context.Background(), "  "+strings.Repeat("é", maxInputCodePoints)+"  "); err != nil {
-		t.Fatalf("2048 code points inside whitespace must fit: %v", err)
+	if err := stream.AppendText(context.Background(), strings.Repeat("é", maxInputCodePoints)); err != nil {
+		t.Fatalf("2048 code points must fit: %v", err)
 	}
-	err = stream.AppendText(context.Background(), "x")
 	var providerErr *runtimepkg.ProviderError
-	if !errors.As(err, &providerErr) || providerErr.Code != "input_too_large" {
+	if err := stream.AppendText(context.Background(), "x"); !errors.As(err, &providerErr) || providerErr.Code != "input_too_large" {
 		t.Fatalf("AppendText error = %v, want input_too_large", err)
+	}
+}
+
+// Whitespace counts toward the buffer, so a client cannot grow it without
+// bound by appending fragments the vendor would trim.
+func TestWhitespaceFloodIsBounded(t *testing.T) {
+	t.Parallel()
+	adapter, err := NewTTS(TTSConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), ttsRequest("https://api.narilabs.com/v1/audio/speech", DefaultTTSModel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+	var providerErr *runtimepkg.ProviderError
+	for i := 0; i <= maxInputCodePoints; i++ {
+		err := stream.AppendText(context.Background(), " ")
+		if err == nil {
+			continue
+		}
+		if !errors.As(err, &providerErr) || providerErr.Code != "input_too_large" || i != maxInputCodePoints {
+			t.Fatalf("append %d: error = %v, want input_too_large at %d", i, err, maxInputCodePoints)
+		}
+		return
+	}
+	t.Fatal("whitespace appends past the cap were accepted")
+}
+
+// A vendor that accepts the connection but never answers must not hold
+// CommitText, and with it the runtime's provider lock, indefinitely.
+func TestCommitTextBoundsTheWaitForResponseHeaders(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		select {
+		case <-release:
+		case <-request.Context().Done():
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+	parsed, _ := url.Parse(server.URL)
+	adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true, HeaderTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), ttsRequest(server.URL+speechPath, DefaultTTSModel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+	if err := stream.AppendText(context.Background(), "Hello."); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err = stream.CommitText(context.Background())
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != "request_timeout" || !providerErr.Retryable {
+		t.Fatalf("CommitText error = %v, want retryable request_timeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("CommitText took %s, want it bounded by the header timeout", elapsed)
 	}
 }
 

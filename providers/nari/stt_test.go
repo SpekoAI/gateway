@@ -307,6 +307,38 @@ func TestCloseDrainsEveryItemOfASplitRecording(t *testing.T) {
 	}
 }
 
+// A final that never arrives is a transcript the caller lost; the drain
+// timeout must end the session with an error, not a clean close.
+func TestCloseDrainTimeoutReportsTheMissingFinal(t *testing.T) {
+	t.Parallel()
+	fake := newFakeRealtime(t)
+	fake.onCommit = []string{`{"type":"input_audio_buffer.committed","item_id":"owed","commit_reason":"manual"}`}
+	adapter, err := NewSTT(STTConfig{AllowedEndpointHosts: []string{fake.host()}, AllowInsecureEndpoint: true, SetupTimeout: 2 * time.Second, CloseDrainTimeout: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), sttRequest(fake.endpoint()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) })
+	if err := stream.WriteAudio(context.Background(), make([]byte, 3_200)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var providerErr *runtimepkg.ProviderError
+	for _, event := range drain(t, stream) {
+		if errors.As(event.Err, &providerErr) {
+			break
+		}
+	}
+	if providerErr == nil || providerErr.Code != "request_timeout" || providerErr.Retryable || !strings.Contains(providerErr.Message, "1 item") {
+		t.Fatalf("terminal error = %v, want non-retryable request_timeout naming the open item", providerErr)
+	}
+}
+
 func TestCommitEmptyReleasesClose(t *testing.T) {
 	t.Parallel()
 	fake := newFakeRealtime(t)
