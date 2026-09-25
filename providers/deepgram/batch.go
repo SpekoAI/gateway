@@ -10,6 +10,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -147,7 +148,8 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if response.Status < 200 || response.Status >= 300 {
 		return nil, batchhttp.StatusError(batchExtensionID, response.Status, response.Body)
 	}
-	return parseBatchResponse(response.Body)
+	language, features := billingDimensions(query, batchBaseQueryKeys)
+	return parseBatchResponse(response.Body, model, language, features)
 }
 
 type batchResponse struct {
@@ -178,7 +180,7 @@ type batchResponse struct {
 	} `json:"results"`
 }
 
-func parseBatchResponse(body []byte) (*runtimepkg.BatchTranscription, error) {
+func parseBatchResponse(body []byte, model, language string, features []string) (*runtimepkg.BatchTranscription, error) {
 	var payload batchResponse
 	if err := batchhttp.DecodeJSON(body, &payload); err != nil {
 		return nil, err
@@ -187,7 +189,16 @@ func parseBatchResponse(body []byte) (*runtimepkg.BatchTranscription, error) {
 		return nil, batchhttp.Malformed(errors.New("deepgram response carries no channel alternative"))
 	}
 	alternative := payload.Results.Channels[0].Alternatives[0]
+	// metadata.duration is the audio duration Deepgram processed and the one
+	// quantity the prerecorded route bills. `detect_language` reaches this
+	// point as a feature, so a response whose tier the vendor chose is
+	// reported unpriceable instead of billed at the mono rate.
+	observation := metering.Duration("request", model, "batch", body, 1000, "metadata", "duration")
+	observation.ProviderRequestID = payload.Metadata.RequestID
+	observation.Language = language
+	observation.Features = features
 	result := &runtimepkg.BatchTranscription{
+		Billing:           metering.Report(observation),
 		Text:              strings.TrimSpace(alternative.Transcript),
 		Language:          payload.Results.Channels[0].DetectedLanguage,
 		DurationMS:        batchhttp.SecondsToMS(payload.Metadata.Duration),

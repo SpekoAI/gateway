@@ -13,6 +13,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -182,7 +183,14 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	// a failure: silent or speech-free audio legitimately yields no text, and
 	// the other batch adapters surface that as text "" rather than a
 	// provider error.
+	// durationMilliseconds is Azure's own processed-audio figure and the
+	// quantity the fast-transcription SKU bills. Taking it from the response
+	// rather than from the bytes the relay uploaded is what keeps a partial
+	// or silence-trimmed transcription billed at what Azure charged.
+	observation := metering.Duration("request", model, "batch", response.Body, 1, "durationMilliseconds")
+	observation.ProviderRequestID = requestID(response.Header)
 	return &runtimepkg.BatchTranscription{
+		Billing:           metering.Report(observation),
 		Text:              text,
 		Segments:          segments,
 		Language:          decoded.language(),
