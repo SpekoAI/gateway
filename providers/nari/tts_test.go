@@ -232,7 +232,7 @@ func TestWhitespaceFloodIsBounded(t *testing.T) {
 	}
 	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
 	chunk := strings.Repeat(" ", 1<<10)
-	appends := maxInputBytes / len(chunk)
+	appends := maxEncodedInputBytes / (len(chunk) + 2)
 	var providerErr *runtimepkg.ProviderError
 	for i := 0; i <= appends; i++ {
 		err := stream.AppendText(context.Background(), chunk)
@@ -245,6 +245,25 @@ func TestWhitespaceFloodIsBounded(t *testing.T) {
 		return
 	}
 	t.Fatal("whitespace appends past the byte bound were accepted")
+}
+
+// JSON escaping doubles a newline, so the bound is measured on the encoded
+// body: raw bytes under the limit can still encode past Nari's 64 KiB.
+func TestEscapedInputIsMeasuredEncoded(t *testing.T) {
+	t.Parallel()
+	adapter, err := NewTTS(TTSConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), ttsRequest("https://api.narilabs.com/v1/audio/speech", DefaultTTSModel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+	var providerErr *runtimepkg.ProviderError
+	if err := stream.AppendText(context.Background(), strings.Repeat("\n", 40_000)+"Hello."); !errors.As(err, &providerErr) || providerErr.Code != "input_too_large" {
+		t.Fatalf("AppendText error = %v, want input_too_large", err)
+	}
 }
 
 // A vendor that accepts the connection but never answers must not hold

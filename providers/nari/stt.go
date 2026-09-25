@@ -655,26 +655,31 @@ func (s *sttStream) transcriptData(message serverMessage, text string, final boo
 // reported twice; anything else is classified from the close frame, whose
 // reason carries the error code when the service sets one.
 func (s *sttStream) finish(err error) {
-	s.stateMu.Lock()
-	drainErr := s.drainErr
-	s.stateMu.Unlock()
-	if drainErr != nil {
-		drainErr.Cause = err
-		s.fail(drainErr)
-		return
-	}
-	if s.closed.Load() || (s.inputClosed.Load() && isNormalClose(err)) {
-		s.settleSetup(&runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Nari STT closed before the session was configured", Retryable: true, Cause: err})
-		return
-	}
 	status := websocket.CloseStatus(err)
 	var closeErr websocket.CloseError
 	reason := ""
 	if errors.As(err, &closeErr) {
 		reason = strings.TrimSpace(closeErr.Reason)
 	}
+	code := reasonCode(reason)
+	// A close that carries Nari's error code, or an abnormal status, says why
+	// the finals never came, and its retryability decides failover. Only a
+	// plain close falls back to the drain timeout.
+	vendorError := code != "" || status == websocket.StatusPolicyViolation || status == websocket.StatusMessageTooBig
+	s.stateMu.Lock()
+	drainErr := s.drainErr
+	s.stateMu.Unlock()
+	if drainErr != nil && !vendorError {
+		drainErr.Cause = err
+		s.fail(drainErr)
+		return
+	}
+	if drainErr == nil && (s.closed.Load() || (s.inputClosed.Load() && isNormalClose(err))) {
+		s.settleSetup(&runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Nari STT closed before the session was configured", Retryable: true, Cause: err})
+		return
+	}
 	var failure *runtimepkg.ProviderError
-	switch code := reasonCode(reason); {
+	switch {
 	case code != "":
 		failure = providerError("Nari STT closed the session", &errorDetail{Code: code}, 0, nil)
 	case status == websocket.StatusPolicyViolation:

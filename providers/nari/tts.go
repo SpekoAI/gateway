@@ -31,10 +31,10 @@ const (
 
 	speechPath         = "/v1/audio/speech"
 	maxInputCodePoints = 2_048
-	// maxInputBytes keeps the JSON body under Nari's 64 KiB limit with room
-	// for the other fields.
-	maxInputBytes      = 60 << 10
-	outputSampleRateHz = 24_000
+	// maxEncodedInputBytes keeps the JSON body under Nari's 64 KiB limit with
+	// room for the other fields.
+	maxEncodedInputBytes = 60 << 10
+	outputSampleRateHz   = 24_000
 
 	defaultTTSEventBuffer   = 32
 	defaultMaxResponseBytes = 64 << 20
@@ -237,12 +237,14 @@ func (s *ttsStream) AppendText(_ context.Context, text string) error {
 		return errors.New("nari tts previous utterance has not completed")
 	}
 	// Nari counts code points after trimming surrounding whitespace, so the
-	// buffer is checked the same way. The raw byte bound stops whitespace from
-	// growing it past what the 64 KiB request body can carry.
-	if s.pending.Len()+len(text) > maxInputBytes {
+	// buffer is checked the same way. The encoded bound stops whitespace from
+	// growing it past what the 64 KiB request body can carry; it measures the
+	// JSON form because escaping can multiply a control character's size.
+	candidate := s.pending.String() + text
+	if encoded, err := json.Marshal(candidate); err != nil || len(encoded) > maxEncodedInputBytes {
 		return &runtimepkg.ProviderError{Code: "input_too_large", Message: "Nari TTS input exceeds the request size limit", Retryable: false, ProviderStatus: http.StatusRequestEntityTooLarge}
 	}
-	if utf8.RuneCountInString(strings.TrimSpace(s.pending.String()+text)) > maxInputCodePoints {
+	if utf8.RuneCountInString(strings.TrimSpace(candidate)) > maxInputCodePoints {
 		return &runtimepkg.ProviderError{Code: "input_too_large", Message: "Nari TTS input exceeds 2048 characters", Retryable: false, ProviderStatus: http.StatusRequestEntityTooLarge}
 	}
 	s.pending.WriteString(text)
