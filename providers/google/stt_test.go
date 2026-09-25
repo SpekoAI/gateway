@@ -422,6 +422,106 @@ func TestSTTUsageObservedCarriesTheGoogleRequestID(t *testing.T) {
 	})
 }
 
+// TestSTTBillingCarriesTheVendorBilledDuration pins the metering evidence, not
+// the event payload: billed_duration_ms in Data is a debugging aid that the
+// runtime does not read, so a duration that reaches only Data is a duration
+// that never reaches a bill.
+//
+// The quantity asserted here is Google's OWN totalBilledDuration, deliberately
+// NOT the duration of the audio the test submitted: those two numbers are the
+// same only for single-channel audio with no vendor rounding, and confusing
+// them is exactly how a per-channel charge gets silently halved. Each case
+// therefore uses a billed duration that no local measurement of the submitted
+// audio could produce.
+func TestSTTBillingCarriesTheVendorBilledDuration(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name           string
+		responseBody   string
+		header         string
+		wantComplete   bool
+		wantDurationMS int64
+		wantRequestID  string
+	}{
+		{
+			name:           "from response metadata",
+			responseBody:   `{"results":[],"metadata":{"requestId":"req-billed","totalBilledDuration":"7.250s"}}`,
+			wantComplete:   true,
+			wantDurationMS: 7_250,
+			wantRequestID:  "req-billed",
+		},
+		{
+			// metadata arrived and carried a billed duration, but no requestId.
+			// The header fallback must still publish the quantity: losing the
+			// charge because a correlation id was missing would be the worst of
+			// both outcomes.
+			name:           "metadata without a request id still bills",
+			responseBody:   `{"results":[],"metadata":{"totalBilledDuration":"3.001s"}}`,
+			header:         "header-billed",
+			wantComplete:   true,
+			wantDurationMS: 3_001,
+			wantRequestID:  "header-billed",
+		},
+		{
+			// No vendor duration anywhere. The observation must stay INCOMPLETE
+			// rather than substituting submitted audio: an unresolved attempt is
+			// recoverable, an invented quantity is not.
+			name:          "no vendor duration is incomplete, never inferred",
+			responseBody:  `{"results":[],"metadata":{"requestId":"req-no-duration"}}`,
+			wantComplete:  false,
+			wantRequestID: "req-no-duration",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := newRecognizeServer(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				if test.header != "" {
+					w.Header().Set("X-Goog-Request-Id", test.header)
+				}
+				writeRecognizeResponse(t, w, test.responseBody)
+			})
+			defer server.Close()
+
+			stream := openSTTStream(t, server, protocol.CredentialsBYOK, nil)
+			sttListen(t, stream, sttSamplePCM(64))
+			events := collectSTTEvents(t, stream.Events(), 2)
+			if events[0].Type != protocol.EventUsageObserved {
+				t.Fatalf("first event = %s, want usage.observed", events[0].Type)
+			}
+			observation := events[0].Billing
+			if observation == nil {
+				t.Fatal("usage.observed carries no billing observation")
+			}
+			if err := observation.Validate(); err != nil {
+				t.Fatalf("observation does not validate: %v", err)
+			}
+			if observation.Complete != test.wantComplete {
+				t.Fatalf("complete = %v, want %v (quantities %v)", observation.Complete, test.wantComplete, observation.Quantities)
+			}
+			if got := observation.Quantities["duration_seconds"]; got != test.wantDurationMS {
+				t.Fatalf("duration_seconds = %d thousandths, want %d", got, test.wantDurationMS)
+			}
+			if !test.wantComplete && len(observation.Quantities) != 0 {
+				t.Fatalf("incomplete observation invented quantities %v", observation.Quantities)
+			}
+			if observation.Model != DefaultSTTModel || observation.Mode != "sync" {
+				t.Fatalf("observation identity = %q/%q, want %q/sync", observation.Model, observation.Mode, DefaultSTTModel)
+			}
+			if observation.ProviderRequestID != test.wantRequestID {
+				t.Fatalf("provider request id = %q, want %q", observation.ProviderRequestID, test.wantRequestID)
+			}
+			if observation.Channels != 1 {
+				t.Fatalf("channels = %d, want the 1 the request declared", observation.Channels)
+			}
+			if strings.TrimSpace(observation.OperationID) == "" {
+				t.Fatal("observation has no operation id, so two recognitions would merge into one charge")
+			}
+			closeSTTStream(t, stream)
+		})
+	}
+}
+
 // TestSTTHandlesMembersInAnyOrder: proto3 JSON promises no member ordering, so
 // a decoder that assumes results-then-metadata would drop metering on a
 // service that serializes the other way. An unknown member must be skipped

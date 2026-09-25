@@ -951,11 +951,12 @@ func (s *sttStream) streamTranscripts(ctx context.Context, response *http.Respon
 	}
 
 	var (
-		results     int
-		lastEndMS   int64
-		haveEndMS   bool
-		requestID   string
-		usageEmited bool
+		results        int
+		lastEndMS      int64
+		haveEndMS      bool
+		requestID      string
+		billedDuration string
+		usageEmited    bool
 	)
 	for decoder.More() {
 		keyToken, keyErr := decoder.Token()
@@ -1017,11 +1018,13 @@ func (s *sttStream) streamTranscripts(ctx context.Context, response *http.Respon
 				return sttErrorEvent(&runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Google STT returned malformed response metadata", Retryable: true, Cause: unmarshalErr})
 			}
 			requestID = strings.TrimSpace(metadata.RequestID)
+			billedDuration = strings.TrimSpace(metadata.TotalBilledDuration)
 			if requestID != "" {
 				usageEmited = true
 				if emitErr := s.emit(runtimepkg.ProviderEvent{
 					Type:       protocol.EventUsageObserved,
 					Data:       sttUsageData(requestID, metadata.TotalBilledDuration),
+					Billing:    s.billingObservation(recognitionID, requestID, billedDuration),
 					Extensions: sttExtension(raw),
 				}); emitErr != nil {
 					return nil
@@ -1044,7 +1047,7 @@ func (s *sttStream) streamTranscripts(ctx context.Context, response *http.Respon
 	// metering event entirely.
 	if !usageEmited {
 		if headerID := sttProviderRequestID(response.Header); headerID != "" {
-			if emitErr := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: sttUsageData(headerID, "")}); emitErr != nil {
+			if emitErr := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: sttUsageData(headerID, billedDuration), Billing: s.billingObservation(recognitionID, headerID, billedDuration)}); emitErr != nil {
 				return nil
 			}
 		}
@@ -1193,6 +1196,45 @@ func sttSpeechEndedData(recognitionID string, results int, lastEndMS int64, have
 		data["audio_end_ms"] = lastEndMS
 	}
 	return sttMarshalData(data)
+}
+
+// billingObservation converts RecognitionResponseMetadata.totalBilledDuration
+// into the trusted metering evidence for one :recognize call.
+//
+// The quantity is Google's OWN billed duration, not the audio the relay
+// submitted and not a wall clock. That distinction is what makes the
+// per-channel rule free: Cloud Speech-to-Text bills each channel of a
+// multi-channel recording separately, and totalBilledDuration is already the
+// summed billed figure, so the value must be reported verbatim and never
+// multiplied by audioChannelCount a second time. Channels is carried alongside
+// as classification only, so an auditor can see what the request declared.
+//
+// Mode is "sync": v2 :recognize is the synchronous recognition endpoint, and
+// it is the ONLY surface this adapter drives. The discounted
+// batchRecognize/dynamic-batch SKU takes Cloud Storage input that this relay
+// does not host, so no request priced here can land on it.
+//
+// metering.Quantity cannot read this field: totalBilledDuration is a proto3
+// google.protobuf.Duration, which serializes as the JSON STRING "3.500s", and
+// Quantity rejects strings by design rather than guessing at a unit. The
+// observation is therefore assembled here from the parser this file already
+// uses for every other duration member. A response that carries no parseable
+// duration yields an INCOMPLETE observation, which leaves the attempt
+// unresolved for an operator instead of inventing a quantity.
+func (s *sttStream) billingObservation(recognitionID, providerRequestID, totalBilledDuration string) *protocol.BillingObservation {
+	observation := &protocol.BillingObservation{
+		ProviderRequestID: providerRequestID,
+		OperationID:       recognitionID,
+		Model:             s.model,
+		Mode:              "sync",
+		Quantities:        map[string]int64{},
+		Channels:          int64(s.audioChannelCount),
+	}
+	if billedMS, ok := sttDurationMilliseconds(totalBilledDuration); ok && billedMS >= 0 {
+		observation.Quantities["duration_seconds"] = billedMS
+		observation.Complete = true
+	}
+	return observation
 }
 
 func sttUsageData(requestID, totalBilledDuration string) json.RawMessage {
