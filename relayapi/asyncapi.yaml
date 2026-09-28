@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:242942b57b61fa7fcd17486943cccf2f2f7ccbbdb61199b5ce195b2e63b5d8df
-# yaml-body: sha256:5f38b028573e0b942e673a96cf82ceef13464aff853abfd9c6dc2ae7040256f7
+# json-mirror: asyncapi.json sha256:cea2dcfb0a3e7f8bc34d6ba98cd2bc4f5a407eac2705c6d5ba16e20e9632e5c3
+# yaml-body: sha256:0c32325ba5095ea6e252e3a28bf8f6b99af1e6e4110fd783895c96fcf667e170
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -20,12 +20,13 @@ info:
   version: "1.0.0"
   description: >-
     WebSocket contract of the Speko Router: streaming speech-to-text and
-    text-to-speech sessions, plus the three native speech-to-speech routes.
+    text-to-speech sessions, plus the four native speech-to-speech routes.
     On the STT and TTS routes JSON text frames carry the control messages and
     events documented here and binary frames carry raw audio in the format
     the session.configure frame declared, with no JSON envelope. On
-    /v1/realtime, /v1/live and /v1/bidi the Router speaks the OpenAI/xAI
-    Realtime, GPT-Live and Gemini Live protocols natively: audio travels
+    /v1/realtime, /v1/live, /v1/bidi and /v1/realtime/translations/qwen the
+    Router speaks the OpenAI/xAI Realtime, GPT-Live, Gemini Live and Alibaba
+    LiveTranslate protocols natively: audio travels
     base64-encoded inside the vendor's own JSON events, the Router forwards a
     bounded set of vendor commands and every vendor server event verbatim,
     and only its own error frame is Router-shaped. The Go types in package
@@ -235,6 +236,76 @@ channels:
     subscribe:
       operationId: receiveRealtimeEvents
       summary: OpenAI/xAI Realtime server events, plus the Router error frame.
+      message:
+        oneOf:
+          - $ref: "#/components/messages/nativeServerEvent"
+          - $ref: "#/components/messages/wsError"
+  /v1/realtime/translations/qwen:
+    description: >-
+      Alibaba Qwen LiveTranslate speech-to-speech translation, spoken
+      natively (alibaba.livetranslate.v1). The model is selected exactly with
+      the `model` query parameter
+      (/v1/realtime/translations/qwen?model=qwen3.8-livetranslate-flash-realtime)
+      and the idempotency content hash is the SHA-256 of that model value.
+      The session is not conversational: there is no assistant turn, no
+      response.create and no instructions. After connecting, send the
+      vendor's session.update with session.translation.language (the target
+      language) and optionally output_modalities, voice,
+      input_audio_transcription, translation.corpus and turn_detection. Then
+      stream input_audio_buffer.append events (base64 mono PCM16 at 16 kHz).
+      input_audio_buffer.commit and input_audio_buffer.clear are forwarded.
+      Every other command, including input_image_buffer.append, is refused
+      with invalid_request. The Router pins the audio formats (PCM16 in at
+      16 kHz, PCM16 out at 24 kHz), so a session.update that names another
+      format or sample rate is refused. The client receives every vendor
+      server event verbatim: session.created, session.updated,
+      conversation.item.input_audio_transcription.text/.completed (the
+      source), response.audio_transcript.delta and response.text.delta (the
+      translation), response.audio.delta (the translated speech), and
+      response.done with the vendor's token usage. Send session.finish to
+      end the session and keep reading until session.finished: the Router
+      forwards the finish upstream so the last segment is translated, then
+      closes. Closing the socket without session.finish drops the final
+      segment.
+    parameters:
+      model:
+        description: Exact LiveTranslate model id from GET /v1/models rows whose endpoint is /v1/realtime/translations/qwen.
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+    bindings:
+      ws:
+        method: GET
+        query:
+          type: object
+          properties:
+            model:
+              type: string
+              minLength: 1
+              maxLength: 128
+          required:
+            - model
+        headers:
+          type: object
+          properties:
+            Idempotency-Key:
+              type: string
+              minLength: 1
+              maxLength: 256
+              description: >-
+                Required on the upgrade request. The content hash covers the
+                exact `model` query value.
+          required:
+            - Idempotency-Key
+    publish:
+      operationId: sendQwenTranslationEvents
+      summary: LiveTranslate client events, forwarded to the model.
+      message:
+        $ref: "#/components/messages/nativeClientEvent"
+    subscribe:
+      operationId: receiveQwenTranslationEvents
+      summary: LiveTranslate server events, plus the Router error frame.
       message:
         oneOf:
           - $ref: "#/components/messages/nativeServerEvent"

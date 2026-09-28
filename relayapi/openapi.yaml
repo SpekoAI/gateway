@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:f165e19f9646b42843b0acbc37f29aad6d27e0323528c1cc70d6683bedf9033b
-# yaml-body: sha256:a15c80ceb051a4cd3ce2faf76c675e1b505328606617910e6356f2210a7e866f
+# json-mirror: openapi.json sha256:6c2d948eb4100189cba74e60de3a2e46807307e821e1a52cf14878b950f56850
+# yaml-body: sha256:3294fae563ee1580ef245d587b2634bae2f1d6119019f3875a5f79719d174258
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -875,22 +875,25 @@ components:
           $ref: "#/components/schemas/BatchAudioLimits"
         endpoint:
           type: string
-          enum: [/v1/realtime, /v1/live, /v1/bidi]
+          enum: [/v1/realtime, /v1/live, /v1/bidi, /v1/realtime/translations/qwen]
           description: >-
             The public Router WebSocket route an S2S model is served on;
             omitted for every other kind, whose routes are fixed per kind.
             Select the model exactly: /v1/realtime takes it as the `model`
             query parameter, /v1/live in the first session.start frame,
-            /v1/bidi in the first setup frame. A model sent to another route
-            is refused with capability_unsupported.
+            /v1/bidi in the first setup frame, and
+            /v1/realtime/translations/qwen as the `model` query parameter. A
+            model sent to another route is refused with
+            capability_unsupported.
         protocol:
           type: string
-          enum: [openai.realtime.v1, xai.realtime.v1, openai.live.v1, google.live.v1]
+          enum: [openai.realtime.v1, xai.realtime.v1, openai.live.v1, google.live.v1, alibaba.livetranslate.v1]
           description: >-
             The native event protocol the S2S route speaks; omitted for every
             other kind. It also tells a client how to frame its messages: the
-            OpenAI, xAI, and GPT-Live protocols tag every message by "type";
-            google.live.v1 uses its single top-level key.
+            OpenAI, xAI, GPT-Live and Alibaba LiveTranslate protocols tag
+            every message by "type"; google.live.v1 uses its single top-level
+            key.
         benchmark:
           $ref: "#/components/schemas/ModelBenchmark"
       required:

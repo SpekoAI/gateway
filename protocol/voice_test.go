@@ -19,6 +19,7 @@ func TestSpeechProtocolsAndPublicRoutes(t *testing.T) {
 		{protocol.SpeechProtocolOpenAILiveV1, "/v1/live"},
 		{protocol.SpeechProtocolGoogleLiveV1, "/v1/bidi"},
 		{protocol.SpeechProtocolXAIRealtimeV1, "/v1/realtime"},
+		{protocol.SpeechProtocolAlibabaLiveTranslateV1, "/v1/realtime/translations/qwen"},
 	} {
 		if !protocol.ValidSpeechProtocol(tc.protocol) {
 			t.Fatalf("%s must be valid", tc.protocol)
@@ -34,6 +35,25 @@ func TestSpeechProtocolsAndPublicRoutes(t *testing.T) {
 	// selects the protocol before the session configuration is built.
 	if protocol.SpeechProtocolOpenAIRealtimeV1.PublicRoute() != protocol.SpeechProtocolXAIRealtimeV1.PublicRoute() {
 		t.Fatal("realtime-shaped protocols must share /v1/realtime")
+	}
+
+	// LiveTranslate reuses Realtime event NAMES but is not conversational:
+	// nothing may ask it for a response or edit a conversation it does not
+	// have, audio rides the media path, session.finish is the hop-owned
+	// close, and image frames are held back until they are bounded and priced.
+	translate := protocol.SpeechProtocolAlibabaLiveTranslateV1
+	for _, name := range []string{"session.update", "input_audio_buffer.commit", "input_audio_buffer.clear"} {
+		if !protocol.ProviderControlAllowed(translate, name) {
+			t.Fatalf("livetranslate must allow %s", name)
+		}
+	}
+	for _, name := range []string{"response.create", "response.cancel", "conversation.item.create", "input_audio_buffer.append", "input_image_buffer.append", "session.finish", "session.close"} {
+		if protocol.ProviderControlAllowed(translate, name) {
+			t.Fatalf("livetranslate must refuse %s", name)
+		}
+	}
+	if types := protocol.ProviderControlTypes(translate); len(types) != 3 || types[0] != "input_audio_buffer.clear" {
+		t.Fatalf("livetranslate control types = %v", types)
 	}
 }
 

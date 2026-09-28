@@ -280,7 +280,7 @@ revisions coexist by construction:
 - Speech-to-speech relay plans (`kind: "s2s"`) additionally assert the
   native `protocol` the model speaks (`protocol.SpeechProtocol`:
   `openai.realtime.v1`, `openai.live.v1`, `google.live.v1`,
-  `xai.realtime.v1`). The connector verifies it against its embedded catalog
+  `xai.realtime.v1`, `alibaba.livetranslate.v1`). The connector verifies it against its embedded catalog
   before reading a credential and dispatches the matching adapter, so one
   provider can serve two protocols. Live plans may carry the
   `backend_input`, `backend_output`, and `backend_tools` budget groups

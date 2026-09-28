@@ -14,8 +14,8 @@ import (
 // on wss://api.openai.com/v1/live/sessions. Catalog rows carry the protocol,
 // signed relay plans assert it, connectors verify it before touching a
 // credential, and the Router exposes the realtime-shaped protocols, GPT-Live,
-// and Gemini Live
-// natively on their own public routes (/v1/realtime, /v1/live, /v1/bidi).
+// Gemini Live, and Alibaba LiveTranslate natively on their own public routes
+// (/v1/realtime, /v1/live, /v1/bidi, /v1/realtime/translations/qwen).
 type SpeechProtocol string
 
 const (
@@ -38,12 +38,24 @@ const (
 	// protocol with its own session body. Public route: GET
 	// /v1/realtime?model=<id>; the exact model selects this protocol.
 	SpeechProtocolXAIRealtimeV1 SpeechProtocol = "xai.realtime.v1"
+	// SpeechProtocolAlibabaLiveTranslateV1 is Alibaba Model Studio's
+	// LiveTranslate event protocol (qwen3.8-livetranslate-flash-realtime):
+	// speech in, translated speech and text out, with no assistant turn and
+	// no response.create. It reuses the Realtime event NAMES
+	// (input_audio_buffer.append, response.audio.delta, response.done) but
+	// not their meaning: the session body carries translation.language
+	// instead of instructions and tools, turns are cut by the vendor's own
+	// VAD, and the session must end with session.finish or the final segment
+	// is never translated. Sharing /v1/realtime would advertise a
+	// conversational surface this socket does not have, so it gets its own
+	// public route: GET /v1/realtime/translations/qwen?model=<id>.
+	SpeechProtocolAlibabaLiveTranslateV1 SpeechProtocol = "alibaba.livetranslate.v1"
 )
 
 // ValidSpeechProtocol reports whether p names a known speech protocol.
 func ValidSpeechProtocol(p SpeechProtocol) bool {
 	switch p {
-	case SpeechProtocolOpenAIRealtimeV1, SpeechProtocolOpenAILiveV1, SpeechProtocolGoogleLiveV1, SpeechProtocolXAIRealtimeV1:
+	case SpeechProtocolOpenAIRealtimeV1, SpeechProtocolOpenAILiveV1, SpeechProtocolGoogleLiveV1, SpeechProtocolXAIRealtimeV1, SpeechProtocolAlibabaLiveTranslateV1:
 		return true
 	}
 	return false
@@ -59,6 +71,10 @@ func (p SpeechProtocol) PublicRoute() string {
 		return "/v1/live"
 	case SpeechProtocolGoogleLiveV1:
 		return "/v1/bidi"
+	case SpeechProtocolAlibabaLiveTranslateV1:
+		// relayapi.QwenTranslationRoutePath; this package cannot import
+		// relayapi, and TestSpeechProtocolsAndPublicRoutes pins the two.
+		return "/v1/realtime/translations/qwen"
 	}
 	return ""
 }
@@ -460,6 +476,21 @@ var realtimeProviderControls = map[string]bool{
 	"output_audio_buffer.clear":  true,
 }
 
+// LiveTranslate client commands the hop forwards. input_audio_buffer.append
+// is the media path and session.finish is the lifecycle close (the hop sends
+// it upstream itself, then waits for session.finished), so neither is a
+// control. session.update is forwarded after the adapter pins both audio
+// formats. input_image_buffer.append is deliberately absent: a documented
+// frame is up to 500 KB of JPEG, several times MaxProviderControlBytes once
+// base64-encoded, and image tokens are a billing dimension the relay does not
+// price yet. Adding it means raising the bound for this protocol and pricing
+// the unit in the same change.
+var liveTranslateProviderControls = map[string]bool{
+	"session.update":            true,
+	"input_audio_buffer.commit": true,
+	"input_audio_buffer.clear":  true,
+}
+
 // Gemini Live client messages the hop forwards, named by their top-level KEY.
 // `setup` is not forwardable (the hop owns it, and it is the admitted session
 // definition) and `realtimeInput` is the media path, so neither appears here.
@@ -500,6 +531,8 @@ func ProviderControlAllowed(protocol SpeechProtocol, controlType string) bool {
 		return liveProviderControls[controlType]
 	case SpeechProtocolOpenAIRealtimeV1, SpeechProtocolXAIRealtimeV1:
 		return realtimeProviderControls[controlType]
+	case SpeechProtocolAlibabaLiveTranslateV1:
+		return liveTranslateProviderControls[controlType]
 	}
 	return false
 }
@@ -512,6 +545,8 @@ func ProviderControlTypes(protocol SpeechProtocol) []string {
 		table = liveProviderControls
 	case SpeechProtocolOpenAIRealtimeV1, SpeechProtocolXAIRealtimeV1:
 		table = realtimeProviderControls
+	case SpeechProtocolAlibabaLiveTranslateV1:
+		table = liveTranslateProviderControls
 	}
 	types := make([]string, 0, len(table))
 	for name := range table {
