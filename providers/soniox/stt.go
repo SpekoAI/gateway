@@ -32,10 +32,7 @@ const (
 	endToken = "<end>"
 	finToken = "<fin>"
 
-	// Soniox records client_reference_id in usage logs and rejects anything
-	// longer with HTTP 400.
-	sttMaxClientReferenceCharacters = 256
-	sttGracefulCloseTimeout         = 30 * time.Second
+	sttGracefulCloseTimeout = 30 * time.Second
 )
 
 const (
@@ -166,7 +163,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		// granularity and never marks an utterance complete on its own.
 		EnableEndpointDetection: true,
 		LanguageHints:           sttLanguageHints(request.Options.Language),
-		ClientReferenceID:       sttClientReferenceID(request.Plan),
+		ClientReferenceID:       reservationReference(request.Plan),
 		// Speaker labels and vocabulary biasing both ride this one start
 		// frame; the gateway has already refused asks Soniox cannot serve.
 		EnableSpeakerDiariz: request.Options.STT.Diarize(),
@@ -278,23 +275,6 @@ func sonioxPrimaryLanguage(language string) (string, bool) {
 		return alias, true
 	}
 	return primary, true
-}
-
-// sttClientReferenceID correlates the provider's usage log with the plan's
-// reservation, the same intent as the Deepgram adapter's `extra` parameter.
-// Soniox ignores the field when the credential is a temporary API key, so this
-// is best-effort correlation for managed provider-direct routes rather than a
-// guarantee. Relay plans are managed too and take the same tag — and because
-// they carry the connector's permanent key, Soniox does record it for them.
-func sttClientReferenceID(plan protocol.SessionPlan) string {
-	if plan.Execution.CredentialSource != protocol.CredentialsManaged {
-		return ""
-	}
-	reservationID := strings.TrimSpace(plan.Reservation.ID)
-	if len(reservationID) > sttMaxClientReferenceCharacters {
-		return ""
-	}
-	return reservationID
 }
 
 type sttStream struct {

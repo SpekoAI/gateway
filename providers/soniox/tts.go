@@ -184,6 +184,12 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		voice:      voice,
 		language:   language,
 		sampleRate: request.Media.SampleRateHz,
+		// Resolved once at Open and replayed on every start message: one
+		// socket can run several streams in sequence, and Soniox writes one
+		// usage-log entry per STREAM, not per socket. A reference captured
+		// only for the first stream would leave every later stream on the
+		// same session unattributable.
+		clientReferenceID: reservationReference(request.Plan),
 	}
 	if _, err := stream.startStream(ctx); err != nil {
 		cancel()
@@ -211,11 +217,12 @@ type ttsStream struct {
 	cancel context.CancelFunc
 	events chan runtimepkg.ProviderEvent
 
-	apiKey     string
-	model      string
-	voice      string
-	language   string
-	sampleRate int
+	apiKey            string
+	model             string
+	voice             string
+	language          string
+	sampleRate        int
+	clientReferenceID string
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -372,14 +379,15 @@ func (s *ttsStream) startStream(ctx context.Context) (string, error) {
 	s.stateMu.Unlock()
 
 	if err := s.writeJSON(ctx, ttsStartRequest{
-		APIKey:           s.apiKey,
-		StreamID:         streamID,
-		Model:            s.model,
-		Language:         s.language,
-		Voice:            s.voice,
-		AudioFormat:      "pcm_s16le",
-		SampleRate:       s.sampleRate,
-		ReturnTimestamps: true,
+		APIKey:            s.apiKey,
+		StreamID:          streamID,
+		Model:             s.model,
+		Language:          s.language,
+		Voice:             s.voice,
+		AudioFormat:       "pcm_s16le",
+		SampleRate:        s.sampleRate,
+		ClientReferenceID: s.clientReferenceID,
+		ReturnTimestamps:  true,
 	}); err != nil {
 		s.finishStream(streamID)
 		return "", err
@@ -670,6 +678,12 @@ type ttsStartRequest struct {
 	Voice       string `json:"voice"`
 	AudioFormat string `json:"audio_format"`
 	SampleRate  int    `json:"sample_rate"`
+	// client_reference_id is what binds this synthesis to a Speko
+	// reservation in Soniox's usage log; omitempty keeps it off the wire for
+	// BYOK plans, which bill the customer's own project. Documented in the
+	// TTS WebSocket reference between sample_rate/bitrate and
+	// return_timestamps, with the same semantics as the STT start message.
+	ClientReferenceID string `json:"client_reference_id,omitempty"`
 	// ReturnTimestamps asks for the per-character timing block. It is always
 	// on: the timestamps ride the same messages as the audio, and measuring
 	// five runs each way found the cost inside the noise, so making it
