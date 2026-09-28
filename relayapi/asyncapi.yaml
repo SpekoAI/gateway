@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:cad241124e24a13edf419cd6330bd35df3af0b754ba55936d59c07c29b9efde2
-# yaml-body: sha256:f5aa6356d976421f687c961603644020b358810417bc03f27f7c921516e9d4d6
+# json-mirror: asyncapi.json sha256:888aa4e345e5d70b7fc1934213cb84dc3eb7f4c48cd03b53605cc26819ea5cbf
+# yaml-body: sha256:13d616b58ead1b9e449d2e875944a53269ef69a8ca0ed45e403feae4bce36de7
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -20,12 +20,13 @@ info:
   version: "1.0.0"
   description: >-
     WebSocket contract of the Speko Router: streaming speech-to-text and
-    text-to-speech sessions, plus the three native speech-to-speech routes.
+    text-to-speech sessions, plus the native speech-to-speech routes.
     On the STT and TTS routes JSON text frames carry the control messages and
     events documented here and binary frames carry raw audio in the format
     the session.configure frame declared, with no JSON envelope. On
-    /v1/realtime, /v1/live and /v1/bidi the Router speaks the OpenAI/xAI
-    Realtime, GPT-Live and Gemini Live protocols natively: audio travels
+    /v1/realtime, /v1/live, /v1/bidi and /v1/realtime/translations the
+    Router speaks the OpenAI/xAI Realtime, GPT-Live, Gemini Live and OpenAI
+    realtime translation protocols natively: audio travels
     base64-encoded inside the vendor's own JSON events, the Router forwards a
     bounded set of vendor commands and every vendor server event verbatim,
     and only its own error frame is Router-shaped. The Go types in package
@@ -235,6 +236,76 @@ channels:
     subscribe:
       operationId: receiveRealtimeEvents
       summary: OpenAI/xAI Realtime server events, plus the Router error frame.
+      message:
+        oneOf:
+          - $ref: "#/components/messages/nativeServerEvent"
+          - $ref: "#/components/messages/wsError"
+  /v1/realtime/translations:
+    description: >-
+      OpenAI realtime speech translation (gpt-realtime-translate), spoken
+      natively on the Router's mirror of the vendor's dedicated
+      /v1/realtime/translations socket. The model is selected exactly with the
+      `model` query parameter (/v1/realtime/translations?model=gpt-realtime-translate)
+      and its catalog row speaks openai.realtime.translation.v1; the
+      idempotency content hash is the SHA-256 of that model value. This is not
+      the conversational Realtime protocol: there is no voice, no
+      instructions, no tools, no conversation items and no response.create.
+      The client names the target language in a native session.update
+      ({"type":"session.update","session":{"audio":{"output":{"language":"es"}}}});
+      the only other settings accepted are
+      session.audio.input.transcription (model gpt-realtime-whisper, or null)
+      and session.audio.input.noise_reduction (type near_field or far_field,
+      or null). Any other session field, and any target language outside es,
+      pt, fr, ja, ru, zh, de, ko, hi, id, vi, it and en, is refused with
+      invalid_request. Audio is mono PCM16 at 24 kHz in both directions,
+      base64-encoded in session.input_audio_buffer.append events and streamed
+      continuously, silence included. The client receives every vendor server
+      event verbatim: session.created, session.output_audio.delta (translated
+      audio), session.output_transcript.delta (target text),
+      session.input_transcript.delta (source text) and session.closed; vendor
+      `error` events pass through unchanged. Send session.close when the
+      source ends and keep reading until session.closed: the vendor flushes
+      pending input and emits the remaining translation first. The Router's
+      own terminal error frame uses the shared ErrorEvent shape.
+    parameters:
+      model:
+        description: Exact translation model id from GET /v1/models rows whose endpoint is /v1/realtime/translations.
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+    bindings:
+      ws:
+        method: GET
+        query:
+          type: object
+          properties:
+            model:
+              type: string
+              minLength: 1
+              maxLength: 128
+          required:
+            - model
+        headers:
+          type: object
+          properties:
+            Idempotency-Key:
+              type: string
+              minLength: 1
+              maxLength: 256
+              description: >-
+                Required on the upgrade request. The content hash covers the
+                exact `model` query value.
+          required:
+            - Idempotency-Key
+    publish:
+      operationId: sendTranslationEvents
+      summary: OpenAI realtime translation client events, forwarded to the model.
+      message:
+        $ref: "#/components/messages/nativeClientEvent"
+    subscribe:
+      operationId: receiveTranslationEvents
+      summary: OpenAI realtime translation server events, plus the Router error frame.
       message:
         oneOf:
           - $ref: "#/components/messages/nativeServerEvent"

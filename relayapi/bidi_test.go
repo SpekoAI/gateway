@@ -221,14 +221,15 @@ func TestDecodeBidiAudioAcceptsBothVendorShapes(t *testing.T) {
 
 func TestBidiRouteIsDistinctFromTheOpenAIRoutes(t *testing.T) {
 	t.Parallel()
-	// Three protocols, three paths: a collision would route a session to a
-	// socket that speaks a different framing.
+	// Four protocol families, four paths: a collision would route a session
+	// to a socket that speaks a different framing.
 	paths := map[string]bool{
-		relayapi.RealtimeRoutePath: true,
-		relayapi.LiveRoutePath:     true,
-		relayapi.BidiRoutePath:     true,
+		relayapi.RealtimeRoutePath:    true,
+		relayapi.LiveRoutePath:        true,
+		relayapi.BidiRoutePath:        true,
+		relayapi.TranslationRoutePath: true,
 	}
-	if len(paths) != 3 {
+	if len(paths) != 4 {
 		t.Fatalf("voice route paths collide: %v", paths)
 	}
 }
