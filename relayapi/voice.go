@@ -28,7 +28,16 @@ const (
 	// session.start naming the model; its exact frame bytes are the
 	// idempotency content hash.
 	LiveRoutePath = "/v1/live"
-	// RealtimeModelQueryParam is the /v1/realtime model selector.
+	// TranslationRoutePath serves OpenAI realtime speech translation
+	// (gpt-realtime-translate), mirroring the vendor's own
+	// /v1/realtime/translations socket. As on /v1/realtime the model is an
+	// exact query parameter (RealtimeModelQueryParam) and the idempotency
+	// content hash covers exactly its value. The target language is not part
+	// of admission: the caller names it in its first native session.update,
+	// just as it would against the vendor.
+	TranslationRoutePath = "/v1/realtime/translations"
+	// RealtimeModelQueryParam is the /v1/realtime and
+	// /v1/realtime/translations model selector.
 	RealtimeModelQueryParam = "model"
 	// LiveSessionStartType is the type tag of the first /v1/live frame.
 	LiveSessionStartType = "session.start"

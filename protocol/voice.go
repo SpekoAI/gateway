@@ -38,12 +38,24 @@ const (
 	// protocol with its own session body. Public route: GET
 	// /v1/realtime?model=<id>; the exact model selects this protocol.
 	SpeechProtocolXAIRealtimeV1 SpeechProtocol = "xai.realtime.v1"
+	// SpeechProtocolOpenAIRealtimeTranslationV1 is OpenAI realtime speech
+	// translation (gpt-realtime-translate) on the vendor's dedicated
+	// wss://api.openai.com/v1/realtime/translations socket — the only
+	// endpoint the model accepts. It is NOT the conversational Realtime
+	// protocol: the session carries a target language and nothing else (no
+	// voice, instructions, tools, conversation items or response.create),
+	// audio rides session.input_audio_buffer.append, and the answer is a
+	// continuous stream of session.output_audio.delta and transcript deltas
+	// rather than responses. Public route: GET
+	// /v1/realtime/translations?model=<id>.
+	SpeechProtocolOpenAIRealtimeTranslationV1 SpeechProtocol = "openai.realtime.translation.v1"
 )
 
 // ValidSpeechProtocol reports whether p names a known speech protocol.
 func ValidSpeechProtocol(p SpeechProtocol) bool {
 	switch p {
-	case SpeechProtocolOpenAIRealtimeV1, SpeechProtocolOpenAILiveV1, SpeechProtocolGoogleLiveV1, SpeechProtocolXAIRealtimeV1:
+	case SpeechProtocolOpenAIRealtimeV1, SpeechProtocolOpenAILiveV1, SpeechProtocolGoogleLiveV1, SpeechProtocolXAIRealtimeV1,
+		SpeechProtocolOpenAIRealtimeTranslationV1:
 		return true
 	}
 	return false
@@ -59,6 +71,8 @@ func (p SpeechProtocol) PublicRoute() string {
 		return "/v1/live"
 	case SpeechProtocolGoogleLiveV1:
 		return "/v1/bidi"
+	case SpeechProtocolOpenAIRealtimeTranslationV1:
+		return "/v1/realtime/translations"
 	}
 	return ""
 }
@@ -460,6 +474,16 @@ var realtimeProviderControls = map[string]bool{
 	"output_audio_buffer.clear":  true,
 }
 
+// Realtime translation client commands the hop forwards. The session has one
+// command besides audio: session.update, restricted to the translation
+// session shape (ValidateTranslationSessionUpdate). The audio append is the
+// media path, and session.close is lifecycle exactly as on GPT-Live — the hop
+// sends it itself on close and drains until session.closed — so neither is a
+// control.
+var translationProviderControls = map[string]bool{
+	"session.update": true,
+}
+
 // Gemini Live client messages the hop forwards, named by their top-level KEY.
 // `setup` is not forwardable (the hop owns it, and it is the admitted session
 // definition) and `realtimeInput` is the media path, so neither appears here.
@@ -500,6 +524,8 @@ func ProviderControlAllowed(protocol SpeechProtocol, controlType string) bool {
 		return liveProviderControls[controlType]
 	case SpeechProtocolOpenAIRealtimeV1, SpeechProtocolXAIRealtimeV1:
 		return realtimeProviderControls[controlType]
+	case SpeechProtocolOpenAIRealtimeTranslationV1:
+		return translationProviderControls[controlType]
 	}
 	return false
 }
@@ -512,6 +538,8 @@ func ProviderControlTypes(protocol SpeechProtocol) []string {
 		table = liveProviderControls
 	case SpeechProtocolOpenAIRealtimeV1, SpeechProtocolXAIRealtimeV1:
 		table = realtimeProviderControls
+	case SpeechProtocolOpenAIRealtimeTranslationV1:
+		table = translationProviderControls
 	}
 	types := make([]string, 0, len(table))
 	for name := range table {
@@ -544,6 +572,11 @@ func (c ProviderControl) Validate(protocol SpeechProtocol) error {
 	}
 	if tagged.Type != c.Type {
 		return fmt.Errorf("payload: type tag %q does not match envelope type %q", tagged.Type, c.Type)
+	}
+	if protocol == SpeechProtocolOpenAIRealtimeTranslationV1 && c.Type == "session.update" {
+		if _, err := ValidateTranslationSessionUpdate(c.Payload); err != nil {
+			return fmt.Errorf("payload: %w", err)
+		}
 	}
 	return nil
 }

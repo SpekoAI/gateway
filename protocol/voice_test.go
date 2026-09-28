@@ -19,6 +19,7 @@ func TestSpeechProtocolsAndPublicRoutes(t *testing.T) {
 		{protocol.SpeechProtocolOpenAILiveV1, "/v1/live"},
 		{protocol.SpeechProtocolGoogleLiveV1, "/v1/bidi"},
 		{protocol.SpeechProtocolXAIRealtimeV1, "/v1/realtime"},
+		{protocol.SpeechProtocolOpenAIRealtimeTranslationV1, "/v1/realtime/translations"},
 	} {
 		if !protocol.ValidSpeechProtocol(tc.protocol) {
 			t.Fatalf("%s must be valid", tc.protocol)
