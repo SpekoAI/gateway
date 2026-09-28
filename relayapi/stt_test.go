@@ -130,6 +130,12 @@ func TestSTTStreamMessageValidation(t *testing.T) {
 		t.Fatalf("valid configure must validate: %v", err)
 	}
 
+	// On a translating session the translation trails the transcript, so a
+	// delta that advances only the translation is still something to say.
+	if err := (relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Translation: "hola"}).Validate(); err != nil {
+		t.Fatalf("a translation-only delta must validate: %v", err)
+	}
+
 	cases := []struct {
 		name    string
 		message interface{ Validate() error }

@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:f165e19f9646b42843b0acbc37f29aad6d27e0323528c1cc70d6683bedf9033b
-# yaml-body: sha256:a15c80ceb051a4cd3ce2faf76c675e1b505328606617910e6356f2210a7e866f
+# json-mirror: openapi.json sha256:047915c193dc38be4ae083111ec1cc276bc421e34465afb8fd83712b6676fc44
+# yaml-body: sha256:9fae9cfff41f3c56f6192f01ed25ecc530fcf33970b5a933020e455e048cacc4
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -1084,6 +1084,30 @@ components:
             Transcription feature asks and per-provider settings. Omit for
             plain text.
       additionalProperties: false
+    STTTranslation:
+      type: object
+      description: >-
+        Translate the spoken audio into target_language and return the
+        translated words BESIDE the transcript: text stays the original
+        words and the translation rides a separate translation field, so
+        a caller that never asks reads exactly what it read before. Fails
+        closed like the other canonical asks: a route whose model does
+        not advertise capabilities.translation is refused
+        capability_unsupported naming translation. One way only; the
+        source is whatever is spoken.
+      properties:
+        target_language:
+          type: string
+          description: >-
+            A BCP-47 language tag such as "es" or "pt-BR": a 2-3 letter
+            primary subtag, then 1-8 character alphanumeric subtags, at
+            most 35 characters. A shape check only; a language the
+            routed vendor does not translate into is the vendor's error.
+          minLength: 2
+          maxLength: 35
+      required:
+        - target_language
+      additionalProperties: false
     STTOptions:
       type: object
       description: >-
@@ -1091,7 +1115,7 @@ components:
         same object rides POST /v1/stt/transcriptions and the STT
         session.configure frame, in the same vocabulary the local gateway
         uses. The canonical asks (diarization, keywords, noise_reduction,
-        word_timestamps) fail closed: a request whose routed model does not advertise the
+        word_timestamps, translation) fail closed: a request whose routed model does not advertise the
         matching capability in GET /v1/models is rejected with
         capability_unsupported, never answered 200 with the feature quietly
         missing. Names arrive lower case and are rejected otherwise rather
@@ -1123,6 +1147,8 @@ components:
             transcription result. Batch only: no streaming route advertises
             it. Omitted leaves the result without words, which is not the same
             as false.
+        translation:
+          $ref: "#/components/schemas/STTTranslation"
         provider_options:
           type: object
           description: >-
@@ -1214,6 +1240,13 @@ components:
             word_timestamps and the routed model advertises it.
           items:
             $ref: "#/components/schemas/TranscriptWord"
+        translation:
+          type: string
+          description: >-
+            The transcript translated into options.translation.target_language,
+            present only when translation was asked for. text stays the
+            original spoken words. Translated words carry no timings, so there
+            are no translated segments.
         route:
           $ref: "#/components/schemas/Route"
         usage:

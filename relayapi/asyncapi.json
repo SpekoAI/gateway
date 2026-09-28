@@ -13,9 +13,7 @@
       "description": "Global entry point. The upgrade request authenticates with a Speko-issued bearer token and must carry an Idempotency-Key header. The idempotency content hash of a WebSocket session is the SHA-256 of the exact session.configure text-frame bytes, so a retry must reproduce the configure frame byte-for-byte; later frames are intentionally outside the hash — they are the stream's continuous content, guarded by budgets and leases, while the configure frame is the session's intent.",
       "security": [
         {
-          "bearerAuth": [
-
-          ]
+          "bearerAuth": []
         }
       ]
     }
@@ -881,9 +879,25 @@
         ],
         "additionalProperties": false
       },
+      "STTTranslation": {
+        "type": "object",
+        "description": "Translate the spoken audio into target_language and return the translated words BESIDE the transcript: text stays the original words and the translation rides a separate translation field, so a caller that never asks reads exactly what it read before. Fails closed like the other canonical asks: a route whose model does not advertise capabilities.translation is refused capability_unsupported naming translation. One way only; the source is whatever is spoken.",
+        "properties": {
+          "target_language": {
+            "type": "string",
+            "description": "A BCP-47 language tag such as \"es\" or \"pt-BR\": a 2-3 letter primary subtag, then 1-8 character alphanumeric subtags, at most 35 characters. A shape check only; a language the routed vendor does not translate into is the vendor's error.",
+            "minLength": 2,
+            "maxLength": 35
+          }
+        },
+        "required": [
+          "target_language"
+        ],
+        "additionalProperties": false
+      },
       "STTOptions": {
         "type": "object",
-        "description": "What a caller asked a transcription to do beyond returning text. The same object rides POST /v1/stt/transcriptions and the STT session.configure frame, in the same vocabulary the local gateway uses. The canonical asks (diarization, keywords, noise_reduction, word_timestamps) fail closed: a session whose routed model does not advertise the matching capability in GET /v1/models is rejected with capability_unsupported, never answered with the feature quietly missing. Names arrive lower case and are rejected otherwise rather than folded, because the idempotency content hash covers the configure frame bytes exactly as sent and one intent must have one spelling.",
+        "description": "What a caller asked a transcription to do beyond returning text. The same object rides POST /v1/stt/transcriptions and the STT session.configure frame, in the same vocabulary the local gateway uses. The canonical asks (diarization, keywords, noise_reduction, word_timestamps, translation) fail closed: a session whose routed model does not advertise the matching capability in GET /v1/models is rejected with capability_unsupported, never answered with the feature quietly missing. Names arrive lower case and are rejected otherwise rather than folded, because the idempotency content hash covers the configure frame bytes exactly as sent and one intent must have one spelling.",
         "properties": {
           "diarization": {
             "type": "boolean",
@@ -903,6 +917,9 @@
           "word_timestamps": {
             "type": "boolean",
             "description": "Return per-word timings on the batch transcription result. No streaming route advertises it, so on session.configure it is refused capability_unsupported."
+          },
+          "translation": {
+            "$ref": "#/components/schemas/STTTranslation"
           },
           "provider_options": {
             "type": "object",
@@ -985,7 +1002,7 @@
       },
       "STTTranscriptDelta": {
         "type": "object",
-        "description": "An interim hypothesis; later deltas and the next transcript.final supersede it. Deltas are never empty — empty interim hypotheses are dropped at normalization, never forwarded.",
+        "description": "An interim hypothesis; later deltas and the next transcript.final supersede it. Deltas are never empty — empty interim hypotheses are dropped at normalization, never forwarded. On a translating session a delta may advance only the translation, with empty text.",
         "properties": {
           "type": {
             "type": "string",
@@ -995,6 +1012,10 @@
           },
           "text": {
             "type": "string"
+          },
+          "translation": {
+            "type": "string",
+            "description": "The interim translation of the current span, present only on a session that asked for one. It trails text, so a delta may carry only one of the two; a delta with neither is never sent."
           }
         },
         "required": [
@@ -1025,6 +1046,10 @@
           "speaker": {
             "type": "string",
             "description": "Whoever said the whole finalized span, present only when the session asked for diarization and the provider attributed the turn. Most providers report one speaker per finalized turn rather than per span, so this is where a diarized session usually reads its labels; per-span attribution rides segments[].speaker instead. The vendor's own label, verbatim."
+          },
+          "translation": {
+            "type": "string",
+            "description": "The finalized translation delivered with this span, present only on a session that asked for one; text stays the original words. The vendor translates after it transcribes, so the translation of a span's last words can arrive on the NEXT transcript.final, and a final may carry a translation with empty text. Concatenate finals in order rather than pairing them one to one."
           }
         },
         "required": [
@@ -1728,8 +1753,7 @@
               "additionalProperties": true
             }
           },
-          "tool_choice": {
-          },
+          "tool_choice": {},
           "parallel_tool_calls": {
             "type": "boolean"
           },

@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:242942b57b61fa7fcd17486943cccf2f2f7ccbbdb61199b5ce195b2e63b5d8df
-# yaml-body: sha256:5f38b028573e0b942e673a96cf82ceef13464aff853abfd9c6dc2ae7040256f7
+# json-mirror: asyncapi.json sha256:cad241124e24a13edf419cd6330bd35df3af0b754ba55936d59c07c29b9efde2
+# yaml-body: sha256:f5aa6356d976421f687c961603644020b358810417bc03f27f7c921516e9d4d6
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -880,6 +880,30 @@ components:
         - type
         - audio
       additionalProperties: false
+    STTTranslation:
+      type: object
+      description: >-
+        Translate the spoken audio into target_language and return the
+        translated words BESIDE the transcript: text stays the original
+        words and the translation rides a separate translation field, so
+        a caller that never asks reads exactly what it read before. Fails
+        closed like the other canonical asks: a route whose model does
+        not advertise capabilities.translation is refused
+        capability_unsupported naming translation. One way only; the
+        source is whatever is spoken.
+      properties:
+        target_language:
+          type: string
+          description: >-
+            A BCP-47 language tag such as "es" or "pt-BR": a 2-3 letter
+            primary subtag, then 1-8 character alphanumeric subtags, at
+            most 35 characters. A shape check only; a language the
+            routed vendor does not translate into is the vendor's error.
+          minLength: 2
+          maxLength: 35
+      required:
+        - target_language
+      additionalProperties: false
     STTOptions:
       type: object
       description: >-
@@ -887,7 +911,7 @@ components:
         same object rides POST /v1/stt/transcriptions and the STT
         session.configure frame, in the same vocabulary the local gateway
         uses. The canonical asks (diarization, keywords, noise_reduction,
-        word_timestamps) fail closed: a session whose routed model does not advertise the
+        word_timestamps, translation) fail closed: a session whose routed model does not advertise the
         matching capability in GET /v1/models is rejected with
         capability_unsupported, never answered with the feature quietly
         missing. Names arrive lower case and are rejected otherwise rather
@@ -919,6 +943,8 @@ components:
             Return per-word timings on the batch transcription result. No
             streaming route advertises it, so on session.configure it is
             refused capability_unsupported.
+        translation:
+          $ref: "#/components/schemas/STTTranslation"
         provider_options:
           type: object
           description: >-
@@ -987,7 +1013,8 @@ components:
       description: >-
         An interim hypothesis; later deltas and the next transcript.final
         supersede it. Deltas are never empty — empty interim hypotheses are
-        dropped at normalization, never forwarded.
+        dropped at normalization, never forwarded. On a translating session a
+        delta may advance only the translation, with empty text.
       properties:
         type:
           type: string
@@ -995,6 +1022,12 @@ components:
             - transcript.delta
         text:
           type: string
+        translation:
+          type: string
+          description: >-
+            The interim translation of the current span, present only on a
+            session that asked for one. It trails text, so a delta may carry
+            only one of the two; a delta with neither is never sent.
       required:
         - type
         - text
@@ -1024,6 +1057,15 @@ components:
             rather than per span, so this is where a diarized session
             usually reads its labels; per-span attribution rides
             segments[].speaker instead. The vendor's own label, verbatim.
+        translation:
+          type: string
+          description: >-
+            The finalized translation delivered with this span, present only
+            on a session that asked for one; text stays the original words.
+            The vendor translates after it transcribes, so the translation of
+            a span's last words can arrive on the NEXT transcript.final, and a
+            final may carry a translation with empty text. Concatenate finals
+            in order rather than pairing them one to one.
       required:
         - type
         - text

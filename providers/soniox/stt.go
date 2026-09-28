@@ -171,6 +171,10 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		// frame; the gateway has already refused asks Soniox cannot serve.
 		EnableSpeakerDiariz: request.Options.STT.Diarize(),
 		Context:             sttContextTerms(request.Options.STT.GetKeywords()),
+		// One-way translation rides the same frame. Soniox then interleaves
+		// translated tokens (translation_status "translation") with the
+		// original ones, and the read loop keeps them apart.
+		Translation: sttTranslationFor(request.Options.STT.TranslationTarget()),
 	}
 	payload, err := json.Marshal(start)
 	if err != nil {
@@ -311,8 +315,12 @@ type sttStream struct {
 	terminalErr  error
 
 	// Read-loop owned; never touched by the write side.
-	segment   sttSegment
-	requestID string
+	segment sttSegment
+	// translated accumulates finalized translated tokens. Kept apart from
+	// segment so a translated word can never land in transcript text, and
+	// never reset by a boundary that finds it empty — see flushSegment.
+	translated sttTranslated
+	requestID  string
 	// commitPending makes an empty <fin> a real finalized silent turn without
 	// changing how spontaneous empty endpointer markers are handled.
 	commitPending atomic.Bool
@@ -608,12 +616,13 @@ func (s *sttStream) handleMessage(payload []byte) error {
 // finals accumulate into the segment while the tail is rebuilt per frame.
 func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage) error {
 	tail := strings.Builder{}
+	translatedTail := strings.Builder{}
 	sawContent := false
 	var tailEndMS *int64
 
 	for _, token := range message.Tokens {
 		if token.Text == endToken || token.Text == finToken {
-			emptySegment := strings.TrimSpace(s.segment.text.String()) == ""
+			emptySegment := strings.TrimSpace(s.segment.text.String()) == "" && s.translated.empty()
 			if err := s.flushSegment(raw); err != nil {
 				return err
 			}
@@ -622,7 +631,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 				if emptySegment && committed {
 					if err := s.emit(runtimepkg.ProviderEvent{
 						Type:       protocol.EventTranscriptFinal,
-						Data:       sttTranscriptData("", true, nil, nil, nil, s.requestID),
+						Data:       sttTranscriptData("", "", true, nil, nil, nil, s.requestID),
 						Extensions: sttExtension(raw),
 					}); err != nil {
 						return err
@@ -632,6 +641,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			// A provisional tail cannot outlive the boundary that closed its
 			// segment; Soniox restarts the tail from scratch afterwards.
 			tail.Reset()
+			translatedTail.Reset()
 			tailEndMS = nil
 			sawContent = false
 			if token.Text == endToken {
@@ -649,6 +659,17 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			continue
 		}
 		sawContent = true
+		if token.TranslationStatus == sttTranslationStatusTranslation {
+			// Translated tokens carry no timestamps and no confidence the
+			// transcript should average, so they touch neither the segment
+			// nor tailEndMS.
+			if token.IsFinal {
+				s.translated.text.WriteString(token.Text)
+			} else {
+				translatedTail.WriteString(token.Text)
+			}
+			continue
+		}
 		if token.IsFinal {
 			s.segment.appendFinal(token)
 			continue
@@ -663,7 +684,8 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 		return nil
 	}
 	interim := strings.TrimSpace(s.segment.text.String() + tail.String())
-	if interim == "" {
+	interimTranslation := strings.TrimSpace(s.translated.text.String() + translatedTail.String())
+	if interim == "" && interimTranslation == "" {
 		return nil
 	}
 	endMS := tailEndMS
@@ -672,19 +694,29 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptDelta,
-		Data:       sttTranscriptData(interim, false, s.segment.startMS, endMS, nil, s.requestID),
+		Data:       sttTranscriptData(interim, interimTranslation, false, s.segment.startMS, endMS, nil, s.requestID),
 		Extensions: sttExtension(raw),
 	})
 }
 
+// flushSegment emits the segment's final. On a translating session the final
+// also carries every translated token finalized since the previous final.
+// Soniox generates a translation AFTER the words it translates and does not
+// promise the translation of a segment's last words arrives before that
+// segment's <end>, so late translated tokens ride the NEXT final rather than
+// being re-attributed. A boundary with translated tokens but no original
+// words (the translation of the previous segment's tail, or the stream
+// finishing) still emits a final, with empty text: dropping it would lose
+// translated words the caller asked, and pays, for.
 func (s *sttStream) flushSegment(raw json.RawMessage) error {
 	text, confidence, startMS, endMS := s.segment.flush()
-	if text == "" {
+	translation := s.translated.flush()
+	if text == "" && translation == "" {
 		return nil
 	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptFinal,
-		Data:       sttTranscriptData(text, true, startMS, endMS, confidence, s.requestID),
+		Data:       sttTranscriptData(text, translation, true, startMS, endMS, confidence, s.requestID),
 		Extensions: sttExtension(raw),
 	})
 }
@@ -735,11 +767,29 @@ func (a *sttSegment) flush() (string, *float64, *int64, *int64) {
 	return text, confidence, startMS, endMS
 }
 
-func sttTranscriptData(text string, isFinal bool, startMS, endMS *int64, confidence *float64, requestID string) json.RawMessage {
+// sttTranslated accumulates finalized translated tokens between finals.
+type sttTranslated struct {
+	text strings.Builder
+}
+
+func (t *sttTranslated) empty() bool { return strings.TrimSpace(t.text.String()) == "" }
+
+func (t *sttTranslated) flush() string {
+	text := strings.TrimSpace(t.text.String())
+	t.text.Reset()
+	return text
+}
+
+func sttTranscriptData(text, translation string, isFinal bool, startMS, endMS *int64, confidence *float64, requestID string) json.RawMessage {
 	// Finals are emitted only after <end>, <fin>, or stream completion has
 	// flushed the segment. Unlike locked token chunks, these complete an
 	// utterance and let consumers skip their missing-final safety timeout.
 	data := map[string]any{"text": text, "is_final": isFinal, "speech_final": isFinal, "provider_request_id": requestID}
+	// Omitted, not empty, on a session that never asked: every event of an
+	// untranslated session keeps its exact bytes.
+	if translation != "" {
+		data["translation"] = translation
+	}
 	if startMS != nil {
 		data["audio_start_ms"] = *startMS
 	}
@@ -765,16 +815,41 @@ func sttExtension(raw json.RawMessage) map[string]json.RawMessage {
 }
 
 type sttStartRequest struct {
-	APIKey                  string      `json:"api_key"`
-	Model                   string      `json:"model"`
-	AudioFormat             string      `json:"audio_format"`
-	SampleRate              int         `json:"sample_rate"`
-	NumChannels             int         `json:"num_channels"`
-	EnableEndpointDetection bool        `json:"enable_endpoint_detection"`
-	LanguageHints           []string    `json:"language_hints,omitempty"`
-	ClientReferenceID       string      `json:"client_reference_id,omitempty"`
-	EnableSpeakerDiariz     bool        `json:"enable_speaker_diarization,omitempty"`
-	Context                 *sttContext `json:"context,omitempty"`
+	APIKey                  string                `json:"api_key"`
+	Model                   string                `json:"model"`
+	AudioFormat             string                `json:"audio_format"`
+	SampleRate              int                   `json:"sample_rate"`
+	NumChannels             int                   `json:"num_channels"`
+	EnableEndpointDetection bool                  `json:"enable_endpoint_detection"`
+	LanguageHints           []string              `json:"language_hints,omitempty"`
+	ClientReferenceID       string                `json:"client_reference_id,omitempty"`
+	EnableSpeakerDiariz     bool                  `json:"enable_speaker_diarization,omitempty"`
+	Context                 *sttContext           `json:"context,omitempty"`
+	Translation             *sttTranslationConfig `json:"translation,omitempty"`
+}
+
+// sttTranslationConfig is Soniox's translation block. Only one_way is sent:
+// two_way needs both languages named, and the canonical option names one.
+type sttTranslationConfig struct {
+	Type           string `json:"type"`
+	TargetLanguage string `json:"target_language"`
+}
+
+// sttTranslationStatusTranslation marks a translated token. "original"
+// (spoken words that were translated), "none" (spoken words that were not)
+// and an absent status are all transcript.
+const sttTranslationStatusTranslation = "translation"
+
+// sttTranslationFor builds the one-way block, or nil when no translation
+// was asked. The target goes through the same subtag-and-alias rule as the
+// language hint: Soniox lists bare codes ("es", "zh", "no") and refuses
+// anything else, so "pt-BR" must be sent as "pt" and "nb" as "no".
+func sttTranslationFor(target string) *sttTranslationConfig {
+	language, ok := sonioxPrimaryLanguage(target)
+	if !ok {
+		return nil
+	}
+	return &sttTranslationConfig{Type: "one_way", TargetLanguage: language}
 }
 
 // sttContext biases recognition toward the caller's domain terms. Soniox's
@@ -811,6 +886,9 @@ type sttToken struct {
 	EndMS      *int64   `json:"end_ms"`
 	Confidence *float64 `json:"confidence"`
 	IsFinal    bool     `json:"is_final"`
+	// TranslationStatus is "original", "translation" or "none" on a
+	// translating session and absent otherwise.
+	TranslationStatus string `json:"translation_status"`
 }
 
 type sttInboundMessage struct {

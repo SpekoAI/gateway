@@ -376,6 +376,7 @@ func wireSchemaTable() []struct {
 		{relayapi.ModelsResponse{}, openapi("ModelsResponse")},
 		{relayapi.TranscriptionRequest{}, openapi("TranscriptionRequest")},
 		{relayapi.STTOptions{}, both("STTOptions")},
+		{relayapi.STTTranslation{}, both("STTTranslation")},
 		{relayapi.TranscriptSegment{}, both("TranscriptSegment")},
 		{relayapi.TranscriptWord{}, openapi("TranscriptWord")},
 		{relayapi.TranscriptionResponse{}, openapi("TranscriptionResponse")},

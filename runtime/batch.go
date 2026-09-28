@@ -67,6 +67,10 @@ type BatchTranscription struct {
 	// request asked for them (SttOptions.WordTimestamps) and the provider
 	// returned them. Segments stay the coarser unit; Words never replace it.
 	Words []BatchWord
+	// Translation is the transcript translated into the requested
+	// SttOptions.Translation target; empty when none was asked for. Text
+	// stays the original words.
+	Translation string
 	// Language is the BCP-47 tag the provider reported using or detecting;
 	// empty when it reported none.
 	Language string

@@ -83,8 +83,15 @@ type TranscriptionResponse struct {
 	// Words are per-word timings, present only when word_timestamps was asked
 	// for. Omitted otherwise, so every existing response is byte-identical.
 	Words []TranscriptWord `json:"words,omitempty"`
-	Route Route            `json:"route"`
-	Usage Usage            `json:"usage"`
+	// Translation is the transcript translated into
+	// options.translation.target_language, present only when translation
+	// was asked for. Text stays the ORIGINAL spoken words, so a caller that
+	// never asks reads a byte-identical response. Translated words carry no
+	// timings (the vendor generates them after the words they translate),
+	// so there are no translated segments.
+	Translation string `json:"translation,omitempty"`
+	Route       Route  `json:"route"`
+	Usage       Usage  `json:"usage"`
 }
 
 // Validate checks segments, words, route, and usage. Text may be empty:
@@ -221,15 +228,23 @@ func (e STTSessionReady) Validate() error {
 type STTTranscriptDelta struct {
 	Type STTEventType `json:"type"`
 	Text string       `json:"text"`
+	// Translation is the interim translation of the current span, present
+	// only on a session that asked for one. It trails Text: the vendor
+	// translates words after it recognises them, so a delta may carry
+	// original words whose translation has not arrived yet, or only a
+	// translation of words already recognised.
+	Translation string `json:"translation,omitempty"`
 }
 
 // Validate checks the frame tag and that the delta says something — empty
-// interim hypotheses are dropped at normalization, never forwarded.
+// interim hypotheses are dropped at normalization, never forwarded. On a
+// translating session a delta that advances only the translation is
+// something.
 func (e STTTranscriptDelta) Validate() error {
 	if e.Type != STTEventTranscriptDelta {
 		return fmt.Errorf("type: got %q, want %q", e.Type, STTEventTranscriptDelta)
 	}
-	if e.Text == "" {
+	if e.Text == "" && e.Translation == "" {
 		return fmt.Errorf("text: required")
 	}
 	return nil
@@ -244,6 +259,13 @@ type STTTranscriptFinal struct {
 	// Speaker labels the whole finalized turn; per-span attribution rides
 	// Segments[].Speaker.
 	Speaker string `json:"speaker,omitempty"`
+	// Translation is the finalized translation delivered with this span,
+	// present only on a session that asked for one. Text stays the original
+	// words. The vendor's translation trails its transcript, so the last
+	// words of a span can be translated in the NEXT final's Translation; a
+	// caller rendering captions concatenates finals rather than pairing them
+	// one to one.
+	Translation string `json:"translation,omitempty"`
 }
 
 // Validate checks the frame tag and segments. Text may be empty: a

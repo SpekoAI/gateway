@@ -29,7 +29,11 @@ type sttSupport struct {
 	// per-word timings, so no row here advertises it and every ask on this
 	// gateway's streaming sessions fails closed with the option named.
 	wordTimestamps bool
-	providerKeys   []string
+	// translation returns the audio translated into a target language beside
+	// the transcript. Only Soniox's realtime socket does this in the same
+	// session today.
+	translation  bool
+	providerKeys []string
 	// modelKeys scopes settings to a model family when one provider serves
 	// two wire generations. The FIRST matching prefix contributes its keys —
 	// the same first-match rule the catalog's ModelRoutes use — and an empty
@@ -88,8 +92,9 @@ var sttOptionSupport = map[string]sttSupport{
 	// the one commit-strategy knob worth exposing (default 1.5s, and the
 	// snappy-vs-patient tradeoff is genuinely per-caller).
 	"elevenlabs": {keywords: true, providerKeys: []string{"vad_silence_threshold_secs"}},
-	// enable_speaker_diarization and context terms both ride the start frame.
-	"soniox": {diarization: true, keywords: true},
+	// enable_speaker_diarization, context terms and the one-way translation
+	// block all ride the start frame.
+	"soniox": {diarization: true, keywords: true, translation: true},
 	// custom vocabulary and the audio enhancer ride the live init call. Live
 	// sessions have no diarization option at all (batch does).
 	"gladia": {keywords: true, noiseReduction: true},
@@ -196,6 +201,9 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 	if options.WantsWordTimestamps() && !support.wordTimestamps {
 		return &SttSupportError{Provider: name, Option: "word_timestamps", Detail: "per-word timings are a batch transcription result; no streaming transport returns them"}
 	}
+	if options.TranslationTarget() != "" && !support.translation {
+		return &SttSupportError{Provider: name, Option: "translation", Detail: "this provider does not translate on its streaming transport; soniox does"}
+	}
 	allowed := support.keysFor(model)
 	for _, key := range options.ProviderKeys(name) {
 		if !sttKeyAllowed(allowed, key) {
@@ -301,6 +309,8 @@ func firstSttAsk(options *protocol.SttOptions) string {
 		return "noise_reduction"
 	case options.WantsWordTimestamps():
 		return "word_timestamps"
+	case options.TranslationTarget() != "":
+		return "translation"
 	default:
 		return ""
 	}

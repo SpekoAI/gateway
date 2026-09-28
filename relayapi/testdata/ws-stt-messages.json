@@ -15,7 +15,10 @@
       "diarization": true,
       "keywords": [
         "Speko"
-      ]
+      ],
+      "translation": {
+        "target_language": "es"
+      }
     }
   },
   {
@@ -36,7 +39,8 @@
   },
   {
     "type": "transcript.delta",
-    "text": "hello"
+    "text": "hello",
+    "translation": "hola"
   },
   {
     "type": "transcript.final",
@@ -49,7 +53,8 @@
         "speaker": "A"
       }
     ],
-    "speaker": "A"
+    "speaker": "A",
+    "translation": "hola mundo"
   },
   {
     "type": "usage.updated",

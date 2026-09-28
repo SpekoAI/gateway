@@ -174,6 +174,8 @@ func (c ModelCapabilities) SupportsSTTOptions(options *STTOptions) (string, bool
 		return "noise_reduction", false
 	case options.WantsWordTimestamps() && !c.WordTimestamps:
 		return "word_timestamps", false
+	case options.TranslationTarget() != "" && !c.Translation:
+		return "translation", false
 	default:
 		return "", true
 	}
