@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:30faf7b06721ee0f408db3ee704d3705cd81d8a8d70882c392aa2f8cadf32d99
-# yaml-body: sha256:f1d5f9e071d6468dd22ff260af463cb7e8d2f47f38ed8410a9d644fc92f232e0
+# json-mirror: openapi.json sha256:f165e19f9646b42843b0acbc37f29aad6d27e0323528c1cc70d6683bedf9033b
+# yaml-body: sha256:a15c80ceb051a4cd3ce2faf76c675e1b505328606617910e6356f2210a7e866f
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -818,6 +818,13 @@ components:
             Router emits what the engine measured and never groups
             characters into words, because only the caller knows where the
             words are in the text it sent.
+        translation:
+          type: boolean
+          description: >-
+            The model translates: speech in, speech in another language out
+            (kind s2s), or speech in, translated text out (kind stt). A
+            translation model is not conversational: its session carries a
+            target language and produces no assistant turn.
       required:
         - streaming
         - tools
@@ -830,6 +837,7 @@ components:
         - word_timestamps
         - word_timings
         - character_timings
+        - translation
       additionalProperties: false
     Model:
       type: object

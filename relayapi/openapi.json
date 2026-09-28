@@ -840,6 +840,10 @@
           "character_timings": {
             "type": "boolean",
             "description": "Reports time-aligned spans of synthesized speech measured per CHARACTER, on the utterance.timings event of GET /v1/tts/stream. A character-level model reports false for word_timings: the Router emits what the engine measured and never groups characters into words, because only the caller knows where the words are in the text it sent."
+          },
+          "translation": {
+            "type": "boolean",
+            "description": "The model translates: speech in, speech in another language out (kind s2s), or speech in, translated text out (kind stt). A translation model is not conversational: its session carries a target language and produces no assistant turn."
           }
         },
         "required": [
@@ -853,7 +857,8 @@
           "noise_reduction",
           "word_timestamps",
           "word_timings",
-          "character_timings"
+          "character_timings",
+          "translation"
         ],
         "additionalProperties": false
       },

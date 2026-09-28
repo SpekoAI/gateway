@@ -45,8 +45,13 @@ type ModelCapabilities struct {
 	// They are separate bits rather than one enum because a model may report
 	// both, and neither is derived from the other: the relay never groups
 	// characters into words on the caller's behalf.
-	WordTimings             bool     `json:"word_timings"`
-	CharacterTimings        bool     `json:"character_timings"`
+	WordTimings      bool `json:"word_timings"`
+	CharacterTimings bool `json:"character_timings"`
+	// Translation says the model translates: speech in, speech in another
+	// language out (S2S), or speech in, translated text out (STT). A model
+	// with this bit set is a translation model, not a conversational one:
+	// its route carries a target language and returns no assistant turn.
+	Translation             bool     `json:"translation"`
 	EvaluationQuestionTypes []string `json:"evaluation_question_types,omitempty"`
 }
 
