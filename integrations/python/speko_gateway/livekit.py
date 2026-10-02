@@ -188,6 +188,8 @@ class SpeechStream(stt.RecognizeStream):
         self._request_id = utils.shortuuid()
         self._gateway_stream: LiveKitSTTStream | None = None
         self._speaking = False
+        self._saw_final_for_turn = False
+        self._awaiting_final = False
 
     async def _run(self) -> None:
         first_frame = None
@@ -264,8 +266,10 @@ class SpeechStream(stt.RecognizeStream):
         if event.provider_request_id:
             self._request_id = event.provider_request_id
         if event.type == "speech.started":
+            self._awaiting_final = False
             if not self._speaking:
                 self._speaking = True
+                self._saw_final_for_turn = False
                 self._event_ch.send_nowait(
                     stt.SpeechEvent(
                         type=stt.SpeechEventType.START_OF_SPEECH,
@@ -274,23 +278,49 @@ class SpeechStream(stt.RecognizeStream):
                 )
             return
         if event.type == "speech.ended":
-            self._emit_end()
+            if self._speaking:
+                if not self._saw_final_for_turn:
+                    self._awaiting_final = True
+                self._emit_end()
             return
         if event.type not in {"transcript.delta", "transcript.final"} or not event.text:
             return
+        is_final = event.type == "transcript.final"
+        if is_final and self._awaiting_final:
+            self._awaiting_final = False
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    request_id=self._request_id,
+                    alternatives=[
+                        stt.SpeechData(
+                            language=self._language,
+                            text=event.text,
+                            start_time=event.start_time or 0.0,
+                            end_time=event.end_time or 0.0,
+                        )
+                    ],
+                )
+            )
+            return
+
+        self._awaiting_final = False
         if not self._speaking:
             self._speaking = True
+            self._saw_final_for_turn = False
             self._event_ch.send_nowait(
                 stt.SpeechEvent(
                     type=stt.SpeechEventType.START_OF_SPEECH,
                     request_id=self._request_id,
                 )
             )
+        if is_final:
+            self._saw_final_for_turn = True
         self._event_ch.send_nowait(
             stt.SpeechEvent(
                 type=(
                     stt.SpeechEventType.FINAL_TRANSCRIPT
-                    if event.type == "transcript.final"
+                    if is_final
                     else stt.SpeechEventType.INTERIM_TRANSCRIPT
                 ),
                 request_id=self._request_id,
