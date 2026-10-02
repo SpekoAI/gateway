@@ -101,9 +101,19 @@ func TestSTTEveryRouteUsesTheSameCredentialField(t *testing.T) {
 		wantClientReference any
 	}{
 		{name: "byok", route: protocol.RouteProviderDirect, source: protocol.CredentialsBYOK, kind: protocol.CredentialBearer, credential: "customer-soniox-key", wantClientReference: nil},
-		{name: "managed", route: protocol.RouteProviderDirect, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, credential: "temporary-soniox-key", wantClientReference: "res_soniox"},
-		{name: "relay with bearer kind", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, credential: "connector-soniox-key", wantClientReference: "res_soniox"},
-		{name: "relay with relay_access kind", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialRelayAccess, credential: "connector-soniox-key", wantClientReference: "res_soniox"},
+		{name: "managed", route: protocol.RouteProviderDirect, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, credential: "temporary-soniox-key", wantClientReference: "speko_reservation:res_soniox"},
+		{name: "relay with bearer kind", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, credential: "connector-soniox-key", wantClientReference: "speko_reservation:res_soniox"},
+		{name: "relay with relay_access kind", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialRelayAccess, credential: "connector-soniox-key", wantClientReference: "speko_reservation:res_soniox"},
+		// The shapes a relay-synthesized plan actually arrives in. The relay
+		// connector builds its plan by hand and never runs
+		// protocol.SessionPlan.Validate, so Execution.CredentialSource is
+		// whatever the signed relay plan carried — it is not guaranteed to be
+		// managed, and an unset value is a legal synthesized shape. Gating the
+		// stamp on CredentialSource alone therefore drops relay traffic, which
+		// is the only Soniox traffic that reaches the vendor on a long-lived
+		// key and so the only traffic the usage log can record a tag for.
+		{name: "relay with unset credential source", route: protocol.RouteSpekoRelay, source: "", kind: protocol.CredentialBearer, credential: "connector-soniox-key", wantClientReference: "speko_reservation:res_soniox"},
+		{name: "relay with byok credential source", route: protocol.RouteSpekoRelay, source: protocol.CredentialsBYOK, kind: protocol.CredentialBearer, credential: "connector-soniox-key", wantClientReference: "speko_reservation:res_soniox"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -151,6 +161,60 @@ func TestSTTEveryRouteUsesTheSameCredentialField(t *testing.T) {
 				t.Errorf("api_key = %v", got)
 			}
 			if got := start["client_reference_id"]; got != testCase.wantClientReference {
+				t.Errorf("client_reference_id = %v, want %v", got, testCase.wantClientReference)
+			}
+		})
+	}
+}
+
+// Soniox answers an over-long client_reference_id with HTTP 400
+// "`client_reference_id` is N characters, which exceeds the maximum allowed
+// length of 256." — it fails the whole request rather than dropping the tag,
+// so a stamp that would not fit must never be sent. The budget is spent by the
+// value that actually goes on the wire, which includes the 18-character
+// "speko_reservation:" namespace; measuring the bare reservation id instead
+// would let a 250-character id build a 268-character stamp and lose the
+// session to correlation metadata.
+func TestSTTOmitsAReservationReferenceThatExceedsTheVendorCeiling(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name                string
+		reservationID       string
+		wantClientReference any
+	}{
+		{name: "at the ceiling", reservationID: strings.Repeat("r", 256-len("speko_reservation:")), wantClientReference: "speko_reservation:" + strings.Repeat("r", 256-len("speko_reservation:"))},
+		{name: "one over the ceiling", reservationID: strings.Repeat("r", 256-len("speko_reservation:")+1), wantClientReference: nil},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			starts := make(chan map[string]any, 1)
+			server := newSTTServer(t, func(ctx context.Context, conn *websocket.Conn) {
+				start, err := readJSONObject(ctx, conn)
+				if err != nil {
+					t.Errorf("read start request: %v", err)
+					return
+				}
+				starts <- start
+				waitForPeer(ctx, conn)
+			})
+			defer server.Close()
+
+			adapter, err := NewSTT(sttTestConfig(server.URL))
+			if err != nil {
+				t.Fatalf("new adapter: %v", err)
+			}
+			request := sttAdapterRequest(server.URL)
+			request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+			request.Plan.Reservation.ID = testCase.reservationID
+			stream, err := adapter.Open(context.Background(), request)
+			if err != nil {
+				t.Fatalf("open stream: %v", err)
+			}
+			defer abortStream(stream)
+
+			if got := mustReceiveObject(t, starts)["client_reference_id"]; got != testCase.wantClientReference {
 				t.Errorf("client_reference_id = %v, want %v", got, testCase.wantClientReference)
 			}
 		})

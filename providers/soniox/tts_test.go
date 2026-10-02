@@ -631,6 +631,132 @@ func TestTTSEveryRouteUsesTheSameCredentialField(t *testing.T) {
 	}
 }
 
+// Synthesis is the bulk of Speko's Soniox spend, and until this field existed
+// on the TTS start message not one synthesis request could be attributed to a
+// reservation: the start frame simply had no place to put one. Soniox
+// documents client_reference_id on the TTS WebSocket configuration message
+// with the same semantics as the STT one — "Optional client-defined identifier
+// recorded with this request in usage logs" — so the two surfaces stamp the
+// same namespaced value and settlement reads them the same way.
+func TestTTSStartRequestCarriesTheReservationReference(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name                string
+		route               protocol.ProviderRoute
+		source              protocol.CredentialSource
+		kind                protocol.CredentialKind
+		wantClientReference any
+	}{
+		// A customer-owned key bills the customer's own Soniox project; a
+		// Speko reservation id has no meaning there and must not be sent.
+		{name: "byok is not tagged", route: protocol.RouteProviderDirect, source: protocol.CredentialsBYOK, kind: protocol.CredentialBearer, wantClientReference: nil},
+		{name: "managed", route: protocol.RouteProviderDirect, source: protocol.CredentialsManaged, kind: protocol.CredentialBearer, wantClientReference: "speko_reservation:res_soniox"},
+		{name: "relay with managed credential source", route: protocol.RouteSpekoRelay, source: protocol.CredentialsManaged, kind: protocol.CredentialRelayAccess, wantClientReference: "speko_reservation:res_soniox"},
+		// The relay connector synthesizes its plan by hand and never runs
+		// protocol.SessionPlan.Validate, so the relay arm cannot depend on
+		// CredentialSource carrying any particular value.
+		{name: "relay with unset credential source", route: protocol.RouteSpekoRelay, source: "", kind: protocol.CredentialBearer, wantClientReference: "speko_reservation:res_soniox"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			starts := make(chan map[string]any, 1)
+			server := newTTSTestServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+				start, err := readJSONObject(ctx, conn)
+				if err != nil {
+					t.Errorf("read start request: %v", err)
+					return
+				}
+				starts <- start
+				waitForPeer(ctx, conn)
+			})
+			defer server.Close()
+
+			adapter, err := NewTTS(ttsTestConfig(server.URL))
+			if err != nil {
+				t.Fatalf("new adapter: %v", err)
+			}
+			request := ttsAdapterRequest(server.URL)
+			request.Plan.Execution.ProviderRoute = testCase.route
+			request.Plan.Execution.CredentialSource = testCase.source
+			request.Plan.Route.Credential.Kind = testCase.kind
+			stream, err := adapter.Open(context.Background(), request)
+			if err != nil {
+				t.Fatalf("open stream: %v", err)
+			}
+			defer abortStream(stream)
+
+			if got := mustReceiveObject(t, starts)["client_reference_id"]; got != testCase.wantClientReference {
+				t.Errorf("client_reference_id = %v, want %v", got, testCase.wantClientReference)
+			}
+		})
+	}
+}
+
+// Soniox writes one usage-log entry per STREAM, not per socket, and a TTS
+// session runs a fresh stream for every utterance on the same connection. A
+// reference sent only on the first start message would leave every later
+// utterance of a multi-turn call unattributable — which is most of the spend
+// on a voice agent.
+func TestTTSEveryStreamOnTheSocketCarriesTheReservationReference(t *testing.T) {
+	t.Parallel()
+
+	messages := make(chan map[string]any, 8)
+	server := newTTSTestServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		for {
+			message, err := readJSONObject(ctx, conn)
+			if err != nil {
+				return
+			}
+			messages <- message
+			if message["text_end"] == true {
+				if err := writeJSONFrame(ctx, conn, map[string]any{"stream_id": message["stream_id"], "terminated": true}); err != nil {
+					return
+				}
+			}
+		}
+	})
+	defer server.Close()
+
+	adapter, err := NewTTS(ttsTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	request := ttsAdapterRequest(server.URL)
+	request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer abortStream(stream)
+
+	for _, text := range []string{"uno", "dos"} {
+		if err := stream.AppendText(context.Background(), text); err != nil {
+			t.Fatalf("append %q: %v", text, err)
+		}
+		if err := stream.CommitText(context.Background()); err != nil {
+			t.Fatalf("commit %q: %v", text, err)
+		}
+		if got := collectEvents(t, stream.Events(), 1); got[0].Type != protocol.EventAudioDone {
+			t.Fatalf("terminal event for %q = %s", text, got[0].Type)
+		}
+	}
+
+	firstStart := mustReceiveObject(t, messages)
+	mustReceiveObject(t, messages) // first text chunk
+	mustReceiveObject(t, messages) // first text_end
+	secondStart := mustReceiveObject(t, messages)
+	if secondStart["stream_id"] == firstStart["stream_id"] {
+		t.Fatalf("second utterance reused stream_id %v", firstStart["stream_id"])
+	}
+	for name, start := range map[string]map[string]any{"first": firstStart, "second": secondStart} {
+		if got := start["client_reference_id"]; got != "speko_reservation:res_soniox" {
+			t.Errorf("%s start client_reference_id = %v, want %q", name, got, "speko_reservation:res_soniox")
+		}
+	}
+}
+
 // --- helpers --------------------------------------------------------------
 
 func newTTSTestServer(t *testing.T, callback func(context.Context, *http.Request, *websocket.Conn)) *httptest.Server {

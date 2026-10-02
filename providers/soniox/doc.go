@@ -54,6 +54,30 @@
 // package classifies as authentication_failed because only a fresh key clears
 // it.
 //
+// # Reservation attribution
+//
+// Every request this package sends on Speko's own Soniox credential carries
+// client_reference_id = "speko_reservation:<reservation id>" — realtime STT
+// and realtime TTS in the start message, async batch in the transcription
+// creation body. Soniox echoes the value verbatim in GET /v1/usage-logs, and
+// that echo is the only thing provider-authoritative settlement can attribute
+// the vendor's invoiced cost_usd by; an unstamped request belongs to no
+// reservation and no organization and can only be charged from relay telemetry
+// at a flat catalog rate.
+//
+// The stamp follows the plan's billing authority, not its credential
+// placement: relay plans and managed provider-direct plans are tagged, BYOK
+// provider-direct plans are not, because those bill the customer's own Soniox
+// project. See reservationReference.
+//
+// Two vendor rules bound it. client_reference_id is capped at 256 characters
+// and a longer value fails the whole request with HTTP 400, so an over-long
+// stamp is dropped rather than sent. And it is "Ignored if the request
+// authenticates with a temporary API key" — the managed provider-direct case —
+// where the control plane binds the identifier to the key at mint time
+// instead; that binding writes the BARE reservation id, so both spellings
+// reach the usage log and settlement accepts either.
+//
 // # Provenance
 //
 // Every wire fact below was read from Soniox's raw MDX sources on 2026-08-07
