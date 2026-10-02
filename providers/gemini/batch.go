@@ -234,18 +234,34 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 // transcriptionConfig renders the caller's asks onto
 // generation_config.transcription_config, or nil when they asked for nothing.
 //
-// `mode` is left unset unless diarization was requested. The two modes are
-// verbatim and smart, and only verbatim carries speaker labels and word
-// timings — the Live API's twin of this field states the incompatibility
-// outright ("Timestamps and diarization are incompatible with mode SMART"),
-// and the smart mode object here carries neither field to set.
+// A transcription_config that carries any field MUST also name a `mode`. The
+// adapter used to leave `mode` unset on the theory that naming one could
+// silently switch the transcript between verbatim output and smart's
+// disfluency removal, so the service default was the safer thing to keep.
+// That theory is refuted. Measured live against v1beta/interactions on
+// 2026-09-20 with one 58.5 s Uzbek recording:
 //
-// Which mode this endpoint defaults to is NOT documented in the generated
-// types, so the adapter does not assume: naming a mode when the caller has no
-// need of one could silently switch every transcript between verbatim output
-// and smart's disfluency removal and auto-formatting. Leaving it unset keeps
-// whichever default the service has, and the one case that genuinely requires
-// verbatim asks for it explicitly.
+//	(no transcription_config)                 94 words, correct
+//	mode {smart}, no language_codes           95 words, correct
+//	mode {verbatim}, no language_codes        94 words, correct
+//	language_codes [uz], NO mode              EMPTY transcript, HTTP 200
+//	language_codes [en], NO mode              EMPTY transcript, HTTP 200
+//	language_codes [tr], NO mode              EMPTY transcript, HTTP 200
+//	language_codes [uz] + mode {verbatim}     EMPTY transcript, HTTP 200
+//	language_codes [uz] + mode {smart}        102 words, correct
+//
+// A single language code with no `mode`, or with the verbatim mode, comes
+// back as a completed interaction carrying no output at all — a silent total
+// loss the caller is still billed for. The smart mode is the pairing that
+// works, and it is also indistinguishable from the service default on the
+// same audio (95 words against 94), so pinning it costs nothing where the
+// config would have worked anyway and repairs every language-hinted request.
+//
+// The verbatim mode is still named explicitly for the one case that requires
+// it. Only verbatim carries speaker labels and word timings — the Live API's
+// twin of this field states the incompatibility outright ("Timestamps and
+// diarization are incompatible with mode SMART"), and the smart mode object
+// carries neither field to set.
 func transcriptionConfig(options protocol.RequestOptions) map[string]any {
 	config := map[string]any{}
 	if language := strings.TrimSpace(options.Language); language != "" {
@@ -271,7 +287,12 @@ func transcriptionConfig(options protocol.RequestOptions) map[string]any {
 		config["mode"] = mode
 	}
 	if len(config) == 0 {
+		// Nothing was asked for, so nothing is sent: a bare request has no
+		// config to pair a mode with, and it transcribes correctly.
 		return nil
+	}
+	if _, moded := config["mode"]; !moded {
+		config["mode"] = map[string]any{"type": "smart"}
 	}
 	return config
 }

@@ -416,3 +416,74 @@ func TestBatchLimitsFollowTheInlineRequestCeiling(t *testing.T) {
 		t.Fatalf("byte cap holds only %d s of 16 kHz mono, less than the %d s duration bound", seconds, BatchMaxDurationSeconds)
 	}
 }
+
+// A language hint alone used to travel as a transcription_config with no
+// `mode`, which the Interactions API answers with a completed interaction and
+// no output at all — measured empty for uz, en and tr on 2026-09-20. The
+// smart mode is the pairing that transcribes, so it is pinned whenever the
+// caller asked for something but not for verbatim.
+func TestBatchLanguageHintPinsSmartMode(t *testing.T) {
+	t.Parallel()
+	server, captured := newFakeInteractions(t, http.StatusOK, `{"id":"i1","steps":[{"type":"model_output","content":[{"type":"text","text":"salom"}]}]}`)
+	request := batchRequest(server.URL, []byte("wav"))
+	request.Options.Language = "uz"
+
+	if _, err := newBatchAdapter(t, server).Transcribe(context.Background(), request); err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	generation, _ := captured.body["generation_config"].(map[string]any)
+	config, _ := generation["transcription_config"].(map[string]any)
+	if languages, _ := config["language_codes"].([]any); len(languages) != 1 || languages[0] != "uz" {
+		t.Fatalf("language_codes = %v", config["language_codes"])
+	}
+	mode, _ := config["mode"].(map[string]any)
+	if mode["type"] != "smart" {
+		t.Fatalf("mode = %v, want the smart mode object beside language_codes", config["mode"])
+	}
+	// Smart carries neither field, and sending them next to it is the
+	// combination the Live API documents as incompatible.
+	for _, absent := range []string{"timestamp_granularities", "diarization_mode"} {
+		if _, present := mode[absent]; present {
+			t.Fatalf("%s was sent on the smart mode: %v", absent, mode)
+		}
+	}
+}
+
+// Keywords travel without verbatim too, so they take the same pairing.
+func TestBatchKeywordsPinSmartMode(t *testing.T) {
+	t.Parallel()
+	server, captured := newFakeInteractions(t, http.StatusOK, `{"id":"i1","steps":[{"type":"model_output","content":[{"type":"text","text":"salom"}]}]}`)
+	request := batchRequest(server.URL, []byte("wav"))
+	request.Options.STT = &protocol.SttOptions{Keywords: []string{"Speko"}}
+
+	if _, err := newBatchAdapter(t, server).Transcribe(context.Background(), request); err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	generation, _ := captured.body["generation_config"].(map[string]any)
+	config, _ := generation["transcription_config"].(map[string]any)
+	mode, _ := config["mode"].(map[string]any)
+	if mode["type"] != "smart" {
+		t.Fatalf("mode = %v, want the smart mode object beside custom_vocabulary", config["mode"])
+	}
+}
+
+// The verbatim ask still wins: smart is the default pairing, never an
+// override of a mode the caller's asks require.
+func TestBatchVerbatimAskIsNotOverriddenBySmart(t *testing.T) {
+	t.Parallel()
+	server, captured := newFakeInteractions(t, http.StatusOK, `{"id":"i1","steps":[{"type":"model_output","content":[{"type":"text","text":"salom"}]}]}`)
+	request := batchRequest(server.URL, []byte("wav"))
+	words := true
+	request.Options.Language = "uz"
+	request.Options.STT = &protocol.SttOptions{WordTimestamps: &words}
+
+	if _, err := newBatchAdapter(t, server).Transcribe(context.Background(), request); err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	generation, _ := captured.body["generation_config"].(map[string]any)
+	config, _ := generation["transcription_config"].(map[string]any)
+	mode, _ := config["mode"].(map[string]any)
+	if mode["type"] != "verbatim" {
+		t.Fatalf("mode = %v, want verbatim to survive the smart default", config["mode"])
+	}
+}
