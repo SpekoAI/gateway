@@ -819,3 +819,35 @@ func utteranceID(t *testing.T, event runtimepkg.ProviderEvent) string {
 	}
 	return data.UtteranceID
 }
+
+// TestTTSLiveWireEndsWithDoneSentinel replays the stream shape captured from
+// the live endpoint on 2026-10-05: `data:` lines with no `event:` names, and a
+// final `data: [DONE]` after speech.audio.done. The sentinel is not JSON; it
+// must end the utterance cleanly with its billing, not fail it after the
+// audio was already delivered.
+func TestTTSLiveWireEndsWithDoneSentinel(t *testing.T) {
+	t.Parallel()
+
+	server := newSpeechServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		delta, _ := json.Marshal(map[string]any{"type": "speech.audio.delta", "audio": base64.StdEncoding.EncodeToString([]byte{1, 2, 3, 4})})
+		_, _ = w.Write([]byte("data: " + string(delta) + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"speech.audio.done","usage":{"input_tokens":1,"output_tokens":33,"total_tokens":34}}` + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+	defer server.Close()
+
+	stream := openTTS(t, server.URL, nil, nil)
+	defer func() { _ = stream.Abort(context.Background()) }()
+	synthesizeTTS(t, stream, "ok")
+
+	var event runtimepkg.ProviderEvent
+	for event.Type != protocol.EventAudioDone {
+		event = nextTTS(t, stream.Events())
+		if event.Err != nil {
+			t.Fatalf("stream failed after the [DONE] sentinel: %v", event.Err)
+		}
+	}
+	if event.Billing == nil || !event.Billing.Complete {
+		t.Fatalf("audio.done billing = %+v, want the complete usage from speech.audio.done", event.Billing)
+	}
+}

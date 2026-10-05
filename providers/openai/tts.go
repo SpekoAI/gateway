@@ -766,6 +766,12 @@ func (s *ttsStream) handleSpeechEvent(utteranceID string, frame []byte, progress
 	if len(bytes.TrimSpace(frame)) == 0 {
 		return true
 	}
+	// The live endpoint ends every stream with `data: [DONE]` after
+	// speech.audio.done. It is a sentinel, not JSON; parsing it failed the
+	// whole utterance after its audio had already been delivered.
+	if string(bytes.TrimSpace(frame)) == "[DONE]" {
+		return true
+	}
 	var event struct {
 		Type  string          `json:"type"`
 		Audio string          `json:"audio"`
