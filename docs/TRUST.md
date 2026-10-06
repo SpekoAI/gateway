@@ -245,3 +245,11 @@ Use the `_FILE` variants and a secrets manager in production.
   canonical stages without moving raw content into telemetry.
 - Process memory is not a hardware security boundary. Run the image with least
   privilege, a read-only filesystem, and a dedicated workload identity.
+
+### Gemini batch option validation
+
+Gemini language-hinted batch transcription uses smart mode. Language hints
+combined with diarization or word timestamps are rejected locally before audio
+is read or sent: the provider returns an empty, billable transcript for that
+combination. Verbatim requests without a language hint retain their requested
+timing and speaker fields.

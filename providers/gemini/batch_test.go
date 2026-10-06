@@ -156,7 +156,7 @@ func TestBatchDiarizationRequestsVerbatimModeAndBuildsSegments(t *testing.T) {
 	server, captured := newFakeInteractions(t, http.StatusOK, response)
 	request := batchRequest(server.URL, []byte("wav"))
 	diarize := true
-	request.Options.Language = "en-US"
+	request.Options.Language = ""
 	request.Options.STT = &protocol.SttOptions{Diarization: &diarize}
 
 	result, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
@@ -165,7 +165,7 @@ func TestBatchDiarizationRequestsVerbatimModeAndBuildsSegments(t *testing.T) {
 	}
 	generation, _ := captured.body["generation_config"].(map[string]any)
 	config, _ := generation["transcription_config"].(map[string]any)
-	if languages, _ := config["language_codes"].([]any); len(languages) != 1 || languages[0] != "en-US" {
+	if _, present := config["language_codes"]; present {
 		t.Fatalf("language_codes = %v", config["language_codes"])
 	}
 	if _, present := config["custom_vocabulary"]; present {
@@ -213,7 +213,7 @@ func TestBatchWordTimestampsRequestVerbatimModeAndReturnWords(t *testing.T) {
 	server, captured := newFakeInteractions(t, http.StatusOK, response)
 	request := batchRequest(server.URL, []byte("wav"))
 	words := true
-	request.Options.Language = "uz-UZ"
+	request.Options.Language = ""
 	request.Options.STT = &protocol.SttOptions{WordTimestamps: &words}
 
 	result, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
@@ -474,7 +474,7 @@ func TestBatchVerbatimAskIsNotOverriddenBySmart(t *testing.T) {
 	server, captured := newFakeInteractions(t, http.StatusOK, `{"id":"i1","steps":[{"type":"model_output","content":[{"type":"text","text":"salom"}]}]}`)
 	request := batchRequest(server.URL, []byte("wav"))
 	words := true
-	request.Options.Language = "uz"
+	request.Options.Language = ""
 	request.Options.STT = &protocol.SttOptions{WordTimestamps: &words}
 
 	if _, err := newBatchAdapter(t, server).Transcribe(context.Background(), request); err != nil {
@@ -485,5 +485,36 @@ func TestBatchVerbatimAskIsNotOverriddenBySmart(t *testing.T) {
 	mode, _ := config["mode"].(map[string]any)
 	if mode["type"] != "verbatim" {
 		t.Fatalf("mode = %v, want verbatim to survive the smart default", config["mode"])
+	}
+}
+
+type unreadAudio struct{}
+
+func (unreadAudio) Read([]byte) (int, error) {
+	panic("audio read before incompatible options were rejected")
+}
+func (unreadAudio) Seek(int64, int) (int64, error) {
+	panic("audio seek before incompatible options were rejected")
+}
+
+func TestBatchRefusesLanguageHintWithVerbatimBeforeReadingAudio(t *testing.T) {
+	t.Parallel()
+	server, captured := newFakeInteractions(t, http.StatusOK, `{"id":"unused","output_text":"never"}`)
+	for name, options := range map[string]*protocol.SttOptions{
+		"diarization":     {Diarization: boolPointer(true)},
+		"word timestamps": {WordTimestamps: boolPointer(true)},
+	} {
+		request := batchRequest(server.URL, []byte("wav"))
+		request.Options.Language = "uz"
+		request.Options.STT = options
+		request.Audio = unreadAudio{}
+		_, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) || providerErr.Code != "invalid_request" || !strings.Contains(providerErr.Message, "language hint") {
+			t.Fatalf("%s: error = %v", name, err)
+		}
+	}
+	if captured.body != nil {
+		t.Fatalf("refused combination reached provider: %+v", captured.body)
 	}
 }

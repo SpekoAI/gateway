@@ -145,6 +145,11 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if verbatimModeRequested(request.Options) && len(trimmedKeywords(request.Options.STT.GetKeywords())) > 0 {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInvalidRequest, Message: "Gemini cannot combine keywords with diarization or word timestamps; drop one of the asks"}
 	}
+	// Language hints combined with verbatim mode produce a billed empty
+	// transcript. Reject before touching audio or contacting the service.
+	if verbatimModeRequested(request.Options) && strings.TrimSpace(request.Options.Language) != "" {
+		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInvalidRequest, Message: "Gemini cannot combine a language hint with diarization or word timestamps; drop one of the asks"}
+	}
 	credential, err := batchhttp.Credential(request.Plan)
 	if err != nil {
 		return nil, err
