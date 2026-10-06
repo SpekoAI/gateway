@@ -3,7 +3,7 @@
   "info": {
     "title": "Speko Router API",
     "version": "1.0.0",
-    "description": "HTTP contract of the Speko Router: model discovery, batch speech transcription, one-shot speech synthesis, and LLM responses over JSON or server-sent events. The Go types in package relayapi are the source of truth for every shape in this document, and speccheck_test.go machine-checks the two against each other. Streaming speech travels over WebSocket and is specified separately in asyncapi.yaml. The /v1 prefix is the stable major version: compatible fields and capabilities may be added, while breaking changes require a new major path. Before a v1 operation or field is retired, Speko documents a migration, sends the Deprecation header and a Link with rel=\"deprecation\", and provides at least 90 days of notice before the Sunset date. See the public versioning policy for the complete compatibility contract.",
+    "description": "The Speko Router is streaming-first: live speech-to-text and text-to-speech sessions, and the three native speech-to-speech routes, all run over WebSocket and are specified in asyncapi.yaml, which this Router serves at /asyncapi.json. This document is the HTTP contract, the request/response surface beside those sockets: model discovery, batch speech transcription, one-shot speech synthesis, LLM responses over JSON or server-sent events, and Jev evaluations. The Go types in package relayapi are the source of truth for every shape in this document, and speccheck_test.go machine-checks the two against each other. The /v1 prefix is the stable major version: compatible fields and capabilities may be added, while breaking changes require a new major path. Before a v1 operation or field is retired, Speko documents a migration, sends the Deprecation header and a Link with rel=\"deprecation\", and provides at least 90 days of notice before the Sunset date. See the public versioning policy for the complete compatibility contract.",
     "x-speko-versioning-policy": "https://speko.ai/developers/versioning"
   },
   "externalDocs": {
@@ -18,9 +18,7 @@
   ],
   "security": [
     {
-      "bearerAuth": [
-
-      ]
+      "bearerAuth": []
     }
   ],
   "paths": {
@@ -28,10 +26,8 @@
       "get": {
         "operationId": "getOpenAPISpec",
         "summary": "Download the canonical Router HTTP contract",
-        "description": "Returns this exact OpenAPI 3.1 document without authentication. Agents and code generators can use it to discover every HTTP operation, request shape, response shape, error code, and lifecycle convention. Streaming speech operations are described by the AsyncAPI document in the public Gateway repository.",
-        "security": [
-
-        ],
+        "description": "Returns this exact OpenAPI 3.1 document without authentication. Agents and code generators can use it to discover every HTTP operation, request shape, response shape, error code, and lifecycle convention. Streaming speech operations are described by the AsyncAPI document, which this Router serves at /asyncapi.json.",
+        "security": [],
         "responses": {
           "200": {
             "description": "The canonical OpenAPI 3.1 document.",
@@ -45,6 +41,39 @@
                 "schema": {
                   "type": "object",
                   "description": "An OpenAPI 3.1 document.",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/asyncapi.json": {
+      "get": {
+        "operationId": "getAsyncAPISpec",
+        "summary": "Download the canonical Router streaming contract",
+        "description": "Returns the canonical AsyncAPI 2.6 document without authentication. It specifies every WebSocket operation the Router serves: the streaming speech-to-text and text-to-speech sessions, and the three native speech-to-speech routes. This OpenAPI document describes the HTTP operations.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The canonical AsyncAPI 2.6 document.",
+            "headers": {
+              "RateLimit-Policy": {
+                "$ref": "#/components/headers/RateLimitPolicy"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "An AsyncAPI 2.6 document.",
                   "additionalProperties": true
                 }
               }
@@ -146,7 +175,7 @@
       "post": {
         "operationId": "createTranscription",
         "summary": "Transcribe one uploaded audio file",
-        "description": "Batch speech-to-text. The audio always travels as an uploaded part, never as a URL: the Router fetches nothing on a caller's behalf. For idempotency the content hash covers the decoded part payload bytes only — no part headers, no boundary bytes — concatenated in part order (request, then audio), so a retry hashes identically no matter what boundary string the client generates. Usage lives in the response body; there is deliberately no STT usage header.",
+        "description": "For live audio, open the streaming socket at /v1/stt/stream, specified in asyncapi.yaml. This operation is the batch path, for a recording that already exists. The audio always travels as an uploaded part, never as a URL: the Router fetches nothing on a caller's behalf. For idempotency the content hash covers the decoded part payload bytes only — no part headers, no boundary bytes — concatenated in part order (request, then audio), so a retry hashes identically no matter what boundary string the client generates. Usage lives in the response body; there is deliberately no STT usage header.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
@@ -230,7 +259,7 @@
       "post": {
         "operationId": "createSpeech",
         "summary": "Synthesize one utterance to a raw audio stream",
-        "description": "One-shot text-to-speech. The response body is a raw audio stream in the requested output format; the route and the billed character count come back in headers (Speko-Provider, Speko-Model, Speko-Region, Speko-Usage-Characters) because a byte stream has no place for a JSON envelope.",
+        "description": "For speech that starts playing before the text is finished, open the streaming socket at /v1/tts/stream, specified in asyncapi.yaml. This operation is the one-shot path, synthesizing a single utterance in full. The response body is a raw audio stream in the requested output format; the route and the billed character count come back in headers (Speko-Provider, Speko-Model, Speko-Region, Speko-Usage-Characters) because a byte stream has no place for a JSON envelope.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
@@ -714,6 +743,20 @@
             "type": "integer",
             "minimum": 0
           },
+          "cache_write_5m_tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Disjoint cache-write input tokens for 5-minute retention."
+          },
+          "cache_write_1h_tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Disjoint cache-write input tokens for 1-hour retention."
+          },
+          "incomplete": {
+            "type": "boolean",
+            "description": "Terminal billing quantities are missing or inconsistent; do not interpret missing evidence as zero usage."
+          },
           "output_tokens": {
             "type": "integer",
             "minimum": 0
@@ -797,6 +840,10 @@
           "character_timings": {
             "type": "boolean",
             "description": "Reports time-aligned spans of synthesized speech measured per CHARACTER, on the utterance.timings event of GET /v1/tts/stream. A character-level model reports false for word_timings: the Router emits what the engine measured and never groups characters into words, because only the caller knows where the words are in the text it sent."
+          },
+          "translation": {
+            "type": "boolean",
+            "description": "The model translates: speech in, speech in another language out (kind s2s), or speech in, translated text out (kind stt). A translation model is not conversational: its session carries a target language and produces no assistant turn."
           }
         },
         "required": [
@@ -810,7 +857,8 @@
           "noise_reduction",
           "word_timestamps",
           "word_timings",
-          "character_timings"
+          "character_timings",
+          "translation"
         ],
         "additionalProperties": false
       },
@@ -858,9 +906,11 @@
             "enum": [
               "/v1/realtime",
               "/v1/live",
-              "/v1/bidi"
+              "/v1/bidi",
+              "/v1/realtime/translations",
+              "/v1/realtime/translations/qwen"
             ],
-            "description": "The public Router WebSocket route an S2S model is served on; omitted for every other kind, whose routes are fixed per kind. Select the model exactly: /v1/realtime takes it as the `model` query parameter, /v1/live in the first session.start frame, /v1/bidi in the first setup frame. A model sent to another route is refused with capability_unsupported."
+            "description": "The public Router WebSocket route an S2S model is served on; omitted for every other kind, whose routes are fixed per kind. Select the model exactly: /v1/realtime, /v1/realtime/translations and /v1/realtime/translations/qwen take it as the `model` query parameter, /v1/live in the first session.start frame, /v1/bidi in the first setup frame. A model sent to another route is refused with capability_unsupported."
           },
           "protocol": {
             "type": "string",
@@ -868,9 +918,11 @@
               "openai.realtime.v1",
               "xai.realtime.v1",
               "openai.live.v1",
-              "google.live.v1"
+              "google.live.v1",
+              "openai.realtime.translation.v1",
+              "alibaba.livetranslate.v1"
             ],
-            "description": "The native event protocol the S2S route speaks; omitted for every other kind. It also tells a client how to frame its messages: the OpenAI, xAI, and GPT-Live protocols tag every message by \"type\"; google.live.v1 uses its single top-level key."
+            "description": "The native event protocol the S2S route speaks; omitted for every other kind. It also tells a client how to frame its messages: the OpenAI, xAI, GPT-Live, OpenAI translation and Alibaba LiveTranslate protocols tag every message by \"type\"; google.live.v1 uses its single top-level key."
           },
           "benchmark": {
             "$ref": "#/components/schemas/ModelBenchmark"
@@ -1138,9 +1190,25 @@
         },
         "additionalProperties": false
       },
+      "STTTranslation": {
+        "type": "object",
+        "description": "Translate the spoken audio into target_language and return the translated words BESIDE the transcript: text stays the original words and the translation rides a separate translation field, so a caller that never asks reads exactly what it read before. Fails closed like the other canonical asks: a route whose model does not advertise capabilities.translation is refused capability_unsupported naming translation. One way only; the source is whatever is spoken.",
+        "properties": {
+          "target_language": {
+            "type": "string",
+            "description": "A BCP-47 language tag such as \"es\" or \"pt-BR\": a 2-3 letter primary subtag, then 1-8 character alphanumeric subtags, at most 35 characters. A shape check only; a language the routed vendor does not translate into is the vendor's error.",
+            "minLength": 2,
+            "maxLength": 35
+          }
+        },
+        "required": [
+          "target_language"
+        ],
+        "additionalProperties": false
+      },
       "STTOptions": {
         "type": "object",
-        "description": "What a caller asked a transcription to do beyond returning text. The same object rides POST /v1/stt/transcriptions and the STT session.configure frame, in the same vocabulary the local gateway uses. The canonical asks (diarization, keywords, noise_reduction, word_timestamps) fail closed: a request whose routed model does not advertise the matching capability in GET /v1/models is rejected with capability_unsupported, never answered 200 with the feature quietly missing. Names arrive lower case and are rejected otherwise rather than folded, because the idempotency content hash covers the request bytes exactly as sent and one intent must have one spelling.",
+        "description": "What a caller asked a transcription to do beyond returning text. The same object rides POST /v1/stt/transcriptions and the STT session.configure frame, in the same vocabulary the local gateway uses. The canonical asks (diarization, keywords, noise_reduction, word_timestamps, translation) fail closed: a request whose routed model does not advertise the matching capability in GET /v1/models is rejected with capability_unsupported, never answered 200 with the feature quietly missing. Names arrive lower case and are rejected otherwise rather than folded, because the idempotency content hash covers the request bytes exactly as sent and one intent must have one spelling.",
         "properties": {
           "diarization": {
             "type": "boolean",
@@ -1160,6 +1228,9 @@
           "word_timestamps": {
             "type": "boolean",
             "description": "Return per-word start/end timings as `words` on the batch transcription result. Batch only: no streaming route advertises it. Omitted leaves the result without words, which is not the same as false."
+          },
+          "translation": {
+            "$ref": "#/components/schemas/STTTranslation"
           },
           "provider_options": {
             "type": "object",
@@ -1258,6 +1329,10 @@
             "items": {
               "$ref": "#/components/schemas/TranscriptWord"
             }
+          },
+          "translation": {
+            "type": "string",
+            "description": "The transcript translated into options.translation.target_language, present only when translation was asked for. text stays the original spoken words. Translated words carry no timings, so there are no translated segments."
           },
           "route": {
             "$ref": "#/components/schemas/Route"
@@ -1750,8 +1825,7 @@
               },
               {
                 "type": "array",
-                "items": {
-                }
+                "items": {}
               }
             ]
           },
@@ -1773,26 +1847,55 @@
       "EvaluationRouting": {
         "type": "object",
         "properties": {
-          "mode": {"type": "string", "enum": ["explicit"]},
-          "provider": {"type": "string", "minLength": 1},
-          "model": {"type": "string", "minLength": 1}
+          "mode": {
+            "type": "string",
+            "enum": [
+              "explicit"
+            ]
+          },
+          "provider": {
+            "type": "string",
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          }
         },
-        "required": ["mode", "provider", "model"],
+        "required": [
+          "mode",
+          "provider",
+          "model"
+        ],
         "additionalProperties": false
       },
       "EvaluationQuestion": {
         "description": "A noul, choice, or score question. Instructions may be structured JSON. Choice criteria contain 2-255 keyed options; Score criteria contain 2-10 ordered levels; Noul criteria may describe true and/or false.",
         "oneOf": [
-          {"$ref": "#/components/schemas/NoulQuestion"},
-          {"$ref": "#/components/schemas/ChoiceQuestion"},
-          {"$ref": "#/components/schemas/ScoreQuestion"}
+          {
+            "$ref": "#/components/schemas/NoulQuestion"
+          },
+          {
+            "$ref": "#/components/schemas/ChoiceQuestion"
+          },
+          {
+            "$ref": "#/components/schemas/ScoreQuestion"
+          }
         ]
       },
       "EvaluationJSONStructure": {
         "oneOf": [
-          {"type": "string"},
-          {"type": "object", "additionalProperties": true},
-          {"type": "array", "items": {}}
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "additionalProperties": true
+          },
+          {
+            "type": "array",
+            "items": {}
+          }
         ]
       },
       "NoulQuestion": {
@@ -1800,7 +1903,9 @@
         "properties": {
           "type": {
             "type": "string",
-            "enum": ["noul"]
+            "enum": [
+              "noul"
+            ]
           },
           "instructions": {
             "$ref": "#/components/schemas/EvaluationJSONStructure"
@@ -1809,91 +1914,207 @@
             "type": "object",
             "minProperties": 1,
             "properties": {
-              "true": {"oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/EvaluationJSONStructure"}]},
-              "false": {"oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/EvaluationJSONStructure"}]}
+              "true": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/EvaluationJSONStructure"
+                  }
+                ]
+              },
+              "false": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/EvaluationJSONStructure"
+                  }
+                ]
+              }
             },
             "additionalProperties": false
           }
         },
-        "required": ["type", "instructions"],
+        "required": [
+          "type",
+          "instructions"
+        ],
         "additionalProperties": false
       },
       "ChoiceQuestion": {
         "type": "object",
         "properties": {
-          "type": {"type": "string", "enum": ["choice"]},
-          "instructions": {"$ref": "#/components/schemas/EvaluationJSONStructure"},
+          "type": {
+            "type": "string",
+            "enum": [
+              "choice"
+            ]
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/EvaluationJSONStructure"
+          },
           "criteria": {
             "type": "object",
             "minProperties": 2,
             "maxProperties": 255,
             "additionalProperties": {
-              "oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/EvaluationJSONStructure"}]
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/EvaluationJSONStructure"
+                }
+              ]
             }
           }
         },
-        "required": ["type", "instructions", "criteria"],
+        "required": [
+          "type",
+          "instructions",
+          "criteria"
+        ],
         "additionalProperties": false
       },
       "ScoreQuestion": {
         "type": "object",
         "properties": {
-          "type": {"type": "string", "enum": ["score"]},
-          "instructions": {"$ref": "#/components/schemas/EvaluationJSONStructure"},
+          "type": {
+            "type": "string",
+            "enum": [
+              "score"
+            ]
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/EvaluationJSONStructure"
+          },
           "criteria": {
             "type": "array",
             "minItems": 2,
             "maxItems": 10,
-            "items": {"$ref": "#/components/schemas/EvaluationJSONStructure"}
+            "items": {
+              "$ref": "#/components/schemas/EvaluationJSONStructure"
+            }
           }
         },
-        "required": ["type", "instructions", "criteria"],
+        "required": [
+          "type",
+          "instructions",
+          "criteria"
+        ],
         "additionalProperties": false
       },
       "EvaluationAnswer": {
         "description": "One native Jev answer. Noul is a numeric yes probability. Choice and Score confidence is a separate distribution statistic and must not be multiplied into the selected answer probability.",
         "oneOf": [
-          {"$ref": "#/components/schemas/NoulAnswer"},
-          {"$ref": "#/components/schemas/ChoiceAnswer"},
-          {"$ref": "#/components/schemas/ScoreAnswer"}
+          {
+            "$ref": "#/components/schemas/NoulAnswer"
+          },
+          {
+            "$ref": "#/components/schemas/ChoiceAnswer"
+          },
+          {
+            "$ref": "#/components/schemas/ScoreAnswer"
+          }
         ]
       },
       "NoulAnswer": {
         "type": "object",
         "properties": {
-          "type": {"type": "string", "enum": ["noul"]},
-          "noul": {"type": "number", "minimum": 0, "maximum": 1}
+          "type": {
+            "type": "string",
+            "enum": [
+              "noul"
+            ]
+          },
+          "noul": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
         },
-        "required": ["type", "noul"],
+        "required": [
+          "type",
+          "noul"
+        ],
         "additionalProperties": false
       },
       "ChoiceAnswer": {
         "type": "object",
         "properties": {
-          "type": {"type": "string", "enum": ["choice"]},
-          "choice": {"type": "string"},
+          "type": {
+            "type": "string",
+            "enum": [
+              "choice"
+            ]
+          },
+          "choice": {
+            "type": "string"
+          },
           "probabilities": {
             "type": "object",
-            "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}
+            "additionalProperties": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
           },
-          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
         },
-        "required": ["type", "choice", "probabilities", "confidence"],
+        "required": [
+          "type",
+          "choice",
+          "probabilities",
+          "confidence"
+        ],
         "additionalProperties": false
       },
       "ScoreAnswer": {
         "type": "object",
         "properties": {
-          "type": {"type": "string", "enum": ["score"]},
-          "score": {"type": "number", "minimum": 0, "maximum": 9},
+          "type": {
+            "type": "string",
+            "enum": [
+              "score"
+            ]
+          },
+          "score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 9
+          },
           "probabilities": {
             "type": "object",
-            "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}
+            "additionalProperties": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
           },
-          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-          "legend": {"type": "object", "additionalProperties": true}
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "legend": {
+            "type": "object",
+            "additionalProperties": true
+          }
         },
-        "required": ["type", "score", "probabilities", "confidence", "legend"],
+        "required": [
+          "type",
+          "score",
+          "probabilities",
+          "confidence",
+          "legend"
+        ],
         "additionalProperties": false
       },
       "EvaluationResponse": {

@@ -3,7 +3,7 @@
   "info": {
     "title": "Speko Router streaming API",
     "version": "1.0.0",
-    "description": "WebSocket contract of the Speko Router: streaming speech-to-text and text-to-speech sessions, plus the three native speech-to-speech routes. On the STT and TTS routes JSON text frames carry the control messages and events documented here and binary frames carry raw audio in the format the session.configure frame declared, with no JSON envelope. On /v1/realtime, /v1/live and /v1/bidi the Router speaks the OpenAI/xAI Realtime, GPT-Live and Gemini Live protocols natively: audio travels base64-encoded inside the vendor's own JSON events, the Router forwards a bounded set of vendor commands and every vendor server event verbatim, and only its own error frame is Router-shaped. The Go types in package relayapi are the source of truth for every Router-defined shape in this document, and speccheck_test.go machine-checks the two against each other. The HTTP endpoints are specified separately in openapi.yaml."
+    "description": "WebSocket contract of the Speko Router: streaming speech-to-text and text-to-speech sessions, plus the five native speech-to-speech routes. On the STT and TTS routes JSON text frames carry the control messages and events documented here and binary frames carry raw audio in the format the session.configure frame declared, with no JSON envelope. On /v1/realtime, /v1/live, /v1/bidi, /v1/realtime/translations and /v1/realtime/translations/qwen the Router speaks the OpenAI/xAI Realtime, GPT-Live, Gemini Live, OpenAI realtime translation and Alibaba LiveTranslate protocols natively: audio travels base64-encoded inside the vendor's own JSON events, the Router forwards a bounded set of vendor commands and every vendor server event verbatim, and only its own error frame is Router-shaped. The Go types in package relayapi are the source of truth for every Router-defined shape in this document, and speccheck_test.go machine-checks the two against each other. The HTTP endpoints are specified separately in openapi.yaml."
   },
   "defaultContentType": "application/json",
   "servers": {
@@ -13,9 +13,7 @@
       "description": "Global entry point. The upgrade request authenticates with a Speko-issued bearer token and must carry an Idempotency-Key header. The idempotency content hash of a WebSocket session is the SHA-256 of the exact session.configure text-frame bytes, so a retry must reproduce the configure frame byte-for-byte; later frames are intentionally outside the hash — they are the stream's continuous content, guarded by budgets and leases, while the configure frame is the session's intent.",
       "security": [
         {
-          "bearerAuth": [
-
-          ]
+          "bearerAuth": []
         }
       ]
     }
@@ -224,6 +222,138 @@
       "subscribe": {
         "operationId": "receiveRealtimeEvents",
         "summary": "OpenAI/xAI Realtime server events, plus the Router error frame.",
+        "message": {
+          "oneOf": [
+            {
+              "$ref": "#/components/messages/nativeServerEvent"
+            },
+            {
+              "$ref": "#/components/messages/wsError"
+            }
+          ]
+        }
+      }
+    },
+    "/v1/realtime/translations": {
+      "description": "OpenAI realtime speech translation (gpt-realtime-translate), spoken natively on the Router's mirror of the vendor's dedicated /v1/realtime/translations socket. The model is selected exactly with the `model` query parameter (/v1/realtime/translations?model=gpt-realtime-translate) and its catalog row speaks openai.realtime.translation.v1; the idempotency content hash is the SHA-256 of that model value. This is not the conversational Realtime protocol: there is no voice, no instructions, no tools, no conversation items and no response.create. The client names the target language in a native session.update ({\"type\":\"session.update\",\"session\":{\"audio\":{\"output\":{\"language\":\"es\"}}}}); the only other settings accepted are session.audio.input.transcription (model gpt-realtime-whisper, or null) and session.audio.input.noise_reduction (type near_field or far_field, or null). Any other session field, and any target language outside es, pt, fr, ja, ru, zh, de, ko, hi, id, vi, it and en, is refused with invalid_request. Audio is mono PCM16 at 24 kHz in both directions, base64-encoded in session.input_audio_buffer.append events and streamed continuously, silence included. The client receives every vendor server event verbatim: session.created, session.output_audio.delta (translated audio), session.output_transcript.delta (target text), session.input_transcript.delta (source text) and session.closed; vendor `error` events pass through unchanged. Send session.close when the source ends and keep reading until session.closed: the vendor flushes pending input and emits the remaining translation first. The Router's own terminal error frame uses the shared ErrorEvent shape.",
+      "parameters": {
+        "model": {
+          "description": "Exact translation model id from GET /v1/models rows whose endpoint is /v1/realtime/translations.",
+          "schema": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      },
+      "bindings": {
+        "ws": {
+          "method": "GET",
+          "query": {
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              }
+            },
+            "required": [
+              "model"
+            ]
+          },
+          "headers": {
+            "type": "object",
+            "properties": {
+              "Idempotency-Key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Required on the upgrade request. The content hash covers the exact `model` query value."
+              }
+            },
+            "required": [
+              "Idempotency-Key"
+            ]
+          }
+        }
+      },
+      "publish": {
+        "operationId": "sendTranslationEvents",
+        "summary": "OpenAI realtime translation client events, forwarded to the model.",
+        "message": {
+          "$ref": "#/components/messages/nativeClientEvent"
+        }
+      },
+      "subscribe": {
+        "operationId": "receiveTranslationEvents",
+        "summary": "OpenAI realtime translation server events, plus the Router error frame.",
+        "message": {
+          "oneOf": [
+            {
+              "$ref": "#/components/messages/nativeServerEvent"
+            },
+            {
+              "$ref": "#/components/messages/wsError"
+            }
+          ]
+        }
+      }
+    },
+    "/v1/realtime/translations/qwen": {
+      "description": "Alibaba Qwen LiveTranslate speech-to-speech translation, spoken natively (alibaba.livetranslate.v1). The model is selected exactly with the `model` query parameter (/v1/realtime/translations/qwen?model=qwen3.8-livetranslate-flash-realtime) and the idempotency content hash is the SHA-256 of that model value. The session is not conversational: there is no assistant turn, no response.create and no instructions. After connecting, send the vendor's session.update with session.translation.language (the target language) and optionally output_modalities, voice, input_audio_transcription, translation.corpus and turn_detection. Then stream input_audio_buffer.append events (base64 mono PCM16 at 16 kHz). input_audio_buffer.commit and input_audio_buffer.clear are forwarded. Every other command, including input_image_buffer.append, is refused with invalid_request. The Router pins the audio formats (PCM16 in at 16 kHz, PCM16 out at 24 kHz), so a session.update that names another format or sample rate is refused. The client receives every vendor server event verbatim: session.created, session.updated, conversation.item.input_audio_transcription.text/.completed (the source), response.audio_transcript.delta and response.text.delta (the translation), response.audio.delta (the translated speech), and response.done with the vendor's token usage. Send session.finish to end the session and keep reading until session.finished: the Router forwards the finish upstream so the last segment is translated, then closes. Closing the socket without session.finish drops the final segment.",
+      "parameters": {
+        "model": {
+          "description": "Exact LiveTranslate model id from GET /v1/models rows whose endpoint is /v1/realtime/translations/qwen.",
+          "schema": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      },
+      "bindings": {
+        "ws": {
+          "method": "GET",
+          "query": {
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              }
+            },
+            "required": [
+              "model"
+            ]
+          },
+          "headers": {
+            "type": "object",
+            "properties": {
+              "Idempotency-Key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Required on the upgrade request. The content hash covers the exact `model` query value."
+              }
+            },
+            "required": [
+              "Idempotency-Key"
+            ]
+          }
+        }
+      },
+      "publish": {
+        "operationId": "sendQwenTranslationEvents",
+        "summary": "LiveTranslate client events, forwarded to the model.",
+        "message": {
+          "$ref": "#/components/messages/nativeClientEvent"
+        }
+      },
+      "subscribe": {
+        "operationId": "receiveQwenTranslationEvents",
+        "summary": "LiveTranslate server events, plus the Router error frame.",
         "message": {
           "oneOf": [
             {
@@ -714,6 +844,20 @@
             "type": "integer",
             "minimum": 0
           },
+          "cache_write_5m_tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Disjoint cache-write input tokens for 5-minute retention."
+          },
+          "cache_write_1h_tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Disjoint cache-write input tokens for 1-hour retention."
+          },
+          "incomplete": {
+            "type": "boolean",
+            "description": "Terminal billing quantities are missing or inconsistent; do not interpret missing evidence as zero usage."
+          },
           "output_tokens": {
             "type": "integer",
             "minimum": 0
@@ -867,9 +1011,25 @@
         ],
         "additionalProperties": false
       },
+      "STTTranslation": {
+        "type": "object",
+        "description": "Translate the spoken audio into target_language and return the translated words BESIDE the transcript: text stays the original words and the translation rides a separate translation field, so a caller that never asks reads exactly what it read before. Fails closed like the other canonical asks: a route whose model does not advertise capabilities.translation is refused capability_unsupported naming translation. One way only; the source is whatever is spoken.",
+        "properties": {
+          "target_language": {
+            "type": "string",
+            "description": "A BCP-47 language tag such as \"es\" or \"pt-BR\": a 2-3 letter primary subtag, then 1-8 character alphanumeric subtags, at most 35 characters. A shape check only; a language the routed vendor does not translate into is the vendor's error.",
+            "minLength": 2,
+            "maxLength": 35
+          }
+        },
+        "required": [
+          "target_language"
+        ],
+        "additionalProperties": false
+      },
       "STTOptions": {
         "type": "object",
-        "description": "What a caller asked a transcription to do beyond returning text. The same object rides POST /v1/stt/transcriptions and the STT session.configure frame, in the same vocabulary the local gateway uses. The canonical asks (diarization, keywords, noise_reduction, word_timestamps) fail closed: a session whose routed model does not advertise the matching capability in GET /v1/models is rejected with capability_unsupported, never answered with the feature quietly missing. Names arrive lower case and are rejected otherwise rather than folded, because the idempotency content hash covers the configure frame bytes exactly as sent and one intent must have one spelling.",
+        "description": "What a caller asked a transcription to do beyond returning text. The same object rides POST /v1/stt/transcriptions and the STT session.configure frame, in the same vocabulary the local gateway uses. The canonical asks (diarization, keywords, noise_reduction, word_timestamps, translation) fail closed: a session whose routed model does not advertise the matching capability in GET /v1/models is rejected with capability_unsupported, never answered with the feature quietly missing. Names arrive lower case and are rejected otherwise rather than folded, because the idempotency content hash covers the configure frame bytes exactly as sent and one intent must have one spelling.",
         "properties": {
           "diarization": {
             "type": "boolean",
@@ -889,6 +1049,9 @@
           "word_timestamps": {
             "type": "boolean",
             "description": "Return per-word timings on the batch transcription result. No streaming route advertises it, so on session.configure it is refused capability_unsupported."
+          },
+          "translation": {
+            "$ref": "#/components/schemas/STTTranslation"
           },
           "provider_options": {
             "type": "object",
@@ -971,7 +1134,7 @@
       },
       "STTTranscriptDelta": {
         "type": "object",
-        "description": "An interim hypothesis; later deltas and the next transcript.final supersede it. Deltas are never empty — empty interim hypotheses are dropped at normalization, never forwarded.",
+        "description": "An interim hypothesis; later deltas and the next transcript.final supersede it. Deltas are never empty — empty interim hypotheses are dropped at normalization, never forwarded. On a translating session a delta may advance only the translation, with empty text.",
         "properties": {
           "type": {
             "type": "string",
@@ -981,6 +1144,10 @@
           },
           "text": {
             "type": "string"
+          },
+          "translation": {
+            "type": "string",
+            "description": "The interim translation of the current span, present only on a session that asked for one. It trails text, so a delta may carry only one of the two; a delta with neither is never sent."
           }
         },
         "required": [
@@ -1011,6 +1178,10 @@
           "speaker": {
             "type": "string",
             "description": "Whoever said the whole finalized span, present only when the session asked for diarization and the provider attributed the turn. Most providers report one speaker per finalized turn rather than per span, so this is where a diarized session usually reads its labels; per-span attribution rides segments[].speaker instead. The vendor's own label, verbatim."
+          },
+          "translation": {
+            "type": "string",
+            "description": "The finalized translation delivered with this span, present only on a session that asked for one; text stays the original words. The vendor translates after it transcribes, so the translation of a span's last words can arrive on the NEXT transcript.final, and a final may carry a translation with empty text. Concatenate finals in order rather than pairing them one to one."
           }
         },
         "required": [
@@ -1714,8 +1885,7 @@
               "additionalProperties": true
             }
           },
-          "tool_choice": {
-          },
+          "tool_choice": {},
           "parallel_tool_calls": {
             "type": "boolean"
           },

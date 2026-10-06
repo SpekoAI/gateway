@@ -156,6 +156,12 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if keywords := request.Options.STT.GetKeywords(); len(keywords) > 0 {
 		creation["context"] = map[string]any{"terms": keywords}
 	}
+	// The async API takes the realtime socket's translation block verbatim.
+	translating := false
+	if translation := sttTranslationFor(request.Options.STT.TranslationTarget()); translation != nil {
+		creation["translation"] = translation
+		translating = true
+	}
 	if reservation := strings.TrimSpace(request.Plan.Reservation.ID); reservation != "" {
 		creation["client_reference_id"] = "speko_reservation:" + reservation
 	}
@@ -236,6 +242,9 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 			EndMS    int64   `json:"end_ms"`
 			Speaker  *string `json:"speaker"`
 			Language string  `json:"language"`
+			// TranslationStatus is "translation" on a translated token,
+			// which carries no timestamps.
+			TranslationStatus string `json:"translation_status"`
 		} `json:"tokens"`
 	}
 	if err := batchhttp.DecodeJSON(fetched.Body, &transcript); err != nil {
@@ -251,6 +260,7 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	// so segments are built by concatenation rather than space-joining.
 	var current *runtimepkg.BatchSegment
 	var buffer strings.Builder
+	var original, translated strings.Builder
 	flush := func() {
 		if current != nil {
 			current.Text = strings.TrimSpace(buffer.String())
@@ -262,6 +272,12 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		buffer.Reset()
 	}
 	for _, token := range transcript.Tokens {
+		if token.TranslationStatus == sttTranslationStatusTranslation {
+			// Never a segment: no timings, and not what was said.
+			translated.WriteString(token.Text)
+			continue
+		}
+		original.WriteString(token.Text)
 		if strings.TrimSpace(token.Text) == "" && current == nil {
 			continue
 		}
@@ -284,6 +300,13 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		buffer.WriteString(token.Text)
 	}
 	flush()
+	if translating {
+		// The transcript's top-level text is not documented as original-only
+		// on a translated job, so it is rebuilt from the original tokens:
+		// translated words must never reach Text.
+		result.Text = strings.TrimSpace(original.String())
+		result.Translation = strings.TrimSpace(translated.String())
+	}
 	if result.Text == "" {
 		result.Text = batchhttp.JoinSegments(result.Segments)
 	}

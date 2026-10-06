@@ -789,3 +789,18 @@ async def test_stt_completion_releases_turn_without_waiting_for_safety_timer(
     finally:
         await service.cleanup()
         await strategy.cleanup()
+
+
+def test_cache_write_tokens_are_included_in_llm_usage() -> None:
+    from speko_gateway.pipecat import _llm_token_usage
+
+    usage = _llm_token_usage({
+        "input_tokens": 300,
+        "cached_input_tokens": 100,
+        "cache_write_5m_tokens": 11,
+        "cache_write_1h_tokens": 19,
+        "output_tokens": 34,
+    })
+    assert usage.prompt_tokens == 430
+    assert usage.cache_read_input_tokens == 100
+    assert usage.total_tokens == 464

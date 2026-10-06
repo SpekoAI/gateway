@@ -26,7 +26,7 @@
 //     previous_response_id anywhere in the contract: callers resend full
 //     history, including function results, on every request.
 //
-//   - Usage split lines are mutually exclusive: cached_input_tokens are not
+//   - Usage split lines are mutually exclusive: cache writes and cached_input_tokens are not
 //     repeated in input_tokens and reasoning_tokens are not repeated in
 //     output_tokens, so the splits always sum to the totals. Providers that
 //     report no split report all-uncached / all-visible.

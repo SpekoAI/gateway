@@ -16,9 +16,30 @@ type STTOptions struct {
 	// WordTimestamps asks for per-word start/end timings on the batch result
 	// (TranscriptionResponse.Words). A pointer like Diarization: nil is
 	// silence, false is a statement.
-	WordTimestamps  *bool                     `json:"word_timestamps,omitempty"`
+	WordTimestamps *bool `json:"word_timestamps,omitempty"`
+	// Translation asks for the spoken audio translated into another
+	// language, returned BESIDE the transcript: `text` stays the original
+	// words so a caller that ignores translation reads exactly what it read
+	// before, and the translated words ride a separate `translation` field.
+	// Fails closed like every canonical ask: a route that cannot translate
+	// is refused with capability_unsupported naming "translation".
+	Translation     *STTTranslation           `json:"translation,omitempty"`
 	ProviderOptions map[string]map[string]any `json:"provider_options,omitempty"`
 }
+
+// STTTranslation names the language the transcript is translated into. One
+// way only: the source language is whatever was spoken (or the request's
+// language hint), so there is nothing else for a caller to say.
+type STTTranslation struct {
+	// TargetLanguage is a BCP-47 tag ("es", "pt-BR", "zh-Hans"). Adapters
+	// pass the primary subtag in the vendor's own spelling.
+	TargetLanguage string `json:"target_language"`
+}
+
+// MaxSTTLanguageTagLength bounds a translation target. 35 characters is the
+// longest tag RFC 5646 section 4.4.1 asks implementations to accept, far
+// beyond any tag a vendor lists.
+const MaxSTTLanguageTagLength = 35
 
 // Bounds on caller input, matching the local gateway's protocol.SttOptions.
 const (
@@ -41,12 +62,25 @@ var reservedSTTOptionKeys = map[string]struct{}{
 	"format_turns": {}, "interim_results": {}, "include_partial_turns": {},
 	"include_timestamps": {}, "commit_strategy": {}, "intent": {},
 	"word_timestamps": {}, "timestamp_granularities": {}, "timestamps": {},
+	// translation rides the canonical Translation field: forwarded as a
+	// provider setting it would skip the capability gate and change what
+	// the transcript's text means.
+	"translation": {}, "translation_config": {}, "target_language": {},
 }
 
 // IsZero reports whether the caller asked for nothing.
 func (o *STTOptions) IsZero() bool {
 	return o == nil ||
-		(o.Diarization == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && o.WordTimestamps == nil && len(o.ProviderOptions) == 0)
+		(o.Diarization == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && o.WordTimestamps == nil && o.Translation == nil && len(o.ProviderOptions) == 0)
+}
+
+// TranslationTarget returns the trimmed target language, or "" when the
+// caller asked for no translation.
+func (o *STTOptions) TranslationTarget() string {
+	if o == nil || o.Translation == nil {
+		return ""
+	}
+	return strings.TrimSpace(o.Translation.TargetLanguage)
 }
 
 // WantsWordTimestamps reports whether the caller asked for per-word timings.
@@ -93,6 +127,9 @@ func (o *STTOptions) Validate() error {
 		if trimmed == "" || utf8.RuneCountInString(trimmed) > MaxSTTKeywordLength || hasControlRune(trimmed) {
 			return fmt.Errorf("keywords[%d]: must be 1-%d characters with no control characters", i, MaxSTTKeywordLength)
 		}
+	}
+	if o.Translation != nil && !ValidSTTLanguageTag(o.TranslationTarget()) {
+		return fmt.Errorf("translation.target_language: must be a BCP-47 language tag of at most %d characters, such as \"es\" or \"pt-BR\"", MaxSTTLanguageTagLength)
 	}
 	if len(o.ProviderOptions) == 0 {
 		return nil
@@ -161,4 +198,41 @@ func validateSTTOptionValue(provider, key string, value any) error {
 
 func hasControlRune(text string) bool {
 	return strings.ContainsFunc(text, unicode.IsControl)
+}
+
+// ValidSTTLanguageTag accepts the BCP-47 shape a translation target needs: a
+// 2-3 letter primary language subtag, then hyphen-separated alphanumeric
+// subtags of 1-8 characters, 35 characters in all. It is a shape check, not
+// a registry lookup: whether a vendor translates INTO the language is the
+// vendor's answer, and a tag outside its table is refused by the vendor with
+// an error rather than served wrong. "auto" and other non-languages fail the
+// primary-subtag rule, because a translation target cannot be detected.
+func ValidSTTLanguageTag(tag string) bool {
+	if tag == "" || len(tag) > MaxSTTLanguageTagLength {
+		return false
+	}
+	for i, subtag := range strings.Split(tag, "-") {
+		if i == 0 {
+			if len(subtag) < 2 || len(subtag) > 3 || !isASCIIAlnum(subtag, false) {
+				return false
+			}
+			continue
+		}
+		if len(subtag) < 1 || len(subtag) > 8 || !isASCIIAlnum(subtag, true) {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlnum(text string, digits bool) bool {
+	for _, r := range text {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+		case digits && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }

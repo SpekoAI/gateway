@@ -768,7 +768,12 @@ def _completion_usage(usage: dict[str, Any]) -> llm.CompletionUsage:
     cached = int(usage.get("cached_input_tokens", 0))
     output_tokens = int(usage.get("output_tokens", 0))
     reasoning = int(usage.get("reasoning_tokens", 0))
-    prompt_tokens = input_tokens + cached
+    prompt_tokens = (
+        input_tokens
+        + cached
+        + int(usage.get("cache_write_5m_tokens", 0))
+        + int(usage.get("cache_write_1h_tokens", 0))
+    )
     completion_tokens = output_tokens + reasoning
     return llm.CompletionUsage(
         completion_tokens=completion_tokens,

@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"github.com/coder/websocket"
@@ -154,6 +156,12 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		events:    make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		flux:      isFluxModel(request.Plan.Route.Model),
 		extension: extensionID,
+		// The Listen model is what Deepgram bills under; Flux (/v2) reports
+		// no processed duration at all, so it stays unmetered here.
+		billingModel: request.Plan.Route.Model,
+	}
+	if parsed, parseErr := url.Parse(endpoint); parseErr == nil {
+		stream.billingLanguage, stream.billingFeatures = billingDimensions(parsed.Query(), streamingBaseQueryKeys)
 	}
 	if stream.flux {
 		stream.extension = fluxExtensionID
@@ -297,6 +305,15 @@ type stream struct {
 	requestID string
 	flux      bool
 	extension string
+
+	// billingModel, billingLanguage and billingFeatures are the frozen
+	// identity of the request that was actually dispatched. They are read
+	// back off the built endpoint so a dimension a caller set through the
+	// provider-key passthrough is recorded, not the one the options asked
+	// for.
+	billingModel    string
+	billingLanguage string
+	billingFeatures []string
 }
 
 func (s *stream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -435,10 +452,18 @@ func (s *stream) handleMessage(payload []byte) error {
 	}
 	switch message.Type {
 	case "Metadata":
-		s.setRequestID(message.Metadata.RequestID)
+		// The terminal Metadata frame spells request_id at the top level;
+		// only the per-result frames nest it under `metadata`. Accept both
+		// so the billed operation carries a provider id to reconcile with.
+		requestID := message.Metadata.RequestID
+		if requestID == "" {
+			requestID = message.RequestID
+		}
+		s.setRequestID(requestID)
 		return s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventUsageObserved,
-			Data:       usageData(message.Metadata.RequestID),
+			Data:       usageData(s.currentRequestID()),
+			Billing:    s.durationObservation(raw),
 			Extensions: extension(raw),
 		})
 	case "SpeechStarted":
@@ -618,6 +643,24 @@ func (s *stream) setRequestID(value string) bool {
 }
 
 func (s *stream) currentRequestID() string { return s.requestID }
+
+// durationObservation reports the total audio duration Deepgram says it
+// processed, which is the one billable quantity a Listen stream returns. It is
+// the vendor's own number, so it holds for Opus exactly as it does for PCM —
+// the relay's PCM byte count, which sizes nothing for a compressed stream, is
+// never a substitute. A Metadata frame without a duration yields an
+// incomplete observation on purpose: the attempt then settles as unresolved
+// rather than as free audio.
+func (s *stream) durationObservation(raw json.RawMessage) *protocol.BillingObservation {
+	if s.flux || strings.TrimSpace(s.billingModel) == "" {
+		return nil
+	}
+	observation := metering.Duration("stream", s.billingModel, "streaming", raw, 1000, "duration")
+	observation.ProviderRequestID = s.currentRequestID()
+	observation.Language = s.billingLanguage
+	observation.Features = s.billingFeatures
+	return observation
+}
 
 func isNormalClose(err error) bool {
 	status := websocket.CloseStatus(err)

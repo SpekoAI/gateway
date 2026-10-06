@@ -603,3 +603,18 @@ def test_stt_declares_the_capabilities_it_asked_for() -> None:
         "keywords": ["Speko"],
         "provider_options": {"deepgram": {"numerals": True}},
     }
+
+
+def test_cache_write_tokens_are_included_in_completion_usage() -> None:
+    from speko_gateway.livekit import _completion_usage
+
+    usage = _completion_usage({
+        "input_tokens": 300,
+        "cached_input_tokens": 100,
+        "cache_write_5m_tokens": 11,
+        "cache_write_1h_tokens": 19,
+        "output_tokens": 34,
+    })
+    assert usage.prompt_tokens == 430
+    assert usage.prompt_cached_tokens == 100
+    assert usage.total_tokens == 464

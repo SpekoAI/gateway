@@ -59,12 +59,18 @@ type BatchTranscribeRequest struct {
 // grouped into utterances where the vendor gives no coarser unit) and may be
 // empty when a provider returns untimed text.
 type BatchTranscription struct {
+	// Billing preserves provider quantities separately from audio authorization.
+	Billing  *protocol.BillingReport
 	Text     string
 	Segments []BatchSegment
 	// Words are the provider's per-word timings, populated only when the
 	// request asked for them (SttOptions.WordTimestamps) and the provider
 	// returned them. Segments stay the coarser unit; Words never replace it.
 	Words []BatchWord
+	// Translation is the transcript translated into the requested
+	// SttOptions.Translation target; empty when none was asked for. Text
+	// stays the original words.
+	Translation string
 	// Language is the BCP-47 tag the provider reported using or detecting;
 	// empty when it reported none.
 	Language string

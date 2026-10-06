@@ -44,11 +44,23 @@ type SttOptions struct {
 	// cannot return them is refused with the option named. Only prerecorded
 	// (batch) adapters can honor it today.
 	WordTimestamps *bool `json:"word_timestamps,omitempty"`
+	// Translation asks for the spoken audio translated into TargetLanguage
+	// alongside the transcript. Fails closed like Diarization. Adapters keep
+	// the original words in transcript `text` and put the translated words in
+	// a separate `translation` field of the same event, so a consumer that
+	// predates translation never reads a second language as the transcript.
+	Translation *SttTranslation `json:"translation,omitempty"`
 	// ProviderOptions maps a provider name to that vendor's own settings,
 	// e.g. {"deepgram": {"numerals": true}, "elevenlabs":
 	// {"vad_silence_threshold_secs": 0.7}}. Scalars only; each adapter
 	// forwards only the keys it allow-lists and refuses the rest by name.
 	ProviderOptions map[string]map[string]any `json:"provider_options,omitempty"`
+}
+
+// SttTranslation is a one-way translation target: whatever is spoken is
+// translated into TargetLanguage, a BCP-47 tag.
+type SttTranslation struct {
+	TargetLanguage string `json:"target_language"`
 }
 
 // Bounds on caller input. They exist because keywords and provider options are
@@ -60,6 +72,8 @@ const (
 	maxSttOptionProviders   = 8
 	maxSttOptionKeys        = 16
 	maxSttOptionStringValue = 256
+	// maxSttLanguageTagLength is RFC 5646's recommended minimum buffer.
+	maxSttLanguageTagLength = 35
 )
 
 // reservedSttOptionKeys are settings the gateway itself owns. Every one of
@@ -80,13 +94,25 @@ var reservedSttOptionKeys = map[string]struct{}{
 	"format_turns": {}, "interim_results": {}, "include_partial_turns": {},
 	"include_timestamps": {}, "commit_strategy": {}, "intent": {},
 	"word_timestamps": {}, "timestamp_granularities": {}, "timestamps": {},
+	// A translation block smuggled in as a vendor setting would skip the
+	// fail-closed gate AND change what the transcript text means.
+	"translation": {}, "translation_config": {}, "target_language": {},
 }
 
 // IsZero reports whether the caller asked for nothing, which is every request
 // that predates this type.
 func (o *SttOptions) IsZero() bool {
 	return o == nil ||
-		(o.Diarization == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && o.WordTimestamps == nil && len(o.ProviderOptions) == 0)
+		(o.Diarization == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && o.WordTimestamps == nil && o.Translation == nil && len(o.ProviderOptions) == 0)
+}
+
+// TranslationTarget returns the trimmed target language, or "" when no
+// translation was asked for. Nil-safe so adapters can ask unconditionally.
+func (o *SttOptions) TranslationTarget() string {
+	if o == nil || o.Translation == nil {
+		return ""
+	}
+	return strings.TrimSpace(o.Translation.TargetLanguage)
 }
 
 // WantsWordTimestamps reports whether the caller asked for per-word timings.
@@ -167,6 +193,13 @@ func (o *SttOptions) Normalize() error {
 			return fmt.Errorf("stt options: each keyword must be 1-%d characters with no control characters", maxSttKeywordLength)
 		}
 	}
+	if o.Translation != nil {
+		// Trimmed in place so every adapter writes the same bytes.
+		o.Translation.TargetLanguage = strings.TrimSpace(o.Translation.TargetLanguage)
+		if !validSttLanguageTag(o.Translation.TargetLanguage) {
+			return fmt.Errorf("stt options: translation.target_language must be a BCP-47 language tag of at most %d characters", maxSttLanguageTagLength)
+		}
+	}
 	if len(o.ProviderOptions) == 0 {
 		return nil
 	}
@@ -233,6 +266,32 @@ func validateSttOptionValue(provider, key string, value any) error {
 	default:
 		return fmt.Errorf("stt options: provider_options.%s.%s must be a boolean, a number, or a string", provider, key)
 	}
+}
+
+// validSttLanguageTag is a BCP-47 SHAPE check — a 2-3 letter primary
+// subtag, then 1-8 character alphanumeric subtags — the same rule as
+// relayapi.ValidSTTLanguageTag. The tag is written into a vendor config
+// frame, so the check keeps arbitrary caller text out of it; whether the
+// vendor translates into the language is the vendor's answer.
+func validSttLanguageTag(tag string) bool {
+	if tag == "" || len(tag) > maxSttLanguageTagLength {
+		return false
+	}
+	for i, subtag := range strings.Split(tag, "-") {
+		minimum, maximum, digits := 1, 8, true
+		if i == 0 {
+			minimum, maximum, digits = 2, 3, false
+		}
+		if len(subtag) < minimum || len(subtag) > maximum {
+			return false
+		}
+		for _, r := range subtag {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || digits && r >= '0' && r <= '9') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func hasControlRune(text string) bool {

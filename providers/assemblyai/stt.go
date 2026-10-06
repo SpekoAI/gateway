@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"github.com/coder/websocket"
@@ -44,9 +45,11 @@ import (
 const (
 	// AdapterID is the identifier returned by an AssemblyAI STT session plan.
 	AdapterID = "assemblyai.stt.v1"
-	// DefaultModel is AssemblyAI's own documented default `speech_model`. The
-	// adapter never applies it: a session plan must name a concrete model, and
-	// this constant exists so the catalog and the vendor agree on one value.
+	// DefaultModel is the catalog's default `speech_model`. The adapter never
+	// applies it: a session plan must name a concrete model. It is no longer
+	// the vendor's own default, which moved to universal-3-6-pro on 2026-09-29;
+	// an omitted speech_model would silently change model under us, and is one
+	// more reason the adapter refuses to open without a concrete one.
 	DefaultModel = "universal-3-5-pro"
 
 	extensionID = "assemblyai.com/v3"
@@ -103,6 +106,42 @@ var streamingLanguages = map[string]struct{}{
 	"en": {}, "es": {}, "fr": {}, "de": {}, "it": {}, "pt": {},
 	"tr": {}, "nl": {}, "sv": {}, "no": {}, "da": {}, "fi": {},
 	"hi": {}, "vi": {}, "ar": {}, "he": {}, "ja": {}, "zh": {},
+}
+
+// universal36Model serves a wider vocabulary than every other model on this
+// socket, so its languages are keyed by model rather than folded into the
+// shared set. The vendor does not refuse a code the model cannot serve: on
+// 2026-09-30 universal-3-5-pro accepted language_codes=["ru"] and returned
+// Russian audio as mixed Cyrillic and Latin gibberish, while universal-3-6-pro
+// returned it exactly.
+const universal36Model = "universal-3-6-pro"
+
+// universal36Languages adds the fourteen codes the Universal-3.6 Pro launch
+// post names as new (af, ca, et, fa, gl, ko, mr, nn, ro, ru, ur, xh, yue, zu),
+// matching the 32 codes the v3 connection parameter table lists for it.
+// Catalan stays out of the shared set: the launch post names it new in 3.6
+// even though the parameter table places it on 3.5 Pro too.
+var universal36Languages = withLanguages(streamingLanguages,
+	"af", "ca", "et", "fa", "gl", "ko", "mr", "nn", "ro", "ru", "ur", "xh", "yue", "zu",
+)
+
+func withLanguages(base map[string]struct{}, extra ...string) map[string]struct{} {
+	languages := make(map[string]struct{}, len(base)+len(extra))
+	for code := range base {
+		languages[code] = struct{}{}
+	}
+	for _, code := range extra {
+		languages[code] = struct{}{}
+	}
+	return languages
+}
+
+// languagesFor returns the language_codes vocabulary of one streaming model.
+func languagesFor(model string) map[string]struct{} {
+	if model == universal36Model {
+		return universal36Languages
+	}
+	return streamingLanguages
 }
 
 // Config controls local transport limits. Credentials and provider selection
@@ -233,6 +272,8 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &stream{
+		billingModel:    strings.TrimSpace(request.Plan.Route.Model),
+		billingFeatures: billingFeatures(request.Options, false),
 		conn:            conn,
 		ctx:             streamCtx,
 		cancel:          cancel,
@@ -303,7 +344,7 @@ func streamEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	// commit-only transcriber.
 	query.Set("include_partial_turns", "true")
 	if language := strings.TrimSpace(options.Language); language != "" {
-		code, err := streamingLanguage(language)
+		code, err := streamingLanguage(model, language)
 		if err != nil {
 			return "", err
 		}
@@ -373,15 +414,15 @@ func validateMedia(media protocol.MediaFormat) error {
 }
 
 // streamingLanguage reduces a portable tag to the primary subtag AssemblyAI
-// accepts (`es`, never `es-419`) and refuses anything outside the documented
-// set.
-func streamingLanguage(language string) (string, error) {
+// accepts (`es`, never `es-419`) and refuses anything outside the model's
+// documented set.
+func streamingLanguage(model, language string) (string, error) {
 	lowered := strings.ToLower(strings.TrimSpace(language))
 	if index := strings.IndexAny(lowered, "-_"); index > 0 {
 		lowered = lowered[:index]
 	}
-	if _, ok := streamingLanguages[lowered]; !ok {
-		return "", fmt.Errorf("assemblyai streaming does not support language %q", language)
+	if _, ok := languagesFor(model)[lowered]; !ok {
+		return "", fmt.Errorf("assemblyai streaming model %s does not support language %q", model, language)
 	}
 	return lowered, nil
 }
@@ -414,10 +455,12 @@ func audioBytes(sampleRateHz, milliseconds int) int {
 }
 
 type stream struct {
-	conn   *websocket.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
-	events chan runtimepkg.ProviderEvent
+	billingModel    string
+	billingFeatures []string
+	conn            *websocket.Conn
+	ctx             context.Context
+	cancel          context.CancelFunc
+	events          chan runtimepkg.ProviderEvent
 
 	minAudioBytes   int
 	batchAudioBytes int
@@ -645,12 +688,16 @@ func (s *stream) handleMessage(payload []byte) (bool, error) {
 	}
 	switch message.Type {
 	case "Begin":
+		billing := metering.Duration("stream", s.billingModel, "streaming", nil, 1000, "session_duration_seconds")
+		billing.ProviderRequestID = message.ID
+		billing.Features = s.billingFeatures
 		// Server-confirmed session start. `id` is the only identifier the
 		// session ever gets, so every later event is tagged with it.
 		s.sessionID = message.ID
 		return false, s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventUsageObserved,
 			Data:       marshalData(map[string]any{"provider_request_id": message.ID, "expires_at_unix": message.ExpiresAt}),
+			Billing:    billing,
 			Extensions: extension(raw),
 		})
 	case "SpeechStarted":
@@ -662,9 +709,13 @@ func (s *stream) handleMessage(payload []byte) (bool, error) {
 	case "Turn":
 		return false, s.handleTurn(message, raw)
 	case "Termination":
+		billing := metering.Duration("stream", s.billingModel, "streaming", raw, 1000, "session_duration_seconds")
+		billing.ProviderRequestID = s.sessionID
+		billing.Features = s.billingFeatures
 		// The session's own accounting, and the last frame on the socket.
 		if err := s.emit(runtimepkg.ProviderEvent{
-			Type: protocol.EventUsageObserved,
+			Type:    protocol.EventUsageObserved,
+			Billing: billing,
 			Data: marshalData(map[string]any{
 				"provider_request_id": s.sessionID,
 				"audio_duration_ms":   milliseconds(message.AudioDurationSeconds),

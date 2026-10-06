@@ -127,8 +127,8 @@ func multiContextEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model st
 	if strings.TrimSpace(model) == "" || model == "auto" {
 		return "", errors.New("elevenlabs requires a concrete model")
 	}
-	if model == "eleven_v3" {
-		return "", errors.New("elevenlabs multi-context websocket does not support eleven_v3")
+	if ServesModel(model) {
+		return "", fmt.Errorf("elevenlabs multi-context websocket does not support %s; it streams on the text-to-dialogue socket", model)
 	}
 	if media.Encoding != "pcm_s16le" || media.Channels != 1 {
 		return "", errors.New("elevenlabs streaming output requires mono pcm_s16le")

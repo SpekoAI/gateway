@@ -330,6 +330,33 @@ func TestAdapterRejectsUnsupportedModelWithoutLeakingCredential(t *testing.T) {
 	}
 }
 
+// The multi-context socket refuses every dialogue-family model with HTTP 400
+// unsupported_model (verified live 2026-09-28), so building its URL for one
+// would only spend a dial on a guaranteed refusal. Siblings still build.
+func TestMultiContextEndpointRefusesDialogueFamilies(t *testing.T) {
+	t.Parallel()
+	adapter, err := New(Config{})
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	media := protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1}
+	build := func(model string) (string, error) {
+		return multiContextEndpoint(adapter.endpointPolicy, "wss://api.elevenlabs.io/v1/text-to-speech", model, protocol.RequestOptions{Voice: "voice-1"}, media, protocol.RouteProviderDirect, protocol.CredentialsBYOK, "key")
+	}
+	for _, model := range []string{"eleven_v3", "eleven_v3_conversational", "eleven_v4", "eleven_v4_turbo"} {
+		if raw, err := build(model); err == nil || !strings.Contains(err.Error(), "text-to-dialogue") {
+			t.Fatalf("%s: endpoint = %q, err = %v; want a text-to-dialogue refusal", model, raw, err)
+		}
+	}
+	raw, err := build("eleven_flash_v2_5")
+	if err != nil {
+		t.Fatalf("eleven_flash_v2_5: %v", err)
+	}
+	if endpoint, _ := url.Parse(raw); endpoint.Path != "/v1/text-to-speech/voice-1/multi-stream-input" {
+		t.Fatalf("eleven_flash_v2_5 endpoint = %s", raw)
+	}
+}
+
 type clientMessage struct {
 	ContextID    string `json:"context_id"`
 	Text         string `json:"text"`

@@ -525,6 +525,11 @@ func (s *Session) runEvents() {
 				s.fail(fmt.Errorf("provider stream: %w", event.Err))
 				return
 			}
+			// Hosted billing evidence is internal; it must not create a new public
+			// usage event when an adapter has no client-facing correlation payload.
+			if event.Type == protocol.EventUsageObserved && event.Billing != nil && len(event.Data) == 0 && len(event.Extensions) == 0 && len(event.Audio) == 0 {
+				continue
+			}
 			if event.Type == "" {
 				s.fail(errors.New("provider emitted an event without a type"))
 				return

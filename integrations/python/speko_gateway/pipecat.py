@@ -924,7 +924,12 @@ def _relay_tool(tool: Any) -> dict[str, Any]:
 def _llm_token_usage(usage: Mapping[str, Any]) -> LLMTokenUsage:
     cached = int(usage.get("cached_input_tokens", 0))
     reasoning = int(usage.get("reasoning_tokens", 0))
-    prompt = int(usage.get("input_tokens", 0)) + cached
+    prompt = (
+        int(usage.get("input_tokens", 0))
+        + cached
+        + int(usage.get("cache_write_5m_tokens", 0))
+        + int(usage.get("cache_write_1h_tokens", 0))
+    )
     completion = int(usage.get("output_tokens", 0)) + reasoning
     return LLMTokenUsage(
         prompt_tokens=prompt,

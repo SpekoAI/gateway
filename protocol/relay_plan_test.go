@@ -186,3 +186,21 @@ func TestRelayCredentialStringsRedactValues(t *testing.T) {
 		t.Fatalf("control token String leaked its value: %q", got)
 	}
 }
+
+func TestOperationPricingRequiresSupportedInternalRevision(t *testing.T) {
+	now := time.Date(2026, time.August, 1, 11, 59, 0, 0, time.UTC)
+	var plan protocol.RelayPlan
+	decodeFixture(t, "relay-plan-tts.json", &plan)
+	plan.RateCardVersion = "list-plus-5-billing-v1:catalog"
+	if err := plan.Validate(now); err == nil {
+		t.Fatal("revision 5 accepted operation pricing")
+	}
+	plan.Requirements.ProtocolRevision = protocol.RelayBillingRevision
+	if err := plan.Validate(now); err != nil {
+		t.Fatal(err)
+	}
+	plan.RateCardVersion = "list-plus-5-billing-v2:future"
+	if err := plan.Validate(now); err == nil {
+		t.Fatal("accepted an unknown billing format")
+	}
+}

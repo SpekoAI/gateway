@@ -13,6 +13,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -157,7 +158,10 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	// a failure: Meta answers silent or speech-free audio with HTTP 200 and
 	// no text, exactly as the other batch adapters surface it (text ""), and
 	// the caller is metered for the audio it sent either way.
+	billing := metering.Duration(decoded.SessionID, model, "batch", response.Body, 1, "audioDurationMs")
+	billing.ProviderRequestID = decoded.SessionID
 	return &runtimepkg.BatchTranscription{
+		Billing:           metering.Report(billing),
 		Text:              text,
 		Segments:          segments,
 		DurationMS:        decoded.AudioDurationMs,

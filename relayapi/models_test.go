@@ -109,3 +109,24 @@ func TestModelsResponseRejectsEachRuleViolation(t *testing.T) {
 		})
 	}
 }
+
+func TestModelsResponseAcceptsTheQwenTranslationRoute(t *testing.T) {
+	t.Parallel()
+	// A LiveTranslate row is an ordinary S2S row served on its own route and
+	// advertised as a translation model; the endpoint allowlist must name the
+	// route or /v1/models would fail its own contract the moment the row ships.
+	var response relayapi.ModelsResponse
+	decodeFixture(t, "models-response.json", &response)
+	model := response.Models[2]
+	if model.Kind != relayapi.KindS2S {
+		t.Fatalf("fixture models[2] kind = %q, want s2s", model.Kind)
+	}
+	model.ID = "qwen3.8-livetranslate-flash-realtime"
+	model.Provider = "alibaba"
+	model.Endpoint = relayapi.QwenTranslationRoutePath
+	model.Protocol = "alibaba.livetranslate.v1"
+	model.Capabilities.Translation = true
+	if err := model.Validate(); err != nil {
+		t.Fatalf("translation route row must validate: %v", err)
+	}
+}

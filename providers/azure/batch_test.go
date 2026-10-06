@@ -279,6 +279,13 @@ func TestBatchRefusesForeignProviderAndNonMAIModel(t *testing.T) {
 	if _, err := adapter.Transcribe(context.Background(), request); err == nil || !strings.Contains(err.Error(), `model "fast-transcription"`) {
 		t.Fatalf("classic model err = %v", err)
 	}
+	// The streaming model shares the MAI-Transcribe prefix but has no
+	// fast-transcription arm.
+	request = batchRequest(server.URL, []byte("RIFF"))
+	request.Plan.Route.Model = RealtimeModel
+	if _, err := adapter.Transcribe(context.Background(), request); err == nil || !strings.Contains(err.Error(), `streaming model "MAI-Transcribe-2-Streaming"`) {
+		t.Fatalf("streaming model err = %v", err)
+	}
 	// The 1.5 generation rides the same enhanced-mode contract.
 	request = batchRequest(server.URL, []byte("RIFF"))
 	request.Plan.Route.Model = "MAI-Transcribe-1.5"
@@ -372,5 +379,50 @@ func TestLocaleReducesTagsToListedCodes(t *testing.T) {
 		if got := locale(input); got != want {
 			t.Errorf("locale(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+// TestBatchReportsProviderProcessedDuration pins MAI-Transcribe-2's only
+// billable quantity. Its negative control is the silence response: Azure
+// answers 200 with phrases and no durationMilliseconds, and that must settle
+// as unpriceable evidence rather than as zero seconds of billable audio.
+func TestBatchReportsProviderProcessedDuration(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		response     string
+		wantComplete bool
+		wantDuration int64
+	}{
+		{name: "processed duration", response: okResponse, wantComplete: true, wantDuration: 8240},
+		{name: "no duration reported", response: `{"combinedPhrases":[{"channel":0,"text":"hi"}],"phrases":[{"channel":0,"offsetMilliseconds":0,"durationMilliseconds":0,"text":"hi","locale":"en"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server, _ := newFakeTranscribe(t, http.StatusOK, tc.response)
+			result, err := newBatchAdapter(t, server).Transcribe(context.Background(), batchRequest(server.URL+"/speechtotext/transcriptions:transcribe", []byte("RIFFwav-bytes")))
+			if err != nil {
+				t.Fatalf("Transcribe: %v", err)
+			}
+			if result.Billing == nil || len(result.Billing.Operations) != 1 {
+				t.Fatalf("Billing = %+v", result.Billing)
+			}
+			if err := result.Billing.Validate(); err != nil {
+				t.Fatalf("report invalid: %v", err)
+			}
+			operation := result.Billing.Operations[0]
+			if operation.Mode != "batch" || operation.Model != DefaultModel {
+				t.Fatalf("identity = %+v", operation)
+			}
+			if operation.Complete != tc.wantComplete {
+				t.Fatalf("Complete = %v, want %v", operation.Complete, tc.wantComplete)
+			}
+			if got := operation.Quantities["duration_seconds"]; got != tc.wantDuration {
+				t.Fatalf("duration_seconds = %d, want %d", got, tc.wantDuration)
+			}
+			if tc.wantComplete && operation.ProviderRequestID != "req-7f3a" {
+				t.Fatalf("ProviderRequestID = %q", operation.ProviderRequestID)
+			}
+		})
 	}
 }

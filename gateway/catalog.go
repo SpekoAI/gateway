@@ -77,7 +77,9 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "elevenlabs", Kind: protocol.SessionKindTTS, Adapter: "elevenlabs.tts.v1", DefaultModel: "eleven_flash_v2_5", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/text-to-speech"},
 	{Provider: "cartesia", Kind: protocol.SessionKindSTT, Adapter: "cartesia.stt.v1", DefaultModel: "ink-2", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/stt/websocket"},
 	{Provider: "cartesia", Kind: protocol.SessionKindTTS, Adapter: "cartesia.tts.v1", DefaultModel: "sonic-3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket"},
-	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "universal-3-5-pro", Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
+	// universal-3-6-pro (2026-09-29) shares the socket and parameters and is
+	// listed so discovery shows it; 3.5 Pro stays the default a bare pin gets.
+	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "universal-3-5-pro", Models: []string{"universal-3-5-pro", "universal-3-6-pro"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
 	// Modulate selects its two streaming transcription models by endpoint path,
 	// not a model query field. English Fast is the conversational default;
 	// multilingual remains explicitly selectable through the same adapter.
@@ -115,8 +117,9 @@ var providerCatalog = []CatalogEntry{
 	// The endpoint is the bare models collection: the adapter appends the
 	// model id and picks the arm per utterance — SSE streaming for short text,
 	// the non-streaming blob for text long enough to hit the streaming arm's
-	// >60s truncation.
-	{Provider: "gemini", Kind: protocol.SessionKindTTS, Adapter: "gemini.tts.v1", DefaultModel: "gemini-3.1-flash-tts-preview", DefaultVoice: "Aoede", Transport: protocol.TransportHTTP, Endpoint: "https://generativelanguage.googleapis.com/v1beta/models"},
+	// >60s truncation. The 3.8 pair shares the body, roster and credential;
+	// the preview stays the default because it is the one the boards measured.
+	{Provider: "gemini", Kind: protocol.SessionKindTTS, Adapter: "gemini.tts.v1", DefaultModel: "gemini-3.1-flash-tts-preview", Models: []string{"gemini-3.1-flash-tts-preview", "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"}, DefaultVoice: "Aoede", Transport: protocol.TransportHTTP, Endpoint: "https://generativelanguage.googleapis.com/v1beta/models"},
 	{Provider: "gradium", Kind: protocol.SessionKindSTT, Adapter: "gradium.stt.v1", DefaultModel: "default", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/asr"},
 	{Provider: "gradium", Kind: protocol.SessionKindTTS, Adapter: "gradium.tts.v1", DefaultModel: "default", DefaultVoice: "YTpq7expH9539ERJ", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gradium.ai/api/speech/tts"},
 	// Hamsa's realtime socket takes one WHOLE-UTTERANCE WAV per message — the
@@ -163,6 +166,10 @@ var providerCatalog = []CatalogEntry{
 	// which this catalog does not publish.
 	{Provider: "meta", Kind: protocol.SessionKindSTT, Adapter: "meta.stt.v1", DefaultModel: "muse-voice-transcribe-1.0", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.meta.ai/v1/asr/realtime"},
 	{Provider: "speechify", Kind: protocol.SessionKindTTS, Adapter: "speechify.tts.v1", DefaultModel: "simba-3.0", Models: []string{"simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"}, DefaultVoice: "geffen_32", Transport: protocol.TransportHTTP, Endpoint: "https://api.speechify.ai/v1/audio/stream"},
+	// Nari Labs serves Qwen3-ASR and Qwen3-TTS in two serving classes each;
+	// the realtime socket adds intent=transcription itself.
+	{Provider: "nari", Kind: protocol.SessionKindSTT, Adapter: "nari.stt.v1", DefaultModel: "qwen3-asr-fast", Models: []string{"qwen3-asr-fast", "qwen3-asr"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.narilabs.com/v1/realtime"},
+	{Provider: "nari", Kind: protocol.SessionKindTTS, Adapter: "nari.tts.v1", DefaultModel: "qwen3-tts-fast", Models: []string{"qwen3-tts-fast", "qwen3-tts"}, DefaultVoice: "claire", Transport: protocol.TransportHTTP, Endpoint: "https://api.narilabs.com/v1/audio/speech"},
 	{Provider: "speechmatics", Kind: protocol.SessionKindSTT, Adapter: "speechmatics.stt.v1", DefaultModel: "standard", Models: []string{"standard", "enhanced"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://global.rt.speechmatics.com/v2/"},
 }
 

@@ -8,6 +8,7 @@
       "speaker": "A"
     }
   ],
+  "translation": "hola mundo",
   "route": {
     "provider": "deepgram",
     "model": "nova-3",

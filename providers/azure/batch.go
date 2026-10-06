@@ -13,6 +13,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -65,6 +66,8 @@ const (
 	audioPartName      = "audio"
 	subscriptionHeader = "Ocp-Apim-Subscription-Key"
 	modelPrefix        = "mai-transcribe"
+	// streamingModelSuffix marks the realtime-only MAI transcription models.
+	streamingModelSuffix = "-streaming"
 )
 
 // BatchConfig controls local transport limits for the prerecorded adapter.
@@ -120,6 +123,12 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	// would silently run Azure's classic recognizer under the MAI rate card.
 	if !strings.HasPrefix(strings.ToLower(model), modelPrefix) {
 		return nil, fmt.Errorf("azure batch adapter cannot serve model %q on the enhanced-mode endpoint", model)
+	}
+	// MAI-Transcribe-2-Streaming shares the prefix but is served only by the
+	// Foundry Realtime API (realtime.go); fast transcription would answer the
+	// unknown enhancedMode.model with a 400 after the whole upload.
+	if strings.HasSuffix(strings.ToLower(model), streamingModelSuffix) {
+		return nil, fmt.Errorf("azure batch adapter cannot serve streaming model %q on the enhanced-mode endpoint", model)
 	}
 	// Refuse before reading the file rather than after streaming a body the
 	// service will answer 413 to.
@@ -182,7 +191,14 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	// a failure: silent or speech-free audio legitimately yields no text, and
 	// the other batch adapters surface that as text "" rather than a
 	// provider error.
+	// durationMilliseconds is Azure's own processed-audio figure and the
+	// quantity the fast-transcription SKU bills. Taking it from the response
+	// rather than from the bytes the relay uploaded is what keeps a partial
+	// or silence-trimmed transcription billed at what Azure charged.
+	observation := metering.Duration("request", model, "batch", response.Body, 1, "durationMilliseconds")
+	observation.ProviderRequestID = requestID(response.Header)
 	return &runtimepkg.BatchTranscription{
+		Billing:           metering.Report(observation),
 		Text:              text,
 		Segments:          segments,
 		Language:          decoded.language(),

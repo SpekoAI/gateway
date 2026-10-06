@@ -28,8 +28,35 @@ const (
 	// session.start naming the model; its exact frame bytes are the
 	// idempotency content hash.
 	LiveRoutePath = "/v1/live"
-	// RealtimeModelQueryParam is the /v1/realtime model selector.
+	// TranslationRoutePath serves OpenAI realtime speech translation
+	// (gpt-realtime-translate), mirroring the vendor's own
+	// /v1/realtime/translations socket. As on /v1/realtime the model is an
+	// exact query parameter (RealtimeModelQueryParam) and the idempotency
+	// content hash covers exactly its value. The target language is not part
+	// of admission: the caller names it in its first native session.update,
+	// just as it would against the vendor.
+	TranslationRoutePath = "/v1/realtime/translations"
+	// QwenTranslationRoutePath serves Alibaba's LiveTranslate protocol
+	// (alibaba.livetranslate.v1). Like /v1/realtime the model is an exact
+	// query parameter and the idempotency content hash covers the model query
+	// value: GET /v1/realtime/translations/qwen?model=qwen3.8-livetranslate-flash-realtime.
+	// Every other setting — the target language above all — rides the
+	// vendor's own session.update, which the caller sends after connecting.
+	// The caller ends the session with the vendor's session.finish, which
+	// the Router honours as the close: it flushes the last segment upstream
+	// and closes once the vendor answers session.finished.
+	//
+	// It is a separate path from /v1/realtime because the protocol is not
+	// conversational (no response.create, no instructions, no tools), and
+	// from any OpenAI translation route so the two vendors' session bodies
+	// never share a socket.
+	QwenTranslationRoutePath = "/v1/realtime/translations/qwen"
+	// RealtimeModelQueryParam is the /v1/realtime model selector. Both
+	// translation routes use the same parameter.
 	RealtimeModelQueryParam = "model"
+	// LiveTranslateFinishType is the client event that ends a
+	// /v1/realtime/translations/qwen session.
+	LiveTranslateFinishType = "session.finish"
 	// LiveSessionStartType is the type tag of the first /v1/live frame.
 	LiveSessionStartType = "session.start"
 )
@@ -55,6 +82,15 @@ const (
 // at launch. One format applies to both directions, as in the vendor
 // protocol. G.711 μ-law and A-law are refused: the Router carries raw PCM.
 var LiveAudioSampleRates = []int{16_000, 24_000}
+
+// LiveTranslate audio is rate-fixed in each direction: the vendor listens to
+// 16 kHz mono PCM16 and speaks 24 kHz mono PCM16 (Model Studio real-time
+// translation guide). The Router pins both into the vendor session, so a
+// caller's session.update may not move either.
+const (
+	LiveTranslateInputSampleRateHz  = 16_000
+	LiveTranslateOutputSampleRateHz = 24_000
+)
 
 // LiveSessionStart is the first text frame of a GET /v1/live session: the
 // native GPT-Live session.start command. Unknown session fields are refused

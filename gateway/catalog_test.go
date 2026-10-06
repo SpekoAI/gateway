@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -86,16 +87,18 @@ func TestModelsPublishesEveryCatalogEntry(t *testing.T) {
 	if !found {
 		t.Fatal("catalog does not publish elevenlabs stt")
 	}
-	wantSimba := map[string]bool{
+	wantMultiModel := map[string]bool{
 		"speechify:simba-3.2": false, "speechify:simba-3.0": false,
 		"speechify:simba-multilingual": false, "speechify:simba-english": false,
+		"gemini:gemini-3.1-flash-tts-preview": false, "gemini:gemini-3.8-flash-tts": false,
+		"gemini:gemini-3.8-flash-lite-tts": false,
 	}
 	for _, model := range catalog.Models {
-		if _, ok := wantSimba[model.ID]; ok {
-			wantSimba[model.ID] = true
+		if _, ok := wantMultiModel[model.ID]; ok {
+			wantMultiModel[model.ID] = true
 		}
 	}
-	for id, present := range wantSimba {
+	for id, present := range wantMultiModel {
 		if !present {
 			t.Errorf("catalog does not publish %s", id)
 		}
@@ -140,6 +143,21 @@ func TestModelsFiltersByKindAndProvider(t *testing.T) {
 	elevenlabs := fetchCatalog(t, "/v1/models?provider=elevenlabs")
 	if len(elevenlabs.Models) != 2 {
 		t.Fatalf("provider=elevenlabs returned %d rows, want stt and tts", len(elevenlabs.Models))
+	}
+	// AssemblyAI serves two published Universal Pro models on one adapter;
+	// both must be discoverable, with the default still resolving to 3.5 Pro.
+	assemblyai := fetchCatalog(t, "/v1/models?provider=assemblyai")
+	ids := make([]string, 0, len(assemblyai.Models))
+	for _, model := range assemblyai.Models {
+		ids = append(ids, model.ID)
+	}
+	if !slices.Contains(ids, "assemblyai:universal-3-5-pro") || !slices.Contains(ids, "assemblyai:universal-3-6-pro") {
+		t.Fatalf("provider=assemblyai returned %v, want both Universal Pro models", ids)
+	}
+	for _, entry := range gateway.Catalog() {
+		if entry.Provider == "assemblyai" && entry.DefaultModel != "universal-3-5-pro" {
+			t.Fatalf("assemblyai default = %q, want universal-3-5-pro", entry.DefaultModel)
+		}
 	}
 	if unknown := fetchCatalog(t, "/v1/models?provider=nope"); len(unknown.Models) != 0 {
 		t.Fatalf("an unknown provider returned %d rows, want none", len(unknown.Models))

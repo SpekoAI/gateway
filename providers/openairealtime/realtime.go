@@ -41,10 +41,17 @@ type providerProfile struct {
 	extensionID   string
 	protocol      protocol.SpeechProtocol
 	hybridSession bool
+	// tokenMetered marks a provider that bills this socket in tokens, so the
+	// adapter emits the per-modality billing observations in billing.go.
+	// OpenAI does. xAI does NOT: Grok Voice is sold per connected audio minute
+	// plus a flat fee per text input, a completely different dimension set,
+	// and reporting token dimensions for it would offer settlement quantities
+	// its rate card cannot price.
+	tokenMetered bool
 }
 
 var profiles = map[string]providerProfile{
-	"openai": {adapterID: AdapterIDOpenAI, host: "api.openai.com", path: "/v1/realtime", extensionID: "openai.com/realtime/v1", protocol: protocol.SpeechProtocolOpenAIRealtimeV1},
+	"openai": {adapterID: AdapterIDOpenAI, host: "api.openai.com", path: "/v1/realtime", extensionID: "openai.com/realtime/v1", protocol: protocol.SpeechProtocolOpenAIRealtimeV1, tokenMetered: true},
 	"xai":    {adapterID: AdapterIDXAI, host: "api.x.ai", path: "/v1/realtime", extensionID: "x.ai/realtime/v1", protocol: protocol.SpeechProtocolXAIRealtimeV1, hybridSession: true},
 }
 
@@ -380,13 +387,19 @@ func (s *realtimeStream) SendProviderControl(ctx context.Context, control protoc
 	return nil
 }
 
-// providerEvent surfaces one vendor event verbatim.
-func (s *realtimeStream) providerEvent(eventType string, raw []byte) {
+// providerEvent surfaces one vendor event verbatim, optionally carrying the
+// billing observation that event established. The observation is internal
+// metering evidence and never reaches the customer's stream.
+func (s *realtimeStream) providerEvent(eventType string, raw []byte, observations ...*protocol.BillingObservation) {
+	var observation *protocol.BillingObservation
+	if len(observations) > 0 {
+		observation = observations[0]
+	}
 	envelope, err := json.Marshal(protocol.ProviderEvent{Type: eventType, Payload: append(json.RawMessage(nil), raw...)})
 	if err != nil {
 		return
 	}
-	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventProviderEvent, Data: envelope})
+	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventProviderEvent, Data: envelope, Billing: observation})
 }
 
 func (s *realtimeStream) Close(context.Context) error {
@@ -508,6 +521,11 @@ func (s *realtimeStream) handle(event serverEvent, raw []byte) {
 			s.providerEvent(event.Type, raw)
 			return
 		}
+	case "session.updated":
+		// Setup confirmation anchors the session's own billing operation: a
+		// session that never produces a response still has to settle as a
+		// measured zero rather than as missing evidence.
+		s.providerEvent(event.Type, raw, s.sessionBilling())
 	case "error":
 		// handleError decides whether the native envelope is a warning or
 		// the terminal failure; it forwards the raw event itself.
@@ -546,8 +564,21 @@ func (s *realtimeStream) handle(event serverEvent, raw []byte) {
 			s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTextDelta, Data: marshalData(map[string]string{"text": event.Delta})})
 		}
 	case "response.done":
-		if event.Response != nil && len(event.Response.Usage) > 0 {
-			s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(map[string]string{"provider_request_id": event.Response.ID}), Extensions: s.extension(event.Response.Usage)})
+		if event.Response != nil {
+			// The usage document rides the extension as dispute evidence; the
+			// billing observation beside it is what settlement actually
+			// prices. Both are emitted even when the vendor sent no usage at
+			// all, because a response that completed without billing evidence
+			// has to leave the attempt unresolved rather than settle as free.
+			observed := runtimepkg.ProviderEvent{
+				Type:    protocol.EventUsageObserved,
+				Data:    marshalData(map[string]string{"provider_request_id": event.Response.ID}),
+				Billing: s.responseBilling(event),
+			}
+			if len(event.Response.Usage) > 0 {
+				observed.Extensions = s.extension(event.Response.Usage)
+			}
+			s.emit(observed)
 		}
 		if event.Response != nil && event.Response.Status == "cancelled" {
 			s.emit(runtimepkg.ProviderEvent{Type: protocol.EventResponseCanceled})

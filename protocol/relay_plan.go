@@ -13,6 +13,9 @@ const (
 	// use. A connector that does not understand this revision rejects the plan
 	// outright instead of guessing how to authenticate to a provider.
 	RelayRevision = 5
+	// RelayBillingRevision requires operation metering. Revision 5 remains
+	// accepted for already-issued plans and routes not yet converted.
+	RelayBillingRevision = 6
 	// RelayPlanJWSType is the protected-header typ required on a relay-plan
 	// compact JWS. Even under a shared signing key, the typ check stops a
 	// session-plan signature from authorizing a relay dispatch and a
@@ -38,8 +41,12 @@ const (
 	RelayUsageUnitCharacters        RelayUsageUnit = "characters"
 	RelayUsageUnitInputTokens       RelayUsageUnit = "input_tokens"
 	RelayUsageUnitCachedInputTokens RelayUsageUnit = "cached_input_tokens"
-	RelayUsageUnitOutputTokens      RelayUsageUnit = "output_tokens"
-	RelayUsageUnitReasoningTokens   RelayUsageUnit = "reasoning_tokens"
+	// Cache writes are disjoint from ordinary input and cache reads. They
+	// consume the same input budget, with prices depending on retention.
+	RelayUsageUnitCacheWrite5mTokens RelayUsageUnit = "cache_write_5m_tokens"
+	RelayUsageUnitCacheWrite1hTokens RelayUsageUnit = "cache_write_1h_tokens"
+	RelayUsageUnitOutputTokens       RelayUsageUnit = "output_tokens"
+	RelayUsageUnitReasoningTokens    RelayUsageUnit = "reasoning_tokens"
 	// RelayUsageUnitToolCalls counts billable hosted tool invocations (web
 	// search) a delegated GPT-Live backend performs. One call is one unit.
 	RelayUsageUnitToolCalls RelayUsageUnit = "tool_calls"
@@ -47,7 +54,7 @@ const (
 
 // RelayBudgetGroup names an authorized spend bucket in a relay plan. Groups
 // are deliberately coarser than units: settlement can split one group across
-// several usage-line units (llm_input covers fresh and cached input tokens),
+// several usage-line units (llm_input covers fresh input, cache reads and writes),
 // but authorization is granted and capped per group.
 type RelayBudgetGroup string
 
@@ -254,6 +261,9 @@ func (p RelayPlan) Validate(now time.Time) error {
 	if err := validateCatalogDigest(p.CatalogDigest); err != nil {
 		return fmt.Errorf("catalog_digest: %w", err)
 	}
+	if strings.HasPrefix(p.RateCardVersion, "list-plus-5-billing-") && (!strings.HasPrefix(p.RateCardVersion, "list-plus-5-billing-v1:") || p.Requirements.ProtocolRevision != RelayBillingRevision) {
+		return fmt.Errorf("rate_card_version: unsupported billing contract")
+	}
 	if strings.TrimSpace(p.RateCardVersion) == "" {
 		return fmt.Errorf("rate_card_version: required")
 	}
@@ -339,7 +349,7 @@ func (r RelayRequirements) validate() error {
 	if r.Protocol != VoiceV0 {
 		return fmt.Errorf("protocol: got %q, want %q", r.Protocol, VoiceV0)
 	}
-	if r.ProtocolRevision != RelayRevision {
+	if r.ProtocolRevision != RelayRevision && r.ProtocolRevision != RelayBillingRevision {
 		return fmt.Errorf("protocol_revision: got %d, want %d", r.ProtocolRevision, RelayRevision)
 	}
 	return nil

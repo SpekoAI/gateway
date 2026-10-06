@@ -45,8 +45,13 @@ type ModelCapabilities struct {
 	// They are separate bits rather than one enum because a model may report
 	// both, and neither is derived from the other: the relay never groups
 	// characters into words on the caller's behalf.
-	WordTimings             bool     `json:"word_timings"`
-	CharacterTimings        bool     `json:"character_timings"`
+	WordTimings      bool `json:"word_timings"`
+	CharacterTimings bool `json:"character_timings"`
+	// Translation says the model translates: speech in, speech in another
+	// language out (S2S), or speech in, translated text out (STT). A model
+	// with this bit set is a translation model, not a conversational one:
+	// its route carries a target language and returns no assistant turn.
+	Translation             bool     `json:"translation"`
 	EvaluationQuestionTypes []string `json:"evaluation_question_types,omitempty"`
 }
 
@@ -169,6 +174,8 @@ func (c ModelCapabilities) SupportsSTTOptions(options *STTOptions) (string, bool
 		return "noise_reduction", false
 	case options.WantsWordTimestamps() && !c.WordTimestamps:
 		return "word_timestamps", false
+	case options.TranslationTarget() != "" && !c.Translation:
+		return "translation", false
 	default:
 		return "", true
 	}
@@ -191,14 +198,17 @@ type Model struct {
 	OutputAudioFormats []AudioFormat     `json:"output_audio_formats,omitempty"`
 	BatchAudioLimits   *BatchAudioLimits `json:"batch_audio_limits,omitempty"`
 	// Endpoint is the public Router route an S2S model is served on
-	// (/v1/realtime, /v1/live, or /v1/bidi); multiple native protocols may
-	// share a route and are disambiguated by the exact model id. Omitted for every other kind,
+	// (/v1/realtime, /v1/live, /v1/bidi, /v1/realtime/translations, or
+	// /v1/realtime/translations/qwen); multiple native protocols may share a
+	// route and are disambiguated by the exact model id. Omitted for every other kind,
 	// whose routes are fixed per kind.
 	Endpoint string `json:"endpoint,omitempty"`
 	// Protocol names the native event protocol an S2S route speaks
-	// (openai.realtime.v1, xai.realtime.v1, openai.live.v1, google.live.v1); omitted for every
-	// other kind. It also tells a client how to FRAME its messages: OpenAI,
-	// xAI, and GPT-Live tag by "type"; google.live.v1 uses a top-level key.
+	// (openai.realtime.v1, xai.realtime.v1, openai.live.v1, google.live.v1,
+	// openai.realtime.translation.v1, alibaba.livetranslate.v1); omitted for
+	// every other kind. It also tells a client how to FRAME its messages:
+	// OpenAI, xAI, GPT-Live and both translation protocols tag by "type";
+	// google.live.v1 uses a top-level key.
 	Protocol  string          `json:"protocol,omitempty"`
 	Benchmark *ModelBenchmark `json:"benchmark,omitempty"`
 }
@@ -234,8 +244,8 @@ func (m Model) Validate() error {
 		if len(m.OutputAudioFormats) == 0 {
 			return fmt.Errorf("output_audio_formats: at least one format is required for s2s models")
 		}
-		if m.Endpoint != RealtimeRoutePath && m.Endpoint != LiveRoutePath && m.Endpoint != BidiRoutePath {
-			return fmt.Errorf("endpoint: s2s models are served on %s, %s or %s, got %q", RealtimeRoutePath, LiveRoutePath, BidiRoutePath, m.Endpoint)
+		if m.Endpoint != RealtimeRoutePath && m.Endpoint != LiveRoutePath && m.Endpoint != BidiRoutePath && m.Endpoint != TranslationRoutePath && m.Endpoint != QwenTranslationRoutePath {
+			return fmt.Errorf("endpoint: s2s models are served on %s, %s, %s, %s or %s, got %q", RealtimeRoutePath, LiveRoutePath, BidiRoutePath, TranslationRoutePath, QwenTranslationRoutePath, m.Endpoint)
 		}
 		if strings.TrimSpace(m.Protocol) == "" || strings.ContainsAny(m.Protocol, " \t\r\n") {
 			return fmt.Errorf("protocol: required for s2s models")

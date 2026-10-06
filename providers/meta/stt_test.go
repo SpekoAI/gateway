@@ -156,9 +156,14 @@ func openRealtime(t *testing.T, fake *fakeRealtime, request runtimepkg.AdapterRe
 func expectEvents(t *testing.T, stream runtimepkg.ProviderStream, ctx context.Context, want []protocol.EventType) []runtimepkg.ProviderEvent {
 	t.Helper()
 	got := make([]runtimepkg.ProviderEvent, 0, len(want))
-	for index, wantType := range want {
+	for index := 0; index < len(want); {
+		wantType := want[index]
 		select {
 		case event := <-stream.Events():
+			if event.Billing != nil && len(event.Data) == 0 && event.Err == nil {
+				continue
+			}
+			index++
 			if event.Err != nil {
 				t.Fatalf("event %d failed: %v, want %q", index, event.Err, wantType)
 			}
@@ -255,7 +260,7 @@ func TestTranscribeStreamsPartialsThenTurnFinal(t *testing.T) {
 	if fake.handshake["partialMode"] != partialCumulative {
 		t.Fatalf("partialMode = %v", fake.handshake["partialMode"])
 	}
-	if fake.handshake["emitAudioProgress"] != false {
+	if fake.handshake["emitAudioProgress"] != true {
 		t.Fatalf("emitAudioProgress = %v", fake.handshake["emitAudioProgress"])
 	}
 	if bias, _ := fake.handshake["languageBias"].([]any); len(bias) != 1 || bias[0] != "English" {
@@ -405,13 +410,10 @@ func TestTranscribeDrainsTheTrailingFinalAfterClose(t *testing.T) {
 	if data := eventData(t, events[0]); data["text"] != "Last words." {
 		t.Fatalf("final = %v", data)
 	}
-	select {
-	case event, open := <-stream.Events():
-		if open {
-			t.Fatalf("unexpected event after the service closed: %+v", event)
+	for event := range stream.Events() {
+		if event.Billing == nil || event.Type != protocol.EventUsageObserved {
+			t.Fatalf("unexpected event after service close: %+v", event)
 		}
-	case <-ctx.Done():
-		t.Fatal("events channel did not close after the service hung up")
 	}
 	if terminal, ok := stream.(runtimepkg.TerminalErrorProviderStream); ok && terminal.TerminalError() != nil {
 		t.Fatalf("TerminalError = %v, want none after a normal close", terminal.TerminalError())

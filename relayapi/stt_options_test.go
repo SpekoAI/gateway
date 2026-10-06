@@ -231,6 +231,7 @@ func TestModelCapabilitiesGateSTTOptions(t *testing.T) {
 		{"keywords", relayapi.ModelCapabilities{Diarization: true, NoiseReduction: true}, relayapi.STTOptions{Keywords: []string{"Speko"}}, "keywords"},
 		{"noise reduction", relayapi.ModelCapabilities{Diarization: true, Keywords: true}, relayapi.STTOptions{NoiseReduction: boolPointer(true)}, "noise_reduction"},
 		{"word timestamps", relayapi.ModelCapabilities{Diarization: true, Keywords: true, NoiseReduction: true}, relayapi.STTOptions{WordTimestamps: boolPointer(true)}, "word_timestamps"},
+		{"translation", relayapi.ModelCapabilities{Diarization: true, Keywords: true, NoiseReduction: true, WordTimestamps: true}, relayapi.STTOptions{Translation: &relayapi.STTTranslation{TargetLanguage: "es"}}, "translation"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -357,6 +358,9 @@ func asProtocolOptions(options relayapi.STTOptions) *protocol.SttOptions {
 		Keywords:       options.Keywords,
 		NoiseReduction: options.NoiseReduction,
 	}
+	if options.Translation != nil {
+		converted.Translation = &protocol.SttTranslation{TargetLanguage: options.Translation.TargetLanguage}
+	}
 	if len(options.ProviderOptions) > 0 {
 		converted.ProviderOptions = make(map[string]map[string]any, len(options.ProviderOptions))
 		for provider, settings := range options.ProviderOptions {
@@ -368,4 +372,73 @@ func asProtocolOptions(options relayapi.STTOptions) *protocol.SttOptions {
 		}
 	}
 	return converted
+}
+
+// A translation target is a BCP-47 SHAPE: the relay contract and the gateway
+// protocol must agree on every tag, because the edge validates with one and
+// the connector's adapter reads the other.
+func TestSTTTranslationTargetValidation(t *testing.T) {
+	t.Parallel()
+
+	translationOnly := relayapi.STTOptions{Translation: &relayapi.STTTranslation{TargetLanguage: "es"}}
+	if translationOnly.IsZero() || translationOnly.TranslationTarget() != "es" {
+		t.Fatal("a translation ask alone must not report zero")
+	}
+	var capable relayapi.ModelCapabilities
+	capable.Translation = true
+	if ask, ok := capable.SupportsSTTOptions(&translationOnly); !ok {
+		t.Fatalf("a translating model must serve the ask, refused %q", ask)
+	}
+
+	for _, tc := range []struct {
+		tag   string
+		valid bool
+	}{
+		{"es", true},
+		{"pt-BR", true},
+		{"zh-Hans", true},
+		{"yue", true},
+		{"es-419", true},
+		{"sr-Latn-RS", true},
+		{"", false},
+		{"  ", false},
+		{"e", false},
+		{"auto", false},
+		{"english", false},
+		{"es_MX", false},
+		{"es-", false},
+		{"es--MX", false},
+		{"es-toolongsubtag", false},
+		{"e1", false},
+		{"es\nX", false},
+		{"es-" + strings.Repeat("a1234567-", 4), false},
+	} {
+		t.Run(tc.tag, func(t *testing.T) {
+			t.Parallel()
+			options := relayapi.STTOptions{Translation: &relayapi.STTTranslation{TargetLanguage: tc.tag}}
+			relayErr := options.Validate()
+			protocolErr := asProtocolOptions(options).Normalize()
+			if (relayErr == nil) != tc.valid {
+				t.Fatalf("relayapi Validate(%q) = %v, want valid=%v", tc.tag, relayErr, tc.valid)
+			}
+			if (protocolErr == nil) != tc.valid {
+				t.Fatalf("protocol Normalize(%q) = %v, want valid=%v", tc.tag, protocolErr, tc.valid)
+			}
+		})
+	}
+}
+
+// A translation block smuggled in as a vendor setting would skip the
+// capability gate and change what text means, so it is refused by name.
+func TestSTTTranslationCannotRideProviderOptions(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{"translation", "target_language"} {
+		options := relayapi.STTOptions{ProviderOptions: map[string]map[string]any{"soniox": {key: "es"}}}
+		if err := options.Validate(); err == nil {
+			t.Fatalf("provider_options.soniox.%s must be refused", key)
+		}
+		if err := asProtocolOptions(options).Normalize(); err == nil {
+			t.Fatalf("protocol must refuse provider_options.soniox.%s", key)
+		}
+	}
 }

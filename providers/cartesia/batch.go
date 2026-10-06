@@ -9,6 +9,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -30,6 +31,20 @@ const (
 	BatchMaxAudioBytes int64 = 1 << 30
 
 	batchExtensionID = "cartesia.ai/stt"
+
+	// Cartesia meters every endpoint in credits, and its credit table prices
+	// POST /stt at "1 credit per 2 seconds of audio" — half the 1 credit per
+	// second the ink-whisper WebSocket costs. Credits, not seconds, are the
+	// quantity Cartesia bills, so that is what this adapter observes; the
+	// credit-to-USD rate stays in the frozen price schedule.
+	//
+	// The denominator keeps the conversion exact: two seconds of audio is one
+	// whole credit, so an odd number of milliseconds is a half-thousandth of a
+	// credit and would be lost at the default denominator of 1000. Protocol
+	// validation caps a denominator at 1e9, which is also the finest credit
+	// fraction this can express.
+	batchCreditDenominator int64 = 1_000_000_000
+	batchSecondsPerCredit  int64 = 2
 )
 
 // BatchConfig controls local transport limits for the batch adapter.
@@ -157,7 +172,26 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if result.ProviderRequestID == "" {
 		result.ProviderRequestID = response.Header.Get("X-Request-ID")
 	}
+	result.Billing = metering.Report(batchCredits(model, response.Body, result.ProviderRequestID))
 	return result, nil
+}
+
+// batchCredits converts the response's own `duration` — documented as "The
+// duration of the input audio in seconds", which is the quantity Cartesia
+// charges against, silence included — into billable credits. A response
+// carrying no usable duration stays incomplete rather than billing zero: the
+// request consumed credits whether or not this adapter could read how many.
+func batchCredits(model string, body []byte, requestID string) *protocol.BillingObservation {
+	o := &protocol.BillingObservation{
+		OperationID: "request", Model: model, Mode: "batch",
+		ProviderRequestID: requestID, Quantities: map[string]int64{},
+	}
+	if n, ok := metering.Quantity(body, batchCreditDenominator/batchSecondsPerCredit, "duration"); ok {
+		o.Quantities["credits"] = n
+		o.QuantityDenominators = map[string]int64{"credits": batchCreditDenominator}
+		o.Complete = true
+	}
+	return o
 }
 
 func primaryLanguageTag(tag string) string {

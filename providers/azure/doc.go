@@ -1,7 +1,58 @@
-// Package azure is the relay's integration for Microsoft's MAI-Transcribe
-// speech-to-text models (MAI-Transcribe-2 by default), served through the
-// Azure Speech fast-transcription REST endpoint in "enhanced mode". It is a
-// prerecorded (batch) adapter only.
+// Package azure is the relay's integration for Microsoft's in-house MAI
+// speech models on Azure. It carries three adapters:
+//
+//   - BatchAdapter: MAI-Transcribe-2 prerecorded speech-to-text through the
+//     Azure Speech fast-transcription REST endpoint in "enhanced mode"
+//     (batch.go; wire facts below).
+//   - RealtimeAdapter: MAI-Transcribe-2-Streaming realtime speech-to-text
+//     through the Microsoft Foundry Realtime API (realtime.go).
+//   - TTSAdapter: MAI-Voice-2.1 and MAI-Voice-2.1-Flash text-to-speech
+//     through the Speech service's SSML REST action (tts.go).
+//
+// The batch and TTS adapters authenticate with an Azure Speech resource key;
+// the realtime adapter with the key of a Foundry resource that DEPLOYS the
+// streaming model, which is a different credential (see realtime.go).
+//
+// # MAI-Transcribe-2-Streaming wire facts
+//
+// Taken from learn.microsoft.com/azure/ai-services/speech-service/
+// mai-transcribe-2-streaming-realtime (read 2026-10-02; public preview):
+//
+//   - wss://{resource}.services.ai.azure.com/mai/v1/realtime?intent=transcription,
+//     with the resource key in an `api-key` handshake header (a Microsoft
+//     Entra bearer is the documented alternative). The protocol is
+//     OpenAI-Realtime-like JSON.
+//   - session.update{session:{type:"transcription", audio:{input:{format:
+//     {type:"audio/pcm", rate:16000|24000}, transcription:{model:<deployment
+//     name>, language:<code> or omitted}, turn_detection:null,
+//     noise_reduction:null}}}} before any audio; settings lock at the first
+//     append.
+//   - input_audio_buffer.append carries base64 PCM16 mono. There is no
+//     server-side speech detection: input_audio_buffer.commit asks for a
+//     final ("completed") of everything since the previous commit.
+//   - Server events: `delta` is newly FINALIZED text (concatenated verbatim),
+//     `intermediate` (MAI-specific) is the provisional suffix after the last
+//     delta, replacing the previous one; `completed` carries the commit
+//     window's transcript. No word timings, confidence or language ids.
+//   - Sessions last at most one hour. Sixty languages (the batch table), with
+//     multilingual auto-detection when language is OMITTED — live, the
+//     service refuses an explicit null, and its language enum is not the
+//     batch table (tl, no; no as/bn/gu/ml/or/pa/te/yue). Served globally from
+//     swedencentral, centralus, southindia/southeastasia (eastus2 coming).
+//     Introductory price $0.54 per audio hour through 2026-12-31.
+//
+// # MAI-Voice-2.1 wire facts
+//
+// Taken from learn.microsoft.com/azure/ai-services/speech-service/mai-voices
+// (read 2026-10-02; public preview): the same SSML action as every Azure
+// prebuilt voice, POST https://{region}.tts.speech.microsoft.com/
+// cognitiveservices/v1 with Ocp-Apim-Subscription-Key and
+// X-Microsoft-OutputFormat. The MODEL is the voice-name suffix
+// (`en-US-Harper:MAI-Voice-2.1`, `…:MAI-Voice-2.1-Flash`); every persona
+// serves both models. 2.1 is the long-form, highest-fidelity tier ($22 per 1M
+// characters), Flash the low-latency agent tier ($15 per 1M).
+//
+// # MAI-Transcribe-2 (batch) wire facts
 //
 // # Wire facts this package is built on
 //
@@ -38,13 +89,13 @@
 //     BCP-47 tag is reduced to its primary subtag and dropped when the model
 //     does not list it.
 //
-// # Why batch only
+// # Why MAI-Transcribe-2 is batch only
 //
 // MAI-Transcribe-2 has no realtime endpoint of its own. Voice Live can run
-// `mai-transcribe` as its input transcriber, but that resolves to
-// MAI-Transcribe-1.5, requires a chat model on the session and does not
-// diarize, so it cannot stand behind the relay's streaming STT contract.
-// The catalog row is therefore BatchOnly and streaming selection skips it.
+// `mai-transcribe` as its input transcriber, but that needs a chat model on
+// the session, so it cannot stand behind the relay's streaming STT
+// contract. Realtime MAI transcription is the separate
+// MAI-Transcribe-2-Streaming model above, which the batch adapter refuses.
 //
 // The route is not routable until its live canary passes, which is the gate
 // that catches a wrong model id or a changed definition schema before a

@@ -20,18 +20,21 @@ import (
 )
 
 // The Text-to-Dialogue socket, which is the ONLY streaming surface that serves
-// ElevenLabs v3.
+// ElevenLabs v3 and v4.
 //
-// `multiContextEndpoint` refuses eleven_v3 because the multi-context
-// text-to-speech socket genuinely cannot serve it — the vendor's own exclusion.
-// v3 streams here instead, at a different path, with a different frame
-// vocabulary, so this is a second adapter rather than a branch inside the first:
+// `multiContextEndpoint` refuses both families because the multi-context
+// text-to-speech socket genuinely cannot serve them — the vendor's own
+// exclusion: it answers the handshake with HTTP 400 `unsupported_model`, "Use
+// the text-to-dialogue websocket endpoint instead" (verified live 2026-09-28
+// for eleven_v3_conversational, eleven_v4 and eleven_v4_turbo). They stream
+// here instead, at a different path, with a different frame vocabulary, so this
+// is a second adapter rather than a branch inside the first:
 //
 //   - the voice is REGISTERED IN A HANDSHAKE FRAME, not carried in the path.
-//     `eleven_v3_conversational` accepts exactly one registered voice (the
-//     broader `eleven_v3` accepts up to ten); a single-voice TTS session is one
-//     either way, so this adapter registers exactly one and rejects a request
-//     that names none.
+//     `eleven_v3_conversational` and `eleven_v4_turbo` accept exactly one
+//     registered voice (the broader `eleven_v3` accepts up to ten); a
+//     single-voice TTS session is one either way, so this adapter registers
+//     exactly one and rejects a request that names none.
 //   - text arrives as `inputs`, a list of turn objects, not as a bare `text`
 //     field, and turns are marked with `new_turn` rather than opened and closed
 //     as numbered contexts. A gateway TTS session is one speaker saying one
@@ -52,12 +55,9 @@ import (
 // this adapter forwards it when it does) and `language_code` (a request-body
 // field on the dialogue API, not a socket parameter — v3 infers the language).
 const (
-	// DialogueAdapterID identifies the ElevenLabs v3 dialogue socket.
+	// DialogueAdapterID identifies the ElevenLabs text-to-dialogue socket.
 	DialogueAdapterID = "elevenlabs.dialogue.v1"
 	dialogueEndpoint  = "/v1/text-to-dialogue/stream-input"
-	// dialogueModelPrefix is the vendor's own gate: "model_id must start with
-	// eleven_v3". Anything else belongs on the text-to-speech socket.
-	dialogueModelPrefix = "eleven_v3"
 	// dialogueIdleTimeout is the vendor's documented inactivity window. The
 	// keep-alive fires comfortably inside it rather than at the edge, because a
 	// frame that races the server's own timer buys nothing.
@@ -65,7 +65,14 @@ const (
 	dialogueKeepAliveTick = 12 * time.Second
 )
 
-// DialogueAdapter serves eleven_v3* over the text-to-dialogue socket.
+// dialogueModelPrefixes are the model families the dialogue socket serves and
+// the text-to-speech socket refuses. The dialogue socket answers any other
+// model (eleven_flash_v2_5, eleven_multilingual_v2, ...) with HTTP 403, so the
+// split is exhaustive in both directions.
+var dialogueModelPrefixes = []string{"eleven_v3", "eleven_v4"}
+
+// DialogueAdapter serves eleven_v3* and eleven_v4* over the text-to-dialogue
+// socket.
 type DialogueAdapter struct {
 	id              string
 	httpClient      *http.Client
@@ -102,7 +109,13 @@ func (a *DialogueAdapter) ID() string { return a.id }
 // that carries both ElevenLabs TTS arms dispatches on it, so the split lives in
 // one place instead of being restated at every call site.
 func ServesModel(model string) bool {
-	return strings.HasPrefix(strings.TrimSpace(model), dialogueModelPrefix)
+	model = strings.TrimSpace(model)
+	for _, prefix := range dialogueModelPrefixes {
+		if strings.HasPrefix(model, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
@@ -174,7 +187,7 @@ func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 		return "", errors.New("elevenlabs dialogue requires a concrete model")
 	}
 	if !ServesModel(model) {
-		return "", fmt.Errorf("elevenlabs dialogue serves only %s* models, got %q", dialogueModelPrefix, model)
+		return "", fmt.Errorf("elevenlabs dialogue serves only %s* models, got %q", strings.Join(dialogueModelPrefixes, "*, "), model)
 	}
 	if path := strings.TrimRight(endpoint.Path, "/"); path != dialogueEndpoint {
 		return "", fmt.Errorf("elevenlabs dialogue endpoint path must be %s, got %q", dialogueEndpoint, path)
