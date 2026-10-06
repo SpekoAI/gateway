@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -345,4 +346,102 @@ func TestPlanPoolBoundsAStalledRefill(t *testing.T) {
 	if metrics := pool.Metrics(); metrics.Routes != 1 {
 		t.Fatalf("pool metrics = %+v, want the route retained", metrics)
 	}
+}
+
+// Explicit session IDs must reach the issuer unchanged and cannot consume a
+// plan signed for another session or fragment the bounded route pool.
+func TestPlanPoolBypassesCallerSelectedSessionIDs(t *testing.T) {
+	t.Parallel()
+	plans := &fakePlanClient{plan: gatewayPlan()}
+	pool := newWarmPool(t, plans, 2)
+	if err := pool.Warm(context.Background(), managedWarmRequest()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 30; i++ {
+		request := managedWarmRequest()
+		request.Request.ClientSessionID = fmt.Sprintf("client-session-%d", i)
+		if _, ok := pool.Take(request); ok {
+			t.Fatal("plan for another signed session returned")
+		}
+		if err := pool.Warm(context.Background(), request); err == nil {
+			t.Fatal("caller-selected session was prefetched")
+		}
+	}
+	if metrics := pool.Metrics(); metrics.Routes != 1 || metrics.Hits != 0 {
+		t.Fatalf("metrics = %+v", metrics)
+	}
+	if _, ok := pool.Take(managedWarmRequest()); !ok {
+		t.Fatal("explicit IDs consumed anonymous warm plans")
+	}
+	plans.mu.Lock()
+	defer plans.mu.Unlock()
+	for _, request := range plans.batchRequests {
+		if request.Request.ClientSessionID != "" {
+			t.Fatal("session ID leaked into prefetch")
+		}
+	}
+}
+
+func TestGatewayCreatesCallerSelectedSessionSynchronously(t *testing.T) {
+	t.Parallel()
+	config, plans := newServerConfigWithAdapter(t, mock.NewSTTAdapter("mock.stt.v1"), 0, 0, 0, 0)
+	// The warm plan is managed, so the create body has to be too.
+	managedPlan := gatewayPlan()
+	managedPlan.SessionID = "caller-selected-session"
+	managedPlan.Execution.CredentialSource = protocol.CredentialsManaged
+	managedPlan.Route.Credential = &protocol.DelegatedCredential{
+		Kind: protocol.CredentialBearer, Value: "delegated", ExpiresAt: managedPlan.ExpiresAt,
+	}
+	plans.plan = managedPlan
+	pool := newWarmPool(t, plans, 2)
+	if err := pool.Warm(context.Background(), managedWarmRequest()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	config.WarmPlans = pool
+	server, err := gateway.New(config)
+	if err != nil {
+		t.Fatalf("new gateway: %v", err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(httpServer.Close)
+
+	body := map[string]any{
+		"kind":      "stt",
+		"execution": map[string]string{"provider_route": "provider_direct", "credential_source": "managed", "relay_policy": "forbidden"},
+		"request":   map[string]string{"model": "mock-model", "language": "en", "client_session_id": "caller-selected-session"},
+		"media":     map[string]any{"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
+	}
+	response := postJSON(t, httpServer.URL+"/v1/sessions", body, "local-token", "warm-create-1")
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		payload, _ := io.ReadAll(response.Body)
+		t.Fatalf("create status = %d: %s", response.StatusCode, payload)
+	}
+	var created struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if created.SessionID != "caller-selected-session" {
+		t.Fatalf("session %q lost the caller-selected identity", created.SessionID)
+	}
+	if plans.createCallCount() != 1 {
+		t.Fatalf("a caller-selected session made %d synchronous plan calls, want 1", plans.createCallCount())
+	}
+
+	plans.mu.Lock()
+	if len(plans.requests) != 1 || plans.requests[0].Request.ClientSessionID != "caller-selected-session" {
+		t.Errorf("session request = %+v", plans.requests)
+	}
+	plans.mu.Unlock()
+
+	metrics := postGet(t, httpServer.URL+"/metrics", "local-token")
+	defer metrics.Body.Close()
+	payload, _ := io.ReadAll(metrics.Body)
+	if !strings.Contains(string(payload), "speko_gateway_warm_plan_hits_total 0") {
+		t.Fatalf("metrics reported a warm hit for a caller-selected identity:\n%s", payload)
+	}
+	cleanup := deleteSession(t, httpServer.URL+"/v1/sessions/"+created.SessionID, "local-token")
+	cleanup.Body.Close()
 }

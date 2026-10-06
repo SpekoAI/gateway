@@ -273,3 +273,30 @@ func TestLocalPlannerResolvesOpenAIRealtimeRowsByModel(t *testing.T) {
 		}
 	}
 }
+
+func TestLocalPlannerPreservesClientSessionID(t *testing.T) {
+	t.Parallel()
+	planner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{Providers: []string{"deepgram"}})
+	if err != nil {
+		t.Fatalf("new local planner: %v", err)
+	}
+
+	request := localPlanRequest()
+	request.Request.ClientSessionID = "custom-client-session-123"
+
+	plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create local plan: %v", err)
+	}
+
+	if plan.SessionID != "custom-client-session-123" {
+		t.Fatalf("plan.SessionID = %q, want custom-client-session-123", plan.SessionID)
+	}
+	if plan.Reservation.ID != "local-custom-client-session-123" {
+		t.Fatalf("plan.Reservation.ID = %q, want local-custom-client-session-123", plan.Reservation.ID)
+	}
+	if plan.Reservation.Concurrency.LeaseID != "local-custom-client-session-123" {
+		t.Fatalf("plan.Reservation.Concurrency.LeaseID = %q, want local-custom-client-session-123", plan.Reservation.Concurrency.LeaseID)
+	}
+}
+

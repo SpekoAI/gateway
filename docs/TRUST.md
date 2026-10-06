@@ -86,6 +86,9 @@ plainly:
   is accepted, exactly as a synchronously fetched plan is. Prefetching changes
   when a plan arrives, not what is checked.
 - Unused plans are discarded at expiry and settle at zero.
+- Requests with a caller-selected `client_session_id` bypass the pool and fetch
+  a plan synchronously. Signed plan identities are never rewritten or shared
+  across different requested session IDs.
 
 Set `SPEKO_WARM_PLAN_TARGET=0` to disable prefetching and fetch every plan at
 session-create time. Sessions then pay a control-plane round trip before the
@@ -254,3 +257,11 @@ Soniox realtime STT and TTS requests using relay or managed plans include
 usage records match a reservation; it contains no media, text, provider key,
 or Speko API key. BYOK provider-direct realtime requests omit it. Tags exceeding
 the vendor's 256-character limit are omitted on every surface.
+
+### Gemini batch option validation
+
+Gemini language-hinted batch transcription uses smart mode. Language hints
+combined with diarization or word timestamps are rejected locally before audio
+is read or sent: the provider returns an empty, billable transcript for that
+combination. Verbatim requests without a language hint retain their requested
+timing and speaker fields.
