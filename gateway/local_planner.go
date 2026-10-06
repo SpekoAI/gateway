@@ -130,9 +130,13 @@ func (p *LocalPlanner) CreateSessionPlan(_ context.Context, request protocol.Ses
 	if err != nil {
 		return protocol.SessionPlan{}, "", err
 	}
-	sessionID, err := localID("session")
-	if err != nil {
-		return protocol.SessionPlan{}, "", err
+	sessionID := strings.TrimSpace(request.Request.ClientSessionID)
+	if sessionID == "" {
+		generated, err := localID("session")
+		if err != nil {
+			return protocol.SessionPlan{}, "", err
+		}
+		sessionID = generated
 	}
 	attemptID, err := localID("attempt")
 	if err != nil {
