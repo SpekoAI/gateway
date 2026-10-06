@@ -40,6 +40,7 @@ var localCredentialSpecs = []localCredentialSpec{
 	{Provider: "nari", Env: "SPEKO_NARI_BYOK_API_KEY"},
 	{Provider: "openai", Env: "SPEKO_OPENAI_BYOK_API_KEY"},
 	{Provider: "palabra", Env: "SPEKO_PALABRA_BYOK_API_KEY"},
+	{Provider: "paxa", Env: "SPEKO_PAXA_BYOK_API_KEY"},
 	{Provider: "rime", Env: "SPEKO_RIME_BYOK_API_KEY"},
 	{Provider: "smallest", Env: "SPEKO_SMALLEST_BYOK_API_KEY"},
 	{Provider: "soniox", Env: "SPEKO_SONIOX_BYOK_API_KEY"},

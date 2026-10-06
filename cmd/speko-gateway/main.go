@@ -43,6 +43,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/openailive"
 	"github.com/SpekoAI/gateway/providers/openairealtime"
 	"github.com/SpekoAI/gateway/providers/palabra"
+	"github.com/SpekoAI/gateway/providers/paxa"
 	"github.com/SpekoAI/gateway/providers/rime"
 	"github.com/SpekoAI/gateway/providers/smallest"
 	"github.com/SpekoAI/gateway/providers/soniox"
@@ -303,6 +304,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	paxaTTSAdapter, err := paxa.NewTTS(paxa.TTSConfig{})
+	if err != nil {
+		return err
+	}
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
 		fishAdapter,
@@ -314,6 +319,7 @@ func run() error {
 		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 		geminiSTTAdapter, geminiTTSAdapter, metaSTTAdapter, nariSTTAdapter, nariTTSAdapter,
+		paxaTTSAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {
