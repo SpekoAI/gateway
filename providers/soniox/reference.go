@@ -47,7 +47,12 @@ func reservationReference(plan protocol.SessionPlan) string {
 	if plan.Execution.ProviderRoute != protocol.RouteSpekoRelay && plan.Execution.CredentialSource != protocol.CredentialsManaged {
 		return ""
 	}
-	reservationID := strings.TrimSpace(plan.Reservation.ID)
+	return reservationReferenceID(plan.Reservation.ID)
+}
+
+// reservationReferenceID also bounds batch tags, whose plans are relay-only.
+func reservationReferenceID(id string) string {
+	reservationID := strings.TrimSpace(id)
 	if reservationID == "" {
 		return ""
 	}

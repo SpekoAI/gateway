@@ -245,3 +245,12 @@ Use the `_FILE` variants and a secrets manager in production.
   canonical stages without moving raw content into telemetry.
 - Process memory is not a hardware security boundary. Run the image with least
   privilege, a read-only filesystem, and a dedicated workload identity.
+
+### Soniox usage attribution
+
+Soniox realtime STT and TTS requests using relay or managed plans include
+`client_reference_id` with the opaque reservation ID, prefixed by
+`speko_reservation:`. Relay batch requests use the same tag. The tag lets vendor
+usage records match a reservation; it contains no media, text, provider key,
+or Speko API key. BYOK provider-direct realtime requests omit it. Tags exceeding
+the vendor's 256-character limit are omitted on every surface.

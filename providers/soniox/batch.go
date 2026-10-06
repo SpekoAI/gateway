@@ -162,14 +162,9 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		creation["translation"] = translation
 		translating = true
 	}
-	// Unconditional by design, unlike the realtime surfaces: the async API is
-	// reached only through the relay's batch route, whose plan always carries
-	// a Speko reservation, and this is the one Soniox path that has always
-	// been attributable. Left on the literal reservation test rather than
-	// routed through reservationReference so this working path keeps its
-	// exact behaviour; only the prefix is now shared.
-	if reservation := strings.TrimSpace(request.Plan.Reservation.ID); reservation != "" {
-		creation["client_reference_id"] = reservationReferencePrefix + reservation
+	// Batch is relay-only; use the same vendor length guard as realtime.
+	if reference := reservationReferenceID(request.Plan.Reservation.ID); reference != "" {
+		creation["client_reference_id"] = reference
 	}
 	for _, key := range request.Options.STT.ProviderKeys("soniox") {
 		creation[key] = request.Options.STT.Provider("soniox")[key]
