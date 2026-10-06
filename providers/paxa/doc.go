@@ -34,10 +34,11 @@
 //     speech requests are capped per plan. Both answer 429 and are retryable,
 //     so the relay fails over.
 //
-// Usage is metered by the relay (input characters), which is what Paxa
-// bills: 10 credits, $0.01, per 1,000 characters, charged before synthesis
-// and refunded when it fails. Timestamps would bill 1.25x and are never
-// requested.
+// Each synthesis reports a billing observation in credits: 0.01 credits per
+// UTF-16 unit, rounded to the vendor's hundredth-credit increment, with a
+// 0.1-credit minimum. Credits cost $10 per 10,000. Completed audio marks the
+// observation complete; interrupted bodies leave incomplete evidence for
+// reconciliation. Timestamps would bill 1.25x and are never requested.
 //
 // The route is not routable until its live canary passes.
 package paxa

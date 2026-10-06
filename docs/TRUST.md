@@ -245,3 +245,13 @@ Use the `_FILE` variants and a secrets manager in production.
   canonical stages without moving raw content into telemetry.
 - Process memory is not a hardware security boundary. Run the image with least
   privilege, a read-only filesystem, and a dedicated workload identity.
+
+### Paxa synthesis
+
+Paxa relay requests send the requested text, voice, model, language, and WAV
+streaming format to the validated Paxa endpoint with its delegated credential.
+Redirects are refused. Provider billing observations contain an opaque
+operation ID, optional provider request ID, model, mode, and credit quantity;
+they contain no synthesis text or voice content. Billing counts UTF-16 units
+and the per-synthesis minimum. Incomplete audio leaves incomplete billing
+evidence. Caller cancellation interrupts a stalled response-header request.

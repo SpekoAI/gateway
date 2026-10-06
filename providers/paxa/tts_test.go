@@ -438,3 +438,87 @@ func TestCommitTextDoesNotFollowRedirects(t *testing.T) {
 	default:
 	}
 }
+
+func TestCommitTextCancellationInterruptsResponseHeaders(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+	stream := openTTS(t, server, "en")
+	if err := stream.AppendText(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- stream.CommitText(ctx) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("request did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("caller cancellation did not interrupt headers")
+	}
+}
+
+func TestSynthesisReportsCreditsPerUtterance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/wav")
+		_, _ = w.Write(append(wavHeader(24000, 1), []byte{1, 0, 2, 0}...))
+	}))
+	defer server.Close()
+	stream := openTTS(t, server, "en")
+	textStream := stream
+	var previous string
+	for _, tc := range []struct {
+		text    string
+		credits int64
+	}{{"a", 100}, {"Hi 👋", 100}, {strings.Repeat("👋", 10), 200}} {
+		if err := textStream.AppendText(context.Background(), tc.text); err != nil {
+			t.Fatal(err)
+		}
+		if err := textStream.CommitText(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			event := <-stream.Events()
+			if event.Err != nil {
+				t.Fatal(event.Err)
+			}
+			if event.Type != protocol.EventAudioDone {
+				continue
+			}
+			if event.Billing == nil || !event.Billing.Complete || event.Billing.OperationID == previous || event.Billing.Quantities["credits"] != tc.credits {
+				t.Fatalf("billing = %+v, want credits %d", event.Billing, tc.credits)
+			}
+			if err := event.Billing.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			previous = event.Billing.OperationID
+			break
+		}
+		// audio.done can reach the consumer just before the reader releases its
+		// in-flight marker; Close is intentionally avoided between utterances.
+		s := stream.(*ttsStream)
+		s.stateMu.Lock()
+		done := s.requestDone
+		s.stateMu.Unlock()
+		if done != nil {
+			<-done
+		}
+	}
+}

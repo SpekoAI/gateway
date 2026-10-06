@@ -245,16 +245,17 @@ type ttsStream struct {
 	language                 string
 	voice                    string
 
-	readers       sync.WaitGroup
-	closeOnce     sync.Once
-	closeErr      error
-	stateMu       sync.Mutex
-	closed        bool
-	pending       strings.Builder
-	inFlight      bool
-	requestCancel context.CancelFunc
-	requestDone   chan struct{}
-	canceled      bool
+	readers         sync.WaitGroup
+	closeOnce       sync.Once
+	closeErr        error
+	stateMu         sync.Mutex
+	closed          bool
+	pending         strings.Builder
+	inFlight        bool
+	requestCancel   context.CancelFunc
+	requestDone     chan struct{}
+	canceled        bool
+	billingSequence atomic.Uint64
 }
 
 func (s *ttsStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -313,6 +314,16 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Cancel a stalled header request when CommitText's caller cancels. Stop
+	// the hook when this call returns so its scope does not own the audio body.
+	stopCallerCancel := context.AfterFunc(ctx, requestCancel)
+	defer stopCallerCancel()
+	billing := &protocol.BillingObservation{
+		OperationID: fmt.Sprintf("synthesis-%d", s.billingSequence.Add(1)),
+		Model:       s.model, Mode: "streaming",
+		// 0.01 credits per UTF-16 unit, with a 0.1-credit synthesis minimum.
+		Quantities: map[string]int64{"credits": int64(max(10, utf16Units(text))) * 10},
+	}
 	payload, err := json.Marshal(speechRequest{Text: text, Voice: s.voice, Model: s.model, Format: "wav", Stream: true, Language: s.language})
 	if err != nil {
 		s.abandonRequest(requestCancel, done)
@@ -366,7 +377,7 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Paxa TTS returned an unexpected success content type", Retryable: true, ProviderStatus: response.StatusCode}
 	}
 	s.readers.Add(1)
-	go s.readResponse(requestCtx, response, requestCancel, done)
+	go s.readResponse(requestCtx, response, requestCancel, done, billing)
 	return nil
 }
 
@@ -422,7 +433,7 @@ func (s *ttsStream) wasCanceled() bool {
 
 // readResponse strips the WAV header and slices the PCM that follows into
 // audio frames as it arrives.
-func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Response, requestCancel context.CancelFunc, done chan struct{}) {
+func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Response, requestCancel context.CancelFunc, done chan struct{}, billing *protocol.BillingObservation) {
 	defer func() {
 		requestCancel()
 		_ = response.Body.Close()
@@ -430,9 +441,10 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 		close(done)
 		s.readers.Done()
 	}()
+	billing.ProviderRequestID = strings.TrimSpace(response.Header.Get(requestIDHeader))
 	data := marshalData(map[string]any{"provider_request_id": strings.TrimSpace(response.Header.Get(requestIDHeader))})
 	if response.Header.Get(requestIDHeader) != "" {
-		if !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: data}) {
+		if !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: data, Billing: billing}) {
 			return
 		}
 	}
@@ -447,18 +459,18 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			s.reportResponseProgress()
 			total += int64(count)
 			if total > s.maxResponseBytes {
-				s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Paxa TTS response exceeded the configured limit", Retryable: true}})
+				s.emit(requestCtx, runtimepkg.ProviderEvent{Billing: billing, Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Paxa TTS response exceeded the configured limit", Retryable: true}})
 				return
 			}
 			audio, headerErr := header.write(buffer[:count])
 			if headerErr != nil {
-				s.emit(requestCtx, runtimepkg.ProviderEvent{Err: headerErr})
+				s.emit(requestCtx, runtimepkg.ProviderEvent{Billing: billing, Err: headerErr})
 				return
 			}
 			if len(audio) > 0 {
 				if !started {
 					started = true
-					if !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: data}) {
+					if !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: data, Billing: billing}) {
 						return
 					}
 				}
@@ -477,14 +489,16 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			// The vendor documents no trailer: a failure after the status line
 			// just cuts the body, so a torn read is a failed synthesis, never a
 			// short utterance.
-			s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Paxa TTS audio stream ended unexpectedly", Retryable: true, Cause: err}})
+			s.emit(requestCtx, runtimepkg.ProviderEvent{Billing: billing, Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Paxa TTS audio stream ended unexpectedly", Retryable: true, Cause: err}})
 			return
 		}
 		if !started {
-			s.emit(requestCtx, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Paxa TTS completed without returning audio", Retryable: true}})
+			s.emit(requestCtx, runtimepkg.ProviderEvent{Billing: billing, Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Paxa TTS completed without returning audio", Retryable: true}})
 			return
 		}
-		s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: data})
+		completeBilling := *billing
+		completeBilling.Complete = true
+		s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: data, Billing: &completeBilling})
 		return
 	}
 }
