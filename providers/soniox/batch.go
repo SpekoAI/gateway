@@ -162,8 +162,9 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		creation["translation"] = translation
 		translating = true
 	}
-	if reservation := strings.TrimSpace(request.Plan.Reservation.ID); reservation != "" {
-		creation["client_reference_id"] = "speko_reservation:" + reservation
+	// Batch is relay-only; use the same vendor length guard as realtime.
+	if reference := reservationReferenceID(request.Plan.Reservation.ID); reference != "" {
+		creation["client_reference_id"] = reference
 	}
 	for _, key := range request.Options.STT.ProviderKeys("soniox") {
 		creation[key] = request.Options.STT.Provider("soniox")[key]

@@ -127,6 +127,13 @@ be correlated with the consolidated bill. It receives no Speko API key.
 
 ## Telemetry and billing
 
+Trusted server-side operation evidence can use `provider_cost_usd` when a
+provider reports a completed request's exact USD cost, including request
+minimums and voice fees. Quantities remain exact rational values with bounded
+denominators. Customer messages do not set billing observations or charges;
+incomplete delivery must retain incomplete evidence for reconciliation.
+
+
 Content-free usage telemetry is on by default for every gateway installation.
 When no Speko API key is configured, events use an unauthenticated Speko
 destination and are not associated with an account. Plans issued after Speko
@@ -258,6 +265,15 @@ operation ID, optional provider request ID, model, mode, and credit quantity;
 they contain no synthesis text or voice content. Billing counts UTF-16 units
 and the per-synthesis minimum. Incomplete audio leaves incomplete billing
 evidence. Caller cancellation interrupts a stalled response-header request.
+
+### Soniox usage attribution
+
+Soniox realtime STT and TTS requests using relay or managed plans include
+`client_reference_id` with the opaque reservation ID, prefixed by
+`speko_reservation:`. Relay batch requests use the same tag. The tag lets vendor
+usage records match a reservation; it contains no media, text, provider key,
+or Speko API key. BYOK provider-direct realtime requests omit it. Tags exceeding
+the vendor's 256-character limit are omitted on every surface.
 
 ### Gemini batch option validation
 

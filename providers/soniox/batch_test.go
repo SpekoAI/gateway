@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -151,5 +152,45 @@ func TestBatchTranscribeRefusesRealtimeModelAndMapsJobError(t *testing.T) {
 	var providerErr *runtimepkg.ProviderError
 	if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeProviderError || providerErr.Retryable {
 		t.Fatalf("job error: %v", err)
+	}
+}
+
+func TestBatchReservationReferenceLengthOnWire(t *testing.T) {
+	t.Parallel()
+	for _, size := range []int{256 - len(reservationReferencePrefix), 257 - len(reservationReferencePrefix)} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			var creation map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method + " " + r.URL.Path {
+				case "POST /v1/files":
+					_, _ = w.Write([]byte(`{"id":"file"}`))
+				case "POST /v1/transcriptions":
+					_ = json.NewDecoder(r.Body).Decode(&creation)
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error":"stop after capturing request"}`))
+				default:
+					w.WriteHeader(http.StatusNoContent)
+				}
+			}))
+			defer server.Close()
+			adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan := batchPlan(server.URL + "/v1/transcriptions")
+			plan.Reservation.ID = strings.Repeat("r", size)
+			_, err = adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{Plan: plan, Audio: strings.NewReader("x"), AudioBytes: 1})
+			if err == nil || creation == nil {
+				t.Fatalf("creation=%v error=%v", creation, err)
+			}
+			got, present := creation["client_reference_id"]
+			if size+len(reservationReferencePrefix) <= 256 {
+				if got != reservationReferencePrefix+plan.Reservation.ID {
+					t.Fatalf("reference=%v", got)
+				}
+			} else if present {
+				t.Fatalf("oversized reference sent: %v", got)
+			}
+		})
 	}
 }
