@@ -127,6 +127,13 @@ be correlated with the consolidated bill. It receives no Speko API key.
 
 ## Telemetry and billing
 
+Trusted server-side operation evidence can use `provider_cost_usd` when a
+provider reports a completed request's exact USD cost, including request
+minimums and voice fees. Quantities remain exact rational values with bounded
+denominators. Customer messages do not set billing observations or charges;
+incomplete delivery must retain incomplete evidence for reconciliation.
+
+
 Content-free usage telemetry is on by default for every gateway installation.
 When no Speko API key is configured, events use an unauthenticated Speko
 destination and are not associated with an account. Plans issued after Speko

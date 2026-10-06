@@ -66,3 +66,31 @@ func TestBillingQuantityPrecisionCanIncreaseWithoutDoubleCounting(t *testing.T) 
 		t.Fatal("accepted changed final duration")
 	}
 }
+
+func TestProviderCostEvidencePreservesExactUSD(t *testing.T) {
+	old := BillingObservation{OperationID: "request", Model: "tts", Mode: "streaming", Quantities: map[string]int64{}}
+	next := old.Clone()
+	// $0.001 minimum plus a $0.000015 creator fee, without floating point.
+	next.Quantities["provider_cost_usd"] = 1015000
+	next.QuantityDenominators = map[string]int64{"provider_cost_usd": 1000000000}
+	next.Complete = true
+	merged, err := MergeBillingObservation(old, next)
+	if err != nil || merged.Quantities["provider_cost_usd"] != 1015000 || merged.QuantityDenominator("provider_cost_usd") != 1000000000 {
+		t.Fatalf("%+v %v", merged, err)
+	}
+	next.Quantities["provider_cost_usd"]--
+	if _, err := MergeBillingObservation(merged, next); err == nil {
+		t.Fatal("accepted change to final provider cost")
+	}
+	for _, quantity := range []int64{-1} {
+		next.Quantities["provider_cost_usd"] = quantity
+		if next.Validate() == nil {
+			t.Fatal("accepted negative provider cost")
+		}
+	}
+	next.Quantities["provider_cost_usd"] = 1
+	next.QuantityDenominators["provider_cost_usd"] = 1000000001
+	if next.Validate() == nil {
+		t.Fatal("accepted unbounded USD denominator")
+	}
+}

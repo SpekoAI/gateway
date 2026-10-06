@@ -24,7 +24,7 @@ type BillingObservation struct {
 	Model              string           `json:"model"`
 	Mode               string           `json:"mode"`
 	Quantities         map[string]int64 `json:"quantities"`
-	// QuantityDenominators overrides the default 1000 for fractional duration or credits.
+	// QuantityDenominators overrides the default 1000 for fractional duration, credits, or provider-reported USD.
 	QuantityDenominators map[string]int64 `json:"quantity_denominators,omitempty"`
 	Complete             bool             `json:"complete"`
 	ContextTokens        int64            `json:"context_tokens,omitempty"`
@@ -48,7 +48,7 @@ func ValidBillingUnit(unit string) bool {
 		"input_audio_tokens", "cached_input_audio_tokens", "output_audio_tokens",
 		"input_image_tokens", "cached_input_image_tokens", "input_video_tokens",
 		"duration_seconds", "characters", "utf8_bytes", "credits", "text_inputs",
-		"web_search_calls", "web_search_content_tokens":
+		"web_search_calls", "web_search_content_tokens", "provider_cost_usd":
 		return true
 	}
 	return false
@@ -67,12 +67,12 @@ func (o BillingObservation) Validate() error {
 		return errors.New("billing: invalid operation metadata")
 	}
 	for u, d := range o.QuantityDenominators {
-		if _, ok := o.Quantities[u]; !ok || (u != "duration_seconds" && u != "credits") || d < 1 || d > 1_000_000_000 {
+		if _, ok := o.Quantities[u]; !ok || (u != "duration_seconds" && u != "credits" && u != "provider_cost_usd") || d < 1 || d > 1_000_000_000 {
 			return errors.New("billing: invalid quantity denominator")
 		}
 	}
 	for u, q := range o.Quantities {
-		if !ValidBillingUnit(u) || q < 0 || (u != "duration_seconds" && u != "credits" && q%1000 != 0) {
+		if !ValidBillingUnit(u) || q < 0 || (u != "duration_seconds" && u != "credits" && u != "provider_cost_usd" && q%1000 != 0) {
 			return errors.New("billing: invalid quantity")
 		}
 	}
