@@ -39,6 +39,22 @@ func TestStreamingBillsSessionDurationNotSubmittedAudio(t *testing.T) {
 	}
 }
 
+func TestTurnDetectionSettingsAreNotBillingFeatures(t *testing.T) {
+	for _, key := range []string{
+		"end_of_turn_confidence_threshold",
+		"min_end_of_turn_silence_when_confident",
+		"min_turn_silence",
+		"max_turn_silence",
+	} {
+		options := protocol.RequestOptions{STT: &protocol.SttOptions{
+			ProviderOptions: map[string]map[string]any{"assemblyai": {key: 400}},
+		}}
+		if got := billingFeatures(options, false); len(got) != 0 {
+			t.Fatalf("%s billed as a feature: %v", key, got)
+		}
+	}
+}
+
 func TestKeywordBillingDependsOnExecutionMode(t *testing.T) {
 	options := protocol.RequestOptions{STT: &protocol.SttOptions{Keywords: []string{"Speko"}}}
 	if got := billingFeatures(options, false); len(got) != 0 {

@@ -1,4 +1,5 @@
-// Package fish implements Fish Audio's MessagePack WebSocket TTS protocol.
+// Package fish implements Fish Audio's MessagePack WebSocket TTS protocol and
+// the prerecorded ASR endpoint (transcribe-1, transcribe-1-pro).
 package fish
 
 import (

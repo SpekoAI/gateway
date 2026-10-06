@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -142,6 +143,21 @@ func TestModelsFiltersByKindAndProvider(t *testing.T) {
 	elevenlabs := fetchCatalog(t, "/v1/models?provider=elevenlabs")
 	if len(elevenlabs.Models) != 2 {
 		t.Fatalf("provider=elevenlabs returned %d rows, want stt and tts", len(elevenlabs.Models))
+	}
+	// AssemblyAI serves two published Universal Pro models on one adapter;
+	// both must be discoverable, with the default still resolving to 3.5 Pro.
+	assemblyai := fetchCatalog(t, "/v1/models?provider=assemblyai")
+	ids := make([]string, 0, len(assemblyai.Models))
+	for _, model := range assemblyai.Models {
+		ids = append(ids, model.ID)
+	}
+	if !slices.Contains(ids, "assemblyai:universal-3-5-pro") || !slices.Contains(ids, "assemblyai:universal-3-6-pro") {
+		t.Fatalf("provider=assemblyai returned %v, want both Universal Pro models", ids)
+	}
+	for _, entry := range gateway.Catalog() {
+		if entry.Provider == "assemblyai" && entry.DefaultModel != "universal-3-5-pro" {
+			t.Fatalf("assemblyai default = %q, want universal-3-5-pro", entry.DefaultModel)
+		}
 	}
 	if unknown := fetchCatalog(t, "/v1/models?provider=nope"); len(unknown.Models) != 0 {
 		t.Fatalf("an unknown provider returned %d rows, want none", len(unknown.Models))

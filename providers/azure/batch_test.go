@@ -279,6 +279,13 @@ func TestBatchRefusesForeignProviderAndNonMAIModel(t *testing.T) {
 	if _, err := adapter.Transcribe(context.Background(), request); err == nil || !strings.Contains(err.Error(), `model "fast-transcription"`) {
 		t.Fatalf("classic model err = %v", err)
 	}
+	// The streaming model shares the MAI-Transcribe prefix but has no
+	// fast-transcription arm.
+	request = batchRequest(server.URL, []byte("RIFF"))
+	request.Plan.Route.Model = RealtimeModel
+	if _, err := adapter.Transcribe(context.Background(), request); err == nil || !strings.Contains(err.Error(), `streaming model "MAI-Transcribe-2-Streaming"`) {
+		t.Fatalf("streaming model err = %v", err)
+	}
 	// The 1.5 generation rides the same enhanced-mode contract.
 	request = batchRequest(server.URL, []byte("RIFF"))
 	request.Plan.Route.Model = "MAI-Transcribe-1.5"
