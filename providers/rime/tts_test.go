@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -337,16 +338,14 @@ func TestHandshakeFailuresMapToDistinctCodes(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("status_%d", testCase.status), func(t *testing.T) {
 			t.Parallel()
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(testCase.status)
-			}))
-			defer server.Close()
-
-			adapter, err := New(testConfig(server.URL))
+			endpoint := "http://127.0.0.1"
+			config := testConfig(endpoint)
+			config.HTTPClient = &http.Client{Transport: handshakeStatusTransport{status: testCase.status}}
+			adapter, err := New(config)
 			if err != nil {
 				t.Fatalf("new adapter: %v", err)
 			}
-			_, err = adapter.Open(context.Background(), adapterRequest(server.URL))
+			_, err = adapter.Open(context.Background(), adapterRequest(endpoint))
 			var providerError *runtimepkg.ProviderError
 			if !errorsAs(err, &providerError) {
 				t.Fatalf("open error = %v", err)
@@ -923,4 +922,13 @@ func errorsAs(err error, target **runtimepkg.ProviderError) bool {
 	}
 	*target = providerError
 	return true
+}
+
+// Status classification is independent of socket scheduling. Happy-path
+// integration tests exercise the real upgrade; rejected statuses use an exact
+// HTTP response so a transient test transport error cannot replace the status.
+type handshakeStatusTransport struct{ status int }
+
+func (h handshakeStatusTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: h.status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
 }

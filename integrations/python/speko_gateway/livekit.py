@@ -283,6 +283,12 @@ class SpeechStream(stt.RecognizeStream):
                     self._awaiting_final = True
                 self._emit_end()
             return
+        # A final with no recognized text still completes its turn. Leaving it
+        # pending steals the next transcript-led turn's START marker.
+        if event.type == "transcript.final" and not event.text:
+            self._saw_final_for_turn = True
+            self._awaiting_final = False
+            return
         if event.type not in {"transcript.delta", "transcript.final"} or not event.text:
             return
         is_final = event.type == "transcript.final"

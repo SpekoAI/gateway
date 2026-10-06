@@ -692,3 +692,32 @@ def test_cache_write_tokens_are_included_in_completion_usage() -> None:
     assert usage.prompt_tokens == 430
     assert usage.prompt_cached_tokens == 100
     assert usage.total_tokens == 464
+
+
+class GoogleEmptyFinalStream(FakeStream):
+    async def events(self) -> AsyncIterator[LiveKitSpeechEvent]:
+        yield LiveKitSpeechEvent(type="transcript.delta", text="partial", provider_request_id="google-silent")
+        yield LiveKitSpeechEvent(type="transcript.final", text="")
+        yield LiveKitSpeechEvent(type="speech.ended")
+        yield LiveKitSpeechEvent(type="transcript.final", text="next turn", provider_request_id="google-next")
+        yield LiveKitSpeechEvent(type="speech.ended")
+
+
+async def test_empty_final_does_not_steal_the_next_turn_start() -> None:
+    plugin = STT(FakeClient())  # type: ignore[arg-type]
+    stream = plugin.stream()
+    stream._bridge = FakeBridge(GoogleEmptyFinalStream())  # type: ignore[assignment]
+    stream.push_frame(frame())
+    stream.flush()
+    stream.end_input()
+    events = [event async for event in stream]
+    assert [event.type for event in events] == [
+        agents_stt.SpeechEventType.START_OF_SPEECH,
+        agents_stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        agents_stt.SpeechEventType.END_OF_SPEECH,
+        agents_stt.SpeechEventType.START_OF_SPEECH,
+        agents_stt.SpeechEventType.FINAL_TRANSCRIPT,
+        agents_stt.SpeechEventType.END_OF_SPEECH,
+    ]
+    assert events[4].alternatives[0].text == "next turn"
+    await plugin.aclose()

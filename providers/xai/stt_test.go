@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -564,16 +565,14 @@ func TestSTTHandshakeStatusMapsToDistinctProviderErrorCodes(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("status %d", testCase.status), func(t *testing.T) {
 			t.Parallel()
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(testCase.status)
-			}))
-			defer server.Close()
-
-			adapter, err := NewSTT(sttTestConfig(server.URL))
+			endpoint := "http://127.0.0.1"
+			config := sttTestConfig(endpoint)
+			config.HTTPClient = &http.Client{Transport: handshakeStatusTransport{status: testCase.status}}
+			adapter, err := NewSTT(config)
 			if err != nil {
 				t.Fatalf("new STT adapter: %v", err)
 			}
-			_, err = adapter.Open(context.Background(), sttAdapterRequest(server.URL))
+			_, err = adapter.Open(context.Background(), sttAdapterRequest(endpoint))
 			assertProviderError(t, err, testCase.code, testCase.retryable, testCase.status)
 		})
 	}
@@ -1026,4 +1025,13 @@ func sttNextAudio(t *testing.T, frames <-chan []byte) []byte {
 		t.Fatal("timed out waiting for an audio frame")
 		return nil
 	}
+}
+
+// Status classification is independent of socket scheduling. Happy-path
+// integration tests exercise the real upgrade; rejected statuses use an exact
+// HTTP response so a transient test transport error cannot replace the status.
+type handshakeStatusTransport struct{ status int }
+
+func (h handshakeStatusTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: h.status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
 }
