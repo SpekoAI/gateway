@@ -171,10 +171,7 @@ func (a *TTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequest) 
 	if endpoint.Path != speechPath {
 		return nil, fmt.Errorf("paxa tts endpoint path must be %s, got %q", speechPath, endpoint.Path)
 	}
-	client := a.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
+	client := noRedirectClient(a.httpClient)
 	streamCtx, cancel := context.WithCancel(context.Background())
 	return &ttsStream{
 		ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), responseProgress: make(chan struct{}, 1),
@@ -201,21 +198,34 @@ func ttsLanguage(language string) (string, error) {
 
 // ttsVoice prefers the caller's choice, then the control plane's, then the
 // language's default, because the endpoint refuses a request without one.
-// The relay fills a blank plan voice with the catalog default, which is the
-// Thai voice; on an English session that fill is not a choice, so the English
-// voice replaces it.
+// A blank plan voice is filled with the catalog default, the Thai voice, and
+// the engine copies the plan voice into a blank request voice, so a request
+// voice equal to the plan voice is that fill, not a choice. On an English
+// session the English voice replaces it.
 func ttsVoice(requested, planned, language string) string {
-	if voice := strings.TrimSpace(requested); voice != "" {
-		return voice
-	}
-	planned = strings.TrimSpace(planned)
-	if language == "en" && (planned == "" || strings.EqualFold(planned, DefaultVoice)) {
+	requested, planned = strings.TrimSpace(requested), strings.TrimSpace(planned)
+	filled := requested == "" || strings.EqualFold(requested, planned)
+	if filled && language == "en" && (planned == "" || strings.EqualFold(planned, DefaultVoice)) {
 		return DefaultEnglishVoice
+	}
+	if requested != "" {
+		return requested
 	}
 	if planned != "" {
 		return planned
 	}
 	return DefaultVoice
+}
+
+// noRedirectClient never follows a redirect: a 3xx would replay the bearer
+// key to a URL the endpoint policy never checked.
+func noRedirectClient(client *http.Client) *http.Client {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	copied := *client
+	copied.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &copied
 }
 
 type ttsStream struct {

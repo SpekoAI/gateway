@@ -153,6 +153,7 @@ func TestLanguagePicksTheVoiceAndTheReadingLanguage(t *testing.T) {
 	}{
 		{name: "english session takes the english voice", language: "en-US", wantVoice: DefaultEnglishVoice, wantLanguage: "en"},
 		{name: "english session replaces the catalog fill", language: "en", planned: DefaultVoice, wantVoice: DefaultEnglishVoice, wantLanguage: "en"},
+		{name: "english session replaces the engine-copied fill", language: "en", requested: DefaultVoice, planned: DefaultVoice, wantVoice: DefaultEnglishVoice, wantLanguage: "en"},
 		{name: "english session keeps a planned choice", language: "en", planned: "toast", wantVoice: "toast", wantLanguage: "en"},
 		{name: "caller voice wins", language: "en", requested: "nomyen", wantVoice: "nomyen", wantLanguage: "en"},
 		{name: "thai session", language: "th", wantVoice: DefaultVoice, wantLanguage: "th"},
@@ -410,5 +411,30 @@ func TestOpenAcceptsTheFlashModelAndNativeEndpointOnly(t *testing.T) {
 		if _, err := adapter.Open(context.Background(), request); err == nil {
 			t.Errorf("%s: Open succeeded, want refusal", name)
 		}
+	}
+}
+
+// A 3xx must not replay the bearer key to a URL the endpoint policy never
+// checked; it surfaces as a rejection instead.
+func TestCommitTextDoesNotFollowRedirects(t *testing.T) {
+	t.Parallel()
+	followed := make(chan struct{}, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { followed <- struct{}{} }))
+	t.Cleanup(target.Close)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, target.URL+speechPath, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(server.Close)
+	stream := openTTS(t, server, "en")
+	_ = stream.AppendText(context.Background(), "hello")
+	err := stream.CommitText(context.Background())
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.ProviderStatus != http.StatusTemporaryRedirect {
+		t.Fatalf("CommitText error = %v, want the redirect surfaced as a rejection", err)
+	}
+	select {
+	case <-followed:
+		t.Fatal("the redirect was followed")
+	default:
 	}
 }
