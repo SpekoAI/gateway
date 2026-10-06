@@ -153,7 +153,7 @@ func TestLanguagePicksTheVoiceAndTheReadingLanguage(t *testing.T) {
 	}{
 		{name: "english session takes the english voice", language: "en-US", wantVoice: DefaultEnglishVoice, wantLanguage: "en"},
 		{name: "english session replaces the catalog fill", language: "en", planned: DefaultVoice, wantVoice: DefaultEnglishVoice, wantLanguage: "en"},
-		{name: "english session replaces the engine-copied fill", language: "en", requested: DefaultVoice, planned: DefaultVoice, wantVoice: DefaultEnglishVoice, wantLanguage: "en"},
+		{name: "explicit thai voice on an english session is honored", language: "en", requested: DefaultVoice, planned: DefaultVoice, wantVoice: DefaultVoice, wantLanguage: "en"},
 		{name: "english session keeps a planned choice", language: "en", planned: "toast", wantVoice: "toast", wantLanguage: "en"},
 		{name: "caller voice wins", language: "en", requested: "nomyen", wantVoice: "nomyen", wantLanguage: "en"},
 		{name: "thai session", language: "th", wantVoice: DefaultVoice, wantLanguage: "th"},

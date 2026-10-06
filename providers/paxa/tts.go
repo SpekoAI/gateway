@@ -198,18 +198,17 @@ func ttsLanguage(language string) (string, error) {
 
 // ttsVoice prefers the caller's choice, then the control plane's, then the
 // language's default, because the endpoint refuses a request without one.
-// A blank plan voice is filled with the catalog default, the Thai voice, and
-// the engine copies the plan voice into a blank request voice, so a request
-// voice equal to the plan voice is that fill, not a choice. On an English
-// session the English voice replaces it.
+// A voice in the request is always honored, even the Thai one on an English
+// session. Managed plans carry the board's per-language voice (cookie for
+// en), so the catalog default only reaches a plan the board had no cell for;
+// on an English session with no request voice that fill becomes cookie.
 func ttsVoice(requested, planned, language string) string {
-	requested, planned = strings.TrimSpace(requested), strings.TrimSpace(planned)
-	filled := requested == "" || strings.EqualFold(requested, planned)
-	if filled && language == "en" && (planned == "" || strings.EqualFold(planned, DefaultVoice)) {
-		return DefaultEnglishVoice
+	if voice := strings.TrimSpace(requested); voice != "" {
+		return voice
 	}
-	if requested != "" {
-		return requested
+	planned = strings.TrimSpace(planned)
+	if language == "en" && (planned == "" || strings.EqualFold(planned, DefaultVoice)) {
+		return DefaultEnglishVoice
 	}
 	if planned != "" {
 		return planned
