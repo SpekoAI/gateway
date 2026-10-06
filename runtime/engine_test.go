@@ -912,11 +912,15 @@ func TestPaxaKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
 		return (<-opened).Options
 	}
 
-	if got := open(protocol.RequestOptions{}).Voice; strings.TrimSpace(got) != "" {
+	if got := open(protocol.RequestOptions{}).Voice; got != "nomyen" {
+		t.Fatalf("no language must preserve catalog default, got %q", got)
+	}
+
+	if got := open(protocol.RequestOptions{Language: "en"}).Voice; strings.TrimSpace(got) != "" {
 		t.Fatalf("adapter voice with no caller voice = %q, want blank so the adapter selects by language", got)
 	}
 	// Whitespace is not a choice: an adapter would reject it, so it is a blank.
-	if got := open(protocol.RequestOptions{Voice: "  "}).Voice; strings.TrimSpace(got) != "" {
+	if got := open(protocol.RequestOptions{Voice: "  ", Language: "en"}).Voice; strings.TrimSpace(got) != "" {
 		t.Fatalf("adapter voice for a blank caller voice = %q, want blank so the adapter selects by language", got)
 	}
 	if got := open(protocol.RequestOptions{Voice: "nomyen"}).Voice; got != "nomyen" {

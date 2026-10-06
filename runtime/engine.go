@@ -133,7 +133,7 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	adapterOptions := request.Options
 	// Paxa resolves language-specific defaults and must distinguish the
 	// caller's explicit voice from the signed plan's fallback.
-	if strings.TrimSpace(adapterOptions.Voice) == "" && adapterPlan.Route.Provider != "paxa" {
+	if strings.TrimSpace(adapterOptions.Voice) == "" && (adapterPlan.Route.Provider != "paxa" || strings.TrimSpace(adapterOptions.Language) == "") {
 		adapterOptions.Voice = adapterPlan.Route.Voice
 	}
 	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery})
