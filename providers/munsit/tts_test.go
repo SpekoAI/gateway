@@ -398,15 +398,117 @@ func TestSynthesisReportsCreditsPerUtterance(t *testing.T) {
 			t.Fatalf("%q billing = %+v, want credits %d", tc.text, done.Billing, tc.credits)
 		}
 		previous = done.Billing.OperationID
-		// audio.done can reach the consumer just before the reader releases its
-		// in-flight marker; Close is intentionally avoided between utterances.
-		s := stream.(*ttsStream)
-		s.stateMu.Lock()
-		requestDone := s.requestDone
-		s.stateMu.Unlock()
-		if requestDone != nil {
-			<-requestDone
+	}
+}
+
+// A caller that starts the next utterance as soon as it sees audio.done must
+// find the previous one finished. The reader used to free its slot only after
+// publishing audio.done. A one-slot buffer holds the reader inside its
+// audio.done send, which makes the ordering observable without a race.
+func TestNextUtteranceMayStartOnAudioDone(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", rawContentType(24_000))
+		_, _ = w.Write([]byte{1, 0, 2, 0})
+	}))
+	t.Cleanup(server.Close)
+	stream := openTTS(t, server, ttsRequest("", "ar", 24_000), TTSConfig{EventBuffer: 1, AudioChunkBytes: 1024})
+	_ = stream.AppendText(context.Background(), "مرحبا")
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if started := nextEvent(t, stream); started.Type != protocol.EventAudioStarted {
+		t.Fatalf("first event = %s", started.Type)
+	}
+	// The frame now fills the buffer and the reader waits to send audio.done.
+	time.Sleep(50 * time.Millisecond)
+	if err := stream.AppendText(context.Background(), "التالي"); err != nil {
+		t.Fatalf("slot still held while audio.done is being published: %v", err)
+	}
+	if frame := nextEvent(t, stream); frame.Type != protocol.EventAudioFrame {
+		t.Fatalf("second event = %s", frame.Type)
+	}
+	if done := nextEvent(t, stream); done.Type != protocol.EventAudioDone {
+		t.Fatalf("third event = %s", done.Type)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("next utterance right after audio.done: %v", err)
+	}
+	if audio, _ := drainAudio(t, stream); len(audio) != 4 {
+		t.Fatalf("next utterance audio = %v", audio)
+	}
+}
+
+// Releasing the slot before audio.done must not let a graceful Close cut
+// that event off: Close waits for the reader, not the slot.
+func TestGracefulCloseStillDeliversAudioDone(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", rawContentType(24_000))
+		for range 5 {
+			_, _ = w.Write([]byte{1, 0})
+			w.(http.Flusher).Flush()
+			time.Sleep(10 * time.Millisecond)
 		}
+	}))
+	t.Cleanup(server.Close)
+	stream := openTTS(t, server, ttsRequest("", "ar", 24_000), TTSConfig{EventBuffer: 1})
+	_ = stream.AppendText(context.Background(), "مرحبا")
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- stream.Close(context.Background()) }()
+	var audio []byte
+	sawDone := false
+	for event := range stream.Events() {
+		if event.Err != nil {
+			t.Fatalf("event error: %v", event.Err)
+		}
+		audio = append(audio, event.Audio...)
+		sawDone = sawDone || event.Type == protocol.EventAudioDone
+	}
+	if err := <-closed; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !sawDone || len(audio) != 10 {
+		t.Fatalf("audio.done=%v audio=%d bytes, want the whole utterance and audio.done", sawDone, len(audio))
+	}
+}
+
+// Error headers that arrive promptly followed by a body that never ends must
+// not hold CommitText, and with it the runtime's provider lock.
+func TestCommitTextBoundsTheErrorBody(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"errorCode":40101,`))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+	stream := openTTS(t, server, ttsRequest("", "ar", 24_000), TTSConfig{HeaderTimeout: 50 * time.Millisecond})
+	_ = stream.AppendText(context.Background(), "مرحبا")
+	result := make(chan error, 1)
+	go func() { result <- stream.CommitText(context.Background()) }()
+	var err error
+	select {
+	case err = <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CommitText is still reading a stalled error body")
+	}
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != "authentication_failed" || providerErr.ProviderStatus != http.StatusUnauthorized {
+		t.Fatalf("CommitText error = %#v, want the status classification", err)
+	}
+	if err := stream.AppendText(context.Background(), "التالي"); err != nil {
+		t.Fatalf("session unusable after a bounded error body: %v", err)
 	}
 }
 

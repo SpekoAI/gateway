@@ -247,13 +247,10 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		_ = stream.abort()
 		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Munsit STT sent no session Metadata", Retryable: true, Cause: setupCtx.Err()}
 	}
+	// The reader sends session.ready and the opening usage itself: it is the
+	// only goroutine that sends on or closes the events channel, so Open
+	// neither races its close nor blocks on a buffer nobody drains yet.
 	go stream.keepAlive()
-	data := stream.baseData()
-	stream.emit(runtimepkg.ProviderEvent{Type: protocol.EventSessionReady, Data: marshalData(data)})
-	// The opening observation stays incomplete until the closing Metadata
-	// reports the billed seconds, so a socket lost before then settles as
-	// unresolved rather than as free audio.
-	stream.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(data), Billing: stream.billing(nil)})
 	return stream, nil
 }
 
@@ -315,6 +312,7 @@ type sttStream struct {
 	inputClosed   atomic.Bool
 	closed        atomic.Bool
 	drainTimedOut atomic.Bool
+	readyOnce     atomic.Bool
 	closeErr      error
 
 	stateMu    sync.Mutex
@@ -607,7 +605,7 @@ func (s *sttStream) handle(message serverMessage, raw []byte) {
 		}
 		s.stateMu.Unlock()
 		if len(message.AudioSecondsBilled) == 0 {
-			s.settleSetup(nil)
+			s.opened(raw)
 			return
 		}
 		// The closing Metadata, sent after CloseStream.
@@ -658,6 +656,23 @@ func (s *sttStream) handle(message serverMessage, raw []byte) {
 			Extensions: extension(raw),
 		})
 	}
+}
+
+// opened handles the opening Metadata: it releases Open, then queues
+// session.ready and the opening usage. The sends follow settleSetup because
+// the runtime only starts draining Events once Open has returned. A repeated
+// opening Metadata announces nothing new.
+func (s *sttStream) opened(raw []byte) {
+	if !s.readyOnce.CompareAndSwap(false, true) {
+		return
+	}
+	s.settleSetup(nil)
+	data := s.baseData()
+	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventSessionReady, Data: marshalData(data), Extensions: extension(raw)})
+	// The opening observation stays incomplete until the closing Metadata
+	// reports the billed seconds, so a socket lost before then settles as
+	// unresolved rather than as free audio.
+	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(data), Billing: s.billing(nil)})
 }
 
 // billing is the session's one duration observation. Without the closing

@@ -621,3 +621,58 @@ func TestOpenRefusesWhatTheSocketCannotServe(t *testing.T) {
 		t.Fatalf("24 kHz error = %#v, want unsupported_media with a hint", err)
 	}
 }
+
+// The reader is the only sender on Events. Open used to send the opening
+// events itself after starting it, which panicked on a closed channel when
+// the socket closed right after Metadata, or blocked forever on a one-slot
+// buffer that nobody drains until Open returns.
+func TestOpenNeverSendsOnEvents(t *testing.T) {
+	t.Parallel()
+	cases := map[string]websocket.StatusCode{"metadata then close": websocket.StatusInternalError, "metadata and stay open": 0}
+	for name, closeStatus := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fake := newFakeListen(t)
+			fake.closeAfterOpen = closeStatus
+			adapter := newTestSTT(t, fake, STTConfig{EventBuffer: 1})
+			type result struct {
+				stream runtimepkg.ProviderStream
+				err    error
+			}
+			opened := make(chan result, 1)
+			go func() {
+				stream, err := adapter.Open(context.Background(), sttRequest(fake.endpoint()))
+				opened <- result{stream, err}
+			}()
+			var got result
+			select {
+			case got = <-opened:
+			case <-time.After(3 * time.Second):
+				t.Fatal("Open blocked on the event buffer")
+			}
+			if got.err != nil {
+				t.Fatalf("Open: %v", got.err)
+			}
+			t.Cleanup(func() { _ = got.stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) })
+			if ready := nextSTTEvent(t, got.stream); ready.Type != protocol.EventSessionReady {
+				t.Fatalf("first event = %s, want session.ready", ready.Type)
+			}
+			if usage := nextSTTEvent(t, got.stream); usage.Type != protocol.EventUsageObserved || usage.Billing == nil {
+				t.Fatalf("second event = %s, want the opening usage", usage.Type)
+			}
+			if closeStatus == 0 {
+				return
+			}
+			var failure error
+			for _, event := range drainSTT(t, got.stream) {
+				if event.Err != nil {
+					failure = event.Err
+				}
+			}
+			var providerErr *runtimepkg.ProviderError
+			if !errors.As(failure, &providerErr) || providerErr.Code != "provider_unavailable" || !providerErr.Retryable {
+				t.Fatalf("failure = %#v, want a retryable close", failure)
+			}
+		})
+	}
+}

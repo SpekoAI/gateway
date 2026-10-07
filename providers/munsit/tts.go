@@ -349,7 +349,12 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Munsit TTS request could not be sent", Retryable: true, Cause: err}
 	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
+		// The header timer has stopped, and the runtime still holds its
+		// provider lock here, so the error body gets its own bound. A body
+		// cut off by it still classifies from the status.
+		bodyTimer := time.AfterFunc(s.headerTimeout, requestCancel)
 		providerErr := s.statusError(response)
+		bodyTimer.Stop()
 		_ = response.Body.Close()
 		s.abandonRequest(requestCancel, done)
 		return providerErr
@@ -413,16 +418,23 @@ func (s *ttsStream) beginRequest() (string, context.Context, context.CancelFunc,
 
 func (s *ttsStream) abandonRequest(cancel context.CancelFunc, done chan struct{}) {
 	cancel()
-	s.finishRequest()
+	s.releaseRequest(done)
 	close(done)
 }
 
-func (s *ttsStream) finishRequest() {
+// releaseRequest frees the in-flight slot of the request that owns done. It
+// is idempotent and leaves a newer request alone, so the reader can release
+// its slot before publishing audio.done and still run its deferred cleanup
+// after the caller has started the next utterance.
+func (s *ttsStream) releaseRequest(done chan struct{}) {
 	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.requestDone != done {
+		return
+	}
 	s.inFlight = false
 	s.requestCancel = nil
 	s.requestDone = nil
-	s.stateMu.Unlock()
 }
 
 func (s *ttsStream) wasCanceled() bool {
@@ -438,10 +450,17 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 	defer func() {
 		requestCancel()
 		_ = response.Body.Close()
-		s.finishRequest()
+		s.releaseRequest(done)
 		close(done)
 		s.readers.Done()
 	}()
+	// finish publishes the request's last event. The slot is released first:
+	// a caller that reacts to audio.done by starting the next utterance must
+	// not find this one still in flight.
+	finish := func(event runtimepkg.ProviderEvent) {
+		s.releaseRequest(done)
+		s.emit(requestCtx, event)
+	}
 	data := marshalData(map[string]any{"sample_rate_hz": s.sampleRate})
 	reader := &io.LimitedReader{R: response.Body, N: s.maxResponseBytes + 1}
 	buffer := make([]byte, s.audioChunkBytes)
@@ -454,7 +473,7 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			s.reportResponseProgress()
 			total += int64(count)
 			if total > s.maxResponseBytes {
-				s.emit(requestCtx, runtimepkg.ProviderEvent{Billing: billing, Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Munsit TTS response exceeded the configured limit", Retryable: true}})
+				finish(runtimepkg.ProviderEvent{Billing: billing, Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Munsit TTS response exceeded the configured limit", Retryable: true}})
 				return
 			}
 			audio := append(carry, buffer[:count]...)
@@ -485,16 +504,16 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			// A failure after the status line cuts the chunked body with no
 			// trailer, so a torn read is a failed synthesis, never a short
 			// utterance.
-			s.emit(requestCtx, runtimepkg.ProviderEvent{Billing: billing, Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Munsit TTS audio stream ended unexpectedly", Retryable: true, Cause: err}})
+			finish(runtimepkg.ProviderEvent{Billing: billing, Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Munsit TTS audio stream ended unexpectedly", Retryable: true, Cause: err}})
 			return
 		}
 		if !started {
-			s.emit(requestCtx, runtimepkg.ProviderEvent{Billing: billing, Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Munsit TTS completed without returning audio", Retryable: true}})
+			finish(runtimepkg.ProviderEvent{Billing: billing, Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Munsit TTS completed without returning audio", Retryable: true}})
 			return
 		}
 		completeBilling := *billing
 		completeBilling.Complete = true
-		s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: data, Billing: &completeBilling})
+		finish(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: data, Billing: &completeBilling})
 		return
 	}
 }
@@ -550,8 +569,9 @@ func (s *ttsStream) Cancel(ctx context.Context) error {
 	}
 }
 
-// Close lets an in-flight synthesis finish so its audio is delivered, then
-// releases the stream.
+// Close lets every reader finish so its audio and audio.done are delivered,
+// then releases the stream. It waits on the readers rather than the in-flight
+// slot, which a reader frees just before its last event.
 func (s *ttsStream) Close(ctx context.Context) error { return s.shutdown(ctx, true) }
 
 // Abort tears the stream down immediately after a terminal runtime failure.
@@ -562,13 +582,19 @@ func (s *ttsStream) shutdown(ctx context.Context, graceful bool) error {
 		s.stateMu.Lock()
 		s.closed = true
 		s.pending.Reset()
-		done := s.requestDone
 		s.stateMu.Unlock()
-		if graceful && done != nil {
-			s.closeErr = s.waitForRequest(ctx, done)
+		// CommitText refuses once closed is set, and the runtime never runs it
+		// beside Close, so no reader is added while this waits.
+		idle := make(chan struct{})
+		go func() {
+			s.readers.Wait()
+			close(idle)
+		}()
+		if graceful {
+			s.closeErr = s.waitForRequest(ctx, idle)
 		}
 		s.cancel()
-		s.readers.Wait()
+		<-idle
 		close(s.events)
 	})
 	return s.closeErr
