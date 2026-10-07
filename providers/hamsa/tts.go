@@ -28,8 +28,15 @@ const (
 	// takes no model field, so the id is a catalog label, not a vendor value.
 	DefaultTTSModel = "default"
 	// DefaultVoice is the Modern Standard Arabic voice the API reference pairs
-	// with dialect `msa`. Hamsa refuses a request without a speaker.
+	// with dialect `msa`, and the catalog default. Hamsa refuses a request
+	// without a speaker.
 	DefaultVoice = "Salem"
+
+	// minAudioBytes is the body size below which a 200 response is checked for
+	// a text failure. Hamsa answers some rejections, such as a speaker given in
+	// the form that voice does not resolve by (name or catalog UUID), with
+	// HTTP 200 and the 7-byte body "aborted", and charges nothing for them.
+	minAudioBytes = 16
 
 	ttsEndpointPath = "/v1/realtime/tts-stream"
 	// maxInputCharacters is the documented per-request text ceiling.
@@ -48,6 +55,20 @@ const (
 )
 
 var ttsModels = map[string]struct{}{DefaultTTSModel: {}}
+
+// dialectVoices is a native default speaker per dialect, from the voices the
+// API reference names per dialect. Salem speaks every dialect but not
+// reliably: on 2026-10-07 Salem with `egy` returned 0.08 s, 0.22 s and 0.6 s
+// for one short Egyptian phrase that Mariam read at a steady 1.02 s. Each
+// entry synthesized a full sentence in its dialect that day. The Qatari and
+// English voices resolve only by catalog UUID.
+var dialectVoices = map[string]string{
+	"msa": DefaultVoice, "egy": "Mariam", "pls": "Amjad", "syr": "Dalal", "irq": "Lyali",
+	"jor": "Lana", "leb": "Carla", "ksa": "Hiba", "uae": "Salma", "bah": "Ruba",
+	"qat": "758b5aef-83fa-44b5-a759-1263ceaecb29", // Deema
+	"kuw": "Mai", "oma": "Jaber",
+	"en": "675e2954-d3e9-4b92-900a-18774ed1409b", // Emma
+}
 
 // ttsSampleRates maps the PCM rates Hamsa emits to its `sampleRate` values.
 // mu-law is not offered: the relay carries PCM only.
@@ -187,7 +208,7 @@ func (a *TTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequest) 
 		audioChunkBytes: a.audioChunkBytes, maxResponseBytes: a.maxResponseBytes, maxErrorBytes: a.maxErrorBytes,
 		gracefulCloseIdleTimeout: a.gracefulCloseIdleTimeout, headerTimeout: a.headerTimeout,
 		model: model, dialect: dialect, sampleRate: sampleRate, bytesPerSecond: int64(request.Media.SampleRateHz) * 2,
-		voice: ttsVoice(request.Options.Voice, request.Plan.Route.Voice),
+		voice: ttsVoice(request.Options.Voice, request.Plan.Route.Voice, dialect),
 	}, nil
 }
 
@@ -211,13 +232,19 @@ func ttsDialect(language string) (string, error) {
 	}
 }
 
-// ttsVoice prefers the caller's speaker, then the control plane's. A speaker
-// is a Hamsa voice name or the UUID of a cloned voice; either is sent as is.
-func ttsVoice(requested, planned string) string {
+// ttsVoice prefers the caller's speaker, then the control plane's, then the
+// dialect's native voice. A planned voice equal to the catalog default is the
+// catalog's fill, not a choice, so a non-MSA session swaps it for its dialect's
+// voice. A speaker is a Hamsa voice name or a voice UUID, sent as is.
+func ttsVoice(requested, planned, dialect string) string {
 	if voice := strings.TrimSpace(requested); voice != "" {
 		return voice
 	}
-	if voice := strings.TrimSpace(planned); voice != "" {
+	planned = strings.TrimSpace(planned)
+	if planned != "" && !strings.EqualFold(planned, DefaultVoice) {
+		return planned
+	}
+	if voice, ok := dialectVoices[dialect]; ok {
 		return voice
 	}
 	return DefaultVoice
@@ -563,6 +590,13 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			s.emit(requestCtx, runtimepkg.ProviderEvent{Billing: snapshot(delivered, false), Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Hamsa TTS audio stream ended unexpectedly", Retryable: true, Cause: err}})
 			return
 		}
+		// A short body that reads as text is a rejection Hamsa sent with a 200
+		// and did not charge for, never audio.
+		if total < minAudioBytes && !started && textBody(header.header) {
+			reason := strings.TrimSpace(string(header.header))
+			s.emit(requestCtx, runtimepkg.ProviderEvent{Billing: snapshot(0, true), Err: &runtimepkg.ProviderError{Code: "invalid_request", Message: fmt.Sprintf("Hamsa TTS returned %q instead of audio; check that the speaker exists in the form given (voice name or catalog UUID)", reason)}})
+			return
+		}
 		// A body shorter than a RIFF preamble is bare PCM still held by the
 		// stripper; a RIFF container that never reached its data chunk is a
 		// failure, never audio.
@@ -702,7 +736,9 @@ func (w *wavStripper) write(chunk []byte) ([]byte, *runtimepkg.ProviderError) {
 		return chunk, nil
 	}
 	w.header = append(w.header, chunk...)
-	if len(w.header) < 12 {
+	// Hold minAudioBytes, not just the 12-byte RIFF preamble, so a short text
+	// rejection such as "aborted" is still whole when the body ends.
+	if len(w.header) < minAudioBytes {
 		return nil, nil
 	}
 	if string(w.header[0:4]) != "RIFF" || string(w.header[8:12]) != "WAVE" {
@@ -740,8 +776,8 @@ func (w *wavStripper) write(chunk []byte) ([]byte, *runtimepkg.ProviderError) {
 }
 
 // flush returns bytes still held while undecided. Only a body that ended
-// before 12 bytes can leave them as PCM; anything longer was a RIFF container
-// that ended before its data chunk.
+// before minAudioBytes can leave them as PCM; anything longer was a RIFF
+// container that ended before its data chunk.
 func (w *wavStripper) flush() ([]byte, *runtimepkg.ProviderError) {
 	if w.decided {
 		return nil, nil
@@ -749,10 +785,23 @@ func (w *wavStripper) flush() ([]byte, *runtimepkg.ProviderError) {
 	w.decided = true
 	payload := w.header
 	w.header = nil
-	if len(payload) >= 12 || bytes.HasPrefix(payload, []byte("RIFF")) {
+	if len(payload) >= minAudioBytes || bytes.HasPrefix(payload, []byte("RIFF")) {
 		return nil, malformedWAV("Hamsa TTS returned a WAV header with no data chunk")
 	}
 	return payload, nil
+}
+
+// textBody reports whether a short body is printable text rather than PCM.
+func textBody(body []byte) bool {
+	if len(body) == 0 || !utf8.Valid(body) {
+		return false
+	}
+	for _, r := range string(body) {
+		if r < 0x20 && r != '\n' && r != '\r' && r != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 func malformedWAV(message string) *runtimepkg.ProviderError {

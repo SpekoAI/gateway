@@ -107,7 +107,7 @@ func TestCommitTextSendsTheDocumentedRequestAndAlignsSamples(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := <-bodies
-	want := map[string]any{"text": "مرحبا بكم", "speaker": "Salem", "dialect": "egy", "mulaw": false, "sampleRate": "16k"}
+	want := map[string]any{"text": "مرحبا بكم", "speaker": "Mariam", "dialect": "egy", "mulaw": false, "sampleRate": "16k"}
 	for key, value := range want {
 		if body[key] != value {
 			t.Errorf("body[%s] = %v, want %v (body %v)", key, body[key], value, body)
@@ -205,14 +205,20 @@ func TestTTSDialectFollowsTheVoicesCatalogTags(t *testing.T) {
 
 func TestRequestedVoiceWinsOverThePlannedOne(t *testing.T) {
 	t.Parallel()
-	if got := ttsVoice("Mariam", "Salem"); got != "Mariam" {
+	if got := ttsVoice("Mariam", "Salem", "msa"); got != "Mariam" {
 		t.Fatalf("ttsVoice = %q, want the requested voice", got)
 	}
-	if got := ttsVoice("", "6b52beba-b560-45d4-827b-49be73d50db7"); got != "6b52beba-b560-45d4-827b-49be73d50db7" {
+	if got := ttsVoice("", "6b52beba-b560-45d4-827b-49be73d50db7", "egy"); got != "6b52beba-b560-45d4-827b-49be73d50db7" {
 		t.Fatalf("ttsVoice = %q, want the planned cloned-voice UUID", got)
 	}
-	if got := ttsVoice(" ", ""); got != DefaultVoice {
+	if got := ttsVoice(" ", "", "msa"); got != DefaultVoice {
 		t.Fatalf("ttsVoice = %q, want the default voice", got)
+	}
+	// The catalog fill (Salem) gives way to the dialect's native voice.
+	for dialect, want := range map[string]string{"egy": "Mariam", "ksa": "Hiba", "en": "675e2954-d3e9-4b92-900a-18774ed1409b", "msa": "Salem"} {
+		if got := ttsVoice("", "Salem", dialect); got != want {
+			t.Errorf("ttsVoice(planned Salem, %s) = %q, want %q", dialect, got, want)
+		}
 	}
 }
 
@@ -478,5 +484,39 @@ func TestWAVHeaderWithoutADataChunkIsAFailureNotAudio(t *testing.T) {
 		if event.Err != nil {
 			return
 		}
+	}
+}
+
+func TestShortTextBodyIsARejectionNotAudio(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "audio/wav")
+		_, _ = writer.Write([]byte("aborted"))
+	}))
+	t.Cleanup(server.Close)
+	stream := openTTS(t, server, ttsRequest("", "en", 16_000))
+	if err := stream.AppendText(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		event := nextTTSEvent(t, stream)
+		if len(event.Audio) > 0 || event.Type == protocol.EventAudioDone {
+			t.Fatalf("an aborted body became %s with %d audio bytes", event.Type, len(event.Audio))
+		}
+		if event.Err == nil {
+			continue
+		}
+		providerErr, ok := event.Err.(*runtimepkg.ProviderError)
+		if !ok || providerErr.Code != "invalid_request" || providerErr.Retryable || !strings.Contains(providerErr.Message, "aborted") {
+			t.Fatalf("error = %#v, want a non-retryable invalid_request naming the body", event.Err)
+		}
+		// Hamsa charged nothing, so the operation settles complete at zero.
+		if event.Billing == nil || !event.Billing.Complete || event.Billing.Quantities["duration_seconds"] != 0 {
+			t.Fatalf("billing = %+v, want a complete zero-second observation", event.Billing)
+		}
+		return
 	}
 }
