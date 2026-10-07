@@ -360,7 +360,7 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Hamsa TTS request could not be sent", Retryable: true, Cause: err}
 	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		providerErr := s.statusError(response)
+		providerErr := s.statusError(response, requestCancel)
 		_ = response.Body.Close()
 		s.abandonRequest(requestCancel, done)
 		return providerErr
@@ -381,8 +381,13 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 	return nil
 }
 
-func (s *ttsStream) statusError(response *http.Response) error {
+// statusError reads the error body under the header timeout: the runtime holds
+// its provider lock across CommitText, so a body that never finishes would
+// wedge the session the same way missing headers would.
+func (s *ttsStream) statusError(response *http.Response, requestCancel context.CancelFunc) error {
+	bodyTimer := time.AfterFunc(s.headerTimeout, requestCancel)
 	body, _ := io.ReadAll(io.LimitReader(response.Body, s.maxErrorBytes))
+	bodyTimer.Stop()
 	var detail hamsaError
 	_ = json.Unmarshal(body, &detail)
 	code, retryable := classifyStatus(response.StatusCode, detail.Message)
@@ -443,16 +448,33 @@ func (s *ttsStream) beginRequest() (string, context.Context, context.CancelFunc,
 
 func (s *ttsStream) abandonRequest(cancel context.CancelFunc, done chan struct{}) {
 	cancel()
-	s.finishRequest()
+	s.finishRequest(done)
 	close(done)
 }
 
-func (s *ttsStream) finishRequest() {
+// markIdle lets the next utterance begin while this request's reader is still
+// publishing audio.done, so a caller that appends on audio.done is not
+// refused. The request's cancel and done stay registered until its reader
+// exits, so a graceful Close still waits for that final event.
+func (s *ttsStream) markIdle(done chan struct{}) {
 	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.requestDone == done {
+		s.inFlight = false
+	}
+}
+
+// finishRequest clears the request identified by done, and only that one: a
+// next utterance may already have replaced it.
+func (s *ttsStream) finishRequest(done chan struct{}) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.requestDone != done {
+		return
+	}
 	s.inFlight = false
 	s.requestCancel = nil
 	s.requestDone = nil
-	s.stateMu.Unlock()
 }
 
 func (s *ttsStream) wasCanceled() bool {
@@ -475,7 +497,7 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 	defer func() {
 		requestCancel()
 		_ = response.Body.Close()
-		s.finishRequest()
+		s.finishRequest(done)
 		close(done)
 		s.readers.Done()
 	}()
@@ -507,7 +529,9 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			}
 		}
 		delivered += int64(aligned)
-		return s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Audio: audio[:aligned]})
+		// Each frame carries the running snapshot, so a synthesis cancelled
+		// mid-stream still leaves the duration Hamsa generated for it.
+		return s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Audio: audio[:aligned], Billing: snapshot(delivered, false)})
 	}
 	for {
 		count, err := reader.Read(buffer)
@@ -540,8 +564,14 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			return
 		}
 		// A body shorter than a RIFF preamble is bare PCM still held by the
-		// stripper.
-		if !deliver(header.flush()) {
+		// stripper; a RIFF container that never reached its data chunk is a
+		// failure, never audio.
+		tail, headerErr := header.flush()
+		if headerErr != nil {
+			s.emit(requestCtx, runtimepkg.ProviderEvent{Billing: snapshot(delivered, false), Err: headerErr})
+			return
+		}
+		if !deliver(tail) {
 			return
 		}
 		if !started {
@@ -549,6 +579,7 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			return
 		}
 		// A lone trailing byte is half a sample: unplayable, and dropped.
+		s.markIdle(done)
 		s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Billing: snapshot(delivered, true)})
 		return
 	}
@@ -709,15 +740,19 @@ func (w *wavStripper) write(chunk []byte) ([]byte, *runtimepkg.ProviderError) {
 }
 
 // flush returns bytes still held while undecided. Only a body that ended
-// before 12 bytes can leave any, and that body was never a RIFF container.
-func (w *wavStripper) flush() []byte {
+// before 12 bytes can leave them as PCM; anything longer was a RIFF container
+// that ended before its data chunk.
+func (w *wavStripper) flush() ([]byte, *runtimepkg.ProviderError) {
 	if w.decided {
-		return nil
+		return nil, nil
 	}
 	w.decided = true
 	payload := w.header
 	w.header = nil
-	return payload
+	if len(payload) >= 12 || bytes.HasPrefix(payload, []byte("RIFF")) {
+		return nil, malformedWAV("Hamsa TTS returned a WAV header with no data chunk")
+	}
+	return payload, nil
 }
 
 func malformedWAV(message string) *runtimepkg.ProviderError {

@@ -343,3 +343,140 @@ func TestCommitTextDoesNotFollowRedirects(t *testing.T) {
 	default:
 	}
 }
+
+func TestErrorBodyThatNeverEndsIsBoundedByTheHeaderTimeout(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusInternalServerError)
+		_, _ = writer.Write([]byte(`{"code":500,`))
+		writer.(http.Flusher).Flush()
+		<-release
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+	parsed, _ := url.Parse(server.URL)
+	adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true, HeaderTimeout: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := ttsRequest(server.URL+"/v1/realtime/tts-stream", "ar", 16_000)
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) })
+	if err := stream.AppendText(context.Background(), "نص"); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- stream.CommitText(context.Background()) }()
+	select {
+	case err := <-result:
+		if providerErr, ok := err.(*runtimepkg.ProviderError); !ok || providerErr.ProviderStatus != http.StatusInternalServerError {
+			t.Fatalf("error = %v, want the 500 classification", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CommitText hung on an error body that never ended")
+	}
+}
+
+func TestNextUtteranceCanStartOnAudioDone(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "audio/wav")
+		_, _ = writer.Write(make([]byte, 64))
+	}))
+	t.Cleanup(server.Close)
+	stream := openTTS(t, server, ttsRequest("", "ar", 16_000))
+	for turn := range 20 {
+		if err := stream.AppendText(context.Background(), "نص"); err != nil {
+			t.Fatalf("turn %d: AppendText right after audio.done: %v", turn, err)
+		}
+		if err := stream.CommitText(context.Background()); err != nil {
+			t.Fatalf("turn %d: %v", turn, err)
+		}
+		drainTTS(t, stream)
+	}
+}
+
+func TestCancelledSynthesisKeepsTheDeliveredDuration(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "audio/wav")
+		// 1.25 s of 16 kHz PCM16, then a stall the caller cancels.
+		_, _ = writer.Write(make([]byte, 40_000))
+		writer.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-request.Context().Done():
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+	parsed, _ := url.Parse(server.URL)
+	adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), ttsRequest(server.URL+"/v1/realtime/tts-stream", "ar", 16_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) })
+	if err := stream.AppendText(context.Background(), "نص"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var last *protocol.BillingObservation
+	var audio int
+	for audio < 40_000 {
+		event := nextTTSEvent(t, stream)
+		if event.Err != nil {
+			t.Fatal(event.Err)
+		}
+		audio += len(event.Audio)
+		if event.Billing != nil {
+			last = event.Billing
+		}
+	}
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if last == nil || last.Complete || last.Quantities["duration_seconds"] != 2000 {
+		t.Fatalf("billing = %+v, want an incomplete 2 s snapshot of the audio already delivered", last)
+	}
+}
+
+func TestWAVHeaderWithoutADataChunkIsAFailureNotAudio(t *testing.T) {
+	t.Parallel()
+	header := make([]byte, 36)
+	copy(header[0:], "RIFF")
+	copy(header[8:], "WAVE")
+	copy(header[12:], "fmt ")
+	binary.LittleEndian.PutUint32(header[16:], 16)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "audio/wav")
+		_, _ = writer.Write(header)
+	}))
+	t.Cleanup(server.Close)
+	stream := openTTS(t, server, ttsRequest("", "ar", 16_000))
+	if err := stream.AppendText(context.Background(), "نص"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		event := nextTTSEvent(t, stream)
+		if len(event.Audio) > 0 || event.Type == protocol.EventAudioDone {
+			t.Fatalf("a header with no data chunk became %s with %d audio bytes", event.Type, len(event.Audio))
+		}
+		if event.Err != nil {
+			return
+		}
+	}
+}
