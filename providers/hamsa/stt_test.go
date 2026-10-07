@@ -42,19 +42,21 @@ func TestSTTAdapterWholeUtteranceRoundTrip(t *testing.T) {
 		var request2 struct {
 			Type    string `json:"type"`
 			Payload struct {
-				AudioBase64  string  `json:"audioBase64"`
-				Language     string  `json:"language"`
-				Model        string  `json:"model"`
-				IsEosEnabled bool    `json:"isEosEnabled"`
-				EosThreshold float64 `json:"eosThreshold"`
+				AudioBase64  string `json:"audioBase64"`
+				Language     string `json:"language"`
+				Model        string `json:"model"`
+				IsEosEnabled *bool  `json:"isEosEnabled"`
 			} `json:"payload"`
 		}
 		if err := json.Unmarshal(payload, &request2); err != nil {
 			t.Errorf("request json: %v", err)
 			return
 		}
-		if request2.Type != "stt" || request2.Payload.Model != "s3" || request2.Payload.Language != "ar" || !request2.Payload.IsEosEnabled {
-			t.Errorf("request = %+v, want type stt, model s3, language ar, isEosEnabled true", request2)
+		// isEosEnabled must be an explicit false: the socket's own default is
+		// true, and with it on an utterance Hamsa judges unfinished is answered
+		// with "[THINKING]" and nothing else.
+		if request2.Type != "stt" || request2.Payload.Model != "s3" || request2.Payload.Language != "ar" || request2.Payload.IsEosEnabled == nil || *request2.Payload.IsEosEnabled {
+			t.Errorf("request = %+v, want type stt, model s3, language ar, isEosEnabled false", request2)
 			return
 		}
 		wav, err := base64.StdEncoding.DecodeString(request2.Payload.AudioBase64)
@@ -108,13 +110,16 @@ func TestSTTAdapterWholeUtteranceRoundTrip(t *testing.T) {
 		t.Fatalf("commit audio: %v", err)
 	}
 
-	events := collectHamsaEvents(t, stream.Events(), 3)
-	want := []protocol.EventType{protocol.EventSpeechStarted, protocol.EventTranscriptFinal, protocol.EventSpeechEnded}
+	events := collectHamsaEvents(t, stream.Events(), 4)
+	want := []protocol.EventType{protocol.EventUsageObserved, protocol.EventSpeechStarted, protocol.EventTranscriptFinal, protocol.EventSpeechEnded}
 	for index := range want {
 		if events[index].Type != want[index] {
 			t.Fatalf("event %d = %q, want %q", index, events[index].Type, want[index])
 		}
 	}
+	// Four bytes is 0.125 ms of audio; Hamsa charges a whole second for it.
+	assertHamsaBilling(t, events[0].Billing, 1000, false)
+	events = events[1:]
 	var final struct {
 		Text     string `json:"text"`
 		IsFinal  bool   `json:"is_final"`
@@ -130,16 +135,21 @@ func TestSTTAdapterWholeUtteranceRoundTrip(t *testing.T) {
 		t.Fatal("final transcript dropped the raw Hamsa payload extension")
 	}
 
-	// The api_key must ride the dial URL: Hamsa's realtime surface does not
-	// read Authorization.
+	// The key rides the X-Api-Key header and never the URL, where proxies
+	// and access logs would record it.
 	request := <-requests
-	if request.URL.Query().Get("api_key") != "customer-hamsa-key" {
-		t.Fatalf("dial query = %q, want api_key=customer-hamsa-key", request.URL.RawQuery)
+	if request.Header.Get("X-Api-Key") != "customer-hamsa-key" {
+		t.Fatalf("X-Api-Key = %q, want customer-hamsa-key", request.Header.Get("X-Api-Key"))
+	}
+	if request.URL.RawQuery != "" {
+		t.Fatalf("dial query = %q, want none", request.URL.RawQuery)
 	}
 
 	if err := stream.Close(context.Background()); err != nil {
 		t.Fatalf("close stream: %v", err)
 	}
+	closing := collectHamsaEvents(t, stream.Events(), 1)
+	assertHamsaBilling(t, closing[0].Billing, 1000, true)
 	if _, ok := <-stream.Events(); ok {
 		t.Fatal("events must end after close")
 	}
@@ -174,12 +184,100 @@ func TestSTTAdapterCloseFlushesTheUncommittedTail(t *testing.T) {
 	if err := stream.Close(context.Background()); err != nil {
 		t.Fatalf("close stream: %v", err)
 	}
-	events := collectHamsaEvents(t, stream.Events(), 3)
+	events := collectHamsaEvents(t, stream.Events(), 5)
 	var final struct {
 		Text string `json:"text"`
 	}
-	if err := json.Unmarshal(events[1].Data, &final); err != nil || final.Text != "goodbye" {
+	if err := json.Unmarshal(events[2].Data, &final); err != nil || final.Text != "goodbye" {
 		t.Fatalf("final = %+v, err=%v", final, err)
+	}
+	assertHamsaBilling(t, events[4].Billing, 1000, true)
+}
+
+func TestSTTAdapterBillsEachUtteranceInWholeSeconds(t *testing.T) {
+	t.Parallel()
+	server := newHamsaServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		conn.SetReadLimit(1 << 20)
+		if _, _, err := conn.Read(ctx); err != nil {
+			t.Errorf("read request: %v", err)
+			return
+		}
+		if err := conn.Write(ctx, websocket.MessageText, []byte("نعم")); err != nil {
+			t.Errorf("write transcript: %v", err)
+		}
+	})
+	defer server.Close()
+
+	adapter, err := NewSTT(hamsaSTTConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), hamsaSTTRequest(server.URL))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	// 1.5 s and then exactly 2 s of 16 kHz PCM16: Hamsa rounds each request
+	// up on its own, so the session owes 2 s + 2 s, not 3.5 s rounded once.
+	for _, pcmBytes := range []int{48_000, 64_000} {
+		if err := stream.WriteAudio(context.Background(), make([]byte, pcmBytes)); err != nil {
+			t.Fatalf("write audio: %v", err)
+		}
+		if err := stream.CommitAudio(context.Background()); err != nil {
+			t.Fatalf("commit audio: %v", err)
+		}
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	var last *protocol.BillingObservation
+	for event := range stream.Events() {
+		if event.Err != nil {
+			t.Fatalf("provider error: %v", event.Err)
+		}
+		if event.Billing != nil {
+			last = event.Billing
+		}
+	}
+	assertHamsaBilling(t, last, 4000, true)
+}
+
+func TestSTTAdapterClassifiesTheDocumentedCloseCodes(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		status websocket.StatusCode
+		code   string
+	}{
+		{4001, "authentication_failed"},
+		{4003, "provider_quota_exceeded"},
+		{4500, "authentication_failed"},
+	} {
+		server := newHamsaServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+			if _, _, err := conn.Read(ctx); err != nil {
+				t.Errorf("read request: %v", err)
+				return
+			}
+			_ = conn.Close(test.status, "refused")
+		})
+		adapter, err := NewSTT(hamsaSTTConfig(server.URL))
+		if err != nil {
+			t.Fatalf("new STT adapter: %v", err)
+		}
+		stream, err := adapter.Open(context.Background(), hamsaSTTRequest(server.URL))
+		if err != nil {
+			t.Fatalf("open stream: %v", err)
+		}
+		if err := stream.WriteAudio(context.Background(), []byte{1, 2}); err != nil {
+			t.Fatalf("write audio: %v", err)
+		}
+		if err := stream.CommitAudio(context.Background()); err != nil {
+			t.Fatalf("commit audio: %v", err)
+		}
+		event := <-stream.Events()
+		providerErr, ok := event.Err.(*runtimepkg.ProviderError)
+		if !ok || providerErr.Code != test.code || providerErr.Retryable {
+			t.Errorf("close %d: error = %#v, want non-retryable %s", test.status, event.Err, test.code)
+		}
+		server.Close()
 	}
 }
 
@@ -253,6 +351,26 @@ func TestSTTAdapterSurfacesTheVendorErrorFrame(t *testing.T) {
 	if providerErr.Extensions[extensionID] == nil {
 		t.Fatal("provider error dropped the raw Hamsa payload extension")
 	}
+	if providerErr.Code != "invalid_request" || providerErr.Retryable {
+		t.Fatalf("error = %s retryable=%v, want a non-retryable invalid_request", providerErr.Code, providerErr.Retryable)
+	}
+}
+
+func TestClassifyErrorMessageReadsTheDocumentedErrors(t *testing.T) {
+	t.Parallel()
+	for message, want := range map[string]string{
+		"API key is invalid or expired":                              "authentication_failed",
+		"Insufficient funds in wallet":                               "provider_quota_exceeded",
+		"You have reached your speech-to-text usage limit!":          "provider_quota_exceeded",
+		"Rate limit exceeded for this API key":                       "provider_rate_limited",
+		"Invalid payload for message type: stt":                      "invalid_request",
+		"Error generating transcription: Audio format not supported": "invalid_request",
+		"something new": "provider_unavailable",
+	} {
+		if got, _ := classifyErrorMessage(message); got != want {
+			t.Errorf("classifyErrorMessage(%q) = %s, want %s", message, got, want)
+		}
+	}
 }
 
 func TestSTTAdapterRejectsMediaTheVendorCannotTake(t *testing.T) {
@@ -323,6 +441,19 @@ func hamsaSTTRequest(serverURL string) runtimepkg.AdapterRequest {
 func hamsaSTTConfig(serverURL string) STTConfig {
 	endpoint, _ := url.Parse(serverURL)
 	return STTConfig{AllowedEndpointHosts: []string{endpoint.Hostname()}, AllowInsecureEndpoint: true}
+}
+
+func assertHamsaBilling(t *testing.T, billing *protocol.BillingObservation, milliseconds int64, complete bool) {
+	t.Helper()
+	if billing == nil {
+		t.Fatal("no billing observation")
+	}
+	if err := billing.Validate(); err != nil {
+		t.Fatalf("billing observation invalid: %v", err)
+	}
+	if billing.OperationID != "session" || billing.Model != "s3" || billing.Mode != "streaming" || billing.Quantities["duration_seconds"] != milliseconds || billing.Complete != complete {
+		t.Fatalf("billing = %+v, want session s3 streaming duration_seconds=%d complete=%v", billing, milliseconds, complete)
+	}
 }
 
 func collectHamsaEvents(t *testing.T, events <-chan runtimepkg.ProviderEvent, count int) []runtimepkg.ProviderEvent {
