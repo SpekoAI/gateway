@@ -266,6 +266,22 @@ they contain no synthesis text or voice content. Billing counts UTF-16 units
 and the per-synthesis minimum. Incomplete audio leaves incomplete billing
 evidence. Caller cancellation interrupts a stalled response-header request.
 
+### Munsit transcription and synthesis
+
+Munsit requests carry the delegated key in an `x-api-key` header on the
+validated Munsit host; there is no token exchange, so no managed
+provider-direct credential exists. The listen socket receives the session's
+audio plus the model, language, sample rate and any caller `endpointing` or
+`smart_turn` setting; prerecorded uploads send the WAV file, model and, for
+`munsit-en-ar`, language. Synthesis sends the text, voice, stability and
+output rate. Redirects are refused. Billing observations contain an opaque
+operation ID, the Munsit session or transcription ID, model, mode, language
+and one quantity: billed audio seconds for the socket, consumed credits for
+uploads, and two credits per character sent for synthesis. They contain no
+audio, transcript, synthesis text or voice content. A socket that ends
+before its closing Metadata, or a synthesis whose audio is cut off, leaves
+incomplete billing evidence.
+
 ### Soniox usage attribution
 
 Soniox realtime STT and TTS requests using relay or managed plans include

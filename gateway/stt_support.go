@@ -105,6 +105,12 @@ var sttOptionSupport = map[string]sttSupport{
 	// vocabulary as the handshake's keywords list. Nothing else is tunable on
 	// the documented handshake, so no vendor settings are forwarded.
 	"meta": {diarization: true, keywords: true},
+	// Munsit's listen socket takes its endpointer's silence window
+	// (endpointing, 100 to 5000 ms) and its semantic turn model (smart_turn)
+	// as query parameters. hotwords exists, but a live term came back in
+	// dropped_hotwords and the accepted form is not pinned down, so keywords
+	// are not advertised.
+	"munsit": {providerKeys: []string{"endpointing", "smart_turn"}},
 	// Keywords fold into the transcription prompt alongside a caller's own
 	// prompt text. gpt-4o-transcribe-diarize is batch-only, so no realtime
 	// diarization. The vendor documents `prompt` on the realtime session for

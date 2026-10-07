@@ -242,6 +242,7 @@ Every catalog provider has a BYOK credential variable:
 | Maya Research | `SPEKO_MAYA_BYOK_API_KEY` | Permanent API key; BYOK/Relay only because Maya has no short-lived session token |
 | Meta | `SPEKO_META_BYOK_API_KEY` | API key; sent as the bearer inside the realtime handshake frame |
 | MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
+| Munsit | `SPEKO_MUNSIT_BYOK_API_KEY` | API key, sent as `x-api-key`; BYOK/Relay only because Munsit has no token exchange |
 | Nari Labs | `SPEKO_NARI_BYOK_API_KEY` | API key; one key serves both the synthesis endpoint and the transcription socket |
 | OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
 | Palabra | `SPEKO_PALABRA_BYOK_API_KEY` | API key; dedicated STT/TTS sockets do not expose a scoped short-lived grant |
@@ -330,6 +331,8 @@ restarting the Gateway.
 | STT | Nari Labs | `nari.stt.v1` | `qwen3-asr-fast` |
 | TTS | Nari Labs | `nari.tts.v1` | `qwen3-tts-fast` |
 | TTS | Paxa Labs | `paxa.tts.v1` | `paxa-tts-flash-v1` |
+| STT | Munsit | `munsit.stt.v1` | `munsit` |
+| TTS | Munsit | `munsit.tts.v1` | `faseeh-v1-preview` |
 
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.

@@ -38,6 +38,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/meta"
 	"github.com/SpekoAI/gateway/providers/minimax"
 	"github.com/SpekoAI/gateway/providers/modulate"
+	"github.com/SpekoAI/gateway/providers/munsit"
 	"github.com/SpekoAI/gateway/providers/nari"
 	"github.com/SpekoAI/gateway/providers/openai"
 	"github.com/SpekoAI/gateway/providers/openailive"
@@ -308,6 +309,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	munsitSTTAdapter, err := munsit.NewSTT(munsit.STTConfig{})
+	if err != nil {
+		return err
+	}
+	munsitTTSAdapter, err := munsit.NewTTS(munsit.TTSConfig{})
+	if err != nil {
+		return err
+	}
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
 		fishAdapter,
@@ -319,7 +328,7 @@ func run() error {
 		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 		geminiSTTAdapter, geminiTTSAdapter, metaSTTAdapter, nariSTTAdapter, nariTTSAdapter,
-		paxaTTSAdapter,
+		paxaTTSAdapter, munsitSTTAdapter, munsitTTSAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {

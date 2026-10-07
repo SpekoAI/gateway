@@ -874,6 +874,19 @@ func TestInternalBillingEvidenceDoesNotChangePublicEvents(t *testing.T) {
 }
 func TestPaxaKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
 	t.Parallel()
+	assertLanguageVoiceFill(t, "paxa", "nomyen")
+}
+
+func TestMunsitKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
+	t.Parallel()
+	assertLanguageVoiceFill(t, "munsit", "ar-najdi-male-2")
+}
+
+// assertLanguageVoiceFill pins the engine exemption for adapters that pick a
+// default voice by language: with a language set and no caller voice, the
+// plan voice is not copied in, so the adapter can tell the two apart.
+func assertLanguageVoiceFill(t *testing.T, provider, plannedVoice string) {
+	t.Helper()
 
 	opened := make(chan runtimepkg.AdapterRequest, 2)
 	adapter := mock.NewAdapter("mock.voice.tts", func(request runtimepkg.AdapterRequest) *mock.Stream {
@@ -884,7 +897,7 @@ func TestPaxaKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
 		Adapters: []runtimepkg.Adapter{adapter},
 		Verifier: runtimepkg.PlanVerifierFunc(func(context.Context, protocol.SessionPlan) error { return nil }),
 		LocalCredentials: map[string]runtimepkg.LocalCredential{
-			"paxa": {Kind: protocol.CredentialBearer, Value: "customer-owned-key"},
+			provider: {Kind: protocol.CredentialBearer, Value: "customer-owned-key"},
 		},
 		Now: func() time.Time { return fixedNow },
 	})
@@ -894,8 +907,8 @@ func TestPaxaKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
 	media := &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1}
 	open := func(options protocol.RequestOptions) protocol.RequestOptions {
 		plan := validPlan(protocol.SessionKindTTS, adapter.ID(), 60)
-		plan.Route.Provider = "paxa"
-		plan.Route.Voice = "nomyen"
+		plan.Route.Provider = provider
+		plan.Route.Voice = plannedVoice
 		session, err := engine.Open(context.Background(), runtimepkg.OpenRequest{
 			Kind: protocol.SessionKindTTS, Plan: plan, Options: options, Media: media,
 		})
@@ -906,13 +919,13 @@ func TestPaxaKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
 			session.Close()
 			collectEvents(t, session)
 		}()
-		if plan.Route.Voice != "nomyen" {
+		if plan.Route.Voice != plannedVoice {
 			t.Fatal("engine mutated the verified plan")
 		}
 		return (<-opened).Options
 	}
 
-	if got := open(protocol.RequestOptions{}).Voice; got != "nomyen" {
+	if got := open(protocol.RequestOptions{}).Voice; got != plannedVoice {
 		t.Fatalf("no language must preserve catalog default, got %q", got)
 	}
 
@@ -923,7 +936,7 @@ func TestPaxaKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
 	if got := open(protocol.RequestOptions{Voice: "  ", Language: "en"}).Voice; strings.TrimSpace(got) != "" {
 		t.Fatalf("adapter voice for a blank caller voice = %q, want blank so the adapter selects by language", got)
 	}
-	if got := open(protocol.RequestOptions{Voice: "nomyen"}).Voice; got != "nomyen" {
+	if got := open(protocol.RequestOptions{Voice: plannedVoice}).Voice; got != plannedVoice {
 		t.Fatalf("adapter voice = %q, want the caller's override to win", got)
 	}
 }

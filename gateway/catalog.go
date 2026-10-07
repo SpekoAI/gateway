@@ -173,6 +173,14 @@ var providerCatalog = []CatalogEntry{
 	// Paxa Labs paxa-tts-flash-v1 on the native endpoint, which carries the
 	// reading language; the adapter refuses any language but en and th.
 	{Provider: "paxa", Kind: protocol.SessionKindTTS, Adapter: "paxa.tts.v1", DefaultModel: "paxa-tts-flash-v1", DefaultVoice: "nomyen", Transport: protocol.TransportHTTP, Endpoint: "https://api.paxalabs.com/v1/tts"},
+	// Munsit: Arabic-only munsit and the Arabic/English code-switching
+	// munsit-en-ar share one listen socket, keyed by an x-api-key header. The
+	// prerecorded sibling (POST /api/v1/audio/transcribe) is a
+	// BatchTranscriber, which this catalog does not publish. Synthesis puts
+	// the model id in the path; English sessions with no voice get the
+	// adapter's English default instead of this Najdi one.
+	{Provider: "munsit", Kind: protocol.SessionKindSTT, Adapter: "munsit.stt.v1", DefaultModel: "munsit", Models: []string{"munsit", "munsit-en-ar"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.munsit.com/api/v1/listen"},
+	{Provider: "munsit", Kind: protocol.SessionKindTTS, Adapter: "munsit.tts.v1", DefaultModel: "faseeh-v1-preview", DefaultVoice: "ar-najdi-male-2", Transport: protocol.TransportHTTP, Endpoint: "https://api.munsit.com/api/v1/text-to-speech/faseeh-v1-preview"},
 	{Provider: "speechmatics", Kind: protocol.SessionKindSTT, Adapter: "speechmatics.stt.v1", DefaultModel: "standard", Models: []string{"standard", "enhanced"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://global.rt.speechmatics.com/v2/"},
 }
 
