@@ -212,9 +212,12 @@ func (s *stream) CommitText(ctx context.Context) error {
 }
 
 func (s *stream) Cancel(ctx context.Context) error {
+	if s.closed.Load() || s.closing.Load() {
+		return runtimepkg.ErrSessionClosed
+	}
 	contextID, ok := s.activeContext()
 	if !ok {
-		return runtimepkg.ErrSessionClosed
+		return nil
 	}
 	if err := s.writeJSON(ctx, map[string]any{"context_id": contextID, "close_context": true}); err != nil {
 		return err
