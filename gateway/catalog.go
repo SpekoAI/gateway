@@ -127,6 +127,9 @@ var providerCatalog = []CatalogEntry{
 	// latency behaves like batch. Arabic-first; s2 selects the prior generation
 	// through the same socket.
 	{Provider: "hamsa", Kind: protocol.SessionKindSTT, Adapter: "hamsa.stt.v1", DefaultModel: "s3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.tryhamsa.com/v1/realtime/ws"},
+	// Hamsa TTS streams bare PCM over chunked HTTP. The session language picks
+	// the Arabic dialect (ar-EG -> egy, bare ar -> MSA); the API takes no model.
+	{Provider: "hamsa", Kind: protocol.SessionKindTTS, Adapter: "hamsa.tts.v1", DefaultModel: "default", DefaultVoice: "Salem", Transport: protocol.TransportHTTP, Endpoint: "https://api.tryhamsa.com/v1/realtime/tts-stream"},
 	{Provider: "rime", Kind: protocol.SessionKindTTS, Adapter: "rime.tts.v1", DefaultModel: "coda", DefaultVoice: "astra", Transport: protocol.TransportWebSocket, Endpoint: "wss://users-ws.rime.ai/ws3"},
 	{Provider: "hume", Kind: protocol.SessionKindTTS, Adapter: "hume.tts.v1", DefaultModel: "octave-2", DefaultVoice: "Colton Rivers", Transport: protocol.TransportHTTP, Endpoint: "https://api.hume.ai/v0/tts/stream/json"},
 	{Provider: "fish", Kind: protocol.SessionKindTTS, Adapter: "fish.tts.v1", DefaultModel: "s2.1-pro", DefaultVoice: "802e3bc2b27e49c2995d23ef70e6ac89", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.fish.audio/v1/tts/live"},
