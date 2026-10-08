@@ -302,9 +302,12 @@ func (s *stream) CommitText(ctx context.Context) error {
 // provider documents that currently generating audio can continue, so callers
 // must still await its terminal event or close the session.
 func (s *stream) Cancel(ctx context.Context) error {
+	if s.closed.Load() || s.closing.Load() {
+		return runtimepkg.ErrSessionClosed
+	}
 	contextID, ok := s.activeContext()
 	if !ok {
-		return runtimepkg.ErrSessionClosed
+		return nil
 	}
 	return s.writeJSON(ctx, map[string]any{"context_id": contextID, "cancel": true})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -425,4 +426,37 @@ func eventTypes(events []runtimepkg.ProviderEvent) []string {
 		types[index] = string(event.Type)
 	}
 	return types
+}
+
+func TestTTSIdleCancelKeepsTheStreamOpen(t *testing.T) {
+	t.Parallel()
+	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		for {
+			_, _, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), adapterRequest(server.URL))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("idle cancellation closed a live session: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Cancel(context.Background()); !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		t.Fatalf("closed session cancel=%v", err)
+	}
 }
