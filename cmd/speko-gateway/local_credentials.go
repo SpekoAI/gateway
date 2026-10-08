@@ -37,6 +37,7 @@ var localCredentialSpecs = []localCredentialSpec{
 	{Provider: "meta", Env: "SPEKO_META_BYOK_API_KEY"},
 	{Provider: "minimax", Env: "SPEKO_MINIMAX_BYOK_API_KEY"},
 	{Provider: "modulate", Env: "SPEKO_MODULATE_BYOK_API_KEY"},
+	{Provider: "munsit", Env: "SPEKO_MUNSIT_BYOK_API_KEY"},
 	{Provider: "nari", Env: "SPEKO_NARI_BYOK_API_KEY"},
 	{Provider: "openai", Env: "SPEKO_OPENAI_BYOK_API_KEY"},
 	{Provider: "palabra", Env: "SPEKO_PALABRA_BYOK_API_KEY"},

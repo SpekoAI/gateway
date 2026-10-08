@@ -874,17 +874,25 @@ func TestInternalBillingEvidenceDoesNotChangePublicEvents(t *testing.T) {
 }
 func TestPaxaKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
 	t.Parallel()
-	testLanguageDefaultVoiceProvider(t, "paxa", "nomyen")
+	assertLanguageVoiceFill(t, "paxa", "nomyen")
+}
+
+func TestMunsitKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
+	t.Parallel()
+	assertLanguageVoiceFill(t, "munsit", "ar-najdi-male-2")
 }
 
 // Hamsa picks a native speaker per dialect, so a session with a language must
 // reach the adapter without the catalog's Salem pre-filled.
 func TestHamsaKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
 	t.Parallel()
-	testLanguageDefaultVoiceProvider(t, "hamsa", "Salem")
+	assertLanguageVoiceFill(t, "hamsa", "Salem")
 }
 
-func testLanguageDefaultVoiceProvider(t *testing.T, provider, catalogVoice string) {
+// assertLanguageVoiceFill pins the engine exemption for adapters that pick a
+// default voice by language: with a language set and no caller voice, the
+// plan voice is not copied in, so the adapter can tell the two apart.
+func assertLanguageVoiceFill(t *testing.T, provider, plannedVoice string) {
 	t.Helper()
 	opened := make(chan runtimepkg.AdapterRequest, 2)
 	adapter := mock.NewAdapter("mock.voice.tts", func(request runtimepkg.AdapterRequest) *mock.Stream {
@@ -906,7 +914,7 @@ func testLanguageDefaultVoiceProvider(t *testing.T, provider, catalogVoice strin
 	open := func(options protocol.RequestOptions) protocol.RequestOptions {
 		plan := validPlan(protocol.SessionKindTTS, adapter.ID(), 60)
 		plan.Route.Provider = provider
-		plan.Route.Voice = catalogVoice
+		plan.Route.Voice = plannedVoice
 		session, err := engine.Open(context.Background(), runtimepkg.OpenRequest{
 			Kind: protocol.SessionKindTTS, Plan: plan, Options: options, Media: media,
 		})
@@ -917,13 +925,13 @@ func testLanguageDefaultVoiceProvider(t *testing.T, provider, catalogVoice strin
 			session.Close()
 			collectEvents(t, session)
 		}()
-		if plan.Route.Voice != catalogVoice {
+		if plan.Route.Voice != plannedVoice {
 			t.Fatal("engine mutated the verified plan")
 		}
 		return (<-opened).Options
 	}
 
-	if got := open(protocol.RequestOptions{}).Voice; got != catalogVoice {
+	if got := open(protocol.RequestOptions{}).Voice; got != plannedVoice {
 		t.Fatalf("no language must preserve catalog default, got %q", got)
 	}
 
@@ -934,7 +942,7 @@ func testLanguageDefaultVoiceProvider(t *testing.T, provider, catalogVoice strin
 	if got := open(protocol.RequestOptions{Voice: "  ", Language: "en"}).Voice; strings.TrimSpace(got) != "" {
 		t.Fatalf("adapter voice for a blank caller voice = %q, want blank so the adapter selects by language", got)
 	}
-	if got := open(protocol.RequestOptions{Voice: catalogVoice}).Voice; got != catalogVoice {
+	if got := open(protocol.RequestOptions{Voice: plannedVoice}).Voice; got != plannedVoice {
 		t.Fatalf("adapter voice = %q, want the caller's override to win", got)
 	}
 }
