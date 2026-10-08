@@ -132,9 +132,6 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if language := normalizeLanguage(request.Options.Language); language != "" {
 		submission["language"] = language
 	}
-	if request.Options.STT.Diarize() {
-		submission["diarization"] = true
-	}
 	for _, key := range request.Options.STT.ProviderKeys("hamsa") {
 		submission[key] = request.Options.STT.Provider("hamsa")[key]
 	}

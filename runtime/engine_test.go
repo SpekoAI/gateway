@@ -882,12 +882,18 @@ func TestMunsitKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
 	assertLanguageVoiceFill(t, "munsit", "ar-najdi-male-2")
 }
 
+// Hamsa picks a native speaker per dialect, so a session with a language must
+// reach the adapter without the catalog's Salem pre-filled.
+func TestHamsaKeepsCallerVoiceDistinctFromPlannedDefault(t *testing.T) {
+	t.Parallel()
+	assertLanguageVoiceFill(t, "hamsa", "Salem")
+}
+
 // assertLanguageVoiceFill pins the engine exemption for adapters that pick a
 // default voice by language: with a language set and no caller voice, the
 // plan voice is not copied in, so the adapter can tell the two apart.
 func assertLanguageVoiceFill(t *testing.T, provider, plannedVoice string) {
 	t.Helper()
-
 	opened := make(chan runtimepkg.AdapterRequest, 2)
 	adapter := mock.NewAdapter("mock.voice.tts", func(request runtimepkg.AdapterRequest) *mock.Stream {
 		opened <- request

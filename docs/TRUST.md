@@ -266,6 +266,18 @@ they contain no synthesis text or voice content. Billing counts UTF-16 units
 and the per-synthesis minimum. Incomplete audio leaves incomplete billing
 evidence. Caller cancellation interrupts a stalled response-header request.
 
+### Hamsa speech
+
+Hamsa realtime transcription sends the API key in the `X-Api-Key` header,
+never the URL, and sends each committed turn as one WAV utterance with the
+language and model. Hamsa synthesis sends the text, speaker, dialect and PCM
+sample rate to the validated Hamsa endpoint with `Authorization: Token`, and
+refuses redirects. Billing observations carry an opaque operation ID, an
+optional provider request ID, the model, the mode, and audio duration rounded
+up to whole seconds per request, which is the grain Hamsa charges. They carry
+no transcript, synthesis text or voice content. Incomplete synthesized audio
+leaves incomplete billing evidence.
+
 ### Munsit transcription and synthesis
 
 Munsit requests carry the delegated key in an `x-api-key` header on the

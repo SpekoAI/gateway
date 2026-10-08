@@ -33,8 +33,14 @@ const (
 	// and the transcript for it comes back as a single plain-string frame.
 	sttEndpointPath = "/v1/realtime/ws"
 
-	// DefaultSTTModel is Hamsa's current dialect-strongest generation. `s2`
-	// remains selectable through the same socket.
+	// apiKeyHeader authenticates the realtime socket. Hamsa documents it as
+	// the alternative to the api_key query parameter; a header keeps the key
+	// out of every URL a proxy or access log records.
+	apiKeyHeader = "X-Api-Key"
+
+	// DefaultSTTModel is Hamsa's current generation. The API reference
+	// enumerates `s2` and `s3` for the socket's `model` field, and `s2` stays
+	// selectable through it.
 	DefaultSTTModel = "s3"
 
 	extensionID = "tryhamsa.com/realtime_v1"
@@ -49,6 +55,22 @@ const (
 	// whole utterance at once, so a reply that has not arrived by now is a
 	// stuck session, not a slow interim.
 	utteranceTimeout = 30 * time.Second
+
+	// billingIncrementMS is Hamsa's metering grain. Measured 2026-10-07 against
+	// the project's credit counter: every realtime request is charged 3 credits
+	// per minute of audio, rounded UP to a whole second per request (3 s cost
+	// 0.15 credits, 65 s cost 3.25, a 0.28 s synthesis cost 0.05).
+	billingIncrementMS = 1000
+
+	// sttBytesPerSecond is 16 kHz mono PCM16.
+	sttBytesPerSecond = sttSampleRateHz * 2
+)
+
+// Close codes the realtime socket documents.
+const (
+	closeAuthenticationFailed websocket.StatusCode = 4001
+	closeInsufficientFunds    websocket.StatusCode = 4003
+	closeInternalAuthError    websocket.StatusCode = 4500
 )
 
 // STTConfig controls local transport limits and endpoint policy. Provider
@@ -149,6 +171,10 @@ func (a *STTAdapter) Open(_ context.Context, request runtimepkg.AdapterRequest) 
 		model:      request.Plan.Route.Model,
 		language:   normalizeLanguage(request.Options.Language),
 		events:     make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		billing: protocol.BillingObservation{
+			OperationID: "session", Model: request.Plan.Route.Model, Mode: "streaming",
+			Quantities: map[string]int64{"duration_seconds": 0},
+		},
 	}, nil
 }
 
@@ -178,10 +204,13 @@ type sttOutboundPayload struct {
 	AudioBase64 string `json:"audioBase64"`
 	Language    string `json:"language"`
 	Model       string `json:"model"`
-	// IsEosEnabled and EosThreshold mirror the values every existing Speko
-	// integration submits; the vendor documents no defaults to fall back on.
-	IsEosEnabled bool    `json:"isEosEnabled"`
-	EosThreshold float64 `json:"eosThreshold"`
+	// IsEosEnabled asks Hamsa's own end-of-speech model whether the speaker
+	// has finished. It is always sent false: a commit already IS the end of
+	// the turn, decided by the caller's VAD. With it on, Hamsa answers an
+	// utterance it judges unfinished with "[THINKING]" and then nothing at all
+	// (observed 2026-10-07 on a 3 s clip that stopped mid-sentence: 45 s of
+	// silence after the marker), so the turn hung until utteranceTimeout.
+	IsEosEnabled bool `json:"isEosEnabled"`
 }
 
 // sttControl is a JSON control frame. Anything on the socket that fails to
@@ -202,9 +231,10 @@ type sttStream struct {
 	events     chan runtimepkg.ProviderEvent
 
 	// The runtime serializes WriteAudio, CommitAudio, Close, and Cancel, so
-	// the utterance buffer needs no lock of its own; closed guards the events
-	// channel against the emit-after-close race with Cancel.
+	// the utterance buffer and billing snapshot need no lock of their own;
+	// closed guards the events channel against the emit-after-close race.
 	buffer    []byte
+	billing   protocol.BillingObservation
 	closed    atomic.Bool
 	closeOnce sync.Once
 }
@@ -246,12 +276,18 @@ func (s *sttStream) AppendText(context.Context, string) error {
 
 func (s *sttStream) CommitText(context.Context) error { return runtimepkg.ErrUnsupportedOperation }
 
-func (s *sttStream) Cancel(context.Context) error {
+// Cancel drops the uncommitted tail. Every utterance already sent finished
+// synchronously inside its CommitAudio, so the billing snapshot is final.
+func (s *sttStream) Cancel(ctx context.Context) error {
+	s.emitBilling(ctx, true)
 	s.shutdown()
 	return nil
 }
 
 func (s *sttStream) Abort(context.Context) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.emitBilling(ctx, true)
 	s.shutdown()
 	return nil
 }
@@ -267,8 +303,36 @@ func (s *sttStream) Close(ctx context.Context) error {
 	if len(s.buffer) > 0 {
 		err = s.transcribeBuffered(ctx)
 	}
+	s.emitBilling(ctx, true)
 	s.shutdown()
 	return err
+}
+
+// recordUtterance adds one dispatched utterance to the session snapshot at the
+// grain Hamsa charges: whole seconds, rounded up per request.
+func (s *sttStream) recordUtterance(pcmBytes int) {
+	milliseconds := (int64(pcmBytes)*1000 + sttBytesPerSecond - 1) / sttBytesPerSecond
+	s.billing.Quantities["duration_seconds"] += (milliseconds + billingIncrementMS - 1) / billingIncrementMS * billingIncrementMS
+}
+
+// emitBilling publishes the cumulative snapshot. A final snapshot is offered
+// without blocking past ctx: Abort passes a cancelled context because a failed
+// runtime may no longer drain events, and the event buffer usually has room.
+func (s *sttStream) emitBilling(ctx context.Context, complete bool) {
+	observation := s.billing.Clone()
+	observation.Complete = complete
+	event := runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: &observation}
+	if s.closed.Load() {
+		return
+	}
+	select {
+	case s.events <- event:
+	default:
+		select {
+		case s.events <- event:
+		case <-ctx.Done():
+		}
+	}
 }
 
 func (s *sttStream) shutdown() {
@@ -295,6 +359,10 @@ func (s *sttStream) transcribeBuffered(ctx context.Context) error {
 		// only fails on local session errors.
 		return s.emit(ctx, runtimepkg.ProviderEvent{Err: err})
 	}
+	// Only an answered utterance is metered: an error frame or a dropped
+	// socket returns before Hamsa reports a transcript to charge for.
+	s.recordUtterance(len(utterance))
+	s.emitBilling(ctx, false)
 	if text != "" {
 		if err := s.emit(ctx, runtimepkg.ProviderEvent{Type: protocol.EventSpeechStarted, Data: transcriptMetadata()}); err != nil {
 			return err
@@ -317,11 +385,9 @@ func (s *sttStream) transcribeUtterance(ctx context.Context, utterance []byte) (
 	ctx, cancel := context.WithTimeout(ctx, utteranceTimeout)
 	defer cancel()
 
-	// The key rides the URL: the realtime surface authenticates by query
-	// parameter, unlike the REST API's Authorization header. The credential
-	// never goes into an error, so the dialled URL must not either.
-	conn, response, err := websocket.Dial(ctx, s.endpoint+"?api_key="+s.credential, &websocket.DialOptions{
+	conn, response, err := websocket.Dial(ctx, s.endpoint, &websocket.DialOptions{
 		HTTPClient: httpClient(s.adapter.httpClient),
+		HTTPHeader: http.Header{apiKeyHeader: []string{s.credential}},
 	})
 	if err != nil {
 		status := 0
@@ -345,8 +411,7 @@ func (s *sttStream) transcribeUtterance(ctx context.Context, utterance []byte) (
 			AudioBase64:  base64.StdEncoding.EncodeToString(pcm16ToWAV(utterance, sttSampleRateHz)),
 			Language:     s.language,
 			Model:        s.model,
-			IsEosEnabled: true,
-			EosThreshold: 0.3,
+			IsEosEnabled: false,
 		},
 	})
 	if err != nil {
@@ -368,16 +433,20 @@ func (s *sttStream) transcribeUtterance(ctx context.Context, utterance []byte) (
 				// final rather than a mystery failure.
 				return "", nil, nil
 			}
+			if closeErr := closeStatusError(websocket.CloseStatus(err), err); closeErr != nil {
+				return "", nil, closeErr
+			}
 			return "", nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Hamsa transcription read failed", Retryable: true, Cause: err}
 		}
 		var control sttControl
 		if json.Unmarshal(payload, &control) == nil && control.Type != "" {
 			switch control.Type {
 			case "error":
+				code, retryable := classifyErrorMessage(control.Payload.Message)
 				return "", nil, &runtimepkg.ProviderError{
-					Code:       "provider_unavailable",
+					Code:       code,
 					Message:    sttErrorMessage(control.Payload.Message),
-					Retryable:  true,
+					Retryable:  retryable,
 					Extensions: extension(json.RawMessage(append([]byte(nil), payload...))),
 				}
 			default:
@@ -387,12 +456,11 @@ func (s *sttStream) transcribeUtterance(ctx context.Context, utterance []byte) (
 			}
 		}
 		text := strings.TrimSpace(string(payload))
-		// Bracketed status markers ("[THINKING]") arrive as plain string
-		// frames while the service works on the utterance — observed live
-		// 2026-08-17, when a degraded backend sent the marker and nothing
-		// else. A marker is never the transcript: skip it and keep waiting,
-		// so a stuck session hits the timeout instead of returning the
-		// marker as a billed result.
+		// Bracketed status markers ("[THINKING]") are Hamsa's end-of-speech
+		// verdict that the speaker has not finished. isEosEnabled is sent
+		// false so they should not arrive; if one does, it is never the
+		// transcript: skip it and keep waiting, so a stuck session hits the
+		// timeout instead of returning the marker as a billed result.
 		if statusMarker(text) {
 			continue
 		}
@@ -478,6 +546,36 @@ func httpClient(client *http.Client) *http.Client {
 func isNormalClose(err error) bool {
 	status := websocket.CloseStatus(err)
 	return status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway
+}
+
+// closeStatusError maps the socket's documented application close codes. The
+// wallet code is the one that matters operationally: retrying an empty
+// wallet only burns the fallback budget.
+func closeStatusError(status websocket.StatusCode, cause error) *runtimepkg.ProviderError {
+	switch status {
+	case closeAuthenticationFailed, closeInternalAuthError:
+		return &runtimepkg.ProviderError{Code: "authentication_failed", Message: "Hamsa refused the API key", Cause: cause}
+	case closeInsufficientFunds:
+		return &runtimepkg.ProviderError{Code: "provider_quota_exceeded", Message: "Hamsa project wallet balance is depleted", Cause: cause}
+	}
+	return nil
+}
+
+// classifyErrorMessage reads the documented error prose, the only signal an
+// error frame carries.
+func classifyErrorMessage(message string) (string, bool) {
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "rate limit"):
+		return "provider_rate_limited", true
+	case strings.Contains(lower, "insufficient funds"), strings.Contains(lower, "usage limit"):
+		return "provider_quota_exceeded", false
+	case strings.Contains(lower, "api key"), strings.Contains(lower, "inactive"), strings.Contains(lower, "not owned"):
+		return "authentication_failed", false
+	case strings.Contains(lower, "invalid payload"), strings.Contains(lower, "supported"), strings.Contains(lower, "invalid message format"):
+		return "invalid_request", false
+	}
+	return "provider_unavailable", true
 }
 
 func dialErrorCode(status int) string {

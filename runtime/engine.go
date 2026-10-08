@@ -131,9 +131,9 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	// adapter rejects an empty voice id, and a caller that delegated the vendor
 	// choice has no way to know which vendor's id space to send one from.
 	adapterOptions := request.Options
-	// Paxa and Munsit resolve language-specific defaults and must distinguish
-	// the caller's explicit voice from the signed plan's fallback.
-	languageVoice := adapterPlan.Route.Provider == "paxa" || adapterPlan.Route.Provider == "munsit"
+	// Paxa, Munsit and Hamsa resolve language-specific defaults and must
+	// distinguish the caller's explicit voice from the signed plan's fallback.
+	languageVoice := adapterPlan.Route.Provider == "paxa" || adapterPlan.Route.Provider == "munsit" || adapterPlan.Route.Provider == "hamsa"
 	if strings.TrimSpace(adapterOptions.Voice) == "" && (!languageVoice || strings.TrimSpace(adapterOptions.Language) == "") {
 		adapterOptions.Voice = adapterPlan.Route.Voice
 	}

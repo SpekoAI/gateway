@@ -311,6 +311,7 @@ restarting the Gateway.
 | STT | Gradium | `gradium.stt.v1` | `default` |
 | TTS | Gradium | `gradium.tts.v1` | `default` |
 | STT | Hamsa | `hamsa.stt.v1` | `s3` |
+| TTS | Hamsa | `hamsa.tts.v1` | `default` |
 | TTS | Rime | `rime.tts.v1` | `coda` |
 | TTS | Hume | `hume.tts.v1` | `octave-2` |
 | STT | Inworld | `inworld.stt.v1` | `inworld-stt-1` |
