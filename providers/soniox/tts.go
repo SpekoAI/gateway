@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -245,6 +246,10 @@ type ttsUtterance struct {
 	// yet, because the active stream is full and has been sent text_end. It
 	// never starts with whitespace.
 	pending string
+	// queued holds appends that arrive while the active stream is closed for
+	// input. They are joined onto pending once, when the next stream starts,
+	// so a long reply arriving in small chunks is not recopied per append.
+	queued []string
 	// priorAudioBytes is the PCM this utterance's finished streams produced.
 	// Soniox times each stream from its own first sample, so it is the
 	// offset that places the active stream's timestamps on the utterance.
@@ -291,6 +296,11 @@ func (s *ttsStream) AppendText(ctx context.Context, text string) error {
 		utterance = &ttsUtterance{done: make(chan struct{})}
 		s.utterance = utterance
 	}
+	if utterance.textEnded {
+		utterance.queued = append(utterance.queued, text)
+		s.stateMu.Unlock()
+		return nil
+	}
 	utterance.pending += text
 	messages, err := s.planLocked(utterance)
 	s.stateMu.Unlock()
@@ -309,10 +319,18 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 	s.sendMu.Lock()
 	s.stateMu.Lock()
 	utterance := s.utterance
-	if s.closed.Load() || s.closing.Load() || utterance == nil || utterance.committed || utterance.canceled {
+	if s.closed.Load() || s.closing.Load() || (utterance != nil && (utterance.committed || utterance.canceled)) {
 		s.stateMu.Unlock()
 		s.sendMu.Unlock()
 		return runtimepkg.ErrSessionClosed
+	}
+	if utterance == nil {
+		// A commit with no text: nothing to synthesize, so no Soniox stream
+		// is opened (one with no text would end in request_timeout). The
+		// caller gets the same audio.done an empty stream used to produce.
+		s.stateMu.Unlock()
+		s.sendMu.Unlock()
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.ttsStreamData("")})
 	}
 	utterance.committed = true
 	messages, err := s.planLocked(utterance)
@@ -352,6 +370,7 @@ func (s *ttsStream) Cancel(ctx context.Context) error {
 	}
 	utterance.canceled = true
 	utterance.pending = ""
+	utterance.queued = nil
 	streamID := utterance.streamID
 	s.canceledStreamID = streamID
 	s.stateMu.Unlock()
@@ -410,6 +429,12 @@ func (s *ttsStream) abort() error {
 // anyone plans further.
 func (s *ttsStream) planLocked(utterance *ttsUtterance) ([]any, error) {
 	var messages []any
+	// Queued appends join once a stream can take them: when the next
+	// stream is about to start, or the active one is still open for input.
+	if len(utterance.queued) > 0 && (utterance.streamID == "" || !utterance.textEnded) {
+		utterance.pending = strings.TrimLeftFunc(utterance.pending+strings.Join(utterance.queued, ""), unicode.IsSpace)
+		utterance.queued = nil
+	}
 	for {
 		if utterance.streamID == "" {
 			if utterance.canceled || utterance.pending == "" {
@@ -496,7 +521,7 @@ func (s *ttsStream) streamTerminated(streamID string, raw json.RawMessage) error
 	)
 	// A stream that ends without having been sent text_end was canceled or
 	// ended by the server; either way nothing queued behind it is wanted.
-	complete := utterance.canceled || !utterance.textEnded || utterance.pending == ""
+	complete := utterance.canceled || !utterance.textEnded || (utterance.pending == "" && len(utterance.queued) == 0)
 	if complete {
 		s.completeLocked(utterance)
 	} else {

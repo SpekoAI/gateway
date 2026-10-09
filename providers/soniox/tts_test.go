@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1329,4 +1330,114 @@ func ttsAdapterRequest(serverURL string) runtimepkg.AdapterRequest {
 		Options: protocol.RequestOptions{Voice: "Adrian", Language: "es-419", MaxInputCharacters: 4_000},
 		Media:   &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1},
 	}
+}
+
+// A commit with no text opens no Soniox stream, which would only end in
+// request_timeout, and still answers audio.done. The next utterance then runs
+// normally on the same socket.
+func TestTTSEmptyCommitCompletesWithoutAStream(t *testing.T) {
+	t.Parallel()
+
+	fake := newRollingTTSServer(t, false)
+	defer fake.close()
+	stream := openRollingTTSStream(t, fake)
+	defer abortStream(stream)
+
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("empty commit: %v", err)
+	}
+	if got := collectEvents(t, stream.Events(), 1); got[0].Type != protocol.EventAudioDone {
+		t.Fatalf("empty commit event = %s, want audio.done", got[0].Type)
+	}
+	if message, ok := fake.tryNext(50 * time.Millisecond); ok {
+		t.Fatalf("empty commit sent %v to Soniox", message)
+	}
+
+	if err := stream.AppendText(context.Background(), "Hola."); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	streams := fake.driveToCompletion(t)
+	if len(streams) != 1 || streams[0].text() != "Hola." {
+		t.Fatalf("streams = %+v, want one carrying the text", streams)
+	}
+	assertOneUtterance(t, stream.Events(), 1)
+}
+
+// An append that fills the stream exactly can end on a letter whose combining
+// mark arrives in the next append. The mark stays with its letter instead of
+// opening the next stream detached.
+func TestTTSKeepsACombiningMarkFromTheNextAppendWithItsLetter(t *testing.T) {
+	t.Parallel()
+
+	fake := newRollingTTSServer(t, false)
+	defer fake.close()
+	stream := openRollingTTSStream(t, fake)
+	defer abortStream(stream)
+
+	first := strings.Repeat("e", ttsStreamTextBudget)
+	second := "́ y sigue el texto."
+	for _, text := range []string{first, second} {
+		if err := stream.AppendText(context.Background(), text); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	streams := fake.driveToCompletion(t)
+	if len(streams) != 2 {
+		t.Fatalf("streams = %d, want 2", len(streams))
+	}
+	if got := streams[0].text(); !strings.HasSuffix(got, "é") {
+		t.Fatalf("first stream ends %q, want the letter with its mark", got[len(got)-4:])
+	}
+	if got := streams[1].text(); got != "y sigue el texto." {
+		t.Fatalf("second stream = %q", got)
+	}
+	assertOneUtterance(t, stream.Events(), 2)
+}
+
+// Appends that arrive while the active stream is closed for input are held
+// and carried, in order and exactly once, by the next stream.
+func TestTTSAppendsWhileAStreamIsFullReachTheNextStreamInOrder(t *testing.T) {
+	t.Parallel()
+
+	fake := newRollingTTSServer(t, true)
+	defer fake.close()
+	stream := openRollingTTSStream(t, fake)
+	defer abortStream(stream)
+
+	full := strings.Repeat("Una frase corta. ", ttsStreamTextBudget/17+1)
+	if err := stream.AppendText(context.Background(), full); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	var want strings.Builder
+	want.WriteString(full)
+	for index := range 200 {
+		chunk := fmt.Sprintf("Parte %d. ", index)
+		want.WriteString(chunk)
+		if err := stream.AppendText(context.Background(), chunk); err != nil {
+			t.Fatalf("append %d: %v", index, err)
+		}
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	streams := fake.driveToCompletion(t)
+	if len(streams) < 2 {
+		t.Fatalf("streams = %d, want the text rolled over", len(streams))
+	}
+	// Stream boundaries drop the whitespace between sentences, so compare
+	// the words.
+	var carried []string
+	for _, wire := range streams {
+		carried = append(carried, strings.Fields(wire.text())...)
+	}
+	if got, wantText := strings.Join(carried, " "), strings.Join(strings.Fields(want.String()), " "); got != wantText {
+		t.Fatalf("streams carried %d bytes, want %d in order", len(got), len(wantText))
+	}
+	assertOneUtterance(t, stream.Events(), len(streams))
 }

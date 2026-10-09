@@ -212,6 +212,19 @@ func ttsSplitForStream(text string, used int, state ttsBoundary, final bool) (he
 			// holds: nothing sensible is left but the rune boundary.
 			cut = limit
 		}
+		if cut == 0 {
+			// The stream is full and this text opens with marks that join
+			// the character an earlier append ended it with. They belong to
+			// that character, so they stay on this stream, a few units over
+			// the budget, which sits well under both vendor caps.
+			for cut < len(text) {
+				r, size := utf8.DecodeRuneInString(text[cut:])
+				if !ttsJoinsPrevious(r) {
+					break
+				}
+				cut += size
+			}
+		}
 	}
 	head = text[:cut]
 	tail = strings.TrimLeftFunc(text[cut:], unicode.IsSpace)
