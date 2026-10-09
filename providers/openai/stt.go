@@ -356,22 +356,23 @@ func sttWriteSessionUpdate(ctx context.Context, conn *websocket.Conn, model, lan
 	return nil
 }
 
-// sttLanguageTag lowercases a caller tag and preserves the regional forms the
-// Realtime API accepts. CONFIRMED raw, Realtime transcription guide: supported
-// formats are ISO-639-1 (`en`), selected ISO-639-3 (`eng`, `yue`, `cmn`), and
-// the regional `zh` locales `zh-cn`, `zh-tw`, `zh-hk`. Blindly reducing every
-// tag to its primary subtag would collapse zh-tw to `zh` and silently change
-// which Chinese variant is transcribed, so `zh-*` is passed through whole.
+// sttLanguageTag reduces a caller tag to a form the Realtime API accepts.
+// CONFIRMED raw, Realtime transcription guide
+// (https://developers.openai.com/api/docs/guides/realtime-transcription, read
+// 2026-10-09): supported formats are ISO-639-1 (`en`), selected ISO-639-3
+// (`eng`, `yue`, `cmn`), and the regional `zh` locales `zh-cn`, `zh-tw`,
+// `zh-hk`; "The Realtime API rejects unsupported or incorrectly formatted
+// language codes." Any other region is refused (`sw-ke` and `id-id` both 400),
+// so every tag except those three locales is reduced to its primary subtag.
+// The `zh` locales are kept whole: collapsing zh-tw to `zh` would silently
+// change which Chinese variant is transcribed.
 func sttLanguageTag(language string) string {
-	lowered := strings.ToLower(strings.TrimSpace(language))
-	if lowered == "" {
-		return ""
-	}
-	normalized := strings.ReplaceAll(lowered, "_", "-")
-	if strings.HasPrefix(normalized, "zh-") {
+	normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(language)), "_", "-")
+	switch normalized {
+	case "zh-cn", "zh-tw", "zh-hk":
 		return normalized
 	}
-	return normalized
+	return sttPrimarySubtag(normalized)
 }
 
 func sttPrimarySubtag(language string) string {

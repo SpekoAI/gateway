@@ -117,3 +117,52 @@ func TestListenEndpointForwardsProviderOptions(t *testing.T) {
 		t.Fatalf("another provider's setting must not leak: %s", endpoint)
 	}
 }
+
+// Deepgram refuses a regional code it does not document (`sw-KE` answers 400
+// while `sw` transcribes), so only its documented regional codes ride the wire
+// intact and everything else is reduced to the primary subtag. Flux takes bare
+// codes only.
+func TestListenEndpointSendsOnlyDocumentedRegionalLanguages(t *testing.T) {
+	t.Parallel()
+	policy := sttTestPolicy(t)
+	for _, test := range []struct {
+		model, language, want string
+	}{
+		{"nova-3", "id", "id"},
+		{"nova-3", "id-ID", "id"},
+		{"nova-3", "sw", "sw"},
+		{"nova-3", "sw-KE", "sw"},
+		{"nova-3", "sw-TZ", "sw"},
+		{"nova-3", "en-US", "en-US"},
+		{"nova-3", "en-GB", "en-GB"},
+		{"nova-3", "pt-BR", "pt-BR"},
+		{"nova-3", "pt_br", "pt-BR"},
+		{"nova-3", "zh-hans", "zh-Hans"},
+		{"nova-3", "es-MX", "es"},
+		{"nova-3", "en-CA", "en"},
+		{"nova-3-medical", "en-CA", "en-CA"},
+		{"nova-3", "multi", "multi"},
+		{"nova-2", "pt-BR", "pt-BR"},
+		{"nova-2", "ar-EG", "ar"},
+		{"nova-2-phonecall", "en-GB", "en"},
+		{"nova-2-phonecall", "en-US", "en-US"},
+		{"nova", "hi-Latn", "hi-Latn"},
+	} {
+		endpoint, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", test.model, protocol.RequestOptions{Language: test.language}, *media(), runtimepkg.AudioDeliveryLive, "")
+		if err != nil {
+			t.Fatalf("%s %s: %v", test.model, test.language, err)
+		}
+		if got := queryOf(t, endpoint).Get("language"); got != test.want {
+			t.Fatalf("%s language %q sent %q, want %q", test.model, test.language, got, test.want)
+		}
+	}
+	for language, want := range map[string]string{"es-419": "es", "sw-KE": "sw", "id-ID": "id", "en": "en"} {
+		endpoint, err := listenEndpoint(policy, "wss://api.deepgram.com/v2/listen", fluxMultilingual, protocol.RequestOptions{Language: language}, *media(), runtimepkg.AudioDeliveryLive, "")
+		if err != nil {
+			t.Fatalf("flux %s: %v", language, err)
+		}
+		if got := queryOf(t, endpoint)["language_hint"]; len(got) != 1 || got[0] != want {
+			t.Fatalf("flux language_hint for %q = %v, want %q", language, got, want)
+		}
+	}
+}

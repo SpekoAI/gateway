@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -26,18 +27,6 @@ const (
 	ttsExtensionID  = "soniox.com/tts/v1"
 	ttsOfficialHost = "tts-rt.soniox.com"
 	ttsEndpointPath = "/tts-websocket"
-
-	// Soniox caps the text it will accept on ONE stream at 5,000 bytes, and
-	// the cap is on the stream's ACCUMULATED input buffer rather than on any
-	// single message: splitting a long input into small chunks does not lift
-	// it, and a chunked feed fails partway through with "input buffer error:
-	// input text too long (limit: 5000 bytes)" once the running total passes
-	// the bound. The per-chunk rejection is the same bound seen from the
-	// other side ("Text is too long (max length 5000).").
-	//
-	// This is a short-form engine, and the accumulated bound is what the
-	// adapter enforces so a caller learns it before paying for a socket.
-	ttsMaxTextBytes = 5_000
 )
 
 // ttsSampleRates are the output rates Soniox documents for pcm_s16le. Anything
@@ -103,12 +92,10 @@ func NewTTS(config TTSConfig) (*TTSAdapter, error) {
 
 func (a *TTSAdapter) ID() string { return a.id }
 
-// Open dials the socket and immediately starts one stream on it. Soniox closes
-// a connection that has not sent a start message with a valid API key within
-// about ten seconds, and a keepalive does not count as authentication, so the
-// start cannot wait for the caller's first AppendText the way Cartesia's
-// context can. A stream that finishes releases its id; the next AppendText
-// starts a fresh stream on the same socket.
+// Open dials the socket, authenticated by the handshake's Authorization
+// header, and starts no stream: the first AppendText does. A finished
+// utterance releases its streams, and the next AppendText starts a fresh one
+// on the same socket.
 func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
 	if request.Kind != protocol.SessionKindTTS {
 		return nil, fmt.Errorf("soniox tts supports tts sessions, got %q", request.Kind)
@@ -154,9 +141,10 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, err
 	}
 
-	// No Authorization header: the api_key travels inside the start message for
-	// managed, BYOK, and relay credentials alike. See doc.go.
-	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: sttHTTPClient(a.httpClient)})
+	// The key rides the handshake's Authorization header for managed, BYOK,
+	// and relay credentials alike, and authenticates every stream the socket
+	// runs. See doc.go.
+	conn, response, err := websocket.Dial(ctx, endpoint, sonioxDialOptions(a.httpClient, credential.Value))
 	if err != nil {
 		status := 0
 		if response != nil {
@@ -179,7 +167,6 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		ctx:        streamCtx,
 		cancel:     cancel,
 		events:     make(chan runtimepkg.ProviderEvent, a.eventBuffer),
-		apiKey:     credential.Value,
 		model:      model,
 		voice:      voice,
 		language:   language,
@@ -191,11 +178,9 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		// same session unattributable.
 		clientReferenceID: reservationReference(request.Plan),
 	}
-	if _, err := stream.startStream(ctx); err != nil {
-		cancel()
-		_ = conn.CloseNow()
-		return nil, err
-	}
+	// No stream starts here. The handshake authenticates the connection, and
+	// Soniox ends a started stream that receives no text within a few seconds
+	// with request_timeout, so the first AppendText starts the first stream.
 	go stream.readLoop()
 	return stream, nil
 }
@@ -217,13 +202,21 @@ type ttsStream struct {
 	cancel context.CancelFunc
 	events chan runtimepkg.ProviderEvent
 
-	apiKey            string
 	model             string
 	voice             string
 	language          string
 	sampleRate        int
 	clientReferenceID string
 
+	// sendMu orders every decide-then-write sequence. The caller's
+	// AppendText and the read loop starting a queued stream both put frames
+	// on the socket, and a stream's start must reach Soniox before its text,
+	// and its text before its text_end, whichever goroutine sends them.
+	sendMu sync.Mutex
+	// eventsMu orders events emitted on a caller's goroutine (CommitText)
+	// against readLoop closing events; eventsClosed is set under it.
+	eventsMu     sync.RWMutex
+	eventsClosed bool
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
 	abortOnce    sync.Once
@@ -231,16 +224,49 @@ type ttsStream struct {
 	closing      atomic.Bool
 	closeErr     error
 
-	stateMu      sync.Mutex
-	streamID     string
-	streamDone   chan struct{}
-	textEnded    bool
+	stateMu   sync.Mutex
+	utterance *ttsUtterance
+	requestID string
+	// canceledStreamID is the last stream Cancel targeted. A cancel can
+	// cross that stream's terminated on the wire, and Soniox then rejects it
+	// as addressed to an unknown stream.
+	canceledStreamID string
+}
+
+// ttsUtterance is the caller's unit of speech: everything appended between
+// one CommitText and the next. Soniox caps one stream at two minutes of audio,
+// so an utterance longer than ttsStreamTextBudget is spread over several
+// Soniox streams run back to back on this socket, one at a time. The runtime
+// sees one utterance: one audio.started, frames in order, alignment measured
+// from the utterance's first sample, and one audio.done when its last stream
+// terminates.
+type ttsUtterance struct {
+	done chan struct{}
+
+	committed    bool
+	canceled     bool
 	audioStarted bool
-	requestID    string
-	// textBytes is the running total this stream has sent, against the
-	// vendor's accumulated-buffer cap. It resets with the stream, not with
-	// the chunk.
-	textBytes int
+	// pending is text accepted for this utterance that no stream carries
+	// yet, because the active stream is full and has been sent text_end. It
+	// never starts with whitespace.
+	pending string
+	// queued holds appends that arrive while the active stream is closed for
+	// input. They are joined onto pending once, when the next stream starts,
+	// so a long reply arriving in small chunks is not recopied per append.
+	queued []string
+	// priorAudioBytes is the PCM this utterance's finished streams produced.
+	// Soniox times each stream from its own first sample, so it is the
+	// offset that places the active stream's timestamps on the utterance.
+	priorAudioBytes int64
+	lastStreamID    string
+
+	// The active Soniox stream. streamID is empty only between the
+	// utterance's last stream terminating and the utterance completing.
+	streamID         string
+	textEnded        bool
+	streamCost       int
+	streamBoundary   ttsBoundary
+	streamAudioBytes int64
 }
 
 func (s *ttsStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -251,81 +277,117 @@ func (s *ttsStream) WriteAudio(context.Context, []byte) error {
 
 func (s *ttsStream) CommitAudio(context.Context) error { return runtimepkg.ErrUnsupportedOperation }
 
-// reserveTextBytes charges one chunk against this stream's accumulated input
-// budget, refusing it if the running total would pass the vendor's cap.
-//
-// The refusal is a ProviderError rather than a bare error so the relay
-// classifies it as the caller's mistake and says how to fix it: the same
-// input against the provider produces an opaque failure partway through
-// synthesis, which reads as a relay fault and tells the caller nothing.
-//
-// The budget is charged BEFORE the socket work, so an over-budget request
-// costs no provider round trip.
-func (s *ttsStream) reserveTextBytes(text string) error {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	pending := s.textBytes + len(text)
-	if pending > ttsMaxTextBytes {
-		return &runtimepkg.ProviderError{
-			Code:      "invalid_request",
-			Message:   fmt.Sprintf("soniox tts accepts at most %d bytes of text per utterance", ttsMaxTextBytes),
-			Hint:      fmt.Sprintf("Send at most %d bytes of text per utterance; Soniox counts the whole utterance, so splitting it across appends does not raise the limit.", ttsMaxTextBytes),
-			Retryable: false,
-		}
-	}
-	s.textBytes = pending
-	return nil
-}
-
-// AppendText sends one text chunk for the active stream. A stream that already
-// received text_end is closed for input, so a new one is started first.
+// AppendText adds text to the current utterance, starting one if none is in
+// flight. Text never fails for length: whatever does not fit the active
+// stream's budget waits for the next stream of the same utterance.
 func (s *ttsStream) AppendText(ctx context.Context, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("soniox tts text is empty")
 	}
-	if err := s.reserveTextBytes(text); err != nil {
-		return err
-	}
-	streamID, needsStart, err := s.currentOrNewStream()
-	if err != nil {
-		return err
-	}
-	if needsStart {
-		if streamID, err = s.startStream(ctx); err != nil {
-			return err
-		}
-	}
-	return s.writeJSON(ctx, ttsTextRequest{Text: text, TextEnd: false, StreamID: streamID})
-}
-
-// CommitText closes the stream for input with the documented end-of-input
-// marker: an empty text chunk carrying text_end. Soniox's own reference client
-// sends exactly this after its last real chunk.
-func (s *ttsStream) CommitText(ctx context.Context) error {
-	streamID, err := s.markTextEnded()
-	if err != nil {
-		return err
-	}
-	return s.writeJSON(ctx, ttsTextRequest{Text: "", TextEnd: true, StreamID: streamID})
-}
-
-// Cancel stops generation for the active stream. Soniox rejects a cancel that
-// also carries text or text_end, so it is sent on its own; the server answers
-// with terminated and sends no further audio.
-func (s *ttsStream) Cancel(ctx context.Context) error {
-	streamID, ok := s.activeStream()
-	if !ok {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	s.stateMu.Lock()
+	if s.closed.Load() || s.closing.Load() {
+		s.stateMu.Unlock()
 		return runtimepkg.ErrSessionClosed
 	}
+	utterance := s.utterance
+	if utterance != nil && (utterance.committed || utterance.canceled) {
+		s.stateMu.Unlock()
+		return errors.New("soniox tts stream is closed for input until it terminates")
+	}
+	if utterance == nil {
+		utterance = &ttsUtterance{done: make(chan struct{})}
+		s.utterance = utterance
+	}
+	if utterance.textEnded {
+		utterance.queued = append(utterance.queued, text)
+		s.stateMu.Unlock()
+		return nil
+	}
+	utterance.pending += text
+	messages, err := s.planLocked(utterance)
+	s.stateMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.send(ctx, messages)
+}
+
+// CommitText ends the utterance's input with the documented end-of-input
+// marker, an empty text chunk carrying text_end, which Soniox's own reference
+// client sends after its last real chunk. When the utterance has rolled over
+// and text is still queued, the marker goes to the utterance's last stream
+// once the read loop starts it.
+func (s *ttsStream) CommitText(ctx context.Context) error {
+	s.sendMu.Lock()
+	s.stateMu.Lock()
+	utterance := s.utterance
+	if s.closed.Load() || s.closing.Load() || (utterance != nil && (utterance.committed || utterance.canceled)) {
+		s.stateMu.Unlock()
+		s.sendMu.Unlock()
+		return runtimepkg.ErrSessionClosed
+	}
+	if utterance == nil {
+		// A commit with no text: nothing to synthesize, so no Soniox stream
+		// is opened (one with no text would end in request_timeout). The
+		// caller gets the same audio.done an empty stream used to produce.
+		s.stateMu.Unlock()
+		s.sendMu.Unlock()
+		return s.emitFromCaller(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.ttsStreamData("")})
+	}
+	utterance.committed = true
+	messages, err := s.planLocked(utterance)
+	// Unreachable while the invariants hold: a stream that ends early always
+	// leaves text queued for the next one. Completing here keeps a broken
+	// invariant from leaving Close waiting forever.
+	complete := err == nil && utterance.streamID == "" && utterance.pending == ""
+	if complete {
+		s.completeLocked(utterance)
+	}
+	s.stateMu.Unlock()
+	if err == nil {
+		err = s.send(ctx, messages)
+	}
+	s.sendMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if complete {
+		return s.emitFromCaller(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.ttsStreamData(utterance.lastStreamID)})
+	}
+	return nil
+}
+
+// Cancel stops the utterance: the active stream is canceled and text queued
+// for its later streams is dropped. Soniox rejects a cancel that also carries
+// text or text_end, so it is sent on its own; the server answers with
+// terminated and sends no further audio.
+func (s *ttsStream) Cancel(ctx context.Context) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	s.stateMu.Lock()
+	utterance := s.utterance
+	if utterance == nil || utterance.streamID == "" {
+		s.stateMu.Unlock()
+		return runtimepkg.ErrSessionClosed
+	}
+	utterance.canceled = true
+	utterance.pending = ""
+	utterance.queued = nil
+	streamID := utterance.streamID
+	s.canceledStreamID = streamID
+	s.stateMu.Unlock()
 	return s.writeJSON(ctx, map[string]any{"stream_id": streamID, "cancel": true})
 }
 
-// Close waits for the active stream's terminated event before closing the
-// socket, so audio still in flight after CommitText is not discarded.
+// Close waits for the utterance in flight, every queued stream of it
+// included, before closing the socket, so audio still owed after CommitText
+// is not discarded.
 func (s *ttsStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
 		s.closing.Store(true)
-		if done := s.activeDone(); done != nil {
+		if done := s.utteranceDone(); done != nil {
 			select {
 			case <-done:
 			case <-ctx.Done():
@@ -355,110 +417,204 @@ func (s *ttsStream) abort() error {
 		if err := s.conn.CloseNow(); err != nil && s.closeErr == nil {
 			s.closeErr = err
 		}
-		s.finishStream("")
+		s.dropUtterance()
 	})
 	return s.closeErr
 }
 
-// startStream allocates a stream id and sends the start message that both
-// authenticates the connection and configures the new stream.
-func (s *ttsStream) startStream(ctx context.Context) (string, error) {
-	streamID, err := newStreamID()
-	if err != nil {
-		return "", err
+// planLocked moves the utterance's queued text onto Soniox streams and
+// returns the frames that do it, in wire order. It starts a stream when none
+// is active, fills the active stream up to ttsStreamTextBudget, and when the
+// text does not fit, sends what does and ends the stream with text_end; the
+// rest stays queued until that stream terminates, because audio must reach
+// the caller in order and this adapter runs one Soniox stream at a time.
+//
+// Called with stateMu held, and under sendMu so the frames are written before
+// anyone plans further.
+func (s *ttsStream) planLocked(utterance *ttsUtterance) ([]any, error) {
+	var messages []any
+	// Queued appends join once a stream can take them: when the next
+	// stream is about to start, or the active one is still open for input.
+	if len(utterance.queued) > 0 && (utterance.streamID == "" || !utterance.textEnded) {
+		utterance.pending = strings.TrimLeftFunc(utterance.pending+strings.Join(utterance.queued, ""), unicode.IsSpace)
+		utterance.queued = nil
 	}
+	for {
+		if utterance.streamID == "" {
+			if utterance.canceled || utterance.pending == "" {
+				return messages, nil
+			}
+			streamID, err := newStreamID()
+			if err != nil {
+				return nil, err
+			}
+			utterance.streamID = streamID
+			utterance.textEnded = false
+			utterance.streamCost = 0
+			utterance.streamBoundary = ttsBoundaryNone
+			utterance.streamAudioBytes = 0
+			// Every stream carries the reservation reference: Soniox writes
+			// one usage-log entry per stream, so a rolled-over utterance is
+			// several entries, and each must be attributable.
+			messages = append(messages, ttsStartRequest{
+				StreamID:          streamID,
+				Model:             s.model,
+				Language:          s.language,
+				Voice:             s.voice,
+				AudioFormat:       "pcm_s16le",
+				SampleRate:        s.sampleRate,
+				ClientReferenceID: s.clientReferenceID,
+				ReturnTimestamps:  true,
+			})
+		}
+		if utterance.textEnded {
+			return messages, nil
+		}
+		if utterance.pending == "" {
+			if utterance.committed {
+				messages = append(messages, ttsTextRequest{Text: "", TextEnd: true, StreamID: utterance.streamID})
+				utterance.textEnded = true
+			}
+			return messages, nil
+		}
+		head, tail, roll := ttsSplitForStream(utterance.pending, utterance.streamCost, utterance.streamBoundary, utterance.committed)
+		if head != "" {
+			messages = append(messages, ttsTextRequest{Text: head, StreamID: utterance.streamID})
+			utterance.streamCost += ttsTextCost(head)
+			utterance.streamBoundary = ttsBoundaryAfter(utterance.streamBoundary, head)
+		}
+		utterance.pending = tail
+		if !roll {
+			continue
+		}
+		messages = append(messages, ttsTextRequest{Text: "", TextEnd: true, StreamID: utterance.streamID})
+		utterance.textEnded = true
+		return messages, nil
+	}
+}
+
+func (s *ttsStream) send(ctx context.Context, messages []any) error {
+	for _, message := range messages {
+		if err := s.writeJSON(ctx, message); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// streamTerminated handles Soniox's terminated for streamID. The stream's
+// audio is complete. If the utterance still has text queued, its next stream
+// starts now; otherwise the utterance is complete and the caller is told so,
+// exactly once.
+func (s *ttsStream) streamTerminated(streamID string, raw json.RawMessage) error {
+	s.sendMu.Lock()
 	s.stateMu.Lock()
-	if s.streamID != "" {
+	utterance := s.utterance
+	if utterance == nil || utterance.streamID != streamID {
+		// Not a stream this adapter is waiting on; nothing to finish.
 		s.stateMu.Unlock()
-		return "", errors.New("soniox tts stream is already active")
+		s.sendMu.Unlock()
+		return nil
 	}
-	s.streamID = streamID
-	s.streamDone = make(chan struct{})
-	s.textEnded = false
-	s.audioStarted = false
+	utterance.priorAudioBytes += utterance.streamAudioBytes
+	utterance.lastStreamID = streamID
+	utterance.streamID = ""
+	var (
+		messages []any
+		err      error
+	)
+	// A stream that ends without having been sent text_end was canceled or
+	// ended by the server; either way nothing queued behind it is wanted.
+	complete := utterance.canceled || !utterance.textEnded || (utterance.pending == "" && len(utterance.queued) == 0)
+	if complete {
+		s.completeLocked(utterance)
+	} else {
+		messages, err = s.planLocked(utterance)
+	}
 	s.stateMu.Unlock()
-
-	if err := s.writeJSON(ctx, ttsStartRequest{
-		APIKey:            s.apiKey,
-		StreamID:          streamID,
-		Model:             s.model,
-		Language:          s.language,
-		Voice:             s.voice,
-		AudioFormat:       "pcm_s16le",
-		SampleRate:        s.sampleRate,
-		ClientReferenceID: s.clientReferenceID,
-		ReturnTimestamps:  true,
-	}); err != nil {
-		s.finishStream(streamID)
-		return "", err
+	if err == nil {
+		err = s.send(s.ctx, messages)
 	}
-	return streamID, nil
+	s.sendMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if !complete {
+		return nil
+	}
+	return s.emit(runtimepkg.ProviderEvent{
+		Type:       protocol.EventAudioDone,
+		Data:       s.ttsStreamData(streamID),
+		Extensions: ttsExtension(raw),
+	})
 }
 
-// currentOrNewStream reports the active stream id, or asks the caller to start
-// a new one when the previous stream already saw text_end and terminated.
-func (s *ttsStream) currentOrNewStream() (string, bool, error) {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	if s.closed.Load() || s.closing.Load() {
-		return "", false, runtimepkg.ErrSessionClosed
+// completeLocked retires the utterance. Called with stateMu held.
+func (s *ttsStream) completeLocked(utterance *ttsUtterance) {
+	if s.utterance == utterance {
+		s.utterance = nil
 	}
-	if s.streamID == "" {
-		return "", true, nil
-	}
-	if s.textEnded {
-		return "", false, errors.New("soniox tts stream is closed for input until it terminates")
-	}
-	return s.streamID, false, nil
+	close(utterance.done)
 }
 
-func (s *ttsStream) markTextEnded() (string, error) {
+func (s *ttsStream) dropUtterance() {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if s.closed.Load() || s.closing.Load() || s.streamID == "" || s.textEnded {
-		return "", runtimepkg.ErrSessionClosed
+	if s.utterance != nil {
+		s.completeLocked(s.utterance)
 	}
-	s.textEnded = true
-	return s.streamID, nil
 }
 
-func (s *ttsStream) activeStream() (string, bool) {
+func (s *ttsStream) utteranceDone() <-chan struct{} {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	return s.streamID, s.streamID != ""
-}
-
-func (s *ttsStream) activeDone() <-chan struct{} {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	return s.streamDone
-}
-
-func (s *ttsStream) finishStream(streamID string) {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	if s.streamID == "" || (streamID != "" && s.streamID != streamID) {
-		return
+	if s.utterance == nil {
+		return nil
 	}
-	close(s.streamDone)
-	s.streamID = ""
-	s.streamDone = nil
-	s.textEnded = false
-	s.audioStarted = false
-	// The input budget belongs to the stream, so it is released with the
-	// stream id: the next utterance opens a new Soniox stream and gets the
-	// whole cap again.
-	s.textBytes = 0
+	return s.utterance.done
 }
 
-func (s *ttsStream) markAudioStarted(streamID string) bool {
+// observeAudio counts a frame of the active stream's PCM and reports whether
+// it is the first audio of the utterance, which is when audio.started fires:
+// later streams of a rolled-over utterance continue the same audio.
+func (s *ttsStream) observeAudio(streamID string, bytes int) bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if s.streamID != streamID || s.audioStarted {
+	utterance := s.utterance
+	if utterance == nil || utterance.streamID != streamID {
 		return false
 	}
-	s.audioStarted = true
+	utterance.streamAudioBytes += int64(bytes)
+	if utterance.audioStarted {
+		return false
+	}
+	utterance.audioStarted = true
 	return true
+}
+
+// audioOffsetSeconds is where streamID's first sample falls in its
+// utterance's audio.
+func (s *ttsStream) audioOffsetSeconds(streamID string) float64 {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	utterance := s.utterance
+	if utterance == nil || utterance.streamID != streamID || s.sampleRate <= 0 {
+		return 0
+	}
+	// pcm_s16le is two bytes a sample, and Soniox synthesizes mono.
+	return float64(utterance.priorAudioBytes) / float64(2*s.sampleRate)
+}
+
+// isLateCancelRejection reports an error about the stream Cancel last
+// targeted after that stream has terminated: the only thing still addressed
+// to it is the cancel itself.
+func (s *ttsStream) isLateCancelRejection(streamID string) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if streamID == "" || streamID != s.canceledStreamID {
+		return false
+	}
+	return s.utterance == nil || s.utterance.streamID != streamID
 }
 
 func (s *ttsStream) setRequestID(value string) bool {
@@ -505,9 +661,14 @@ func (s *ttsStream) writeJSON(ctx context.Context, value any) error {
 
 func (s *ttsStream) readLoop() {
 	defer func() {
+		// Cancel first: a caller blocked in emitFromCaller then returns and
+		// releases its read lock, so the close below cannot deadlock.
 		s.cancel()
-		s.finishStream("")
+		s.dropUtterance()
+		s.eventsMu.Lock()
+		s.eventsClosed = true
 		close(s.events)
+		s.eventsMu.Unlock()
 	}()
 	for {
 		messageType, payload, err := s.conn.Read(s.ctx)
@@ -545,17 +706,31 @@ func (s *ttsStream) handleMessage(payload []byte) error {
 	raw := json.RawMessage(append([]byte(nil), payload...))
 
 	if message.ErrorType != "" || message.ErrorCode != 0 {
+		if s.isLateCancelRejection(message.StreamID) {
+			// Soniox refused a cancel because the stream had already
+			// terminated on its own; the utterance outcome was decided by
+			// that terminated, and no audio is affected.
+			return nil
+		}
 		// Soniox keeps the connection open and terminates only the failed
-		// stream, but this adapter runs one stream per session, so the failure
-		// is the attempt's failure and the runtime fails it over.
+		// stream, but a failed stream leaves its utterance with a hole in
+		// it, so the failure is the attempt's failure and the runtime fails
+		// it over.
 		code, retryable := sonioxErrorCode(message.ErrorType, message.ErrorCode)
-		return &runtimepkg.ProviderError{
+		providerError := &runtimepkg.ProviderError{
 			Code:           code,
 			Message:        sonioxErrorMessage("Soniox reported a streaming error", message.ErrorMessage),
 			Retryable:      retryable,
 			ProviderStatus: message.ErrorCode,
 			Extensions:     ttsExtension(raw),
 		}
+		if message.ErrorType == "max_audio_duration_reached" {
+			// The adapter budgets each stream well under the cap, so this
+			// means text that speaks far slower than the budget assumes.
+			providerError.Message = sonioxErrorMessage("Soniox truncated the synthesis at its two-minute per-stream audio cap", message.ErrorMessage)
+			providerError.Hint = "Soniox caps each stream at two minutes of audio; this text produced more audio per character than the adapter's per-stream budget allows for. Split it into shorter utterances."
+		}
+		return providerError
 	}
 	if s.setRequestID(message.RequestID) {
 		if err := s.emit(runtimepkg.ProviderEvent{
@@ -567,6 +742,10 @@ func (s *ttsStream) handleMessage(payload []byte) error {
 		}
 	}
 
+	// The offset is read before this frame's bytes are counted: it covers the
+	// utterance's earlier streams only, and Soniox times this frame's
+	// characters from its own stream's first sample.
+	offset := s.audioOffsetSeconds(message.StreamID)
 	if message.Audio != "" {
 		audio, err := base64.StdEncoding.DecodeString(message.Audio)
 		if err != nil {
@@ -577,7 +756,7 @@ func (s *ttsStream) handleMessage(payload []byte) error {
 				Cause:     err,
 			}
 		}
-		if s.markAudioStarted(message.StreamID) {
+		if s.observeAudio(message.StreamID, len(audio)) {
 			if err := s.emit(runtimepkg.ProviderEvent{
 				Type:       protocol.EventAudioStarted,
 				Data:       s.ttsStreamData(message.StreamID),
@@ -598,7 +777,7 @@ func (s *ttsStream) handleMessage(payload []byte) error {
 	if message.Timestamps != nil {
 		if err := s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventAlignment,
-			Data:       s.ttsAlignmentData(message.StreamID, message.Timestamps),
+			Data:       s.ttsAlignmentData(message.StreamID, message.Timestamps, offset),
 			Extensions: ttsExtension(raw),
 		}); err != nil {
 			return err
@@ -606,14 +785,26 @@ func (s *ttsStream) handleMessage(payload []byte) error {
 	}
 	// audio_end only promises that no further audio frames follow; Soniox is
 	// explicit that the stream is complete at terminated, not before, so the
-	// terminal event is bound to terminated alone.
+	// terminal event is bound to terminated alone, and to the utterance's
+	// last stream.
 	if message.Terminated {
-		s.finishStream(message.StreamID)
-		return s.emit(runtimepkg.ProviderEvent{
-			Type:       protocol.EventAudioDone,
-			Data:       s.ttsStreamData(message.StreamID),
-			Extensions: ttsExtension(raw),
-		})
+		return s.streamTerminated(message.StreamID, raw)
+	}
+	return nil
+}
+
+// emitFromCaller is emit for a goroutine other than readLoop. readLoop owns
+// events and closes it on exit, and a send on a closed channel panics even
+// when ctx is also done, so the send happens under eventsMu.
+func (s *ttsStream) emitFromCaller(event runtimepkg.ProviderEvent) error {
+	s.eventsMu.RLock()
+	defer s.eventsMu.RUnlock()
+	if s.eventsClosed || s.ctx.Err() != nil {
+		return runtimepkg.ErrSessionClosed
+	}
+	if err := s.emit(event); err != nil {
+		// The reader exited while this send waited.
+		return runtimepkg.ErrSessionClosed
 	}
 	return nil
 }
@@ -631,14 +822,19 @@ func (s *ttsStream) ttsStreamData(streamID string) json.RawMessage {
 	return sonioxMarshalData(map[string]any{"stream_id": streamID, "provider_request_id": s.currentRequestID()})
 }
 
-// ttsAlignmentData carries Soniox's own timestamps block verbatim and adds
-// the normalized span reading beside it. Soniox measures per CHARACTER and
-// reports start and END times in fractional seconds.
+// ttsAlignmentData carries Soniox's timestamps block and adds the normalized
+// span reading beside it. Soniox measures per CHARACTER and reports start and
+// END times in fractional seconds, from the first sample of its own stream.
+//
+// A rolled-over utterance is several streams, so offsetSeconds, the audio its
+// earlier streams produced, is added to every time in both readings: the
+// caller plays one continuous utterance, and a span must point into it. The
+// unshifted block stays in the raw frame under the extension key.
 //
 // A block that does not parse, or whose three parallel arrays disagree, is
 // carried raw with no spans, so a garbled frame goes out silent rather than
 // wrong.
-func (s *ttsStream) ttsAlignmentData(streamID string, timestamps json.RawMessage) json.RawMessage {
+func (s *ttsStream) ttsAlignmentData(streamID string, timestamps json.RawMessage, offsetSeconds float64) json.RawMessage {
 	payload := map[string]any{
 		"stream_id":            streamID,
 		"character_timestamps": timestamps,
@@ -650,6 +846,15 @@ func (s *ttsStream) ttsAlignmentData(streamID string, timestamps json.RawMessage
 		End        []float64 `json:"character_end_times_seconds"`
 	}
 	if err := json.Unmarshal(timestamps, &block); err == nil {
+		if offsetSeconds > 0 {
+			for index := range block.Start {
+				block.Start[index] += offsetSeconds
+			}
+			for index := range block.End {
+				block.End[index] += offsetSeconds
+			}
+			payload["character_timestamps"] = block
+		}
 		timings := protocol.TimingSpansFromSeconds(block.Characters, block.Start, block.End, protocol.TimingGranularityCharacter)
 		if len(timings.Spans) > 0 {
 			payload["granularity"], payload["spans"] = timings.Granularity, timings.Spans
@@ -671,7 +876,6 @@ func newStreamID() (string, error) {
 }
 
 type ttsStartRequest struct {
-	APIKey      string `json:"api_key"`
 	StreamID    string `json:"stream_id"`
 	Model       string `json:"model"`
 	Language    string `json:"language"`

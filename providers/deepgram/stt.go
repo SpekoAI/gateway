@@ -224,7 +224,7 @@ func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 		// valid here. Its multilingual model accepts repeatable language_hint;
 		// RequestOptions currently exposes one preferred language.
 		if language := strings.TrimSpace(options.Language); language != "" && model == fluxMultilingual {
-			query.Add("language_hint", language)
+			query.Add("language_hint", deepgramLanguage(model, language))
 		}
 		if strings.TrimSpace(reservationID) != "" {
 			query.Add("tag", "speko_reservation:"+reservationID)
@@ -238,8 +238,8 @@ func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 		if delivery != runtimepkg.AudioDeliveryBuffered {
 			query.Set("endpointing", "false")
 		}
-		if strings.TrimSpace(options.Language) != "" {
-			query.Set("language", options.Language)
+		if language := strings.TrimSpace(options.Language); language != "" {
+			query.Set("language", deepgramLanguage(model, language))
 		}
 		if options.STT.Diarize() {
 			// Per-word speaker labels ride the same transcript frames; the

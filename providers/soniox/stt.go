@@ -132,9 +132,9 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, err
 	}
 
-	// No Authorization header: Soniox authenticates the start message, not the
-	// handshake, for managed, BYOK, and relay credentials alike. See doc.go.
-	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: sttHTTPClient(a.httpClient)})
+	// The key rides the handshake's Authorization header for managed, BYOK,
+	// and relay credentials alike. See doc.go.
+	conn, response, err := websocket.Dial(ctx, endpoint, sonioxDialOptions(a.httpClient, credential.Value))
 	if err != nil {
 		status := 0
 		if response != nil {
@@ -152,7 +152,6 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	conn.SetReadLimit(a.maxMessageBytes)
 
 	start := sttStartRequest{
-		APIKey:      credential.Value,
 		Model:       model,
 		AudioFormat: audioFormat,
 		SampleRate:  request.Media.SampleRateHz,
@@ -213,11 +212,20 @@ func sttHTTPClient(client *http.Client) *http.Client {
 // requires relay plans to label their credential relay_access while a relay
 // connector that synthesizes the plan and drives these adapters directly — no
 // Engine, no SessionPlan.Validate — labels the same permanent Soniox key
-// bearer. Both spellings ride the same api_key field of the first JSON
-// message: Soniox has no header-versus-query channel to split on, so nothing
-// else on the relay arm changes.
+// bearer. Both spellings ride the same Authorization header: Soniox has no
+// second channel to split on, so nothing else on the relay arm changes.
 func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.CredentialKind) bool {
 	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
+}
+
+// sonioxDialOptions authenticates the handshake. Soniox deprecated the
+// api_key field of the first message, and refuses a connection that sends
+// its key only there from 2027-01-15; long-lived and temporary keys both
+// work in the Authorization header.
+func sonioxDialOptions(client *http.Client, key string) *websocket.DialOptions {
+	header := make(http.Header, 1)
+	header.Set("Authorization", "Bearer "+key)
+	return &websocket.DialOptions{HTTPClient: sttHTTPClient(client), HTTPHeader: header}
 }
 
 func sttEndpoint(policy upstream.WebSocketPolicy, rawEndpoint string) (string, error) {
@@ -376,7 +384,10 @@ func (s *sttStream) Close(ctx context.Context) error {
 			}
 		}
 		if s.closeErr == nil {
-			if err := s.conn.Write(ctx, websocket.MessageBinary, []byte{}); err != nil {
+			// An empty TEXT frame ends the stream. An empty binary frame is an
+			// empty audio chunk to Soniox: no finished reply, so Close waited
+			// out the idle timeout and Soniox billed the idle tail.
+			if err := s.conn.Write(ctx, websocket.MessageText, []byte{}); err != nil {
 				s.closeErr = err
 			}
 		}
@@ -795,7 +806,6 @@ func sttExtension(raw json.RawMessage) map[string]json.RawMessage {
 }
 
 type sttStartRequest struct {
-	APIKey                  string                `json:"api_key"`
 	Model                   string                `json:"model"`
 	AudioFormat             string                `json:"audio_format"`
 	SampleRate              int                   `json:"sample_rate"`
@@ -897,6 +907,11 @@ func sonioxErrorCode(errorType string, status int) (string, bool) {
 	case "limit_exceeded":
 		return "provider_rate_limited", true
 	case "invalid_request", "invalid_stream_state", "model_not_available", "max_concurrent_streams_reached", "invalid_audio_file", "invalid_cursor":
+		return "invalid_request", false
+	case "max_audio_duration_reached":
+		// TTS only (HTTP 413): the stream hit Soniox's fixed two-minute audio
+		// cap and its output was truncated. Retrying the same text on the
+		// same budget would truncate again, so it is the request's fault.
 		return "invalid_request", false
 	case "request_timeout", "internal_error", "service_unavailable", "max_duration_reached":
 		// max_duration_reached is retryable in the sense Soniox documents:

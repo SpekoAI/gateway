@@ -99,7 +99,7 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	query.Set("smart_format", "true")
 	query.Set("utterances", "true")
 	if language := strings.TrimSpace(request.Options.Language); language != "" {
-		query.Set("language", language)
+		query.Set("language", deepgramLanguage(model, language))
 	} else {
 		query.Set("detect_language", "true")
 	}

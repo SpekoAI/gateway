@@ -194,3 +194,24 @@ func TestBatchReservationReferenceLengthOnWire(t *testing.T) {
 		})
 	}
 }
+
+// The async API takes the realtime socket's language codes, aliases included:
+// Soniox lists Tagalog as tl and Norwegian as no.
+func TestBatchLanguageHintsUseTheRealtimeAliases(t *testing.T) {
+	t.Parallel()
+	for _, testCase := range []struct {
+		language string
+		want     []string
+	}{
+		{"sw-KE", []string{"sw"}},
+		{"fil", []string{"tl"}},
+		{"nb", []string{"no"}},
+		{"", nil},
+		{"auto", nil},
+	} {
+		got := sttLanguageHints(testCase.language)
+		if len(got) != len(testCase.want) || (len(got) == 1 && got[0] != testCase.want[0]) {
+			t.Errorf("sttLanguageHints(%q) = %v, want %v", testCase.language, got, testCase.want)
+		}
+	}
+}

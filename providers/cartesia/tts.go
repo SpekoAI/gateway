@@ -506,6 +506,15 @@ func (s *stream) handleMessage(payload []byte) error {
 	case "flush_done":
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, "flush_done"), Extensions: extension(raw)})
 	case "error":
+		if message.StatusCode == http.StatusBadRequest && (isUnsupportedLanguage(message.Message) || isUnsupportedLanguage(errorText(message.Error))) {
+			return &runtimepkg.ProviderError{
+				Code:           "invalid_request",
+				Message:        fmt.Sprintf("Cartesia model %s does not support language %q", s.modelID, s.language),
+				Hint:           "Choose a Cartesia model that supports this language, or use another TTS provider for it.",
+				Retryable:      false,
+				ProviderStatus: message.StatusCode,
+			}
+		}
 		return &runtimepkg.ProviderError{Code: cartesiaErrorCode(message.StatusCode), Message: cartesiaErrorMessage(message.Message), Retryable: message.StatusCode >= 500, ProviderStatus: message.StatusCode}
 	default:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, message.Type), Extensions: extension(raw)})
@@ -622,6 +631,23 @@ func marshalData(value any) json.RawMessage {
 	return payload
 }
 
+// isUnsupportedLanguage recognizes Cartesia's explicit language refusal, a 400
+// error frame reading "Your request was invalid: unsupported language 'sw'. See
+// …/supported-locales …" (verified live 2026-10-09). The adapter's API version
+// carries it in `message`; older versions put it in `error`, so both are read.
+func isUnsupportedLanguage(text string) bool {
+	return strings.Contains(strings.ToLower(text), "unsupported language")
+}
+
+// errorText reads the error frame's `error` field when it is a plain string.
+func errorText(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return ""
+	}
+	return text
+}
+
 func cartesiaErrorMessage(message string) string {
 	if strings.TrimSpace(message) == "" {
 		return "Cartesia reported a streaming error"
@@ -658,6 +684,7 @@ type inbound struct {
 	StatusCode     int             `json:"status_code"`
 	ContextID      string          `json:"context_id"`
 	Message        string          `json:"message"`
+	Error          json.RawMessage `json:"error"`
 	RequestID      string          `json:"request_id"`
 	WordTimestamps json.RawMessage `json:"word_timestamps"`
 }

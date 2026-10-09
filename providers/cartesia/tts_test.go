@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -425,4 +426,65 @@ func eventTypes(events []runtimepkg.ProviderEvent) []string {
 		types[index] = string(event.Type)
 	}
 	return types
+}
+
+// A 400 error frame naming an unsupported language is a caller error: the same
+// model and language are refused on every retry. Any other 400 keeps its
+// existing classification.
+func TestAdapterMapsUnsupportedLanguageToInvalidRequest(t *testing.T) {
+	t.Parallel()
+	for name, test := range map[string]struct {
+		frame         map[string]any
+		code, message string
+	}{
+		"unsupported language in message": {
+			frame:   map[string]any{"type": "error", "status_code": 400, "done": true, "message": "Your request was invalid: unsupported language 'sw'. See https://docs.cartesia.ai/build-with-cartesia/capability-guides/supported-locales for the accepted codes"},
+			code:    "invalid_request",
+			message: `Cartesia model sonic-3 does not support language "sw"`,
+		},
+		"unsupported language in error": {
+			frame:   map[string]any{"type": "error", "status_code": 400, "done": true, "error": "Invalid request: Your request was invalid: unsupported language 'sw'. See https://docs.cartesia.ai/build-with-cartesia/capability-guides/supported-locales for the accepted codes"},
+			code:    "invalid_request",
+			message: `Cartesia model sonic-3 does not support language "sw"`,
+		},
+		"other bad request": {
+			frame:   map[string]any{"type": "error", "status_code": 400, "done": true, "message": "voice not found"},
+			code:    "provider_unavailable",
+			message: "Cartesia reported a streaming error: voice not found",
+		},
+	} {
+		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+			first, err := readGeneration(ctx, conn)
+			if err != nil {
+				return
+			}
+			test.frame["context_id"] = first.ContextID
+			_ = writeJSON(ctx, conn, test.frame)
+			waitForClientClose(ctx, conn)
+		})
+		adapter, _ := New(testConfig(server.URL))
+		request := adapterRequest(server.URL)
+		request.Options.Language = "sw"
+		stream, err := adapter.Open(context.Background(), request)
+		if err != nil {
+			t.Fatalf("%s: open: %v", name, err)
+		}
+		if err := stream.AppendText(context.Background(), "Habari"); err != nil {
+			t.Fatalf("%s: append: %v", name, err)
+		}
+		var providerErr *runtimepkg.ProviderError
+		for event := range stream.Events() {
+			if event.Err != nil {
+				if !errors.As(event.Err, &providerErr) {
+					t.Fatalf("%s: error = %v, want a provider error", name, event.Err)
+				}
+				break
+			}
+		}
+		_ = stream.Close(context.Background())
+		server.Close()
+		if providerErr == nil || providerErr.Code != test.code || providerErr.Retryable || providerErr.ProviderStatus != 400 || providerErr.Message != test.message {
+			t.Fatalf("%s: error = %+v, want code %s message %q", name, providerErr, test.code, test.message)
+		}
+	}
 }

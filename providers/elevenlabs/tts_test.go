@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -553,5 +554,87 @@ func TestAdapterMapsRawAlignmentToCharacterSpans(t *testing.T) {
 	}
 	if text != "The " {
 		t.Fatalf("spans concatenate to %q, want the source text", text)
+	}
+}
+
+// The multi-stream socket refuses a regional tag (eleven_flash_v2_5 closed
+// `id-ID` with 1008 unsupported_language, verified live 2026-10-09) while the
+// bare `id` synthesizes, so only the primary subtag rides the wire, with the
+// platform's Norwegian and Uzbek aliases.
+func TestMultiContextEndpointSendsPrimaryLanguageCode(t *testing.T) {
+	t.Parallel()
+	adapter, err := New(Config{})
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	media := protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1}
+	for language, want := range map[string]string{
+		"id": "id", "id-ID": "id", "sw": "sw", "sw-KE": "sw", "sw-TZ": "sw", "en-US": "en", "pt_BR": "pt",
+		"fil-PH": "fil", "nb-NO": "no", "nn": "no", "uz": "en", "": "",
+	} {
+		raw, err := multiContextEndpoint(adapter.endpointPolicy, "wss://api.elevenlabs.io/v1/text-to-speech", "eleven_flash_v2_5", protocol.RequestOptions{Voice: "voice-1", Language: language}, media, protocol.RouteProviderDirect, protocol.CredentialsBYOK, "key")
+		if err != nil {
+			t.Fatalf("%q: %v", language, err)
+		}
+		endpoint, _ := url.Parse(raw)
+		got, present := endpoint.Query()["language_code"]
+		if want == "" {
+			if present {
+				t.Fatalf("empty language must not send language_code: %s", raw)
+			}
+			continue
+		}
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("language %q sent language_code %v, want %q", language, got, want)
+		}
+	}
+}
+
+// A language the model does not support is a caller error: retrying the same
+// pair is refused identically, so it must not surface as a retryable outage.
+// ElevenLabs sends an unsupported_language error frame and then closes 1008;
+// either signal alone is recognized.
+func TestAdapterMapsUnsupportedLanguageToInvalidRequest(t *testing.T) {
+	t.Parallel()
+	for name, refuse := range map[string]func(context.Context, *websocket.Conn){
+		"error frame": func(ctx context.Context, conn *websocket.Conn) {
+			_ = writeServerJSON(ctx, conn, map[string]any{"message": "Model 'eleven_flash_v2_5' does not support language_code 'sw'.", "error": "unsupported_language", "code": 1008})
+			_ = conn.Close(websocket.StatusPolicyViolation, "Model 'eleven_flash_v2_5' does not support language_code 'sw'.")
+		},
+		"close reason": func(_ context.Context, conn *websocket.Conn) {
+			_ = conn.Close(websocket.StatusPolicyViolation, "Model 'eleven_flash_v2_5' does not support language_code 'sw'.")
+		},
+	} {
+		server := newMultiContextServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+			if _, err := readClientMessage(ctx, conn); err != nil {
+				return
+			}
+			refuse(ctx, conn)
+		})
+		adapter, _ := New(testConfig(server.URL))
+		request := elevenLabsRequest(server.URL, protocol.CredentialsBYOK)
+		request.Options.Language = "sw-KE"
+		stream, err := adapter.Open(context.Background(), request)
+		if err != nil {
+			t.Fatalf("%s: open: %v", name, err)
+		}
+		if err := stream.AppendText(context.Background(), "Habari"); err != nil {
+			t.Fatalf("%s: append: %v", name, err)
+		}
+		var providerErr *runtimepkg.ProviderError
+		for event := range stream.Events() {
+			if event.Err != nil {
+				if !errors.As(event.Err, &providerErr) {
+					t.Fatalf("%s: error = %v, want a provider error", name, event.Err)
+				}
+				break
+			}
+		}
+		_ = stream.Close(context.Background())
+		server.Close()
+		if providerErr == nil || providerErr.Code != "invalid_request" || providerErr.Retryable ||
+			!strings.Contains(providerErr.Message, "eleven_flash_v2_5") || !strings.Contains(providerErr.Message, `"sw"`) {
+			t.Fatalf("%s: error = %+v, want non-retryable invalid_request naming model and language", name, providerErr)
+		}
 	}
 }
