@@ -212,7 +212,11 @@ type ttsStream struct {
 	// AppendText and the read loop starting a queued stream both put frames
 	// on the socket, and a stream's start must reach Soniox before its text,
 	// and its text before its text_end, whichever goroutine sends them.
-	sendMu       sync.Mutex
+	sendMu sync.Mutex
+	// eventsMu orders events emitted on a caller's goroutine (CommitText)
+	// against readLoop closing events; eventsClosed is set under it.
+	eventsMu     sync.RWMutex
+	eventsClosed bool
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
 	abortOnce    sync.Once
@@ -330,7 +334,7 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		// caller gets the same audio.done an empty stream used to produce.
 		s.stateMu.Unlock()
 		s.sendMu.Unlock()
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.ttsStreamData("")})
+		return s.emitFromCaller(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.ttsStreamData("")})
 	}
 	utterance.committed = true
 	messages, err := s.planLocked(utterance)
@@ -350,7 +354,7 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		return err
 	}
 	if complete {
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.ttsStreamData(utterance.lastStreamID)})
+		return s.emitFromCaller(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.ttsStreamData(utterance.lastStreamID)})
 	}
 	return nil
 }
@@ -657,9 +661,14 @@ func (s *ttsStream) writeJSON(ctx context.Context, value any) error {
 
 func (s *ttsStream) readLoop() {
 	defer func() {
+		// Cancel first: a caller blocked in emitFromCaller then returns and
+		// releases its read lock, so the close below cannot deadlock.
 		s.cancel()
 		s.dropUtterance()
+		s.eventsMu.Lock()
+		s.eventsClosed = true
 		close(s.events)
+		s.eventsMu.Unlock()
 	}()
 	for {
 		messageType, payload, err := s.conn.Read(s.ctx)
@@ -780,6 +789,22 @@ func (s *ttsStream) handleMessage(payload []byte) error {
 	// last stream.
 	if message.Terminated {
 		return s.streamTerminated(message.StreamID, raw)
+	}
+	return nil
+}
+
+// emitFromCaller is emit for a goroutine other than readLoop. readLoop owns
+// events and closes it on exit, and a send on a closed channel panics even
+// when ctx is also done, so the send happens under eventsMu.
+func (s *ttsStream) emitFromCaller(event runtimepkg.ProviderEvent) error {
+	s.eventsMu.RLock()
+	defer s.eventsMu.RUnlock()
+	if s.eventsClosed || s.ctx.Err() != nil {
+		return runtimepkg.ErrSessionClosed
+	}
+	if err := s.emit(event); err != nil {
+		// The reader exited while this send waited.
+		return runtimepkg.ErrSessionClosed
 	}
 	return nil
 }

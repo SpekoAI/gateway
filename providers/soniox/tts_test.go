@@ -1441,3 +1441,40 @@ func TestTTSAppendsWhileAStreamIsFullReachTheNextStreamInOrder(t *testing.T) {
 	}
 	assertOneUtterance(t, stream.Events(), len(streams))
 }
+
+// An empty commit emits audio.done from the caller's goroutine while readLoop
+// may be closing events because Soniox hung up. That must never send on the
+// closed channel: once the reader is gone the commit reports a closed session.
+func TestTTSEmptyCommitRacingADisconnectNeverPanics(t *testing.T) {
+	t.Parallel()
+
+	server := newTTSTestServer(t, func(context.Context, *http.Request, *websocket.Conn) {})
+	defer server.Close()
+	adapter, err := NewTTS(ttsTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), ttsAdapterRequest(server.URL))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer abortStream(stream)
+	go func() {
+		for range stream.Events() {
+		}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := stream.CommitText(context.Background())
+		if errors.Is(err, runtimepkg.ErrSessionClosed) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("commit = %v, want nil or ErrSessionClosed", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the session never reported the disconnect")
+		}
+	}
+}
