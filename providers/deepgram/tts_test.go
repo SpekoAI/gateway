@@ -379,3 +379,42 @@ func deepgramTTSRequest(serverURL string, source protocol.CredentialSource) runt
 		Media:   &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1},
 	}
 }
+
+func TestTTSIdleCancelKeepsTheStreamOpen(t *testing.T) {
+	t.Parallel()
+	server := newSpeakServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		for {
+			_, _, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+
+	adapter, err := NewTTS(testTTSConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), deepgramTTSRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("idle cancellation closed a live session: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "next turn"); err != nil {
+		t.Fatalf("session unusable after idle cancel: %v", err)
+	}
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("buffered text cancellation: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Cancel(context.Background()); !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		t.Fatalf("closed session cancel=%v", err)
+	}
+}
