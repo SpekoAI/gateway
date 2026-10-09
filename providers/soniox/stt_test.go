@@ -46,10 +46,10 @@ func TestSTTStartRequestMatchesDocumentedWireShape(t *testing.T) {
 	defer abortStream(stream)
 
 	start := mustReceiveObject(t, starts)
-	// api_key, not a header and not a query parameter: Soniox authenticates the
-	// first JSON message on an already-open socket.
-	if got := start["api_key"]; got != "customer-soniox-key" {
-		t.Errorf("api_key = %v", got)
+	// The key rides the handshake's Authorization header; the deprecated
+	// api_key field stays off the start message.
+	if got, present := start["api_key"]; present {
+		t.Errorf("start request carried api_key = %v", got)
 	}
 	if got := start["model"]; got != "stt-rt-v5" {
 		t.Errorf("model = %v", got)
@@ -82,9 +82,9 @@ func TestSTTStartRequestMatchesDocumentedWireShape(t *testing.T) {
 	}
 }
 
-// Soniox reads the credential out of api_key for a long-lived key and a
-// temporary key alike, so a managed route must produce the same message shape
-// as a BYOK route. A CredentialSource branch here would be an invented split.
+// Soniox reads the credential out of the Authorization header for a
+// long-lived key and a temporary key alike, so a managed route must open the
+// same connection as a BYOK route. A CredentialSource branch here would be an invented split.
 // The relay rows pin the same invariant for the third route: a relay plan
 // carries the connector's permanent key in the same field, labelled bearer by
 // the plan-synthesizing connector or relay_access by protocol.SessionPlan
@@ -148,17 +148,16 @@ func TestSTTEveryRouteUsesTheSameCredentialField(t *testing.T) {
 			defer abortStream(stream)
 
 			handshake := mustReceiveRequest(t, handshakes)
-			// The secret must never reach the handshake: Soniox has no header
-			// or query auth on this endpoint, so anything here would be a leak.
-			if got := handshake.Header.Get("Authorization"); got != "" {
+			if got := handshake.Header.Get("Authorization"); got != "Bearer "+testCase.credential {
 				t.Errorf("handshake Authorization = %q", got)
 			}
+			// Never the query string, where the secret would reach access logs.
 			if got := handshake.URL.RawQuery; got != "" {
 				t.Errorf("handshake query = %q", got)
 			}
 			start := mustReceiveObject(t, starts)
-			if got := start["api_key"]; got != testCase.credential {
-				t.Errorf("api_key = %v", got)
+			if got, present := start["api_key"]; present {
+				t.Errorf("start request carried api_key = %v", got)
 			}
 			if got := start["client_reference_id"]; got != testCase.wantClientReference {
 				t.Errorf("client_reference_id = %v, want %v", got, testCase.wantClientReference)
@@ -480,8 +479,8 @@ func TestSTTCloseAfterCommitWaitsForFinishedUsage(t *testing.T) {
 			return
 		}
 		messageType, payload, err := conn.Read(ctx)
-		if err != nil || messageType != websocket.MessageBinary || len(payload) != 0 {
-			t.Errorf("close frame = (%v, %q, %v), want empty binary", messageType, payload, err)
+		if err != nil || messageType != websocket.MessageText || len(payload) != 0 {
+			t.Errorf("close frame = (%v, %q, %v), want empty text", messageType, payload, err)
 			return
 		}
 		if err := writeJSONFrame(ctx, conn, map[string]any{
@@ -558,8 +557,8 @@ func TestSTTCloseHandlesFinishedBeforeTheEndFrame(t *testing.T) {
 			return
 		}
 		messageType, payload, err := conn.Read(ctx)
-		if err != nil || messageType != websocket.MessageBinary || len(payload) != 0 {
-			t.Errorf("close frame = (%v, %q, %v), want empty binary", messageType, payload, err)
+		if err != nil || messageType != websocket.MessageText || len(payload) != 0 {
+			t.Errorf("close frame = (%v, %q, %v), want empty text", messageType, payload, err)
 			return
 		}
 		waitForPeer(ctx, conn)
@@ -611,8 +610,8 @@ func TestSTTCloseTimesOutWhenFinishedNeverArrives(t *testing.T) {
 			return
 		}
 		messageType, payload, err := conn.Read(ctx)
-		if err != nil || messageType != websocket.MessageBinary || len(payload) != 0 {
-			t.Errorf("close frame = (%v, %q, %v), want empty binary", messageType, payload, err)
+		if err != nil || messageType != websocket.MessageText || len(payload) != 0 {
+			t.Errorf("close frame = (%v, %q, %v), want empty text", messageType, payload, err)
 			return
 		}
 		waitForPeer(ctx, conn)
@@ -699,7 +698,9 @@ func TestSTTRefusesEmptyAudioAndClosesWithFinalizeThenEmptyFrame(t *testing.T) {
 		t.Fatalf("first close frame = (%v, %q)", first.kind, first.payload)
 	}
 	second := mustReceiveFrame(t, frames)
-	if second.kind != websocket.MessageBinary || len(second.payload) != 0 {
+	// An empty TEXT frame: an empty binary frame is an empty audio chunk to
+	// Soniox and does not end the stream.
+	if second.kind != websocket.MessageText || len(second.payload) != 0 {
 		t.Fatalf("second close frame = (%v, %q)", second.kind, second.payload)
 	}
 	if err := stream.WriteAudio(context.Background(), []byte{1}); !errors.Is(err, runtimepkg.ErrSessionClosed) {

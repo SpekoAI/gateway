@@ -148,8 +148,10 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		"model":                      model,
 		"enable_speaker_diarization": request.Options.STT.Diarize(),
 	}
-	if language := strings.TrimSpace(request.Options.Language); language != "" {
-		creation["language_hints"] = []string{baseLanguage(language)}
+	// The realtime socket's mapping, aliases included: Soniox lists Tagalog
+	// as tl and Norwegian as no, never the platform's fil or nb.
+	if hints := sttLanguageHints(request.Options.Language); len(hints) > 0 {
+		creation["language_hints"] = hints
 	} else {
 		creation["enable_language_identification"] = true
 	}
@@ -335,12 +337,4 @@ func (a *BatchAdapter) deleteQuietly(ctx context.Context, target string, authori
 	// Through batchhttp.Do, never the raw client: the bearer is on this
 	// request too, and only Do refuses the redirect that would replay it.
 	_, _ = batchhttp.Do(a.httpClient, request, 1<<10)
-}
-
-func baseLanguage(tag string) string {
-	tag = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(tag), "_", "-"))
-	if i := strings.IndexByte(tag, '-'); i > 0 {
-		return tag[:i]
-	}
-	return tag
 }

@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
@@ -21,7 +23,7 @@ import (
 // ttsStartRequest, so renaming a struct tag cannot keep the test green. Every
 // key is transcribed from Soniox's TTS WebSocket API reference, where all of
 // stream_id, model, language, voice and audio_format are marked required.
-func TestTTSStartRequestIsSentAtOpenWithTheDocumentedWireShape(t *testing.T) {
+func TestTTSStartRequestIsSentWithTheFirstTextInTheDocumentedWireShape(t *testing.T) {
 	t.Parallel()
 
 	starts := make(chan map[string]any, 1)
@@ -40,18 +42,26 @@ func TestTTSStartRequestIsSentAtOpenWithTheDocumentedWireShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}
-	// Open alone must produce the start message: Soniox closes a connection
-	// that has not authenticated within about ten seconds, and a keepalive does
-	// not authenticate, so it cannot wait for the caller's first AppendText.
+	// The handshake authenticates, so Open sends nothing: Soniox ends a
+	// started stream that receives no text within a few seconds with
+	// request_timeout, so the start message waits for the first text.
 	stream, err := adapter.Open(context.Background(), ttsAdapterRequest(server.URL))
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
 	defer abortStream(stream)
+	select {
+	case start := <-starts:
+		t.Fatalf("Open sent a start message before any text: %v", start)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := stream.AppendText(context.Background(), "Hola."); err != nil {
+		t.Fatalf("append text: %v", err)
+	}
 
 	start := mustReceiveObject(t, starts)
-	if got := start["api_key"]; got != "customer-soniox-key" {
-		t.Errorf("api_key = %v", got)
+	if got, present := start["api_key"]; present {
+		t.Errorf("start request carried api_key = %v", got)
 	}
 	if got := start["model"]; got != "tts-rt-v2" {
 		t.Errorf("model = %v", got)
@@ -262,7 +272,7 @@ func TestTTSStartsAFreshStreamForTheNextUtterance(t *testing.T) {
 	// Soniox refuses to reuse a stream id that is still active and refuses more
 	// text on one that already saw text_end, so the second utterance needs both
 	// a new id and its own start message.
-	if secondStart["api_key"] != "customer-soniox-key" || secondStart["voice"] != "Adrian" {
+	if secondStart["voice"] != "Adrian" {
 		t.Fatalf("second start message = %v", secondStart)
 	}
 	if secondStart["stream_id"] == firstStart["stream_id"] {
@@ -323,10 +333,11 @@ func TestTTSClassifiesDocumentedErrorTypes(t *testing.T) {
 	t.Parallel()
 
 	for _, testCase := range []struct {
-		errorType string
-		errorCode int
-		wantCode  string
-		retryable bool
+		errorType   string
+		errorCode   int
+		wantCode    string
+		retryable   bool
+		wantMessage string
 	}{
 		{errorType: "unauthenticated", errorCode: 401, wantCode: "authentication_failed"},
 		// A temporary key scoped to transcribe_websocket is rejected here: the
@@ -337,6 +348,10 @@ func TestTTSClassifiesDocumentedErrorTypes(t *testing.T) {
 		{errorType: "invalid_request", errorCode: 400, wantCode: "invalid_request"},
 		{errorType: "invalid_stream_state", errorCode: 400, wantCode: "invalid_request"},
 		{errorType: "max_concurrent_streams_reached", errorCode: 400, wantCode: "invalid_request"},
+		// The two-minute per-stream audio cap. The adapter budgets streams
+		// to stay under it, so reaching it means the text speaks slower than
+		// the budget allows for; the same text would truncate again.
+		{errorType: "max_audio_duration_reached", errorCode: 413, wantCode: "invalid_request", wantMessage: "two-minute"},
 		{errorType: "internal_error", errorCode: 500, wantCode: "provider_unavailable", retryable: true},
 		{errorType: "service_unavailable", errorCode: 503, wantCode: "provider_unavailable", retryable: true},
 	} {
@@ -368,6 +383,9 @@ func TestTTSClassifiesDocumentedErrorTypes(t *testing.T) {
 				t.Fatalf("open stream: %v", err)
 			}
 			defer abortStream(stream)
+			if err := stream.AppendText(context.Background(), "Hola."); err != nil {
+				t.Fatalf("append text: %v", err)
+			}
 
 			providerError := awaitProviderError(t, stream.Events())
 			if providerError.Code != testCase.wantCode {
@@ -378,6 +396,9 @@ func TestTTSClassifiesDocumentedErrorTypes(t *testing.T) {
 			}
 			if providerError.ProviderStatus != testCase.errorCode {
 				t.Errorf("provider status = %d", providerError.ProviderStatus)
+			}
+			if !strings.Contains(providerError.Message, testCase.wantMessage) {
+				t.Errorf("message = %q, want it to mention %q", providerError.Message, testCase.wantMessage)
 			}
 			// The message may quote the provider but must never quote the key.
 			if strings.Contains(providerError.Message, "customer-soniox-key") {
@@ -493,13 +514,10 @@ func TestTTSRejectsMismatchedRequestsWithoutLeakingTheCredential(t *testing.T) {
 	}
 }
 
-func TestTTSRefusesTextOutsideTheVendorLimits(t *testing.T) {
+func TestTTSRefusesBlankTextAndAudioInput(t *testing.T) {
 	t.Parallel()
 
 	server := newTTSTestServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
-		if _, err := readJSONObject(ctx, conn); err != nil {
-			return
-		}
 		waitForPeer(ctx, conn)
 	})
 	defer server.Close()
@@ -517,44 +535,6 @@ func TestTTSRefusesTextOutsideTheVendorLimits(t *testing.T) {
 	if err := stream.AppendText(context.Background(), "   "); err == nil {
 		t.Error("blank text must be refused rather than billed as an empty chunk")
 	}
-	// Soniox caps one chunk at 5000 bytes and 400s beyond it, which would
-	// otherwise kill an in-flight utterance.
-	err = stream.AppendText(context.Background(), strings.Repeat("a", 5_001))
-	if err == nil {
-		t.Fatal("a chunk longer than Soniox's documented 5000-byte cap must be refused locally")
-	}
-	// The refusal must name the caller as the party at fault and say how to
-	// fix it. Left to the provider this arrives as an opaque, non-retryable
-	// failure partway through synthesis, which reads as a relay fault.
-	var refusal *runtimepkg.ProviderError
-	if !errors.As(err, &refusal) {
-		t.Fatalf("refusal = %T(%v), want a classified ProviderError", err, err)
-	}
-	if refusal.Code != "invalid_request" || refusal.Retryable {
-		t.Errorf("refusal = %+v, want a non-retryable invalid_request", refusal)
-	}
-	if !strings.Contains(refusal.Hint, "5000") {
-		t.Errorf("hint = %q, want it to name the limit", refusal.Hint)
-	}
-	// The cap is on the stream's ACCUMULATED buffer, so chunking must not
-	// slip past it: this is the failure that otherwise reaches the caller as
-	// an opaque 500 partway through a long render.
-	for i := range 2 {
-		if err := stream.AppendText(context.Background(), strings.Repeat("b", 2_000)); err != nil {
-			t.Fatalf("chunk %d within the accumulated budget = %v", i, err)
-		}
-	}
-	// 4,000 bytes are spoken for; a third 2,000-byte chunk would put the
-	// stream's buffer at 6,000, so it must be refused here rather than at
-	// the provider.
-	if err := stream.AppendText(context.Background(), strings.Repeat("b", 2_000)); err == nil {
-		t.Error("chunked text past the accumulated 5000-byte buffer cap must be refused locally")
-	}
-	// The bound is the accumulated total, not a per-chunk ceiling: a chunk
-	// that still fits must go through.
-	if err := stream.AppendText(context.Background(), strings.Repeat("b", 1_000)); err != nil {
-		t.Errorf("a chunk that still fits the accumulated budget = %v", err)
-	}
 	// This surface consumes text, never audio.
 	if err := stream.WriteAudio(context.Background(), []byte{1}); !errors.Is(err, runtimepkg.ErrUnsupportedOperation) {
 		t.Errorf("write audio = %v", err)
@@ -565,8 +545,8 @@ func TestTTSRefusesTextOutsideTheVendorLimits(t *testing.T) {
 }
 
 // Same assertion as the STT twin, for the other half of the temporary-key
-// scope: TTS also authenticates through api_key in the start message, so the
-// managed, BYOK, and relay paths differ only in the secret they carry. The
+// scope: TTS also authenticates through the handshake's Authorization header,
+// so the managed, BYOK, and relay paths differ only in the secret they carry. The
 // relay rows pin that a relay-synthesized plan opens with either credential
 // spelling — bearer from the plan-synthesizing connector, relay_access from
 // protocol.SessionPlan validation.
@@ -616,16 +596,19 @@ func TestTTSEveryRouteUsesTheSameCredentialField(t *testing.T) {
 				t.Fatalf("open stream: %v", err)
 			}
 			defer abortStream(stream)
+			if err := stream.AppendText(context.Background(), "Hola."); err != nil {
+				t.Fatalf("append text: %v", err)
+			}
 
 			handshake := mustReceiveRequest(t, handshakes)
-			if got := handshake.Header.Get("Authorization"); got != "" {
+			if got := handshake.Header.Get("Authorization"); got != "Bearer "+testCase.credential {
 				t.Errorf("handshake Authorization = %q", got)
 			}
 			if got := handshake.URL.RawQuery; got != "" {
 				t.Errorf("handshake query = %q", got)
 			}
-			if got := mustReceiveObject(t, starts)["api_key"]; got != testCase.credential {
-				t.Errorf("api_key = %v", got)
+			if got, present := mustReceiveObject(t, starts)["api_key"]; present {
+				t.Errorf("start request carried api_key = %v", got)
 			}
 		})
 	}
@@ -686,6 +669,9 @@ func TestTTSStartRequestCarriesTheReservationReference(t *testing.T) {
 				t.Fatalf("open stream: %v", err)
 			}
 			defer abortStream(stream)
+			if err := stream.AppendText(context.Background(), "Hola."); err != nil {
+				t.Fatalf("append text: %v", err)
+			}
 
 			if got := mustReceiveObject(t, starts)["client_reference_id"]; got != testCase.wantClientReference {
 				t.Errorf("client_reference_id = %v, want %v", got, testCase.wantClientReference)
@@ -754,6 +740,568 @@ func TestTTSEveryStreamOnTheSocketCarriesTheReservationReference(t *testing.T) {
 		if got := start["client_reference_id"]; got != "speko_reservation:res_soniox" {
 			t.Errorf("%s start client_reference_id = %v, want %q", name, got, "speko_reservation:res_soniox")
 		}
+	}
+}
+
+// A long utterance is spread over several Soniox streams, one at a time,
+// each well under the two-minute audio cap. The caller sees one utterance:
+// one audio.started, every frame in order, alignment measured from the
+// utterance's first sample, and one audio.done after the last stream.
+func TestTTSRollsALongUtteranceOverSequentialStreams(t *testing.T) {
+	t.Parallel()
+
+	const sentence = "The quick brown fox jumps over the lazy dog near the river bank. "
+	text := strings.Repeat(sentence, 110) // 7,150 bytes
+	fake := newRollingTTSServer(t, true)
+	defer fake.close()
+	stream := openRollingTTSStream(t, fake)
+	defer abortStream(stream)
+
+	if err := stream.AppendText(context.Background(), text); err != nil {
+		t.Fatalf("append long text: %v", err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit long text: %v", err)
+	}
+
+	streams := fake.driveToCompletion(t)
+	if len(streams) < 6 {
+		t.Fatalf("streams = %d, want the 7,150 bytes spread over at least 6", len(streams))
+	}
+	var spoken []string
+	for index, wire := range streams {
+		if wire.start["client_reference_id"] != "speko_reservation:res_soniox" {
+			t.Errorf("stream %d start client_reference_id = %v", index, wire.start["client_reference_id"])
+		}
+		if cost := ttsTextCost(wire.text()); cost > ttsStreamTextBudget {
+			t.Errorf("stream %d carried %d cost units, budget %d", index, cost, ttsStreamTextBudget)
+		}
+		if !wire.ended {
+			t.Errorf("stream %d was never sent text_end", index)
+		}
+		// Sentence-only input must be cut at sentence ends.
+		if got := strings.TrimSpace(wire.text()); !strings.HasSuffix(got, ".") {
+			t.Errorf("stream %d ends mid-sentence: ...%q", index, got[max(0, len(got)-20):])
+		}
+		spoken = append(spoken, wire.text())
+	}
+	if got, want := strings.Join(strings.Fields(strings.Join(spoken, " ")), " "), strings.Join(strings.Fields(text), " "); got != want {
+		t.Fatalf("streams did not carry the utterance's text exactly once, in order")
+	}
+	assertOneUtterance(t, stream.Events(), len(streams))
+}
+
+// An LLM streams a word at a time. Past the soft budget the next sentence end
+// rolls the stream over, so the hard budget does not land mid-sentence.
+func TestTTSRollsTokenStreamsAtSentenceEnds(t *testing.T) {
+	t.Parallel()
+
+	fake := newRollingTTSServer(t, false)
+	defer fake.close()
+	stream := openRollingTTSStream(t, fake)
+	defer abortStream(stream)
+
+	var words []string
+	for range 90 {
+		words = append(words, strings.Fields("Soniox speaks this sentence aloud, one token at a time, for the test.")...)
+	}
+	for index, word := range words {
+		token := word
+		if index > 0 {
+			token = " " + word
+		}
+		if err := stream.AppendText(context.Background(), token); err != nil {
+			t.Fatalf("append token %d: %v", index, err)
+		}
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	streams := fake.driveToCompletion(t)
+	if len(streams) < 3 {
+		t.Fatalf("streams = %d, want the token stream spread over at least 3", len(streams))
+	}
+	var spoken []string
+	for index, wire := range streams {
+		if cost := ttsTextCost(wire.text()); cost > ttsStreamTextBudget {
+			t.Errorf("stream %d carried %d cost units, budget %d", index, cost, ttsStreamTextBudget)
+		}
+		if got := strings.TrimSpace(wire.text()); !strings.HasSuffix(got, ".") {
+			t.Errorf("stream %d ends mid-sentence: ...%q", index, got[max(0, len(got)-20):])
+		}
+		spoken = append(spoken, wire.text())
+	}
+	if got, want := strings.Join(strings.Fields(strings.Join(spoken, " ")), " "), strings.Join(words, " "); got != want {
+		t.Fatalf("streams did not carry the token stream exactly once, in order")
+	}
+	assertOneUtterance(t, stream.Events(), len(streams))
+}
+
+// Text with no punctuation and no whitespace still splits, only on rune
+// boundaries and never between a base letter and its combining mark.
+func TestTTSSplitsUnbrokenTextOnRuneBoundaries(t *testing.T) {
+	t.Parallel()
+
+	for name, text := range map[string]string{
+		"two-byte runes":  strings.Repeat("ñ", 3_000),
+		"combining marks": strings.Repeat("é", 2_000),
+		"ideographs":      strings.Repeat("語", 2_000),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newRollingTTSServer(t, false)
+			defer fake.close()
+			stream := openRollingTTSStream(t, fake)
+			defer abortStream(stream)
+
+			if err := stream.AppendText(context.Background(), text); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+			if err := stream.CommitText(context.Background()); err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+			streams := fake.driveToCompletion(t)
+			if len(streams) < 2 {
+				t.Fatalf("streams = %d, want the text split", len(streams))
+			}
+			var joined strings.Builder
+			for index, wire := range streams {
+				chunk := wire.text()
+				if !utf8.ValidString(chunk) {
+					t.Fatalf("stream %d text is not valid UTF-8", index)
+				}
+				if first, _ := utf8.DecodeRuneInString(chunk); first == '́' {
+					t.Fatalf("stream %d starts with a combining mark split from its letter", index)
+				}
+				if cost := ttsTextCost(chunk); cost > ttsStreamTextBudget {
+					t.Errorf("stream %d carried %d cost units, budget %d", index, cost, ttsStreamTextBudget)
+				}
+				joined.WriteString(chunk)
+			}
+			if joined.String() != text {
+				t.Fatal("the streams did not carry the text exactly")
+			}
+			assertOneUtterance(t, stream.Events(), len(streams))
+		})
+	}
+}
+
+// Cancel stops the active stream and drops the utterance's queued streams;
+// the next utterance starts cleanly on the same socket.
+func TestTTSCancelDropsQueuedStreams(t *testing.T) {
+	t.Parallel()
+
+	fake := newRollingTTSServer(t, true)
+	defer fake.close()
+	stream := openRollingTTSStream(t, fake)
+	defer abortStream(stream)
+
+	if err := stream.AppendText(context.Background(), strings.Repeat("One more sentence that keeps the stream busy. ", 150)); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	first := fake.nextStream(t)
+	if !first.ended {
+		t.Fatal("the first stream must be full and ended before the rest is queued")
+	}
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	cancel := fake.next(t)
+	if cancel["cancel"] != true || cancel["stream_id"] != first.id {
+		t.Fatalf("cancel message = %v", cancel)
+	}
+	done := collectEvents(t, stream.Events(), 1)
+	if done[0].Type != protocol.EventAudioDone {
+		t.Fatalf("event after cancel = %s", done[0].Type)
+	}
+	if message, ok := fake.tryNext(150 * time.Millisecond); ok {
+		t.Fatalf("queued text reached Soniox after Cancel: %v", message)
+	}
+
+	if err := stream.AppendText(context.Background(), "Hola."); err != nil {
+		t.Fatalf("append after cancel: %v", err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit after cancel: %v", err)
+	}
+	next := fake.nextStream(t)
+	if next.id == first.id || next.text() != "Hola." || !next.ended {
+		t.Fatalf("next utterance stream = %+v", next)
+	}
+	fake.release <- struct{}{}
+	events := collectEvents(t, stream.Events(), 4)
+	if got := strings.Join(eventTypeNames(events), ","); got != "audio.started,audio.frame,alignment,audio.done" {
+		t.Fatalf("next utterance events = %s", got)
+	}
+}
+
+// Close waits for every queued stream of the utterance, not just the active
+// one, so a rolled-over utterance is not cut short.
+func TestTTSCloseWaitsForQueuedStreams(t *testing.T) {
+	t.Parallel()
+
+	fake := newRollingTTSServer(t, true)
+	defer fake.close()
+	stream := openRollingTTSStream(t, fake)
+	defer abortStream(stream)
+
+	if err := stream.AppendText(context.Background(), strings.Repeat("Close must not cut this utterance short. ", 100)); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- stream.Close(context.Background()) }()
+	go func() {
+		for range stream.Events() {
+		}
+	}()
+
+	streams := 0
+	for {
+		fake.nextStream(t)
+		streams++
+		select {
+		case err := <-closed:
+			t.Fatalf("Close returned %v with stream %d still synthesizing", err, streams)
+		default:
+		}
+		fake.release <- struct{}{}
+		if _, more := fake.peek(150 * time.Millisecond); !more {
+			break
+		}
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after the last stream terminated")
+	}
+	if streams < 3 {
+		t.Fatalf("streams = %d, want the utterance rolled over", streams)
+	}
+}
+
+func TestTTSSplitPrefersSentenceThenClauseThenSpace(t *testing.T) {
+	t.Parallel()
+
+	filler := strings.Repeat("x", ttsStreamTextBudget-100)
+	for _, testCase := range []struct {
+		name     string
+		text     string
+		wantHead string
+	}{
+		{name: "latin sentence", text: filler + " One. Two, three four " + strings.Repeat("y", 200), wantHead: filler + " One."},
+		{name: "clause", text: filler + " one, two three " + strings.Repeat("y", 200), wantHead: filler + " one,"},
+		{name: "space", text: filler + " one two " + strings.Repeat("y", 200), wantHead: filler + " one two"},
+		{name: "decimal is not a sentence end", text: filler + " pi is 3.14 then " + strings.Repeat("y", 200), wantHead: filler + " pi is 3.14 then"},
+		{name: "quoted sentence", text: filler + ` he said "stop." Then ` + strings.Repeat("y", 200), wantHead: filler + ` he said "stop."`},
+		{name: "arabic question", text: filler + " هل أنت هنا؟ نعم " + strings.Repeat("y", 200), wantHead: filler + " هل أنت هنا؟"},
+		{name: "cjk sentence without spaces", text: filler + "你好。再见" + strings.Repeat("y", 200), wantHead: filler + "你好。"},
+		{name: "devanagari danda", text: filler + " नमस्ते। फिर " + strings.Repeat("y", 200), wantHead: filler + " नमस्ते।"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			head, tail, roll := ttsSplitForStream(testCase.text, 0, ttsBoundaryNone, false)
+			if !roll || head != testCase.wantHead {
+				t.Fatalf("head = ...%q roll=%v, want ...%q", head[max(0, len(head)-30):], roll, testCase.wantHead[max(0, len(testCase.wantHead)-30):])
+			}
+			if strings.TrimSpace(head+" "+tail) != strings.TrimSpace(testCase.text) && head+tail != testCase.text {
+				t.Fatalf("split lost text")
+			}
+		})
+	}
+
+	// A stream that already ends a sentence is cut before the next token.
+	head, tail, roll := ttsSplitForStream(" Next words", ttsStreamTextBudget-3, ttsBoundarySentence, false)
+	if !roll || head != "" || tail != "Next words" {
+		t.Fatalf("token at a full stream = (%q, %q, %v)", head, tail, roll)
+	}
+	// Text that fits and is final is never split early.
+	if head, tail, roll := ttsSplitForStream("Short. Text.", 0, ttsBoundaryNone, true); roll || head != "Short. Text." || tail != "" {
+		t.Fatalf("fitting final text = (%q, %q, %v)", head, tail, roll)
+	}
+}
+
+// --- rolling fake server ---------------------------------------------------
+
+// rollingTTSServer is a fake Soniox TTS socket that enforces the adapter's
+// one-stream-at-a-time contract: a start while another stream is still
+// active is a test failure. For each stream that receives text_end it sends
+// one audio frame (with a single-character alignment block timed from the
+// stream's own start, as Soniox does), audio_end, then terminated. With hold
+// set, terminated waits for a token on release.
+type rollingTTSServer struct {
+	t        *testing.T
+	server   *httptest.Server
+	request  runtimepkg.AdapterRequest
+	messages chan map[string]any
+	release  chan struct{}
+	stop     chan struct{}
+	hold     bool
+	// peeked is a message read ahead of its turn by tryNext.
+	peeked map[string]any
+}
+
+// rollingTTSFrameBytes is each stream's audio: 100 ms at 24 kHz pcm_s16le.
+const rollingTTSFrameBytes = 4_800
+
+type rollingWireStream struct {
+	id    string
+	start map[string]any
+	texts []string
+	ended bool
+}
+
+func (w rollingWireStream) text() string { return strings.Join(w.texts, "") }
+
+func newRollingTTSServer(t *testing.T, hold bool) *rollingTTSServer {
+	t.Helper()
+	fake := &rollingTTSServer{
+		t:        t,
+		messages: make(chan map[string]any, 4_096),
+		release:  make(chan struct{}),
+		stop:     make(chan struct{}),
+		hold:     hold,
+	}
+	fake.server = newTTSTestServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		var (
+			mu       sync.Mutex
+			active   string
+			canceled = map[string]chan struct{}{}
+			index    = 0
+		)
+		write := func(value any) {
+			mu.Lock()
+			defer mu.Unlock()
+			_ = writeJSONFrame(ctx, conn, value)
+		}
+		for {
+			message, err := readJSONObject(ctx, conn)
+			if err != nil {
+				return
+			}
+			fake.messages <- message
+			streamID, _ := message["stream_id"].(string)
+			switch {
+			case message["model"] != nil:
+				mu.Lock()
+				if active != "" {
+					t.Errorf("stream %s started while %s was still active", streamID, active)
+				}
+				active = streamID
+				mu.Unlock()
+			case message["cancel"] == true:
+				mu.Lock()
+				if gone, ok := canceled[streamID]; ok {
+					close(gone)
+				} else {
+					canceled[streamID] = closedChannel()
+				}
+				if active == streamID {
+					active = ""
+				}
+				mu.Unlock()
+				write(map[string]any{"stream_id": streamID, "terminated": true})
+			case message["text_end"] == true:
+				frameIndex := index
+				index++
+				gone := make(chan struct{})
+				mu.Lock()
+				canceled[streamID] = gone
+				mu.Unlock()
+				go func() {
+					if fake.hold {
+						select {
+						case <-fake.release:
+						case <-gone:
+							return
+						case <-fake.stop:
+							return
+						}
+					}
+					audio := make([]byte, rollingTTSFrameBytes)
+					audio[0] = byte(frameIndex)
+					write(map[string]any{
+						"stream_id": streamID,
+						"audio":     base64.StdEncoding.EncodeToString(audio),
+						"timestamps": map[string]any{
+							"characters":                    []string{"a"},
+							"character_start_times_seconds": []float64{0},
+							"character_end_times_seconds":   []float64{0.05},
+						},
+					})
+					write(map[string]any{"stream_id": streamID, "audio": "", "audio_end": true})
+					mu.Lock()
+					if active == streamID {
+						active = ""
+					}
+					mu.Unlock()
+					write(map[string]any{"stream_id": streamID, "terminated": true})
+				}()
+			}
+		}
+	})
+	fake.request = ttsAdapterRequest(fake.server.URL)
+	fake.request.Plan.Execution.ProviderRoute = protocol.RouteSpekoRelay
+	return fake
+}
+
+func closedChannel() chan struct{} {
+	channel := make(chan struct{})
+	close(channel)
+	return channel
+}
+
+func (f *rollingTTSServer) close() {
+	close(f.stop)
+	f.server.Close()
+}
+
+func openRollingTTSStream(t *testing.T, fake *rollingTTSServer) runtimepkg.ProviderStream {
+	t.Helper()
+	adapter, err := NewTTS(ttsTestConfig(fake.server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), fake.request)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	return stream
+}
+
+// nextStream reads one stream's frames: its start, its text, and its
+// text_end. A stream whose text_end is an empty marker after text that did
+// not fill the budget is the utterance's final one; the rest are rollovers.
+func (f *rollingTTSServer) nextStream(t *testing.T) rollingWireStream {
+	t.Helper()
+	start := f.next(t)
+	if start["model"] == nil {
+		t.Fatalf("expected a start message, got %v", start)
+	}
+	wire := rollingWireStream{id: start["stream_id"].(string), start: start}
+	for !wire.ended {
+		message := f.next(t)
+		if message["stream_id"] != wire.id {
+			t.Fatalf("message for %v interleaved into stream %s: %v", message["stream_id"], wire.id, message)
+		}
+		if message["model"] != nil || message["cancel"] != nil {
+			t.Fatalf("unexpected message inside stream %s: %v", wire.id, message)
+		}
+		text, _ := message["text"].(string)
+		if text != "" {
+			wire.texts = append(wire.texts, text)
+		}
+		wire.ended = message["text_end"] == true
+	}
+	// Nothing for a later stream may arrive before this one terminates.
+	if f.hold {
+		if message, ok := f.tryNext(50 * time.Millisecond); ok {
+			t.Fatalf("Soniox received %v before stream %s terminated", message, wire.id)
+		}
+	}
+	return wire
+}
+
+func (f *rollingTTSServer) next(t *testing.T) map[string]any {
+	t.Helper()
+	if message, ok := f.tryNext(2 * time.Second); ok {
+		return message
+	}
+	t.Fatal("timed out waiting for a provider message")
+	return nil
+}
+
+// tryNext returns the next client message, or false after wait. A message it
+// returns stays readable by the next call when peek is used.
+func (f *rollingTTSServer) tryNext(wait time.Duration) (map[string]any, bool) {
+	if f.peeked != nil {
+		message := f.peeked
+		f.peeked = nil
+		return message, true
+	}
+	select {
+	case message := <-f.messages:
+		return message, true
+	case <-time.After(wait):
+		return nil, false
+	}
+}
+
+func (f *rollingTTSServer) peek(wait time.Duration) (map[string]any, bool) {
+	message, ok := f.tryNext(wait)
+	if ok {
+		f.peeked = message
+	}
+	return message, ok
+}
+
+// driveToCompletion reads every stream of one utterance, releasing each one's
+// terminated in turn, until no further stream starts.
+func (f *rollingTTSServer) driveToCompletion(t *testing.T) []rollingWireStream {
+	t.Helper()
+	var streams []rollingWireStream
+	for {
+		wire := f.nextStream(t)
+		streams = append(streams, wire)
+		if f.hold {
+			f.release <- struct{}{}
+		}
+		message, ok := f.peek(150 * time.Millisecond)
+		if !ok {
+			return streams
+		}
+		// A start for the next stream exists; nextStream will read it.
+		if message["model"] == nil {
+			t.Fatalf("unexpected message after stream %s: %v", wire.id, message)
+		}
+	}
+}
+
+// assertOneUtterance checks the events of one rolled-over utterance: one
+// audio.started first, then a frame and an alignment per stream in stream
+// order, with alignment moved onto the utterance's timeline, and one
+// audio.done last.
+func assertOneUtterance(t *testing.T, events <-chan runtimepkg.ProviderEvent, streams int) {
+	t.Helper()
+	got := collectEvents(t, events, 1+2*streams+1)
+	if got[0].Type != protocol.EventAudioStarted {
+		t.Fatalf("first event = %s, want audio.started", got[0].Type)
+	}
+	for index := range streams {
+		frame, alignment := got[1+2*index], got[2+2*index]
+		if frame.Type != protocol.EventAudioFrame || len(frame.Audio) != rollingTTSFrameBytes || frame.Audio[0] != byte(index) {
+			t.Fatalf("event %d = %s (frame %v), want stream %d's audio", 1+2*index, frame.Type, frame.Audio[:1], index)
+		}
+		if alignment.Type != protocol.EventAlignment {
+			t.Fatalf("event %d = %s, want alignment", 2+2*index, alignment.Type)
+		}
+		var timings struct {
+			Spans []protocol.TimingSpan `json:"spans"`
+		}
+		if err := json.Unmarshal(alignment.Data, &timings); err != nil || len(timings.Spans) != 1 {
+			t.Fatalf("alignment %d = %s (%v)", index, alignment.Data, err)
+		}
+		// Each stream's audio is 100 ms, so stream N starts N*100 ms into
+		// the utterance even though Soniox times it from zero.
+		if want := (protocol.TimingSpan{Text: "a", StartMS: int64(index) * 100, EndMS: int64(index)*100 + 50}); timings.Spans[0] != want {
+			t.Fatalf("stream %d span = %+v, want %+v", index, timings.Spans[0], want)
+		}
+	}
+	if last := got[len(got)-1]; last.Type != protocol.EventAudioDone {
+		t.Fatalf("last event = %s, want audio.done", last.Type)
+	}
+	select {
+	case event := <-events:
+		if event.Type == protocol.EventAudioDone || event.Type == protocol.EventAudioStarted {
+			t.Fatalf("a rolled-over utterance must complete once, got another %s", event.Type)
+		}
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
