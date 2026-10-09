@@ -333,8 +333,12 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 func (s *ttsStream) Cancel(context.Context) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if !s.inFlight {
+	if s.closed.Load() || s.closing.Load() {
 		return runtimepkg.ErrSessionClosed
+	}
+	s.pending.Reset()
+	if !s.inFlight {
+		return nil
 	}
 	s.canceled = true
 	return nil
