@@ -110,7 +110,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
-	stream := &stream{conn: conn, ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer)}
+	stream := &stream{conn: conn, ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), model: request.Plan.Route.Model, language: ttsLanguageCode(request.Options.Language)}
 	go stream.readLoop()
 	return stream, nil
 }
@@ -149,7 +149,7 @@ func multiContextEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model st
 	query.Set("model_id", model)
 	query.Set("output_format", "pcm_"+strconv.Itoa(media.SampleRateHz))
 	query.Set("sync_alignment", "true")
-	if language := strings.TrimSpace(options.Language); language != "" {
+	if language := ttsLanguageCode(options.Language); language != "" {
 		query.Set("language_code", language)
 	}
 	// A relay plan is managed but carries a permanent key that dials via the
@@ -167,6 +167,11 @@ type stream struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	events chan runtimepkg.ProviderEvent
+
+	// model and language are the values sent on the dial, kept to name them
+	// when the vendor refuses the pair.
+	model    string
+	language string
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -338,6 +343,11 @@ func (s *stream) readLoop() {
 		messageType, payload, err := s.conn.Read(s.ctx)
 		if err != nil {
 			if !s.closed.Load() && s.ctx.Err() == nil && !isNormalClose(err) {
+				var closeErr websocket.CloseError
+				if errors.As(err, &closeErr) && closeErr.Code == websocket.StatusPolicyViolation && isUnsupportedLanguage(closeErr.Reason) {
+					_ = s.emit(runtimepkg.ProviderEvent{Err: s.unsupportedLanguageError(err)})
+					return
+				}
 				_ = s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs TTS read failed", Retryable: true, Cause: err}})
 			}
 			return
@@ -382,6 +392,10 @@ func (s *stream) handleMessage(payload []byte) error {
 	}
 	raw := json.RawMessage(append([]byte(nil), payload...))
 	if len(message.Error) > 0 && string(message.Error) != "null" {
+		var code string
+		if json.Unmarshal(message.Error, &code) == nil && isUnsupportedLanguage(code) {
+			return s.unsupportedLanguageError(nil)
+		}
 		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs reported a streaming error", Retryable: false}
 	}
 	if message.Audio != "" {
@@ -485,6 +499,45 @@ func newContextID() (string, error) {
 		return "", fmt.Errorf("generate ElevenLabs context id: %w", err)
 	}
 	return hex.EncodeToString(value), nil
+}
+
+// ttsLanguageCode is the TTS `language_code`: ISO 639-1 primary subtag only.
+// The multi-stream socket refuses a regional tag outright — eleven_flash_v2_5
+// closes `id-ID` with 1008 unsupported_language while `id` synthesizes. The
+// aliases match the platform's elevenLabsLanguage (packages/providers lang.ts):
+// Norwegian is keyed `no` (a raw `nb` is refused), and Uzbek, which ElevenLabs
+// does not support, is steered as `en` so the request survives — the voice
+// still speaks the text's own language; the code only steers normalization.
+func ttsLanguageCode(language string) string {
+	base := baseLanguageTag(language)
+	if alias, ok := ttsLanguageAliases[base]; ok {
+		return alias
+	}
+	return base
+}
+
+var ttsLanguageAliases = map[string]string{"uz": "en", "nb": "no", "nn": "no"}
+
+// isUnsupportedLanguage recognizes ElevenLabs' explicit refusal of a language:
+// the `unsupported_language` error code on the error frame, or the 1008 close
+// reason that follows it ("Model 'eleven_flash_v2_5' does not support
+// language_code 'sw'.").
+func isUnsupportedLanguage(text string) bool {
+	lowered := strings.ToLower(text)
+	return strings.Contains(lowered, "unsupported_language") || strings.Contains(lowered, "invalid language") ||
+		(strings.Contains(lowered, "does not support") && strings.Contains(lowered, "language"))
+}
+
+// unsupportedLanguageError is a caller error, not an outage: the same model and
+// language are refused again on every retry.
+func (s *stream) unsupportedLanguageError(cause error) *runtimepkg.ProviderError {
+	return &runtimepkg.ProviderError{
+		Code:      "invalid_request",
+		Message:   fmt.Sprintf("ElevenLabs model %s does not support language %q", s.model, s.language),
+		Hint:      "Choose an ElevenLabs model that supports this language, or use another TTS provider for it.",
+		Retryable: false,
+		Cause:     cause,
+	}
 }
 
 func isNormalClose(err error) bool {

@@ -93,6 +93,34 @@ func TestBatchTranscribeUsesPreRecordedContract(t *testing.T) {
 	}
 }
 
+// The pre-recorded route shares the streaming rule: documented regional codes
+// stay intact, anything else is reduced to the primary subtag.
+func TestBatchTranscribeSendsOnlyDocumentedRegionalLanguages(t *testing.T) {
+	t.Parallel()
+	languages := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		languages <- r.URL.Query().Get("language")
+		_, _ = w.Write([]byte(`{"metadata":{"request_id":"req-1","duration":1},"results":{"channels":[{"alternatives":[{"transcript":"habari"}]}]}}`))
+	}))
+	defer server.Close()
+	adapter := newBatchTestAdapter(t, server)
+	for language, want := range map[string]string{"id": "id", "id-ID": "id", "sw": "sw", "sw-KE": "sw", "sw-TZ": "sw", "en-US": "en-US", "en-GB": "en-GB", "pt-BR": "pt-BR"} {
+		audio := "RIFF....WAVEfmt data...."
+		if _, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{
+			Plan:       batchPlan(server.URL+"/v1/listen", "nova-3"),
+			Options:    protocol.RequestOptions{Language: language},
+			Media:      protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1},
+			Audio:      strings.NewReader(audio),
+			AudioBytes: int64(len(audio)),
+		}); err != nil {
+			t.Fatalf("transcribe %s: %v", language, err)
+		}
+		if got := <-languages; got != want {
+			t.Fatalf("language %q sent %q, want %q", language, got, want)
+		}
+	}
+}
+
 func TestBatchTranscribeGroupsWordsWithoutUtterancesAndDetectsLanguage(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -116,3 +116,13 @@ func TestBatchTranscribeRefusals(t *testing.T) {
 		t.Fatalf("diarize on non-diarize model: %v", err)
 	}
 }
+
+// The `language` form field takes ISO-639-1 only; a region (`sw-KE`) is a 400.
+func TestBaseBatchLanguageSendsPrimarySubtag(t *testing.T) {
+	t.Parallel()
+	for language, want := range map[string]string{"id": "id", "id-ID": "id", "sw": "sw", "sw-KE": "sw", "sw_TZ": "sw", "en-US": "en", " pt-BR ": "pt"} {
+		if got := baseBatchLanguage(language); got != want {
+			t.Fatalf("baseBatchLanguage(%q) = %q, want %q", language, got, want)
+		}
+	}
+}

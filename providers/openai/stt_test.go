@@ -162,6 +162,50 @@ func TestSTTPreservesRegionalChineseTag(t *testing.T) {
 	}
 }
 
+// TestSTTSendsOnlyAcceptedLanguageForms pins the exact language value every
+// realtime transcription model receives. The API rejects any region outside
+// the documented zh locales (`sw-ke` and `id-id` both 400), so those reduce to
+// the primary subtag on the live model's `languages` field as well.
+func TestSTTSendsOnlyAcceptedLanguageForms(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		model, language, want string
+	}{
+		{"gpt-live-transcribe", "id", "id"},
+		{"gpt-live-transcribe", "id-ID", "id"},
+		{"gpt-live-transcribe", "sw", "sw"},
+		{"gpt-live-transcribe", "sw-KE", "sw"},
+		{"gpt-live-transcribe", "sw_TZ", "sw"},
+		{"gpt-live-transcribe", "en-US", "en"},
+		{"gpt-live-transcribe", "zh-HK", "zh-hk"},
+		{"gpt-live-transcribe", "zh-Hans", "zh"},
+		{"gpt-transcribe", "id-ID", "id"},
+		{"gpt-transcribe", "sw-KE", "sw"},
+		{"gpt-transcribe", "sw-TZ", "sw"},
+		{"gpt-transcribe", "en-US", "en"},
+		{"gpt-4o-mini-transcribe", "sw-KE", "sw"},
+		{"gpt-4o-mini-transcribe", "zh-TW", "zh"},
+	} {
+		handshakes := make(chan *http.Request, 1)
+		frames := make(chan []byte, 4)
+		server := newRealtimeServer(t, handshakes, frames, nil)
+		stream := openSTT(t, server.URL, func(request *runtimepkg.AdapterRequest) {
+			request.Plan.Route.Model = test.model
+			request.Options.Language = test.language
+		})
+		transcription := sessionTranscription(t, receiveFrame(t, frames))
+		want := map[string]any{"model": test.model, "language": test.want}
+		if test.model == "gpt-live-transcribe" {
+			want = map[string]any{"model": test.model, "languages": []any{test.want}}
+		}
+		_ = stream.Abort(context.Background())
+		server.Close()
+		if !reflect.DeepEqual(transcription, want) {
+			t.Fatalf("%s %q: transcription = %#v, want %#v", test.model, test.language, transcription, want)
+		}
+	}
+}
+
 // TestSTTForwardsAudioAsBase64AppendAndCommit checks the two client events that
 // carry a live turn. Audio is a base64 STRING field on a JSON event: the socket
 // has no binary input frame, so sending a binary message would be silently
