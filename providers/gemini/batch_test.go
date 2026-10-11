@@ -488,33 +488,119 @@ func TestBatchVerbatimAskIsNotOverriddenBySmart(t *testing.T) {
 	}
 }
 
-type unreadAudio struct{}
+// The customer shape behind tkt_d08d896faec844a9: an Uzbek hint plus word
+// timings (and the diarization twin). Both asks travel together on the
+// verbatim mode — refusing the pair broke every such request, and dropping
+// the hint to satisfy it loses speech (20 of 58 words, read as Turkish;
+// empty with diarization, measured 2026-10-12).
+func TestBatchLanguageHintRidesWithVerbatimMode(t *testing.T) {
+	t.Parallel()
+	const response = `{"id":"i4","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"salom dunyo","annotations":[
+		{"type":"word_info","text":"salom","start_offset":"0.120s","end_offset":"0.480s","speaker":"spk:0"},
+		{"type":"word_info","text":"dunyo","start_offset":"0.510s","end_offset":"1s","speaker":"spk:0"}
+	]}]}]}`
+	for name, tc := range map[string]struct {
+		language string
+		options  *protocol.SttOptions
+		diarize  bool
+		words    bool
+	}{
+		"word timestamps":             {language: "uz", options: &protocol.SttOptions{WordTimestamps: boolPointer(true)}, words: true},
+		"word timestamps, region tag": {language: "uz-UZ", options: &protocol.SttOptions{WordTimestamps: boolPointer(true)}, words: true},
+		"diarization":                 {language: "uz", options: &protocol.SttOptions{Diarization: boolPointer(true)}, diarize: true},
+		"both":                        {language: " uz ", options: &protocol.SttOptions{WordTimestamps: boolPointer(true), Diarization: boolPointer(true)}, diarize: true, words: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			server, captured := newFakeInteractions(t, http.StatusOK, response)
+			request := batchRequest(server.URL, []byte("wav"))
+			request.Options.Language = tc.language
+			request.Options.STT = tc.options
 
-func (unreadAudio) Read([]byte) (int, error) {
-	panic("audio read before incompatible options were rejected")
-}
-func (unreadAudio) Seek(int64, int) (int64, error) {
-	panic("audio seek before incompatible options were rejected")
+			result, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Transcribe: %v", err)
+			}
+			generation, _ := captured.body["generation_config"].(map[string]any)
+			config, _ := generation["transcription_config"].(map[string]any)
+			want := strings.TrimSpace(tc.language)
+			if languages, _ := config["language_codes"].([]any); len(languages) != 1 || languages[0] != want {
+				t.Fatalf("language_codes = %v, want [%s] beside the verbatim mode", config["language_codes"], want)
+			}
+			mode, _ := config["mode"].(map[string]any)
+			if mode["type"] != "verbatim" {
+				t.Fatalf("mode = %v, want verbatim beside the language hint", config["mode"])
+			}
+			if granularities, _ := mode["timestamp_granularities"].([]any); len(granularities) != 1 || granularities[0] != "word" {
+				t.Fatalf("timestamp_granularities = %v", mode["timestamp_granularities"])
+			}
+			if _, present := mode["diarization_mode"]; present != tc.diarize {
+				t.Fatalf("diarization_mode present = %v, want %v", present, tc.diarize)
+			}
+			if result.Text != "salom dunyo" || len(result.Segments) != 1 {
+				t.Fatalf("result = %+v", result)
+			}
+			if got := len(result.Words); (got == 2) != tc.words || (got != 0 && got != 2) {
+				t.Fatalf("Words = %+v, want them only for a word_timestamps ask", result.Words)
+			}
+		})
+	}
 }
 
-func TestBatchRefusesLanguageHintWithVerbatimBeforeReadingAudio(t *testing.T) {
+// Keywords + timestamps is still a real provider 400 ("custom_vocabulary is
+// incompatible with word timestamps", re-measured 2026-10-12), and a language
+// hint beside them does not change that.
+func TestBatchStillRefusesKeywordsWithTimestampsWhenLanguageIsSet(t *testing.T) {
 	t.Parallel()
 	server, captured := newFakeInteractions(t, http.StatusOK, `{"id":"unused","output_text":"never"}`)
-	for name, options := range map[string]*protocol.SttOptions{
-		"diarization":     {Diarization: boolPointer(true)},
-		"word timestamps": {WordTimestamps: boolPointer(true)},
-	} {
-		request := batchRequest(server.URL, []byte("wav"))
-		request.Options.Language = "uz"
-		request.Options.STT = options
-		request.Audio = unreadAudio{}
-		_, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
-		var providerErr *runtimepkg.ProviderError
-		if !errors.As(err, &providerErr) || providerErr.Code != "invalid_request" || !strings.Contains(providerErr.Message, "language hint") {
-			t.Fatalf("%s: error = %v", name, err)
-		}
+	request := batchRequest(server.URL, []byte("wav"))
+	request.Options.Language = "uz"
+	request.Options.STT = &protocol.SttOptions{WordTimestamps: boolPointer(true), Keywords: []string{"Toshkent"}}
+	_, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != "invalid_request" || !strings.Contains(providerErr.Message, "keywords") {
+		t.Fatalf("error = %v", err)
 	}
 	if captured.body != nil {
 		t.Fatalf("refused combination reached provider: %+v", captured.body)
+	}
+}
+
+// The service returns the opening word of longer recordings with a start past
+// its own end ("10.300s" .. "0.400s" on every 40 s run, 2026-10-12). The word
+// keeps its end and starts where the previous word ended — zero for the
+// first — so neither the word nor the segment grouped from it begins ten
+// seconds into the audio.
+func TestBatchRepairsInvertedWordOffsets(t *testing.T) {
+	t.Parallel()
+	const response = `{"id":"i5","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"Assalomu alaykum hurmatli","annotations":[
+		{"type":"word_info","text":"Assalomu","start_offset":"10.300s","end_offset":"0.400s"},
+		{"type":"word_info","text":"alaykum","start_offset":"0.400s","end_offset":"1.100s"},
+		{"type":"word_info","text":"hurmatli","start_offset":"9s","end_offset":"1.500s"}
+	]}]}]}`
+	server, _ := newFakeInteractions(t, http.StatusOK, response)
+	request := batchRequest(server.URL, []byte("wav"))
+	request.Options.Language = "uz"
+	request.Options.STT = &protocol.SttOptions{WordTimestamps: boolPointer(true)}
+
+	result, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	want := []runtimepkg.BatchWord{
+		{Text: "Assalomu", StartMS: 0, EndMS: 400},
+		{Text: "alaykum", StartMS: 400, EndMS: 1100},
+		{Text: "hurmatli", StartMS: 1100, EndMS: 1500},
+	}
+	if len(result.Words) != len(want) {
+		t.Fatalf("Words = %+v, want %+v", result.Words, want)
+	}
+	for i := range want {
+		if result.Words[i] != want[i] {
+			t.Fatalf("Words[%d] = %+v, want %+v", i, result.Words[i], want[i])
+		}
+	}
+	if len(result.Segments) != 1 || result.Segments[0].StartMS != 0 || result.Segments[0].EndMS != 1500 {
+		t.Fatalf("Segments = %+v, want one 0..1500 segment", result.Segments)
 	}
 }

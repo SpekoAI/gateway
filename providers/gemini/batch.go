@@ -145,11 +145,6 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if verbatimModeRequested(request.Options) && len(trimmedKeywords(request.Options.STT.GetKeywords())) > 0 {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInvalidRequest, Message: "Gemini cannot combine keywords with diarization or word timestamps; drop one of the asks"}
 	}
-	// Language hints combined with verbatim mode produce a billed empty
-	// transcript. Reject before touching audio or contacting the service.
-	if verbatimModeRequested(request.Options) && strings.TrimSpace(request.Options.Language) != "" {
-		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInvalidRequest, Message: "Gemini cannot combine a language hint with diarization or word timestamps; drop one of the asks"}
-	}
 	credential, err := batchhttp.Credential(request.Plan)
 	if err != nil {
 		return nil, err
@@ -255,18 +250,35 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 //	language_codes [uz] + mode {verbatim}     EMPTY transcript, HTTP 200
 //	language_codes [uz] + mode {smart}        102 words, correct
 //
-// A single language code with no `mode`, or with the verbatim mode, comes
-// back as a completed interaction carrying no output at all — a silent total
-// loss the caller is still billed for. The smart mode is the pairing that
-// works, and it is also indistinguishable from the service default on the
-// same audio (95 words against 94), so pinning it costs nothing where the
-// config would have worked anyway and repairs every language-hinted request.
+// A single language code with no `mode` came back as a completed interaction
+// carrying no output at all — a silent total loss the caller is still billed
+// for. The smart mode is the pairing that works, and it is also
+// indistinguishable from the service default on the same audio (95 words
+// against 94), so pinning it costs nothing where the config would have worked
+// anyway and repairs every language-hinted request.
 //
 // The verbatim mode is still named explicitly for the one case that requires
 // it. Only verbatim carries speaker labels and word timings — the Live API's
 // twin of this field states the incompatibility outright ("Timestamps and
 // diarization are incompatible with mode SMART"), and the smart mode object
-// carries neither field to set.
+// carries neither field to set; naming timestamp_granularities on smart is a
+// 400 ("Unknown parameter").
+//
+// The language hint rides WITH the verbatim mode, never instead of it. The
+// 2026-09-20 empty result for language_codes + bare verbatim did not
+// reproduce for the shape this adapter sends (verbatim always carries
+// timestamp_granularities ["word"]). Measured live on 2026-10-12, 40.7 s of
+// Uzbek speech, three runs each, every one identical:
+//
+//	language_codes [uz] + verbatim/word              58 words, 58 timed
+//	language_codes [uz-UZ] + verbatim/word           58 words, 58 timed
+//	language_codes [uz] + verbatim/word/speaker      58 words, 58 timed
+//	verbatim/word, NO language_codes                 20 words, read as Turkish
+//	verbatim/word/speaker, NO language_codes         EMPTY transcript, HTTP 200
+//
+// Dropping the hint is what loses speech, so refusing the combination (or
+// stripping the language to satisfy it) is the wrong trade: the caller who
+// asked for both gets both.
 func transcriptionConfig(options protocol.RequestOptions) map[string]any {
 	config := map[string]any{}
 	if language := strings.TrimSpace(options.Language); language != "" {
@@ -408,6 +420,7 @@ func (i interaction) transcript() string {
 // list and are skipped by type.
 func (i interaction) words() []batchhttp.Word {
 	var words []batchhttp.Word
+	var previousEndMS int64
 	for _, step := range i.Steps {
 		if step.Type != stepModelOutput {
 			continue
@@ -417,10 +430,23 @@ func (i interaction) words() []batchhttp.Word {
 				if annotation.Type != annotationWordInfo || strings.TrimSpace(annotation.Text) == "" {
 					continue
 				}
+				start, end := offsetMS(annotation.StartOffset), offsetMS(annotation.EndOffset)
+				// An inverted range keeps its END. The service returns the
+				// opening word of longer recordings with a start well past
+				// its own end ("10.300s" .. "0.400s", every run on 40 s of
+				// Uzbek and of English speech, 2026-10-12) while every
+				// later offset is sound. The word cannot start before the
+				// one it follows, so its start falls back to that word's
+				// end — zero for the first word — and the segment grouped
+				// from it starts where the speech does, not ten seconds in.
+				if start > end {
+					start = min(previousEndMS, end)
+				}
+				previousEndMS = end
 				words = append(words, batchhttp.Word{
 					Text:    annotation.Text,
-					StartMS: offsetMS(annotation.StartOffset),
-					EndMS:   offsetMS(annotation.EndOffset),
+					StartMS: start,
+					EndMS:   end,
 					Speaker: annotation.Speaker,
 				})
 			}

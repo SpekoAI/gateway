@@ -305,8 +305,9 @@ the vendor's 256-character limit are omitted on every surface.
 
 ### Gemini batch option validation
 
-Gemini language-hinted batch transcription uses smart mode. Language hints
-combined with diarization or word timestamps are rejected locally before audio
-is read or sent: the provider returns an empty, billable transcript for that
-combination. Verbatim requests without a language hint retain their requested
-timing and speaker fields.
+Gemini language-hinted batch transcription uses smart mode. A language hint
+combined with diarization or word timestamps travels with the verbatim mode
+those asks require; the hint is never dropped to satisfy them, because the
+provider loses speech without it. Keywords combined with diarization or word
+timestamps are rejected locally before audio is read or sent: the provider
+refuses that combination with HTTP 400.
