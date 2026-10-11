@@ -534,8 +534,8 @@ func TestBatchLanguageHintRidesWithVerbatimMode(t *testing.T) {
 			if granularities, _ := mode["timestamp_granularities"].([]any); len(granularities) != 1 || granularities[0] != "word" {
 				t.Fatalf("timestamp_granularities = %v", mode["timestamp_granularities"])
 			}
-			if _, present := mode["diarization_mode"]; present != tc.diarize {
-				t.Fatalf("diarization_mode present = %v, want %v", present, tc.diarize)
+			if value, present := mode["diarization_mode"]; present != tc.diarize || (present && value != "speaker") {
+				t.Fatalf("diarization_mode = %v (present %v), want speaker only for a diarization ask", value, present)
 			}
 			if result.Text != "salom dunyo" || len(result.Segments) != 1 {
 				t.Fatalf("result = %+v", result)
@@ -547,6 +547,15 @@ func TestBatchLanguageHintRidesWithVerbatimMode(t *testing.T) {
 	}
 }
 
+type unreadAudio struct{}
+
+func (unreadAudio) Read([]byte) (int, error) {
+	panic("audio read before incompatible options were rejected")
+}
+func (unreadAudio) Seek(int64, int) (int64, error) {
+	panic("audio seek before incompatible options were rejected")
+}
+
 // Keywords + timestamps is still a real provider 400 ("custom_vocabulary is
 // incompatible with word timestamps", re-measured 2026-10-12), and a language
 // hint beside them does not change that.
@@ -556,6 +565,7 @@ func TestBatchStillRefusesKeywordsWithTimestampsWhenLanguageIsSet(t *testing.T) 
 	request := batchRequest(server.URL, []byte("wav"))
 	request.Options.Language = "uz"
 	request.Options.STT = &protocol.SttOptions{WordTimestamps: boolPointer(true), Keywords: []string{"Toshkent"}}
+	request.Audio = unreadAudio{}
 	_, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
 	var providerErr *runtimepkg.ProviderError
 	if !errors.As(err, &providerErr) || providerErr.Code != "invalid_request" || !strings.Contains(providerErr.Message, "keywords") {
@@ -602,5 +612,53 @@ func TestBatchRepairsInvertedWordOffsets(t *testing.T) {
 	}
 	if len(result.Segments) != 1 || result.Segments[0].StartMS != 0 || result.Segments[0].EndMS != 1500 {
 		t.Fatalf("Segments = %+v, want one 0..1500 segment", result.Segments)
+	}
+}
+
+// The repair never invents a span across a gap. An inversion deep in the
+// audio, or after a long silence, keeps at most maxRepairedWordMS before its
+// end, so a provider that dropped the middle of a recording still shows the
+// hole to the relay's coverage checks instead of one stretched word.
+func TestBatchInvertedWordRepairNeverBridgesAGap(t *testing.T) {
+	t.Parallel()
+	const response = `{"id":"i6","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"a b c","annotations":[
+		{"type":"word_info","text":"a","start_offset":"0s","end_offset":"0.400s"},
+		{"type":"word_info","text":"b","start_offset":"50s","end_offset":"44.500s"},
+		{"type":"word_info","text":"c","start_offset":"44.500s","end_offset":"45s"}
+	]}]}]}`
+	server, _ := newFakeInteractions(t, http.StatusOK, response)
+	request := batchRequest(server.URL, []byte("wav"))
+	request.Options.STT = &protocol.SttOptions{WordTimestamps: boolPointer(true)}
+
+	result, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if len(result.Words) != 3 || result.Words[1].StartMS != 44_500-maxRepairedWordMS || result.Words[1].EndMS != 44_500 {
+		t.Fatalf("Words = %+v, want b repaired to at most %d ms before its end", result.Words, maxRepairedWordMS)
+	}
+	if len(result.Segments) != 2 || result.Segments[0].EndMS != 400 || result.Segments[1].StartMS != 44_500-maxRepairedWordMS {
+		t.Fatalf("Segments = %+v, want the 0.4 s .. 43 s hole kept between two segments", result.Segments)
+	}
+}
+
+// A dropped head stays visible too: an inverted FIRST word far into the
+// audio is not pulled back to zero.
+func TestBatchInvertedWordRepairDoesNotHideADroppedHead(t *testing.T) {
+	t.Parallel()
+	const response = `{"id":"i7","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"b c","annotations":[
+		{"type":"word_info","text":"b","start_offset":"50s","end_offset":"30s"},
+		{"type":"word_info","text":"c","start_offset":"30s","end_offset":"30.500s"}
+	]}]}]}`
+	server, _ := newFakeInteractions(t, http.StatusOK, response)
+	request := batchRequest(server.URL, []byte("wav"))
+	request.Options.STT = &protocol.SttOptions{WordTimestamps: boolPointer(true)}
+
+	result, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if len(result.Words) != 2 || result.Words[0].StartMS != 30_000-maxRepairedWordMS {
+		t.Fatalf("Words = %+v, want the first word to start %d ms before its end, not at zero", result.Words, maxRepairedWordMS)
 	}
 }

@@ -56,6 +56,12 @@ const (
 	// statusCompleted is the interaction's terminal status. Over speech-free
 	// audio it is the only evidence in the body that the model ran.
 	statusCompleted = "completed"
+
+	// maxRepairedWordMS bounds the duration a word with an inverted range
+	// is given when its start is reconstructed (see interaction.words). It
+	// is a generous single-word length: long enough for the measured opening
+	// word (400 ms), short enough that no repair can paper over a gap.
+	maxRepairedWordMS int64 = 1500
 )
 
 // batchModels are the model ids this endpoint serves. The live-only id is
@@ -439,8 +445,16 @@ func (i interaction) words() []batchhttp.Word {
 				// one it follows, so its start falls back to that word's
 				// end — zero for the first word — and the segment grouped
 				// from it starts where the speech does, not ten seconds in.
+				//
+				// The reconstructed word is never longer than
+				// maxRepairedWordMS. An inversion deep in the audio, or one
+				// whose predecessor ended long before, would otherwise be
+				// stretched across a gap the provider left empty, and the
+				// relay's coverage checks would read that invented span as
+				// speech it transcribed — masking exactly the loss they
+				// exist to catch.
 				if start > end {
-					start = min(previousEndMS, end)
+					start = min(max(previousEndMS, end-maxRepairedWordMS), end)
 				}
 				previousEndMS = end
 				words = append(words, batchhttp.Word{
