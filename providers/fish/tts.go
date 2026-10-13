@@ -30,11 +30,15 @@ const (
 	defaultShutdownTimeout = 30 * time.Second
 )
 
+// supportedModels mirrors the values Fish documents for the `model` header.
+// Fish silently falls back to s2.1-pro on an unknown value, so an id outside
+// this set is refused here rather than billed as a different model.
 var supportedModels = map[string]struct{}{
 	"s1":            {},
 	"s2-pro":        {},
 	"s2.1-pro":      {},
 	"s2.1-pro-free": {},
+	"drama-3":       {},
 }
 
 var supportedSampleRates = map[int]struct{}{

@@ -91,7 +91,8 @@ func TestModelsPublishesEveryCatalogEntry(t *testing.T) {
 		"speechify:simba-3.2": false, "speechify:simba-3.0": false,
 		"speechify:simba-multilingual": false, "speechify:simba-english": false,
 		"gemini:gemini-3.1-flash-tts-preview": false, "gemini:gemini-3.8-flash-tts": false,
-		"gemini:gemini-3.8-flash-lite-tts": false,
+		"gemini:gemini-3.8-flash-lite-tts": false, "fish:s2.1-pro": false,
+		"fish:drama-3": false, "fish:s2-pro": false, "fish:s1": false, "fish:s2.1-pro-free": false,
 	}
 	for _, model := range catalog.Models {
 		if _, ok := wantMultiModel[model.ID]; ok {
