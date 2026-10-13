@@ -184,6 +184,12 @@ var providerCatalog = []CatalogEntry{
 	// adapter's English default instead of this Najdi one.
 	{Provider: "munsit", Kind: protocol.SessionKindSTT, Adapter: "munsit.stt.v1", DefaultModel: "munsit", Models: []string{"munsit", "munsit-en-ar"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.munsit.com/api/v1/listen"},
 	{Provider: "munsit", Kind: protocol.SessionKindTTS, Adapter: "munsit.tts.v1", DefaultModel: "faseeh-v1-preview", DefaultVoice: "ar-najdi-male-2", Transport: protocol.TransportHTTP, Endpoint: "https://api.munsit.com/api/v1/text-to-speech/faseeh-v1-preview"},
+	// Hopper: English-only nemotron-asr over a listen socket keyed by a
+	// bearer header; the prerecorded sibling (POST /v1/audio/transcriptions)
+	// is a BatchTranscriber, which this catalog does not publish. qwen3-tts
+	// streams 24 kHz PCM and refuses requests without a voice.
+	{Provider: "hopper", Kind: protocol.SessionKindSTT, Adapter: "hopper.stt.v1", DefaultModel: "nemotron-asr", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.withhopper.com/stt/websocket"},
+	{Provider: "hopper", Kind: protocol.SessionKindTTS, Adapter: "hopper.tts.v1", DefaultModel: "qwen3-tts", DefaultVoice: "elena", Transport: protocol.TransportHTTP, Endpoint: "https://api.withhopper.com/v1/audio/speech"},
 	{Provider: "speechmatics", Kind: protocol.SessionKindSTT, Adapter: "speechmatics.stt.v1", DefaultModel: "standard", Models: []string{"standard", "enhanced"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://global.rt.speechmatics.com/v2/"},
 }
 

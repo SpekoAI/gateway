@@ -294,6 +294,23 @@ audio, transcript, synthesis text or voice content. A socket that ends
 before its closing Metadata, or a synthesis whose audio is cut off, leaves
 incomplete billing evidence.
 
+### Hopper transcription and synthesis
+
+Hopper requests carry the delegated key in an `Authorization` bearer header
+on the validated Hopper host, never in the `api_key` query parameter; there is
+no token exchange, so no managed provider-direct credential exists. The listen
+socket receives the session's audio plus the model, sample rate and turn
+detection mode; prerecorded uploads send the WAV file, model and sample rate.
+Synthesis sends the text, voice, model and output format. Redirects are
+refused. Hopper reports no usage on the wire, so billing observations carry an
+opaque operation ID, model, mode, language and a duration: the audio bytes
+sent on the socket, the `duration_seconds` an upload returns, or the audio
+bytes a synthesis returned. Uploads also carry the USD cost Hopper reports in
+its `x-hopper-request-cost-usd` header, and socket observations the socket's
+numeric stream ID. They contain no audio, transcript, synthesis text
+or voice content. A socket that ends before the server's END reply, or a
+synthesis whose audio is cut off, leaves incomplete billing evidence.
+
 ### Soniox usage attribution
 
 Soniox realtime STT and TTS requests using relay or managed plans include

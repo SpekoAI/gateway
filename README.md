@@ -237,6 +237,7 @@ Every catalog provider has a BYOK credential variable:
 | Google | `SPEKO_GOOGLE_BYOK_ACCESS_TOKEN` | OAuth access token; prefer `_FILE` for rotation |
 | Gradium | `SPEKO_GRADIUM_BYOK_API_KEY` | API key |
 | Hamsa | `SPEKO_HAMSA_BYOK_API_KEY` | API key |
+| Hopper | `SPEKO_HOPPER_BYOK_API_KEY` | API key (`sk_hopper_…`), sent as a bearer; BYOK/Relay only because Hopper has no token exchange |
 | Hume | `SPEKO_HUME_BYOK_API_KEY` | API key |
 | Inworld | `SPEKO_INWORLD_BYOK_API_KEY` | Base64 portal credential (`key:secret`) |
 | Maya Research | `SPEKO_MAYA_BYOK_API_KEY` | Permanent API key; BYOK/Relay only because Maya has no short-lived session token |
@@ -334,6 +335,8 @@ restarting the Gateway.
 | TTS | Paxa Labs | `paxa.tts.v1` | `paxa-tts-flash-v1` |
 | STT | Munsit | `munsit.stt.v1` | `munsit` |
 | TTS | Munsit | `munsit.tts.v1` | `faseeh-v1-preview` |
+| STT | Hopper | `hopper.stt.v1` | `nemotron-asr` |
+| TTS | Hopper | `hopper.tts.v1` | `qwen3-tts` |
 
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.
