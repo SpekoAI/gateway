@@ -171,10 +171,15 @@ func parseBatchResponse(body []byte, header http.Header, model, language string,
 	observation.Language = language
 	// The request's exact USD cost rides a response header, in nano-dollars
 	// so a six-decimal figure stays exact. A missing or unreadable header
-	// leaves the duration as the only evidence.
+	// leaves the duration as the only evidence. The cost denominator joins any
+	// the duration already set: a sub-millisecond duration carries its own
+	// nanosecond denominator, which replacing the map would drop.
 	if cost, ok := metering.Quantity([]byte(strings.TrimSpace(header.Get(costHeader))), 1_000_000_000); ok {
 		observation.Quantities["provider_cost_usd"] = cost
-		observation.QuantityDenominators = map[string]int64{"provider_cost_usd": 1_000_000_000}
+		if observation.QuantityDenominators == nil {
+			observation.QuantityDenominators = map[string]int64{}
+		}
+		observation.QuantityDenominators["provider_cost_usd"] = 1_000_000_000
 	}
 	result := &runtimepkg.BatchTranscription{
 		Billing:    metering.Report(observation),

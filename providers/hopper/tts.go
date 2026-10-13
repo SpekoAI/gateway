@@ -481,6 +481,12 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			finish(runtimepkg.ProviderEvent{Billing: s.billing(operationID, 0, false), Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Hopper TTS completed without returning audio", Retryable: true}})
 			return
 		}
+		// A body that ends on an odd byte has lost half a sample: the audio
+		// is broken, not complete, whatever came before it.
+		if len(carry) > 0 {
+			finish(runtimepkg.ProviderEvent{Billing: s.billing(operationID, emitted, false), Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Hopper TTS audio ended mid-sample", Retryable: true}})
+			return
+		}
 		finish(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: data, Billing: s.billing(operationID, emitted, true)})
 		return
 	}

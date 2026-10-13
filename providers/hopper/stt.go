@@ -292,6 +292,10 @@ type sttStream struct {
 	readyOnce     atomic.Bool
 	closeErr      error
 
+	// endReceived is the server's END reply. inputClosed only says the
+	// client sent END; billing completes on the reply alone.
+	endReceived atomic.Bool
+
 	// streamID and the turn state are owned by readLoop.
 	streamID string
 	turnOpen bool
@@ -497,6 +501,7 @@ func (s *sttStream) readLoop() {
 			return
 		}
 		if messageType == websocket.MessageText && strings.TrimSpace(string(payload)) == string(endFrame) {
+			s.endReceived.Store(true)
 			s.ended()
 			return
 		}
@@ -677,16 +682,18 @@ func (s *sttStream) billing(complete bool) *protocol.BillingObservation {
 	return observation
 }
 
-// finish classifies how the socket ended. A close after Close or Abort is
-// normal; a failure an error frame already explained is not reported twice;
-// anything else is classified from the close status.
+// finish classifies how the socket ended. A close after Abort or after the
+// server's END reply is normal; a failure an error frame already explained is
+// not reported twice; anything else is classified from the close status. A
+// normal close after the client's END but before the server's reply is not a
+// clean finish: finals may be missing and the billed audio is unconfirmed.
 func (s *sttStream) finish(err error) {
 	if s.drainTimedOut.Load() {
 		s.fail(&runtimepkg.ProviderError{Code: "request_timeout", Message: fmt.Sprintf("Hopper STT did not answer END within %s", s.drainTimeout), Retryable: false, Cause: err})
 		return
 	}
 	status := websocket.CloseStatus(err)
-	if s.closed.Load() || (s.inputClosed.Load() && status == websocket.StatusNormalClosure) {
+	if s.closed.Load() || s.endReceived.Load() {
 		s.settleSetup(&runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Hopper STT closed before sending Ready", Retryable: true, Cause: err})
 		return
 	}
@@ -699,6 +706,9 @@ func (s *sttStream) finish(err error) {
 		reason = strings.TrimSpace(closeErr.Reason)
 	}
 	failure := socketFailure(int(status), reason)
+	if s.inputClosed.Load() && status == websocket.StatusNormalClosure {
+		failure.Message = "Hopper STT closed the session after END without answering END"
+	}
 	failure.Cause = err
 	if status != -1 {
 		failure.Extensions = map[string]json.RawMessage{extensionID: marshalData(map[string]any{"close_status": int(status), "close_reason": reason})}

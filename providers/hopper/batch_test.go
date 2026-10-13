@@ -166,6 +166,29 @@ func TestBatchWithoutACostHeaderKeepsTheDuration(t *testing.T) {
 	}
 }
 
+// A duration finer than a millisecond is read in nanoseconds with its own
+// denominator. The cost header must add its denominator beside that one, or
+// the duration falls back to milliseconds and bills a million times over.
+func TestBatchCostHeaderKeepsASubMillisecondDurationDenominator(t *testing.T) {
+	t.Parallel()
+	response := strings.Replace(documentedBatchResponse, `"duration_seconds":6.08`, `"duration_seconds":6.0800001`, 1)
+	server, _ := newFakeTranscribeWithCost(t, http.StatusOK, response, "0.000084")
+	result, err := newBatchAdapter(t, server).Transcribe(context.Background(), batchRequest(server.URL+batchPath, "", []byte("RIFF")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := result.Billing.Validate(); err != nil || !result.Billing.Complete {
+		t.Fatalf("billing = %+v %v", result.Billing, err)
+	}
+	operation := result.Billing.Operations[0]
+	if operation.Quantities["duration_seconds"] != 6_080_000_100 || operation.QuantityDenominator("duration_seconds") != 1_000_000_000 {
+		t.Fatalf("duration = %d/%d, want 6080000100/1e9", operation.Quantities["duration_seconds"], operation.QuantityDenominator("duration_seconds"))
+	}
+	if operation.Quantities["provider_cost_usd"] != 84_000 || operation.QuantityDenominator("provider_cost_usd") != 1_000_000_000 {
+		t.Fatalf("provider cost = %d/%d", operation.Quantities["provider_cost_usd"], operation.QuantityDenominator("provider_cost_usd"))
+	}
+}
+
 // firstTurnTimedResponse is the live shape from 2026-10-13: a two-turn clip
 // whose words cover only the first turn.
 const firstTurnTimedResponse = `{"text":"thanks for calling speco support i can help you","words":[{"text":" thanks","start":0.96,"end":1.28,"conf":0},{"text":"for","start":1.28,"end":1.44,"conf":0},{"text":"calling","start":1.44,"end":1.76,"conf":0},{"text":"speco","start":2.24,"end":2.88,"conf":0},{"text":"support","start":2.88,"end":3.2,"conf":0}],"duration_seconds":6.08}`

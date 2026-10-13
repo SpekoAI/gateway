@@ -39,10 +39,12 @@ type fakeListen struct {
 	closeAfterAudio websocket.StatusCode
 	closeReason     string
 	// onEnd is written after the client's END, followed by the END reply
-	// unless ignoreEnd is set.
-	onEnd     []string
-	ignoreEnd bool
-	server    *httptest.Server
+	// unless ignoreEnd or closeOnEnd is set. closeOnEnd closes the socket
+	// normally in place of the reply.
+	onEnd      []string
+	ignoreEnd  bool
+	closeOnEnd bool
+	server     *httptest.Server
 
 	mu       sync.Mutex
 	header   http.Header
@@ -118,6 +120,11 @@ func (f *fakeListen) handle(writer http.ResponseWriter, request *http.Request) {
 		}
 		if f.ignoreEnd {
 			continue
+		}
+		if f.closeOnEnd {
+			f.write(ctx, conn, f.onEnd)
+			_ = conn.Close(websocket.StatusNormalClosure, "")
+			return
 		}
 		f.write(ctx, conn, append(append([]string(nil), f.onEnd...), "END"))
 		// The client closes once it has read the END reply.
@@ -626,6 +633,35 @@ func TestCloseDrainTimeoutReportsTheMissingEND(t *testing.T) {
 	}
 	if failure := terminalFailure(t, events); failure.Code != "request_timeout" {
 		t.Fatalf("failure = %#v, want request_timeout", failure)
+	}
+}
+
+// A normal close that follows the client's END without the server's END reply
+// is a truncated session: the flushed finals may be missing and the billed
+// audio is unconfirmed, so it fails retryably and billing stays incomplete.
+func TestNormalCloseBeforeTheENDReplyIsAFailure(t *testing.T) {
+	t.Parallel()
+	fake := newFakeListen(t)
+	fake.closeOnEnd = true
+	stream := openSTT(t, fake, STTConfig{}, sttRequest(fake.endpoint()))
+	if err := stream.WriteAudio(context.Background(), make([]byte, 640)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	events := drainSTT(t, stream)
+	for _, event := range events {
+		if event.Billing != nil && event.Billing.Complete {
+			t.Fatal("billing completed without the END reply")
+		}
+	}
+	failure := terminalFailure(t, events)
+	if failure.Code != "provider_unavailable" || !failure.Retryable {
+		t.Fatalf("failure = %#v, want retryable provider_unavailable", failure)
+	}
+	if stream.(runtimepkg.TerminalErrorProviderStream).TerminalError() == nil {
+		t.Fatal("terminal error not preserved")
 	}
 }
 

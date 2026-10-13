@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -312,6 +313,45 @@ func TestTruncatedStreamIsAFailureNotAShortUtterance(t *testing.T) {
 			}
 			if event.Billing == nil || event.Billing.Complete || event.Billing.Quantities["duration_seconds"] != 4 {
 				t.Fatalf("billing = %+v, want the delivered audio, incomplete", event.Billing)
+			}
+			return
+		}
+	}
+}
+
+// A clean EOF on an odd byte leaves half a sample behind. The whole sample
+// before it is delivered, but the synthesis fails rather than completing.
+func TestTrailingOddByteIsAFailureNotAShortUtterance(t *testing.T) {
+	t.Parallel()
+	server := pcmServer(t, func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "audio/pcm")
+		_, _ = writer.Write([]byte{1, 2, 3})
+	})
+	stream := openTTS(t, server, ttsRequest("", 24_000), TTSConfig{AudioChunkBytes: 2})
+	_ = stream.AppendText(context.Background(), "hello")
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var audio []byte
+	for {
+		event := nextEvent(t, stream)
+		if event.Type == protocol.EventAudioDone {
+			t.Fatal("a body ending mid-sample reported audio.done")
+		}
+		if event.Billing != nil && event.Billing.Complete {
+			t.Fatalf("billing = %+v, want incomplete", event.Billing)
+		}
+		audio = append(audio, event.Audio...)
+		if event.Err != nil {
+			var providerErr *runtimepkg.ProviderError
+			if !errors.As(event.Err, &providerErr) || providerErr.Code != "provider_unavailable" || !providerErr.Retryable {
+				t.Fatalf("error = %v", event.Err)
+			}
+			if event.Billing == nil || event.Billing.Quantities["duration_seconds"] != 2 {
+				t.Fatalf("billing = %+v, want the one whole sample, incomplete", event.Billing)
+			}
+			if !bytes.Equal(audio, []byte{1, 2}) {
+				t.Fatalf("audio = %v, want only the whole sample", audio)
 			}
 			return
 		}
