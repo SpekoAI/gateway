@@ -153,7 +153,14 @@ var providerCatalog = []CatalogEntry{
 	// it is the only Gemini Live id the S2S board has measured, and moving the
 	// default is a routing change, not a table growth.
 	{Provider: "google", Kind: protocol.SessionKindRealtime, Adapter: "google.live.v1", Protocol: protocol.SpeechProtocolGoogleLiveV1, DefaultModel: "gemini-3.1-flash-live-preview", Models: []string{"gemini-3.1-flash-live-preview", "gemini-3.8-live", "gemini-3.8-live-extended-thinking"}, DefaultVoice: "Puck", Transport: protocol.TransportWebSocket, Endpoint: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained"},
-	{Provider: "xai", Kind: protocol.SessionKindRealtime, Adapter: "xai.realtime.v1", Protocol: protocol.SpeechProtocolXAIRealtimeV1, DefaultModel: "grok-voice-latest", Models: []string{"grok-voice-latest", "grok-voice-think-fast-2.0", "grok-voice-think-fast-1.0", "grok-voice-fast-1.0"}, DefaultVoice: "eve", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/realtime"},
+	// Grok Voice 3.0 is xAI's current speech-to-speech generation
+	// (docs.x.ai speech-to-speech guide, 2026-10-15): the same
+	// wss://api.x.ai/v1/realtime socket, session fields, events and price as
+	// 2.0, so it is a model on this row rather than a second adapter. The
+	// grok-voice-latest alias already resolves to it; the pin is listed so a
+	// caller can hold 3.0 when the alias moves on. reasoning.effort defaults
+	// to "high" on 3.0 and is the caller's session.update field to lower.
+	{Provider: "xai", Kind: protocol.SessionKindRealtime, Adapter: "xai.realtime.v1", Protocol: protocol.SpeechProtocolXAIRealtimeV1, DefaultModel: "grok-voice-latest", Models: []string{"grok-voice-latest", "grok-voice-3.0", "grok-voice-think-fast-2.0", "grok-voice-think-fast-1.0", "grok-voice-fast-1.0"}, DefaultVoice: "eve", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/realtime"},
 	{Provider: "openai", Kind: protocol.SessionKindTTS, Adapter: "openai.tts.v1", DefaultModel: "gpt-4o-mini-tts", Transport: protocol.TransportHTTP, Endpoint: "https://api.openai.com/v1/audio/speech"},
 	{Provider: "soniox", Kind: protocol.SessionKindSTT, Adapter: "soniox.stt.v1", DefaultModel: "stt-rt-v5", Transport: protocol.TransportWebSocket, Endpoint: "wss://stt-rt.soniox.com/transcribe-websocket"},
 	{Provider: "soniox", Kind: protocol.SessionKindTTS, Adapter: "soniox.tts.v1", DefaultModel: "tts-rt-v2", Transport: protocol.TransportWebSocket, Endpoint: "wss://tts-rt.soniox.com/tts-websocket"},
