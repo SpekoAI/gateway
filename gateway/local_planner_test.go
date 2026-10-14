@@ -238,6 +238,37 @@ func TestLocalPlannerResolvesGeminiLiveModelsByName(t *testing.T) {
 	}
 }
 
+// Grok Voice 3.0 is a model on the existing xai realtime row: reachable by
+// name on the same socket, while "auto" stays on the grok-voice-latest alias.
+func TestLocalPlannerResolvesGrokVoiceModelsByName(t *testing.T) {
+	t.Parallel()
+	planner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{Providers: []string{"xai"}})
+	if err != nil {
+		t.Fatalf("new local planner: %v", err)
+	}
+	for _, tc := range []struct{ model, wantModel string }{
+		{"auto", "grok-voice-latest"},
+		{"", "grok-voice-latest"},
+		{"grok-voice-3.0", "grok-voice-3.0"},
+		{"grok-voice-think-fast-2.0", "grok-voice-think-fast-2.0"},
+	} {
+		request := localPlanRequest()
+		request.Kind = protocol.SessionKindRealtime
+		request.Runtime.Adapters = []string{"xai.realtime.v1"}
+		request.Request.Provider = "xai"
+		request.Request.Model = tc.model
+		request.Request.Voice = "eve"
+		request.Request.S2S = &protocol.S2SOptions{OutputMedia: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1}}
+		plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
+		if err != nil {
+			t.Fatalf("model %q: create local plan: %v", tc.model, err)
+		}
+		if plan.Route.Adapter != "xai.realtime.v1" || plan.Route.Model != tc.wantModel || plan.Route.Endpoint != "wss://api.x.ai/v1/realtime" {
+			t.Fatalf("model %q: route = %+v", tc.model, plan.Route)
+		}
+	}
+}
+
 // The openai/realtime pair is the one (provider, kind) with two rows, and
 // they differ by protocol. "auto" and every Realtime model must stay on the
 // Realtime adapter; gpt-live-1 must reach the Live adapter by name and never
@@ -299,4 +330,3 @@ func TestLocalPlannerPreservesClientSessionID(t *testing.T) {
 		t.Fatalf("plan.Reservation.Concurrency.LeaseID = %q, want local-custom-client-session-123", plan.Reservation.Concurrency.LeaseID)
 	}
 }
-
