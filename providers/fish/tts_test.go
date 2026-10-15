@@ -82,6 +82,54 @@ func TestAdapterUsesDocumentedMessagePackWireContract(t *testing.T) {
 	}
 }
 
+func TestAdapterSendsDrama3ModelHeader(t *testing.T) {
+	t.Parallel()
+	models := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		models <- request.Header.Get("model")
+		conn, err := websocket.Accept(writer, request, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		_, _, _ = conn.Read(context.Background())
+	}))
+	defer server.Close()
+
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	request := adapterRequest(server.URL, protocol.CredentialsBYOK)
+	request.Plan.Route.Model = "drama-3"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = stream.Close(context.Background()) }()
+	if got := <-models; got != "drama-3" {
+		t.Fatalf("model header = %q, want drama-3", got)
+	}
+}
+
+// Fish answers an unknown model header with s2.1-pro instead of an error, so the
+// adapter is the only place a mistyped id can be caught before it is billed.
+func TestAdapterRejectsUnknownModel(t *testing.T) {
+	t.Parallel()
+	adapter, err := New(Config{})
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	for _, model := range []string{"drama-3-preview", "drama-3-previewx", ""} {
+		request := adapterRequest("wss://api.fish.audio/v1/tts/live", protocol.CredentialsBYOK)
+		request.Plan.Route.Model = model
+		if _, err := adapter.Open(context.Background(), request); err == nil || !strings.Contains(err.Error(), "is not supported") {
+			t.Fatalf("open model %q = %v, want unsupported", model, err)
+		}
+	}
+}
+
 func TestAdapterReconnectsForTheNextUtterance(t *testing.T) {
 	t.Parallel()
 	dials := make(chan struct{}, 2)

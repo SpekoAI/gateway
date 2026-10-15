@@ -320,7 +320,7 @@ restarting the Gateway.
 | STT | OpenAI | `openai.stt.v1` | `gpt-live-transcribe` |
 | TTS | OpenAI | `openai.tts.v1` | `gpt-4o-mini-tts` |
 | STT | Soniox | `soniox.stt.v1` | `stt-rt-v5` |
-| TTS | Fish Audio | `fish.tts.v1` | `s2.1-pro` |
+| TTS | Fish Audio | `fish.tts.v1` | `s2.1-pro` (also `drama-3`, `s2-pro`, `s1`, `s2.1-pro-free`) |
 | TTS | Soniox | `soniox.tts.v1` | `tts-rt-v2` |
 | STT | Smallest | `smallest.stt.v1` | `pulse` |
 | TTS | Smallest | `smallest.tts.v1` | `lightning_v3.1` |

@@ -132,7 +132,7 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "hamsa", Kind: protocol.SessionKindTTS, Adapter: "hamsa.tts.v1", DefaultModel: "default", DefaultVoice: "Salem", Transport: protocol.TransportHTTP, Endpoint: "https://api.tryhamsa.com/v1/realtime/tts-stream"},
 	{Provider: "rime", Kind: protocol.SessionKindTTS, Adapter: "rime.tts.v1", DefaultModel: "coda", DefaultVoice: "astra", Transport: protocol.TransportWebSocket, Endpoint: "wss://users-ws.rime.ai/ws3"},
 	{Provider: "hume", Kind: protocol.SessionKindTTS, Adapter: "hume.tts.v1", DefaultModel: "octave-2", DefaultVoice: "Colton Rivers", Transport: protocol.TransportHTTP, Endpoint: "https://api.hume.ai/v0/tts/stream/json"},
-	{Provider: "fish", Kind: protocol.SessionKindTTS, Adapter: "fish.tts.v1", DefaultModel: "s2.1-pro", DefaultVoice: "802e3bc2b27e49c2995d23ef70e6ac89", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.fish.audio/v1/tts/live"},
+	{Provider: "fish", Kind: protocol.SessionKindTTS, Adapter: "fish.tts.v1", DefaultModel: "s2.1-pro", Models: []string{"s2.1-pro", "drama-3", "s2-pro", "s1", "s2.1-pro-free"}, DefaultVoice: "802e3bc2b27e49c2995d23ef70e6ac89", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.fish.audio/v1/tts/live"},
 	{Provider: "inworld", Kind: protocol.SessionKindSTT, Adapter: "inworld.stt.v1", DefaultModel: "inworld-stt-1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional"},
 	{Provider: "xai", Kind: protocol.SessionKindSTT, Adapter: "xai.stt.v1", DefaultModel: "stt", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/stt"},
 	{Provider: "openai", Kind: protocol.SessionKindSTT, Adapter: "openai.stt.v1", DefaultModel: "gpt-live-transcribe", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.openai.com/v1/realtime"},
@@ -153,7 +153,14 @@ var providerCatalog = []CatalogEntry{
 	// it is the only Gemini Live id the S2S board has measured, and moving the
 	// default is a routing change, not a table growth.
 	{Provider: "google", Kind: protocol.SessionKindRealtime, Adapter: "google.live.v1", Protocol: protocol.SpeechProtocolGoogleLiveV1, DefaultModel: "gemini-3.1-flash-live-preview", Models: []string{"gemini-3.1-flash-live-preview", "gemini-3.8-live", "gemini-3.8-live-extended-thinking"}, DefaultVoice: "Puck", Transport: protocol.TransportWebSocket, Endpoint: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained"},
-	{Provider: "xai", Kind: protocol.SessionKindRealtime, Adapter: "xai.realtime.v1", Protocol: protocol.SpeechProtocolXAIRealtimeV1, DefaultModel: "grok-voice-latest", Models: []string{"grok-voice-latest", "grok-voice-think-fast-2.0", "grok-voice-think-fast-1.0", "grok-voice-fast-1.0"}, DefaultVoice: "eve", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/realtime"},
+	// Grok Voice 3.0 is xAI's current speech-to-speech generation
+	// (docs.x.ai speech-to-speech guide, 2026-10-15): the same
+	// wss://api.x.ai/v1/realtime socket, session fields, events and price as
+	// 2.0, so it is a model on this row rather than a second adapter. The
+	// grok-voice-latest alias already resolves to it; the pin is listed so a
+	// caller can hold 3.0 when the alias moves on. reasoning.effort defaults
+	// to "high" on 3.0 and is the caller's session.update field to lower.
+	{Provider: "xai", Kind: protocol.SessionKindRealtime, Adapter: "xai.realtime.v1", Protocol: protocol.SpeechProtocolXAIRealtimeV1, DefaultModel: "grok-voice-latest", Models: []string{"grok-voice-latest", "grok-voice-3.0", "grok-voice-think-fast-2.0", "grok-voice-think-fast-1.0", "grok-voice-fast-1.0"}, DefaultVoice: "eve", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/realtime"},
 	{Provider: "openai", Kind: protocol.SessionKindTTS, Adapter: "openai.tts.v1", DefaultModel: "gpt-4o-mini-tts", Transport: protocol.TransportHTTP, Endpoint: "https://api.openai.com/v1/audio/speech"},
 	{Provider: "soniox", Kind: protocol.SessionKindSTT, Adapter: "soniox.stt.v1", DefaultModel: "stt-rt-v5", Transport: protocol.TransportWebSocket, Endpoint: "wss://stt-rt.soniox.com/transcribe-websocket"},
 	{Provider: "soniox", Kind: protocol.SessionKindTTS, Adapter: "soniox.tts.v1", DefaultModel: "tts-rt-v2", Transport: protocol.TransportWebSocket, Endpoint: "wss://tts-rt.soniox.com/tts-websocket"},
