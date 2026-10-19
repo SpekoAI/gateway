@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,13 +25,18 @@ import (
 const (
 	// TTSAdapterID is the identifier the connector registers this adapter under.
 	TTSAdapterID = "paxa.tts.v1"
-	// DefaultTTSModel is the only TTS model Paxa serves.
+	// DefaultTTSModel is the model a plan gets when it names none.
 	DefaultTTSModel = "paxa-tts-flash-v1"
+	// FlashV2TTSModel is Paxa TTS Flash v2: every voice reads English, Thai and
+	// Mandarin, and direction tags in the text.
+	FlashV2TTSModel = "paxa-tts-flash-v2"
 	// DefaultVoice is the Thai voice the listening study measured; `voice` is
 	// required on every request.
 	DefaultVoice = "nomyen"
 	// DefaultEnglishVoice is the voice the English board row measured.
 	DefaultEnglishVoice = "cookie"
+	// DefaultMandarinVoice is the Mandarin voice both models serve.
+	DefaultMandarinVoice = "taohuay"
 
 	speechPath = "/v1/tts"
 	// maxInputUnits is Paxa's per-request ceiling, counted in UTF-16 code
@@ -49,11 +55,14 @@ const (
 	defaultHeaderTimeout    = 10 * time.Second
 )
 
-var ttsModels = map[string]struct{}{DefaultTTSModel: {}}
-
-// ttsLanguages are the session languages routed to Paxa, mapped to the
-// `language` value sent. Paxa also reads Mandarin, which is not routed.
-var ttsLanguages = map[string]string{"": "auto", "en": "en", "th": "th"}
+// ttsModels maps each served model to the session languages routed to it and
+// the `language` value sent for each. v1 voices are each made for one
+// language and read Mandarin with a foreign accent, so v1 is not routed for
+// zh; every v2 voice speaks all three.
+var ttsModels = map[string]map[string]string{
+	DefaultTTSModel: {"": "auto", "en": "en", "th": "th"},
+	FlashV2TTSModel: {"": "auto", "en": "en", "th": "th", "zh": "zh"},
+}
 
 // TTSConfig controls local transport bounds. Provider identity, model, voice,
 // and credential always come from the verified plan.
@@ -153,10 +162,11 @@ func (a *TTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequest) 
 		}
 	}
 	model := strings.TrimSpace(request.Plan.Route.Model)
-	if _, ok := ttsModels[model]; !ok {
+	languages, ok := ttsModels[model]
+	if !ok {
 		return nil, fmt.Errorf("paxa tts does not support model %q", model)
 	}
-	language, err := ttsLanguage(request.Options.Language)
+	language, err := ttsLanguage(model, languages, request.Options.Language)
 	if err != nil {
 		return nil, err
 	}
@@ -183,15 +193,22 @@ func (a *TTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequest) 
 }
 
 // ttsLanguage narrows a BCP-47 tag to the bare subtag and refuses any language
-// Paxa is not routed for. An empty language is sent as "auto".
-func ttsLanguage(language string) (string, error) {
+// the model is not routed for. An empty language is sent as "auto".
+func ttsLanguage(model string, languages map[string]string, language string) (string, error) {
 	base := strings.ToLower(strings.TrimSpace(language))
 	if index := strings.IndexAny(base, "-_"); index > 0 {
 		base = base[:index]
 	}
-	value, ok := ttsLanguages[base]
+	value, ok := languages[base]
 	if !ok {
-		return "", &runtimepkg.ProviderError{Code: "unsupported_language", Message: fmt.Sprintf("Paxa TTS is routed for en and th only, got %q", language)}
+		routed := make([]string, 0, len(languages))
+		for tag := range languages {
+			if tag != "" {
+				routed = append(routed, tag)
+			}
+		}
+		slices.Sort(routed)
+		return "", &runtimepkg.ProviderError{Code: "unsupported_language", Message: fmt.Sprintf("Paxa TTS %s is routed for %s only, got %q", model, strings.Join(routed, ", "), language)}
 	}
 	return value, nil
 }
@@ -201,14 +218,20 @@ func ttsLanguage(language string) (string, error) {
 // A voice in the request is always honored, even the Thai one on an English
 // session. Managed plans carry the board's per-language voice (cookie for
 // en), so the catalog default only reaches a plan the board had no cell for;
-// on an English session with no request voice that fill becomes cookie.
+// on an English or Mandarin session with no request voice that fill becomes
+// cookie or taohuay.
 func ttsVoice(requested, planned, language string) string {
 	if voice := strings.TrimSpace(requested); voice != "" {
 		return voice
 	}
 	planned = strings.TrimSpace(planned)
-	if language == "en" && (planned == "" || strings.EqualFold(planned, DefaultVoice)) {
-		return DefaultEnglishVoice
+	if planned == "" || strings.EqualFold(planned, DefaultVoice) {
+		switch language {
+		case "en":
+			return DefaultEnglishVoice
+		case "zh":
+			return DefaultMandarinVoice
+		}
 	}
 	if planned != "" {
 		return planned
