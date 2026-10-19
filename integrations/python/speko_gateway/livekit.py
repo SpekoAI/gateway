@@ -8,6 +8,7 @@ trust boundary: the conversation content travels to the relay.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import weakref
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -55,6 +56,29 @@ def _report_stream_leg(kind: str, stream: Any) -> None:
     )
 
 
+# STTCapabilities fields added after livekit-agents 1.4.5 (both in 1.6.5).
+_NEWER_STT_CAPABILITIES = frozenset({"keyterms", "chat_context"})
+
+
+def _stt_capabilities(**declared: Any) -> stt.STTCapabilities:
+    """Build STTCapabilities, omitting newer fields the installed release lacks.
+
+    Both newer fields default to False and nothing in a release that predates
+    them reads them, so omitting them changes no behavior; keywords still reach
+    the Gateway through the STT options payload. Any other unknown field still
+    raises, so a typo is not silently dropped.
+    """
+
+    known = {field.name for field in dataclasses.fields(stt.STTCapabilities)}
+    return stt.STTCapabilities(
+        **{
+            name: value
+            for name, value in declared.items()
+            if name in known or name not in _NEWER_STT_CAPABILITIES
+        }
+    )
+
+
 class STT(stt.STT):
     """Stream speech through a colocated Speko Gateway."""
 
@@ -85,7 +109,7 @@ class STT(stt.STT):
             provider_options=provider_options,
         )
         super().__init__(
-            capabilities=stt.STTCapabilities(
+            capabilities=_stt_capabilities(
                 streaming=True,
                 interim_results=True,
                 diarization=bool(diarization),

@@ -34,6 +34,23 @@ jobs:
       - run: uv run --locked --extra dev ruff check .
       - run: uv run --locked --extra dev pytest
 
+  python-livekit-floor:
+    # The oldest livekit-agents the `livekit` extra admits; the locked job above
+    # covers the newest. livekit-agents before 1.6.10 declares an open
+    # `openai>=2`, and openai 3 dropped the httpx it imports, so pin openai 2.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integrations/python
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv venv
+      - run: uv pip install -e . "livekit-agents==1.4.5" "openai>=2,<3" "pytest>=8" "pytest-asyncio>=0.24"
+      - run: .venv/bin/python -m pytest
+
   container:
     runs-on: ubuntu-latest
     steps:
