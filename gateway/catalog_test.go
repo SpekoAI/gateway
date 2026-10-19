@@ -93,6 +93,7 @@ func TestModelsPublishesEveryCatalogEntry(t *testing.T) {
 		"gemini:gemini-3.1-flash-tts-preview": false, "gemini:gemini-3.8-flash-tts": false,
 		"gemini:gemini-3.8-flash-lite-tts": false, "fish:s2.1-pro": false,
 		"fish:drama-3": false, "fish:s2-pro": false, "fish:s1": false, "fish:s2.1-pro-free": false,
+		"paxa:paxa-tts-flash-v1": false, "paxa:paxa-tts-flash-v2": false,
 	}
 	for _, model := range catalog.Models {
 		if _, ok := wantMultiModel[model.ID]; ok {

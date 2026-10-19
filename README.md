@@ -332,7 +332,7 @@ restarting the Gateway.
 | STT | Meta | `meta.stt.v1` | `muse-voice-transcribe-1.0` |
 | STT | Nari Labs | `nari.stt.v1` | `qwen3-asr-fast` |
 | TTS | Nari Labs | `nari.tts.v1` | `qwen3-tts-fast` |
-| TTS | Paxa Labs | `paxa.tts.v1` | `paxa-tts-flash-v1` |
+| TTS | Paxa Labs | `paxa.tts.v1` | `paxa-tts-flash-v1` (also `paxa-tts-flash-v2`) |
 | STT | Munsit | `munsit.stt.v1` | `munsit` |
 | TTS | Munsit | `munsit.tts.v1` | `faseeh-v1-preview` |
 | STT | Hopper | `hopper.stt.v1` | `nemotron-asr` |

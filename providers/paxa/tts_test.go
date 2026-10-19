@@ -1,6 +1,7 @@
 package paxa
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -55,13 +56,20 @@ func wavHeader(rate uint32, channels uint16) []byte {
 
 func openTTS(t *testing.T, server *httptest.Server, language string) runtimepkg.ProviderStream {
 	t.Helper()
+	return openTTSModel(t, server, DefaultTTSModel, language)
+}
+
+func openTTSModel(t *testing.T, server *httptest.Server, model, language string) runtimepkg.ProviderStream {
+	t.Helper()
 	parsed, _ := url.Parse(server.URL)
 	// A 5-byte read size splits the 44-byte header across reads.
 	adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true, AudioChunkBytes: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
-	stream, err := adapter.Open(context.Background(), ttsRequest(server.URL+speechPath, language))
+	request := ttsRequest(server.URL+speechPath, language)
+	request.Plan.Route.Model = model
+	stream, err := adapter.Open(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -145,6 +153,40 @@ func TestCommitTextSendsTheDocumentedRequestAndStripsTheWAVHeader(t *testing.T) 
 	}
 }
 
+// v2 reads Mandarin and direction tags; both travel as sent, with the model
+// the plan named.
+func TestFlashV2SendsItsModelMandarinAndTagsVerbatim(t *testing.T) {
+	t.Parallel()
+	bodies := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		raw, _ := io.ReadAll(request.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		bodies <- body
+		writer.Header().Set("Content-Type", "audio/wav")
+		_, _ = writer.Write(append(wavHeader(24_000, 1), 1, 2, 3, 4))
+	}))
+	t.Cleanup(server.Close)
+	stream := openTTSModel(t, server, FlashV2TTSModel, "zh-CN")
+	text := "[亲切的客服语气] 您好，<emph>航班</emph>已改为TG628。"
+	if err := stream.AppendText(context.Background(), text); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("CommitText: %v", err)
+	}
+	body := <-bodies
+	want := map[string]any{"text": text, "voice": DefaultMandarinVoice, "model": FlashV2TTSModel, "format": "wav", "stream": true, "language": "zh"}
+	for key, value := range want {
+		if body[key] != value {
+			t.Fatalf("body[%s] = %#v, want %#v", key, body[key], value)
+		}
+	}
+	if audio := drain(t, stream); !bytes.Equal(audio, []byte{1, 2, 3, 4}) {
+		t.Fatalf("audio = %v", audio)
+	}
+}
+
 func TestIdleCancelKeepsTheStreamOpen(t *testing.T) {
 	pcm := []byte{1, 2, 3, 4}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -185,8 +227,8 @@ func TestIdleCancelKeepsTheStreamOpen(t *testing.T) {
 func TestLanguagePicksTheVoiceAndTheReadingLanguage(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name, language, requested, planned string
-		wantVoice, wantLanguage            string
+		name, model, language, requested, planned string
+		wantVoice, wantLanguage                   string
 	}{
 		{name: "english session takes the english voice", language: "en-US", wantVoice: DefaultEnglishVoice, wantLanguage: "en"},
 		{name: "english session replaces the catalog fill", language: "en", planned: DefaultVoice, wantVoice: DefaultEnglishVoice, wantLanguage: "en"},
@@ -195,6 +237,11 @@ func TestLanguagePicksTheVoiceAndTheReadingLanguage(t *testing.T) {
 		{name: "caller voice wins", language: "en", requested: "nomyen", wantVoice: "nomyen", wantLanguage: "en"},
 		{name: "thai session", language: "th", wantVoice: DefaultVoice, wantLanguage: "th"},
 		{name: "no language is auto", language: "", planned: "tako", wantVoice: "tako", wantLanguage: "auto"},
+		{name: "v2 mandarin session takes the mandarin voice", model: FlashV2TTSModel, language: "zh-CN", wantVoice: DefaultMandarinVoice, wantLanguage: "zh"},
+		{name: "v2 mandarin session replaces the catalog fill", model: FlashV2TTSModel, language: "zh", planned: DefaultVoice, wantVoice: DefaultMandarinVoice, wantLanguage: "zh"},
+		{name: "v2 mandarin session keeps a planned choice", model: FlashV2TTSModel, language: "zh", planned: "saku", wantVoice: "saku", wantLanguage: "zh"},
+		{name: "v2 english session", model: FlashV2TTSModel, language: "en", wantVoice: DefaultEnglishVoice, wantLanguage: "en"},
+		{name: "v2 thai session", model: FlashV2TTSModel, language: "th", wantVoice: DefaultVoice, wantLanguage: "th"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -204,6 +251,9 @@ func TestLanguagePicksTheVoiceAndTheReadingLanguage(t *testing.T) {
 				t.Fatal(err)
 			}
 			request := ttsRequest(testEndpoint, tc.language)
+			if tc.model != "" {
+				request.Plan.Route.Model = tc.model
+			}
 			request.Options.Voice = tc.requested
 			request.Plan.Route.Voice = tc.planned
 			stream, err := adapter.Open(context.Background(), request)
@@ -225,11 +275,19 @@ func TestOpenRefusesLanguagesPaxaIsNotRoutedFor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, language := range []string{"zh", "zh-CN", "ja", "auto"} {
-		_, err := adapter.Open(context.Background(), ttsRequest(testEndpoint, language))
-		var providerErr *runtimepkg.ProviderError
-		if !errors.As(err, &providerErr) || providerErr.Code != "unsupported_language" {
-			t.Errorf("%s: Open error = %v, want unsupported_language", language, err)
+	refused := map[string][]string{
+		DefaultTTSModel: {"zh", "zh-CN", "ja", "auto"},
+		FlashV2TTSModel: {"ja", "ko", "auto"},
+	}
+	for model, languages := range refused {
+		for _, language := range languages {
+			request := ttsRequest(testEndpoint, language)
+			request.Plan.Route.Model = model
+			_, err := adapter.Open(context.Background(), request)
+			var providerErr *runtimepkg.ProviderError
+			if !errors.As(err, &providerErr) || providerErr.Code != "unsupported_language" || !strings.Contains(providerErr.Message, model) {
+				t.Errorf("%s %s: Open error = %v, want unsupported_language naming the model", model, language, err)
+			}
 		}
 	}
 }
@@ -277,6 +335,7 @@ func TestSynthesisRejectionsKeepTheirClassification(t *testing.T) {
 		{status: http.StatusForbidden, code: "key_limit", want: "provider_quota_exceeded"},
 		{status: http.StatusBadRequest, code: "unknown_voice", want: "invalid_request"},
 		{status: http.StatusBadRequest, code: "text_too_long", want: "input_too_large"},
+		{status: http.StatusBadRequest, code: "tag_invalid", want: "invalid_request"},
 		{status: http.StatusUnprocessableEntity, code: "unspeakable_text", want: "invalid_request"},
 		{status: http.StatusTooManyRequests, code: "rate_limited", want: "provider_rate_limited", retryable: true},
 		{status: http.StatusTooManyRequests, code: "concurrency_limited", want: "provider_rate_limited", retryable: true},
@@ -424,17 +483,21 @@ func TestCommitTextBoundsTheWaitForResponseHeaders(t *testing.T) {
 	}
 }
 
-func TestOpenAcceptsTheFlashModelAndNativeEndpointOnly(t *testing.T) {
+func TestOpenAcceptsTheFlashModelsAndNativeEndpointOnly(t *testing.T) {
 	t.Parallel()
 	adapter, err := NewTTS(TTSConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	stream, err := adapter.Open(context.Background(), ttsRequest(testEndpoint, "en"))
-	if err != nil {
-		t.Fatal(err)
+	for _, model := range []string{DefaultTTSModel, FlashV2TTSModel} {
+		request := ttsRequest(testEndpoint, "en")
+		request.Plan.Route.Model = model
+		stream, err := adapter.Open(context.Background(), request)
+		if err != nil {
+			t.Fatalf("%s: %v", model, err)
+		}
+		_ = stream.Close(context.Background())
 	}
-	_ = stream.Close(context.Background())
 	model := ttsRequest(testEndpoint, "en")
 	model.Plan.Route.Model = "paxa-tts-pro-v1"
 	media := ttsRequest(testEndpoint, "en")

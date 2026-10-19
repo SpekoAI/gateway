@@ -1,11 +1,12 @@
 // Package paxa is the relay's integration for Paxa Labs (Bangkok), whose
-// paxa-tts-flash-v1 model speaks Thai and English over an HTTP synthesis
-// endpoint. One API key, sent as an Authorization bearer header, serves it.
+// paxa-tts-flash-v1 and paxa-tts-flash-v2 models speak over an HTTP synthesis
+// endpoint. One API key, sent as an Authorization bearer header, serves both.
 //
 // # Wire facts this package is built on
 //
 // Taken from paxalabs.com/docs (text-to-speech, streaming, voices, models,
-// errors, credits, rate-limits; read 2026-10-06) and confirmed against the
+// errors, credits, rate-limits; read 2026-10-06, and the v2 changelog,
+// directions and voices pages, read 2026-10-19) and confirmed against the
 // live API the same day:
 //
 //   - Synthesis is POST https://api.paxalabs.com/v1/tts with
@@ -18,12 +19,17 @@
 //   - `language` is "auto", "th", "en" or "zh". It sets how digits, codes and
 //     symbols are read; words keep the language of their script. "auto"
 //     takes the language most of the text is written in and Thai on a tie.
-//     Only th and en are routed here, so any other tag is refused at Open
-//     and an empty one is sent as "auto".
-//   - `voice` is a case-insensitive id from GET /v1/voices. Every voice
-//     reads every language, the other two with a foreign accent, so the
-//     default follows the session language: nomyen (the Thai board voice)
-//     or cookie (the English board voice).
+//     v1 is routed for th and en, v2 for th, en and zh; any other tag is
+//     refused at Open and an empty one is sent as "auto".
+//   - `voice` is a case-insensitive id from GET /v1/voices, which lists each
+//     model's roster. A v1 voice is made for one language and reads the
+//     other two with a foreign accent; every v2 voice speaks all three. 26
+//     ids are on both models, and a voice off the model's roster answers
+//     unknown_voice. The default follows the session language: nomyen (the
+//     Thai board voice), cookie (the English board voice) or taohuay.
+//   - paxa-tts-flash-v2 reads direction tags written into the text, such as
+//     [whispering] or <emph>. They travel verbatim and bill as characters; a
+//     tag the model refuses answers tag_invalid before any charge.
 //   - `text` is at most 5,000 characters, counted as UTF-16 code units.
 //   - Errors are RFC 9457 problem details, application/problem+json, with
 //     the stable code in `title` and the status mirrored in `status`.
