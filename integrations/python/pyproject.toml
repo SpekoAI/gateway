@@ -7,10 +7,13 @@ requires-python = ">=3.10,<3.15"
 dependencies = ["aiohttp>=3.10,<4"]
 
 [project.optional-dependencies]
-livekit = ["livekit-agents>=1.4.5,<2"]
+# livekit-agents before 1.6.10 imports httpx without declaring it and got it
+# through openai>=2; openai 3 moved to httpx2, so a fresh install fails on import.
+livekit = ["livekit-agents>=1.4.5,<2", "httpx>=0.23,<1"]
 pipecat = ["pipecat-ai>=1.7,<2; python_version >= '3.11'"]
 dev = [
   "livekit-agents>=1.4.5,<2",
+  "httpx>=0.23,<1",
   "pipecat-ai>=1.7,<2; python_version >= '3.11'",
   "pytest>=8",
   "pytest-asyncio>=0.24",

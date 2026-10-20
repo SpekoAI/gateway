@@ -2831,6 +2831,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "httpx" },
     { name = "livekit-agents" },
     { name = "pipecat-ai", marker = "python_full_version >= '3.11'" },
     { name = "pytest" },
@@ -2838,6 +2839,7 @@ dev = [
     { name = "ruff" },
 ]
 livekit = [
+    { name = "httpx" },
     { name = "livekit-agents" },
 ]
 pipecat = [
@@ -2847,6 +2849,8 @@ pipecat = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.10,<4" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.23,<1" },
+    { name = "httpx", marker = "extra == 'livekit'", specifier = ">=0.23,<1" },
     { name = "livekit-agents", marker = "extra == 'dev'", specifier = ">=1.4.5,<2" },
     { name = "livekit-agents", marker = "extra == 'livekit'", specifier = ">=1.4.5,<2" },
     { name = "pipecat-ai", marker = "python_full_version >= '3.11' and extra == 'dev'", specifier = ">=1.7,<2" },
