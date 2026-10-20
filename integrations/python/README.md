@@ -43,8 +43,8 @@ The LiveKit classes support `livekit-agents` 1.4.5 and later. Releases before
 1.6.5 have no keyterm capability flag, so `STT(keywords=...)` still sends the
 keywords to the provider but does not advertise keyterm support to LiveKit.
 Releases before 1.6.10 import `httpx` without declaring it, and openai 3 no
-longer brings it in; the `livekit` extra (`speko-gateway[livekit]`) installs it,
-so no `openai` pin is needed.
+longer brings it in; this package depends on `httpx`, so any install of it,
+with or without the `livekit` extra, works without an `openai` pin.
 
 With a Speko API key the LLM can come from Speko too, served by the hosted
 relay:
