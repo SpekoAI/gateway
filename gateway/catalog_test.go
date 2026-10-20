@@ -88,7 +88,7 @@ func TestModelsPublishesEveryCatalogEntry(t *testing.T) {
 		t.Fatal("catalog does not publish elevenlabs stt")
 	}
 	wantMultiModel := map[string]bool{
-		"speechify:simba-3.2": false, "speechify:simba-3.0": false,
+		"speechify:simba-3.2": false, "speechify:simba-3.5": false, "speechify:simba-3.0": false,
 		"speechify:simba-multilingual": false, "speechify:simba-english": false,
 		"gemini:gemini-3.1-flash-tts-preview": false, "gemini:gemini-3.8-flash-tts": false,
 		"gemini:gemini-3.8-flash-lite-tts": false, "fish:s2.1-pro": false,
@@ -192,7 +192,7 @@ func TestCatalogReturnsModelListsAsCopies(t *testing.T) {
 		if entries[index].Provider != "speechify" || entries[index].Kind != protocol.SessionKindTTS {
 			continue
 		}
-		if len(entries[index].Models) != 4 {
+		if len(entries[index].Models) != 5 {
 			t.Fatalf("Speechify models = %v", entries[index].Models)
 		}
 		entries[index].Models[0] = "mutated"
