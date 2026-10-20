@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from collections.abc import AsyncIterator
 
+import pytest
 from livekit import rtc
 from livekit.agents import APIConnectionError, APIConnectOptions
 from livekit.agents import llm as agents_llm
@@ -656,10 +658,16 @@ def test_stt_options_payload_builds_the_request_block() -> None:
     }
 
 
+_HAS_KEYTERMS = "keyterms" in {
+    field.name for field in dataclasses.fields(agents_stt.STTCapabilities)
+}
+
+
 def test_stt_declares_the_capabilities_it_asked_for() -> None:
     plain = STT(FakeClient())  # type: ignore[arg-type]
     assert plain.capabilities.diarization is False
-    assert plain.capabilities.keyterms is False
+    if _HAS_KEYTERMS:  # livekit-agents >= 1.6.5
+        assert plain.capabilities.keyterms is False
     assert plain._stt_options is None
 
     asking = STT(  # type: ignore[arg-type]
@@ -671,12 +679,46 @@ def test_stt_declares_the_capabilities_it_asked_for() -> None:
     # Declared here, enforced at session create: a provider that cannot honor
     # the ask refuses the session (stt_option_unsupported) before any audio.
     assert asking.capabilities.diarization is True
-    assert asking.capabilities.keyterms is True
+    if _HAS_KEYTERMS:
+        assert asking.capabilities.keyterms is True
     assert asking._stt_options == {
         "diarization": True,
         "keywords": ["Speko"],
         "provider_options": {"deepgram": {"numerals": True}},
     }
+
+
+@dataclasses.dataclass
+class _PreKeytermsSTTCapabilities:
+    """STTCapabilities as livekit-agents shipped it before 1.6.5."""
+
+    streaming: bool
+    interim_results: bool
+    diarization: bool = False
+    aligned_transcript: bool = False
+    offline_recognize: bool = True
+
+
+def test_stt_constructs_on_livekit_agents_before_keyterms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Runs against whatever livekit-agents is installed; CI also runs the whole
+    # suite against the real 1.4.5 floor.
+    monkeypatch.setattr(agents_stt, "STTCapabilities", _PreKeytermsSTTCapabilities)
+
+    asking = STT(  # type: ignore[arg-type]
+        FakeClient(),
+        diarization=True,
+        keywords=["Speko"],
+    )
+
+    assert asking.capabilities == _PreKeytermsSTTCapabilities(
+        streaming=True,
+        interim_results=True,
+        diarization=True,
+    )
+    # The capability flag is gone, but the keywords still reach the Gateway.
+    assert asking._stt_options == {"diarization": True, "keywords": ["Speko"]}
 
 
 def test_cache_write_tokens_are_included_in_completion_usage() -> None:

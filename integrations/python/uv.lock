@@ -2847,8 +2847,8 @@ pipecat = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.10,<4" },
-    { name = "livekit-agents", marker = "extra == 'dev'", specifier = ">=1.6.1,<2" },
-    { name = "livekit-agents", marker = "extra == 'livekit'", specifier = ">=1.6.1,<2" },
+    { name = "livekit-agents", marker = "extra == 'dev'", specifier = ">=1.4.5,<2" },
+    { name = "livekit-agents", marker = "extra == 'livekit'", specifier = ">=1.4.5,<2" },
     { name = "pipecat-ai", marker = "python_full_version >= '3.11' and extra == 'dev'", specifier = ">=1.7,<2" },
     { name = "pipecat-ai", marker = "python_full_version >= '3.11' and extra == 'pipecat'", specifier = ">=1.7,<2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },

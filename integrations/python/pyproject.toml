@@ -7,10 +7,10 @@ requires-python = ">=3.10,<3.15"
 dependencies = ["aiohttp>=3.10,<4"]
 
 [project.optional-dependencies]
-livekit = ["livekit-agents>=1.6.1,<2"]
+livekit = ["livekit-agents>=1.4.5,<2"]
 pipecat = ["pipecat-ai>=1.7,<2; python_version >= '3.11'"]
 dev = [
-  "livekit-agents>=1.6.1,<2",
+  "livekit-agents>=1.4.5,<2",
   "pipecat-ai>=1.7,<2; python_version >= '3.11'",
   "pytest>=8",
   "pytest-asyncio>=0.24",
