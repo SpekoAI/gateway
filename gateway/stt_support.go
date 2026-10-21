@@ -115,6 +115,11 @@ var sttOptionSupport = map[string]sttSupport{
 	// (turn_detection: balanced, patient or responsive) as a query
 	// parameter. Nothing else on the socket is tunable.
 	"hopper": {providerKeys: []string{"turn_detection"}},
+	// Voxtral's realtime session takes keywords as context_bias and its
+	// lookahead as target_streaming_delay_ms (80 to 1200, or 2400). The model
+	// lists diarization, but this socket's speaker labels are unverified, so
+	// it is not advertised.
+	"mistral": {keywords: true, providerKeys: []string{"target_streaming_delay_ms"}},
 	// Keywords fold into the transcription prompt alongside a caller's own
 	// prompt text. gpt-4o-transcribe-diarize is batch-only, so no realtime
 	// diarization. The vendor documents `prompt` on the realtime session for

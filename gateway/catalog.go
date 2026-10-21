@@ -198,6 +198,13 @@ var providerCatalog = []CatalogEntry{
 	// streams 24 kHz PCM and refuses requests without a voice.
 	{Provider: "hopper", Kind: protocol.SessionKindSTT, Adapter: "hopper.stt.v1", DefaultModel: "nemotron-asr", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.withhopper.com/stt/websocket"},
 	{Provider: "hopper", Kind: protocol.SessionKindTTS, Adapter: "hopper.tts.v1", DefaultModel: "qwen3-tts", DefaultVoice: "elena", Transport: protocol.TransportHTTP, Endpoint: "https://api.withhopper.com/v1/audio/speech"},
+	// Mistral Voxtral 3: the realtime transcription socket keyed by a bearer
+	// header, its turns ended server-side; the two offline models (POST
+	// /v1/audio/transcriptions) are a BatchTranscriber, which this catalog
+	// does not publish. voxtral-mini-tts-3-0 streams 24 kHz float PCM that
+	// the adapter converts, and refuses requests without a voice.
+	{Provider: "mistral", Kind: protocol.SessionKindSTT, Adapter: "mistral.stt.v1", DefaultModel: "voxtral-mini-transcribe-realtime-3-0", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.mistral.ai/v1/audio/transcriptions/realtime"},
+	{Provider: "mistral", Kind: protocol.SessionKindTTS, Adapter: "mistral.tts.v1", DefaultModel: "voxtral-mini-tts-3-0", DefaultVoice: "en_paul_neutral", Transport: protocol.TransportHTTP, Endpoint: "https://api.mistral.ai/v1/audio/speech"},
 	{Provider: "speechmatics", Kind: protocol.SessionKindSTT, Adapter: "speechmatics.stt.v1", DefaultModel: "standard", Models: []string{"standard", "enhanced"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://global.rt.speechmatics.com/v2/"},
 }
 
