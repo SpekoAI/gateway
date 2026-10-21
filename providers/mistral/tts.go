@@ -331,7 +331,7 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 func (s *ttsStream) statusError(response *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(response.Body, s.maxErrorBytes))
 	providerErr := providerError(fmt.Sprintf("Mistral TTS rejected the synthesis request with status %d", response.StatusCode), parseError(body), response.StatusCode, body)
-	if detail := parseError(body); detail != nil && strings.EqualFold(detail.Type, "invalid_voice") {
+	if parseError(body).kind() == "invalid_voice" {
 		providerErr.Message = fmt.Sprintf("Mistral TTS does not know voice %q", s.voice)
 		providerErr.Hint = "Use a preset slug such as en_paul_neutral or a voice id from GET /v1/audio/voices."
 	}
@@ -394,9 +394,9 @@ func (s *ttsStream) wasCanceled() bool {
 // `error`, as the realtime socket sends it, or at the top level, as the REST
 // error body has it.
 type speechEvent struct {
-	Type      string       `json:"type"`
-	AudioData string       `json:"audio_data"`
-	Error     *errorDetail `json:"error"`
+	Type      string          `json:"type"`
+	AudioData string          `json:"audio_data"`
+	Error     json.RawMessage `json:"error"`
 }
 
 // readResponse turns the event stream into audio frames as it arrives. Each
@@ -468,11 +468,14 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			}
 			return true
 		case "error":
-			detail := event.Error
+			detail := parseError(event.Error)
 			if detail == nil {
 				detail = parseError(payload)
+				if detail == nil {
+					detail = &errorDetail{}
+				}
 				// The event's own type is "error", which says nothing.
-				detail.Type = ""
+				detail.Type = nil
 			}
 			finish(runtimepkg.ProviderEvent{Err: providerError("Mistral TTS failed mid-synthesis", detail, 0, payload)})
 			return true

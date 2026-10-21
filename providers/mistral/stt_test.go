@@ -616,6 +616,127 @@ func TestLostSocketPublishesTheOpenTurnBeforeTheFailure(t *testing.T) {
 	}
 }
 
+// Turn boundaries that pile up behind an owed final queue in order: three
+// turns give three finals.
+func TestOverlappingTurnBoundariesQueue(t *testing.T) {
+	t.Parallel()
+	fake := newFakeRealtime(t)
+	fake.onAudio = frames(
+		`{"time_s": 0.0, "type": "turn.start"}`, delta("One"), `{"time_s": 0.4, "type": "turn.end", "end_reason": "threshold"}`,
+		`{"time_s": 0.6, "type": "turn.start"}`, `{"time_s": 0.8, "type": "turn.end", "end_reason": "timeout"}`,
+		`{"time_s": 1.0, "type": "turn.start"}`, delta("."),
+	)
+	fake.onAudio = append(fake.onAudio, step{after: 600 * time.Millisecond, frame: delta(" Three")}, step{frame: `{"time_s": 2.0, "type": "turn.end", "end_reason": "threshold"}`}, step{frame: delta(".")})
+	stream := openAndSpeak(t, fake, withDelay(sttRequest(fake.endpoint()), 80))
+	var finals []string
+	var starts []any
+	for len(finals) < 3 {
+		event := nextSTTEvent(t, stream)
+		switch event.Type {
+		case protocol.EventTranscriptFinal:
+			finals = append(finals, dataOf(t, event)["text"].(string))
+		case protocol.EventSpeechStarted:
+			starts = append(starts, dataOf(t, event)["audio_start_ms"])
+		}
+	}
+	if strings.Join(finals, "|") != "One.||Three." || len(starts) != 3 || starts[1] != float64(600) || starts[2] != float64(1000) {
+		t.Fatalf("finals = %q, speech.started at %v", finals, starts)
+	}
+}
+
+// A held turn promoted by one final can itself be overdue at the next
+// frame's arrival; the frame then opens a turn of its own instead of joining
+// it.
+func TestAnOverdueHeldTurnIsPublishedBeforeTheNextFrame(t *testing.T) {
+	t.Parallel()
+	fake := newFakeRealtime(t)
+	fake.onAudio = frames(
+		`{"time_s": 0.0, "type": "turn.start"}`, delta("Hel"), delta("lo"), `{"time_s": 0.4, "type": "turn.end", "end_reason": "threshold"}`,
+		`{"time_s": 0.6, "type": "turn.start"}`, `{"time_s": 0.8, "type": "turn.end", "end_reason": "timeout"}`,
+	)
+	fake.onAudio = append(fake.onAudio, step{after: 400 * time.Millisecond, frame: delta(" later")})
+	stream := openSTT(t, fake, STTConfig{EventBuffer: 1}, withDelay(sttRequest(fake.endpoint()), 80))
+	if err := stream.WriteAudio(context.Background(), make([]byte, 3_200)); err != nil {
+		t.Fatal(err)
+	}
+	// Paused after speech.started, the consumer leaves readLoop blocked on
+	// the second delta while every other frame arrives.
+	untilType(t, stream, protocol.EventSpeechStarted)
+	time.Sleep(700 * time.Millisecond)
+	first := untilType(t, stream, protocol.EventSpeechEnded)
+	second := untilType(t, stream, protocol.EventSpeechEnded)
+	third := untilType(t, stream, protocol.EventTranscriptDelta)
+	if finalText(t, first) != "Hello" || finalText(t, second) != "" || eventTypes(third) != "speech.started,transcript.delta" || dataOf(t, third[1])["text"] != "later" {
+		t.Fatalf("turns = %s / %s / %s", eventTypes(first), eventTypes(second), eventTypes(third))
+	}
+}
+
+// After an error frame has reported the failure, nothing follows it, not
+// even when the drain later times out.
+func TestNothingFollowsAReportedFailure(t *testing.T) {
+	t.Parallel()
+	fake := newFakeRealtime(t)
+	fake.onAudio = frames(`{"time_s": 0.0, "type": "turn.start"}`, delta("words"), `{"type":"error","error":{"message":"internal error","code":1000}}`)
+	fake.ignoreFlush = true
+	stream := openSTT(t, fake, STTConfig{CloseDrainTimeout: 100 * time.Millisecond}, sttRequest(fake.endpoint()))
+	if err := stream.WriteAudio(context.Background(), make([]byte, 640)); err != nil {
+		t.Fatal(err)
+	}
+	for event := nextSTTEvent(t, stream); event.Err == nil; event = nextSTTEvent(t, stream) {
+	}
+	_ = stream.Close(context.Background())
+	if rest := drainSTT(t, stream); len(rest) != 0 {
+		t.Fatalf("events after the failure = %s", eventTypes(rest))
+	}
+}
+
+// A drain timeout under backpressure still delivers the open turn's final,
+// speech.ended and the failure, in that order, to a consumer that is slow
+// but still draining.
+func TestDrainTimeoutDeliversEverythingToASlowConsumer(t *testing.T) {
+	t.Parallel()
+	fake := newFakeRealtime(t)
+	fake.onAudio = frames(`{"time_s": 0.0, "type": "turn.start"}`, delta("half"))
+	fake.ignoreFlush = true
+	stream := openSTT(t, fake, STTConfig{EventBuffer: 1, CloseDrainTimeout: 100 * time.Millisecond}, sttRequest(fake.endpoint()))
+	if err := stream.WriteAudio(context.Background(), make([]byte, 640)); err != nil {
+		t.Fatal(err)
+	}
+	untilType(t, stream, protocol.EventTranscriptDelta)
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1_500 * time.Millisecond)
+	events := drainSTT(t, stream)
+	if got := eventTypes(events); got != "transcript.final,speech.ended," || events[2].Err == nil {
+		t.Fatalf("events = %s", got)
+	}
+}
+
+// A consumer that stops draining Events fails the session once the frames
+// read off the socket pass their bound, rather than buffering without end.
+func TestUnpublishedFramesAreBounded(t *testing.T) {
+	t.Parallel()
+	fake := newFakeRealtime(t)
+	fake.onAudio = []step{{frame: `{"time_s": 0.0, "type": "turn.start"}`}}
+	for range 20 {
+		fake.onAudio = append(fake.onAudio, step{frame: delta(" word")})
+	}
+	stream := openSTT(t, fake, STTConfig{EventBuffer: 1, MaxPendingFrameBytes: 256}, sttRequest(fake.endpoint()))
+	if err := stream.WriteAudio(context.Background(), make([]byte, 640)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	terminal := stream.(runtimepkg.TerminalErrorProviderStream).TerminalError()
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(terminal, &providerErr) || !strings.Contains(providerErr.Message, "backed up") || providerErr.Retryable {
+		t.Fatalf("terminal error = %v, want the backlog failure", terminal)
+	}
+	if failure := terminalFailure(t, drainSTT(t, stream)); failure != providerErr {
+		t.Fatalf("published failure = %v, want the terminal error", failure)
+	}
+}
+
 // CommitAudio sends nothing. Close sends the flush then the end, publishes
 // the turn still open when transcription.done arrives, and completes the
 // billing with the bytes sent.

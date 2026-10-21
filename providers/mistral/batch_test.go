@@ -88,6 +88,23 @@ func wav(rate int, pcm []byte) []byte {
 	return append(header.Bytes(), pcm...)
 }
 
+// extensible builds a WAVE_FORMAT_EXTENSIBLE container, 16 kHz mono 16-bit,
+// whose sub-format is guid, around 1,000 bytes of silence.
+func extensible(guid []byte) []byte {
+	var out bytes.Buffer
+	out.WriteString("RIFF")
+	_ = binary.Write(&out, binary.LittleEndian, uint32(60+1_000))
+	out.WriteString("WAVEfmt ")
+	for _, field := range []any{uint32(40), uint16(0xFFFE), uint16(1), uint32(16_000), uint32(32_000), uint16(2), uint16(16), uint16(22), uint16(16), uint32(4)} {
+		_ = binary.Write(&out, binary.LittleEndian, field)
+	}
+	out.Write(guid)
+	out.WriteString("data")
+	_ = binary.Write(&out, binary.LittleEndian, uint32(1_000))
+	out.Write(make([]byte, 1_000))
+	return out.Bytes()
+}
+
 func batchRequest(endpoint, model string, audio []byte) runtimepkg.BatchTranscribeRequest {
 	return runtimepkg.BatchTranscribeRequest{
 		Plan: protocol.SessionPlan{
@@ -194,7 +211,12 @@ func TestReadWAV(t *testing.T) {
 	binary.LittleEndian.PutUint16(float[20:22], 3)
 	eightBit := append([]byte(nil), canonical...)
 	binary.LittleEndian.PutUint16(eightBit[34:36], 8)
-	for name, audio := range map[string][]byte{"not wav": []byte("ID3\x04 an mp3"), "no data": canonical[:36], "float": float, "8-bit": eightBit} {
+	if got, err := readWAV(bytes.NewReader(extensible(pcmSubFormat)), int64(len(extensible(pcmSubFormat)))); err != nil || got != (wavPCM{sampleRate: 16_000, channels: 1, dataBytes: 1_000}) {
+		t.Errorf("extensible PCM: readWAV = %+v %v", got, err)
+	}
+	floatGUID := append([]byte{0x03, 0x00}, pcmSubFormat[2:]...)
+	otherGUID := append(append([]byte(nil), pcmSubFormat[:2]...), make([]byte, 14)...)
+	for name, audio := range map[string][]byte{"not wav": []byte("ID3\x04 an mp3"), "no data": canonical[:36], "float": float, "8-bit": eightBit, "extensible float": extensible(floatGUID), "extensible other GUID": extensible(otherGUID)} {
 		_, err := readWAV(bytes.NewReader(audio), int64(len(audio)))
 		var providerErr *runtimepkg.ProviderError
 		if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeUnsupportedMedia {

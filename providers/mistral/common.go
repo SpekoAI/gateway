@@ -3,6 +3,7 @@ package mistral
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/SpekoAI/gateway/protocol"
@@ -50,17 +51,19 @@ func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.Creden
 
 // errorDetail is the REST error body: {"object":"error", message, type,
 // param, code, raw_status_code}. message is a string or, on a 422, the
-// validation detail object, so it is kept raw. A refused key answers
+// validation detail object; code is a string on REST ("1902") and a number
+// in a socket error frame (3051). Every field is kept raw so that no
+// spelling of one can make the whole body unreadable. A refused key answers
 // {"detail":"Invalid API Key"} instead, which leaves every field empty and
 // classifies from the status.
 type errorDetail struct {
 	Message       json.RawMessage `json:"message"`
-	Type          string          `json:"type"`
+	Type          json.RawMessage `json:"type"`
 	Code          json.RawMessage `json:"code"`
-	RawStatusCode int             `json:"raw_status_code"`
+	RawStatusCode json.RawMessage `json:"raw_status_code"`
 }
 
-// parseError reads the REST error body, or nil when the body is not JSON.
+// parseError reads an error body, or nil when the body is not a JSON object.
 func parseError(body []byte) *errorDetail {
 	var detail errorDetail
 	if json.Unmarshal(body, &detail) != nil {
@@ -69,21 +72,44 @@ func parseError(body []byte) *errorDetail {
 	return &detail
 }
 
-// code reads the error's code, a string on REST ("1902") and a number in a
-// socket error frame (3051).
+// scalar reads a JSON string or number as text, or "" for anything else.
+func scalar(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return strings.TrimSpace(text)
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) == nil {
+		return number.String()
+	}
+	return ""
+}
+
 func (d *errorDetail) code() string {
 	if d == nil {
 		return ""
 	}
-	var text string
-	if json.Unmarshal(d.Code, &text) == nil {
-		return strings.TrimSpace(text)
+	return scalar(d.Code)
+}
+
+// kind is the error's type, lowercased.
+func (d *errorDetail) kind() string {
+	if d == nil {
+		return ""
 	}
-	var number json.Number
-	if json.Unmarshal(d.Code, &number) == nil {
-		return number.String()
+	return strings.ToLower(scalar(d.Type))
+}
+
+// status is raw_status_code, a number or a numeric string, or 0.
+func (d *errorDetail) status() int {
+	if d == nil {
+		return 0
 	}
-	return ""
+	status, err := strconv.Atoi(scalar(d.RawStatusCode))
+	if err != nil {
+		return 0
+	}
+	return status
 }
 
 // text lowercases the error's message, string or object, for the keyword
@@ -102,18 +128,15 @@ func (d *errorDetail) text() string {
 // classify maps a failed exchange onto the protocol classification and
 // whether the same request may succeed later. Mistral documents no error
 // code table: 1902 (invalid_voice) and 3051 (validation) are the codes seen
-// live, so the status leads and the code, type and message refine it. A body
-// that arrives without an HTTP status of its own (a socket or event-stream
-// error) uses the raw_status_code it carries, when it carries one.
+// live. The message's quota and moderation wording leads, then the vendor
+// type, then the status. A body that arrives without an HTTP status of its
+// own (a socket or event-stream error) uses the raw_status_code it carries,
+// when it carries one.
 func classify(detail *errorDetail, status int) (string, bool) {
-	errorType := ""
-	if detail != nil {
-		errorType = strings.ToLower(detail.Type)
-		if status == 0 {
-			status = detail.RawStatusCode
-		}
+	if status == 0 {
+		status = detail.status()
 	}
-	message := detail.text()
+	errorType, message := detail.kind(), detail.text()
 	switch {
 	case errorType == "invalid_voice" || detail.code() == "1902":
 		return "invalid_request", false
@@ -121,6 +144,12 @@ func classify(detail *errorDetail, status int) (string, bool) {
 		return "provider_quota_exceeded", false
 	case strings.Contains(message, "moderation"):
 		return "invalid_request", false
+	case strings.HasPrefix(errorType, "invalid_request"):
+		return "invalid_request", false
+	case strings.Contains(errorType, "authentication") || strings.Contains(errorType, "unauthorized") || strings.Contains(errorType, "permission"):
+		return "authentication_failed", false
+	case strings.Contains(errorType, "rate_limit"):
+		return "provider_rate_limited", true
 	}
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
@@ -151,12 +180,10 @@ func classify(detail *errorDetail, status int) (string, bool) {
 func providerError(message string, detail *errorDetail, status int, raw []byte) *runtimepkg.ProviderError {
 	canonical, retryable := classify(detail, status)
 	providerErr := &runtimepkg.ProviderError{Code: canonical, Message: message, Retryable: retryable, ProviderStatus: status}
-	if detail != nil {
-		if label := strings.TrimSpace(detail.Type); label != "" {
-			providerErr.Message += " (" + label + ")"
-		} else if code := detail.code(); code != "" {
-			providerErr.Message += " (" + code + ")"
-		}
+	if label := detail.kind(); label != "" {
+		providerErr.Message += " (" + label + ")"
+	} else if code := detail.code(); code != "" {
+		providerErr.Message += " (" + code + ")"
 	}
 	if json.Valid(raw) {
 		providerErr.Extensions = extension(raw)

@@ -32,6 +32,11 @@ func TestClassifyReadsTheStatusThenTheBody(t *testing.T) {
 		{name: "outage", status: http.StatusServiceUnavailable, want: "provider_unavailable", retryable: true},
 		{name: "validation frame", body: `{"message":"target_streaming_delay_ms must be one of the trained values: ['80-1200', '2400'] (got 5000).","code":3051}`, want: "invalid_request"},
 		{name: "unknown frame", body: `{"message":"internal error","code":1000}`, want: "provider_unavailable", retryable: true},
+		{name: "vendor invalid type", body: `{"message":"bad input","type":"invalid_request_error"}`, want: "invalid_request"},
+		{name: "vendor auth type", body: `{"message":"no","type":"authentication_error"}`, want: "authentication_failed"},
+		{name: "vendor rate type", body: `{"message":"slow down","type":"rate_limit_error"}`, want: "provider_rate_limited", retryable: true},
+		{name: "string raw status", body: `{"message":"no","raw_status_code":"403"}`, want: "authentication_failed"},
+		{name: "odd field types", body: `{"message":7,"type":["x"],"code":{"a":1},"raw_status_code":true}`, want: "provider_unavailable", retryable: true},
 	}
 	for _, tc := range cases {
 		got, retryable := classify(parseError([]byte(tc.body)), tc.status)

@@ -1,6 +1,7 @@
 package mistral
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -237,12 +238,15 @@ type wavPCM struct {
 	dataBytes  int64
 }
 
-// wavFormatExtensible is WAVE_FORMAT_EXTENSIBLE, whose sub-format GUID opens
-// with the real format tag.
+// wavFormatExtensible is WAVE_FORMAT_EXTENSIBLE, whose sub-format GUID names
+// the real encoding; pcmSubFormat is KSDATAFORMAT_SUBTYPE_PCM
+// (00000001-0000-0010-8000-00aa00389b71) as it is laid out in the file.
 const (
 	wavFormatPCM        = 1
 	wavFormatExtensible = 0xFFFE
 )
+
+var pcmSubFormat = []byte{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71}
 
 // readWAV reads the container's fmt and data chunks. Only 16-bit integer
 // PCM is accepted: the billed duration is the data length over the header's
@@ -270,11 +274,14 @@ func readWAV(audio io.ReadSeeker, total int64) (wavPCM, error) {
 		body := header[offset+8:]
 		switch {
 		case id == "fmt " && size >= 16 && len(body) >= 16:
-			tag := binary.LittleEndian.Uint16(body[0:2])
-			if tag == wavFormatExtensible && size >= 26 && len(body) >= 26 {
-				tag = binary.LittleEndian.Uint16(body[24:26])
+			pcm := false
+			switch binary.LittleEndian.Uint16(body[0:2]) {
+			case wavFormatPCM:
+				pcm = true
+			case wavFormatExtensible:
+				pcm = size >= 40 && len(body) >= 40 && bytes.Equal(body[24:40], pcmSubFormat)
 			}
-			if tag != wavFormatPCM || binary.LittleEndian.Uint16(body[14:16]) != 16 {
+			if !pcm || binary.LittleEndian.Uint16(body[14:16]) != 16 {
 				return unsupported("the WAV is not 16-bit PCM")
 			}
 			format = &wavPCM{sampleRate: int(binary.LittleEndian.Uint32(body[4:8])), channels: int(binary.LittleEndian.Uint16(body[2:4]))}

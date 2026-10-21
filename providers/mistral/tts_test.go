@@ -350,12 +350,15 @@ func TestStreamErrorEventsAreClassified(t *testing.T) {
 		code      string
 		retryable bool
 	}{
-		"validation":   {event: `{"type":"error","error":{"message":"1 validation error","code":3051}}`, code: "invalid_request"},
-		"refused key":  {event: `{"type":"error","error":{"message":"Invalid API Key","code":1001,"raw_status_code":401}}`, code: "authentication_failed"},
-		"quota":        {event: `{"type":"error","message":"Monthly quota exceeded","raw_status_code":429}`, code: "provider_quota_exceeded"},
-		"rate limit":   {event: `{"type":"error","message":"Requests rate limit exceeded","raw_status_code":429}`, code: "provider_rate_limited", retryable: true},
-		"moderation":   {event: `{"type":"error","message":"Input refused by moderation"}`, code: "invalid_request"},
-		"server error": {event: `{"type":"error","error":{"message":"internal error","raw_status_code":500}}`, code: "provider_unavailable", retryable: true},
+		"validation":    {event: `{"type":"error","error":{"message":"1 validation error","code":3051}}`, code: "invalid_request"},
+		"refused key":   {event: `{"type":"error","error":{"message":"Invalid API Key","code":1001,"raw_status_code":401}}`, code: "authentication_failed"},
+		"quota":         {event: `{"type":"error","message":"Monthly quota exceeded","raw_status_code":429}`, code: "provider_quota_exceeded"},
+		"rate limit":    {event: `{"type":"error","message":"Requests rate limit exceeded","raw_status_code":429}`, code: "provider_rate_limited", retryable: true},
+		"moderation":    {event: `{"type":"error","message":"Input refused by moderation"}`, code: "invalid_request"},
+		"server error":  {event: `{"type":"error","error":{"message":"internal error","raw_status_code":500}}`, code: "provider_unavailable", retryable: true},
+		"string status": {event: `{"type":"error","raw_status_code":"401"}`, code: "authentication_failed"},
+		"string error":  {event: `{"type":"error","error":"boom"}`, code: "provider_unavailable", retryable: true},
+		"vendor type":   {event: `{"type":"error","error":{"message":"bad input","type":"invalid_request_error"}}`, code: "invalid_request"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

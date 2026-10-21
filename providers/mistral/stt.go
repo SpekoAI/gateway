@@ -57,6 +57,13 @@ const (
 	// that acknowledges the configuration, both of which arrive within a
 	// second live.
 	defaultSetupTimeout = 15 * time.Second
+	// defaultMaxPendingFrameBytes bounds the frames read off the socket and
+	// not yet published, while a consumer that stops draining Events holds
+	// readLoop up.
+	defaultMaxPendingFrameBytes = 4 << 20
+	// closeDeliveryTimeout bounds how long a drain timeout waits for the last
+	// turn's final and the failure to reach a consumer still draining Events.
+	closeDeliveryTimeout = 10 * time.Second
 	// defaultCloseDrainTimeout bounds how long Close waits for
 	// transcription.done after the flush. It arrived about a second after
 	// the flush live.
@@ -65,6 +72,10 @@ const (
 	// handshake's body.
 	handshakeErrorBytes = 1 << 10
 )
+
+// errInboxFull marks the read that would have pushed the unpublished frames
+// past their bound.
+var errInboxFull = errors.New("mistral stt: unpublished frames exceeded their bound")
 
 // sampleRates are the pcm_s16le rates the session's audio_format takes.
 var sampleRates = map[int]struct{}{8_000: {}, 16_000: {}, 24_000: {}, 44_100: {}, 48_000: {}}
@@ -82,17 +93,21 @@ type STTConfig struct {
 	SetupTimeout time.Duration
 	// CloseDrainTimeout bounds how long Close waits for transcription.done.
 	CloseDrainTimeout time.Duration
+	// MaxPendingFrameBytes bounds the server frames read but not yet
+	// published. Past it the session fails rather than buffer without end.
+	MaxPendingFrameBytes int
 }
 
 // STTAdapter opens Voxtral realtime transcription sessions.
 type STTAdapter struct {
-	id                string
-	httpClient        *http.Client
-	eventBuffer       int
-	maxMessageBytes   int64
-	setupTimeout      time.Duration
-	closeDrainTimeout time.Duration
-	endpointPolicy    upstream.WebSocketPolicy
+	id                   string
+	httpClient           *http.Client
+	eventBuffer          int
+	maxMessageBytes      int64
+	setupTimeout         time.Duration
+	closeDrainTimeout    time.Duration
+	maxPendingFrameBytes int
+	endpointPolicy       upstream.WebSocketPolicy
 }
 
 // NewSTT validates the configuration and builds the adapter.
@@ -112,7 +127,10 @@ func NewSTT(config STTConfig) (*STTAdapter, error) {
 	if config.CloseDrainTimeout == 0 {
 		config.CloseDrainTimeout = defaultCloseDrainTimeout
 	}
-	if config.EventBuffer < 1 || config.MaxMessageBytes < 1 || config.SetupTimeout <= 0 || config.CloseDrainTimeout <= 0 {
+	if config.MaxPendingFrameBytes == 0 {
+		config.MaxPendingFrameBytes = defaultMaxPendingFrameBytes
+	}
+	if config.EventBuffer < 1 || config.MaxMessageBytes < 1 || config.SetupTimeout <= 0 || config.CloseDrainTimeout <= 0 || config.MaxPendingFrameBytes < 1 {
 		return nil, errors.New("mistral stt: event buffer, message bound and timeouts must be positive")
 	}
 	policy, err := upstream.NewWebSocketPolicy(officialHost, config.AllowedEndpointHosts, config.AllowInsecureEndpoint)
@@ -122,7 +140,7 @@ func NewSTT(config STTConfig) (*STTAdapter, error) {
 	return &STTAdapter{
 		id: config.AdapterID, httpClient: config.HTTPClient, eventBuffer: config.EventBuffer,
 		maxMessageBytes: config.MaxMessageBytes, setupTimeout: config.SetupTimeout,
-		closeDrainTimeout: config.CloseDrainTimeout, endpointPolicy: policy,
+		closeDrainTimeout: config.CloseDrainTimeout, maxPendingFrameBytes: config.MaxPendingFrameBytes, endpointPolicy: policy,
 	}, nil
 }
 
@@ -206,6 +224,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		events:         make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		done:           make(chan struct{}),
 		inboxReady:     make(chan struct{}, 1),
+		maxInboxBytes:  a.maxPendingFrameBytes,
 		drainTimeout:   a.closeDrainTimeout,
 		model:          model,
 		language:       language,
@@ -366,17 +385,22 @@ type sttStream struct {
 	// never waits on readLoop, so a consumer that stalls readLoop cannot delay
 	// a frame's stamp, and a turn's membership is decided on arrival times
 	// alone. inboxReady wakes readLoop.
-	inboxMu    sync.Mutex
-	inbox      []socketRead
+	inboxMu       sync.Mutex
+	inbox         []socketRead
+	inboxBytes    int
+	maxInboxBytes int
+	// overflow is the failure the reader recorded when the inbox passed its
+	// bound. Guarded by inboxMu until readLoop takes the entry it marks.
+	overflow   *runtimepkg.ProviderError
 	inboxReady chan struct{}
 
 	// turn, held and the turn ids are owned by readLoop.
 	turn turnState
-	// held is a turn.start, and possibly its turn.end, that arrived while
-	// the previous turn's final was still owed. Its speech.started goes out
-	// right after that final, so the deltas in between stay with the old
-	// turn.
-	held *heldTurn
+	// held are the turn boundaries (a turn.start and possibly its turn.end)
+	// that arrived while an earlier turn's final was still owed, oldest
+	// first. Each speech.started goes out right after the final before it,
+	// so the deltas in between stay with the turn that was ended.
+	held []heldTurn
 
 	terminalMu  sync.Mutex
 	terminalErr error
@@ -503,11 +527,13 @@ func (s *sttStream) drainThenClose() {
 		s.writeMu.Lock()
 		_ = s.conn.Close(websocket.StatusNormalClosure, "")
 		s.writeMu.Unlock()
-		// The close ends the reader's Read; give it a moment to report the
-		// timeout before the context cancels its send.
+		// The close ends the reader's Read. readLoop then publishes the open
+		// turn's final and the failure, which a slow consumer may take a
+		// while to drain; the context that cancels those sends waits for it,
+		// within a bound.
 		select {
 		case <-s.done:
-		case <-time.After(time.Second):
+		case <-time.After(closeDeliveryTimeout):
 		}
 	}
 	s.closed.Store(true)
@@ -619,6 +645,16 @@ func (s *sttStream) readLoop() {
 			// The stamp is taken under the lock that takeInbox holds, so a
 			// frame takeInbox does not return arrived after its cutoff.
 			s.inboxMu.Lock()
+			if err == nil && s.inboxBytes+len(payload) > s.maxInboxBytes {
+				// Events is not being drained, so readLoop may never get to
+				// this entry: the failure is recorded here, where
+				// TerminalError reports it at once, and the socket stops.
+				err = errInboxFull
+				s.overflow = &runtimepkg.ProviderError{Code: "provider_unavailable", Message: fmt.Sprintf("Mistral STT frames backed up past %d bytes because Events was not drained", s.maxInboxBytes), Retryable: false, Cause: err}
+				s.setTerminal(s.overflow)
+				_ = s.conn.CloseNow()
+			}
+			s.inboxBytes += len(payload)
 			s.inbox = append(s.inbox, socketRead{messageType: messageType, payload: payload, err: err, received: time.Now()})
 			s.inboxMu.Unlock()
 			select {
@@ -655,9 +691,20 @@ func (s *sttStream) readLoop() {
 		// Every frame that arrived before cutoff has been processed, so a
 		// deadline at or before it has passed with nothing more owed to the
 		// turn.
-		if due, ok := s.finalDue(); ok && !cutoff.Before(due) {
-			s.finalize(nil)
+		s.finalizeDue(cutoff)
+	}
+}
+
+// finalizeDue publishes every turn whose final was due at or before at. A
+// held turn promoted by one final can itself be overdue: its turn.end came
+// in long before.
+func (s *sttStream) finalizeDue(at time.Time) {
+	for {
+		due, ok := s.finalDue()
+		if !ok || at.Before(due) {
+			return
 		}
+		s.finalize(nil)
 	}
 }
 
@@ -667,7 +714,7 @@ func (s *sttStream) takeInbox() ([]socketRead, time.Time) {
 	s.inboxMu.Lock()
 	defer s.inboxMu.Unlock()
 	reads := s.inbox
-	s.inbox = nil
+	s.inbox, s.inboxBytes = nil, 0
 	return reads, time.Now()
 }
 
@@ -675,9 +722,7 @@ func (s *sttStream) takeInbox() ([]socketRead, time.Time) {
 // final whose deadline passed before the frame arrived goes out first: the
 // frame belongs to whatever comes next.
 func (s *sttStream) process(read socketRead) bool {
-	if due, ok := s.finalDue(); ok && !read.received.Before(due) {
-		s.finalize(nil)
-	}
+	s.finalizeDue(read.received)
 	if read.err != nil {
 		s.finish(read.err)
 		return true
@@ -703,18 +748,19 @@ func (s *sttStream) handle(message serverMessage, raw []byte, received time.Time
 		case s.turn.ended:
 			// The next turn began while this one's final is still owed. Its
 			// trailing words may still be on their way, so the final keeps
-			// its own rule and the new turn waits for it.
-			if s.held == nil {
-				s.held = &heldTurn{raw: raw, startTimeMS: milliseconds(message.TimeS)}
+			// its own rule and the new turn waits for it. A turn.start that
+			// repeats one still open is ignored.
+			if last := len(s.held) - 1; last < 0 || s.held[last].ended {
+				s.held = append(s.held, heldTurn{raw: raw, startTimeMS: milliseconds(message.TimeS)})
 			}
 		case !s.turn.open:
 			s.startTurn(milliseconds(message.TimeS), raw)
 		}
 	case "turn.end":
 		switch {
-		case s.held != nil:
-			if !s.held.ended {
-				s.held.ended, s.held.endedAt, s.held.endTimeMS = true, received, milliseconds(message.TimeS)
+		case len(s.held) > 0:
+			if last := &s.held[len(s.held)-1]; !last.ended {
+				last.ended, last.endedAt, last.endTimeMS = true, received, milliseconds(message.TimeS)
 			}
 		case s.turn.open && !s.turn.ended:
 			s.turn.ended, s.turn.endedAt, s.turn.endTimeMS = true, received, milliseconds(message.TimeS)
@@ -827,8 +873,9 @@ func (s *sttStream) finalize(raw []byte) {
 	}
 	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventSpeechEnded, Data: marshalData(data)})
 	s.turn = turnState{id: s.turn.id + 1}
-	if held := s.held; held != nil {
-		s.held = nil
+	if len(s.held) > 0 {
+		held := s.held[0]
+		s.held = s.held[1:]
 		s.startTurn(held.startTimeMS, held.raw)
 		if held.ended {
 			s.turn.ended, s.turn.endedAt, s.turn.endTimeMS = true, held.endedAt, held.endTimeMS
@@ -907,12 +954,23 @@ func (s *sttStream) billing(complete bool) *protocol.BillingObservation {
 // unconfirmed. Text the socket did deliver is still published as final
 // before the failure, so a lost socket does not swallow the caller's words.
 func (s *sttStream) finish(err error) {
-	if s.drainTimedOut.Load() {
-		s.finalizeAll(nil)
-		s.fail(&runtimepkg.ProviderError{Code: "request_timeout", Message: fmt.Sprintf("Mistral STT sent no transcription.done within %s", s.drainTimeout), Retryable: false, Cause: err})
+	if errors.Is(err, errInboxFull) {
+		// The reader recorded the failure; it is published here unless an
+		// earlier one already was.
+		if s.TerminalError() == s.overflow {
+			s.finalizeAll(nil)
+			s.emit(runtimepkg.ProviderEvent{Err: s.overflow})
+		}
 		return
 	}
-	if s.closed.Load() || s.doneReceived.Load() || s.TerminalError() != nil {
+	if s.doneReceived.Load() || s.TerminalError() != nil {
+		return
+	}
+	if s.drainTimedOut.Load() {
+		s.failClosing(&runtimepkg.ProviderError{Code: "request_timeout", Message: fmt.Sprintf("Mistral STT sent no transcription.done within %s", s.drainTimeout), Retryable: false, Cause: err})
+		return
+	}
+	if s.closed.Load() {
 		return
 	}
 	status := websocket.CloseStatus(err)
@@ -926,11 +984,22 @@ func (s *sttStream) finish(err error) {
 		failure.Message = "Mistral STT closed the session after the flush without transcription.done"
 	}
 	failure.Cause = err
-	s.finalizeAll(nil)
 	if status != -1 {
 		failure.Extensions = map[string]json.RawMessage{extensionID: marshalData(map[string]any{"close_status": int(status), "close_reason": reason})}
 	}
-	s.fail(failure)
+	s.failClosing(failure)
+}
+
+// failClosing ends a session that lost its socket. The terminal error is
+// recorded first, so TerminalError holds it even if the consumer never takes
+// another event; then the open turn's final and speech.ended go out, and
+// the failure last.
+func (s *sttStream) failClosing(err *runtimepkg.ProviderError) {
+	if !s.setTerminal(err) {
+		return
+	}
+	s.finalizeAll(nil)
+	s.emit(runtimepkg.ProviderEvent{Err: err})
 }
 
 // socketFailure maps a close status onto the protocol classification.
