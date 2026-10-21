@@ -526,26 +526,93 @@ func TestEmptyTurnEndsWithAnEmptyFinal(t *testing.T) {
 	}
 }
 
-// A turn.start inside the grace window publishes the old turn first; the
-// next turn's text never joins it.
-func TestTurnStartInsideTheGraceWindowClosesTheOldTurn(t *testing.T) {
+// A turn.start that arrives while the previous final is still owed does not
+// cut that turn short: its trailing words still join it, and the new turn's
+// speech.started follows its final.
+func TestTurnStartInsideTheGraceWindowWaitsForTheOldFinal(t *testing.T) {
 	t.Parallel()
 	fake := newFakeRealtime(t)
-	fake.onAudio = frames(
-		`{"time_s": 0.0, "type": "turn.start"}`, delta("Yes"), `{"time_s": 0.5, "type": "turn.end", "end_reason": "threshold"}`,
-		`{"time_s": 0.7, "type": "turn.start"}`, delta(" and then"), `{"time_s": 1.5, "type": "turn.end", "end_reason": "threshold"}`, delta("?"),
-	)
+	fake.onAudio = []step{
+		{frame: `{"time_s": 0.0, "type": "turn.start"}`}, {frame: delta("Call me")},
+		{frame: `{"time_s": 0.5, "type": "turn.end", "end_reason": "threshold"}`},
+		{after: 10 * time.Millisecond, frame: `{"time_s": 0.7, "type": "turn.start"}`},
+		{after: 20 * time.Millisecond, frame: delta(" tomorrow.")},
+		{after: 400 * time.Millisecond, frame: delta(" Bye")},
+		{frame: `{"time_s": 1.5, "type": "turn.end", "end_reason": "threshold"}`}, {frame: delta(".")},
+	}
 	stream := openAndSpeak(t, fake, sttRequest(fake.endpoint()))
 	first := untilType(t, stream, protocol.EventSpeechEnded)
+	if got := finalText(t, first); got != "Call me tomorrow." {
+		t.Fatalf("first final = %q", got)
+	}
 	second := untilType(t, stream, protocol.EventSpeechEnded)
-	if finalText(t, first) != "Yes" || finalText(t, second) != "and then?" {
-		t.Fatalf("finals = %q / %q", finalText(t, first), finalText(t, second))
+	if got := eventTypes(second); got != "speech.started,transcript.delta,transcript.delta,transcript.final,speech.ended" {
+		t.Fatalf("second turn = %s", got)
 	}
-	if eventTypes(second) != "speech.started,transcript.delta,transcript.delta,transcript.final,speech.ended" {
-		t.Fatalf("second turn = %s", eventTypes(second))
+	if data := dataOf(t, second[0]); data["turn_id"] != float64(1) || data["audio_start_ms"] != float64(700) {
+		t.Fatalf("held speech.started = %v", data)
 	}
-	if data := dataOf(t, second[len(second)-2]); data["turn_id"] != float64(1) || data["audio_start_ms"] != float64(700) {
-		t.Fatalf("second final = %v", data)
+	if got := finalText(t, second); got != "Bye." {
+		t.Fatalf("second final = %q", got)
+	}
+}
+
+// A turn's membership follows arrival times, not how fast the consumer
+// drains: with a one-slot event buffer and a paused consumer, the words that
+// arrived inside the deadline still join the turn.
+func TestAStalledConsumerDoesNotMoveWordsToTheNextTurn(t *testing.T) {
+	t.Parallel()
+	fake := newFakeRealtime(t)
+	fake.onAudio = frames(`{"time_s": 0.0, "type": "turn.start"}`, delta("First"), `{"time_s": 0.4, "type": "turn.end", "end_reason": "threshold"}`, delta(" still"), delta(" tail"))
+	stream := openSTT(t, fake, STTConfig{EventBuffer: 1}, withDelay(sttRequest(fake.endpoint()), 80))
+	if err := stream.WriteAudio(context.Background(), make([]byte, 3_200)); err != nil {
+		t.Fatal(err)
+	}
+	// The consumer takes session.ready, the opening usage and
+	// speech.started, then pauses: the first delta fills the buffer, and
+	// readLoop is still blocked publishing " still" when the 230 ms deadline
+	// passes, with " tail" already received.
+	events := untilType(t, stream, protocol.EventSpeechStarted)
+	time.Sleep(300 * time.Millisecond)
+	events = append(events, untilType(t, stream, protocol.EventSpeechEnded)...)
+	if got := finalText(t, events); got != "First still tail" {
+		t.Fatalf("final = %q", got)
+	}
+}
+
+// A socket that dies before transcription.done still publishes the text it
+// delivered, then the failure.
+func TestLostSocketPublishesTheOpenTurnBeforeTheFailure(t *testing.T) {
+	t.Parallel()
+	cases := map[string]func(*fakeRealtime){
+		"drain timeout": func(fake *fakeRealtime) { fake.ignoreFlush = true },
+		"closed":        func(fake *fakeRealtime) { fake.closeOnFlush = true },
+	}
+	for name, configure := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fake := newFakeRealtime(t)
+			fake.onAudio = frames(`{"time_s": 0.0, "type": "turn.start"}`, delta("half a sentence"))
+			configure(fake)
+			stream := openSTT(t, fake, STTConfig{CloseDrainTimeout: 150 * time.Millisecond}, sttRequest(fake.endpoint()))
+			if err := stream.WriteAudio(context.Background(), make([]byte, 640)); err != nil {
+				t.Fatal(err)
+			}
+			untilType(t, stream, protocol.EventTranscriptDelta)
+			if err := stream.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			events := drainSTT(t, stream)
+			if got := eventTypes(events); got != "transcript.final,speech.ended," {
+				t.Fatalf("events = %s", got)
+			}
+			if got := finalText(t, events); got != "half a sentence" {
+				t.Fatalf("final = %q", got)
+			}
+			if events[2].Err == nil {
+				t.Fatal("no failure after the final")
+			}
+		})
 	}
 }
 

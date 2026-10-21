@@ -127,9 +127,15 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if endpoint.Path != batchPath {
 		return nil, fmt.Errorf("mistral batch endpoint path must be %s, got %q", batchPath, endpoint.Path)
 	}
-	pcmBytes, err := wavDataBytes(request.Audio, request.AudioBytes)
+	pcm, err := readWAV(request.Audio, request.AudioBytes)
 	if err != nil {
 		return nil, err
+	}
+	if pcm.sampleRate != request.Media.SampleRateHz || pcm.channels != request.Media.Channels {
+		return nil, &runtimepkg.ProviderError{
+			Code:    batchhttp.CodeUnsupportedMedia,
+			Message: fmt.Sprintf("the WAV header says %d Hz/%d channels, the request %d Hz/%d channels", pcm.sampleRate, pcm.channels, request.Media.SampleRateHz, request.Media.Channels),
+		}
 	}
 	if err := batchhttp.Rewind(request.Audio); err != nil {
 		return nil, err
@@ -161,8 +167,7 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if response.Status < 200 || response.Status >= 300 {
 		return nil, providerError(fmt.Sprintf("Mistral rejected the transcription with status %d", response.Status), parseError(response.Body), response.Status, response.Body)
 	}
-	bytesPerSecond := int64(request.Media.SampleRateHz) * int64(request.Media.Channels) * 2
-	return parseBatchResponse(response.Body, response.Header, model, language, request.Options.STT.Diarize(), pcmBytes, bytesPerSecond)
+	return parseBatchResponse(response.Body, response.Header, model, language, request.Options.STT.Diarize(), pcm.dataBytes, int64(pcm.sampleRate)*int64(pcm.channels)*2)
 }
 
 // batchResponse is the JSON answer of the transcriptions endpoint. language
@@ -225,27 +230,62 @@ func parseBatchResponse(body []byte, header http.Header, model, language string,
 	return result, nil
 }
 
-// wavDataBytes finds the data chunk of the WAV container and returns its PCM
-// length: the declared size, clamped to what the container actually holds.
-func wavDataBytes(audio io.ReadSeeker, total int64) (int64, error) {
+// wavPCM is what the container's header says about its audio.
+type wavPCM struct {
+	sampleRate int
+	channels   int
+	dataBytes  int64
+}
+
+// wavFormatExtensible is WAVE_FORMAT_EXTENSIBLE, whose sub-format GUID opens
+// with the real format tag.
+const (
+	wavFormatPCM        = 1
+	wavFormatExtensible = 0xFFFE
+)
+
+// readWAV reads the container's fmt and data chunks. Only 16-bit integer
+// PCM is accepted: the billed duration is the data length over the header's
+// own rate and channels, which holds only for that encoding. The data length
+// is the declared size, clamped to what the container actually holds.
+func readWAV(audio io.ReadSeeker, total int64) (wavPCM, error) {
+	unsupported := func(message string) (wavPCM, error) {
+		return wavPCM{}, &runtimepkg.ProviderError{Code: batchhttp.CodeUnsupportedMedia, Message: message, Hint: "Send 16-bit PCM WAV."}
+	}
 	if err := batchhttp.Rewind(audio); err != nil {
-		return 0, err
+		return wavPCM{}, err
 	}
 	header := make([]byte, wavHeaderSearchBytes)
 	read, err := io.ReadFull(audio, header)
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
-		return 0, &runtimepkg.ProviderError{Code: batchhttp.CodeProviderError, Message: "the audio could not be read", Cause: err}
+		return wavPCM{}, &runtimepkg.ProviderError{Code: batchhttp.CodeProviderError, Message: "the audio could not be read", Cause: err}
 	}
 	header = header[:read]
 	if len(header) < 12 || string(header[0:4]) != "RIFF" || string(header[8:12]) != "WAVE" {
-		return 0, &runtimepkg.ProviderError{Code: batchhttp.CodeUnsupportedMedia, Message: "the upload is not a WAV container"}
+		return unsupported("the upload is not a WAV container")
 	}
+	var format *wavPCM
 	for offset := 12; offset+8 <= len(header); {
-		size := int64(binary.LittleEndian.Uint32(header[offset+4 : offset+8]))
-		if string(header[offset:offset+4]) == "data" {
-			return min(size, max(total-int64(offset+8), 0)), nil
+		id, size := string(header[offset:offset+4]), int64(binary.LittleEndian.Uint32(header[offset+4:offset+8]))
+		body := header[offset+8:]
+		switch {
+		case id == "fmt " && size >= 16 && len(body) >= 16:
+			tag := binary.LittleEndian.Uint16(body[0:2])
+			if tag == wavFormatExtensible && size >= 26 && len(body) >= 26 {
+				tag = binary.LittleEndian.Uint16(body[24:26])
+			}
+			if tag != wavFormatPCM || binary.LittleEndian.Uint16(body[14:16]) != 16 {
+				return unsupported("the WAV is not 16-bit PCM")
+			}
+			format = &wavPCM{sampleRate: int(binary.LittleEndian.Uint32(body[4:8])), channels: int(binary.LittleEndian.Uint16(body[2:4]))}
+		case id == "data":
+			if format == nil {
+				return unsupported("the WAV container has no format chunk before its data")
+			}
+			format.dataBytes = min(size, max(total-int64(offset+8), 0))
+			return *format, nil
 		}
 		offset += 8 + int(size) + int(size&1)
 	}
-	return 0, &runtimepkg.ProviderError{Code: batchhttp.CodeUnsupportedMedia, Message: "the WAV container has no data chunk"}
+	return unsupported("the WAV container has no data chunk")
 }

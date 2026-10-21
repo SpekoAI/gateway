@@ -178,24 +178,51 @@ func TestBatchSendsOnlyWhatWasAskedFor(t *testing.T) {
 
 // The data chunk is found behind ancillary chunks, and a streaming header's
 // oversized length is clamped to what the container holds.
-func TestWAVDataBytes(t *testing.T) {
+func TestReadWAV(t *testing.T) {
 	t.Parallel()
 	canonical := wav(16_000, make([]byte, 1_000))
 	withList := append(append(append([]byte(nil), canonical[:36]...), []byte("LIST\x05\x00\x00\x00abcde\x00")...), canonical[36:]...)
 	streaming := append([]byte(nil), canonical...)
 	binary.LittleEndian.PutUint32(streaming[40:44], 0xFFFFFFFF)
 	for name, audio := range map[string][]byte{"canonical": canonical, "list chunk": withList, "streaming": streaming} {
-		got, err := wavDataBytes(bytes.NewReader(audio), int64(len(audio)))
-		if err != nil || got != 1_000 {
-			t.Errorf("%s: wavDataBytes = %d %v, want 1000", name, got, err)
+		got, err := readWAV(bytes.NewReader(audio), int64(len(audio)))
+		if err != nil || got != (wavPCM{sampleRate: 16_000, channels: 1, dataBytes: 1_000}) {
+			t.Errorf("%s: readWAV = %+v %v", name, got, err)
 		}
 	}
-	for name, audio := range map[string][]byte{"not wav": []byte("ID3\x04 an mp3"), "no data": canonical[:36]} {
-		_, err := wavDataBytes(bytes.NewReader(audio), int64(len(audio)))
+	float := append([]byte(nil), canonical...)
+	binary.LittleEndian.PutUint16(float[20:22], 3)
+	eightBit := append([]byte(nil), canonical...)
+	binary.LittleEndian.PutUint16(eightBit[34:36], 8)
+	for name, audio := range map[string][]byte{"not wav": []byte("ID3\x04 an mp3"), "no data": canonical[:36], "float": float, "8-bit": eightBit} {
+		_, err := readWAV(bytes.NewReader(audio), int64(len(audio)))
 		var providerErr *runtimepkg.ProviderError
 		if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeUnsupportedMedia {
-			t.Errorf("%s: wavDataBytes = %v, want unsupported_media", name, err)
+			t.Errorf("%s: readWAV = %v, want unsupported_media", name, err)
 		}
+	}
+}
+
+// The billed duration comes from the header's own rate, and a header that
+// disagrees with the request is refused before anything is sent.
+func TestBatchBillsOnTheHeaderRateAndRefusesAMismatch(t *testing.T) {
+	t.Parallel()
+	server, captured := newFakeTranscribe(t, http.StatusOK, liveBatchResponse)
+	request := batchRequest(server.URL+batchPath, BatchMiniModel, wav(24_000, make([]byte, 48_000)))
+	request.Media.SampleRateHz = 24_000
+	result, err := newBatchAdapter(t, server).Transcribe(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation := result.Billing.Operations[0]; operation.Quantities["duration_seconds"] != 48_000 || operation.QuantityDenominator("duration_seconds") != 48_000 {
+		t.Fatalf("billing operation = %+v, want one second", operation)
+	}
+	captured.parts = nil
+	mismatch := batchRequest(server.URL+batchPath, BatchMiniModel, wav(8_000, make([]byte, 16_000)))
+	_, err = newBatchAdapter(t, server).Transcribe(context.Background(), mismatch)
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeUnsupportedMedia || captured.parts != nil {
+		t.Fatalf("mismatch = %v (sent %v), want unsupported_media before sending", err, captured.parts)
 	}
 }
 

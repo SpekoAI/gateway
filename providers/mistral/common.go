@@ -54,9 +54,10 @@ func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.Creden
 // {"detail":"Invalid API Key"} instead, which leaves every field empty and
 // classifies from the status.
 type errorDetail struct {
-	Message json.RawMessage `json:"message"`
-	Type    string          `json:"type"`
-	Code    json.RawMessage `json:"code"`
+	Message       json.RawMessage `json:"message"`
+	Type          string          `json:"type"`
+	Code          json.RawMessage `json:"code"`
+	RawStatusCode int             `json:"raw_status_code"`
 }
 
 // parseError reads the REST error body, or nil when the body is not JSON.
@@ -101,11 +102,16 @@ func (d *errorDetail) text() string {
 // classify maps a failed exchange onto the protocol classification and
 // whether the same request may succeed later. Mistral documents no error
 // code table: 1902 (invalid_voice) and 3051 (validation) are the codes seen
-// live, so the status leads and the code, type and message refine it.
+// live, so the status leads and the code, type and message refine it. A body
+// that arrives without an HTTP status of its own (a socket or event-stream
+// error) uses the raw_status_code it carries, when it carries one.
 func classify(detail *errorDetail, status int) (string, bool) {
 	errorType := ""
 	if detail != nil {
 		errorType = strings.ToLower(detail.Type)
+		if status == 0 {
+			status = detail.RawStatusCode
+		}
 	}
 	message := detail.text()
 	switch {

@@ -389,10 +389,14 @@ func (s *ttsStream) wasCanceled() bool {
 }
 
 // speechEvent is one SSE payload: speech.audio.delta carries base64 float32
-// samples, speech.audio.done the usage and the end of the utterance.
+// samples, speech.audio.done the usage and the end of the utterance. An error
+// event's shape is not documented, so its detail is read either nested under
+// `error`, as the realtime socket sends it, or at the top level, as the REST
+// error body has it.
 type speechEvent struct {
-	Type      string `json:"type"`
-	AudioData string `json:"audio_data"`
+	Type      string       `json:"type"`
+	AudioData string       `json:"audio_data"`
+	Error     *errorDetail `json:"error"`
 }
 
 // readResponse turns the event stream into audio frames as it arrives. Each
@@ -464,7 +468,13 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			}
 			return true
 		case "error":
-			finish(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Mistral TTS failed mid-synthesis", Retryable: true, Extensions: extension(payload)}})
+			detail := event.Error
+			if detail == nil {
+				detail = parseError(payload)
+				// The event's own type is "error", which says nothing.
+				detail.Type = ""
+			}
+			finish(runtimepkg.ProviderEvent{Err: providerError("Mistral TTS failed mid-synthesis", detail, 0, payload)})
 			return true
 		}
 		return false

@@ -205,6 +205,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		conn: conn, ctx: streamCtx, cancel: cancel,
 		events:         make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		done:           make(chan struct{}),
+		inboxReady:     make(chan struct{}, 1),
 		drainTimeout:   a.closeDrainTimeout,
 		model:          model,
 		language:       language,
@@ -360,8 +361,22 @@ type sttStream struct {
 	// flushed; billing completes on transcription.done alone.
 	doneReceived atomic.Bool
 
-	// turn is owned by readLoop.
+	// inbox holds the frames the socket reader has taken off the wire, each
+	// stamped with when it arrived, until readLoop processes them. The reader
+	// never waits on readLoop, so a consumer that stalls readLoop cannot delay
+	// a frame's stamp, and a turn's membership is decided on arrival times
+	// alone. inboxReady wakes readLoop.
+	inboxMu    sync.Mutex
+	inbox      []socketRead
+	inboxReady chan struct{}
+
+	// turn, held and the turn ids are owned by readLoop.
 	turn turnState
+	// held is a turn.start, and possibly its turn.end, that arrived while
+	// the previous turn's final was still owed. Its speech.started goes out
+	// right after that final, so the deltas in between stay with the old
+	// turn.
+	held *heldTurn
 
 	terminalMu  sync.Mutex
 	terminalErr error
@@ -378,6 +393,14 @@ type turnState struct {
 	ended       bool
 	endedAt     time.Time
 	startTimeMS *int64
+	endTimeMS   *int64
+}
+
+type heldTurn struct {
+	raw         []byte
+	startTimeMS *int64
+	ended       bool
+	endedAt     time.Time
 	endTimeMS   *int64
 }
 
@@ -579,22 +602,28 @@ type socketRead struct {
 	messageType websocket.MessageType
 	payload     []byte
 	err         error
+	// received is when the frame came off the socket.
+	received time.Time
 }
 
 // readLoop owns the turn state and is the only sender on Events. Reads run
 // on their own goroutine so the finalization deadline can fire while the
-// socket is quiet.
+// socket is quiet, and every decision about which turn a frame belongs to
+// uses the frame's arrival time, never the time readLoop got round to it.
 func (s *sttStream) readLoop() {
 	defer close(s.events)
 	defer close(s.done)
-	reads := make(chan socketRead)
 	go func() {
 		for {
 			messageType, payload, err := s.conn.Read(s.ctx)
+			// The stamp is taken under the lock that takeInbox holds, so a
+			// frame takeInbox does not return arrived after its cutoff.
+			s.inboxMu.Lock()
+			s.inbox = append(s.inbox, socketRead{messageType: messageType, payload: payload, err: err, received: time.Now()})
+			s.inboxMu.Unlock()
 			select {
-			case reads <- socketRead{messageType: messageType, payload: payload, err: err}:
-			case <-s.done:
-				return
+			case s.inboxReady <- struct{}{}:
+			default:
 			}
 			if err != nil {
 				return
@@ -613,49 +642,82 @@ func (s *sttStream) readLoop() {
 			wake = timer.C
 		}
 		select {
-		case read := <-reads:
-			timer.Stop()
-			if read.err != nil {
-				s.finish(read.err)
-				return
-			}
-			if read.messageType != websocket.MessageText {
-				continue
-			}
-			var message serverMessage
-			if err := json.Unmarshal(read.payload, &message); err != nil {
-				continue
-			}
-			if s.handle(message, read.payload) {
-				return
-			}
+		case <-s.inboxReady:
 		case <-wake:
-			if due, ok := s.finalDue(); ok && !time.Now().Before(due) {
-				s.finalize(nil)
+		}
+		timer.Stop()
+		reads, cutoff := s.takeInbox()
+		for _, read := range reads {
+			if s.process(read) {
+				return
 			}
+		}
+		// Every frame that arrived before cutoff has been processed, so a
+		// deadline at or before it has passed with nothing more owed to the
+		// turn.
+		if due, ok := s.finalDue(); ok && !cutoff.Before(due) {
+			s.finalize(nil)
 		}
 	}
 }
 
-// handle maps one server frame and reports whether the session is over.
-func (s *sttStream) handle(message serverMessage, raw []byte) bool {
+// takeInbox returns the frames read so far and the instant they were taken:
+// any frame not returned arrived after it.
+func (s *sttStream) takeInbox() ([]socketRead, time.Time) {
+	s.inboxMu.Lock()
+	defer s.inboxMu.Unlock()
+	reads := s.inbox
+	s.inbox = nil
+	return reads, time.Now()
+}
+
+// process handles one frame and reports whether the session is over. A
+// final whose deadline passed before the frame arrived goes out first: the
+// frame belongs to whatever comes next.
+func (s *sttStream) process(read socketRead) bool {
+	if due, ok := s.finalDue(); ok && !read.received.Before(due) {
+		s.finalize(nil)
+	}
+	if read.err != nil {
+		s.finish(read.err)
+		return true
+	}
+	if read.messageType != websocket.MessageText {
+		return false
+	}
+	var message serverMessage
+	if err := json.Unmarshal(read.payload, &message); err != nil {
+		return false
+	}
+	return s.handle(message, read.payload, read.received)
+}
+
+// handle maps one server frame, which arrived at received, and reports
+// whether the session is over.
+func (s *sttStream) handle(message serverMessage, raw []byte, received time.Time) bool {
 	switch message.Type {
 	case "transcription.text.delta":
-		s.delta(message, raw)
+		s.delta(message, raw, received)
 	case "turn.start":
-		// A turn.start while a final is still owed means the next turn began
-		// inside the grace window: what arrived so far is the old turn's.
-		if s.turn.ended {
-			s.finalize(nil)
-		}
-		if !s.turn.open {
+		switch {
+		case s.turn.ended:
+			// The next turn began while this one's final is still owed. Its
+			// trailing words may still be on their way, so the final keeps
+			// its own rule and the new turn waits for it.
+			if s.held == nil {
+				s.held = &heldTurn{raw: raw, startTimeMS: milliseconds(message.TimeS)}
+			}
+		case !s.turn.open:
 			s.startTurn(milliseconds(message.TimeS), raw)
 		}
 	case "turn.end":
-		if s.turn.open && !s.turn.ended {
-			s.turn.ended = true
-			s.turn.endedAt = time.Now()
-			s.turn.endTimeMS = milliseconds(message.TimeS)
+		switch {
+		case s.held != nil:
+			if !s.held.ended {
+				s.held.ended, s.held.endedAt, s.held.endTimeMS = true, received, milliseconds(message.TimeS)
+			}
+		case s.turn.open && !s.turn.ended:
+			s.turn.ended, s.turn.endedAt, s.turn.endTimeMS = true, received, milliseconds(message.TimeS)
 		}
 	case "turn.eager_end", "turn.resume", "session.created", "session.updated":
 	case "transcription.done":
@@ -703,7 +765,7 @@ func (s *sttStream) startTurn(startMS *int64, raw []byte) {
 // turn's text so far, the cumulative shape transcript.delta carries.
 // Fragments split words (" V", "ox", "tral") and carry their own spacing, so
 // they are joined verbatim.
-func (s *sttStream) delta(message serverMessage, raw []byte) {
+func (s *sttStream) delta(message serverMessage, raw []byte, received time.Time) {
 	if message.Text == "" {
 		return
 	}
@@ -711,7 +773,7 @@ func (s *sttStream) delta(message serverMessage, raw []byte) {
 		s.startTurn(nil, raw)
 	}
 	s.turn.text.WriteString(message.Text)
-	s.turn.lastDelta = time.Now()
+	s.turn.lastDelta = received
 	text := strings.TrimSpace(s.turn.text.String())
 	if text == "" {
 		return
@@ -745,9 +807,9 @@ func endsSentence(text string) bool {
 	return strings.ContainsRune(".?!。？！", last)
 }
 
-// finalize publishes the open turn's final then speech.ended. An empty final
-// is still emitted: silence legitimately completes a turn, and it is the
-// evidence a caller needs to tell silence from loss.
+// finalize publishes the open turn's final then speech.ended, then opens a
+// held turn. An empty final is still emitted: silence legitimately completes
+// a turn, and it is the evidence a caller needs to tell silence from loss.
 func (s *sttStream) finalize(raw []byte) {
 	if !s.turn.open {
 		return
@@ -765,6 +827,21 @@ func (s *sttStream) finalize(raw []byte) {
 	}
 	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventSpeechEnded, Data: marshalData(data)})
 	s.turn = turnState{id: s.turn.id + 1}
+	if held := s.held; held != nil {
+		s.held = nil
+		s.startTurn(held.startTimeMS, held.raw)
+		if held.ended {
+			s.turn.ended, s.turn.endedAt, s.turn.endTimeMS = true, held.endedAt, held.endTimeMS
+		}
+	}
+}
+
+// finalizeAll publishes every turn still open, a held one included, so no
+// speech.started is left without its final.
+func (s *sttStream) finalizeAll(raw []byte) {
+	for s.turn.open {
+		s.finalize(raw)
+	}
 }
 
 // transcriptData carries the text and the turn's audio window where the
@@ -793,7 +870,7 @@ func (s *sttStream) transcriptData(text string, final bool) json.RawMessage {
 // or its final was still owed) is published as final, then the duration
 // observation completes and the socket closes.
 func (s *sttStream) completed(raw []byte) {
-	s.finalize(raw)
+	s.finalizeAll(raw)
 	// Taking the write lock waits out a frame in flight, so the count below
 	// is final.
 	s.writeMu.Lock()
@@ -827,9 +904,11 @@ func (s *sttStream) billing(complete bool) *protocol.BillingObservation {
 // is not reported twice; anything else is classified from the close status.
 // A normal close after the flush but before transcription.done is not a
 // clean finish: the last turn may be missing and the billed audio is
-// unconfirmed.
+// unconfirmed. Text the socket did deliver is still published as final
+// before the failure, so a lost socket does not swallow the caller's words.
 func (s *sttStream) finish(err error) {
 	if s.drainTimedOut.Load() {
+		s.finalizeAll(nil)
 		s.fail(&runtimepkg.ProviderError{Code: "request_timeout", Message: fmt.Sprintf("Mistral STT sent no transcription.done within %s", s.drainTimeout), Retryable: false, Cause: err})
 		return
 	}
@@ -847,6 +926,7 @@ func (s *sttStream) finish(err error) {
 		failure.Message = "Mistral STT closed the session after the flush without transcription.done"
 	}
 	failure.Cause = err
+	s.finalizeAll(nil)
 	if status != -1 {
 		failure.Extensions = map[string]json.RawMessage{extensionID: marshalData(map[string]any{"close_status": int(status), "close_reason": reason})}
 	}

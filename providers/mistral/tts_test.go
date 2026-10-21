@@ -341,6 +341,37 @@ func TestStreamFailuresAreNotShortUtterances(t *testing.T) {
 	}
 }
 
+// An error event classifies like an HTTP error: only an unknown failure is
+// retryable.
+func TestStreamErrorEventsAreClassified(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		event     string
+		code      string
+		retryable bool
+	}{
+		"validation":   {event: `{"type":"error","error":{"message":"1 validation error","code":3051}}`, code: "invalid_request"},
+		"refused key":  {event: `{"type":"error","error":{"message":"Invalid API Key","code":1001,"raw_status_code":401}}`, code: "authentication_failed"},
+		"quota":        {event: `{"type":"error","message":"Monthly quota exceeded","raw_status_code":429}`, code: "provider_quota_exceeded"},
+		"rate limit":   {event: `{"type":"error","message":"Requests rate limit exceeded","raw_status_code":429}`, code: "provider_rate_limited", retryable: true},
+		"moderation":   {event: `{"type":"error","message":"Input refused by moderation"}`, code: "invalid_request"},
+		"server error": {event: `{"type":"error","error":{"message":"internal error","raw_status_code":500}}`, code: "provider_unavailable", retryable: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			stream := openTTS(t, sseServer(t, deltaEvent(floats(0.1)), "data: "+tc.event+"\n\n"), ttsRequest("", 24_000), TTSConfig{})
+			if err := commit(t, stream, "hello"); err != nil {
+				t.Fatal(err)
+			}
+			failure := failure(t, stream)
+			if failure.Code != tc.code || failure.Retryable != tc.retryable || strings.Contains(failure.Message, "refused by") {
+				t.Fatalf("failure = %#v, want %s retryable=%v", failure, tc.code, tc.retryable)
+			}
+		})
+	}
+}
+
 // A final event without its trailing blank line still ends the utterance.
 func TestDoneWithoutTrailingBlankLineCompletes(t *testing.T) {
 	t.Parallel()
