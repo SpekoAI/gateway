@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -483,7 +484,9 @@ func (s *sttStream) Close(ctx context.Context) error {
 		s.inputClosed.Store(true)
 		err := s.writeControl(ctx, "input_audio.flush")
 		if err == nil {
-			err = s.writeControl(ctx, "input_audio.end")
+			// A socket the server drops right after the flush fails this
+			// write; the reader reports that loss with the open turn.
+			_ = s.writeControl(ctx, "input_audio.end")
 		}
 		s.writeMu.Unlock()
 		if err != nil {
@@ -534,7 +537,7 @@ func (s *sttStream) abort() error {
 		s.inputClosed.Store(true)
 		s.closed.Store(true)
 		s.cancel()
-		if err := s.conn.CloseNow(); err != nil && s.closeErr == nil {
+		if err := s.conn.CloseNow(); err != nil && !errors.Is(err, net.ErrClosed) && s.closeErr == nil {
 			s.closeErr = err
 		}
 	})
