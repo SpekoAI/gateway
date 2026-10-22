@@ -324,7 +324,7 @@ class SpeechStream(stt.RecognizeStream):
                     request_id=self._request_id,
                     alternatives=[
                         stt.SpeechData(
-                            language=self._language,
+                            language=event.language or self._language,
                             text=event.text,
                             start_time=event.start_time or 0.0,
                             end_time=event.end_time or 0.0,
@@ -356,7 +356,7 @@ class SpeechStream(stt.RecognizeStream):
                 request_id=self._request_id,
                 alternatives=[
                     stt.SpeechData(
-                        language=self._language,
+                        language=event.language or self._language,
                         text=event.text,
                         start_time=event.start_time or 0.0,
                         end_time=event.end_time or 0.0,
@@ -414,6 +414,24 @@ class TTS(tts.TTS):
     @property
     def provider(self) -> str:
         return "speko"
+
+    def update_options(
+        self,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        voice: NotGivenOr[str] = NOT_GIVEN,
+    ) -> None:
+        """Change the language or voice of the next synthesis stream.
+
+        Every LiveKit reply opens its own Gateway session, so a multilingual
+        agent can follow the caller turn by turn: pass the language the STT
+        final reports, and an empty voice lets Speko pick one for it.
+        Streams already speaking keep their settings.
+        """
+        if is_given(language):
+            self._language = language
+        if is_given(voice):
+            self._voice = voice
 
     def synthesize(
         self,

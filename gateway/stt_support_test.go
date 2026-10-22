@@ -252,3 +252,28 @@ func TestAssemblyAIVoiceFocusMustNameAPlacement(t *testing.T) {
 		}
 	}
 }
+
+// Soniox's endpoint knobs are caller-tunable, and an out-of-range value is
+// refused at create rather than dying on Soniox's error frame mid-call.
+func TestSonioxEndpointOptionsAreRangeChecked(t *testing.T) {
+	t.Parallel()
+	settings := func(values map[string]any) *protocol.SttOptions {
+		return &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"soniox": values}}
+	}
+	accepted := settings(map[string]any{"max_endpoint_delay_ms": float64(500), "endpoint_sensitivity": 0.5, "endpoint_latency_adjustment_level": float64(3)})
+	if err := validateSttRouteSupport("soniox", "stt-rt-v5", accepted); err != nil {
+		t.Fatalf("in-range endpoint knobs: %v", err)
+	}
+	for name, values := range map[string]map[string]any{
+		"delay below 500":     {"max_endpoint_delay_ms": float64(200)},
+		"fractional delay":    {"max_endpoint_delay_ms": 750.5},
+		"sensitivity above 1": {"endpoint_sensitivity": 1.5},
+		"level as string":     {"endpoint_latency_adjustment_level": "3"},
+		"unlisted key":        {"enable_language_identification": true},
+	} {
+		var supportError *SttSupportError
+		if err := validateSttRouteSupport("soniox", "stt-rt-v5", settings(values)); !errors.As(err, &supportError) {
+			t.Fatalf("%s: want a support error, got %v", name, err)
+		}
+	}
+}

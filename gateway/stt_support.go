@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/SpekoAI/gateway/protocol"
@@ -93,8 +94,12 @@ var sttOptionSupport = map[string]sttSupport{
 	// snappy-vs-patient tradeoff is genuinely per-caller).
 	"elevenlabs": {keywords: true, providerKeys: []string{"vad_silence_threshold_secs"}},
 	// enable_speaker_diarization, context terms and the one-way translation
-	// block all ride the start frame.
-	"soniox": {diarization: true, keywords: true, translation: true},
+	// block all ride the start frame, and so do the endpoint knobs: Soniox's
+	// defaults wait up to 2s after speech ends before returning an endpoint,
+	// which a voice agent hears as a slow turn.
+	"soniox": {diarization: true, keywords: true, translation: true, providerKeys: []string{
+		"max_endpoint_delay_ms", "endpoint_sensitivity", "endpoint_latency_adjustment_level",
+	}},
 	// custom vocabulary and the audio enhancer ride the live init call. Live
 	// sessions have no diarization option at all (batch does).
 	"gladia": {keywords: true, noiseReduction: true},
@@ -233,6 +238,13 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 			return err
 		}
 	}
+	// Soniox answers an out-of-range endpoint knob with an error frame after
+	// the handshake, so the session would open and then die mid-call.
+	if name == "soniox" {
+		if err := validateSonioxEndpointOptions(options); err != nil {
+			return err
+		}
+	}
 	if name == "assemblyai" && options.Provider(name)["voice_focus_threshold"] != nil &&
 		!sttAssemblyAIVoiceFocusOn(options) {
 		return &SttSupportError{
@@ -286,6 +298,46 @@ func validateAssemblyAIVoiceFocus(options *protocol.SttOptions) error {
 			Provider: "assemblyai",
 			Option:   "provider_options.assemblyai.voice_focus",
 			Detail:   "voice focus takes near-field or far-field",
+		}
+	}
+	return nil
+}
+
+// sonioxEndpointRanges are the documented bounds of Soniox's endpoint knobs
+// (https://soniox.com/docs/stt/rt/endpoint-detection). whole marks the knobs
+// that take integers.
+var sonioxEndpointRanges = map[string]struct {
+	min, max float64
+	whole    bool
+}{
+	"max_endpoint_delay_ms":             {min: 500, max: 3000, whole: true},
+	"endpoint_sensitivity":              {min: -1, max: 1},
+	"endpoint_latency_adjustment_level": {min: 0, max: 3, whole: true},
+}
+
+func validateSonioxEndpointOptions(options *protocol.SttOptions) error {
+	for key, raw := range options.Provider("soniox") {
+		bounds, ok := sonioxEndpointRanges[key]
+		if !ok {
+			continue
+		}
+		var value float64
+		switch typed := raw.(type) {
+		case float64:
+			value = typed
+		case int:
+			value = float64(typed)
+		case int64:
+			value = float64(typed)
+		default:
+			return &SttSupportError{Provider: "soniox", Option: "provider_options.soniox." + key, Detail: "must be a number"}
+		}
+		if value < bounds.min || value > bounds.max || bounds.whole && value != math.Trunc(value) {
+			kind := "a number"
+			if bounds.whole {
+				kind = "an integer"
+			}
+			return &SttSupportError{Provider: "soniox", Option: "provider_options.soniox." + key, Detail: fmt.Sprintf("must be %s from %g to %g", kind, bounds.min, bounds.max)}
 		}
 	}
 	return nil
