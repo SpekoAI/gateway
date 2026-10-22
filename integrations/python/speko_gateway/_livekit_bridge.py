@@ -31,6 +31,9 @@ class LiveKitSpeechEvent:
     start_time: float | None = None
     end_time: float | None = None
     provider_request_id: str = ""
+    # language is the provider-identified language of a final, "" when the
+    # provider identified none (a session pinned to one language).
+    language: str = ""
 
 
 @dataclass(frozen=True)
@@ -247,6 +250,7 @@ def _speech_event(event: CanonicalEvent) -> LiveKitSpeechEvent | None:
         start_time=_milliseconds(data.get("audio_start_ms")),
         end_time=_milliseconds(data.get("audio_end_ms")),
         provider_request_id=str(data.get("provider_request_id", "")),
+        language=str(data.get("language", "")),
     )
 
 

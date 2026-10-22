@@ -763,3 +763,39 @@ async def test_empty_final_does_not_steal_the_next_turn_start() -> None:
     ]
     assert events[4].alternatives[0].text == "next turn"
     await plugin.aclose()
+
+
+class IdentifiedLanguageStream(FakeStream):
+    async def events(self) -> AsyncIterator[LiveKitSpeechEvent]:
+        yield LiveKitSpeechEvent(type="transcript.delta", text="ನಮಸ್ಕಾರ")
+        await self.finished.wait()
+        yield LiveKitSpeechEvent(type="transcript.final", text="ನಮಸ್ಕಾರ", language="kn")
+        yield LiveKitSpeechEvent(type="transcript.final", text="hello")
+
+
+async def test_final_reports_the_identified_language() -> None:
+    plugin = STT(FakeClient(), language="multi")  # type: ignore[arg-type]
+    stream = plugin.stream()
+    stream._bridge = FakeBridge(IdentifiedLanguageStream())  # type: ignore[assignment]
+
+    stream.push_frame(frame())
+    stream.end_input()
+    finals = [
+        event
+        async for event in stream
+        if event.type == agents_stt.SpeechEventType.FINAL_TRANSCRIPT
+    ]
+
+    # An identified final carries its language; one without keeps the
+    # session's configured language.
+    assert [final.alternatives[0].language for final in finals] == ["kn", "multi"]
+    await plugin.aclose()
+
+
+async def test_tts_update_options_applies_to_the_next_stream() -> None:
+    plugin = TTS(FakeClient(), language="en", voice="v-en")  # type: ignore[arg-type]
+    plugin.update_options(language="kn", voice="")
+    stream = plugin.stream()
+    assert stream._bridge._language == "kn"
+    assert stream._bridge._voice == ""
+    await plugin.aclose()

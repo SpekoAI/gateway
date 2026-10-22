@@ -162,7 +162,11 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		// granularity and never marks an utterance complete on its own.
 		EnableEndpointDetection: true,
 		LanguageHints:           sttLanguageHints(request.Options.Language),
-		ClientReferenceID:       reservationReference(request.Plan),
+		// With no hint Soniox already auto-detects; identification only adds
+		// the detected language to each token, which the finals then report
+		// so a multilingual caller can switch its TTS language per turn.
+		EnableLanguageIdentification: len(sttLanguageHints(request.Options.Language)) == 0,
+		ClientReferenceID:            reservationReference(request.Plan),
 		// Speaker labels and vocabulary biasing both ride this one start
 		// frame; the gateway has already refused asks Soniox cannot serve.
 		EnableSpeakerDiariz: request.Options.STT.Diarize(),
@@ -172,7 +176,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		// original ones, and the read loop keeps them apart.
 		Translation: sttTranslationFor(request.Options.STT.TranslationTarget()),
 	}
-	payload, err := json.Marshal(start)
+	payload, err := sttStartPayload(start, request.Options.STT.Provider("soniox"))
 	if err != nil {
 		_ = conn.CloseNow()
 		return nil, err
@@ -276,7 +280,9 @@ func sonioxPrimaryLanguage(language string) (string, bool) {
 	if index := strings.IndexByte(primary, '-'); index >= 0 {
 		primary = primary[:index]
 	}
-	if primary == "" || primary == "auto" {
+	// "multi" is the multilingual spelling other STT vendors (Deepgram) take;
+	// Soniox refuses it as a hint, and auto-detection is what it asks for.
+	if primary == "" || primary == "auto" || primary == "multi" {
 		return "", false
 	}
 	if alias, ok := sonioxLanguageAliases[primary]; ok {
@@ -622,7 +628,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 				if emptySegment && committed {
 					if err := s.emit(runtimepkg.ProviderEvent{
 						Type:       protocol.EventTranscriptFinal,
-						Data:       sttTranscriptData("", "", true, nil, nil, nil, s.requestID),
+						Data:       sttTranscriptData("", "", "", true, nil, nil, nil, s.requestID),
 						Extensions: sttExtension(raw),
 					}); err != nil {
 						return err
@@ -685,7 +691,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptDelta,
-		Data:       sttTranscriptData(interim, interimTranslation, false, s.segment.startMS, endMS, nil, s.requestID),
+		Data:       sttTranscriptData(interim, interimTranslation, "", false, s.segment.startMS, endMS, nil, s.requestID),
 		Extensions: sttExtension(raw),
 	})
 }
@@ -700,14 +706,14 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 // finishing) still emits a final, with empty text: dropping it would lose
 // translated words the caller asked, and pays, for.
 func (s *sttStream) flushSegment(raw json.RawMessage) error {
-	text, confidence, startMS, endMS := s.segment.flush()
+	text, language, confidence, startMS, endMS := s.segment.flush()
 	translation := s.translated.flush()
 	if text == "" && translation == "" {
 		return nil
 	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptFinal,
-		Data:       sttTranscriptData(text, translation, true, startMS, endMS, confidence, s.requestID),
+		Data:       sttTranscriptData(text, translation, language, true, startMS, endMS, confidence, s.requestID),
 		Extensions: sttExtension(raw),
 	})
 }
@@ -730,10 +736,19 @@ type sttSegment struct {
 	confidenceN   int
 	startMS       *int64
 	endMS         *int64
+	// languages counts tokens per identified language; only a session with
+	// language identification on gets any.
+	languages map[string]int
 }
 
 func (a *sttSegment) appendFinal(token sttToken) {
 	a.text.WriteString(token.Text)
+	if token.Language != "" && strings.TrimSpace(token.Text) != "" {
+		if a.languages == nil {
+			a.languages = map[string]int{}
+		}
+		a.languages[token.Language]++
+	}
 	if token.Confidence != nil {
 		a.confidenceSum += *token.Confidence
 		a.confidenceN++
@@ -746,8 +761,16 @@ func (a *sttSegment) appendFinal(token sttToken) {
 	}
 }
 
-func (a *sttSegment) flush() (string, *float64, *int64, *int64) {
+// flush returns the segment's text, its majority identified language ("" when
+// none was identified), average confidence, and audio span.
+func (a *sttSegment) flush() (string, string, *float64, *int64, *int64) {
 	text := strings.TrimSpace(a.text.String())
+	language, most := "", 0
+	for candidate, count := range a.languages {
+		if count > most || count == most && candidate < language {
+			language, most = candidate, count
+		}
+	}
 	var confidence *float64
 	if a.confidenceN > 0 {
 		average := a.confidenceSum / float64(a.confidenceN)
@@ -755,7 +778,7 @@ func (a *sttSegment) flush() (string, *float64, *int64, *int64) {
 	}
 	startMS, endMS := a.startMS, a.endMS
 	*a = sttSegment{}
-	return text, confidence, startMS, endMS
+	return text, language, confidence, startMS, endMS
 }
 
 // sttTranslated accumulates finalized translated tokens between finals.
@@ -771,7 +794,7 @@ func (t *sttTranslated) flush() string {
 	return text
 }
 
-func sttTranscriptData(text, translation string, isFinal bool, startMS, endMS *int64, confidence *float64, requestID string) json.RawMessage {
+func sttTranscriptData(text, translation, language string, isFinal bool, startMS, endMS *int64, confidence *float64, requestID string) json.RawMessage {
 	// Finals are emitted only after <end>, <fin>, or stream completion has
 	// flushed the segment. Unlike locked token chunks, these complete an
 	// utterance and let consumers skip their missing-final safety timeout.
@@ -780,6 +803,9 @@ func sttTranscriptData(text, translation string, isFinal bool, startMS, endMS *i
 	// untranslated session keeps its exact bytes.
 	if translation != "" {
 		data["translation"] = translation
+	}
+	if language != "" {
+		data["language"] = language
 	}
 	if startMS != nil {
 		data["audio_start_ms"] = *startMS
@@ -806,16 +832,38 @@ func sttExtension(raw json.RawMessage) map[string]json.RawMessage {
 }
 
 type sttStartRequest struct {
-	Model                   string                `json:"model"`
-	AudioFormat             string                `json:"audio_format"`
-	SampleRate              int                   `json:"sample_rate"`
-	NumChannels             int                   `json:"num_channels"`
-	EnableEndpointDetection bool                  `json:"enable_endpoint_detection"`
-	LanguageHints           []string              `json:"language_hints,omitempty"`
-	ClientReferenceID       string                `json:"client_reference_id,omitempty"`
-	EnableSpeakerDiariz     bool                  `json:"enable_speaker_diarization,omitempty"`
-	Context                 *sttContext           `json:"context,omitempty"`
-	Translation             *sttTranslationConfig `json:"translation,omitempty"`
+	Model                        string                `json:"model"`
+	AudioFormat                  string                `json:"audio_format"`
+	SampleRate                   int                   `json:"sample_rate"`
+	NumChannels                  int                   `json:"num_channels"`
+	EnableEndpointDetection      bool                  `json:"enable_endpoint_detection"`
+	LanguageHints                []string              `json:"language_hints,omitempty"`
+	EnableLanguageIdentification bool                  `json:"enable_language_identification,omitempty"`
+	ClientReferenceID            string                `json:"client_reference_id,omitempty"`
+	EnableSpeakerDiariz          bool                  `json:"enable_speaker_diarization,omitempty"`
+	Context                      *sttContext           `json:"context,omitempty"`
+	Translation                  *sttTranslationConfig `json:"translation,omitempty"`
+}
+
+// sttStartPayload marshals the start frame with the caller's allow-listed
+// provider_options (see gateway/stt_support.go) written beside the adapter's
+// own fields. The allow-list holds only endpoint tuning, which the adapter
+// never sets itself, so a caller value cannot shadow a field above.
+func sttStartPayload(start sttStartRequest, settings map[string]any) ([]byte, error) {
+	payload, err := json.Marshal(start)
+	if err != nil || len(settings) == 0 {
+		return payload, err
+	}
+	frame := map[string]any{}
+	if err := json.Unmarshal(payload, &frame); err != nil {
+		return nil, err
+	}
+	for key, value := range settings {
+		if _, owned := frame[key]; !owned {
+			frame[key] = value
+		}
+	}
+	return json.Marshal(frame)
 }
 
 // sttTranslationConfig is Soniox's translation block. Only one_way is sent:
@@ -879,6 +927,9 @@ type sttToken struct {
 	// TranslationStatus is "original", "translation" or "none" on a
 	// translating session and absent otherwise.
 	TranslationStatus string `json:"translation_status"`
+	// Language is the identified language, present only when the start
+	// frame enabled language identification.
+	Language string `json:"language"`
 }
 
 type sttInboundMessage struct {

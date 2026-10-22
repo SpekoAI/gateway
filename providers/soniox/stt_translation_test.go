@@ -285,7 +285,7 @@ func TestSTTTranslationTailIsFlushedOnFinish(t *testing.T) {
 // event bytes: no translation key appears.
 func TestSTTUntranslatedEventsCarryNoTranslationKey(t *testing.T) {
 	t.Parallel()
-	payload := sttTranscriptData("hello", "", true, nil, nil, nil, "req")
+	payload := sttTranscriptData("hello", "", "", true, nil, nil, nil, "req")
 	if strings.Contains(string(payload), "translation") {
 		t.Fatalf("untranslated event mentions translation: %s", payload)
 	}
