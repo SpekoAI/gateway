@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -535,34 +536,54 @@ func TestEmptyTurnEndsWithAnEmptyFinal(t *testing.T) {
 	}
 }
 
-// A turn.start that arrives while the previous final is still owed does not
-// cut that turn short: its trailing words still join it, and the new turn's
-// speech.started follows its final.
-func TestTurnStartInsideTheGraceWindowWaitsForTheOldFinal(t *testing.T) {
+// The next turn.start closes a turn whose final is still owed; the words
+// after it belong to the new turn.
+func TestTurnStartClosesThePendingTurn(t *testing.T) {
 	t.Parallel()
 	fake := newFakeRealtime(t)
 	fake.onAudio = []step{
-		{frame: `{"time_s": 0.0, "type": "turn.start"}`}, {frame: delta("Call me")},
+		{frame: `{"time_s": 0.0, "type": "turn.start"}`}, {frame: delta("Hello.")},
 		{frame: `{"time_s": 0.5, "type": "turn.end", "end_reason": "threshold"}`},
-		{after: 10 * time.Millisecond, frame: `{"time_s": 0.7, "type": "turn.start"}`},
-		{after: 20 * time.Millisecond, frame: delta(" tomorrow.")},
-		{after: 400 * time.Millisecond, frame: delta(" Bye")},
-		{frame: `{"time_s": 1.5, "type": "turn.end", "end_reason": "threshold"}`}, {frame: delta(".")},
+		{after: 200 * time.Millisecond, frame: `{"time_s": 0.7, "type": "turn.start"}`},
+		{after: 100 * time.Millisecond, frame: delta(" Next request.")},
+		{frame: `{"time_s": 1.5, "type": "turn.end", "end_reason": "threshold"}`},
 	}
-	stream := openAndSpeak(t, fake, withDelay(sttRequest(fake.endpoint()), 80))
+	stream := openAndSpeak(t, fake, sttRequest(fake.endpoint()))
 	first := untilType(t, stream, protocol.EventSpeechEnded)
-	if got := finalText(t, first); got != "Call me tomorrow." {
-		t.Fatalf("first final = %q", got)
-	}
 	second := untilType(t, stream, protocol.EventSpeechEnded)
-	if got := eventTypes(second); got != "speech.started,transcript.delta,transcript.delta,transcript.final,speech.ended" {
+	if finalText(t, first) != "Hello." || finalText(t, second) != "Next request." {
+		t.Fatalf("finals = %q / %q", finalText(t, first), finalText(t, second))
+	}
+	if got := eventTypes(second); got != "speech.started,transcript.delta,transcript.final,speech.ended" {
 		t.Fatalf("second turn = %s", got)
 	}
 	if data := dataOf(t, second[0]); data["turn_id"] != float64(1) || data["audio_start_ms"] != float64(700) {
-		t.Fatalf("held speech.started = %v", data)
+		t.Fatalf("second speech.started = %v", data)
 	}
-	if got := finalText(t, second); got != "Bye." {
-		t.Fatalf("second final = %q", got)
+}
+
+// Three turns in quick succession give three finals, in order.
+func TestRapidTurnsEachGetTheirFinal(t *testing.T) {
+	t.Parallel()
+	fake := newFakeRealtime(t)
+	for index, word := range []string{"One.", " Two.", " Three."} {
+		fake.onAudio = append(fake.onAudio,
+			step{frame: fmt.Sprintf(`{"time_s": %d.0, "type": "turn.start"}`, index)},
+			step{frame: delta(word)},
+			step{frame: fmt.Sprintf(`{"time_s": %d.5, "type": "turn.end", "end_reason": "threshold"}`, index)},
+		)
+	}
+	stream := openAndSpeak(t, fake, withDelay(sttRequest(fake.endpoint()), 80))
+	var finals []string
+	for turn := range 3 {
+		events := untilType(t, stream, protocol.EventSpeechEnded)
+		if data := dataOf(t, events[len(events)-2]); data["turn_id"] != float64(turn) {
+			t.Fatalf("final %d = %v", turn, data)
+		}
+		finals = append(finals, finalText(t, events))
+	}
+	if strings.Join(finals, "|") != "One.|Two.|Three." {
+		t.Fatalf("finals = %q", finals)
 	}
 }
 
@@ -625,45 +646,15 @@ func TestLostSocketPublishesTheOpenTurnBeforeTheFailure(t *testing.T) {
 	}
 }
 
-// Turn boundaries that pile up behind an owed final queue in order: three
-// turns give three finals.
-func TestOverlappingTurnBoundariesQueue(t *testing.T) {
+// With the consumer stalled, frames are still assigned by when they
+// arrived: a word inside the deadline joins the ended turn, and one that
+// arrived after it opens a turn of its own, however late readLoop gets to
+// either.
+func TestAStalledConsumerStillAssignsByArrival(t *testing.T) {
 	t.Parallel()
 	fake := newFakeRealtime(t)
-	fake.onAudio = frames(
-		`{"time_s": 0.0, "type": "turn.start"}`, delta("One"), `{"time_s": 0.4, "type": "turn.end", "end_reason": "threshold"}`,
-		`{"time_s": 0.6, "type": "turn.start"}`, `{"time_s": 0.8, "type": "turn.end", "end_reason": "timeout"}`,
-		`{"time_s": 1.0, "type": "turn.start"}`, delta("."),
-	)
-	fake.onAudio = append(fake.onAudio, step{after: 600 * time.Millisecond, frame: delta(" Three")}, step{frame: `{"time_s": 2.0, "type": "turn.end", "end_reason": "threshold"}`}, step{frame: delta(".")})
-	stream := openAndSpeak(t, fake, withDelay(sttRequest(fake.endpoint()), 80))
-	var finals []string
-	var starts []any
-	for len(finals) < 3 {
-		event := nextSTTEvent(t, stream)
-		switch event.Type {
-		case protocol.EventTranscriptFinal:
-			finals = append(finals, dataOf(t, event)["text"].(string))
-		case protocol.EventSpeechStarted:
-			starts = append(starts, dataOf(t, event)["audio_start_ms"])
-		}
-	}
-	if strings.Join(finals, "|") != "One.||Three." || len(starts) != 3 || starts[1] != float64(600) || starts[2] != float64(1000) {
-		t.Fatalf("finals = %q, speech.started at %v", finals, starts)
-	}
-}
-
-// A held turn promoted by one final can itself be overdue at the next
-// frame's arrival; the frame then opens a turn of its own instead of joining
-// it.
-func TestAnOverdueHeldTurnIsPublishedBeforeTheNextFrame(t *testing.T) {
-	t.Parallel()
-	fake := newFakeRealtime(t)
-	fake.onAudio = frames(
-		`{"time_s": 0.0, "type": "turn.start"}`, delta("Hel"), delta("lo"), `{"time_s": 0.4, "type": "turn.end", "end_reason": "threshold"}`,
-		`{"time_s": 0.6, "type": "turn.start"}`, `{"time_s": 0.8, "type": "turn.end", "end_reason": "timeout"}`,
-	)
-	fake.onAudio = append(fake.onAudio, step{after: 400 * time.Millisecond, frame: delta(" later")})
+	fake.onAudio = frames(`{"time_s": 0.0, "type": "turn.start"}`, delta("Hel"), delta("lo"), `{"time_s": 0.4, "type": "turn.end", "end_reason": "threshold"}`)
+	fake.onAudio = append(fake.onAudio, step{after: 50 * time.Millisecond, frame: delta(" still")}, step{after: 400 * time.Millisecond, frame: delta(" orphan")})
 	stream := openSTT(t, fake, STTConfig{EventBuffer: 1}, withDelay(sttRequest(fake.endpoint()), 80))
 	if err := stream.WriteAudio(context.Background(), make([]byte, 3_200)); err != nil {
 		t.Fatal(err)
@@ -673,10 +664,9 @@ func TestAnOverdueHeldTurnIsPublishedBeforeTheNextFrame(t *testing.T) {
 	untilType(t, stream, protocol.EventSpeechStarted)
 	time.Sleep(700 * time.Millisecond)
 	first := untilType(t, stream, protocol.EventSpeechEnded)
-	second := untilType(t, stream, protocol.EventSpeechEnded)
-	third := untilType(t, stream, protocol.EventTranscriptDelta)
-	if finalText(t, first) != "Hello" || finalText(t, second) != "" || eventTypes(third) != "speech.started,transcript.delta" || dataOf(t, third[1])["text"] != "later" {
-		t.Fatalf("turns = %s / %s / %s", eventTypes(first), eventTypes(second), eventTypes(third))
+	second := untilType(t, stream, protocol.EventTranscriptDelta)
+	if finalText(t, first) != "Hello still" || eventTypes(second) != "speech.started,transcript.delta" || dataOf(t, second[1])["text"] != "orphan" {
+		t.Fatalf("turns = %s %q / %s", eventTypes(first), finalText(t, first), eventTypes(second))
 	}
 }
 

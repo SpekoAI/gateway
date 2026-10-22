@@ -34,10 +34,12 @@
 //   - turn.* runs on the audio clock while text lags it by up to the
 //     streaming delay: at 480 ms a turn's last words arrived 10 to 240 ms
 //     after its turn.end, at 1200 ms up to 800 ms after, and punctuation
-//     marks no turn's end. A turn's final therefore goes out once the delay
-//     plus 150 ms has passed since turn.end; deltas until then belong to the
-//     ended turn, even after the next turn.start, whose speech.started
-//     follows that final.
+//     marks no turn's end. As Mistral's turn-detection docs put it, a turn's
+//     text closes once the delay has passed since turn.end or when the next
+//     turn.start arrives, whichever comes first. The final goes out at the
+//     delay plus 150 ms after turn.end, or at the next turn.start; deltas
+//     until then belong to the ended turn, and deltas after that turn.start
+//     to the new one.
 //   - input_audio.flush finalizes the whole stream, not the turn: audio
 //     sent after it is ignored. There is no per-turn commit, so CommitAudio
 //     sends nothing, as with Meta. Close sends input_audio.flush then

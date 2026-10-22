@@ -45,7 +45,7 @@ const (
 	// ms up to 800 ms after. Punctuation is no completion signal: at 1200 ms
 	// a turn.end once arrived 250 ms after a mid-turn "Voice." and just ahead
 	// of the next sentence. So a turn's final goes out once the delay plus
-	// finalGrace has passed since turn.end.
+	// finalGrace has passed since turn.end, or at the next turn.start.
 	finalGrace = 150 * time.Millisecond
 
 	defaultSTTEventBuffer  = 64
@@ -393,13 +393,8 @@ type sttStream struct {
 	overflow   *runtimepkg.ProviderError
 	inboxReady chan struct{}
 
-	// turn, held and the turn ids are owned by readLoop.
+	// turn is owned by readLoop.
 	turn turnState
-	// held are the turn boundaries (a turn.start and possibly its turn.end)
-	// that arrived while an earlier turn's final was still owed, oldest
-	// first. Each speech.started goes out right after the final before it,
-	// so the deltas in between stay with the turn that was ended.
-	held []heldTurn
 
 	terminalMu  sync.Mutex
 	terminalErr error
@@ -407,7 +402,8 @@ type sttStream struct {
 
 // turnState is the open turn. text accumulates the append-only deltas
 // verbatim, spacing included. ended is set by turn.end: the final is then
-// owed, and deltas until it goes out still belong to this turn.
+// owed, and deltas until it goes out, by the deadline or the next
+// turn.start, still belong to this turn.
 type turnState struct {
 	id          int
 	open        bool
@@ -415,14 +411,6 @@ type turnState struct {
 	ended       bool
 	endedAt     time.Time
 	startTimeMS *int64
-	endTimeMS   *int64
-}
-
-type heldTurn struct {
-	raw         []byte
-	startTimeMS *int64
-	ended       bool
-	endedAt     time.Time
 	endTimeMS   *int64
 }
 
@@ -693,15 +681,10 @@ func (s *sttStream) readLoop() {
 	}
 }
 
-// finalizeDue publishes every turn whose final was due at or before at. A
-// held turn promoted by one final can itself be overdue: its turn.end came
-// in long before.
+// finalizeDue publishes the ended turn when its final was due at or before
+// at.
 func (s *sttStream) finalizeDue(at time.Time) {
-	for {
-		due, ok := s.finalDue()
-		if !ok || at.Before(due) {
-			return
-		}
+	if due, ok := s.finalDue(); ok && !at.Before(due) {
 		s.finalize(nil)
 	}
 }
@@ -742,25 +725,19 @@ func (s *sttStream) handle(message serverMessage, raw []byte, received time.Time
 	case "transcription.text.delta":
 		s.delta(message, raw)
 	case "turn.start":
-		switch {
-		case s.turn.ended:
-			// The next turn began while this one's final is still owed. Its
-			// trailing words may still be on their way, so the final keeps
-			// its own rule and the new turn waits for it. A turn.start that
-			// repeats one still open is ignored.
-			if last := len(s.held) - 1; last < 0 || s.held[last].ended {
-				s.held = append(s.held, heldTurn{raw: raw, startTimeMS: milliseconds(message.TimeS)})
-			}
-		case !s.turn.open:
+		// The next turn.start closes a turn whose final is still owed:
+		// Mistral's turn-detection docs close a turn's text at the deadline
+		// or at the next turn.start, whichever comes first. Deltas after it
+		// belong to the new turn. A turn.start that repeats one still open
+		// is ignored.
+		if s.turn.ended {
+			s.finalize(nil)
+		}
+		if !s.turn.open {
 			s.startTurn(milliseconds(message.TimeS), raw)
 		}
 	case "turn.end":
-		switch {
-		case len(s.held) > 0:
-			if last := &s.held[len(s.held)-1]; !last.ended {
-				last.ended, last.endedAt, last.endTimeMS = true, received, milliseconds(message.TimeS)
-			}
-		case s.turn.open && !s.turn.ended:
+		if s.turn.open && !s.turn.ended {
 			s.turn.ended, s.turn.endedAt, s.turn.endTimeMS = true, received, milliseconds(message.TimeS)
 		}
 	case "turn.eager_end", "turn.resume", "session.created", "session.updated":
@@ -833,9 +810,9 @@ func (s *sttStream) finalDue() (time.Time, bool) {
 	return s.turn.endedAt.Add(s.finalDeadline), true
 }
 
-// finalize publishes the open turn's final then speech.ended, then opens a
-// held turn. An empty final is still emitted: silence legitimately completes
-// a turn, and it is the evidence a caller needs to tell silence from loss.
+// finalize publishes the open turn's final then speech.ended. An empty final
+// is still emitted: silence legitimately completes a turn, and it is the
+// evidence a caller needs to tell silence from loss.
 func (s *sttStream) finalize(raw []byte) {
 	if !s.turn.open {
 		return
@@ -853,22 +830,6 @@ func (s *sttStream) finalize(raw []byte) {
 	}
 	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventSpeechEnded, Data: marshalData(data)})
 	s.turn = turnState{id: s.turn.id + 1}
-	if len(s.held) > 0 {
-		held := s.held[0]
-		s.held = s.held[1:]
-		s.startTurn(held.startTimeMS, held.raw)
-		if held.ended {
-			s.turn.ended, s.turn.endedAt, s.turn.endTimeMS = true, held.endedAt, held.endTimeMS
-		}
-	}
-}
-
-// finalizeAll publishes every turn still open, a held one included, so no
-// speech.started is left without its final.
-func (s *sttStream) finalizeAll(raw []byte) {
-	for s.turn.open {
-		s.finalize(raw)
-	}
 }
 
 // transcriptData carries the text and the turn's audio window where the
@@ -897,7 +858,7 @@ func (s *sttStream) transcriptData(text string, final bool) json.RawMessage {
 // or its final was still owed) is published as final, then the duration
 // observation completes and the socket closes.
 func (s *sttStream) completed(raw []byte) {
-	s.finalizeAll(raw)
+	s.finalize(raw)
 	// Taking the write lock waits out a frame in flight, so the count below
 	// is final.
 	s.writeMu.Lock()
@@ -938,7 +899,7 @@ func (s *sttStream) finish(err error) {
 		// The reader recorded the failure; it is published here unless an
 		// earlier one already was.
 		if s.TerminalError() == s.overflow {
-			s.finalizeAll(nil)
+			s.finalize(nil)
 			s.emit(runtimepkg.ProviderEvent{Err: s.overflow})
 		}
 		return
@@ -978,7 +939,7 @@ func (s *sttStream) failClosing(err *runtimepkg.ProviderError) {
 	if !s.setTerminal(err) {
 		return
 	}
-	s.finalizeAll(nil)
+	s.finalize(nil)
 	s.emit(runtimepkg.ProviderEvent{Err: err})
 }
 
