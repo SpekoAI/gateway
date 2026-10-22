@@ -204,16 +204,34 @@ type ttsStream struct {
 	model                    string
 	voice                    string
 
-	readers       sync.WaitGroup
-	closeOnce     sync.Once
-	closeErr      error
-	stateMu       sync.Mutex
-	closed        bool
-	pending       strings.Builder
-	inFlight      bool
-	requestCancel context.CancelFunc
-	requestDone   chan struct{}
-	canceled      bool
+	readers   sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
+	stateMu   sync.Mutex
+	closed    bool
+	pending   strings.Builder
+	// inFlight is the newest request's hold on the stream: AppendText and
+	// CommitText refuse while it is set. A request gives it up just before
+	// publishing its last event, so a caller can start the next utterance as
+	// soon as it receives audio.done.
+	inFlight bool
+	// requests are the requests whose events may still be published, oldest
+	// first. A request stays here until its last event is delivered or
+	// suppressed, so Cancel can still suppress an audio.done or failure that
+	// a full event buffer holds back.
+	requests []*synthesis
+}
+
+// synthesis is one synthesis request.
+type synthesis struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	// done closes once the request will publish nothing more.
+	done chan struct{}
+	// after is the previous request's done: this request publishes nothing
+	// until the previous one has, so utterances never interleave.
+	after    chan struct{}
+	canceled atomic.Bool
 }
 
 func (s *ttsStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -255,27 +273,28 @@ type speechRequest struct {
 // is known, so a rejection surfaces synchronously; audio then streams on
 // Events until audio.done.
 func (s *ttsStream) CommitText(ctx context.Context) error {
-	text, requestCtx, requestCancel, done, err := s.beginRequest()
+	text, request, err := s.beginRequest()
 	if err != nil {
 		return err
 	}
+	requestCancel := request.cancel
 	// Cancel a stalled header request when CommitText's caller cancels. Stop
 	// the hook when this call returns so its scope does not own the audio body.
 	stopCallerCancel := context.AfterFunc(ctx, requestCancel)
 	defer stopCallerCancel()
 	payload, err := json.Marshal(speechRequest{Model: s.model, Input: text, VoiceID: s.voice, ResponseFormat: "pcm", Stream: true})
 	if err != nil {
-		s.abandonRequest(requestCancel, done)
+		s.abandonRequest(request)
 		return err
 	}
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, s.endpoint, bytes.NewReader(payload))
+	httpRequest, err := http.NewRequestWithContext(request.ctx, http.MethodPost, s.endpoint, bytes.NewReader(payload))
 	if err != nil {
-		s.abandonRequest(requestCancel, done)
+		s.abandonRequest(request)
 		return err
 	}
-	request.Header.Set("Authorization", "Bearer "+s.credential)
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "text/event-stream")
+	httpRequest.Header.Set("Authorization", "Bearer "+s.credential)
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Accept", "text/event-stream")
 	// The runtime holds its provider lock across CommitText, so a vendor that
 	// accepts the connection but never answers would wedge the session.
 	var headerTimedOut atomic.Bool
@@ -283,7 +302,7 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		headerTimedOut.Store(true)
 		requestCancel()
 	})
-	response, err := s.httpClient.Do(request)
+	response, err := s.httpClient.Do(httpRequest)
 	// Stop reporting false means the callback ran or is running, so the
 	// request context is cancelled even if headers arrived: that context also
 	// carries the audio body, so the response cannot be used.
@@ -295,7 +314,7 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		}
 	}
 	if err != nil {
-		s.abandonRequest(requestCancel, done)
+		s.abandonRequest(request)
 		if headerTimedOut.Load() {
 			return &runtimepkg.ProviderError{Code: "request_timeout", Message: fmt.Sprintf("Mistral TTS sent no response headers within %s", s.headerTimeout), Retryable: true, Cause: err}
 		}
@@ -312,16 +331,16 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		providerErr := s.statusError(response)
 		bodyTimer.Stop()
 		_ = response.Body.Close()
-		s.abandonRequest(requestCancel, done)
+		s.abandonRequest(request)
 		return providerErr
 	}
 	if mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type")); err != nil || !strings.EqualFold(mediaType, "text/event-stream") {
 		_ = response.Body.Close()
-		s.abandonRequest(requestCancel, done)
+		s.abandonRequest(request)
 		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Mistral TTS returned an unexpected success content type", Retryable: true, ProviderStatus: response.StatusCode}
 	}
 	s.readers.Add(1)
-	go s.readResponse(requestCtx, response, requestCancel, done)
+	go s.readResponse(request, response)
 	return nil
 }
 
@@ -338,54 +357,63 @@ func (s *ttsStream) statusError(response *http.Response) error {
 	return providerErr
 }
 
-func (s *ttsStream) beginRequest() (string, context.Context, context.CancelFunc, chan struct{}, error) {
+func (s *ttsStream) beginRequest() (string, *synthesis, error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if s.closed {
-		return "", nil, nil, nil, runtimepkg.ErrSessionClosed
+		return "", nil, runtimepkg.ErrSessionClosed
 	}
 	if s.inFlight {
-		return "", nil, nil, nil, errors.New("mistral tts previous utterance has not completed")
+		return "", nil, errors.New("mistral tts previous utterance has not completed")
 	}
 	text := s.pending.String()
 	if text == "" {
-		return "", nil, nil, nil, errors.New("mistral tts has no buffered text to synthesize")
+		return "", nil, errors.New("mistral tts has no buffered text to synthesize")
 	}
-	requestCtx, requestCancel := context.WithCancel(s.ctx)
-	done := make(chan struct{})
+	request := &synthesis{done: make(chan struct{})}
+	request.ctx, request.cancel = context.WithCancel(s.ctx)
+	if last := len(s.requests) - 1; last >= 0 {
+		request.after = s.requests[last].done
+	}
 	s.pending.Reset()
 	s.inFlight = true
-	s.requestCancel = requestCancel
-	s.requestDone = done
-	s.canceled = false
-	return text, requestCtx, requestCancel, done, nil
+	s.requests = append(s.requests, request)
+	return text, request, nil
 }
 
-func (s *ttsStream) abandonRequest(cancel context.CancelFunc, done chan struct{}) {
-	cancel()
-	s.releaseRequest(done)
-	close(done)
+func (s *ttsStream) abandonRequest(request *synthesis) {
+	request.cancel()
+	s.releaseRequest(request)
+	close(request.done)
 }
 
-// releaseRequest frees the in-flight slot of the request that owns done. It
-// is idempotent and leaves a newer request alone, so the reader can release
-// its slot before publishing audio.done and still run its deferred cleanup
-// after the caller has started the next utterance.
-func (s *ttsStream) releaseRequest(done chan struct{}) {
+// finishing gives up the stream's in-flight hold just before the request's
+// last event, so a caller that reacts to audio.done by starting the next
+// utterance does not find this one still in flight. The request stays
+// cancellable until releaseRequest.
+func (s *ttsStream) finishing(request *synthesis) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if s.requestDone != done {
+	if last := len(s.requests) - 1; last >= 0 && s.requests[last] == request {
+		s.inFlight = false
+	}
+}
+
+// releaseRequest drops a request that will publish nothing more. It is
+// idempotent and leaves newer requests alone.
+func (s *ttsStream) releaseRequest(request *synthesis) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	for index, candidate := range s.requests {
+		if candidate != request {
+			continue
+		}
+		if index == len(s.requests)-1 {
+			s.inFlight = false
+		}
+		s.requests = append(s.requests[:index:index], s.requests[index+1:]...)
 		return
 	}
-	s.inFlight = false
-	s.requestCancel = nil
-	s.requestDone = nil
-}
-
-func (s *ttsStream) wasCanceled() bool {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	return s.canceled
 }
 
 // speechEvent is one SSE payload: speech.audio.delta carries base64 float32
@@ -402,20 +430,19 @@ type speechEvent struct {
 // readResponse turns the event stream into audio frames as it arrives. Each
 // delta's float32 samples become s16le; a delta that ends mid-sample leaves
 // its trailing bytes for the next one, so every frame carries whole samples.
-func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Response, requestCancel context.CancelFunc, done chan struct{}) {
+func (s *ttsStream) readResponse(request *synthesis, response *http.Response) {
 	defer func() {
-		requestCancel()
+		request.cancel()
 		_ = response.Body.Close()
-		s.releaseRequest(done)
-		close(done)
+		s.releaseRequest(request)
+		close(request.done)
 		s.readers.Done()
 	}()
-	// finish publishes the request's last event. The slot is released first:
-	// a caller that reacts to audio.done by starting the next utterance must
-	// not find this one still in flight.
+	// finish publishes the request's last event, after giving up the
+	// in-flight hold; Cancel can still suppress it until it is delivered.
 	finish := func(event runtimepkg.ProviderEvent) {
-		s.releaseRequest(done)
-		s.emit(requestCtx, event)
+		s.finishing(request)
+		s.emit(request, event)
 	}
 	failed := func(message string, cause error) {
 		finish(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: message, Retryable: true, Cause: cause}})
@@ -450,11 +477,11 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 			}
 			if !started {
 				started = true
-				if !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: data}) {
+				if !s.emit(request, runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: data}) {
 					return true
 				}
 			}
-			return !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: data, Audio: audio})
+			return !s.emit(request, runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: data, Audio: audio})
 		case "speech.audio.done":
 			switch {
 			case !started:
@@ -505,7 +532,7 @@ func (s *ttsStream) readResponse(requestCtx context.Context, response *http.Resp
 		if err == nil {
 			continue
 		}
-		if s.wasCanceled() || s.ctx.Err() != nil {
+		if request.canceled.Load() || s.ctx.Err() != nil {
 			return
 		}
 		if !errors.Is(err, io.EOF) {
@@ -556,14 +583,27 @@ func (s *ttsStream) reportResponseProgress() {
 
 // emit does not let Close interrupt a blocked send: a runtime still draining
 // events must receive every frame and audio.done. The graceful-close idle
-// timer cancels s.ctx if the consumer is abandoned; Cancel interrupts just
-// this request through requestCtx.
-func (s *ttsStream) emit(requestCtx context.Context, event runtimepkg.ProviderEvent) bool {
+// timer cancels s.ctx if the consumer is abandoned; Cancel interrupts the
+// request through its own context. Nothing is published before the previous
+// request has published its last event, and nothing after a Cancel.
+func (s *ttsStream) emit(request *synthesis, event runtimepkg.ProviderEvent) bool {
+	if request.after != nil {
+		select {
+		case <-request.after:
+		case <-request.ctx.Done():
+			return false
+		case <-s.ctx.Done():
+			return false
+		}
+	}
+	if request.ctx.Err() != nil || s.ctx.Err() != nil {
+		return false
+	}
 	select {
 	case s.events <- event:
 		s.reportResponseProgress()
 		return true
-	case <-requestCtx.Done():
+	case <-request.ctx.Done():
 		return false
 	case <-s.ctx.Done():
 		return false
@@ -576,26 +616,33 @@ func (s *ttsStream) Cancel(ctx context.Context) error {
 	s.stateMu.Lock()
 	s.pending.Reset()
 	closed := s.closed
-	cancel, done := s.requestCancel, s.requestDone
-	if cancel != nil {
-		s.canceled = true
+	requests := append([]*synthesis(nil), s.requests...)
+	for _, request := range requests {
+		request.canceled.Store(true)
 	}
 	s.stateMu.Unlock()
-	if cancel == nil {
+	if len(requests) == 0 {
 		if closed {
 			return runtimepkg.ErrSessionClosed
 		}
 		return nil
 	}
-	cancel()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.ctx.Done():
-		return nil
+	// A request whose audio has all been delivered may still hold its
+	// audio.done or failure behind a full event buffer; cancelling it
+	// suppresses that event rather than let it reach the next utterance.
+	for _, request := range requests {
+		request.cancel()
 	}
+	for _, request := range requests {
+		select {
+		case <-request.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.ctx.Done():
+			return nil
+		}
+	}
+	return nil
 }
 
 // Close lets every reader finish so its audio and audio.done are delivered,

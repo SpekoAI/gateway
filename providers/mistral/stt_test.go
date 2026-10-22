@@ -496,20 +496,29 @@ func TestFinalWithoutPunctuationWaitsForTheDeadline(t *testing.T) {
 	}
 }
 
-// Punctuation and a quiet 100 ms end the turn long before a 2400 ms
-// deadline.
-func TestPunctuationEndsTheTurnEarly(t *testing.T) {
+// Punctuation does not end a turn: a sentence that ends before turn.end is
+// joined by the next one, arriving 300 ms after it at a 1200 ms delay, and
+// the final waits for the deadline.
+func TestPunctuationDoesNotEndATurn(t *testing.T) {
 	t.Parallel()
 	fake := newFakeRealtime(t)
-	fake.onAudio = frames(`{"time_s": 0.1, "type": "turn.start"}`, delta("Thank you"), `{"time_s": 1.1, "type": "turn.end", "end_reason": "threshold"}`, delta("."))
-	stream := openAndSpeak(t, fake, withDelay(sttRequest(fake.endpoint()), 2400))
+	fake.onAudio = []step{
+		{frame: `{"time_s": 0.1, "type": "turn.start"}`}, {frame: delta("First sentence.")},
+		{frame: `{"time_s": 1.1, "type": "turn.end", "end_reason": "threshold"}`},
+		{after: 300 * time.Millisecond, frame: delta(" Second sentence.")},
+	}
+	stream := openAndSpeak(t, fake, withDelay(sttRequest(fake.endpoint()), 1200))
+	untilType(t, stream, protocol.EventTranscriptDelta)
 	started := time.Now()
 	events := untilType(t, stream, protocol.EventSpeechEnded)
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("final took %s; punctuation should end the turn after 100 ms", elapsed)
+	if elapsed := time.Since(started); elapsed < 1200*time.Millisecond {
+		t.Fatalf("final went out %s after turn.end, before the 1350 ms deadline", elapsed)
 	}
-	if got := finalText(t, events); got != "Thank you." {
+	if got := finalText(t, events); got != "First sentence. Second sentence." {
 		t.Fatalf("final = %q", got)
+	}
+	if strings.Count(eventTypes(events), "transcript.final") != 1 {
+		t.Fatalf("events = %s, want one final", eventTypes(events))
 	}
 }
 
@@ -540,7 +549,7 @@ func TestTurnStartInsideTheGraceWindowWaitsForTheOldFinal(t *testing.T) {
 		{after: 400 * time.Millisecond, frame: delta(" Bye")},
 		{frame: `{"time_s": 1.5, "type": "turn.end", "end_reason": "threshold"}`}, {frame: delta(".")},
 	}
-	stream := openAndSpeak(t, fake, sttRequest(fake.endpoint()))
+	stream := openAndSpeak(t, fake, withDelay(sttRequest(fake.endpoint()), 80))
 	first := untilType(t, stream, protocol.EventSpeechEnded)
 	if got := finalText(t, first); got != "Call me tomorrow." {
 		t.Fatalf("first final = %q", got)
@@ -920,6 +929,39 @@ func TestHandshakeRejectionIsClassified(t *testing.T) {
 	}
 }
 
+// The upgrade never follows a redirect, so the key is never replayed to a
+// URL the endpoint policy did not check, a plain-HTTP one included.
+func TestHandshakeDoesNotFollowRedirects(t *testing.T) {
+	t.Parallel()
+	followed := make(chan string, 4)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		followed <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	t.Cleanup(target.Close)
+	for _, location := range []string{target.URL + realtimePath, "ws" + strings.TrimPrefix(target.URL, "http") + realtimePath} {
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, location, http.StatusFound)
+		}))
+		t.Cleanup(server.Close)
+		parsed, _ := url.Parse(server.URL)
+		adapter, err := NewSTT(STTConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = adapter.Open(context.Background(), sttRequest("wss"+strings.TrimPrefix(server.URL, "https")+realtimePath))
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) || providerErr.ProviderStatus != http.StatusFound {
+			t.Fatalf("redirect to %s: Open error = %#v, want the 302 refused", location, err)
+		}
+	}
+	select {
+	case authorization := <-followed:
+		t.Fatalf("the redirect was followed, carrying %q", authorization)
+	default:
+	}
+}
+
 func TestCloseDrainTimeoutReportsTheMissingDone(t *testing.T) {
 	t.Parallel()
 	fake := newFakeRealtime(t)
@@ -1012,15 +1054,6 @@ func TestOpenRefusesWhatTheSocketCannotServe(t *testing.T) {
 		var providerErr *runtimepkg.ProviderError
 		if !errors.As(err, &providerErr) || providerErr.Code != code || providerErr.Hint == "" {
 			t.Fatalf("%s: Open error = %#v, want %s with a hint", name, err, code)
-		}
-	}
-}
-
-func TestEndsSentence(t *testing.T) {
-	t.Parallel()
-	for text, want := range map[string]bool{"Hello.": true, "today? ": true, "wow!": true, "好的。": true, "本当？": true, "sound": false, "Hello,": false, "": false} {
-		if got := endsSentence(text); got != want {
-			t.Errorf("endsSentence(%q) = %v, want %v", text, got, want)
 		}
 	}
 }

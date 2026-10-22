@@ -426,6 +426,39 @@ func TestNextUtteranceMayStartOnAudioDone(t *testing.T) {
 	}
 }
 
+// A Cancel while the last event is held back by a full event buffer
+// suppresses it: the stale audio.done never reaches the next utterance.
+func TestCancelSuppressesAHeldBackAudioDone(t *testing.T) {
+	t.Parallel()
+	stream := openTTS(t, sseServer(t, deltaEvent(floats(0.1, 0.2)), liveDoneEvent), ttsRequest("", 24_000), TTSConfig{EventBuffer: 1})
+	if err := commit(t, stream, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if started := nextEvent(t, stream); started.Type != protocol.EventAudioStarted {
+		t.Fatalf("first event = %s", started.Type)
+	}
+	// The frame fills the buffer and audio.done waits behind it.
+	time.Sleep(50 * time.Millisecond)
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if frame := nextEvent(t, stream); frame.Type != protocol.EventAudioFrame {
+		t.Fatalf("buffered event = %s, want the frame queued before Cancel", frame.Type)
+	}
+	select {
+	case event := <-stream.Events():
+		t.Fatalf("event after Cancel = %s %v", event.Type, event.Err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// The next utterance sees only its own events.
+	if err := commit(t, stream, "next"); err != nil {
+		t.Fatal(err)
+	}
+	if audio, events := drainAudio(t, stream); len(audio) != 4 || events[0].Type != protocol.EventAudioStarted {
+		t.Fatalf("next utterance = %s, %d bytes", eventTypes(events), len(audio))
+	}
+}
+
 // Releasing the slot before audio.done must not let a graceful Close cut
 // that event off: Close waits for the reader, not the slot.
 func TestGracefulCloseStillDeliversAudioDone(t *testing.T) {

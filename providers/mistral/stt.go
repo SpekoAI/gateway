@@ -15,7 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -39,16 +38,14 @@ const (
 	// input_audio.append.
 	maxAppendBytes = 262_144
 
-	// finalQuiet and finalGrace implement the finalization rule. turn.end
-	// runs on the audio clock while text lags it by up to the streaming
-	// delay: at 480 ms the turn's last words arrived 10 to 240 ms after
-	// turn.end live, at 1200 ms up to 800 ms after. So a turn's final waits
-	// for punctuation followed by finalQuiet without a delta, or for the
-	// delay plus finalGrace after turn.end, whichever comes first. The quiet
-	// window starts no earlier than turn.end: at 1200 ms a turn.end once
-	// arrived 250 ms after a mid-turn "Voice." and just ahead of the next
-	// sentence's first word.
-	finalQuiet = 100 * time.Millisecond
+	// finalGrace sets the finalization rule. turn.end runs on the audio
+	// clock while text lags it by up to the streaming delay ("the last words
+	// arrive after the turn event", Mistral's turn-detection docs): at 480 ms
+	// a turn's last words arrived 10 to 240 ms after turn.end live, at 1200
+	// ms up to 800 ms after. Punctuation is no completion signal: at 1200 ms
+	// a turn.end once arrived 250 ms after a mid-turn "Voice." and just ahead
+	// of the next sentence. So a turn's final goes out once the delay plus
+	// finalGrace has passed since turn.end.
 	finalGrace = 150 * time.Millisecond
 
 	defaultSTTEventBuffer  = 64
@@ -198,7 +195,9 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 
 	headers := make(http.Header)
 	headers.Set("Authorization", "Bearer "+strings.TrimSpace(credential.Value))
-	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: a.httpClient, HTTPHeader: headers})
+	// The upgrade never follows a redirect: it would replay the key to a URL
+	// the endpoint policy never checked, possibly over plain HTTP.
+	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: noRedirectClient(a.httpClient), HTTPHeader: headers})
 	if err != nil {
 		return nil, handshakeError(response, err)
 	}
@@ -413,7 +412,6 @@ type turnState struct {
 	id          int
 	open        bool
 	text        strings.Builder
-	lastDelta   time.Time
 	ended       bool
 	endedAt     time.Time
 	startTimeMS *int64
@@ -742,7 +740,7 @@ func (s *sttStream) process(read socketRead) bool {
 func (s *sttStream) handle(message serverMessage, raw []byte, received time.Time) bool {
 	switch message.Type {
 	case "transcription.text.delta":
-		s.delta(message, raw, received)
+		s.delta(message, raw)
 	case "turn.start":
 		switch {
 		case s.turn.ended:
@@ -811,7 +809,7 @@ func (s *sttStream) startTurn(startMS *int64, raw []byte) {
 // turn's text so far, the cumulative shape transcript.delta carries.
 // Fragments split words (" V", "ox", "tral") and carry their own spacing, so
 // they are joined verbatim.
-func (s *sttStream) delta(message serverMessage, raw []byte, received time.Time) {
+func (s *sttStream) delta(message serverMessage, raw []byte) {
 	if message.Text == "" {
 		return
 	}
@@ -819,7 +817,6 @@ func (s *sttStream) delta(message serverMessage, raw []byte, received time.Time)
 		s.startTurn(nil, raw)
 	}
 	s.turn.text.WriteString(message.Text)
-	s.turn.lastDelta = received
 	text := strings.TrimSpace(s.turn.text.String())
 	if text == "" {
 		return
@@ -827,30 +824,13 @@ func (s *sttStream) delta(message serverMessage, raw []byte, received time.Time)
 	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTranscriptDelta, Data: s.transcriptData(text, false), Extensions: extension(raw)})
 }
 
-// finalDue is when the ended turn's final goes out: finalQuiet after the
-// later of the last delta and turn.end when the text ends a sentence, else
-// the streaming delay plus finalGrace after turn.end.
+// finalDue is when the ended turn's final goes out: the streaming delay
+// plus finalGrace after turn.end arrived.
 func (s *sttStream) finalDue() (time.Time, bool) {
 	if !s.turn.ended {
 		return time.Time{}, false
 	}
-	due := s.turn.endedAt.Add(s.finalDeadline)
-	if endsSentence(s.turn.text.String()) {
-		quietSince := s.turn.lastDelta
-		if quietSince.Before(s.turn.endedAt) {
-			quietSince = s.turn.endedAt
-		}
-		if quiet := quietSince.Add(finalQuiet); quiet.Before(due) {
-			due = quiet
-		}
-	}
-	return due, true
-}
-
-// endsSentence reports whether the text ends in sentence punctuation.
-func endsSentence(text string) bool {
-	last, _ := utf8.DecodeLastRuneInString(strings.TrimSpace(text))
-	return strings.ContainsRune(".?!。？！", last)
+	return s.turn.endedAt.Add(s.finalDeadline), true
 }
 
 // finalize publishes the open turn's final then speech.ended, then opens a
