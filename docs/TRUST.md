@@ -311,6 +311,24 @@ numeric stream ID. They contain no audio, transcript, synthesis text
 or voice content. A socket that ends before the server's END reply, or a
 synthesis whose audio is cut off, leaves incomplete billing evidence.
 
+### Mistral transcription and synthesis
+
+Mistral requests carry the delegated key in an `Authorization` bearer header
+on the validated Mistral host; there is no token exchange, so no managed
+provider-direct credential exists. The realtime socket receives the
+session's audio plus the model, audio format, streaming delay, language,
+keywords and turn detection settings; prerecorded uploads send the WAV file,
+model, language, keywords and the diarization and timestamp switches.
+Synthesis sends the text, voice, model and output format. Redirects are
+refused. Mistral reports whole seconds, floored, so transcription billing
+observations carry an opaque operation ID, model, mode, language, the
+provider request ID (the socket's `request_id` or the upload's
+`Mistral-Correlation-Id`) and a duration measured from the PCM sent.
+Synthesis reports no observation; the relay meters the characters it sent.
+Observations contain no audio, transcript, synthesis text or voice content. A
+socket that ends before `transcription.done` leaves incomplete billing
+evidence.
+
 ### Soniox usage attribution
 
 Soniox realtime STT and TTS requests using relay or managed plans include

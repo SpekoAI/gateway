@@ -38,6 +38,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/maya"
 	"github.com/SpekoAI/gateway/providers/meta"
 	"github.com/SpekoAI/gateway/providers/minimax"
+	"github.com/SpekoAI/gateway/providers/mistral"
 	"github.com/SpekoAI/gateway/providers/modulate"
 	"github.com/SpekoAI/gateway/providers/munsit"
 	"github.com/SpekoAI/gateway/providers/nari"
@@ -330,6 +331,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	mistralSTTAdapter, err := mistral.NewSTT(mistral.STTConfig{})
+	if err != nil {
+		return err
+	}
+	mistralTTSAdapter, err := mistral.NewTTS(mistral.TTSConfig{})
+	if err != nil {
+		return err
+	}
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
 		fishAdapter,
@@ -342,7 +351,7 @@ func run() error {
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 		geminiSTTAdapter, geminiTTSAdapter, metaSTTAdapter, nariSTTAdapter, nariTTSAdapter,
 		paxaTTSAdapter, munsitSTTAdapter, munsitTTSAdapter, hamsaTTSAdapter,
-		hopperSTTAdapter, hopperTTSAdapter,
+		hopperSTTAdapter, hopperTTSAdapter, mistralSTTAdapter, mistralTTSAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {
