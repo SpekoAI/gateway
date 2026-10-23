@@ -175,7 +175,9 @@ var providerCatalog = []CatalogEntry{
 	// prerecorded sibling (POST /v1/asr/transcribe) is a BatchTranscriber,
 	// which this catalog does not publish.
 	{Provider: "meta", Kind: protocol.SessionKindSTT, Adapter: "meta.stt.v1", DefaultModel: "muse-voice-transcribe-1.0", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.meta.ai/v1/asr/realtime"},
-	{Provider: "speechify", Kind: protocol.SessionKindTTS, Adapter: "speechify.tts.v1", DefaultModel: "simba-3.0", Models: []string{"simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"}, DefaultVoice: "geffen_32", Transport: protocol.TransportHTTP, Endpoint: "https://api.speechify.ai/v1/audio/stream"},
+	// Speechify Simba models share one streaming endpoint and 24 kHz PCM. The
+	// default stays simba-3.0; simba-3.5 is listed so a caller can pin it.
+	{Provider: "speechify", Kind: protocol.SessionKindTTS, Adapter: "speechify.tts.v1", DefaultModel: "simba-3.0", Models: []string{"simba-3.2", "simba-3.5", "simba-3.0", "simba-multilingual", "simba-english"}, DefaultVoice: "geffen_32", Transport: protocol.TransportHTTP, Endpoint: "https://api.speechify.ai/v1/audio/stream"},
 	// Nari Labs serves Qwen3-ASR and Qwen3-TTS in two serving classes each;
 	// the realtime socket adds intent=transcription itself.
 	{Provider: "nari", Kind: protocol.SessionKindSTT, Adapter: "nari.stt.v1", DefaultModel: "qwen3-asr-fast", Models: []string{"qwen3-asr-fast", "qwen3-asr"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.narilabs.com/v1/realtime"},
