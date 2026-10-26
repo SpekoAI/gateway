@@ -50,10 +50,6 @@ func TestBYOKCredentialVariablesAreExposedByExamplesAndCompose(t *testing.T) {
 			t.Errorf("docker-compose.yml does not forward %s", spec.Env)
 		}
 	}
-	const googleEndpoint = "SPEKO_GOOGLE_STT_ENDPOINT"
-	if !strings.Contains(string(environment), googleEndpoint+"=") || !strings.Contains(string(compose), googleEndpoint+":") {
-		t.Errorf("configuration surfaces do not expose %s", googleEndpoint)
-	}
 	for _, entry := range gateway.Catalog() {
 		if entry.Kind != protocol.SessionKindTTS {
 			continue
@@ -65,15 +61,11 @@ func TestBYOKCredentialVariablesAreExposedByExamplesAndCompose(t *testing.T) {
 	}
 }
 
-func TestLocalRouteOverridesReadGoogleEndpointAndProviderVoice(t *testing.T) {
-	t.Setenv("SPEKO_GOOGLE_STT_ENDPOINT", "https://speech.googleapis.com/v2/projects/test-project/locations/eu/recognizers/_:recognize")
+func TestLocalRouteOverridesReadProviderVoice(t *testing.T) {
 	t.Setenv("SPEKO_CARTESIA_BYOK_TTS_VOICE", "voice-123")
 	overrides, err := loadLocalRouteOverrides()
 	if err != nil {
 		t.Fatalf("load local route overrides: %v", err)
-	}
-	if got := overrides["google.stt.v1"].Endpoint; !strings.Contains(got, "projects/test-project/") {
-		t.Fatalf("Google STT endpoint = %q", got)
 	}
 	if got := overrides["cartesia.tts.v1"].DefaultVoice; got != "voice-123" {
 		t.Fatalf("Cartesia default voice = %q", got)

@@ -24,8 +24,6 @@ import (
 
 const (
 	// TTSAdapterID identifies the AI Studio speech-generation implementation.
-	// It is distinct from google.tts.v1: same modality, different API,
-	// different credential — the same split the STT adapters draw.
 	TTSAdapterID = "gemini.tts.v1"
 
 	// TTSEndpoint is the models collection both synthesis arms hang off. The

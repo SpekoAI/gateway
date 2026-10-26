@@ -205,7 +205,6 @@ is disabled. The exact payloads and trust boundaries are documented in
 | --- | --- | --- |
 | `SPEKO_LOCAL_AUTH_TOKEN` | required | Local API bearer token |
 | `SPEKO_API_KEY` | unset | Enables managed routing, relay, and billing; explicit BYOK remains local |
-| `SPEKO_GOOGLE_STT_ENDPOINT` | unset | Project-scoped Google Speech V2 `:recognize` URL required for Google STT |
 | `SPEKO_<PROVIDER>_BYOK_TTS_VOICE` | catalog default | Operator-selected fallback voice; request voice wins |
 | `SPEKO_TELEMETRY_DISABLED` | `false` | Opts out of telemetry |
 | `SPEKO_SOCKET_PATH` | `/run/speko/runtime.sock` | Absolute Unix socket path |
@@ -234,7 +233,7 @@ Every catalog provider has a BYOK credential variable:
 | ElevenLabs | `SPEKO_ELEVENLABS_BYOK_API_KEY` | API key |
 | Fish Audio | `SPEKO_FISH_BYOK_API_KEY` | Team API key; `/v1/tts/live` does not accept Fish agent session tokens |
 | Gladia | `SPEKO_GLADIA_BYOK_API_KEY` | API key used for live-session initialization |
-| Google | `SPEKO_GOOGLE_BYOK_ACCESS_TOKEN` | OAuth access token; prefer `_FILE` for rotation |
+| Google | `SPEKO_GOOGLE_BYOK_ACCESS_TOKEN` | Gemini Live bearer access token; prefer `_FILE` for rotation |
 | Gradium | `SPEKO_GRADIUM_BYOK_API_KEY` | API key |
 | Hamsa | `SPEKO_HAMSA_BYOK_API_KEY` | API key |
 | Hopper | `SPEKO_HOPPER_BYOK_API_KEY` | API key (`sk_hopper_…`), sent as a bearer; BYOK/Relay only because Hopper has no token exchange |
@@ -305,8 +304,6 @@ restarting the Gateway.
 | TTS | MiniMax | `minimax.tts.v1` | `speech-2.8-hd` |
 | STT | xAI | `xai.stt.v1` | `stt` |
 | TTS | xAI | `xai.tts.v1` | `tts` |
-| STT | Google | `google.stt.v1` | `chirp_3` |
-| TTS | Google | `google.tts.v1` | `chirp-3-hd` |
 | STT | Alibaba | `alibaba.stt.v1` | `qwen3-asr-flash-realtime` |
 | TTS | Alibaba | `alibaba.tts.v1` | `qwen3-tts-flash-realtime` |
 | STT | Gradium | `gradium.stt.v1` | `default` |

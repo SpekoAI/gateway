@@ -1,18 +1,13 @@
 // Package gemini is the relay's integration for Google's AI Studio speech
 // surface: the Gemini 3.5 Transcribe family (speech-to-text, live and
-// prerecorded) and Gemini Flash speech generation (text-to-speech). Both are
-// different products from the Cloud Speech and Cloud Text-to-Speech services
-// behind provider "google". The two are deliberately separate provider keys:
+// prerecorded) and Gemini Flash speech generation (text-to-speech), on
+// provider "gemini": the AI Studio generative surface, a global endpoint
+// authenticated with a raw API key in x-goog-api-key. Provider "google" is a
+// separate key; it once carried Cloud Speech V2 and Cloud Text-to-Speech
+// (Chirp, withdrawn 2026-10-26) and now serves only Gemini Live realtime.
 //
-//   - "google" is Cloud Speech V2 (Chirp), a project-scoped regional endpoint
-//     authenticated with an OAuth bearer minted from the relay's
-//     service-account ADC document.
-//   - "gemini" is the AI Studio generative surface, a global endpoint
-//     authenticated with a raw API key in x-goog-api-key.
-//
-// Splitting them keeps one adapter per (provider, kind) — the shape the relay
-// connector dispatches on — instead of teaching a single google STT adapter to
-// speak two unrelated APIs with two unrelated credential types. The measured
+// The split keeps one adapter per (provider, kind) — the shape the relay
+// connector dispatches on — with one credential type per provider. The measured
 // board already spells the split this way, keying Gemini speech rows under
 // their own provider name.
 //
@@ -20,8 +15,9 @@
 //
 // Cloud Speech V2 has no streaming STT the relay can reach: its
 // Speech.StreamingRecognize is bidirectional-streaming gRPC with no HTTP/JSON
-// binding (see gateway providers/google/stt.go, which documents the discovery
-// probe). That is why the relay has had no live Google transcription route.
+// binding (the discovery probe was documented in the since-deleted
+// providers/google/stt.go). That is why the relay had no live Google
+// transcription route.
 // Gemini's Live API is a plain WebSocket and closes that gap.
 //
 // # Wire facts this package is built on

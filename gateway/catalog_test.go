@@ -223,12 +223,9 @@ func TestCatalogCarriesADefaultVoiceWhereTheVendorDemandsOne(t *testing.T) {
 			t.Fatalf("%s TTS has no default voice, so a standalone plan cannot open", provider)
 		}
 	}
-	// Google is deliberately blank: its voice names embed the language
-	// (hi-IN-Chirp3-HD-Aoede), so no single value is correct for every request.
-	// A wrong-language default would be worse than none — it would synthesize
-	// Hindi text in an English voice rather than failing.
-	if voices["google"] != "" {
-		t.Fatalf("google TTS carries default voice %q, but its voices are language-specific", voices["google"])
+	// google has no TTS row since the 2026-10-26 Chirp withdrawal.
+	if _, ok := voices["google"]; ok {
+		t.Fatal("google TTS is back in the catalog; Google Cloud Chirp was withdrawn")
 	}
 }
 
