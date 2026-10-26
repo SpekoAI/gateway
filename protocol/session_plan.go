@@ -143,6 +143,10 @@ type RuntimeDescriptor struct {
 	Placement      Placement       `json:"placement"`
 	ProviderRoutes []ProviderRoute `json:"provider_routes"`
 	Adapters       []string        `json:"adapters"`
+	// Region is where the runtime runs, in its cloud's spelling
+	// (asia-southeast1, ap-northeast-1). Optional; the control plane uses it
+	// to plan a provider deployment near the runtime.
+	Region string `json:"region,omitempty"`
 }
 
 // Integration identifies an optional framework integration without coupling
@@ -674,7 +678,18 @@ func (r RuntimeDescriptor) validate() error {
 			return fmt.Errorf("provider_routes: unsupported value %q", route)
 		}
 	}
+	if len(r.Region) > 64 || strings.ContainsFunc(r.Region, func(c rune) bool {
+		return (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-'
+	}) {
+		return fmt.Errorf("region: %q is not a lowercase cloud region name such as asia-southeast1", r.Region)
+	}
 	return nil
+}
+
+// Validate checks the descriptor a runtime sends with every plan request, so
+// a process can refuse a bad configuration at startup rather than per session.
+func (r RuntimeDescriptor) Validate() error {
+	return r.validate()
 }
 
 func (e ExecutionRequest) validateRequest(runtimeRoutes []ProviderRoute) error {

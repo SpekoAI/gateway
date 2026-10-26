@@ -262,11 +262,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	sonioxSTTAdapter, err := soniox.NewSTT(soniox.STTConfig{})
+	// The control plane plans an Asia-Pacific gateway (SPEKO_GATEWAY_REGION)
+	// onto Soniox's Japan deployment, so its hosts must pass the endpoint policy.
+	sonioxSTTAdapter, err := soniox.NewSTT(soniox.STTConfig{AllowedEndpointHosts: []string{"stt-rt.jp.soniox.com"}})
 	if err != nil {
 		return err
 	}
-	sonioxTTSAdapter, err := soniox.NewTTS(soniox.TTSConfig{})
+	sonioxTTSAdapter, err := soniox.NewTTS(soniox.TTSConfig{AllowedEndpointHosts: []string{"tts-rt.jp.soniox.com"}})
 	if err != nil {
 		return err
 	}
@@ -358,6 +360,10 @@ func run() error {
 		// apart would advertise an adapter the engine does not have, or hide one it
 		// does — and nothing would fail until a session tried to open.
 		Adapters: adapterIDs,
+		Region:   env("SPEKO_GATEWAY_REGION"),
+	}
+	if err := runtimeDescriptor.Validate(); err != nil {
+		return fmt.Errorf("SPEKO_GATEWAY_REGION: %w", err)
 	}
 
 	localCredentials, err := loadLocalCredentials()
