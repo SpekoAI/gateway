@@ -176,6 +176,23 @@ func TestSessionPlanRequestValidatesOptionalWorkloadIdentity(t *testing.T) {
 	assertInvalid(t, request.Validate(), "workload: type and id are required")
 }
 
+func TestSessionPlanRequestValidatesOptionalRuntimeRegion(t *testing.T) {
+	t.Parallel()
+
+	for _, region := range []string{"", "asia-southeast1", "ap-northeast-1", "southeastasia"} {
+		request := validRequest(t)
+		request.Runtime.Region = region
+		if err := request.Validate(); err != nil {
+			t.Fatalf("region %q must validate: %v", region, err)
+		}
+	}
+	for _, region := range []string{"Asia-Southeast1", "asia southeast1", "asia/southeast1"} {
+		request := validRequest(t)
+		request.Runtime.Region = region
+		assertInvalid(t, request.Validate(), "runtime: region:")
+	}
+}
+
 func validRequest(t *testing.T) protocol.SessionPlanRequest {
 	t.Helper()
 	var request protocol.SessionPlanRequest
