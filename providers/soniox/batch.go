@@ -73,7 +73,7 @@ func NewBatch(config BatchConfig) (*BatchAdapter, error) {
 	if config.MaxResponseBytes < 1 || config.PollInterval < 0 {
 		return nil, errors.New("soniox batch limits must be positive")
 	}
-	policy, err := upstream.NewHTTPPolicy(batchAPIHost, config.AllowedEndpointHosts, config.AllowInsecureEndpoint)
+	policy, err := upstream.NewHTTPPolicy(batchAPIHost, endpointHosts(batchAPIHost, config.AllowedEndpointHosts), config.AllowInsecureEndpoint)
 	if err != nil {
 		return nil, err
 	}
