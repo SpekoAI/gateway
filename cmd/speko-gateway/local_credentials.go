@@ -91,9 +91,6 @@ func credentialFromEnv(name string) (runtimepkg.LocalCredential, bool, error) {
 
 func loadLocalRouteOverrides() (map[string]gateway.LocalRouteOverride, error) {
 	overrides := make(map[string]gateway.LocalRouteOverride)
-	if endpoint := env("SPEKO_GOOGLE_STT_ENDPOINT"); endpoint != "" {
-		overrides["google.stt.v1"] = gateway.LocalRouteOverride{Endpoint: endpoint}
-	}
 	for _, entry := range gateway.Catalog() {
 		if entry.Kind != protocol.SessionKindTTS {
 			continue

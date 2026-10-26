@@ -29,7 +29,6 @@ import (
 	"github.com/SpekoAI/gateway/providers/gemini"
 	"github.com/SpekoAI/gateway/providers/geminirealtime"
 	"github.com/SpekoAI/gateway/providers/gladia"
-	"github.com/SpekoAI/gateway/providers/google"
 	"github.com/SpekoAI/gateway/providers/gradium"
 	"github.com/SpekoAI/gateway/providers/hamsa"
 	"github.com/SpekoAI/gateway/providers/hopper"
@@ -174,10 +173,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	googleAdapter, err := google.New(google.Config{})
-	if err != nil {
-		return err
-	}
 	inworldAdapter, err := inworld.New(inworld.Config{})
 	if err != nil {
 		return err
@@ -187,10 +182,6 @@ func run() error {
 		return err
 	}
 	xaiAdapter, err := xai.New(xai.Config{})
-	if err != nil {
-		return err
-	}
-	googleSTTAdapter, err := google.NewSTT(google.STTConfig{})
 	if err != nil {
 		return err
 	}
@@ -336,11 +327,11 @@ func run() error {
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
 		fishAdapter,
 		cartesiaAdapter, cartesiaSTTAdapter, assemblyAIAdapter, modulateAdapter, gladiaAdapter,
-		googleAdapter, inworldAdapter, minimaxAdapter, xaiAdapter,
+		inworldAdapter, minimaxAdapter, xaiAdapter,
 		sonioxSTTAdapter, sonioxTTSAdapter, smallestSTTAdapter, smallestTTSAdapter,
 		openaiSTTAdapter, openaiTTSAdapter, openaiRealtimeAdapter, openaiLiveAdapter, xaiRealtimeAdapter, googleRealtimeAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
-		inworldSTTAdapter, xaiSTTAdapter, googleSTTAdapter, hamsaSTTAdapter,
+		inworldSTTAdapter, xaiSTTAdapter, hamsaSTTAdapter,
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 		geminiSTTAdapter, geminiTTSAdapter, metaSTTAdapter, nariSTTAdapter, nariTTSAdapter,
 		paxaTTSAdapter, munsitSTTAdapter, munsitTTSAdapter, hamsaTTSAdapter,

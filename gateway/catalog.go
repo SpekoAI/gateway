@@ -29,14 +29,10 @@ type CatalogEntry struct {
 	// not disappear behind a single provider row.
 	Models []string `json:"models,omitempty"`
 	// DefaultVoice is used only in standalone BYOK mode. Several TTS vendors
-	// REFUSE to open without a voice — Rime, Gradium and Google among them — and
+	// REFUSE to open without a voice — Rime and Gradium among them — and
 	// the local planner has no benchmark board to choose from, so without this a
 	// perfectly good adapter fails at open with a vendor error the operator cannot
 	// act on. Empty means the vendor supplies its own default.
-	//
-	// Google is deliberately empty: its voice names embed the language
-	// (hi-IN-Chirp3-HD-Aoede), so no single value is correct and the caller must
-	// pass one. The control plane fills this from the measured board instead.
 	DefaultVoice string             `json:"default_voice,omitempty"`
 	Transport    protocol.Transport `json:"transport"`
 	Endpoint     string             `json:"endpoint"`
@@ -51,10 +47,10 @@ type CatalogEntry struct {
 	// to pick between them. Empty for stt and tts.
 	Protocol protocol.SpeechProtocol `json:"protocol,omitempty"`
 	// RequiresDeploymentConfig, when non-empty, says this row cannot be dialled as
-	// written and names what an operator must supply. Google STT is the case: its
-	// path embeds the caller's own GCP project
-	// (/v2/projects/{project}/locations/{location}/recognizers/_:recognize), so no
-	// static endpoint is correct for anybody.
+	// written and names what an operator must supply: a vendor whose path embeds
+	// the caller's own account resource, so no static endpoint is correct for
+	// anybody. (Google Cloud Speech V2, the one such row, was withdrawn with
+	// Google Cloud Chirp on 2026-10-26; no row sets it today.)
 	//
 	// The row stays published because the catalog answers "what does this build
 	// implement", and hiding a supported vendor would be its own lie. But the
@@ -91,25 +87,12 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "gladia", Kind: protocol.SessionKindSTT, Adapter: "gladia.stt.v1", DefaultModel: "solaria-1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.gladia.io/v2/live"},
 	{Provider: "minimax", Kind: protocol.SessionKindTTS, Adapter: "minimax.tts.v1", DefaultModel: "speech-2.8-hd", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.minimax.io/ws/v1/t2a_v2"},
 	{Provider: "xai", Kind: protocol.SessionKindTTS, Adapter: "xai.tts.v1", DefaultModel: "tts", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/tts"},
-	// The first two HTTP-transport rows. The engine is transport-agnostic — it only
-	// needs a ProviderStream — so these stream by decoding the response body
-	// incrementally rather than by holding a socket open.
-	{Provider: "google", Kind: protocol.SessionKindTTS, Adapter: "google.tts.v1", DefaultModel: "chirp-3-hd", Transport: protocol.TransportHTTP, Endpoint: "https://texttospeech.googleapis.com/v1/text:synthesize"},
 	// Alibaba's realtime socket is one path serving both modalities; the model id
 	// selects which. International host — the mainland twin is a separate account.
 	{Provider: "alibaba", Kind: protocol.SessionKindSTT, Adapter: "alibaba.stt.v1", DefaultModel: "qwen3-asr-flash-realtime", Transport: protocol.TransportWebSocket, Endpoint: "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"},
 	{Provider: "alibaba", Kind: protocol.SessionKindTTS, Adapter: "alibaba.tts.v1", DefaultModel: "qwen3-tts-flash-realtime", Transport: protocol.TransportWebSocket, Endpoint: "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"},
-	// Google STT is the one PROJECT-SCOPED endpoint in the catalog: the real path
-	// is /v2/projects/{project}/locations/{location}/recognizers/_:recognize, so a
-	// plan MUST rewrite the project and location. The row below is a template, not
-	// a dialable URL — `eu` because Chirp 3 wins hi/ta/te only from that region.
-	{Provider: "google", Kind: protocol.SessionKindSTT, Adapter: "google.stt.v1", DefaultModel: "chirp_3", Transport: protocol.TransportHTTP, Endpoint: "https://speech.googleapis.com/v2/projects/PROJECT_ID/locations/eu/recognizers/_:recognize",
-		RequiresDeploymentConfig: "set SPEKO_GOOGLE_STT_ENDPOINT to a project-scoped recognize URL"},
 	// Gemini speech is a SEPARATE provider from google: the AI Studio surface
-	// authenticates with an API key and is global, where Cloud Speech V2 above
-	// is project-scoped and takes an ADC bearer. One adapter per (provider,
-	// kind) is what the relay connector dispatches on, so the split is what
-	// lets both exist. This row is the Live API transcription socket; the
+	// authenticates with an API key and is global. This row is the Live API transcription socket; the
 	// prerecorded sibling (gemini-3.5-transcribe) is a BatchTranscriber, which
 	// this catalog does not publish.
 	{Provider: "gemini", Kind: protocol.SessionKindSTT, Adapter: "gemini.stt.v1", DefaultModel: "gemini-3.5-transcribe-live", Transport: protocol.TransportWebSocket, Endpoint: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"},

@@ -21,8 +21,7 @@ import (
 
 const (
 	// STTAdapterID is the identifier the connector registers this adapter
-	// under. It is distinct from google.stt.v1: same modality, different API,
-	// different credential.
+	// under.
 	STTAdapterID = "gemini.stt.v1"
 	// ProviderName is the only provider this package serves.
 	ProviderName = "gemini"

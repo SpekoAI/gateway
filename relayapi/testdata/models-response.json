@@ -263,8 +263,8 @@
       "protocol": "xai.realtime.v1"
     },
     {
-      "id": "chirp_3",
-      "provider": "google",
+      "id": "transcribe-1",
+      "provider": "fish",
       "kind": "stt",
       "capabilities": {
         "streaming": false,
@@ -295,8 +295,8 @@
         }
       ],
       "batch_audio_limits": {
-        "max_pcm_bytes": 7856128,
-        "max_duration_seconds": 60
+        "max_pcm_bytes": 46120960,
+        "max_duration_seconds": 180
       }
     }
   ],

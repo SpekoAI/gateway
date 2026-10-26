@@ -34,8 +34,8 @@ type LocalPlannerConfig struct {
 	Providers          []string
 	MaxSessionDuration time.Duration
 	// RouteOverrides supplies deployment-specific values that cannot live in
-	// the public catalog. Keys are adapter IDs. Google STT's project-scoped
-	// recognize URL and operator-selected TTS voices are the common cases.
+	// the public catalog. Keys are adapter IDs. Operator-selected TTS voices
+	// are the common case.
 	RouteOverrides map[string]LocalRouteOverride
 	Now            func() time.Time
 }
