@@ -215,6 +215,7 @@ is disabled. The exact payloads and trust boundaries are documented in
 | `SPEKO_PLAN_ISSUER` | control-plane URL | Required plan issuer |
 | `SPEKO_PLAN_AUDIENCE` | `speko-runtime` | Required plan audience |
 | `SPEKO_RUNTIME_INSTANCE_ID` | hostname | Non-secret process identity |
+| `SPEKO_RUNTIME_REGION` | unset | Cloud region this gateway runs in (`ap-southeast-1`, `asia-southeast1`); lets managed routes use a provider's nearer regional endpoint (Soniox: Japan for Asia-Pacific) |
 | `SPEKO_WORKLOAD_TYPE` | `agent` when an ID is set | Dashboard workload category |
 | `SPEKO_WORKLOAD_ID` | unset | Stable Agent or custom workload ID |
 | `SPEKO_MAX_SESSIONS` | `100` | Per-process session capacity |

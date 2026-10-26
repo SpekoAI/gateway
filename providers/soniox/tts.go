@@ -77,7 +77,7 @@ func NewTTS(config TTSConfig) (*TTSAdapter, error) {
 	if config.MaxMessageBytes < 1 {
 		return nil, errors.New("soniox maximum message bytes must be positive")
 	}
-	endpointPolicy, err := upstream.NewWebSocketPolicy(ttsOfficialHost, config.AllowedEndpointHosts, config.AllowInsecureEndpoint)
+	endpointPolicy, err := upstream.NewWebSocketPolicy(ttsOfficialHost, endpointHosts(ttsOfficialHost, config.AllowedEndpointHosts), config.AllowInsecureEndpoint)
 	if err != nil {
 		return nil, err
 	}

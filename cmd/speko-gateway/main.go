@@ -113,6 +113,10 @@ func run() error {
 			return errors.New("determine runtime instance ID")
 		}
 	}
+	region := strings.ToLower(env("SPEKO_RUNTIME_REGION"))
+	if region != "" && !protocol.ValidRuntimeRegion(region) {
+		return fmt.Errorf("SPEKO_RUNTIME_REGION %q is not a cloud region name", region)
+	}
 	var workload *protocol.Workload
 	if workloadID := env("SPEKO_WORKLOAD_ID"); workloadID != "" {
 		workloadType := env("SPEKO_WORKLOAD_TYPE")
@@ -358,6 +362,7 @@ func run() error {
 		// apart would advertise an adapter the engine does not have, or hide one it
 		// does — and nothing would fail until a session tried to open.
 		Adapters: adapterIDs,
+		Region:   region,
 	}
 
 	localCredentials, err := loadLocalCredentials()

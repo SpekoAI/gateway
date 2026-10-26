@@ -143,6 +143,13 @@ type RuntimeDescriptor struct {
 	Placement      Placement       `json:"placement"`
 	ProviderRoutes []ProviderRoute `json:"provider_routes"`
 	Adapters       []string        `json:"adapters"`
+	// Region is the cloud region the operator deployed this runtime in, as
+	// their cloud spells it (AWS "ap-southeast-1", GCP "asia-southeast1"). A
+	// control plane may use it to send managed routes to a provider's nearer
+	// regional endpoint. Empty keeps every provider on its default endpoint,
+	// and omitempty keeps the request byte-identical for a control plane that
+	// predates the field and decodes strictly.
+	Region string `json:"region,omitempty"`
 }
 
 // Integration identifies an optional framework integration without coupling
@@ -674,7 +681,24 @@ func (r RuntimeDescriptor) validate() error {
 			return fmt.Errorf("provider_routes: unsupported value %q", route)
 		}
 	}
+	if r.Region != "" && !ValidRuntimeRegion(r.Region) {
+		return fmt.Errorf("region: unsupported value %q", r.Region)
+	}
 	return nil
+}
+
+// ValidRuntimeRegion reports whether region is spelled like a cloud region
+// name: 1-64 lowercase letters, digits, and hyphens.
+func ValidRuntimeRegion(region string) bool {
+	if region == "" || len(region) > 64 {
+		return false
+	}
+	for _, char := range region {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func (e ExecutionRequest) validateRequest(runtimeRoutes []ProviderRoute) error {
