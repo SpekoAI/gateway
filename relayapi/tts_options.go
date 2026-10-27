@@ -1,6 +1,8 @@
 package relayapi
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -17,6 +19,32 @@ import (
 // does not forward is refused by name rather than accepted and dropped.
 type TTSOptions struct {
 	ProviderOptions map[string]map[string]any `json:"provider_options,omitempty"`
+}
+
+// TTSOptionsDecodeError is an options object the strict decoder refused,
+// typically a misspelled member such as "provider_option". The edges match it
+// to answer invalid_request naming the problem rather than "not valid JSON".
+type TTSOptionsDecodeError struct {
+	Err error
+}
+
+func (e *TTSOptionsDecodeError) Error() string { return "options: " + e.Err.Error() }
+
+func (e *TTSOptionsDecodeError) Unwrap() error { return e.Err }
+
+// UnmarshalJSON keeps the options object closed. encoding/json would drop a
+// misspelled member, leaving empty options that validate and synthesize with
+// vendor defaults: a 200 that silently did not do what was asked.
+func (o *TTSOptions) UnmarshalJSON(data []byte) error {
+	type wire TTSOptions
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var decoded wire
+	if err := decoder.Decode(&decoded); err != nil {
+		return &TTSOptionsDecodeError{Err: err}
+	}
+	*o = TTSOptions(decoded)
+	return nil
 }
 
 // Bounds on caller input, matching the local gateway's protocol.TtsOptions.
@@ -53,10 +81,12 @@ func (o *TTSOptions) Provider(name string) map[string]any {
 	return o.ProviderOptions[name]
 }
 
-// Validate checks shape and bounds. Names must arrive lower case: the
-// idempotency content hash covers the request bytes as sent, so one intent
-// must have one spelling. Whether a provider accepts a named setting is a
-// routing-time question the Router answers per route.
+// Validate checks shape and bounds. Names must arrive lower case and
+// trimmed: the idempotency content hash covers the request bytes as sent, so
+// one intent must have one spelling, and the connector's normalization (which
+// folds and trims) must be a no-op on anything admitted here. Whether a
+// provider accepts a named setting is a routing-time question the Router
+// answers per route.
 func (o *TTSOptions) Validate() error {
 	if o == nil || len(o.ProviderOptions) == 0 {
 		return nil
@@ -68,8 +98,8 @@ func (o *TTSOptions) Validate() error {
 		if strings.TrimSpace(provider) == "" {
 			return fmt.Errorf("provider_options: names an empty provider")
 		}
-		if provider != strings.ToLower(provider) {
-			return fmt.Errorf("provider_options.%s: provider id must be lower case", provider)
+		if provider != strings.ToLower(strings.TrimSpace(provider)) {
+			return fmt.Errorf("provider_options.%s: provider id must be lower case with no surrounding spaces", provider)
 		}
 		if len(settings) > MaxTTSOptionKeys {
 			return fmt.Errorf("provider_options.%s: may carry at most %d settings", provider, MaxTTSOptionKeys)
@@ -78,8 +108,8 @@ func (o *TTSOptions) Validate() error {
 			if strings.TrimSpace(key) == "" {
 				return fmt.Errorf("provider_options.%s: names an empty setting", provider)
 			}
-			if key != strings.ToLower(key) {
-				return fmt.Errorf("provider_options.%s.%s: setting name must be lower case", provider, key)
+			if key != strings.ToLower(strings.TrimSpace(key)) {
+				return fmt.Errorf("provider_options.%s.%s: setting name must be lower case with no surrounding spaces", provider, key)
 			}
 			if _, reserved := reservedTTSOptionKeys[key]; reserved {
 				return fmt.Errorf("provider_options.%s.%s: is owned by the relay and cannot be forwarded", provider, key)
