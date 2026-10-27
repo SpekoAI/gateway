@@ -325,7 +325,7 @@ restarting the Gateway.
 | STT | Palabra | `palabra.stt.v1` | `default` |
 | TTS | Palabra | `palabra.tts.v1` | `auto` |
 | TTS | Maya Research | `maya.tts.v1` | `Maya Calyx` |
-| TTS | Speechify | `speechify.tts.v1` | `simba-3.0` |
+| TTS | Speechify | `speechify.tts.v1` | `simba-3.0` (also `simba-3.5`, `simba-3.2`, `simba-multilingual`, `simba-english`) |
 | STT | Speechmatics | `speechmatics.stt.v1` | `standard` |
 | STT | Meta | `meta.stt.v1` | `muse-voice-transcribe-1.0` |
 | STT | Nari Labs | `nari.stt.v1` | `qwen3-asr-fast` |
