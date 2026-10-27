@@ -243,6 +243,7 @@ Every catalog provider has a BYOK credential variable:
 | Maya Research | `SPEKO_MAYA_BYOK_API_KEY` | Permanent API key; BYOK/Relay only because Maya has no short-lived session token |
 | Meta | `SPEKO_META_BYOK_API_KEY` | API key; sent as the bearer inside the realtime handshake frame |
 | MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
+| Mistral | `SPEKO_MISTRAL_BYOK_API_KEY` | API key, sent as a bearer on the realtime handshake and every REST call; BYOK/Relay only because Mistral has no token exchange |
 | Munsit | `SPEKO_MUNSIT_BYOK_API_KEY` | API key, sent as `x-api-key`; BYOK/Relay only because Munsit has no token exchange |
 | Nari Labs | `SPEKO_NARI_BYOK_API_KEY` | API key; one key serves both the synthesis endpoint and the transcription socket |
 | OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
@@ -335,6 +336,8 @@ restarting the Gateway.
 | TTS | Munsit | `munsit.tts.v1` | `faseeh-v1-preview` |
 | STT | Hopper | `hopper.stt.v1` | `nemotron-asr` |
 | TTS | Hopper | `hopper.tts.v1` | `qwen3-tts` |
+| STT | Mistral | `mistral.stt.v1` | `voxtral-mini-transcribe-realtime-3-0` |
+| TTS | Mistral | `mistral.tts.v1` | `voxtral-mini-tts-3-0` |
 
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.
