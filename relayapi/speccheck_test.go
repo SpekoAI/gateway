@@ -382,6 +382,7 @@ func wireSchemaTable() []struct {
 		{relayapi.TranscriptionResponse{}, openapi("TranscriptionResponse")},
 		{relayapi.AudioConfig{}, both("AudioConfig")},
 		{relayapi.SpeechRequest{}, openapi("SpeechRequest")},
+		{relayapi.TTSOptions{}, both("TTSOptions")},
 		{relayapi.ContentPart{}, openapi("ContentPart")},
 		{relayapi.Item{}, openapi("Item")},
 		{relayapi.FunctionTool{}, openapi("FunctionTool")},

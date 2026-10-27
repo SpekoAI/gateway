@@ -81,6 +81,12 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("elevenlabs tts requires a bearer credential")
 	}
+	// Refused before dialing: the socket answers an out-of-range setting with
+	// silence rather than an error.
+	voiceSettings, err := ttsVoiceSettings(request.Plan.Route.Model, request.Options.TTS.Provider("elevenlabs"))
+	if err != nil {
+		return nil, err
+	}
 	endpoint, err := multiContextEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, request.Plan.Execution.ProviderRoute, request.Plan.Execution.CredentialSource, credential.Value)
 	if err != nil {
 		return nil, err
@@ -110,7 +116,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
-	stream := &stream{conn: conn, ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), model: request.Plan.Route.Model, language: ttsLanguageCode(request.Options.Language)}
+	stream := &stream{conn: conn, ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), model: request.Plan.Route.Model, language: ttsLanguageCode(request.Options.Language), voiceSettings: voiceSettings}
 	go stream.readLoop()
 	return stream, nil
 }
@@ -172,6 +178,9 @@ type stream struct {
 	// when the vendor refuses the pair.
 	model    string
 	language string
+	// voiceSettings is the caller's validated voice_settings, sent as each
+	// context's init packet. Nil leaves the voice's own saved settings.
+	voiceSettings map[string]any
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -194,9 +203,16 @@ func (s *stream) AppendText(ctx context.Context, text string) error {
 	if text == "" {
 		return errors.New("elevenlabs text is empty")
 	}
-	contextID, err := s.startOrCurrentContext()
+	contextID, fresh, err := s.startOrCurrentContext()
 	if err != nil {
 		return err
+	}
+	// Voice settings are per context on this socket and ride the context's
+	// first message, so every utterance carries them, not just the first.
+	if fresh && s.voiceSettings != nil {
+		if err := s.writeJSON(ctx, map[string]any{"context_id": contextID, "text": " ", "voice_settings": s.voiceSettings}); err != nil {
+			return err
+		}
 	}
 	return s.writeJSON(ctx, map[string]any{"context_id": contextID, "text": text})
 }
@@ -255,24 +271,26 @@ func (s *stream) abort() error {
 	return s.closeErr
 }
 
-func (s *stream) startOrCurrentContext() (string, error) {
+// startOrCurrentContext returns the open context, minting one when none is
+// open; fresh reports that this call minted it.
+func (s *stream) startOrCurrentContext() (id string, fresh bool, err error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if s.closed.Load() || s.closing.Load() {
-		return "", runtimepkg.ErrSessionClosed
+		return "", false, runtimepkg.ErrSessionClosed
 	}
 	if s.contextID != "" {
 		if s.committed {
-			return "", errors.New("elevenlabs previous utterance has not completed")
+			return "", false, errors.New("elevenlabs previous utterance has not completed")
 		}
-		return s.contextID, nil
+		return s.contextID, false, nil
 	}
-	id, err := newContextID()
+	id, err = newContextID()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	s.contextID, s.committed, s.audioStarted = id, false, false
-	return id, nil
+	return id, true, nil
 }
 
 func (s *stream) commitContext() (string, error) {

@@ -22,6 +22,7 @@ import (
 
 	"github.com/SpekoAI/gateway/controlplane"
 	"github.com/SpekoAI/gateway/protocol"
+	"github.com/SpekoAI/gateway/providers/ttsoptions"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"github.com/coder/websocket"
 )
@@ -416,6 +417,24 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 			return
 		}
 	}
+	if body.Request.TTS != nil {
+		if body.Kind != protocol.SessionKindTTS {
+			writeError(writer, http.StatusBadRequest, "invalid_tts_options", "tts options are valid only on tts sessions")
+			return
+		}
+		if err := body.Request.TTS.Normalize(); err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_tts_options", err.Error())
+			return
+		}
+		// Every named provider, not just the routed one: a misspelled name
+		// would otherwise validate and then match nothing.
+		for provider := range body.Request.TTS.ProviderOptions {
+			if !ttsoptions.Accepts(provider) {
+				writeError(writer, http.StatusBadRequest, "invalid_tts_options", fmt.Sprintf("provider_options.%s: no speech provider by this name accepts settings; providers that do: %s", provider, strings.Join(ttsoptions.Providers(), ", ")))
+				return
+			}
+		}
+	}
 	if body.Request.S2S != nil {
 		if body.Kind != protocol.SessionKindRealtime {
 			writeError(writer, http.StatusBadRequest, "invalid_realtime_options", "s2s options are valid only on realtime sessions")
@@ -504,6 +523,10 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 		var supportError *SttSupportError
 		if errors.As(err, &supportError) {
 			outcome = createOutcome{status: http.StatusUnprocessableEntity, code: "stt_option_unsupported", message: supportError.Error()}
+		}
+		var ttsOptionError *protocol.TtsOptionError
+		if errors.As(err, &ttsOptionError) {
+			outcome = createOutcome{status: http.StatusUnprocessableEntity, code: "tts_option_unsupported", message: ttsOptionError.Error()}
 		}
 		s.finishCreate(idempotencyKey, inflight, outcome)
 		writeCreateOutcome(writer, outcome, false)
@@ -628,6 +651,11 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 func (s *Server) openSession(ctx context.Context, body CreateSessionRequest, plan protocol.SessionPlan) (*runtimepkg.Session, error) {
 	if body.Kind == protocol.SessionKindSTT {
 		if err := validateSttRouteSupport(plan.Route.Provider, plan.Route.Model, body.Request.STT); err != nil {
+			return nil, err
+		}
+	}
+	if body.Kind == protocol.SessionKindTTS {
+		if err := ttsoptions.Validate(plan.Route.Provider, plan.Route.Model, body.Request.TTS); err != nil {
 			return nil, err
 		}
 	}
@@ -832,6 +860,8 @@ func planRequestFor(body CreateSessionRequest, runtime protocol.RuntimeDescripto
 	// the provider, and the refusal tells them so.
 	request := body.Request
 	request.STT = nil
+	// TTS provider options are data-plane settings in the same way.
+	request.TTS = nil
 	// Instructions and other realtime configuration are customer content. A
 	// hosted plan needs only provider/model/media capability metadata; it must
 	// never receive the prompt merely to choose a route or mint a credential.

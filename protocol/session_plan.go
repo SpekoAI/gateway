@@ -190,6 +190,10 @@ type RequestOptions struct {
 	// every plan request an older control plane parses — byte-identical when
 	// the caller asks for nothing.
 	STT *SttOptions `json:"stt,omitempty"`
+	// TTS carries per-provider synthesis settings. Only ever set on TTS
+	// sessions; omitempty keeps every existing payload byte-identical when
+	// the caller asks for nothing.
+	TTS *TtsOptions `json:"tts,omitempty"`
 	// S2S carries the local session-level asks of a provider-direct realtime
 	// session. The gateway strips this content before requesting a hosted plan;
 	// only the selected provider adapter reads it. Omitempty keeps every existing payload

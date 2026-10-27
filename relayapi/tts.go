@@ -42,6 +42,9 @@ type SpeechRequest struct {
 	Voice    string      `json:"voice,omitempty"`
 	Language string      `json:"language,omitempty"`
 	Audio    AudioConfig `json:"audio"`
+	// Options carries per-provider synthesis settings. Omitempty keeps every
+	// request that predates it byte-identical on the connector hop.
+	Options *TTSOptions `json:"options,omitempty"`
 }
 
 // Validate checks routing, input, and the requested output format. Voice is
@@ -56,6 +59,9 @@ func (r SpeechRequest) Validate() error {
 	}
 	if err := r.Audio.Validate(); err != nil {
 		return fmt.Errorf("audio: %w", err)
+	}
+	if err := r.Options.Validate(); err != nil {
+		return fmt.Errorf("options: %w", err)
 	}
 	return nil
 }
@@ -105,6 +111,8 @@ type TTSSessionConfigure struct {
 	Voice    string         `json:"voice,omitempty"`
 	Language string         `json:"language,omitempty"`
 	Audio    AudioConfig    `json:"audio"`
+	// Options carries per-provider synthesis settings for the whole session.
+	Options *TTSOptions `json:"options,omitempty"`
 }
 
 // Validate checks the frame tag, routing, and requested output format. The
@@ -119,6 +127,9 @@ func (c TTSSessionConfigure) Validate() error {
 	}
 	if err := c.Audio.Validate(); err != nil {
 		return fmt.Errorf("audio: %w", err)
+	}
+	if err := c.Options.Validate(); err != nil {
+		return fmt.Errorf("options: %w", err)
 	}
 	return nil
 }
