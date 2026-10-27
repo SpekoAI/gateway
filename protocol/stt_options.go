@@ -253,6 +253,12 @@ func (o *SttOptions) Normalize() error {
 // into URLs and frames verbatim, where a CR/LF could mint fields validation
 // never saw.
 func validateSttOptionValue(provider, key string, value any) error {
+	return validateOptionScalar("stt options", provider, key, value)
+}
+
+// validateOptionScalar is the scalar rule shared by STT and TTS provider
+// options; prefix names which options object refused the value.
+func validateOptionScalar(prefix, provider, key string, value any) error {
 	switch typed := value.(type) {
 	case bool:
 		return nil
@@ -260,11 +266,11 @@ func validateSttOptionValue(provider, key string, value any) error {
 		return nil
 	case string:
 		if utf8.RuneCountInString(typed) > maxSttOptionStringValue || hasControlRune(typed) {
-			return fmt.Errorf("stt options: provider_options.%s.%s must be a string of at most %d characters with no control characters", provider, key, maxSttOptionStringValue)
+			return fmt.Errorf("%s: provider_options.%s.%s must be a string of at most %d characters with no control characters", prefix, provider, key, maxSttOptionStringValue)
 		}
 		return nil
 	default:
-		return fmt.Errorf("stt options: provider_options.%s.%s must be a boolean, a number, or a string", provider, key)
+		return fmt.Errorf("%s: provider_options.%s.%s must be a boolean, a number, or a string", prefix, provider, key)
 	}
 }
 

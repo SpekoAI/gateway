@@ -1230,6 +1230,33 @@
         ],
         "additionalProperties": false
       },
+      "TTSOptions": {
+        "type": "object",
+        "description": "Synthesis settings beyond the text and voice. The same object rides POST /v1/tts/speech and the TTS session.configure frame. Names arrive lower case and are rejected otherwise, because the idempotency content hash covers the request bytes exactly as sent.",
+        "properties": {
+          "provider_options": {
+            "type": "object",
+            "description": "The vendor's OWN settings, namespaced by provider name. Values are scalars only (boolean, number, or string of at most 256 characters); at most 8 providers, each with at most 16 settings. Settings addressed to a provider the request does not reach are ignored by design. Settings addressed to the routed provider fail closed: a key or value its route cannot honor is refused with capability_unsupported naming it (in auto mode that candidate is skipped instead), and a provider name that accepts no settings at all is refused as invalid_request. Accepted today: cartesia.normalization (\"auto\", \"off\", or a language or locale such as \"en-IN\", which reads numbers, dates and currency by that language's conventions while the speech stays in the session language; sonic-3.6 only); elevenlabs.stability, elevenlabs.similarity_boost and elevenlabs.style (0 to 1), elevenlabs.speed (0.7 to 1.2) and elevenlabs.use_speaker_boost (boolean). ElevenLabs v3 and v4 models stream on the text-to-dialogue socket, which accepts stability only.",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": {
+                "oneOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "TTSSessionConfigure": {
         "type": "object",
         "description": "Opens a streaming synthesis session. audio is the requested output format of the binary frames the server will send. The exact frame bytes are the session's idempotency content hash; later frames are intentionally outside the hash.",
@@ -1251,6 +1278,10 @@
           "language": {
             "type": "string",
             "description": "Optional language hint. Auto routing ranks candidates on that language's benchmark board and the Router picks a voice curated for it; omitted means English."
+          },
+          "options": {
+            "$ref": "#/components/schemas/TTSOptions",
+            "description": "Per-provider synthesis settings. Omit to use each vendor's defaults."
           },
           "audio": {
             "$ref": "#/components/schemas/AudioConfig"

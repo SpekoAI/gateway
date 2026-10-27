@@ -111,6 +111,10 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	if err := validateGenerationOptions(request.Plan.Route.Model, request.Options, *request.Media); err != nil {
 		return nil, err
 	}
+	normalization, err := ttsNormalization(request.Plan.Route.Model, request.Options.TTS.Provider("cartesia"))
+	if err != nil {
+		return nil, err
+	}
 	credential := request.Plan.Route.Credential
 	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("cartesia requires a bearer credential")
@@ -161,6 +165,8 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		voiceID:  request.Options.Voice,
 		language: request.Options.Language,
 		media:    *request.Media,
+
+		normalization: normalization,
 	}
 	if response != nil {
 		stream.setProviderRequestID(response.Header.Get("X-Request-ID"))
@@ -243,6 +249,9 @@ type stream struct {
 	voiceID  string
 	language string
 	media    protocol.MediaFormat
+	// normalization is the caller's provider_options.cartesia.normalization,
+	// sent on every generation; "" leaves the vendor default.
+	normalization string
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -420,11 +429,12 @@ func (s *stream) markAudioStarted(contextID string) bool {
 
 func (s *stream) generationRequest(contextID, transcript string, continuation bool) generation {
 	return generation{
-		ModelID:    s.modelID,
-		Transcript: transcript,
-		Voice:      voice{Mode: "id", ID: s.voiceID},
-		Language:   s.language,
-		ContextID:  contextID,
+		ModelID:       s.modelID,
+		Transcript:    transcript,
+		Voice:         voice{Mode: "id", ID: s.voiceID},
+		Language:      s.language,
+		Normalization: s.normalization,
+		ContextID:     contextID,
 		OutputFormat: outputFormat{
 			Container:  "raw",
 			Encoding:   "pcm_s16le",
@@ -671,6 +681,7 @@ type generation struct {
 	Transcript    string       `json:"transcript"`
 	Voice         voice        `json:"voice"`
 	Language      string       `json:"language"`
+	Normalization string       `json:"normalization,omitempty"`
 	ContextID     string       `json:"context_id"`
 	OutputFormat  outputFormat `json:"output_format"`
 	AddTimestamps bool         `json:"add_timestamps"`

@@ -435,6 +435,8 @@ type dialogueClientMessage struct {
 	Flush       bool `json:"flush"`
 	KeepAlive   bool `json:"keep_alive"`
 	CloseSocket bool `json:"close_socket"`
+
+	VoiceSettings map[string]any `json:"voice_settings"`
 }
 
 func readDialogueMessage(ctx context.Context, conn *websocket.Conn) (dialogueClientMessage, error) {

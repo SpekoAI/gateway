@@ -136,6 +136,10 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 	if voiceID == "" {
 		return nil, errors.New("elevenlabs dialogue requires a voice id")
 	}
+	voiceSettings, err := ttsVoiceSettings(request.Plan.Route.Model, request.Options.TTS.Provider("elevenlabs"))
+	if err != nil {
+		return nil, err
+	}
 	endpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media)
 	if err != nil {
 		return nil, err
@@ -166,7 +170,14 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 	// so it is written synchronously on the caller's context: a session that
 	// cannot register a voice has not started, and reporting that as a dial
 	// failure is more useful than surfacing it later as a read error.
-	if err := stream.writeJSON(ctx, map[string]any{"voices": []string{voiceID}, "xi_api_key": credential.Value}); err != nil {
+	handshake := map[string]any{"voices": []string{voiceID}, "xi_api_key": credential.Value}
+	// The dialogue socket takes voice_settings once, in the handshake, for
+	// the whole connection; ttsVoiceSettings has already narrowed it to
+	// stability.
+	if voiceSettings != nil {
+		handshake["voice_settings"] = voiceSettings
+	}
+	if err := stream.writeJSON(ctx, handshake); err != nil {
 		_ = stream.abort()
 		return nil, err
 	}

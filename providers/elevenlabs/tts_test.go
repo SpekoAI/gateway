@@ -364,6 +364,8 @@ type clientMessage struct {
 	Flush        bool   `json:"flush"`
 	CloseContext bool   `json:"close_context"`
 	CloseSocket  bool   `json:"close_socket"`
+
+	VoiceSettings map[string]any `json:"voice_settings"`
 }
 
 func readClientMessage(ctx context.Context, conn *websocket.Conn) (clientMessage, error) {
