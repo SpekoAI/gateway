@@ -35,7 +35,12 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_llm
 
-from ._voice import CredentialSource, execution_from_env, stt_options_payload
+from ._voice import (
+    CredentialSource,
+    execution_from_env,
+    stt_options_payload,
+    tts_options_payload,
+)
 from .client import (
     CanonicalEvent,
     GatewayClient,
@@ -310,6 +315,7 @@ class SpekoTTSService(PipecatTTSService):
         ready_timeout: float = 15.0,
         session_id: str = "",
         fallback_to_auto_on_no_eligible_route: bool = False,
+        provider_options: Mapping[str, Mapping[str, Any]] | None = None,
         **kwargs: Any,
     ) -> None:
         native_settings = kwargs.pop("settings", None)
@@ -346,6 +352,7 @@ class SpekoTTSService(PipecatTTSService):
         self._credential_source = credential_source
         self._num_channels = num_channels
         self._max_input_characters = max_input_characters
+        self._tts_options = tts_options_payload(provider_options=provider_options)
         self._ready_timeout = ready_timeout
         self._platform_session_id = session_id
         self._fallback_to_auto_on_no_eligible_route = (
@@ -480,6 +487,10 @@ class SpekoTTSService(PipecatTTSService):
             request["client_session_id"] = self._platform_session_id
         if voice:
             request["voice"] = voice
+        # Kept on the auto fallback too: the Gateway ignores settings for a
+        # provider the route does not reach and checks the rest against it.
+        if self._tts_options:
+            request["tts"] = self._tts_options
         return await self._client.open(
             SessionConfig(
                 kind="tts",

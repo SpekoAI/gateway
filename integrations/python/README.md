@@ -33,6 +33,13 @@ session = AgentSession(
 )
 ```
 
+`TTS(provider_options=...)` passes a vendor's own synthesis settings, for
+example `{"cartesia": {"normalization": "en-IN"}}` to read numbers and dates
+the Indian-English way in a Hindi session, or `{"elevenlabs": {"stability":
+0.4, "similarity_boost": 0.8, "style": 0.2}}`. `update_options(provider_options=...)`
+changes them for the next reply. The Gateway refuses a setting the routed
+model cannot honor before the session opens.
+
 `STT()` and `TTS()` read `SPEKO_SOCKET_PATH` and `SPEKO_LOCAL_AUTH_TOKEN`.
 `credential_source="auto"` preserves the original behavior: managed when
 `SPEKO_API_KEY` is present and local BYOK otherwise. Set `"byok"` explicitly

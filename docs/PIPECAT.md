@@ -207,6 +207,20 @@ stt = SpekoSTTService(
 )
 ```
 
+TTS takes the vendor's own synthesis settings the same way:
+
+```python
+tts = SpekoTTSService(
+    provider="cartesia",
+    model="sonic-3.6",
+    language="hi",
+    provider_options={"cartesia": {"normalization": "en-IN"}},
+)
+```
+
+Today that is Cartesia `normalization` (`sonic-3.6`) and ElevenLabs
+`stability`, `similarity_boost`, `style`, `speed` and `use_speaker_boost`.
+
 Options fail closed when the chosen provider cannot honor them. Pin both
 `provider` and `model` when an option is a hard requirement; with `auto`, the
 router is otherwise free to choose another compatible catalog route.

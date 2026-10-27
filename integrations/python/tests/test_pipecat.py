@@ -754,3 +754,39 @@ def test_cache_write_tokens_are_included_in_llm_usage() -> None:
     assert usage.prompt_tokens == 430
     assert usage.cache_read_input_tokens == 100
     assert usage.total_tokens == 464
+
+
+async def test_tts_provider_options_ride_every_session_request() -> None:
+    first = FakeGatewaySession(
+        [
+            CanonicalEvent(type="audio.started"),
+            CanonicalEvent(type="audio.frame", audio=b"\x01\x00" * 240),
+            CanonicalEvent(type="audio.done"),
+        ]
+    )
+    client = FakeGatewayClient(first)
+    service = SpekoTTSService(  # type: ignore[arg-type]
+        client,
+        sample_rate=24_000,
+        provider="cartesia",
+        model="sonic-3.6",
+        language="hi",
+        provider_options={"cartesia": {"normalization": "en-IN"}},
+    )
+    service._sample_rate = 24_000
+    await service.create_audio_context("turn-1")
+    assert await _run_once(service.run_tts("आपका प्लान 19,497 रुपये का है", "turn-1")) == [None]
+    await service.flush_audio("turn-1")
+    state = service._contexts["turn-1"]
+    assert state.task is not None
+    await state.task
+
+    assert client.opened[0].request["tts"] == {
+        "provider_options": {"cartesia": {"normalization": "en-IN"}}
+    }
+    assert client.opened[0].request["language"] == "hi"
+
+
+def test_tts_without_provider_options_sends_no_tts_block() -> None:
+    service = SpekoTTSService(FakeGatewayClient())  # type: ignore[arg-type]
+    assert service._tts_options is None
