@@ -59,4 +59,31 @@ def stt_options_payload(
     return options or None
 
 
-__all__ = ["CredentialSource", "execution_from_env", "stt_options_payload"]
+def tts_options_payload(
+    *,
+    provider_options: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Build the request's ``tts`` block, or None when nothing was asked.
+
+    ``provider_options`` are the vendor's own synthesis settings, namespaced by
+    provider, e.g. ``{"cartesia": {"normalization": "en-IN"}}`` or
+    ``{"elevenlabs": {"stability": 0.4}}``. The Gateway refuses a setting the
+    routed model cannot honor before the session opens, and ignores settings
+    addressed to a provider the session does not reach.
+    """
+
+    if not provider_options:
+        return None
+    return {
+        "provider_options": {
+            provider: dict(settings) for provider, settings in provider_options.items()
+        }
+    }
+
+
+__all__ = [
+    "CredentialSource",
+    "execution_from_env",
+    "stt_options_payload",
+    "tts_options_payload",
+]

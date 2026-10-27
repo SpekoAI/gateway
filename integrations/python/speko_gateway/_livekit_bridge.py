@@ -106,6 +106,7 @@ class LiveKitTTSBridge:
         num_channels: int = 1,
         max_input_characters: int = 100_000,
         credential_source: CredentialSource = "auto",
+        tts_options: dict[str, Any] | None = None,
     ) -> None:
         self._client = client
         self._voice = voice
@@ -116,6 +117,7 @@ class LiveKitTTSBridge:
         self._num_channels = num_channels
         self._max_input_characters = max_input_characters
         self._credential_source = credential_source
+        self._tts_options = tts_options
 
     async def start(self) -> LiveKitTTSStream:
         request: dict[str, Any] = {
@@ -126,6 +128,8 @@ class LiveKitTTSBridge:
         }
         if self._voice:
             request["voice"] = self._voice
+        if self._tts_options:
+            request["tts"] = self._tts_options
         session = await self._client.open(
             SessionConfig(
                 kind="tts",

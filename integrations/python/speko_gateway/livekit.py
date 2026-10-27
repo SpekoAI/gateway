@@ -35,7 +35,7 @@ from ._livekit_bridge import (
     LiveKitTTSBridge,
     LiveKitTTSStream,
 )
-from ._voice import CredentialSource, stt_options_payload
+from ._voice import CredentialSource, stt_options_payload, tts_options_payload
 from .client import GatewayClient, GatewayError
 from .probe import report_leg as _report_probe_leg
 from .probe import report_marker as _report_probe_marker
@@ -391,6 +391,7 @@ class TTS(tts.TTS):
         sample_rate: int = 24_000,
         max_input_characters: int = 100_000,
         credential_source: CredentialSource = "auto",
+        provider_options: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -405,6 +406,7 @@ class TTS(tts.TTS):
         self._provider_name = provider
         self._max_input_characters = max_input_characters
         self._credential_source = credential_source
+        self._tts_options = tts_options_payload(provider_options=provider_options)
         self._streams: weakref.WeakSet[SynthesisStream] = weakref.WeakSet()
 
     @property
@@ -420,18 +422,22 @@ class TTS(tts.TTS):
         *,
         language: NotGivenOr[str] = NOT_GIVEN,
         voice: NotGivenOr[str] = NOT_GIVEN,
+        provider_options: NotGivenOr[Mapping[str, Mapping[str, Any]] | None] = NOT_GIVEN,
     ) -> None:
-        """Change the language or voice of the next synthesis stream.
+        """Change the language, voice or provider settings of the next stream.
 
         Every LiveKit reply opens its own Gateway session, so a multilingual
         agent can follow the caller turn by turn: pass the language the STT
         final reports, and an empty voice lets Speko pick one for it.
+        ``provider_options`` replaces the previous settings; None clears them.
         Streams already speaking keep their settings.
         """
         if is_given(language):
             self._language = language
         if is_given(voice):
             self._voice = voice
+        if is_given(provider_options):
+            self._tts_options = tts_options_payload(provider_options=provider_options)
 
     def synthesize(
         self,
@@ -456,6 +462,7 @@ class TTS(tts.TTS):
             num_channels=self.num_channels,
             max_input_characters=self._max_input_characters,
             credential_source=self._credential_source,
+            tts_options=self._tts_options,
         )
         stream = SynthesisStream(
             tts_instance=self,

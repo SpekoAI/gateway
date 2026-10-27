@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 from livekit import rtc
@@ -798,4 +799,71 @@ async def test_tts_update_options_applies_to_the_next_stream() -> None:
     stream = plugin.stream()
     assert stream._bridge._language == "kn"
     assert stream._bridge._voice == ""
+    await plugin.aclose()
+
+
+class _RecordingOpenClient:
+    def __init__(self) -> None:
+        self.opened: list[Any] = []
+
+    async def open(self, config: Any) -> object:
+        self.opened.append(config)
+        return object()
+
+
+def test_tts_options_payload_builds_the_request_block() -> None:
+    from speko_gateway._voice import tts_options_payload
+
+    assert tts_options_payload() is None
+    assert tts_options_payload(provider_options={}) is None
+    assert tts_options_payload(
+        provider_options={"cartesia": {"normalization": "en-IN"}}
+    ) == {"provider_options": {"cartesia": {"normalization": "en-IN"}}}
+
+
+async def test_tts_provider_options_reach_the_session_request() -> None:
+    from speko_gateway._livekit_bridge import LiveKitTTSBridge
+
+    plugin = TTS(  # type: ignore[arg-type]
+        FakeClient(),
+        provider="elevenlabs",
+        model="eleven_flash_v2_5",
+        provider_options={"elevenlabs": {"stability": 0.4, "style": 0.2}},
+    )
+    stream = plugin.stream()
+    bridge = stream._bridge
+    assert isinstance(bridge, LiveKitTTSBridge)
+    recorder = _RecordingOpenClient()
+    bridge._client = recorder  # type: ignore[assignment]
+    await bridge.start()
+    assert recorder.opened[0].request["tts"] == {
+        "provider_options": {"elevenlabs": {"stability": 0.4, "style": 0.2}}
+    }
+    await stream.aclose()
+
+    # A plugin with no settings sends no tts block at all, so requests stay
+    # byte-identical for every existing caller.
+    plain = TTS(FakeClient())  # type: ignore[arg-type]
+    plain_stream = plain.stream()
+    plain_recorder = _RecordingOpenClient()
+    plain_stream._bridge._client = plain_recorder  # type: ignore[assignment]
+    await plain_stream._bridge.start()  # type: ignore[attr-defined]
+    assert "tts" not in plain_recorder.opened[0].request
+    await plain_stream.aclose()
+    await plugin.aclose()
+    await plain.aclose()
+
+
+async def test_tts_update_options_replaces_and_clears_provider_options() -> None:
+    plugin = TTS(  # type: ignore[arg-type]
+        FakeClient(), provider_options={"cartesia": {"normalization": "en-IN"}}
+    )
+    plugin.update_options(provider_options={"cartesia": {"normalization": "off"}})
+    assert plugin.stream()._bridge._tts_options == {  # type: ignore[attr-defined]
+        "provider_options": {"cartesia": {"normalization": "off"}}
+    }
+    plugin.update_options(provider_options=None)
+    assert plugin.stream()._bridge._tts_options is None  # type: ignore[attr-defined]
+    plugin.update_options(language="hi")
+    assert plugin._tts_options is None
     await plugin.aclose()
