@@ -171,7 +171,7 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 		return nil, err
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
-	stream := &dialogueStream{ctx: streamCtx, cancel: cancel, voiceID: voiceID, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), conn: conn, superseded: make(chan struct{})}
+	stream := &dialogueStream{ctx: streamCtx, cancel: cancel, voiceID: voiceID, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), inbox: make(chan dialogueItem, a.eventBuffer), conn: conn, superseded: make(chan struct{})}
 	// There is no frame that stops a dialogue turn, so Cancel has to drop the
 	// socket and the session continues on a new one. A permanent key (BYOK,
 	// relay) simply dials again. A managed single-use token is spent by the
@@ -201,6 +201,7 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 		}
 	}
 	stream.lastWrite.Store(time.Now().UnixNano())
+	go stream.pump()
 	go stream.readLoop(conn, 0)
 	go stream.keepAliveLoop()
 	return stream, nil
@@ -292,30 +293,49 @@ func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 // included. The caller's next utterance waits on it, so it is kept short.
 const dialogueReconnectTimeout = 10 * time.Second
 
-// errSuperseded stops a reader whose connection a Cancel has replaced. Its
-// frames belong to the cancelled turn and must never reach the session.
+// errSuperseded reports a write on a connection a Cancel has replaced.
 var errSuperseded = errors.New("elevenlabs dialogue connection superseded")
 
+// dialogueItem is what a connection's reader hands the pump: one vendor frame,
+// or how that connection ended.
+type dialogueItem struct {
+	generation uint64
+	payload    []byte
+	err        error // the connection failed
+	ended      bool  // the connection closed normally
+}
+
+// dialogueStream serves one TTS session across successive sockets. Readers
+// only read; every turn-state change and every event goes through ONE pump
+// goroutine, which applies an item only if it comes from the current
+// connection generation. That single path is what keeps a Cancel clean: a
+// reader of a replaced socket cannot touch the replacement's turn state, end
+// its session, or interleave a frame into its audio, because the pump checks
+// the generation and mutates state under the same lock, and it alone sends.
 type dialogueStream struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	voiceID string
 	events  chan runtimepkg.ProviderEvent
+	inbox   chan dialogueItem
 	// redial opens a replacement connection, handshake written. Nil when the
 	// credential is single-use and nothing can mint another.
 	redial func(context.Context) (*websocket.Conn, error)
 
-	// mu guards the connection state below. It is never held across a send
-	// on events: a consumer that stops reading must not be able to wedge
-	// Cancel or Close behind a blocked reader.
+	// mu guards the connection and turn state. It is never held across a send
+	// on events or inbox, so a consumer that stops reading cannot wedge
+	// Cancel or Close.
 	mu           sync.RWMutex
 	conn         *websocket.Conn // nil while a reconnect is in flight
 	generation   uint64
 	superseded   chan struct{} // closed when Cancel replaces this generation
 	reconnected  chan struct{} // closed when the in-flight reconnect settles
 	reconnectErr error
-	eventsClosed bool
-	emitters     sync.WaitGroup // in-flight sends; the close waits for them
+	audioStarted bool
+	// speaking is set by the first append of a turn and cleared when the turn
+	// finishes or is cancelled: a Cancel with nothing in flight has nothing to
+	// stop and keeps the connection.
+	speaking bool
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -324,13 +344,8 @@ type dialogueStream struct {
 	closing      atomic.Bool
 	closeErr     error
 
-	lastWrite    atomic.Int64
-	audioStarted atomic.Bool
-	committed    atomic.Bool
-	// speaking is set by the first append of a turn and cleared when the turn
-	// finishes or is cancelled: a Cancel with nothing in flight has nothing to
-	// stop and keeps the connection.
-	speaking atomic.Bool
+	lastWrite atomic.Int64
+	committed atomic.Bool
 }
 
 func (s *dialogueStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -360,7 +375,9 @@ func (s *dialogueStream) AppendText(ctx context.Context, text string) error {
 	}); err != nil {
 		return err
 	}
-	s.speaking.Store(true)
+	s.mu.Lock()
+	s.speaking = true
+	s.mu.Unlock()
 	return nil
 }
 
@@ -390,17 +407,24 @@ func (s *dialogueStream) CommitText(ctx context.Context) error {
 // the background so the next utterance does not pay for the handshake. Draining
 // the turn instead would hold the next utterance until the vendor finished
 // generating the cancelled one (measured ~3.7s for 450 characters) and bill it.
+//
+// One frame the pump was already sending when Cancel landed can still reach
+// the session after Cancel returns (the text-to-speech arm has the same window
+// between reading a frame and closing its context). It always precedes the
+// replacement's first event: the pump sends in order.
 func (s *dialogueStream) Cancel(context.Context) error {
 	if s.closed.Load() || s.closing.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
-	if !s.speaking.Load() {
+	s.mu.Lock()
+	if !s.speaking {
+		s.mu.Unlock()
 		return nil
 	}
 	if s.redial == nil {
+		s.mu.Unlock()
 		return s.abort()
 	}
-	s.mu.Lock()
 	old := s.conn
 	s.conn = nil
 	close(s.superseded)
@@ -409,9 +433,8 @@ func (s *dialogueStream) Cancel(context.Context) error {
 	generation := s.generation
 	done := make(chan struct{})
 	s.reconnected, s.reconnectErr = done, nil
-	s.speaking.Store(false)
+	s.speaking, s.audioStarted = false, false
 	s.committed.Store(false)
-	s.audioStarted.Store(false)
 	s.mu.Unlock()
 	if old != nil {
 		_ = old.CloseNow()
@@ -437,10 +460,9 @@ func (s *dialogueStream) reconnect(generation uint64, done chan struct{}) {
 	close(done)
 	s.mu.Unlock()
 	if err != nil {
-		if !s.closed.Load() && s.ctx.Err() == nil {
-			_ = s.emitFrom(generation, runtimepkg.ProviderEvent{Err: err})
+		if !s.closed.Load() {
+			s.deliver(dialogueItem{generation: generation, err: err})
 		}
-		s.finish()
 		return
 	}
 	go s.readLoop(conn, generation)
@@ -505,22 +527,6 @@ func (s *dialogueStream) abort() error {
 	return s.closeErr
 }
 
-// finish ends the stream: the session sees the events channel close. The
-// first caller closes it, after every in-flight send has returned (cancelling
-// the context first releases any send blocked on a full channel).
-func (s *dialogueStream) finish() {
-	s.cancel()
-	s.mu.Lock()
-	if s.eventsClosed {
-		s.mu.Unlock()
-		return
-	}
-	s.eventsClosed = true
-	s.mu.Unlock()
-	s.emitters.Wait()
-	close(s.events)
-}
-
 func (s *dialogueStream) writeJSON(ctx context.Context, value any) error {
 	payload, err := json.Marshal(value)
 	if err != nil {
@@ -539,6 +545,12 @@ func (s *dialogueStream) writeJSON(ctx context.Context, value any) error {
 		return runtimepkg.ErrSessionClosed
 	}
 	if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
+		s.mu.RLock()
+		replaced := s.conn != conn
+		s.mu.RUnlock()
+		if replaced {
+			return errSuperseded
+		}
 		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue write failed", Retryable: true, Cause: err}
 	}
 	s.lastWrite.Store(time.Now().UnixNano())
@@ -549,7 +561,8 @@ func (s *dialogueStream) writeJSON(ctx context.Context, value any) error {
 // dialogueIdleTimeout of inactivity and a voice agent idles longer than that
 // waiting on a caller, so without this the SECOND turn of a call dials a dead
 // connection. The frame synthesizes nothing. It skips while a reconnect is in
-// flight: the replacement is fresh and the next write waits for it anyway.
+// flight, and a write that lost a race with Cancel keeps the loop running for
+// the replacement.
 func (s *dialogueStream) keepAliveLoop() {
 	ticker := time.NewTicker(dialogueKeepAlivePoll)
 	defer ticker.Stop()
@@ -567,7 +580,7 @@ func (s *dialogueStream) keepAliveLoop() {
 			if !live || !keepAliveDue(s.lastWrite.Load(), time.Now()) {
 				continue
 			}
-			if err := s.writeJSON(s.ctx, map[string]any{"keep_alive": true}); err != nil {
+			if err := s.writeJSON(s.ctx, map[string]any{"keep_alive": true}); err != nil && !errors.Is(err, errSuperseded) {
 				return
 			}
 		}
@@ -579,39 +592,98 @@ func keepAliveDue(lastWriteUnixNano int64, now time.Time) bool {
 	return lastWriteUnixNano == 0 || now.Sub(time.Unix(0, lastWriteUnixNano)) >= dialogueKeepAliveTick
 }
 
-// readLoop owns one connection. A reader whose connection a Cancel replaced
-// exits quietly: the replacement's reader owns the session from then on.
+// readLoop reads one connection and hands everything to the pump. It decides
+// nothing itself: whether a frame or a failure still matters depends on the
+// generation, which only the pump checks.
 func (s *dialogueStream) readLoop(conn *websocket.Conn, generation uint64) {
 	for {
 		messageType, payload, err := conn.Read(s.ctx)
 		if err != nil {
-			if !s.current(generation) {
-				return
+			item := dialogueItem{generation: generation, ended: true}
+			if !isNormalClose(err) && s.ctx.Err() == nil {
+				item = dialogueItem{generation: generation, err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue read failed", Retryable: true, Cause: err}}
 			}
-			if !s.closed.Load() && s.ctx.Err() == nil && !isNormalClose(err) {
-				_ = s.emitFrom(generation, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue read failed", Retryable: true, Cause: err}})
-			}
-			s.finish()
+			s.deliver(item)
 			return
 		}
 		if messageType != websocket.MessageText {
 			continue
 		}
-		if err := s.handleMessage(generation, payload); err != nil {
-			if errors.Is(err, errSuperseded) {
-				return
-			}
-			_ = s.emitFrom(generation, runtimepkg.ProviderEvent{Err: err})
-			s.finish()
+		if !s.deliver(dialogueItem{generation: generation, payload: payload}) {
 			return
 		}
 	}
 }
 
-func (s *dialogueStream) current(generation uint64) bool {
+// deliver queues an item for the pump. It gives up once the item's generation
+// is replaced or the stream ends, so a reader never blocks on a dead pump.
+func (s *dialogueStream) deliver(item dialogueItem) bool {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.generation == generation
+	current, superseded := s.generation == item.generation, s.superseded
+	s.mu.RUnlock()
+	if !current {
+		return false
+	}
+	select {
+	case s.inbox <- item:
+		return true
+	case <-superseded:
+		return false
+	case <-s.ctx.Done():
+		return false
+	}
+}
+
+// pump is the only goroutine that changes turn state from vendor frames, sends
+// on events, or closes it.
+func (s *dialogueStream) pump() {
+	defer close(s.events)
+	defer s.cancel()
+	for {
+		var item dialogueItem
+		select {
+		case <-s.ctx.Done():
+			return
+		case item = <-s.inbox:
+		}
+		events, superseded, terminal := s.apply(item)
+		for _, event := range events {
+			select {
+			case s.events <- event:
+			case <-superseded:
+				// Cancel replaced this generation mid-item: drop the rest.
+			case <-s.ctx.Done():
+				return
+			}
+		}
+		if terminal {
+			return
+		}
+	}
+}
+
+// apply turns one item into events, under the lock, if and only if it comes
+// from the current generation. A stale item changes nothing.
+func (s *dialogueStream) apply(item dialogueItem) ([]runtimepkg.ProviderEvent, chan struct{}, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if item.generation != s.generation {
+		return nil, nil, false
+	}
+	switch {
+	case item.ended:
+		return nil, s.superseded, true
+	case item.err != nil:
+		if s.closed.Load() {
+			return nil, s.superseded, true
+		}
+		return []runtimepkg.ProviderEvent{{Err: item.err}}, s.superseded, true
+	}
+	events, err := s.handleMessage(item.payload)
+	if err != nil {
+		return append(events, runtimepkg.ProviderEvent{Err: err}), s.superseded, true
+	}
+	return events, s.superseded, false
 }
 
 // dialogueInbound is the dialogue socket's own frame set. `alignment` is typed
@@ -642,10 +714,11 @@ func (m dialogueInbound) finishesTurn() bool {
 	return m.IsFinalForTurn || m.IsFinal || m.IsFinalCamel
 }
 
-func (s *dialogueStream) handleMessage(generation uint64, payload []byte) error {
+// handleMessage translates one vendor frame. It runs under s.mu, inside apply.
+func (s *dialogueStream) handleMessage(payload []byte) ([]runtimepkg.ProviderEvent, error) {
 	var message dialogueInbound
 	if err := json.Unmarshal(payload, &message); err != nil {
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue sent malformed streaming JSON", Retryable: true, Cause: err}
+		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue sent malformed streaming JSON", Retryable: true, Cause: err}
 	}
 	raw := json.RawMessage(append([]byte(nil), payload...))
 	if len(message.Error) > 0 && string(message.Error) != "null" {
@@ -655,30 +728,26 @@ func (s *dialogueStream) handleMessage(generation uint64, payload []byte) error 
 		// from an exhausted quota. The error field is the vendor's own
 		// message, never the credential, which rides the handshake and the
 		// request header.
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: fmt.Sprintf("ElevenLabs dialogue reported a streaming error: %s", strings.TrimSpace(string(message.Error))), Retryable: false}
+		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: fmt.Sprintf("ElevenLabs dialogue reported a streaming error: %s", strings.TrimSpace(string(message.Error))), Retryable: false}
 	}
+	var events []runtimepkg.ProviderEvent
 	if message.Audio != "" {
 		audio, err := base64.StdEncoding.DecodeString(message.Audio)
 		if err != nil {
-			return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue sent invalid base64 audio", Retryable: true, Cause: err}
+			return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue sent invalid base64 audio", Retryable: true, Cause: err}
 		}
-		if s.audioStarted.CompareAndSwap(false, true) {
-			if err := s.emitFrom(generation, runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: contextData(""), Extensions: extension(raw)}); err != nil {
-				return err
-			}
+		if !s.audioStarted {
+			s.audioStarted = true
+			events = append(events, runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: contextData(""), Extensions: extension(raw)})
 		}
-		if err := s.emitFrom(generation, runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: contextData(""), Extensions: extension(raw), Audio: audio}); err != nil {
-			return err
-		}
+		events = append(events, runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: contextData(""), Extensions: extension(raw), Audio: audio})
 	}
 	if len(message.Alignment) > 0 && string(message.Alignment) != "null" {
 		// No spans: the dialogue socket's alignment shape is not the character
 		// arrays TimingSpansFromMillisecondDurations reads, and inventing spans
 		// from a shape we have not measured is the desync this package's
 		// text-to-speech alignment comment warns about.
-		if err := s.emitFrom(generation, runtimepkg.ProviderEvent{Type: protocol.EventAlignment, Data: contextData(""), Extensions: extension(raw)}); err != nil {
-			return err
-		}
+		events = append(events, runtimepkg.ProviderEvent{Type: protocol.EventAlignment, Data: contextData(""), Extensions: extension(raw)})
 	}
 	if message.finishesTurn() {
 		// The turn is over, so the session takes the next one: the socket
@@ -687,43 +756,12 @@ func (s *dialogueStream) handleMessage(generation uint64, payload []byte) error 
 		// Reset BEFORE emitting, so a caller that appends as soon as it sees
 		// audio.done is not refused. This mirrors finishContext on the
 		// text-to-speech arm, where Pipecat commits sentence by sentence.
-		s.audioStarted.Store(false)
+		s.audioStarted, s.speaking = false, false
 		s.committed.Store(false)
-		s.speaking.Store(false)
-		return s.emitFrom(generation, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: contextData(""), Extensions: extension(raw)})
+		return append(events, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: contextData(""), Extensions: extension(raw)}), nil
 	}
 	if message.Audio == "" && len(message.Alignment) == 0 {
-		return s.emitFrom(generation, runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"message": "ignored ElevenLabs dialogue message"}), Extensions: extension(raw)})
+		events = append(events, runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"message": "ignored ElevenLabs dialogue message"}), Extensions: extension(raw)})
 	}
-	return nil
-}
-
-// emitFrom delivers an event from one connection generation, or reports
-// errSuperseded once a Cancel has replaced that connection. A frame already
-// past the generation check when Cancel lands can still be delivered — the
-// same one-frame window the text-to-speech arm has between reading a frame
-// and closing its context — but a reader blocked on a full channel gives up
-// as soon as its generation is replaced.
-func (s *dialogueStream) emitFrom(generation uint64, event runtimepkg.ProviderEvent) error {
-	s.mu.RLock()
-	if s.generation != generation {
-		s.mu.RUnlock()
-		return errSuperseded
-	}
-	if s.eventsClosed {
-		s.mu.RUnlock()
-		return runtimepkg.ErrSessionClosed
-	}
-	superseded := s.superseded
-	s.emitters.Add(1)
-	s.mu.RUnlock()
-	defer s.emitters.Done()
-	select {
-	case s.events <- event:
-		return nil
-	case <-superseded:
-		return errSuperseded
-	case <-s.ctx.Done():
-		return s.ctx.Err()
-	}
+	return events, nil
 }

@@ -696,6 +696,61 @@ func TestDialogueAdapterCancelDoesNotWaitOnAStalledConsumer(t *testing.T) {
 	_ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
 }
 
+// A reader of a socket Cancel replaced may still be holding a frame. Applying
+// it must change nothing: a stale end-of-turn clearing `speaking` made the
+// next Cancel a no-op while the replacement kept talking, a stale audio frame
+// set audioStarted and swallowed the replacement's audio.started, and a stale
+// error ended the replacement session (Codex review, 2026-10-28).
+func TestDialogueAdapterIgnoresItemsFromAReplacedConnection(t *testing.T) {
+	t.Parallel()
+	connections := make(chan *http.Request, 4)
+	handshakes := make(chan dialogueClientMessage, 4)
+	server := cancelServer(t, connections, handshakes)
+	defer server.Close()
+	adapter, err := NewDialogue(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new dialogue adapter: %v", err)
+	}
+	opened, err := adapter.Open(context.Background(), dialogueRequest(server.URL, "eleven_v4_turbo"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	stream := opened.(*dialogueStream)
+	defer stream.Abort(context.Background())
+	if err := stream.AppendText(context.Background(), "First."); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	waitForCancelledAudio(t, stream.Events())
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "Second."); err != nil {
+		t.Fatalf("append after cancel: %v", err)
+	}
+	stale := func(item dialogueItem) {
+		t.Helper()
+		item.generation = 0
+		if events, _, terminal := stream.apply(item); len(events) != 0 || terminal {
+			t.Fatalf("stale item %+v produced events=%v terminal=%t", item, events, terminal)
+		}
+	}
+	stale(dialogueItem{payload: []byte(`{"is_final_audio_for_turn":true}`)})
+	stale(dialogueItem{payload: []byte(`{"audio":"qg=="}`)})
+	stale(dialogueItem{err: errors.New("old socket failed")})
+	stale(dialogueItem{ended: true})
+	stream.mu.RLock()
+	speaking, started := stream.speaking, stream.audioStarted
+	stream.mu.RUnlock()
+	if !speaking || started {
+		t.Fatalf("replacement turn state after stale items: speaking=%t audioStarted=%t", speaking, started)
+	}
+	// The same frames from the CURRENT generation do apply.
+	events, _, _ := stream.apply(dialogueItem{generation: 1, payload: []byte(`{"audio":"uw=="}`)})
+	if len(events) != 2 || events[0].Type != protocol.EventAudioStarted {
+		t.Fatalf("current-generation audio = %v, want audio.started then the frame", eventTypes(events))
+	}
+}
+
 // A Cancel with nothing in flight has nothing to stop, so it keeps the socket
 // rather than spending a reconnect (and, managed, a minted token).
 func TestDialogueAdapterIdleCancelKeepsTheConnection(t *testing.T) {
