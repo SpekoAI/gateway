@@ -1,13 +1,17 @@
 package elevenlabs
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -490,6 +494,276 @@ func TestDialogueAdapterSpeaksSuccessiveCommitsOnOneSession(t *testing.T) {
 	}
 	if err := stream.Close(context.Background()); err != nil {
 		t.Fatalf("close: %v", err)
+	}
+}
+
+// cancelServer answers each connection in turn. The first keeps streaming
+// audio until it is dropped, standing in for a long utterance the caller
+// interrupts; every later connection speaks one flushed turn and then waits
+// for close_socket.
+func cancelServer(t *testing.T, connections chan<- *http.Request, handshakes chan<- dialogueClientMessage) *httptest.Server {
+	t.Helper()
+	var count atomic.Int32
+	return newDialogueServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+		index := count.Add(1)
+		connections <- request.Clone(request.Context())
+		handshake, err := readDialogueMessage(ctx, conn)
+		if err != nil {
+			return
+		}
+		handshakes <- handshake
+		if index == 1 {
+			if _, err := readDialogueMessage(ctx, conn); err != nil {
+				return
+			}
+			for {
+				if err := writeServerJSON(ctx, conn, map[string]any{"audio": base64.StdEncoding.EncodeToString([]byte{0xAA})}); err != nil {
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		for {
+			message, err := readDialogueMessage(ctx, conn)
+			if err != nil {
+				return
+			}
+			switch {
+			case message.Flush:
+				_ = writeServerJSON(ctx, conn, map[string]any{"audio": base64.StdEncoding.EncodeToString([]byte{0xBB})})
+				_ = writeServerJSON(ctx, conn, map[string]any{"is_final_audio_for_turn": true})
+			case message.CloseSocket:
+				_ = conn.Close(websocket.StatusNormalClosure, "")
+				return
+			}
+		}
+	})
+}
+
+// waitForCancelledAudio drains events until the first audio frame of the
+// utterance being cancelled, so the Cancel lands mid-speech.
+func waitForCancelledAudio(t *testing.T, events <-chan runtimepkg.ProviderEvent) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				t.Fatal("events closed before the first utterance spoke")
+			}
+			if event.Err != nil {
+				t.Fatalf("first utterance error: %v", event.Err)
+			}
+			if event.Type == protocol.EventAudioFrame {
+				return
+			}
+		case <-deadline:
+			t.Fatal("first utterance never spoke")
+		}
+	}
+}
+
+// After a Cancel the session must still speak: the caller interrupted one
+// utterance, not the call. The cancelled socket is dropped (the vendor has no
+// stop-turn frame) and the next utterance runs on a replacement, so no audio
+// of the cancelled turn may reach the session after Cancel returns.
+func TestDialogueAdapterSpeaksAgainAfterCancel(t *testing.T) {
+	t.Parallel()
+	for _, managed := range []bool{false, true} {
+		name := "permanent key"
+		if managed {
+			name = "managed token"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			connections := make(chan *http.Request, 4)
+			handshakes := make(chan dialogueClientMessage, 4)
+			server := cancelServer(t, connections, handshakes)
+			defer server.Close()
+
+			adapter, err := NewDialogue(testConfig(server.URL))
+			if err != nil {
+				t.Fatalf("new dialogue adapter: %v", err)
+			}
+			request := dialogueRequest(server.URL, "eleven_v4_turbo")
+			var refreshes atomic.Int32
+			if managed {
+				request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+				request.Plan.Route.Credential.Value = "token-1"
+				request.RefreshCredential = func(context.Context) (protocol.DelegatedCredential, error) {
+					n := refreshes.Add(1)
+					return protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: fmt.Sprintf("token-%d", n+1), ExpiresAt: time.Now().Add(time.Minute)}, nil
+				}
+			}
+			stream, err := adapter.Open(context.Background(), request)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			if err := stream.AppendText(context.Background(), "A long first answer the caller talks over."); err != nil {
+				t.Fatalf("first append: %v", err)
+			}
+			waitForCancelledAudio(t, stream.Events())
+			if err := stream.Cancel(context.Background()); err != nil {
+				t.Fatalf("cancel: %v", err)
+			}
+			if err := stream.AppendText(context.Background(), "Sorry, go ahead."); err != nil {
+				t.Fatalf("append after cancel: %v", err)
+			}
+			if err := stream.CommitText(context.Background()); err != nil {
+				t.Fatalf("commit after cancel: %v", err)
+			}
+			var audio []byte
+			deadline := time.After(5 * time.Second)
+		collect:
+			for {
+				select {
+				case event, ok := <-stream.Events():
+					if !ok {
+						t.Fatal("session ended after cancel")
+					}
+					if event.Err != nil {
+						t.Fatalf("event error after cancel: %v", event.Err)
+					}
+					audio = append(audio, event.Audio...)
+					if event.Type == protocol.EventAudioDone {
+						break collect
+					}
+				case <-deadline:
+					t.Fatal("no audio.done after cancel")
+				}
+			}
+			// Frames already queued before Cancel returned may still drain; none
+			// may arrive after the replacement's audio starts.
+			if len(audio) == 0 || audio[len(audio)-1] != 0xBB || bytes.Contains(audio[bytes.IndexByte(audio, 0xBB):], []byte{0xAA}) {
+				t.Fatalf("post-cancel audio = %x, want the replacement's turn only", audio)
+			}
+			if err := stream.Close(context.Background()); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			first, second := <-connections, <-connections
+			firstHandshake, secondHandshake := <-handshakes, <-handshakes
+			if managed {
+				if first.URL.Query().Get("single_use_token") != "token-1" || second.URL.Query().Get("single_use_token") != "token-2" || refreshes.Load() != 1 {
+					t.Fatalf("tokens = %q then %q after %d refreshes; a spent token must never be replayed", first.URL.Query().Get("single_use_token"), second.URL.Query().Get("single_use_token"), refreshes.Load())
+				}
+				if second.Header.Get("xi-api-key") != "" || secondHandshake.APIKey != "" {
+					t.Fatal("refreshed token leaked outside the query")
+				}
+			} else if second.Header.Get("xi-api-key") != "customer-elevenlabs-key" || secondHandshake.APIKey != "customer-elevenlabs-key" {
+				t.Fatalf("permanent key not reused: header=%q frame=%q", second.Header.Get("xi-api-key"), secondHandshake.APIKey)
+			}
+			if len(firstHandshake.Voices) != 1 || len(secondHandshake.Voices) != 1 || secondHandshake.Voices[0] != firstHandshake.Voices[0] {
+				t.Fatalf("voice not re-registered: %v then %v", firstHandshake.Voices, secondHandshake.Voices)
+			}
+		})
+	}
+}
+
+// A Cancel with nothing in flight has nothing to stop, so it keeps the socket
+// rather than spending a reconnect (and, managed, a minted token).
+func TestDialogueAdapterIdleCancelKeepsTheConnection(t *testing.T) {
+	t.Parallel()
+	connections := make(chan *http.Request, 4)
+	handshakes := make(chan dialogueClientMessage, 4)
+	server := cancelServer(t, connections, handshakes)
+	defer server.Close()
+	adapter, err := NewDialogue(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new dialogue adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), dialogueRequest(server.URL, "eleven_v4_turbo"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("idle cancel: %v", err)
+	}
+	_ = stream.Close(context.Background())
+	<-connections
+	select {
+	case <-connections:
+		t.Fatal("idle cancel reconnected")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// Without a refresher a managed single-use token cannot authenticate a second
+// socket, so Cancel ends the session as it always did instead of replaying a
+// spent token.
+func TestDialogueAdapterManagedCancelWithoutRefresherEndsTheSession(t *testing.T) {
+	t.Parallel()
+	connections := make(chan *http.Request, 4)
+	handshakes := make(chan dialogueClientMessage, 4)
+	server := cancelServer(t, connections, handshakes)
+	defer server.Close()
+	adapter, err := NewDialogue(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new dialogue adapter: %v", err)
+	}
+	request := dialogueRequest(server.URL, "eleven_v4_turbo")
+	request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "Something to cancel."); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	waitForCancelledAudio(t, stream.Events())
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "More."); !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		t.Fatalf("append after cancel = %v, want ErrSessionClosed", err)
+	}
+	<-connections
+	select {
+	case <-connections:
+		t.Fatal("reconnected without a credential source")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// A refresh the control plane refuses ends the session with the provider error
+// rather than leaving the next utterance hanging.
+func TestDialogueAdapterFailedRefreshEndsTheSession(t *testing.T) {
+	t.Parallel()
+	connections := make(chan *http.Request, 4)
+	handshakes := make(chan dialogueClientMessage, 4)
+	server := cancelServer(t, connections, handshakes)
+	defer server.Close()
+	adapter, err := NewDialogue(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new dialogue adapter: %v", err)
+	}
+	request := dialogueRequest(server.URL, "eleven_v4_turbo")
+	request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+	request.RefreshCredential = func(context.Context) (protocol.DelegatedCredential, error) {
+		return protocol.DelegatedCredential{}, errors.New("reissue cap reached")
+	}
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "Something to cancel."); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	waitForCancelledAudio(t, stream.Events())
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "More."); err == nil {
+		t.Fatal("append after a failed refresh succeeded")
+	}
+	var providerErr *runtimepkg.ProviderError
+	for event := range stream.Events() {
+		if event.Err != nil && errors.As(event.Err, &providerErr) {
+			break
+		}
+	}
+	if providerErr == nil || !strings.Contains(providerErr.Message, "reconnect") {
+		t.Fatalf("terminal error = %v, want the reconnect failure", providerErr)
 	}
 }
 

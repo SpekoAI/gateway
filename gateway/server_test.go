@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1126,6 +1127,89 @@ func TestGatewayProviderOpenErrorPreservesClassificationOnly(t *testing.T) {
 			e := body.Error
 			if e.Code != "session_open_failed" || e.Source != "provider" || e.Retryable == nil || *e.Retryable != retryable || e.Provider.Code != "provider_unavailable" || e.Provider.Status != 503 {
 				t.Fatalf("classification = %s", payload)
+			}
+		})
+	}
+}
+
+type refreshingPlanClient struct {
+	*fakePlanClient
+	refreshes atomic.Int32
+	refreshed chan protocol.SessionPlan
+}
+
+func (c *refreshingPlanClient) RefreshCredential(_ context.Context, plan protocol.SessionPlan, request controlplane.CredentialRefreshRequest) (protocol.DelegatedCredential, string, error) {
+	c.refreshes.Add(1)
+	if request.Reason != "provider_reconnect" {
+		return protocol.DelegatedCredential{}, "", fmt.Errorf("refresh reason = %q", request.Reason)
+	}
+	c.refreshed <- plan
+	return protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "fresh-token", ExpiresAt: gatewayNow.Add(time.Minute)}, "", nil
+}
+
+type refreshCapturingAdapter struct {
+	inner    *mock.Adapter
+	requests chan runtimepkg.AdapterRequest
+}
+
+func (a *refreshCapturingAdapter) ID() string { return a.inner.ID() }
+
+func (a *refreshCapturingAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
+	a.requests <- request
+	return a.inner.Open(ctx, request)
+}
+
+// A managed provider-direct session hands its adapter a refresher bound to
+// that exact attempt, so a provider whose credential is single-use per
+// connection can redial mid-session. BYOK sessions get none: their key is
+// local and reusable, and the control plane must never mint for them.
+func TestGatewayHandsManagedAdaptersAnAttemptBoundCredentialRefresher(t *testing.T) {
+	t.Parallel()
+	for _, source := range []protocol.CredentialSource{protocol.CredentialsManaged, protocol.CredentialsBYOK} {
+		t.Run(string(source), func(t *testing.T) {
+			t.Parallel()
+			adapter := &refreshCapturingAdapter{inner: mock.NewSTTAdapter("mock.stt.v1"), requests: make(chan runtimepkg.AdapterRequest, 1)}
+			config, fake := newServerConfigWithAdapter(t, adapter, 0, 0, 0, 0)
+			plans := &refreshingPlanClient{fakePlanClient: fake, refreshed: make(chan protocol.SessionPlan, 1)}
+			config.Plans = plans
+			plan := gatewayPlan()
+			plan.Execution.CredentialSource = source
+			if source == protocol.CredentialsManaged {
+				plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "first-token", ExpiresAt: gatewayNow.Add(time.Minute)}
+			}
+			fake.mu.Lock()
+			fake.plan = plan
+			fake.mu.Unlock()
+			gatewayServer, err := gateway.New(config)
+			if err != nil {
+				t.Fatalf("new gateway: %v", err)
+			}
+			httpServer := httptest.NewServer(gatewayServer.Handler())
+			t.Cleanup(httpServer.Close)
+			body := gatewayRequestBody()
+			body["execution"] = map[string]string{"provider_route": "provider_direct", "credential_source": string(source), "relay_policy": "forbidden"}
+			response := postJSON(t, httpServer.URL+"/v1/sessions", body, "local-token", "refresh-create-"+string(source))
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusCreated {
+				payload, _ := io.ReadAll(response.Body)
+				t.Fatalf("create status = %d: %s", response.StatusCode, payload)
+			}
+			request := <-adapter.requests
+			if source == protocol.CredentialsBYOK {
+				if request.RefreshCredential != nil {
+					t.Fatal("BYOK adapter was handed a control-plane refresher")
+				}
+				return
+			}
+			if request.RefreshCredential == nil {
+				t.Fatal("managed adapter has no credential refresher")
+			}
+			credential, err := request.RefreshCredential(context.Background())
+			if err != nil || credential.Value != "fresh-token" {
+				t.Fatalf("refresh = %+v, %v", credential, err)
+			}
+			if refreshed := <-plans.refreshed; refreshed.SessionID != plan.SessionID || refreshed.AttemptID != plan.AttemptID {
+				t.Fatalf("refreshed %s/%s, want the open attempt %s/%s", refreshed.SessionID, refreshed.AttemptID, plan.SessionID, plan.AttemptID)
 			}
 		})
 	}

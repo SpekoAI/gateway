@@ -159,13 +159,62 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 	if err != nil {
 		return nil, err
 	}
-	headers := make(http.Header)
-	if singleUseToken == "" {
-		headers.Set("xi-api-key", credential.Value)
-	}
 	client := a.httpClient
 	if client == nil {
 		client = http.DefaultClient
+	}
+	dial := func(ctx context.Context, credential string) (*websocket.Conn, error) {
+		return a.dialDialogue(ctx, client, endpoint, credential, singleUseToken != "", voiceID, voiceSettings)
+	}
+	conn, err := dial(ctx, credential.Value)
+	if err != nil {
+		return nil, err
+	}
+	streamCtx, cancel := context.WithCancel(context.Background())
+	stream := &dialogueStream{ctx: streamCtx, cancel: cancel, voiceID: voiceID, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), conn: conn}
+	// There is no frame that stops a dialogue turn, so Cancel has to drop the
+	// socket and the session continues on a new one. A permanent key (BYOK,
+	// relay) simply dials again. A managed single-use token is spent by the
+	// first connection (a second one is refused "Token not found or has
+	// expired", verified live 2026-10-28), so the new socket needs a fresh
+	// token from the control plane; without a refresher Cancel ends the
+	// session, as it always did.
+	switch {
+	case singleUseToken == "":
+		permanent := credential.Value
+		stream.redial = func(ctx context.Context) (*websocket.Conn, error) { return dial(ctx, permanent) }
+	case request.RefreshCredential != nil:
+		refresh := request.RefreshCredential
+		stream.redial = func(ctx context.Context) (*websocket.Conn, error) {
+			fresh, err := refresh(ctx)
+			if err != nil {
+				return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue could not obtain a credential to reconnect", Retryable: true, Cause: err}
+			}
+			if !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, fresh.Kind) || strings.TrimSpace(fresh.Value) == "" {
+				return nil, errors.New("elevenlabs dialogue reconnect requires a bearer credential")
+			}
+			freshEndpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media, fresh.Value)
+			if err != nil {
+				return nil, err
+			}
+			return a.dialDialogue(ctx, client, freshEndpoint, fresh.Value, true, voiceID, voiceSettings)
+		}
+	}
+	stream.lastWrite.Store(time.Now().UnixNano())
+	go stream.readLoop(conn, 0)
+	go stream.keepAliveLoop()
+	return stream, nil
+}
+
+// dialDialogue opens one socket and registers the voice on it. The handshake
+// must land before any input frame, so it is written synchronously on the
+// caller's context: a connection that cannot register a voice has not started,
+// and reporting that as a dial failure is more useful than surfacing it later
+// as a read error.
+func (a *DialogueAdapter) dialDialogue(ctx context.Context, client *http.Client, endpoint, credential string, singleUseToken bool, voiceID string, voiceSettings map[string]any) (*websocket.Conn, error) {
+	headers := make(http.Header)
+	if !singleUseToken {
+		headers.Set("xi-api-key", credential)
 	}
 	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: client, HTTPHeader: headers})
 	if err != nil {
@@ -176,18 +225,12 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 		return nil, &runtimepkg.ProviderError{Code: dialErrorCode(status), Message: "ElevenLabs dialogue connection could not be established", Retryable: status == 0 || status == http.StatusTooManyRequests || status >= 500, ProviderStatus: status, Cause: err}
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
-	streamCtx, cancel := context.WithCancel(context.Background())
-	stream := &dialogueStream{conn: conn, ctx: streamCtx, cancel: cancel, voiceID: voiceID, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer)}
-	// The handshake registers the voice and must land before any input frame,
-	// so it is written synchronously on the caller's context: a session that
-	// cannot register a voice has not started, and reporting that as a dial
-	// failure is more useful than surfacing it later as a read error.
 	// The handshake frame carries a permanent key too, because the dialogue
 	// socket documents `xi_api_key` there and the vendor's own sample sends
 	// both. A single-use token stays in the query alone.
 	handshake := map[string]any{"voices": []string{voiceID}}
-	if singleUseToken == "" {
-		handshake["xi_api_key"] = credential.Value
+	if !singleUseToken {
+		handshake["xi_api_key"] = credential
 	}
 	// The dialogue socket takes voice_settings once, in the handshake, for
 	// the whole connection; ttsVoiceSettings has already narrowed it to
@@ -195,13 +238,15 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 	if voiceSettings != nil {
 		handshake["voice_settings"] = voiceSettings
 	}
-	if err := stream.writeJSON(ctx, handshake); err != nil {
-		_ = stream.abort()
-		return nil, err
+	payload, err := json.Marshal(handshake)
+	if err == nil {
+		err = conn.Write(ctx, websocket.MessageText, payload)
 	}
-	go stream.readLoop()
-	go stream.keepAliveLoop()
-	return stream, nil
+	if err != nil {
+		_ = conn.CloseNow()
+		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue write failed", Retryable: true, Cause: err}
+	}
+	return conn, nil
 }
 
 // dialogueSocket validates the route and builds the socket URL. The path is
@@ -243,12 +288,33 @@ func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	return endpoint.String(), nil
 }
 
+// dialogueReconnectTimeout bounds the redial after a Cancel, credential mint
+// included. The caller's next utterance waits on it, so it is kept short.
+const dialogueReconnectTimeout = 10 * time.Second
+
+// errSuperseded stops a reader whose connection a Cancel has replaced. Its
+// frames belong to the cancelled turn and must never reach the session.
+var errSuperseded = errors.New("elevenlabs dialogue connection superseded")
+
 type dialogueStream struct {
-	conn    *websocket.Conn
 	ctx     context.Context
 	cancel  context.CancelFunc
 	voiceID string
 	events  chan runtimepkg.ProviderEvent
+	// redial opens a replacement connection, handshake written. Nil when the
+	// credential is single-use and nothing can mint another.
+	redial func(context.Context) (*websocket.Conn, error)
+
+	// mu guards the connection state below and the events channel: readers
+	// hold it shared while emitting, and swapping connections or closing the
+	// channel takes it exclusively, so no frame from a replaced connection is
+	// emitted after Cancel returns and no emit races the close.
+	mu           sync.RWMutex
+	conn         *websocket.Conn // nil while a reconnect is in flight
+	generation   uint64
+	reconnected  chan struct{} // closed when the in-flight reconnect settles
+	reconnectErr error
+	eventsClosed bool
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -260,6 +326,10 @@ type dialogueStream struct {
 	lastWrite    atomic.Int64
 	audioStarted atomic.Bool
 	committed    atomic.Bool
+	// speaking is set by the first append of a turn and cleared when the turn
+	// finishes or is cancelled: a Cancel with nothing in flight has nothing to
+	// stop and keeps the connection.
+	speaking atomic.Bool
 }
 
 func (s *dialogueStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -284,9 +354,13 @@ func (s *dialogueStream) AppendText(ctx context.Context, text string) error {
 	if s.committed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
-	return s.writeJSON(ctx, map[string]any{
+	if err := s.writeJSON(ctx, map[string]any{
 		"inputs": []map[string]any{{"text": text, "voice_id": s.voiceID, "new_turn": false}},
-	})
+	}); err != nil {
+		return err
+	}
+	s.speaking.Store(true)
+	return nil
 }
 
 // CommitText flushes. The dialogue socket buffers to a fixed server-side
@@ -308,15 +382,93 @@ func (s *dialogueStream) CommitText(ctx context.Context) error {
 	return nil
 }
 
-// Cancel has no frame-level equivalent on this socket: there is no context to
-// close, so stopping the current utterance means dropping the connection. That
-// is the honest mapping — a caller cancelling a TTS turn wants the audio to
-// stop, and a half-flushed dialogue socket cannot be rewound.
+// Cancel stops the current utterance and keeps the session. The socket has no
+// frame that stops a turn (the vendor documents only flush, keep_alive and
+// close_socket), so the connection carrying it is dropped — which stops the
+// audio and the vendor's generation at once — and a replacement is dialled in
+// the background so the next utterance does not pay for the handshake. Draining
+// the turn instead would hold the next utterance until the vendor finished
+// generating the cancelled one (measured ~3.7s for 450 characters) and bill it.
 func (s *dialogueStream) Cancel(context.Context) error {
-	if s.closed.Load() {
+	if s.closed.Load() || s.closing.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
-	return s.abort()
+	if !s.speaking.Load() {
+		return nil
+	}
+	if s.redial == nil {
+		return s.abort()
+	}
+	s.mu.Lock()
+	old := s.conn
+	s.conn = nil
+	s.generation++
+	generation := s.generation
+	done := make(chan struct{})
+	s.reconnected, s.reconnectErr = done, nil
+	s.speaking.Store(false)
+	s.committed.Store(false)
+	s.audioStarted.Store(false)
+	s.mu.Unlock()
+	if old != nil {
+		_ = old.CloseNow()
+	}
+	go s.reconnect(generation, done)
+	return nil
+}
+
+func (s *dialogueStream) reconnect(generation uint64, done chan struct{}) {
+	ctx, cancel := context.WithTimeout(s.ctx, dialogueReconnectTimeout)
+	defer cancel()
+	conn, err := s.redial(ctx)
+	s.mu.Lock()
+	if err == nil && (s.generation != generation || s.ctx.Err() != nil) {
+		_ = conn.CloseNow()
+		conn, err = nil, runtimepkg.ErrSessionClosed
+	}
+	if err == nil {
+		s.conn = conn
+		s.lastWrite.Store(time.Now().UnixNano())
+	}
+	s.reconnectErr = err
+	close(done)
+	s.mu.Unlock()
+	if err != nil {
+		if !s.closed.Load() && s.ctx.Err() == nil {
+			_ = s.emitFrom(generation, runtimepkg.ProviderEvent{Err: err})
+		}
+		s.finish()
+		return
+	}
+	go s.readLoop(conn, generation)
+}
+
+// connection returns the live socket, waiting out an in-flight reconnect.
+func (s *dialogueStream) connection(ctx context.Context) (*websocket.Conn, error) {
+	s.mu.RLock()
+	conn, pending := s.conn, s.reconnected
+	s.mu.RUnlock()
+	if conn != nil {
+		return conn, nil
+	}
+	if pending == nil {
+		return nil, runtimepkg.ErrSessionClosed
+	}
+	select {
+	case <-pending:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	s.mu.RLock()
+	conn, err := s.conn, s.reconnectErr
+	s.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	if conn == nil {
+		return nil, runtimepkg.ErrSessionClosed
+	}
+	return conn, nil
 }
 
 func (s *dialogueStream) Close(ctx context.Context) error {
@@ -338,11 +490,28 @@ func (s *dialogueStream) abort() error {
 	s.abortOnce.Do(func() {
 		s.closed.Store(true)
 		s.cancel()
-		if err := s.conn.CloseNow(); err != nil && s.closeErr == nil {
-			s.closeErr = err
+		s.mu.RLock()
+		conn := s.conn
+		s.mu.RUnlock()
+		if conn != nil {
+			if err := conn.CloseNow(); err != nil && s.closeErr == nil {
+				s.closeErr = err
+			}
 		}
 	})
 	return s.closeErr
+}
+
+// finish ends the stream: the session sees the events channel close. Every
+// path that ends a dialogue session goes through here exactly once.
+func (s *dialogueStream) finish() {
+	s.cancel()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.eventsClosed {
+		s.eventsClosed = true
+		close(s.events)
+	}
 }
 
 func (s *dialogueStream) writeJSON(ctx context.Context, value any) error {
@@ -353,12 +522,16 @@ func (s *dialogueStream) writeJSON(ctx context.Context, value any) error {
 	if s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
+	conn, err := s.connection(ctx)
+	if err != nil {
+		return err
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
-	if err := s.conn.Write(ctx, websocket.MessageText, payload); err != nil {
+	if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
 		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue write failed", Retryable: true, Cause: err}
 	}
 	s.lastWrite.Store(time.Now().UnixNano())
@@ -368,7 +541,8 @@ func (s *dialogueStream) writeJSON(ctx context.Context, value any) error {
 // keepAliveLoop holds the socket open between turns. The vendor closes after
 // dialogueIdleTimeout of inactivity and a voice agent idles longer than that
 // waiting on a caller, so without this the SECOND turn of a call dials a dead
-// connection. The frame synthesizes nothing.
+// connection. The frame synthesizes nothing. It skips while a reconnect is in
+// flight: the replacement is fresh and the next write waits for it anyway.
 func (s *dialogueStream) keepAliveLoop() {
 	ticker := time.NewTicker(dialogueKeepAlivePoll)
 	defer ticker.Stop()
@@ -380,7 +554,10 @@ func (s *dialogueStream) keepAliveLoop() {
 			if s.closed.Load() || s.closing.Load() {
 				return
 			}
-			if !keepAliveDue(s.lastWrite.Load(), time.Now()) {
+			s.mu.RLock()
+			live := s.conn != nil
+			s.mu.RUnlock()
+			if !live || !keepAliveDue(s.lastWrite.Load(), time.Now()) {
 				continue
 			}
 			if err := s.writeJSON(s.ctx, map[string]any{"keep_alive": true}); err != nil {
@@ -395,24 +572,39 @@ func keepAliveDue(lastWriteUnixNano int64, now time.Time) bool {
 	return lastWriteUnixNano == 0 || now.Sub(time.Unix(0, lastWriteUnixNano)) >= dialogueKeepAliveTick
 }
 
-func (s *dialogueStream) readLoop() {
-	defer func() { s.cancel(); close(s.events) }()
+// readLoop owns one connection. A reader whose connection a Cancel replaced
+// exits quietly: the replacement's reader owns the session from then on.
+func (s *dialogueStream) readLoop(conn *websocket.Conn, generation uint64) {
 	for {
-		messageType, payload, err := s.conn.Read(s.ctx)
+		messageType, payload, err := conn.Read(s.ctx)
 		if err != nil {
-			if !s.closed.Load() && s.ctx.Err() == nil && !isNormalClose(err) {
-				_ = s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue read failed", Retryable: true, Cause: err}})
+			if !s.current(generation) {
+				return
 			}
+			if !s.closed.Load() && s.ctx.Err() == nil && !isNormalClose(err) {
+				_ = s.emitFrom(generation, runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue read failed", Retryable: true, Cause: err}})
+			}
+			s.finish()
 			return
 		}
 		if messageType != websocket.MessageText {
 			continue
 		}
-		if err := s.handleMessage(payload); err != nil {
-			_ = s.emit(runtimepkg.ProviderEvent{Err: err})
+		if err := s.handleMessage(generation, payload); err != nil {
+			if errors.Is(err, errSuperseded) {
+				return
+			}
+			_ = s.emitFrom(generation, runtimepkg.ProviderEvent{Err: err})
+			s.finish()
 			return
 		}
 	}
+}
+
+func (s *dialogueStream) current(generation uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.generation == generation
 }
 
 // dialogueInbound is the dialogue socket's own frame set. `alignment` is typed
@@ -443,7 +635,7 @@ func (m dialogueInbound) finishesTurn() bool {
 	return m.IsFinalForTurn || m.IsFinal || m.IsFinalCamel
 }
 
-func (s *dialogueStream) handleMessage(payload []byte) error {
+func (s *dialogueStream) handleMessage(generation uint64, payload []byte) error {
 	var message dialogueInbound
 	if err := json.Unmarshal(payload, &message); err != nil {
 		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue sent malformed streaming JSON", Retryable: true, Cause: err}
@@ -464,11 +656,11 @@ func (s *dialogueStream) handleMessage(payload []byte) error {
 			return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs dialogue sent invalid base64 audio", Retryable: true, Cause: err}
 		}
 		if s.audioStarted.CompareAndSwap(false, true) {
-			if err := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: contextData(""), Extensions: extension(raw)}); err != nil {
+			if err := s.emitFrom(generation, runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: contextData(""), Extensions: extension(raw)}); err != nil {
 				return err
 			}
 		}
-		if err := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: contextData(""), Extensions: extension(raw), Audio: audio}); err != nil {
+		if err := s.emitFrom(generation, runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: contextData(""), Extensions: extension(raw), Audio: audio}); err != nil {
 			return err
 		}
 	}
@@ -477,7 +669,7 @@ func (s *dialogueStream) handleMessage(payload []byte) error {
 		// arrays TimingSpansFromMillisecondDurations reads, and inventing spans
 		// from a shape we have not measured is the desync this package's
 		// text-to-speech alignment comment warns about.
-		if err := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAlignment, Data: contextData(""), Extensions: extension(raw)}); err != nil {
+		if err := s.emitFrom(generation, runtimepkg.ProviderEvent{Type: protocol.EventAlignment, Data: contextData(""), Extensions: extension(raw)}); err != nil {
 			return err
 		}
 	}
@@ -490,15 +682,26 @@ func (s *dialogueStream) handleMessage(payload []byte) error {
 		// text-to-speech arm, where Pipecat commits sentence by sentence.
 		s.audioStarted.Store(false)
 		s.committed.Store(false)
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: contextData(""), Extensions: extension(raw)})
+		s.speaking.Store(false)
+		return s.emitFrom(generation, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: contextData(""), Extensions: extension(raw)})
 	}
 	if message.Audio == "" && len(message.Alignment) == 0 {
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"message": "ignored ElevenLabs dialogue message"}), Extensions: extension(raw)})
+		return s.emitFrom(generation, runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"message": "ignored ElevenLabs dialogue message"}), Extensions: extension(raw)})
 	}
 	return nil
 }
 
-func (s *dialogueStream) emit(event runtimepkg.ProviderEvent) error {
+// emitFrom delivers an event from one connection generation, or reports
+// errSuperseded once a Cancel has replaced that connection.
+func (s *dialogueStream) emitFrom(generation uint64, event runtimepkg.ProviderEvent) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.generation != generation {
+		return errSuperseded
+	}
+	if s.eventsClosed {
+		return runtimepkg.ErrSessionClosed
+	}
 	select {
 	case s.events <- event:
 		return nil

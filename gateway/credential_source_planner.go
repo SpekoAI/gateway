@@ -57,3 +57,17 @@ func (p *CredentialSourcePlanner) ExchangeFallbackPlan(ctx context.Context, plan
 	}
 	return planner.ExchangeFallbackPlan(ctx, plan, request, idempotencyKey)
 }
+
+// RefreshCredential re-credentials a live managed attempt. Only the managed
+// planner talks to a control plane that can mint; BYOK credentials are local.
+func (p *CredentialSourcePlanner) RefreshCredential(ctx context.Context, plan protocol.SessionPlan, request controlplane.CredentialRefreshRequest) (protocol.DelegatedCredential, string, error) {
+	planner, err := p.planner(plan.Execution.CredentialSource)
+	if err != nil {
+		return protocol.DelegatedCredential{}, "", err
+	}
+	refresher, ok := planner.(CredentialRefresher)
+	if !ok {
+		return protocol.DelegatedCredential{}, "", errors.New("gateway: planner cannot refresh credentials")
+	}
+	return refresher.RefreshCredential(ctx, plan, request)
+}

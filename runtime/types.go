@@ -76,7 +76,16 @@ type OpenRequest struct {
 	Options  protocol.RequestOptions
 	Media    *protocol.MediaFormat
 	Delivery AudioDeliveryMode
+	// RefreshCredential is passed through to AdapterRequest unchanged.
+	RefreshCredential CredentialRefresher
 }
+
+// CredentialRefresher obtains a fresh delegated credential for the SAME plan
+// attempt: same route, same reservation, no new attempt. It exists for
+// providers whose managed credential is single-use per connection, so an
+// adapter that must redial mid-session (ElevenLabs dialogue after a Cancel)
+// can authenticate the new socket.
+type CredentialRefresher func(context.Context) (protocol.DelegatedCredential, error)
 
 // LocalCredential is a customer-owned provider credential installed in the
 // local runtime. It is deliberately separate from SessionPlan:
@@ -107,6 +116,10 @@ type AdapterRequest struct {
 	// from a buffered upload. Adapters that require real-time pacing use it to
 	// pace only buffered input and avoid adding latency to live streams.
 	Delivery AudioDeliveryMode
+	// RefreshCredential, when non-nil, mints a fresh credential for this
+	// attempt. It is set only for managed provider-direct plans; BYOK and relay
+	// credentials are permanent keys an adapter can simply reuse.
+	RefreshCredential CredentialRefresher
 }
 
 // AudioDeliveryMode describes the cadence of audio supplied to an adapter.
