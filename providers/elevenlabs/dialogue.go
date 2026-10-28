@@ -63,6 +63,11 @@ const (
 	// frame that races the server's own timer buys nothing.
 	dialogueIdleTimeout   = 20 * time.Second
 	dialogueKeepAliveTick = 12 * time.Second
+	// dialogueKeepAlivePoll is how often the loop checks for idleness. Ticking
+	// at dialogueKeepAliveTick itself and skipping recent writes let the gap
+	// reach almost twice the tick (a write just after one tick skips the
+	// next), past the vendor's window; polling bounds it at tick + poll.
+	dialogueKeepAlivePoll = 2 * time.Second
 )
 
 // dialogueModelPrefixes are the model families the dialogue socket serves and
@@ -365,7 +370,7 @@ func (s *dialogueStream) writeJSON(ctx context.Context, value any) error {
 // waiting on a caller, so without this the SECOND turn of a call dials a dead
 // connection. The frame synthesizes nothing.
 func (s *dialogueStream) keepAliveLoop() {
-	ticker := time.NewTicker(dialogueKeepAliveTick)
+	ticker := time.NewTicker(dialogueKeepAlivePoll)
 	defer ticker.Stop()
 	for {
 		select {
@@ -375,8 +380,7 @@ func (s *dialogueStream) keepAliveLoop() {
 			if s.closed.Load() || s.closing.Load() {
 				return
 			}
-			last := s.lastWrite.Load()
-			if last != 0 && time.Since(time.Unix(0, last)) < dialogueKeepAliveTick {
+			if !keepAliveDue(s.lastWrite.Load(), time.Now()) {
 				continue
 			}
 			if err := s.writeJSON(s.ctx, map[string]any{"keep_alive": true}); err != nil {
@@ -384,6 +388,11 @@ func (s *dialogueStream) keepAliveLoop() {
 			}
 		}
 	}
+}
+
+// keepAliveDue reports whether the socket has been quiet for a full tick.
+func keepAliveDue(lastWriteUnixNano int64, now time.Time) bool {
+	return lastWriteUnixNano == 0 || now.Sub(time.Unix(0, lastWriteUnixNano)) >= dialogueKeepAliveTick
 }
 
 func (s *dialogueStream) readLoop() {
@@ -473,6 +482,14 @@ func (s *dialogueStream) handleMessage(payload []byte) error {
 		}
 	}
 	if message.finishesTurn() {
+		// The turn is over, so the session takes the next one: the socket
+		// accepts another inputs+flush round on the same connection (verified
+		// live 2026-10-28 for eleven_v4_turbo and eleven_v3_conversational).
+		// Reset BEFORE emitting, so a caller that appends as soon as it sees
+		// audio.done is not refused. This mirrors finishContext on the
+		// text-to-speech arm, where Pipecat commits sentence by sentence.
+		s.audioStarted.Store(false)
+		s.committed.Store(false)
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: contextData(""), Extensions: extension(raw)})
 	}
 	if message.Audio == "" && len(message.Alignment) == 0 {

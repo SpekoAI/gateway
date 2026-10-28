@@ -217,8 +217,14 @@ func TestDialogueAdapterKeepsTheSocketAliveWhileIdle(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("no keep-alive reached the server")
 	}
-	if dialogueKeepAliveTick >= dialogueIdleTimeout {
-		t.Fatalf("keep-alive tick %v does not fit inside the vendor's %v idle window", dialogueKeepAliveTick, dialogueIdleTimeout)
+	// The longest silence the loop allows is a full tick plus one poll: a write
+	// just after a poll is not idle for a whole tick until up to one poll later.
+	if dialogueKeepAliveTick+dialogueKeepAlivePoll >= dialogueIdleTimeout {
+		t.Fatalf("keep-alive tick %v + poll %v does not fit inside the vendor's %v idle window", dialogueKeepAliveTick, dialogueKeepAlivePoll, dialogueIdleTimeout)
+	}
+	now := time.Now()
+	if keepAliveDue(now.Add(-dialogueKeepAliveTick+time.Millisecond).UnixNano(), now) || !keepAliveDue(now.Add(-dialogueKeepAliveTick).UnixNano(), now) {
+		t.Fatal("keep-alive is not due exactly once the socket has been quiet for a full tick")
 	}
 	if err := stream.Close(context.Background()); err != nil {
 		t.Fatalf("close: %v", err)
@@ -421,6 +427,69 @@ func TestDialogueAdapterRequiresAVoice(t *testing.T) {
 	request.Options.Voice = "   "
 	if _, err := adapter.Open(context.Background(), request); err == nil || !strings.Contains(err.Error(), "voice id") {
 		t.Fatalf("open without a voice: %v", err)
+	}
+}
+
+// Pipecat keeps one Gateway session for a bot turn and commits sentence by
+// sentence, waiting for audio.done between them. The dialogue socket takes
+// another inputs+flush round on the same connection, so the session must too:
+// it used to refuse every append after the first commit.
+func TestDialogueAdapterSpeaksSuccessiveCommitsOnOneSession(t *testing.T) {
+	t.Parallel()
+	server := newDialogueServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if _, err := readDialogueMessage(ctx, conn); err != nil {
+			t.Errorf("read handshake: %v", err)
+			return
+		}
+		for turn := 0; turn < 2; turn++ {
+			input, err := readDialogueMessage(ctx, conn)
+			if err != nil || len(input.Inputs) != 1 {
+				t.Errorf("turn %d input = %+v, err=%v", turn, input, err)
+				return
+			}
+			flush, err := readDialogueMessage(ctx, conn)
+			if err != nil || !flush.Flush {
+				t.Errorf("turn %d flush = %+v, err=%v", turn, flush, err)
+				return
+			}
+			if err := writeServerJSON(ctx, conn, map[string]any{"audio": base64.StdEncoding.EncodeToString([]byte{byte(turn)})}); err != nil {
+				t.Errorf("write audio: %v", err)
+				return
+			}
+			if err := writeServerJSON(ctx, conn, map[string]any{"is_final_audio_for_turn": true}); err != nil {
+				t.Errorf("write final: %v", err)
+				return
+			}
+		}
+		if message, err := readDialogueMessage(ctx, conn); err != nil || !message.CloseSocket {
+			t.Errorf("close socket = %+v, err=%v", message, err)
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	adapter, err := NewDialogue(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new dialogue adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), dialogueRequest(server.URL, "eleven_v4_turbo"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for turn, sentence := range []string{"First sentence.", "Second sentence."} {
+		if err := stream.AppendText(context.Background(), sentence); err != nil {
+			t.Fatalf("turn %d append: %v", turn, err)
+		}
+		if err := stream.CommitText(context.Background()); err != nil {
+			t.Fatalf("turn %d commit: %v", turn, err)
+		}
+		events := collectEvents(t, stream.Events(), 3)
+		if got := eventTypes(events); strings.Join(got, ",") != "audio.started,audio.frame,audio.done" {
+			t.Fatalf("turn %d event types = %v", turn, got)
+		}
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }
 
