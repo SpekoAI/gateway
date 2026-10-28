@@ -749,6 +749,14 @@ func TestDialogueAdapterIgnoresItemsFromAReplacedConnection(t *testing.T) {
 	if len(events) != 2 || events[0].Type != protocol.EventAudioStarted {
 		t.Fatalf("current-generation audio = %v, want audio.started then the frame", eventTypes(events))
 	}
+	// Once the pump has accepted an ending, the stream is over: a Cancel can
+	// no longer replace the connection and carry that ending onto a fresh one.
+	if _, _, terminal := stream.apply(dialogueItem{generation: 1, err: errors.New("current socket failed")}); !terminal {
+		t.Fatal("current-generation failure did not end the stream")
+	}
+	if err := stream.Cancel(context.Background()); !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		t.Fatalf("cancel after the stream ended = %v, want ErrSessionClosed", err)
+	}
 }
 
 // A Cancel with nothing in flight has nothing to stop, so it keeps the socket

@@ -331,6 +331,10 @@ type dialogueStream struct {
 	superseded   chan struct{} // closed when Cancel replaces this generation
 	reconnected  chan struct{} // closed when the in-flight reconnect settles
 	reconnectErr error
+	// ended is set, under mu, when the pump accepts an item that ends the
+	// stream. Cancel refuses from then on, so the end belongs to the
+	// connection that produced it and can never take down a replacement.
+	ended        bool
 	audioStarted bool
 	// speaking is set by the first append of a turn and cleared when the turn
 	// finishes or is cancelled: a Cancel with nothing in flight has nothing to
@@ -408,15 +412,19 @@ func (s *dialogueStream) CommitText(ctx context.Context) error {
 // the turn instead would hold the next utterance until the vendor finished
 // generating the cancelled one (measured ~3.7s for 450 characters) and bill it.
 //
-// One frame the pump was already sending when Cancel landed can still reach
-// the session after Cancel returns (the text-to-speech arm has the same window
-// between reading a frame and closing its context). It always precedes the
-// replacement's first event: the pump sends in order.
+// The events of one vendor frame the pump had already applied when Cancel
+// landed can still reach the session after Cancel returns (the text-to-speech
+// arm has the same window between reading a frame and closing its context).
+// They always precede the replacement's first event: the pump sends in order.
 func (s *dialogueStream) Cancel(context.Context) error {
 	if s.closed.Load() || s.closing.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
 	s.mu.Lock()
+	if s.ended {
+		s.mu.Unlock()
+		return runtimepkg.ErrSessionClosed
+	}
 	if !s.speaking {
 		s.mu.Unlock()
 		return nil
@@ -663,27 +671,32 @@ func (s *dialogueStream) pump() {
 }
 
 // apply turns one item into events, under the lock, if and only if it comes
-// from the current generation. A stale item changes nothing.
+// from the current generation. A stale item changes nothing. Accepting an item
+// that ends the stream marks it ended in the same critical section, so a
+// Cancel cannot slip in between and have that end land on its replacement.
 func (s *dialogueStream) apply(item dialogueItem) ([]runtimepkg.ProviderEvent, chan struct{}, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if item.generation != s.generation {
+	if item.generation != s.generation || s.ended {
 		return nil, nil, false
 	}
+	var events []runtimepkg.ProviderEvent
 	switch {
 	case item.ended:
-		return nil, s.superseded, true
 	case item.err != nil:
-		if s.closed.Load() {
-			return nil, s.superseded, true
+		if !s.closed.Load() {
+			events = []runtimepkg.ProviderEvent{{Err: item.err}}
 		}
-		return []runtimepkg.ProviderEvent{{Err: item.err}}, s.superseded, true
+	default:
+		var err error
+		events, err = s.handleMessage(item.payload)
+		if err == nil {
+			return events, s.superseded, false
+		}
+		events = append(events, runtimepkg.ProviderEvent{Err: err})
 	}
-	events, err := s.handleMessage(item.payload)
-	if err != nil {
-		return append(events, runtimepkg.ProviderEvent{Err: err}), s.superseded, true
-	}
-	return events, s.superseded, false
+	s.ended = true
+	return events, s.superseded, true
 }
 
 // dialogueInbound is the dialogue socket's own frame set. `alignment` is typed
