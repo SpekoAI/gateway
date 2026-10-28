@@ -150,7 +150,7 @@ func TestDialogueSocketServesV4Family(t *testing.T) {
 	}
 	media := protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1}
 	for _, model := range []string{"eleven_v4", "eleven_v4_turbo"} {
-		raw, err := dialogueSocket(adapter.endpointPolicy, "wss://api.elevenlabs.io"+dialogueEndpoint, model, media)
+		raw, err := dialogueSocket(adapter.endpointPolicy, "wss://api.elevenlabs.io"+dialogueEndpoint, model, media, "")
 		if err != nil {
 			t.Fatalf("%s: %v", model, err)
 		}
@@ -421,6 +421,62 @@ func TestDialogueAdapterRequiresAVoice(t *testing.T) {
 	request.Options.Voice = "   "
 	if _, err := adapter.Open(context.Background(), request); err == nil || !strings.Contains(err.Error(), "voice id") {
 		t.Fatalf("open without a voice: %v", err)
+	}
+}
+
+// A managed provider-direct plan carries a control-plane-minted single-use
+// token. The vendor accepts it only as the `single_use_token` query parameter
+// (the header answers 1008 "Invalid API key"), so it must never reach the header
+// or the handshake frame, while a relay plan's permanent connector key keeps the
+// header channel.
+func TestDialogueAdapterSendsManagedTokensOnTheQueryOnly(t *testing.T) {
+	t.Parallel()
+	for _, route := range []protocol.ProviderRoute{protocol.RouteProviderDirect, protocol.RouteSpekoRelay} {
+		t.Run(string(route), func(t *testing.T) {
+			t.Parallel()
+			type observed struct {
+				request   *http.Request
+				handshake dialogueClientMessage
+			}
+			seen := make(chan observed, 1)
+			server := newDialogueServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+				handshake, err := readDialogueMessage(ctx, conn)
+				if err != nil {
+					t.Errorf("read handshake: %v", err)
+					return
+				}
+				seen <- observed{request: request.Clone(request.Context()), handshake: handshake}
+				_ = conn.Close(websocket.StatusNormalClosure, "")
+			})
+			defer server.Close()
+
+			adapter, err := NewDialogue(testConfig(server.URL))
+			if err != nil {
+				t.Fatalf("new dialogue adapter: %v", err)
+			}
+			request := dialogueRequest(server.URL, "eleven_v4_turbo")
+			request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+			request.Plan.Execution.ProviderRoute = route
+			request.Plan.Route.Credential.Value = "temporary-elevenlabs-token"
+			stream, err := adapter.Open(context.Background(), request)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			defer stream.Close(context.Background())
+
+			got := <-seen
+			token := got.request.URL.Query().Get("single_use_token")
+			header := got.request.Header.Get("xi-api-key")
+			if route == protocol.RouteProviderDirect {
+				if token != "temporary-elevenlabs-token" || header != "" || got.handshake.APIKey != "" {
+					t.Fatalf("provider-direct token=%q header=%q frame=%q", token, header, got.handshake.APIKey)
+				}
+				return
+			}
+			if token != "" || header != "temporary-elevenlabs-token" || got.handshake.APIKey != "temporary-elevenlabs-token" {
+				t.Fatalf("relay token=%q header=%q frame=%q", token, header, got.handshake.APIKey)
+			}
+		})
 	}
 }
 

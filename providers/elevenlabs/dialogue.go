@@ -140,17 +140,24 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media)
+	// Same rule as the text-to-speech arm: a BYOK key and the relay's permanent
+	// connector key both ride the header, and a control-plane-minted
+	// provider-direct token rides the `single_use_token` query parameter. The
+	// vendor refuses a token in the header (1008 "Invalid API key", verified
+	// live 2026-10-28), and only a `ttd_websocket` token opens this socket: a
+	// `tts_websocket` one is refused as "Token type mismatch".
+	singleUseToken := ""
+	if request.Plan.Execution.CredentialSource == protocol.CredentialsManaged && request.Plan.Execution.ProviderRoute != protocol.RouteSpekoRelay {
+		singleUseToken = credential.Value
+	}
+	endpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media, singleUseToken)
 	if err != nil {
 		return nil, err
 	}
 	headers := make(http.Header)
-	// Same rule as the text-to-speech arm: a BYOK key and the relay's permanent
-	// connector key both ride the header, and only a control-plane-minted
-	// provider-direct token would ever ride the query string. The handshake
-	// frame below carries the key too, because the dialogue socket documents
-	// `xi_api_key` there; sending both is what the vendor's own sample does.
-	headers.Set("xi-api-key", credential.Value)
+	if singleUseToken == "" {
+		headers.Set("xi-api-key", credential.Value)
+	}
 	client := a.httpClient
 	if client == nil {
 		client = http.DefaultClient
@@ -170,7 +177,13 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 	// so it is written synchronously on the caller's context: a session that
 	// cannot register a voice has not started, and reporting that as a dial
 	// failure is more useful than surfacing it later as a read error.
-	handshake := map[string]any{"voices": []string{voiceID}, "xi_api_key": credential.Value}
+	// The handshake frame carries a permanent key too, because the dialogue
+	// socket documents `xi_api_key` there and the vendor's own sample sends
+	// both. A single-use token stays in the query alone.
+	handshake := map[string]any{"voices": []string{voiceID}}
+	if singleUseToken == "" {
+		handshake["xi_api_key"] = credential.Value
+	}
 	// The dialogue socket takes voice_settings once, in the handshake, for
 	// the whole connection; ttsVoiceSettings has already narrowed it to
 	// stability.
@@ -189,7 +202,7 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 // dialogueSocket validates the route and builds the socket URL. The path is
 // fixed — unlike the text-to-speech socket there is no voice segment to append,
 // because the voice is registered in the handshake instead.
-func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model string, media protocol.MediaFormat) (string, error) {
+func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model string, media protocol.MediaFormat, singleUseToken string) (string, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
 		return "", fmt.Errorf("elevenlabs dialogue endpoint: %w", err)
@@ -218,6 +231,9 @@ func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	query := endpoint.Query()
 	query.Set("model_id", model)
 	query.Set("output_format", "pcm_"+strconv.Itoa(media.SampleRateHz))
+	if singleUseToken != "" {
+		query.Set("single_use_token", singleUseToken)
+	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil
 }
