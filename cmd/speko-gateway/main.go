@@ -141,6 +141,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// eleven_v3* and eleven_v4* stream only on the text-to-dialogue socket; the
+	// control plane plans them onto this adapter when the runtime advertises it.
+	elevenLabsDialogueAdapter, err := elevenlabs.NewDialogue(elevenlabs.Config{})
+	if err != nil {
+		return err
+	}
 	elevenLabsSTTAdapter, err := elevenlabs.NewSTT(elevenlabs.STTConfig{})
 	if err != nil {
 		return err
@@ -324,7 +330,7 @@ func run() error {
 		return err
 	}
 	adapters := []runtimepkg.Adapter{
-		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsSTTAdapter,
+		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsDialogueAdapter, elevenLabsSTTAdapter,
 		fishAdapter,
 		cartesiaAdapter, cartesiaSTTAdapter, assemblyAIAdapter, modulateAdapter, gladiaAdapter,
 		inworldAdapter, minimaxAdapter, xaiAdapter,

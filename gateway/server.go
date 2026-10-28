@@ -52,6 +52,13 @@ type PlanClient interface {
 	ExchangeFallbackPlan(context.Context, protocol.SessionPlan, controlplane.FallbackRequest, string) (protocol.SessionPlan, string, error)
 }
 
+// CredentialRefresher is an optional PlanClient capability: re-credential a
+// live managed attempt so an adapter whose provider credential is single-use
+// per connection can redial mid-session. The hosted client implements it.
+type CredentialRefresher interface {
+	RefreshCredential(context.Context, protocol.SessionPlan, controlplane.CredentialRefreshRequest) (protocol.DelegatedCredential, string, error)
+}
+
 // Config builds a local gateway service. LocalAuthToken is mandatory even for
 // a Unix socket: a mounted socket can otherwise be reached by another process
 // in the same host or container namespace.
@@ -659,7 +666,14 @@ func (s *Server) openSession(ctx context.Context, body CreateSessionRequest, pla
 			return nil, err
 		}
 	}
-	return s.engine.Open(ctx, runtimepkg.OpenRequest{Kind: body.Kind, Plan: plan, Options: body.Request, Media: body.Media})
+	open := runtimepkg.OpenRequest{Kind: body.Kind, Plan: plan, Options: body.Request, Media: body.Media}
+	if refresher, ok := s.plans.(CredentialRefresher); ok && plan.Execution.CredentialSource == protocol.CredentialsManaged && plan.Execution.ProviderRoute == protocol.RouteProviderDirect {
+		open.RefreshCredential = func(ctx context.Context) (protocol.DelegatedCredential, error) {
+			credential, _, err := refresher.RefreshCredential(ctx, plan, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"})
+			return credential, err
+		}
+	}
+	return s.engine.Open(ctx, open)
 }
 
 func (s *Server) streamSession(writer http.ResponseWriter, request *http.Request) {

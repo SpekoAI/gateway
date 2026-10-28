@@ -6,6 +6,8 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -179,6 +181,43 @@ func (c *Client) ExchangeFallbackPlan(ctx context.Context, current protocol.Sess
 		return protocol.SessionPlan{}, requestID, err
 	}
 	return plan, requestID, nil
+}
+
+// CredentialRefreshRequest asks the control plane to re-credential a live
+// attempt. Reason is audit metadata only.
+type CredentialRefreshRequest struct {
+	Reason string `json:"reason"`
+}
+
+// RefreshCredential obtains a freshly minted provider credential for the
+// plan's own attempt: same route, same reservation, no new attempt or plan. It
+// exists for managed providers whose credential is single-use per connection
+// (ElevenLabs text-to-dialogue), so an adapter that must redial mid-session
+// can authenticate the new socket. The control plane caps it per attempt.
+func (c *Client) RefreshCredential(ctx context.Context, plan protocol.SessionPlan, request CredentialRefreshRequest) (protocol.DelegatedCredential, string, error) {
+	if plan.Execution.CredentialSource != protocol.CredentialsManaged || plan.Execution.ProviderRoute != protocol.RouteProviderDirect {
+		return protocol.DelegatedCredential{}, "", errors.New("controlplane: only managed provider-direct attempts can refresh a credential")
+	}
+	if strings.TrimSpace(plan.SessionID) == "" || strings.TrimSpace(plan.AttemptID) == "" || strings.TrimSpace(request.Reason) == "" {
+		return protocol.DelegatedCredential{}, "", errors.New("controlplane: credential refresh needs a session, an attempt, and a reason")
+	}
+	nonce := make([]byte, 12)
+	if _, err := rand.Read(nonce); err != nil {
+		return protocol.DelegatedCredential{}, "", fmt.Errorf("controlplane: credential refresh key: %w", err)
+	}
+	// Every refresh is a new mint (a single-use token cannot be replayed), so
+	// the key only correlates this one request.
+	idempotencyKey := "credential:" + plan.AttemptID + ":" + hex.EncodeToString(nonce)
+	endpoint := c.resolve("/v1/sessions/" + url.PathEscape(plan.SessionID) + "/attempts/" + url.PathEscape(plan.AttemptID) + "/credentials")
+	var credential protocol.DelegatedCredential
+	requestID, err := c.postJSON(ctx, endpoint, request, idempotencyKey, &credential)
+	if err != nil {
+		return protocol.DelegatedCredential{}, requestID, err
+	}
+	if strings.TrimSpace(credential.Value) == "" || credential.Kind == "" {
+		return protocol.DelegatedCredential{}, requestID, errors.New("controlplane: credential refresh response contained no credential")
+	}
+	return credential, requestID, nil
 }
 
 func (c *Client) postPlan(ctx context.Context, endpoint *url.URL, value any, idempotencyKey string, target *protocol.SessionPlan) (string, error) {

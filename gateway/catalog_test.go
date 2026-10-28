@@ -142,9 +142,16 @@ func TestModelsFiltersByKindAndProvider(t *testing.T) {
 			t.Fatalf("kind=tts returned %s", model.Kind)
 		}
 	}
+	// One STT row, flash on the text-to-speech socket, and the four v3/v4
+	// models on the text-to-dialogue socket, which is the only one serving them.
 	elevenlabs := fetchCatalog(t, "/v1/models?provider=elevenlabs")
-	if len(elevenlabs.Models) != 2 {
-		t.Fatalf("provider=elevenlabs returned %d rows, want stt and tts", len(elevenlabs.Models))
+	adapters := make(map[string]string, len(elevenlabs.Models))
+	for _, model := range elevenlabs.Models {
+		adapters[model.ID] = model.Adapter
+	}
+	if len(elevenlabs.Models) != 6 || adapters["elevenlabs:eleven_flash_v2_5"] != "elevenlabs.tts.v1" ||
+		adapters["elevenlabs:eleven_v4_turbo"] != "elevenlabs.dialogue.v1" || adapters["elevenlabs:eleven_v3_conversational"] != "elevenlabs.dialogue.v1" {
+		t.Fatalf("provider=elevenlabs returned %v", adapters)
 	}
 	// AssemblyAI serves two published Universal Pro models on one adapter;
 	// both must be discoverable, with the default still resolving to 3.5 Pro.

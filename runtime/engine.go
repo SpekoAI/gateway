@@ -137,7 +137,7 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if strings.TrimSpace(adapterOptions.Voice) == "" && (!languageVoice || strings.TrimSpace(adapterOptions.Language) == "") {
 		adapterOptions.Voice = adapterPlan.Route.Voice
 	}
-	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery})
+	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential})
 	if err != nil {
 		cancel()
 		e.recordOpenFailure(request, err)

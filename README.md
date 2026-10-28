@@ -297,6 +297,7 @@ restarting the Gateway.
 | TTS | Deepgram | `deepgram.tts.v1` | `flux-haley-en` |
 | STT | ElevenLabs | `elevenlabs.stt.v1` | `scribe_v2_realtime` |
 | TTS | ElevenLabs | `elevenlabs.tts.v1` | `eleven_flash_v2_5` |
+| TTS | ElevenLabs (v3/v4) | `elevenlabs.dialogue.v1` | `eleven_v4_turbo` |
 | STT | Cartesia | `cartesia.stt.v1` | `ink-2` |
 | TTS | Cartesia | `cartesia.tts.v1` | `sonic-3` |
 | STT | AssemblyAI | `assemblyai.stt.v1` | `universal-3-5-pro` |

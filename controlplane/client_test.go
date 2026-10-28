@@ -202,3 +202,47 @@ func validPlan() protocol.SessionPlan {
 		Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: "test"},
 	}
 }
+
+func TestRefreshCredentialMintsForTheSameAttempt(t *testing.T) {
+	t.Parallel()
+	plan := validPlan()
+	plan.Execution.CredentialSource = protocol.CredentialsManaged
+	var calls atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		if request.Method != http.MethodPost || request.URL.Path != "/v1/sessions/session-test/attempts/attempt-test/credentials" {
+			t.Errorf("request = %s %s", request.Method, request.URL.Path)
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer sk_speko_test" {
+			t.Errorf("Authorization = %q", got)
+		}
+		var body controlplane.CredentialRefreshRequest
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.Reason != "provider_reconnect" {
+			t.Errorf("refresh body = %+v, %v", body, err)
+		}
+		writer.Header().Set("X-Request-ID", "cp_refresh_1")
+		_ = json.NewEncoder(writer).Encode(protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "fresh-token", ExpiresAt: time.Now().Add(time.Minute)})
+	}))
+	t.Cleanup(server.Close)
+	client := newClient(t, server, "sk_speko_test")
+
+	credential, requestID, err := client.RefreshCredential(context.Background(), plan, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"})
+	if err != nil || credential.Value != "fresh-token" || requestID != "cp_refresh_1" {
+		t.Fatalf("refresh = %+v, %q, %v", credential, requestID, err)
+	}
+	// Only managed provider-direct attempts have a control-plane credential to
+	// refresh: a BYOK key is local, a relay key belongs to the relay.
+	for _, execution := range []protocol.Execution{
+		{Placement: protocol.PlacementEmbedded, ProviderRoute: protocol.RouteProviderDirect, CredentialSource: protocol.CredentialsBYOK},
+		{Placement: protocol.PlacementEmbedded, ProviderRoute: protocol.RouteSpekoRelay, CredentialSource: protocol.CredentialsManaged},
+	} {
+		other := plan
+		other.Execution = execution
+		if _, _, err := client.RefreshCredential(context.Background(), other, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"}); err == nil {
+			t.Fatalf("refresh allowed for %+v", execution)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("control-plane calls = %d, want 1", calls.Load())
+	}
+}

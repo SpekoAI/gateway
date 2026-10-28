@@ -71,6 +71,10 @@ var providerCatalog = []CatalogEntry{
 	// over /v1/speech-to-text/realtime.
 	{Provider: "elevenlabs", Kind: protocol.SessionKindSTT, Adapter: "elevenlabs.stt.v1", DefaultModel: "scribe_v2_realtime", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/speech-to-text/realtime"},
 	{Provider: "elevenlabs", Kind: protocol.SessionKindTTS, Adapter: "elevenlabs.tts.v1", DefaultModel: "eleven_flash_v2_5", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/text-to-speech"},
+	// v3/v4 stream only on the text-to-dialogue socket, a separate adapter. The
+	// row sits after the text-to-speech one so a bare or `auto` model keeps
+	// resolving to flash; only these model ids select it.
+	{Provider: "elevenlabs", Kind: protocol.SessionKindTTS, Adapter: "elevenlabs.dialogue.v1", DefaultModel: "eleven_v4_turbo", Models: []string{"eleven_v4_turbo", "eleven_v4", "eleven_v3_conversational", "eleven_v3"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/text-to-dialogue/stream-input"},
 	{Provider: "cartesia", Kind: protocol.SessionKindSTT, Adapter: "cartesia.stt.v1", DefaultModel: "ink-2", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/stt/websocket"},
 	{Provider: "cartesia", Kind: protocol.SessionKindTTS, Adapter: "cartesia.tts.v1", DefaultModel: "sonic-3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket"},
 	// universal-3-6-pro (2026-09-29) shares the socket and parameters and is
