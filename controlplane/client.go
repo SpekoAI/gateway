@@ -15,11 +15,22 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/SpekoAI/gateway/protocol"
 )
 
 const maxResponseBytes = 1 << 20
+
+// The control plane writes an issued plan to its database a moment after
+// returning it, so a refresh in the first instants of a session can arrive
+// before the row and be told `plan_not_recorded`. That, and a 503, are worth
+// another try within this budget; every other refusal is final.
+const (
+	credentialRefreshFirstRetry  = 100 * time.Millisecond
+	credentialRefreshMaxRetry    = time.Second
+	credentialRefreshRetryBudget = 5 * time.Second
+)
 
 // Config configures an authenticated control-plane client. The Speko API key
 // authenticates setup calls and is never sent to an upstream model provider.
@@ -201,14 +212,35 @@ func (c *Client) RefreshCredential(ctx context.Context, plan protocol.SessionPla
 	if strings.TrimSpace(plan.SessionID) == "" || strings.TrimSpace(plan.AttemptID) == "" || strings.TrimSpace(request.Reason) == "" {
 		return protocol.DelegatedCredential{}, "", errors.New("controlplane: credential refresh needs a session, an attempt, and a reason")
 	}
+	endpoint := c.resolve("/v1/sessions/" + url.PathEscape(plan.SessionID) + "/attempts/" + url.PathEscape(plan.AttemptID) + "/credentials")
+	// The budget bounds the requests too, not only the waits between them: a
+	// stalled retry must not eat the caller's whole reconnect window.
+	ctx, cancel := context.WithTimeout(ctx, credentialRefreshRetryBudget)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	for delay := credentialRefreshFirstRetry; ; delay = min(2*delay, credentialRefreshMaxRetry) {
+		credential, requestID, err := c.refreshCredentialOnce(ctx, endpoint, plan.AttemptID, request)
+		if err == nil || !credentialRefreshRetryable(err) || time.Now().Add(delay).After(deadline) {
+			return credential, requestID, err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return protocol.DelegatedCredential{}, requestID, err
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *Client) refreshCredentialOnce(ctx context.Context, endpoint *url.URL, attemptID string, request CredentialRefreshRequest) (protocol.DelegatedCredential, string, error) {
 	nonce := make([]byte, 12)
 	if _, err := rand.Read(nonce); err != nil {
 		return protocol.DelegatedCredential{}, "", fmt.Errorf("controlplane: credential refresh key: %w", err)
 	}
 	// Every refresh is a new mint (a single-use token cannot be replayed), so
 	// the key only correlates this one request.
-	idempotencyKey := "credential:" + plan.AttemptID + ":" + hex.EncodeToString(nonce)
-	endpoint := c.resolve("/v1/sessions/" + url.PathEscape(plan.SessionID) + "/attempts/" + url.PathEscape(plan.AttemptID) + "/credentials")
+	idempotencyKey := "credential:" + attemptID + ":" + hex.EncodeToString(nonce)
 	var credential protocol.DelegatedCredential
 	requestID, err := c.postJSON(ctx, endpoint, request, idempotencyKey, &credential)
 	if err != nil {
@@ -218,6 +250,14 @@ func (c *Client) RefreshCredential(ctx context.Context, plan protocol.SessionPla
 		return protocol.DelegatedCredential{}, requestID, errors.New("controlplane: credential refresh response contained no credential")
 	}
 	return credential, requestID, nil
+}
+
+func credentialRefreshRetryable(err error) bool {
+	var failure *HTTPError
+	if !errors.As(err, &failure) {
+		return false
+	}
+	return failure.Code == "plan_not_recorded" || failure.Status == http.StatusServiceUnavailable
 }
 
 func (c *Client) postPlan(ctx context.Context, endpoint *url.URL, value any, idempotencyKey string, target *protocol.SessionPlan) (string, error) {

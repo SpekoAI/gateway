@@ -3,6 +3,8 @@ package controlplane_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -244,5 +246,104 @@ func TestRefreshCredentialMintsForTheSameAttempt(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("control-plane calls = %d, want 1", calls.Load())
+	}
+}
+
+// The control plane records an issued plan a moment after returning it, so a
+// Cancel in the first instants of a session can ask for a credential before
+// the plan row exists (Pullfrog review of runtime#341, 2026-10-28). That
+// answer is retried; a real refusal is not.
+func TestRefreshCredentialRetriesAPlanNotYetRecorded(t *testing.T) {
+	t.Parallel()
+	plan := validPlan()
+	plan.Execution.CredentialSource = protocol.CredentialsManaged
+	refuse := func(writer http.ResponseWriter, status int, code string) {
+		writer.WriteHeader(status)
+		_, _ = fmt.Fprintf(writer, `{"error":{"code":%q}}`, code)
+	}
+	var calls atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch calls.Add(1) {
+		case 1, 2:
+			refuse(writer, http.StatusConflict, "plan_not_recorded")
+		case 3:
+			refuse(writer, http.StatusServiceUnavailable, "service_unavailable")
+		default:
+			_ = json.NewEncoder(writer).Encode(protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "fresh-token", ExpiresAt: time.Now().Add(time.Minute)})
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := newClient(t, server, "sk_speko_test")
+	credential, _, err := client.RefreshCredential(context.Background(), plan, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"})
+	if err != nil || credential.Value != "fresh-token" || calls.Load() != 4 {
+		t.Fatalf("refresh = %+v, %v after %d calls", credential, err, calls.Load())
+	}
+
+	for _, refusal := range []struct {
+		status int
+		code   string
+	}{{http.StatusUnprocessableEntity, "no_eligible_route"}, {http.StatusTooManyRequests, "credential_reissue_limit"}, {http.StatusConflict, "idempotency_conflict"}} {
+		var refused atomic.Int32
+		final := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			refused.Add(1)
+			refuse(writer, refusal.status, refusal.code)
+		}))
+		_, _, err := newClient(t, final, "sk_speko_test").RefreshCredential(context.Background(), plan, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"})
+		final.Close()
+		var failure *controlplane.HTTPError
+		if !errors.As(err, &failure) || failure.Code != refusal.code || refused.Load() != 1 {
+			t.Fatalf("%s: err = %v after %d calls, want one call", refusal.code, err, refused.Load())
+		}
+	}
+}
+
+func TestRefreshCredentialStopsRetryingWhenTheCallerGivesUp(t *testing.T) {
+	t.Parallel()
+	plan := validPlan()
+	plan.Execution.CredentialSource = protocol.CredentialsManaged
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusConflict)
+		_, _ = writer.Write([]byte(`{"error":{"code":"plan_not_recorded"}}`))
+	}))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, _, err := newClient(t, server, "sk_speko_test").RefreshCredential(ctx, plan, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"})
+	var failure *controlplane.HTTPError
+	if !errors.As(err, &failure) || failure.Code != "plan_not_recorded" {
+		t.Fatalf("err = %v, want the last refusal", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("refresh kept retrying %v past its caller's deadline", elapsed)
+	}
+}
+
+func TestRefreshCredentialBoundsAStalledRetry(t *testing.T) {
+	t.Parallel()
+	plan := validPlan()
+	plan.Execution.CredentialSource = protocol.CredentialsManaged
+	var calls atomic.Int32
+	release := make(chan struct{})
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if calls.Add(1) == 1 {
+			writer.WriteHeader(http.StatusConflict)
+			_, _ = writer.Write([]byte(`{"error":{"code":"plan_not_recorded"}}`))
+			return
+		}
+		select {
+		case <-request.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) }) // runs first: Close waits on handlers
+	started := time.Now()
+	_, _, err := newClient(t, server, "sk_speko_test").RefreshCredential(context.Background(), plan, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"})
+	if err == nil {
+		t.Fatal("a refresh whose retry never answered succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > 7*time.Second {
+		t.Fatalf("a stalled retry held the refresh for %v, past its 5s budget", elapsed)
 	}
 }
