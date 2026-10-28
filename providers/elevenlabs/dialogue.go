@@ -655,19 +655,33 @@ func (s *dialogueStream) pump() {
 		case item = <-s.inbox:
 		}
 		events, superseded, terminal := s.apply(item)
-		for _, event := range events {
-			select {
-			case s.events <- event:
-			case <-superseded:
-				// Cancel replaced this generation mid-item: drop the rest.
-			case <-s.ctx.Done():
-				return
-			}
-		}
-		if terminal {
+		if !s.publish(events, superseded) || terminal {
 			return
 		}
 	}
+}
+
+// publish sends one applied item's events in order. Once Cancel has replaced
+// the item's generation, the rest of the item is dropped: each send first
+// checks for that, because a select with a waiting consumer and a closed
+// `superseded` picks either case at random. It reports false once the stream
+// is done.
+func (s *dialogueStream) publish(events []runtimepkg.ProviderEvent, superseded <-chan struct{}) bool {
+	for _, event := range events {
+		select {
+		case <-superseded:
+			return true
+		default:
+		}
+		select {
+		case s.events <- event:
+		case <-superseded:
+			return true
+		case <-s.ctx.Done():
+			return false
+		}
+	}
+	return true
 }
 
 // apply turns one item into events, under the lock, if and only if it comes

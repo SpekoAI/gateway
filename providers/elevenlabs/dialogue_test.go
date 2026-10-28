@@ -977,3 +977,42 @@ func dialogueRequest(serverURL, model string) runtimepkg.AdapterRequest {
 	request.Plan.Route.Adapter = DialogueAdapterID
 	return request
 }
+
+// Once Cancel has replaced an item's generation, none of the rest of that
+// item may reach a consumer, even one that is already waiting: a select
+// between that consumer and the closed `superseded` channel picks at random,
+// so cancelled audio leaked in about half of the sends (Pullfrog review of
+// runtime#341, 2026-10-28).
+func TestDialoguePublishDropsTheRestOfASupersededItem(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	consumer := make(chan runtimepkg.ProviderEvent)
+	stream := &dialogueStream{ctx: ctx, events: consumer}
+	var leaked atomic.Int32
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range consumer {
+			leaked.Add(1)
+		}
+	}()
+	superseded := make(chan struct{})
+	close(superseded)
+	item := []runtimepkg.ProviderEvent{{Type: protocol.EventAudioFrame}, {Type: protocol.EventAudioFrame}, {Type: protocol.EventAudioFrame}}
+	for range 200 {
+		if !stream.publish(item, superseded) {
+			t.Fatal("publish reported the stream done")
+		}
+	}
+	close(consumer)
+	<-drained
+	if n := leaked.Load(); n != 0 {
+		t.Fatalf("%d events of superseded items reached the consumer", n)
+	}
+	// A current item still goes out whole.
+	stream.events = make(chan runtimepkg.ProviderEvent, len(item))
+	if !stream.publish(item, make(chan struct{})) || len(stream.events) != len(item) {
+		t.Fatalf("current item delivered %d of %d events", len(stream.events), len(item))
+	}
+}
