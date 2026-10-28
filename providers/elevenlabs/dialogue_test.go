@@ -660,6 +660,42 @@ func TestDialogueAdapterSpeaksAgainAfterCancel(t *testing.T) {
 	}
 }
 
+// A consumer that stops reading fills the events buffer and blocks the
+// reader mid-send. Cancel must still return: the first version held the
+// stream lock across that send, so Cancel waited on it forever (found by a
+// live run against ElevenLabs, where audio outpaces a paused reader).
+func TestDialogueAdapterCancelDoesNotWaitOnAStalledConsumer(t *testing.T) {
+	t.Parallel()
+	connections := make(chan *http.Request, 4)
+	handshakes := make(chan dialogueClientMessage, 4)
+	server := cancelServer(t, connections, handshakes)
+	defer server.Close()
+	adapter, err := NewDialogue(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new dialogue adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), dialogueRequest(server.URL, "eleven_v4_turbo"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "Fill the buffer."); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	// 32 buffered events at one frame per 5ms: well past full by now.
+	time.Sleep(400 * time.Millisecond)
+	cancelled := make(chan error, 1)
+	go func() { cancelled <- stream.Cancel(context.Background()) }()
+	select {
+	case err := <-cancelled:
+		if err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cancel blocked behind a reader stuck on a full events channel")
+	}
+	_ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+}
+
 // A Cancel with nothing in flight has nothing to stop, so it keeps the socket
 // rather than spending a reconnect (and, managed, a minted token).
 func TestDialogueAdapterIdleCancelKeepsTheConnection(t *testing.T) {

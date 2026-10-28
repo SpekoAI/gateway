@@ -171,7 +171,7 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 		return nil, err
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
-	stream := &dialogueStream{ctx: streamCtx, cancel: cancel, voiceID: voiceID, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), conn: conn}
+	stream := &dialogueStream{ctx: streamCtx, cancel: cancel, voiceID: voiceID, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), conn: conn, superseded: make(chan struct{})}
 	// There is no frame that stops a dialogue turn, so Cancel has to drop the
 	// socket and the session continues on a new one. A permanent key (BYOK,
 	// relay) simply dials again. A managed single-use token is spent by the
@@ -305,16 +305,17 @@ type dialogueStream struct {
 	// credential is single-use and nothing can mint another.
 	redial func(context.Context) (*websocket.Conn, error)
 
-	// mu guards the connection state below and the events channel: readers
-	// hold it shared while emitting, and swapping connections or closing the
-	// channel takes it exclusively, so no frame from a replaced connection is
-	// emitted after Cancel returns and no emit races the close.
+	// mu guards the connection state below. It is never held across a send
+	// on events: a consumer that stops reading must not be able to wedge
+	// Cancel or Close behind a blocked reader.
 	mu           sync.RWMutex
 	conn         *websocket.Conn // nil while a reconnect is in flight
 	generation   uint64
+	superseded   chan struct{} // closed when Cancel replaces this generation
 	reconnected  chan struct{} // closed when the in-flight reconnect settles
 	reconnectErr error
 	eventsClosed bool
+	emitters     sync.WaitGroup // in-flight sends; the close waits for them
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -402,6 +403,8 @@ func (s *dialogueStream) Cancel(context.Context) error {
 	s.mu.Lock()
 	old := s.conn
 	s.conn = nil
+	close(s.superseded)
+	s.superseded = make(chan struct{})
 	s.generation++
 	generation := s.generation
 	done := make(chan struct{})
@@ -502,16 +505,20 @@ func (s *dialogueStream) abort() error {
 	return s.closeErr
 }
 
-// finish ends the stream: the session sees the events channel close. Every
-// path that ends a dialogue session goes through here exactly once.
+// finish ends the stream: the session sees the events channel close. The
+// first caller closes it, after every in-flight send has returned (cancelling
+// the context first releases any send blocked on a full channel).
 func (s *dialogueStream) finish() {
 	s.cancel()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.eventsClosed {
-		s.eventsClosed = true
-		close(s.events)
+	if s.eventsClosed {
+		s.mu.Unlock()
+		return
 	}
+	s.eventsClosed = true
+	s.mu.Unlock()
+	s.emitters.Wait()
+	close(s.events)
 }
 
 func (s *dialogueStream) writeJSON(ctx context.Context, value any) error {
@@ -692,19 +699,30 @@ func (s *dialogueStream) handleMessage(generation uint64, payload []byte) error 
 }
 
 // emitFrom delivers an event from one connection generation, or reports
-// errSuperseded once a Cancel has replaced that connection.
+// errSuperseded once a Cancel has replaced that connection. A frame already
+// past the generation check when Cancel lands can still be delivered — the
+// same one-frame window the text-to-speech arm has between reading a frame
+// and closing its context — but a reader blocked on a full channel gives up
+// as soon as its generation is replaced.
 func (s *dialogueStream) emitFrom(generation uint64, event runtimepkg.ProviderEvent) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if s.generation != generation {
+		s.mu.RUnlock()
 		return errSuperseded
 	}
 	if s.eventsClosed {
+		s.mu.RUnlock()
 		return runtimepkg.ErrSessionClosed
 	}
+	superseded := s.superseded
+	s.emitters.Add(1)
+	s.mu.RUnlock()
+	defer s.emitters.Done()
 	select {
 	case s.events <- event:
 		return nil
+	case <-superseded:
+		return errSuperseded
 	case <-s.ctx.Done():
 		return s.ctx.Err()
 	}
