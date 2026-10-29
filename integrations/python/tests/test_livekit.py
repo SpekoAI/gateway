@@ -761,6 +761,70 @@ def test_stt_constructs_on_livekit_agents_before_keyterms(
     assert asking._stt_options == {"diarization": True, "keywords": ["Speko"]}
 
 
+def test_stt_on_livekit_agents_before_manual_flush_keeps_flushing_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(agents_stt, "STTCapabilities", _PreKeytermsSTTCapabilities)
+
+    plugin = STT(FakeClient(), provider="soniox")  # type: ignore[arg-type]
+
+    assert plugin.capabilities == _PreKeytermsSTTCapabilities(
+        streaming=True,
+        interim_results=True,
+    )
+
+
+@dataclasses.dataclass
+class _ManualFlushSTTCapabilities:
+    """STTCapabilities as livekit-agents ships it from 1.8.9."""
+
+    streaming: bool
+    interim_results: bool
+    diarization: bool = False
+    aligned_transcript: bool = False
+    offline_recognize: bool = True
+    keyterms: bool = False
+    chat_context: bool = False
+    manual_flush: bool = False
+
+
+@pytest.mark.parametrize(
+    ("provider", "manual_flush"),
+    [
+        # audio.commit is Soniox's mid-stream finalize.
+        ("soniox", True),
+        (" Soniox ", True),
+        # The route is unknown until the session plan names it.
+        ("auto", False),
+        # audio.commit is a no-op on Deepgram Flux and drops a sub-50 ms
+        # AssemblyAI tail; it ends the input on Gladia and Gemini, and
+        # transcribes a buffered batch on Hamsa.
+        ("deepgram", False),
+        ("assemblyai", False),
+        ("gladia", False),
+        ("gemini", False),
+        ("hamsa", False),
+    ],
+)
+def test_stt_asks_livekit_to_flush_at_turn_end_only_where_commit_finalizes(
+    monkeypatch: pytest.MonkeyPatch, provider: str, manual_flush: bool
+) -> None:
+    monkeypatch.setattr(agents_stt, "STTCapabilities", _ManualFlushSTTCapabilities)
+
+    plugin = STT(FakeClient(), provider=provider)  # type: ignore[arg-type]
+
+    assert plugin.capabilities.manual_flush is manual_flush
+
+
+def test_stt_declares_manual_flush_on_the_installed_livekit_agents() -> None:
+    plugin = STT(FakeClient(), provider="soniox")  # type: ignore[arg-type]
+    fields = {field.name for field in dataclasses.fields(agents_stt.STTCapabilities)}
+    if "manual_flush" in fields:  # livekit-agents >= 1.8.9
+        assert plugin.capabilities.manual_flush is True
+    else:
+        assert not hasattr(plugin.capabilities, "manual_flush")
+
+
 def test_cache_write_tokens_are_included_in_completion_usage() -> None:
     from speko_gateway.livekit import _completion_usage
 

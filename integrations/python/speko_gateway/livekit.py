@@ -61,8 +61,26 @@ def _report_stream_leg(kind: str, stream: Any) -> None:
     )
 
 
-# STTCapabilities fields added after livekit-agents 1.4.5 (both in 1.6.5).
-_NEWER_STT_CAPABILITIES = frozenset({"keyterms", "chat_context"})
+# STTCapabilities fields added after livekit-agents 1.4.5: keyterms and
+# chat_context in 1.6.5, manual_flush in 1.8.9.
+_NEWER_STT_CAPABILITIES = frozenset({"keyterms", "chat_context", "manual_flush"})
+
+# Providers for which LiveKit may flush the stream at the end of the user's
+# turn (livekit-agents >= 1.8.9 `manual_flush`: VAD end of speech, a turn
+# detector's end-of-turn verdict, or commit_user_turn). The flush becomes
+# audio.commit, which the Soniox adapter sends as Soniox's `finalize`: the final
+# then arrives a few hundred milliseconds after the user stops instead of when
+# Soniox's own endpointer fires, which can hold a turn for its whole 2 s
+# maximum endpoint delay. Other providers and "auto" (route unknown here) keep
+# waiting for the provider's endpointer: a commit is a no-op on Deepgram Flux
+# (so commit_user_turn would skip the silence LiveKit otherwise pushes), drops
+# a sub-50 ms AssemblyAI tail, ends input on Gladia and Gemini, and
+# transcribes a buffered batch on Hamsa. Known cost: when commit_user_turn
+# flushes audio that holds no new words, Soniox answers with an empty final,
+# which this plugin does not forward, so LiveKit waits out its
+# transcript_timeout. Without the flush it already waited that long unless a
+# final had arrived in the previous 0.5 s.
+_FLUSH_ON_TURN_END_PROVIDERS = frozenset({"soniox"})
 
 
 def _stt_capabilities(**declared: Any) -> stt.STTCapabilities:
@@ -122,6 +140,7 @@ class STT(stt.STT):
                 offline_recognize=True,
                 keyterms=bool(keywords),
                 chat_context=False,
+                manual_flush=provider.strip().lower() in _FLUSH_ON_TURN_END_PROVIDERS,
             )
         )
         self._client = client or GatewayClient.from_env()

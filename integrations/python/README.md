@@ -49,6 +49,12 @@ other managed traffic.
 The LiveKit classes support `livekit-agents` 1.4.5 and later. Releases before
 1.6.5 have no keyterm capability flag, so `STT(keywords=...)` still sends the
 keywords to the provider but does not advertise keyterm support to LiveKit.
+From 1.8.9, `STT(provider="soniox")` lets LiveKit flush the stream when the
+user stops speaking (VAD end of speech, a turn detector's end-of-turn verdict,
+or `commit_user_turn`). The Gateway turns the flush into Soniox's `finalize`,
+so the final transcript arrives a few hundred milliseconds later instead of
+waiting for Soniox's own endpointer (up to 2 s by default). Other providers
+and `provider="auto"` keep waiting for the provider's endpointer.
 Releases before 1.6.10 import `httpx` without declaring it, and openai 3 no
 longer brings it in; this package depends on `httpx`, so any install of it,
 with or without the `livekit` extra, works without an `openai` pin.
