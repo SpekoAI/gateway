@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from collections.abc import AsyncGenerator, Mapping, Sequence
@@ -28,7 +29,14 @@ from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext, is_given
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
-from pipecat.services.settings import LLMSettings, STTSettings, TTSSettings
+from pipecat.services.settings import (
+    NOT_GIVEN,
+    LLMSettings,
+    STTSettings,
+    TTSSettings,
+    _NotGiven,
+)
+from pipecat.services.settings import is_given as is_setting_given
 from pipecat.services.stt_service import STTService as PipecatSTTService
 from pipecat.services.tts_service import TTSService as PipecatTTSService
 from pipecat.transcriptions.language import Language
@@ -48,7 +56,12 @@ from .client import (
     GatewaySession,
     SessionConfig,
 )
-from .relay import RelayError, RelayLLMClient
+from .relay import (
+    ReasoningEffort,
+    RelayError,
+    RelayLLMClient,
+    validate_reasoning_effort,
+)
 
 _INTEGRATION_VERSION = "0.1.0"
 _logger = logging.getLogger(__name__)
@@ -80,9 +93,9 @@ class SpekoSTTService(PipecatSTTService):
         if native_settings is not None:
             if not isinstance(native_settings, STTSettings):
                 raise TypeError("settings must be an STTSettings instance")
-            if is_given(native_settings.model) and native_settings.model is not None:
+            if is_setting_given(native_settings.model) and native_settings.model is not None:
                 model = native_settings.model
-            if is_given(native_settings.language) and native_settings.language is not None:
+            if is_setting_given(native_settings.language) and native_settings.language is not None:
                 language = str(native_settings.language)
         super().__init__(
             sample_rate=sample_rate,
@@ -322,11 +335,11 @@ class SpekoTTSService(PipecatTTSService):
         if native_settings is not None:
             if not isinstance(native_settings, TTSSettings):
                 raise TypeError("settings must be a TTSSettings instance")
-            if is_given(native_settings.model) and native_settings.model is not None:
+            if is_setting_given(native_settings.model) and native_settings.model is not None:
                 model = native_settings.model
-            if is_given(native_settings.voice) and native_settings.voice is not None:
+            if is_setting_given(native_settings.voice) and native_settings.voice is not None:
                 voice = native_settings.voice
-            if is_given(native_settings.language) and native_settings.language is not None:
+            if is_setting_given(native_settings.language) and native_settings.language is not None:
                 language = str(native_settings.language)
         kwargs.setdefault("push_start_frame", True)
         kwargs.setdefault("push_stop_frames", False)
@@ -591,15 +604,48 @@ class SpekoTTSService(PipecatTTSService):
             self._contexts.pop(context_id, None)
 
 
+@dataclass
+class SpekoLLMSettings(LLMSettings):
+    """Runtime-updatable settings for `SpekoLLMService`.
+
+    Parameters:
+        reasoning_effort: The Router's reasoning control, one of "none",
+            "minimal", "low", "medium", "high" or "xhigh". None omits the
+            field and keeps the provider's default. See `SpekoLLMService`.
+    """
+
+    reasoning_effort: ReasoningEffort | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+
+
 class SpekoLLMService(LLMService):
     """Stream a Pipecat universal LLM context through Speko Router.
 
     Router speaks a provider-neutral Responses-style protocol.  Pipecat's
     OpenAI-compatible universal context is normalized here instead of exposing
     provider SDK objects to the worker.
+
+    `reasoning_effort` controls how much the model reasons before answering.
+    Use "none" to turn reasoning off. "minimal" asks for the least the routed
+    model allows (the Router maps it per provider), and "low" through "xhigh"
+    ask for more. The default, None, sends no field and keeps the provider's
+    default. Change it mid-conversation like temperature, with
+    `LLMUpdateSettingsFrame(delta=SpekoLLMService.Settings(reasoning_effort=...))`.
+    While reasoning is enabled (any value but "none") the Router refuses
+    `temperature` and `top_p`, so leave both unset then.
+
+    "none" is accepted on models that cannot reason, where it changes nothing
+    (older Routers refuse it there, e.g. on gpt-4.1). Four models always reason
+    and refuse "none", with "minimal" as their floor: Inception mercury-voice,
+    gpt-oss-120b on Cerebras and Together, and Together zai-org/GLM-5.3-Flash.
+    Every other value, "minimal" included, needs a model that can reason: the
+    Router refuses it for a pinned model that cannot, and auto routing considers
+    only models that can.
     """
 
-    Settings = LLMSettings
+    Settings = SpekoLLMSettings
+    _settings: SpekoLLMSettings
 
     def __init__(
         self,
@@ -611,6 +657,7 @@ class SpekoLLMService(LLMService):
         max_output_tokens: int = 8_192,
         temperature: float | None = None,
         top_p: float | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         system_instruction: str | None = None,
         session_id: str = "",
         **kwargs: Any,
@@ -619,7 +666,7 @@ class SpekoLLMService(LLMService):
             raise ValueError("provider and model must both be auto or both be explicit")
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
-        settings = LLMSettings(
+        settings = SpekoLLMSettings(
             model=model,
             system_instruction=system_instruction,
             temperature=temperature,
@@ -631,6 +678,7 @@ class SpekoLLMService(LLMService):
             seed=None,
             filter_incomplete_user_turns=False,
             user_turn_completion_config=None,
+            reasoning_effort=validate_reasoning_effort(reasoning_effort),
             extra={},
         )
         kwargs.setdefault("run_in_parallel", False)
@@ -648,7 +696,9 @@ class SpekoLLMService(LLMService):
         return True
 
     async def _update_settings(self, delta: LLMSettings) -> dict[str, Any]:
-        if is_given(delta.model):
+        # Settings deltas mark absent fields with Pipecat's own NOT_GIVEN, which
+        # the context module's OpenAI-flavored is_given counts as given.
+        if is_setting_given(delta.model):
             model = delta.model
             if not isinstance(model, str) or not model:
                 raise ValueError("model must be a non-empty string")
@@ -656,6 +706,9 @@ class SpekoLLMService(LLMService):
                 raise ValueError(
                     "runtime model updates cannot change between auto and explicit routing"
                 )
+        delta = _speko_llm_delta(delta)
+        if is_setting_given(delta.reasoning_effort):
+            validate_reasoning_effort(delta.reasoning_effort)
         changed = await super()._update_settings(delta)
         if "model" in changed:
             self._model = self._settings.model
@@ -792,7 +845,40 @@ class SpekoLLMService(LLMService):
             request["temperature"] = self._settings.temperature
         if self._settings.top_p is not None:
             request["top_p"] = self._settings.top_p
+        reasoning_effort = self._settings.reasoning_effort
+        if isinstance(reasoning_effort, str):
+            request["reasoning_effort"] = reasoning_effort
         return request
+
+
+def _speko_llm_delta(delta: LLMSettings) -> SpekoLLMSettings:
+    """Return `delta` as a SpekoLLMSettings with reasoning_effort out of `extra`.
+
+    A plain `LLMSettings.from_mapping({"reasoning_effort": ...})` files the key
+    under `extra`, where it would never reach the request yet would still show
+    in tracing. Lift it onto the field so it is validated and applied like a
+    typed update; a delta that sets both, differently, is ambiguous.
+    """
+
+    extra = dict(delta.extra)
+    lifted = extra.pop("reasoning_effort", NOT_GIVEN)
+    typed = getattr(delta, "reasoning_effort", NOT_GIVEN)
+    if isinstance(delta, SpekoLLMSettings) and not is_setting_given(lifted):
+        return delta
+    if is_setting_given(lifted) and is_setting_given(typed) and lifted != typed:
+        raise ValueError(
+            "reasoning_effort is set twice with different values (field and extra)"
+        )
+    values = {
+        f.name: getattr(delta, f.name)
+        for f in dataclasses.fields(delta)
+        if f.name not in ("extra", "reasoning_effort")
+    }
+    return SpekoLLMSettings(
+        **values,
+        reasoning_effort=typed if is_setting_given(typed) else lifted,
+        extra=extra,
+    )
 
 
 # Short aliases mirror the naming style of the existing LiveKit integration.

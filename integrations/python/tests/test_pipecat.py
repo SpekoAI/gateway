@@ -299,6 +299,91 @@ async def test_llm_typed_settings_updates_change_router_request() -> None:
     assert request["top_p"] == 0.8
 
 
+async def test_llm_settings_update_without_model_keeps_route() -> None:
+    llm = SpekoLLMService(  # type: ignore[arg-type]
+        FakeRelayClient(), provider="openai", model="gpt-default"
+    )
+
+    await llm._update_settings(LLMSettings(temperature=0.4))
+
+    request = llm._request(LLMContext(messages=[{"role": "user", "content": "Hi"}]))
+    assert request["routing"]["model"] == "gpt-default"
+    assert request["temperature"] == 0.4
+
+
+def test_llm_omits_reasoning_effort_by_default() -> None:
+    llm = SpekoLLMService(FakeRelayClient())  # type: ignore[arg-type]
+
+    request = llm._request(LLMContext(messages=[{"role": "user", "content": "Hi"}]))
+
+    assert "reasoning_effort" not in request
+    assert llm._settings.reasoning_effort is None
+
+
+@pytest.mark.parametrize(
+    "effort", ["none", "minimal", "low", "medium", "high", "xhigh"]
+)
+async def test_llm_sends_each_reasoning_effort(effort: str) -> None:
+    relay = FakeRelayClient([("response.completed", {})])
+    llm = SpekoLLMService(relay, reasoning_effort=effort)  # type: ignore[arg-type]
+
+    await llm.run_inference(LLMContext(messages=[{"role": "user", "content": "Hi"}]))
+
+    assert relay.requests[0]["reasoning_effort"] == effort
+
+
+@pytest.mark.parametrize("effort", ["", "None", "max", "HIGH", True, 1])
+def test_llm_rejects_unknown_reasoning_effort(effort: object) -> None:
+    with pytest.raises(ValueError, match="reasoning_effort must be None or one of"):
+        SpekoLLMService(FakeRelayClient(), reasoning_effort=effort)  # type: ignore[arg-type]
+
+
+async def test_llm_reasoning_effort_updates_at_runtime() -> None:
+    llm = SpekoLLMService(  # type: ignore[arg-type]
+        FakeRelayClient(), provider="openai", model="gpt-5.6-luna"
+    )
+    context = LLMContext(messages=[{"role": "user", "content": "Hi"}])
+
+    changed = await llm._update_settings(
+        SpekoLLMService.Settings(reasoning_effort="none")
+    )
+    assert "reasoning_effort" in changed
+    assert llm._request(context)["reasoning_effort"] == "none"
+
+    # A plain LLMSettings delta leaves the reasoning control alone.
+    await llm._update_settings(LLMSettings(max_tokens=64))
+    assert llm._request(context)["reasoning_effort"] == "none"
+
+    # The deprecated dict form of LLMUpdateSettingsFrame maps onto the field.
+    await llm._update_settings(
+        SpekoLLMService.Settings.from_mapping({"reasoning_effort": "high"})
+    )
+    assert llm._request(context)["reasoning_effort"] == "high"
+
+    with pytest.raises(ValueError, match="reasoning_effort must be None or one of"):
+        await llm._update_settings(SpekoLLMService.Settings(reasoning_effort="max"))  # type: ignore[arg-type]
+    assert llm._settings.reasoning_effort == "high"
+
+    # A generic LLMSettings mapping files the key under extra; it is lifted
+    # onto the field, validated, and kept out of extra (and so out of tracing).
+    await llm._update_settings(LLMSettings.from_mapping({"reasoning_effort": "low"}))
+    assert llm._request(context)["reasoning_effort"] == "low"
+    assert "reasoning_effort" not in llm._settings.extra
+    assert llm._settings.given_fields()["reasoning_effort"] == "low"
+    with pytest.raises(ValueError, match="reasoning_effort must be None or one of"):
+        await llm._update_settings(LLMSettings(extra={"reasoning_effort": "bogus"}))
+    with pytest.raises(ValueError, match="set twice"):
+        await llm._update_settings(
+            SpekoLLMService.Settings(
+                reasoning_effort="none", extra={"reasoning_effort": "high"}
+            )
+        )
+    assert llm._settings.reasoning_effort == "low"
+
+    await llm._update_settings(SpekoLLMService.Settings(reasoning_effort=None))
+    assert "reasoning_effort" not in llm._request(context)
+
+
 async def test_llm_settings_cannot_change_auto_route_mode() -> None:
     auto = SpekoLLMService(FakeRelayClient())  # type: ignore[arg-type]
     explicit = SpekoLLMService(  # type: ignore[arg-type]
@@ -381,6 +466,23 @@ def test_voice_services_honor_caller_supplied_pipecat_settings() -> None:
     assert tts._model == "sonic-3"
     assert tts._voice == "amy"
     assert tts._language == "fr"
+
+
+def test_voice_services_keep_arguments_absent_from_partial_settings() -> None:
+    client = FakeGatewayClient(FakeGatewaySession())
+
+    stt = SpekoSTTService(  # type: ignore[arg-type]
+        client, model="nova-3", settings=STTSettings(language="es")
+    )
+    tts = SpekoTTSService(  # type: ignore[arg-type]
+        client, model="sonic-3", voice="amy", settings=TTSSettings(language="es")
+    )
+
+    assert stt._model == "nova-3"
+    assert stt._language == "es"
+    assert tts._model == "sonic-3"
+    assert tts._voice == "amy"
+    assert tts._language == "es"
 
 
 async def test_stt_start_surfaces_gateway_admission_failure_as_fatal() -> None:

@@ -502,6 +502,45 @@ def test_llm_rejects_half_explicit_routing() -> None:
         raise AssertionError("expected ValueError for provider without model")
 
 
+def _user_ctx() -> agents_llm.ChatContext:
+    ctx = agents_llm.ChatContext.empty()
+    ctx.add_message(role="user", content="hi")
+    return ctx
+
+
+async def test_llm_omits_reasoning_effort_by_default() -> None:
+    plugin = LLM(FakeRelayClient([]))  # type: ignore[arg-type]
+
+    assert "reasoning_effort" not in plugin._request_body(_user_ctx(), [])
+
+    await plugin.aclose()
+
+
+@pytest.mark.parametrize(
+    "effort", ["none", "minimal", "low", "medium", "high", "xhigh"]
+)
+async def test_llm_sends_each_reasoning_effort(effort: str) -> None:
+    client = FakeRelayClient(_relay_events())
+    plugin = LLM(  # type: ignore[arg-type]
+        client, provider="openai", model="gpt-5.6-luna", reasoning_effort=effort
+    )
+
+    stream = plugin.chat(chat_ctx=_user_ctx())
+    async for _ in stream:
+        pass
+
+    assert client.requests[0]["reasoning_effort"] == effort
+    assert "temperature" not in client.requests[0]
+
+    await plugin.aclose()
+
+
+@pytest.mark.parametrize("effort", ["", "None", "max", "HIGH", True, 1])
+def test_llm_rejects_unknown_reasoning_effort(effort: Any) -> None:
+    with pytest.raises(ValueError, match="reasoning_effort must be None or one of"):
+        LLM(FakeRelayClient([]), reasoning_effort=effort)  # type: ignore[arg-type]
+
+
 async def test_llm_stream_preserves_relay_error_classification() -> None:
     client = FailingRelayClient([])
     plugin = LLM(client)  # type: ignore[arg-type]

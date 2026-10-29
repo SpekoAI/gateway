@@ -66,10 +66,27 @@ session = AgentSession(
         model="auto",             # default: GET router.speko.dev/v1/models lists the options
         objective="balanced",     # default: or "quality", "latency", "cost"
         max_output_tokens=8_192,  # default
+        reasoning_effort=None,    # default: provider default; or "none" ... "xhigh"
     ),
     tts=TTS(),
 )
 ```
+
+`reasoning_effort` is the Router's reasoning control. Use `"none"` to turn
+reasoning off. `"minimal"` asks for the least reasoning the routed model allows
+(the Router maps it onto each provider's own scale), and `"low"`, `"medium"`,
+`"high"` and `"xhigh"` ask for more. Unset, no field is sent and the provider
+default applies. Any other value raises `ValueError` when the LLM is
+constructed. While reasoning is enabled (any value but `"none"`) the Router
+refuses `temperature` and `top_p`.
+
+`"none"` is accepted on models that cannot reason, where it changes nothing,
+except on older Routers, which refuse it there (e.g. on `gpt-4.1`). Four models
+always reason and refuse `"none"`; `"minimal"` is their floor: Inception
+`mercury-voice`, `gpt-oss-120b` on Cerebras and Together, and Together
+`zai-org/GLM-5.3-Flash`. Every other value, `"minimal"` included, needs a model
+that can reason: a pinned model that cannot is refused
+(`capability_unsupported`), and auto routing considers only models that can.
 
 `LLM()` requires `SPEKO_API_KEY` (plus optional `SPEKO_ROUTER_URL`; the old
 `SPEKO_RELAY_URL` remains a fallback) and speaks HTTPS directly to

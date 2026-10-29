@@ -5,6 +5,7 @@ from .relay import (
     EvaluationAnswer,
     EvaluationQuestion,
     EvaluationResponse,
+    ReasoningEffort,
     RelayEvaluationClient,
     RelayLLMClient,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "GatewayClient",
     "GatewayError",
     "GatewaySession",
+    "ReasoningEffort",
     "RelayEvaluationClient",
     "RelayLLMClient",
 ]
