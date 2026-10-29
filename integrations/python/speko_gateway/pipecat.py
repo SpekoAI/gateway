@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from collections.abc import AsyncGenerator, Mapping, Sequence
@@ -92,9 +93,9 @@ class SpekoSTTService(PipecatSTTService):
         if native_settings is not None:
             if not isinstance(native_settings, STTSettings):
                 raise TypeError("settings must be an STTSettings instance")
-            if is_given(native_settings.model) and native_settings.model is not None:
+            if is_setting_given(native_settings.model) and native_settings.model is not None:
                 model = native_settings.model
-            if is_given(native_settings.language) and native_settings.language is not None:
+            if is_setting_given(native_settings.language) and native_settings.language is not None:
                 language = str(native_settings.language)
         super().__init__(
             sample_rate=sample_rate,
@@ -334,11 +335,11 @@ class SpekoTTSService(PipecatTTSService):
         if native_settings is not None:
             if not isinstance(native_settings, TTSSettings):
                 raise TypeError("settings must be a TTSSettings instance")
-            if is_given(native_settings.model) and native_settings.model is not None:
+            if is_setting_given(native_settings.model) and native_settings.model is not None:
                 model = native_settings.model
-            if is_given(native_settings.voice) and native_settings.voice is not None:
+            if is_setting_given(native_settings.voice) and native_settings.voice is not None:
                 voice = native_settings.voice
-            if is_given(native_settings.language) and native_settings.language is not None:
+            if is_setting_given(native_settings.language) and native_settings.language is not None:
                 language = str(native_settings.language)
         kwargs.setdefault("push_start_frame", True)
         kwargs.setdefault("push_stop_frames", False)
@@ -704,9 +705,9 @@ class SpekoLLMService(LLMService):
                 raise ValueError(
                     "runtime model updates cannot change between auto and explicit routing"
                 )
-        reasoning_effort = getattr(delta, "reasoning_effort", NOT_GIVEN)
-        if is_setting_given(reasoning_effort):
-            validate_reasoning_effort(reasoning_effort)
+        delta = _speko_llm_delta(delta)
+        if is_setting_given(delta.reasoning_effort):
+            validate_reasoning_effort(delta.reasoning_effort)
         changed = await super()._update_settings(delta)
         if "model" in changed:
             self._model = self._settings.model
@@ -847,6 +848,36 @@ class SpekoLLMService(LLMService):
         if isinstance(reasoning_effort, str):
             request["reasoning_effort"] = reasoning_effort
         return request
+
+
+def _speko_llm_delta(delta: LLMSettings) -> SpekoLLMSettings:
+    """Return `delta` as a SpekoLLMSettings with reasoning_effort out of `extra`.
+
+    A plain `LLMSettings.from_mapping({"reasoning_effort": ...})` files the key
+    under `extra`, where it would never reach the request yet would still show
+    in tracing. Lift it onto the field so it is validated and applied like a
+    typed update; a delta that sets both, differently, is ambiguous.
+    """
+
+    extra = dict(delta.extra)
+    lifted = extra.pop("reasoning_effort", NOT_GIVEN)
+    typed = getattr(delta, "reasoning_effort", NOT_GIVEN)
+    if isinstance(delta, SpekoLLMSettings) and not is_setting_given(lifted):
+        return delta
+    if is_setting_given(lifted) and is_setting_given(typed) and lifted != typed:
+        raise ValueError(
+            "reasoning_effort is set twice with different values (field and extra)"
+        )
+    values = {
+        f.name: getattr(delta, f.name)
+        for f in dataclasses.fields(delta)
+        if f.name not in ("extra", "reasoning_effort")
+    }
+    return SpekoLLMSettings(
+        **values,
+        reasoning_effort=typed if is_setting_given(typed) else lifted,
+        extra=extra,
+    )
 
 
 # Short aliases mirror the naming style of the existing LiveKit integration.

@@ -364,6 +364,22 @@ async def test_llm_reasoning_effort_updates_at_runtime() -> None:
         await llm._update_settings(SpekoLLMService.Settings(reasoning_effort="max"))  # type: ignore[arg-type]
     assert llm._settings.reasoning_effort == "high"
 
+    # A generic LLMSettings mapping files the key under extra; it is lifted
+    # onto the field, validated, and kept out of extra (and so out of tracing).
+    await llm._update_settings(LLMSettings.from_mapping({"reasoning_effort": "low"}))
+    assert llm._request(context)["reasoning_effort"] == "low"
+    assert "reasoning_effort" not in llm._settings.extra
+    assert llm._settings.given_fields()["reasoning_effort"] == "low"
+    with pytest.raises(ValueError, match="reasoning_effort must be None or one of"):
+        await llm._update_settings(LLMSettings(extra={"reasoning_effort": "bogus"}))
+    with pytest.raises(ValueError, match="set twice"):
+        await llm._update_settings(
+            SpekoLLMService.Settings(
+                reasoning_effort="none", extra={"reasoning_effort": "high"}
+            )
+        )
+    assert llm._settings.reasoning_effort == "low"
+
     await llm._update_settings(SpekoLLMService.Settings(reasoning_effort=None))
     assert "reasoning_effort" not in llm._request(context)
 
@@ -450,6 +466,23 @@ def test_voice_services_honor_caller_supplied_pipecat_settings() -> None:
     assert tts._model == "sonic-3"
     assert tts._voice == "amy"
     assert tts._language == "fr"
+
+
+def test_voice_services_keep_arguments_absent_from_partial_settings() -> None:
+    client = FakeGatewayClient(FakeGatewaySession())
+
+    stt = SpekoSTTService(  # type: ignore[arg-type]
+        client, model="nova-3", settings=STTSettings(language="es")
+    )
+    tts = SpekoTTSService(  # type: ignore[arg-type]
+        client, model="sonic-3", voice="amy", settings=TTSSettings(language="es")
+    )
+
+    assert stt._model == "nova-3"
+    assert stt._language == "es"
+    assert tts._model == "sonic-3"
+    assert tts._voice == "amy"
+    assert tts._language == "es"
 
 
 async def test_stt_start_surfaces_gateway_admission_failure_as_fatal() -> None:
