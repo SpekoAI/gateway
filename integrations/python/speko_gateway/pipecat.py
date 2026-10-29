@@ -626,21 +626,22 @@ class SpekoLLMService(LLMService):
     OpenAI-compatible universal context is normalized here instead of exposing
     provider SDK objects to the worker.
 
-    `reasoning_effort` controls how much the model reasons before answering:
-    "none" disables reasoning, "minimal" asks for the least the routed model
-    allows (the Router maps it per provider), and "low" through "xhigh" ask for
-    more. The default, None, sends no field and keeps the provider's default.
-    Change it mid-conversation like temperature, with
+    `reasoning_effort` controls how much the model reasons before answering.
+    Use "none" to turn reasoning off. "minimal" asks for the least the routed
+    model allows (the Router maps it per provider), and "low" through "xhigh"
+    ask for more. The default, None, sends no field and keeps the provider's
+    default. Change it mid-conversation like temperature, with
     `LLMUpdateSettingsFrame(delta=SpekoLLMService.Settings(reasoning_effort=...))`.
     While reasoning is enabled (any value but "none") the Router refuses
     `temperature` and `top_p`, so leave both unset then.
 
-    "low" and above need a model that can reason: the Router refuses them for
-    a pinned model that cannot and auto routing picks only models that can.
-    "none" and "minimal" are meant to be a no-op on models that do not reason,
-    but Routers without that change still refuse any value for a pinned
-    non-reasoning model (e.g. gpt-4.1) and leave such models out of auto
-    routing.
+    "none" is accepted on models that cannot reason, where it changes nothing
+    (older Routers refuse it there, e.g. on gpt-4.1). Four models always reason
+    and refuse "none", with "minimal" as their floor: Inception mercury-voice,
+    gpt-oss-120b on Cerebras and Together, and Together zai-org/GLM-5.3-Flash.
+    Every other value, "minimal" included, needs a model that can reason: the
+    Router refuses it for a pinned model that cannot, and auto routing considers
+    only models that can.
     """
 
     Settings = SpekoLLMSettings

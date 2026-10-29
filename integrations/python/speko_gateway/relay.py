@@ -27,11 +27,17 @@ _TERMINAL_EVENTS = {"response.completed", "error"}
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 """The Router's provider-neutral reasoning control, sent as `reasoning_effort`.
 
-`"none"` asks the model not to reason. `"minimal"` asks for the least
-reasoning the routed model allows; the Router maps it onto each provider's own
-scale, so on some models it means no reasoning and on others the lowest level.
-`"low"` through `"xhigh"` ask for progressively more. Leaving it unset sends no
-field and keeps the provider's default.
+`"none"` turns reasoning off. `"minimal"` asks for the least reasoning the
+routed model allows; the Router maps it onto each provider's own scale, so on
+some models it means no reasoning and on others the lowest level. `"low"`
+through `"xhigh"` ask for progressively more. Leaving it unset sends no field
+and keeps the provider's default.
+
+`"none"` is accepted on models that cannot reason, where it changes nothing
+(older Routers refuse it there). Four models always reason and refuse `"none"`,
+with `"minimal"` as their floor: Inception mercury-voice, gpt-oss-120b on
+Cerebras and Together, and Together zai-org/GLM-5.3-Flash. Every other value,
+`"minimal"` included, needs a model that can reason.
 
 While reasoning is enabled (any value other than `"none"`), the Router refuses
 `temperature` and `top_p` in the same request.
