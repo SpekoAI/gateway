@@ -39,7 +39,12 @@ from ._voice import CredentialSource, stt_options_payload, tts_options_payload
 from .client import GatewayClient, GatewayError
 from .probe import report_leg as _report_probe_leg
 from .probe import report_marker as _report_probe_marker
-from .relay import RelayError, RelayLLMClient
+from .relay import (
+    ReasoningEffort,
+    RelayError,
+    RelayLLMClient,
+    validate_reasoning_effort,
+)
 
 
 def _report_stream_leg(kind: str, stream: Any) -> None:
@@ -605,7 +610,22 @@ class SynthesisStream(tts.SynthesizeStream):
 
 
 class LLM(llm.LLM):
-    """Generate responses through the hosted Speko Router."""
+    """Generate responses through the hosted Speko Router.
+
+    `reasoning_effort` controls how much the model reasons before answering:
+    `"none"` disables reasoning, `"minimal"` asks for the least the routed
+    model allows (the Router maps it per provider), and `"low"` through
+    `"xhigh"` ask for more. The default, None, sends no field and keeps the
+    provider's default. While reasoning is enabled (any value but `"none"`)
+    the Router refuses `temperature`, so leave temperature unset then.
+
+    `"low"` and above need a model that can reason: the Router refuses them
+    for a pinned model that cannot and auto routing picks only models that
+    can. `"none"` and `"minimal"` are meant to be a no-op on models that do
+    not reason, but Routers without that change still refuse any value for a
+    pinned non-reasoning model (e.g. `gpt-4.1`) and leave such models out of
+    auto routing.
+    """
 
     def __init__(
         self,
@@ -616,10 +636,12 @@ class LLM(llm.LLM):
         objective: str = "balanced",
         max_output_tokens: int = 8_192,
         temperature: float | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         super().__init__()
         if (provider == "auto") != (model == "auto"):
             raise ValueError("provider and model must both be auto or both be explicit")
+        reasoning_effort = validate_reasoning_effort(reasoning_effort)
         self._client = client or RelayLLMClient.from_env()
         self._owns_client = client is None
         self._provider_name = provider
@@ -627,6 +649,7 @@ class LLM(llm.LLM):
         self._objective = objective
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
+        self._reasoning_effort = reasoning_effort
 
     @property
     def model(self) -> str:
@@ -677,6 +700,8 @@ class LLM(llm.LLM):
             body["tools"] = _relay_tools(tools)
         if self._temperature is not None:
             body["temperature"] = self._temperature
+        if self._reasoning_effort is not None:
+            body["reasoning_effort"] = self._reasoning_effort
         return body
 
     async def aclose(self) -> None:

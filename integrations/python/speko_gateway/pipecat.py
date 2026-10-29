@@ -28,7 +28,14 @@ from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext, is_given
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
-from pipecat.services.settings import LLMSettings, STTSettings, TTSSettings
+from pipecat.services.settings import (
+    NOT_GIVEN,
+    LLMSettings,
+    STTSettings,
+    TTSSettings,
+    _NotGiven,
+)
+from pipecat.services.settings import is_given as is_setting_given
 from pipecat.services.stt_service import STTService as PipecatSTTService
 from pipecat.services.tts_service import TTSService as PipecatTTSService
 from pipecat.transcriptions.language import Language
@@ -48,7 +55,12 @@ from .client import (
     GatewaySession,
     SessionConfig,
 )
-from .relay import RelayError, RelayLLMClient
+from .relay import (
+    ReasoningEffort,
+    RelayError,
+    RelayLLMClient,
+    validate_reasoning_effort,
+)
 
 _INTEGRATION_VERSION = "0.1.0"
 _logger = logging.getLogger(__name__)
@@ -591,15 +603,47 @@ class SpekoTTSService(PipecatTTSService):
             self._contexts.pop(context_id, None)
 
 
+@dataclass
+class SpekoLLMSettings(LLMSettings):
+    """Runtime-updatable settings for `SpekoLLMService`.
+
+    Parameters:
+        reasoning_effort: The Router's reasoning control, one of "none",
+            "minimal", "low", "medium", "high" or "xhigh". None omits the
+            field and keeps the provider's default. See `SpekoLLMService`.
+    """
+
+    reasoning_effort: ReasoningEffort | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+
+
 class SpekoLLMService(LLMService):
     """Stream a Pipecat universal LLM context through Speko Router.
 
     Router speaks a provider-neutral Responses-style protocol.  Pipecat's
     OpenAI-compatible universal context is normalized here instead of exposing
     provider SDK objects to the worker.
+
+    `reasoning_effort` controls how much the model reasons before answering:
+    "none" disables reasoning, "minimal" asks for the least the routed model
+    allows (the Router maps it per provider), and "low" through "xhigh" ask for
+    more. The default, None, sends no field and keeps the provider's default.
+    Change it mid-conversation like temperature, with
+    `LLMUpdateSettingsFrame(delta=SpekoLLMService.Settings(reasoning_effort=...))`.
+    While reasoning is enabled (any value but "none") the Router refuses
+    `temperature` and `top_p`, so leave both unset then.
+
+    "low" and above need a model that can reason: the Router refuses them for
+    a pinned model that cannot and auto routing picks only models that can.
+    "none" and "minimal" are meant to be a no-op on models that do not reason,
+    but Routers without that change still refuse any value for a pinned
+    non-reasoning model (e.g. gpt-4.1) and leave such models out of auto
+    routing.
     """
 
-    Settings = LLMSettings
+    Settings = SpekoLLMSettings
+    _settings: SpekoLLMSettings
 
     def __init__(
         self,
@@ -611,6 +655,7 @@ class SpekoLLMService(LLMService):
         max_output_tokens: int = 8_192,
         temperature: float | None = None,
         top_p: float | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         system_instruction: str | None = None,
         session_id: str = "",
         **kwargs: Any,
@@ -619,7 +664,7 @@ class SpekoLLMService(LLMService):
             raise ValueError("provider and model must both be auto or both be explicit")
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
-        settings = LLMSettings(
+        settings = SpekoLLMSettings(
             model=model,
             system_instruction=system_instruction,
             temperature=temperature,
@@ -631,6 +676,7 @@ class SpekoLLMService(LLMService):
             seed=None,
             filter_incomplete_user_turns=False,
             user_turn_completion_config=None,
+            reasoning_effort=validate_reasoning_effort(reasoning_effort),
             extra={},
         )
         kwargs.setdefault("run_in_parallel", False)
@@ -648,7 +694,9 @@ class SpekoLLMService(LLMService):
         return True
 
     async def _update_settings(self, delta: LLMSettings) -> dict[str, Any]:
-        if is_given(delta.model):
+        # Settings deltas mark absent fields with Pipecat's own NOT_GIVEN, which
+        # the context module's OpenAI-flavored is_given counts as given.
+        if is_setting_given(delta.model):
             model = delta.model
             if not isinstance(model, str) or not model:
                 raise ValueError("model must be a non-empty string")
@@ -656,6 +704,9 @@ class SpekoLLMService(LLMService):
                 raise ValueError(
                     "runtime model updates cannot change between auto and explicit routing"
                 )
+        reasoning_effort = getattr(delta, "reasoning_effort", NOT_GIVEN)
+        if is_setting_given(reasoning_effort):
+            validate_reasoning_effort(reasoning_effort)
         changed = await super()._update_settings(delta)
         if "model" in changed:
             self._model = self._settings.model
@@ -792,6 +843,9 @@ class SpekoLLMService(LLMService):
             request["temperature"] = self._settings.temperature
         if self._settings.top_p is not None:
             request["top_p"] = self._settings.top_p
+        reasoning_effort = self._settings.reasoning_effort
+        if isinstance(reasoning_effort, str):
+            request["reasoning_effort"] = reasoning_effort
         return request
 
 

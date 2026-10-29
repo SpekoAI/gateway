@@ -96,10 +96,24 @@ session = AgentSession(
         model="auto",             # default: GET router.speko.dev/v1/models lists the options
         objective="balanced",     # default: or "quality", "latency", "cost"
         max_output_tokens=8_192,  # default
+        reasoning_effort=None,    # default: provider default; or "none" ... "xhigh"
     ),
     tts=TTS(),
 )
 ```
+
+`reasoning_effort` is the Router's reasoning control: `"none"` turns reasoning
+off, `"minimal"` asks for the least the routed model allows (the Router maps it
+onto each provider's own scale), and `"low"`, `"medium"`, `"high"` and `"xhigh"`
+ask for more. Unset, no field is sent and the provider default applies. Any
+other value raises `ValueError` when the LLM is constructed. While reasoning is
+enabled (any value but `"none"`) the Router refuses `temperature` and `top_p`.
+`"low"` and above need a model that can reason: a pinned model that cannot is
+refused, and auto routing picks only models that can. `"none"` and `"minimal"`
+are meant to be a no-op on models that do not reason, but Routers without that
+change still refuse any value for a pinned non-reasoning model such as
+`gpt-4.1` and leave such models out of auto routing, so leave it unset for
+those until then.
 
 STT accepts transcription options in the same canonical vocabulary as the
 hosted Speko API, plus a per-vendor passthrough for each provider's own

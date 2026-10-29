@@ -221,6 +221,31 @@ tts = SpekoTTSService(
 Today that is Cartesia `normalization` (`sonic-3.6`) and ElevenLabs
 `stability`, `similarity_boost`, `style`, `speed` and `use_speaker_boost`.
 
+The LLM takes the Router's reasoning control, and it updates at runtime like
+temperature:
+
+```python
+from pipecat.frames.frames import LLMUpdateSettingsFrame
+
+llm = SpekoLLMService(provider="openai", model="gpt-5.6-luna", reasoning_effort="none")
+
+await task.queue_frame(
+    LLMUpdateSettingsFrame(delta=SpekoLLMService.Settings(reasoning_effort="low"))
+)
+```
+
+`"none"` turns reasoning off, `"minimal"` asks for the least the routed model
+allows (the Router maps it onto each provider's own scale), and `"low"`,
+`"medium"`, `"high"` and `"xhigh"` ask for more. `None`, the default, sends no
+field and keeps the provider default. Any other value raises `ValueError`.
+While reasoning is enabled (any value but `"none"`) the Router refuses
+`temperature` and `top_p`. `"low"` and above need a model that can reason: a
+pinned model that cannot is refused, and auto routing picks only models that
+can. `"none"` and `"minimal"` are meant to be a no-op on models that do not
+reason, but Routers without that change still refuse any value for a pinned
+non-reasoning model such as `gpt-4.1` and leave such models out of auto
+routing, so leave it unset for those until then.
+
 Options fail closed when the chosen provider cannot honor them. Pin both
 `provider` and `model` when an option is a hard requirement; with `auto`, the
 router is otherwise free to choose another compatible catalog route.

@@ -24,6 +24,45 @@ from .probe import report_leg as _report_probe_leg
 _DEFAULT_RELAY_URL = "https://router.speko.dev"
 _TERMINAL_EVENTS = {"response.completed", "error"}
 
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+"""The Router's provider-neutral reasoning control, sent as `reasoning_effort`.
+
+`"none"` asks the model not to reason. `"minimal"` asks for the least
+reasoning the routed model allows; the Router maps it onto each provider's own
+scale, so on some models it means no reasoning and on others the lowest level.
+`"low"` through `"xhigh"` ask for progressively more. Leaving it unset sends no
+field and keeps the provider's default.
+
+While reasoning is enabled (any value other than `"none"`), the Router refuses
+`temperature` and `top_p` in the same request.
+"""
+
+REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+)
+
+
+def validate_reasoning_effort(value: object) -> ReasoningEffort | None:
+    """Return `value` if it is None or a Router reasoning level, else raise.
+
+    Raises ValueError naming the accepted levels, so a typo fails where the
+    integration is configured rather than as a Router 400 on the first reply.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, str) and value in REASONING_EFFORTS:
+        return value  # type: ignore[return-value]
+    raise ValueError(
+        f"reasoning_effort must be None or one of {', '.join(REASONING_EFFORTS)};"
+        f" got {value!r}"
+    )
+
 
 class RelayError(RuntimeError):
     """A relay HTTP or stream failure carrying the normalized error code."""
@@ -201,6 +240,10 @@ class RelayLLMClient:
         self, request: dict[str, Any]
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         """POST /v1/llm/responses with stream=true, yielding (event, payload).
+
+        `request` is sent as-is. An optional top-level `reasoning_effort`
+        (see `ReasoningEffort`) controls reasoning; the framework LLM classes
+        validate it before it gets here.
 
         Every stream carries exactly one terminal event: response.completed on
         success — yielded to the caller — or error, raised as RelayError. A
