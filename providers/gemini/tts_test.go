@@ -639,3 +639,28 @@ func TestTTSPCMRejectsAnExtensibleContainer(t *testing.T) {
 		t.Fatal("a WAVE_FORMAT_EXTENSIBLE container was accepted as plain PCM")
 	}
 }
+
+func TestIdleCancelKeepsTheStreamOpen(t *testing.T) {
+	t.Parallel()
+	stream, cleanup := newTTSFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {}\n\n")
+	})
+	defer cleanup()
+
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("idle cancellation closed a live session: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "next turn"); err != nil {
+		t.Fatalf("session unusable after idle cancel: %v", err)
+	}
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("buffered text cancellation: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Cancel(context.Background()); !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		t.Fatalf("closed session cancel=%v, want ErrSessionClosed", err)
+	}
+}
