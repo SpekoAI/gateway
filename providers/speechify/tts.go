@@ -423,18 +423,18 @@ func (s *stream) emit(requestCtx context.Context, event runtimepkg.ProviderEvent
 
 func (s *stream) Cancel(ctx context.Context) error {
 	s.stateMu.Lock()
-	hadPending := s.pending.Len() > 0
 	s.pending.Reset()
+	closed := s.closed
 	cancel, done := s.requestCancel, s.requestDone
 	if cancel != nil {
 		s.canceled = true
 	}
 	s.stateMu.Unlock()
 	if cancel == nil {
-		if hadPending {
-			return nil
+		if closed {
+			return runtimepkg.ErrSessionClosed
 		}
-		return runtimepkg.ErrSessionClosed
+		return nil
 	}
 	cancel()
 	select {
