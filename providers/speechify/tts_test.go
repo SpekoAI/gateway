@@ -338,3 +338,40 @@ func speechifyEventWithin(t *testing.T, events <-chan runtimepkg.ProviderEvent) 
 		return runtimepkg.ProviderEvent{}
 	}
 }
+
+func TestIdleCancelKeepsTheStreamOpen(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Speechify-Request-Id", "speechify-request-1")
+		w.Header().Set("Content-Type", "audio/L16;rate=24000;channels=1")
+		_, _ = w.Write([]byte{0, 1, 2, 3})
+	}))
+	defer server.Close()
+
+	parsed, _ := url.Parse(server.URL)
+	adapter, err := New(Config{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), adapterRequest(server.URL+streamPath, "simba-3.2"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("idle cancellation closed a live session: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "next turn"); err != nil {
+		t.Fatalf("session unusable after idle cancel: %v", err)
+	}
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("buffered text cancellation: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Cancel(context.Background()); !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		t.Fatalf("closed session cancel=%v, want ErrSessionClosed", err)
+	}
+}
