@@ -72,8 +72,9 @@
 // speech (finishReason OTHER on HTTP 200), so the adapter streams short
 // utterances for time-to-first-audio and routes long text through the
 // non-streaming arm — the same split the platform's google-gemini-tts adapter
-// ships. Voice selection is prebuiltVoiceConfig only; there is no language
-// field, and style is steered by the text itself.
+// ships. Voice selection is prebuiltVoiceConfig only. RequestOptions.Language
+// rides speechConfig.languageCode when it is a well-formed tag. The portable
+// options carry no speaking style for TTS, so none is sent.
 //
 // Neither model id is routable until its live canary passes, which is the gate
 // that catches a wrong id before a customer pays admission latency for it.
