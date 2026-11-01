@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -200,8 +201,24 @@ func (a *TTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequest) 
 		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), responseProgress: make(chan struct{}, 1),
 		httpClient: client, endpoint: endpoint, credential: credential.Value, credentialHeader: a.credentialHeader,
 		maxResponseBytes: a.maxResponseBytes, gracefulCloseIdleTimeout: a.gracefulCloseIdleTimeout,
-		model: model, voice: voice,
+		model: model, voice: voice, languageCode: ttsLanguageCode(request.Options.Language),
 	}, nil
+}
+
+// ttsLanguageTag is the shape Gemini accepts as speechConfig.languageCode. The
+// service parses the tag and answers 400 "Invalid language_code" for one it
+// cannot (probed 2026-11-01: uz, uz-UZ, fil, yue, sw-KE accepted; xx-XX
+// refused), so anything outside this shape is left off and the model detects
+// the language from the text.
+var ttsLanguageTag = regexp.MustCompile(`^[a-z]{2,3}(-[A-Z]{2})?$`)
+
+// ttsLanguageCode is the request language as Gemini's languageCode, or empty.
+func ttsLanguageCode(language string) string {
+	language = strings.TrimSpace(language)
+	if !ttsLanguageTag.MatchString(language) {
+		return ""
+	}
+	return language
 }
 
 // parseEndpoint validates the plan's endpoint as the bare models collection.
@@ -237,6 +254,7 @@ type ttsStream struct {
 	gracefulCloseIdleTimeout time.Duration
 	model                    string
 	voice                    string
+	languageCode             string
 
 	readers       sync.WaitGroup
 	closeOnce     sync.Once
@@ -296,15 +314,19 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 	s.billingInvalid = false
 	s.stateMu.Unlock()
 	s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billingSnapshot(false)})
+	speechConfig := map[string]any{
+		"voiceConfig": map[string]any{
+			"prebuiltVoiceConfig": map[string]any{"voiceName": s.voice},
+		},
+	}
+	if s.languageCode != "" {
+		speechConfig["languageCode"] = s.languageCode
+	}
 	body, err := json.Marshal(map[string]any{
 		"contents": []map[string]any{{"parts": []map[string]any{{"text": text}}}},
 		"generationConfig": map[string]any{
 			"responseModalities": []string{responseModalityAudio},
-			"speechConfig": map[string]any{
-				"voiceConfig": map[string]any{
-					"prebuiltVoiceConfig": map[string]any{"voiceName": s.voice},
-				},
-			},
+			"speechConfig":       speechConfig,
 		},
 	})
 	if err != nil {

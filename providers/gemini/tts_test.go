@@ -391,6 +391,64 @@ func TestVoicePrecedenceIsOptionsThenRouteThenDefault(t *testing.T) {
 	}
 }
 
+// TestLanguageRidesSpeechConfig pins RequestOptions.Language onto
+// speechConfig.languageCode. It used to be dropped, so non-English text was
+// left to the model's detection with no hint.
+func TestLanguageRidesSpeechConfig(t *testing.T) {
+	codes := make(chan *string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var decoded struct {
+			GenerationConfig struct {
+				SpeechConfig struct {
+					LanguageCode *string `json:"languageCode"`
+				} `json:"speechConfig"`
+			} `json:"generationConfig"`
+		}
+		_ = json.Unmarshal(body, &decoded)
+		codes <- decoded.GenerationConfig.SpeechConfig.LanguageCode
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sseFrame(t, []byte{1}, finishReasonStop))
+	}))
+	defer server.Close()
+	parsed, _ := url.Parse(server.URL)
+	adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, testCase := range []struct {
+		language string
+		want     string
+	}{
+		{language: "uz", want: "uz"},
+		{language: "es-MX", want: "es-MX"},
+		{language: "", want: ""},
+		{language: "en_US", want: ""},
+	} {
+		request := ttsAdapterRequest(server.URL+"/v1beta/models", TTSModel, "Kore")
+		request.Options.Language = testCase.language
+		stream, err := adapter.Open(context.Background(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stream.AppendText(context.Background(), "salom"); err != nil {
+			t.Fatal(err)
+		}
+		if err := stream.CommitText(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := ""
+		if code := <-codes; code != nil {
+			got = *code
+		}
+		if got != testCase.want {
+			t.Fatalf("language %q: languageCode = %q, want %q", testCase.language, got, testCase.want)
+		}
+		_ = stream.Close(context.Background())
+	}
+}
+
 func TestCancelInterruptsAnInFlightUtterance(t *testing.T) {
 	release := make(chan struct{})
 	stream, cleanup := newTTSFixture(t, func(w http.ResponseWriter, r *http.Request) {
