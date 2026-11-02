@@ -73,8 +73,10 @@ send content-free process metadata to the configured control-plane origin,
 authenticated by its Speko API key. Lifetime reports add a process incarnation
 UUID, mutation sequence and nanosecond start instant; DELETE identifies that
 same lifetime. Explicit server acknowledgement is required and these methods
-never fall back to unversioned mutations. Existing methods and command-line
-reporting remain unchanged. This protocol supplies no per-plan attribution,
+never fall back to unversioned mutations. The hosted command now uses these
+methods, retains immutable retries, joins periodic reporting before terminal
+shutdown, and drains before sequence exhaustion. Legacy library methods remain
+available for explicit existing callers. This protocol supplies no per-plan attribution,
 provider-account authority or capacity enforcement, and releases no reservations.
 See [the lifetime contract](../controlplane/instances-v2.md) for rollout and retry
 semantics. Descriptive labels must never contain content or secrets.
