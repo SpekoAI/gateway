@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -171,6 +172,43 @@ func TestRuntimeInstanceHeartbeatUsesAPIKeyAndInstancePath(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("ReportInstance: %v", err)
+	}
+}
+
+func TestRuntimeInstanceRequestsPreserveEscapedIdentity(t *testing.T) {
+	for _, base := range []struct{ suffix, decoded, escaped string }{
+		{"/control%2Fplane/", "/control/plane", "/control%2Fplane"},
+		{"/control%2F", "/control", "/control"},
+		{"/control%2F/", "/control", "/control"},
+		{"/control%2f%2F///", "/control", "/control"},
+		{"/control%252F/", "/control%2F", "/control%252F"},
+	} {
+		for _, id := range []string{"team/worker", "team%2Fworker", "team%worker", "team worker", "team+worker", "worker?#", "worker🙂"} {
+			t.Run(base.suffix+"/"+id, func(t *testing.T) {
+				var requests atomic.Int64
+				server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != base.decoded+"/v1/runtime-instances/"+id || r.URL.EscapedPath() != base.escaped+"/v1/runtime-instances/"+url.PathEscape(id) {
+						t.Errorf("instance identity changed: decoded %q, encoded %q", r.URL.Path, r.URL.EscapedPath())
+					}
+					requests.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+				}))
+				defer server.Close()
+				client, err := controlplane.New(controlplane.Config{BaseURL: server.URL + base.suffix, APIKey: "sk_speko_test", HTTPClient: server.Client()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := client.ReportInstance(context.Background(), id, controlplane.InstanceHeartbeat{RuntimeName: "go", RuntimeVersion: "test", StartedAt: time.Now(), SessionCapacity: 1}); err != nil {
+					t.Fatal(err)
+				}
+				if err := client.DeregisterInstance(context.Background(), id); err != nil {
+					t.Fatal(err)
+				}
+				if requests.Load() != 2 {
+					t.Fatal("PUT and DELETE must reach the same process")
+				}
+			})
+		}
 	}
 }
 
