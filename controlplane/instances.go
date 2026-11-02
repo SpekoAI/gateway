@@ -49,7 +49,11 @@ func (c *Client) DeregisterInstance(ctx context.Context, instanceID string) erro
 }
 
 func (c *Client) sendInstanceRequest(ctx context.Context, method, instanceID string, value any) error {
-	endpoint := c.resolve("/v1/runtime-instances/" + url.PathEscape(instanceID))
+	endpoint := c.resolve("/v1/runtime-instances/" + instanceID)
+	// URL.Path holds decoded text. Keep the ID as one escaped segment in
+	// RawPath so serialization escapes it once, preserving literal percent
+	// sequences as distinct identities and retaining the configured base path.
+	endpoint.RawPath = strings.TrimRight(c.baseURL.EscapedPath(), "/") + "/v1/runtime-instances/" + url.PathEscape(instanceID)
 	var body io.Reader
 	if value != nil {
 		encoded, err := json.Marshal(value)
