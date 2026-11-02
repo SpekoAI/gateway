@@ -503,79 +503,31 @@ func run() error {
 		_ = listener.Close()
 		_ = os.Remove(socketPath)
 	}()
-	serveErrors := make(chan error, 1)
-	go func() { serveErrors <- server.Serve(listener) }()
-
 	processCtx, cancelProcess := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancelProcess()
 	startedAt := time.Now().UTC()
-	if warmPlans != nil {
-		// Warm the routes named in configuration before any traffic arrives, so
-		// the first session of the process — the one a real caller is waiting
-		// on — is as fast as the thousandth.
-		for _, route := range warmRoutesFromEnv() {
-			if err := warmPlans.Warm(processCtx, route); err != nil {
-				log.Printf("warm route %s/%s: %v", route.Kind, route.Request.Provider, err)
-			}
-		}
-		go warmPlans.Run(processCtx)
-	}
+	var reporter *instanceReporter
 	if hostedClient != nil {
-		go reportInstanceLoop(processCtx, hostedClient, server, telemetryExporter, runtimeDescriptor, workload, startedAt, heartbeatInterval)
-	}
-	select {
-	case <-processCtx.Done():
-		log.Printf("received shutdown signal; draining")
-		server.BeginDrain()
-		if hostedClient != nil {
-			heartbeatCtx, cancelHeartbeat := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := reportInstance(heartbeatCtx, hostedClient, server, telemetryExporter, runtimeDescriptor, workload, startedAt); err != nil {
-				log.Printf("final draining heartbeat failed: %v", err)
-			}
-			cancelHeartbeat()
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		drainErr := server.Drain(ctx)
-		cancel()
-		if hostedClient != nil {
-			deregisterCtx, cancelDeregister := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := hostedClient.DeregisterInstance(deregisterCtx, instanceID); err != nil {
-				log.Printf("runtime instance deregistration failed: %v", err)
-			}
-			cancelDeregister()
-		}
-		return drainErr
-	case err := <-serveErrors:
-		return err
-	}
-}
-
-func reportInstanceLoop(ctx context.Context, client *controlplane.Client, server *gateway.Server, telemetry *runtimepkg.TelemetryExporter, descriptor protocol.RuntimeDescriptor, workload *protocol.Workload, startedAt time.Time, interval time.Duration) {
-	report := func() {
-		reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if err := reportInstance(reportCtx, client, server, telemetry, descriptor, workload, startedAt); err != nil && ctx.Err() == nil {
-			log.Printf("runtime instance heartbeat failed: %v", err)
+		reporter, err = newInstanceReporter(hostedClient, instanceID, startedAt)
+		if err != nil {
+			return err
 		}
 	}
-	report()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+	heartbeat := func() controlplane.InstanceHeartbeat {
+		return instanceHeartbeat(server.Stats(), telemetryExporter.Stats().Dropped, runtimeDescriptor, workload, startedAt)
+	}
+	warm := func(ctx context.Context) {
+		if warmPlans == nil {
 			return
-		case <-ticker.C:
-			report()
 		}
+		for _, route := range warmRoutesFromEnv() {
+			if err := warmPlans.Warm(ctx, route); err != nil && ctx.Err() == nil {
+				log.Printf("warm route failed")
+			}
+		}
+		warmPlans.Run(ctx)
 	}
-}
-
-func reportInstance(ctx context.Context, client *controlplane.Client, server *gateway.Server, telemetry *runtimepkg.TelemetryExporter, descriptor protocol.RuntimeDescriptor, workload *protocol.Workload, startedAt time.Time) error {
-	stats := server.Stats()
-	telemetryStats := telemetry.Stats()
-	heartbeat := instanceHeartbeat(stats, telemetryStats.Dropped, descriptor, workload, startedAt)
-	return client.ReportInstance(ctx, descriptor.InstanceID, heartbeat)
+	return serveGateway(processCtx, server, listener, reporter, heartbeat, heartbeatInterval, warm)
 }
 
 func instanceHeartbeat(stats gateway.Stats, telemetryDropped uint64, descriptor protocol.RuntimeDescriptor, workload *protocol.Workload, startedAt time.Time) controlplane.InstanceHeartbeat {
