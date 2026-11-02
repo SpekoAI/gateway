@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -31,9 +32,51 @@ type InstanceHeartbeat struct {
 	Labels           map[string]string `json:"labels,omitempty"`
 }
 
+// InstanceHeartbeatV2 opts into lifetime fencing, not capacity attribution.
+// Callers serialize mutations and retain the same sequence/body on retries.
+type InstanceHeartbeatV2 struct {
+	InstanceHeartbeat
+	IncarnationID string `json:"incarnation_id"`
+	Sequence      uint32 `json:"sequence"`
+}
+
+// InstanceLifetimeV2 identifies one process for a terminal DELETE.
+// Reserve a sequence for shutdown and never wrap it under one incarnation.
+type InstanceLifetimeV2 struct {
+	IncarnationID string    `json:"incarnation_id"`
+	StartedAt     time.Time `json:"started_at"`
+	Sequence      uint32    `json:"sequence"`
+}
+
+const InstanceProtocolHeader = "Speko-Instance-Protocol"
+
+var incarnationPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// ReportInstanceV2 requires explicit server acknowledgement. It never falls
+// back to an unversioned report, which could undo a lifetime fence.
+func (c *Client) ReportInstanceV2(ctx context.Context, instanceID string, heartbeat InstanceHeartbeatV2) error {
+	if !validHeartbeat(instanceID, heartbeat.InstanceHeartbeat) || !incarnationPattern.MatchString(heartbeat.IncarnationID) || heartbeat.Sequence == 0 {
+		return errors.New("controlplane: invalid versioned runtime instance heartbeat")
+	}
+	return c.sendVersionedInstanceRequest(ctx, http.MethodPut, instanceID, heartbeat, true)
+}
+
+// DeregisterInstanceV2 closes only the specified lifetime. A timeout is retried
+// with this exact body; successful DELETE is terminal for that incarnation.
+func (c *Client) DeregisterInstanceV2(ctx context.Context, instanceID string, lifetime InstanceLifetimeV2) error {
+	if strings.TrimSpace(instanceID) == "" || !incarnationPattern.MatchString(lifetime.IncarnationID) || lifetime.StartedAt.IsZero() || lifetime.Sequence == 0 {
+		return errors.New("controlplane: invalid runtime instance lifetime")
+	}
+	return c.sendVersionedInstanceRequest(ctx, http.MethodDelete, instanceID, lifetime, true)
+}
+
+func validHeartbeat(instanceID string, heartbeat InstanceHeartbeat) bool {
+	return strings.TrimSpace(instanceID) != "" && strings.TrimSpace(heartbeat.RuntimeName) != "" && strings.TrimSpace(heartbeat.RuntimeVersion) != "" && !heartbeat.StartedAt.IsZero() && heartbeat.ActiveSessions >= 0 && heartbeat.PendingSessions >= 0 && heartbeat.SessionCapacity >= 1
+}
+
 // ReportInstance upserts one authenticated runtime instance heartbeat.
 func (c *Client) ReportInstance(ctx context.Context, instanceID string, heartbeat InstanceHeartbeat) error {
-	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(heartbeat.RuntimeName) == "" || strings.TrimSpace(heartbeat.RuntimeVersion) == "" || heartbeat.StartedAt.IsZero() || heartbeat.ActiveSessions < 0 || heartbeat.PendingSessions < 0 || heartbeat.SessionCapacity < 1 {
+	if !validHeartbeat(instanceID, heartbeat) {
 		return errors.New("controlplane: invalid runtime instance heartbeat")
 	}
 	return c.sendInstanceRequest(ctx, http.MethodPut, instanceID, heartbeat)
@@ -49,6 +92,10 @@ func (c *Client) DeregisterInstance(ctx context.Context, instanceID string) erro
 }
 
 func (c *Client) sendInstanceRequest(ctx context.Context, method, instanceID string, value any) error {
+	return c.sendVersionedInstanceRequest(ctx, method, instanceID, value, false)
+}
+
+func (c *Client) sendVersionedInstanceRequest(ctx context.Context, method, instanceID string, value any, versioned bool) error {
 	endpoint := c.resolve("/v1/runtime-instances/" + instanceID)
 	// URL.Path holds decoded text. Keep the ID as one escaped segment in
 	// RawPath so serialization escapes it once, preserving literal percent
@@ -70,6 +117,9 @@ func (c *Client) sendInstanceRequest(ctx context.Context, method, instanceID str
 		if err != nil {
 			return fmt.Errorf("controlplane: encode runtime instance heartbeat: %w", err)
 		}
+		if versioned && len(encoded) > 16*1024 {
+			return errors.New("controlplane: runtime instance report exceeds 16 KiB")
+		}
 		body = bytes.NewReader(encoded)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), body)
@@ -78,6 +128,9 @@ func (c *Client) sendInstanceRequest(ctx context.Context, method, instanceID str
 	}
 	request.Header.Set("Authorization", "Bearer "+c.bearer)
 	request.Header.Set("Accept", "application/json")
+	if versioned {
+		request.Header.Set(InstanceProtocolHeader, "2")
+	}
 	if value != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
@@ -92,6 +145,9 @@ func (c *Client) sendInstanceRequest(ctx context.Context, method, instanceID str
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes))
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return &HTTPError{Status: response.StatusCode, RequestID: response.Header.Get("X-Request-ID")}
+	}
+	if versioned && (response.StatusCode != http.StatusNoContent || response.Header.Get(InstanceProtocolHeader) != "2") {
+		return errors.New("controlplane: runtime instance protocol 2 was not acknowledged")
 	}
 	return nil
 }
