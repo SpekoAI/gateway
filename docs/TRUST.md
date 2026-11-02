@@ -68,6 +68,17 @@ Speko returns a signed, short-lived session plan. The gateway validates its
 structure, time bounds, issuer, audience, signature, provider endpoint, and
 adapter before it accepts media or attaches credentials.
 
+The opt-in control-plane methods `ReportInstanceV2` and `DeregisterInstanceV2`
+send content-free process metadata to the configured control-plane origin,
+authenticated by its Speko API key. Lifetime reports add a process incarnation
+UUID, mutation sequence and nanosecond start instant; DELETE identifies that
+same lifetime. Explicit server acknowledgement is required and these methods
+never fall back to unversioned mutations. Existing methods and command-line
+reporting remain unchanged. This protocol supplies no per-plan attribution,
+provider-account authority or capacity enforcement, and releases no reservations.
+See [the lifetime contract](../controlplane/instances-v2.md) for rollout and retry
+semantics. Descriptive labels must never contain content or secrets.
+
 ### Prefetched plans
 
 By default the gateway fetches plans **ahead of demand** and holds a small pool
