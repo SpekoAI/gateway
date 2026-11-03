@@ -44,12 +44,13 @@ def _error(payload: dict[str, Any]) -> GatewayError:
     code = value.get("code", "")
     if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", code):
         code = ""
-    retryable = value.get("retryable", False)
     return GatewayError(
         "Relay speech request failed",
         code=code,
         source="relay",
-        retryable=retryable if isinstance(retryable, bool) else False,
+        # A relay retry hint does not prove that this model request did no I/O.
+        # Framework retries open a new request and could charge it twice.
+        retryable=False,
     )
 
 
@@ -218,10 +219,19 @@ class RelaySpeechClient:
         except BaseException as error:
             if websocket is not None:
                 await websocket.close()
+            if isinstance(error, aiohttp.WSServerHandshakeError):
+                raise GatewayError(
+                    "Relay speech handshake failed",
+                    source="relay",
+                    code=f"http_{error.status}",
+                    retryable=False,
+                ) from None
             if isinstance(
                 error, (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError)
             ):
-                raise GatewayError("Relay speech connection failed") from None
+                raise GatewayError(
+                    "Relay speech connection failed", retryable=False
+                ) from None
             raise
 
 
@@ -286,8 +296,11 @@ class RelaySpeechSession:
         await self._send({"type": "input.commit"})
 
     async def cancel(self) -> None:
-        if self._kind != "tts":
-            raise ValueError("Cancel requires TTS")
+        if self._kind == "stt":
+            # Native STT has no cancel control. Disconnect aborts that stream;
+            # its durable receipt and settlement lifecycle remains on the relay.
+            await self.aclose()
+            return
         await self._send({"type": "input.cancel"})
 
     async def finish(self) -> None:

@@ -23,7 +23,7 @@ speech = RelaySpeechClient(
     base_url=relay_origin,
 )
 stt = STT(speech, provider=stt_provider, model=stt_model,
-          language=stt_language, credential_source="managed")
+          language=stt_language, credential_source="managed", turn_vad=local_vad)
 tts = TTS(speech, provider=tts_provider, model=tts_model, voice="",
           language=tts_language, credential_source="managed")
 ```
@@ -35,6 +35,17 @@ accept the same client and explicit managed configuration. Native admission's
 `session.ready` frame checks readiness; these clients use no local health probe
 and Pipecat's optional automatic provider fallback does not apply to them.
 Close both models and then `await speech.aclose()` at the end of the call.
+
+Relay-backed LiveKit STT requires `turn_vad`, the worker's local LiveKit VAD.
+Native transcript finals can be pieces within one turn and do not assert end
+of speech. The VAD's actual start/end events supply those boundaries, keep the
+stream open across turns, and finalize at speech end. Missing VAD is refused
+before admission. Pipecat uses its pipeline's VAD and explicit commits.
+
+Native speech disables LiveKit automatic retries for streaming STT, recognition,
+streaming TTS and chunked synthesis, including when retry-enabled connection
+options were supplied. Relay retry hints and timeouts cannot prove no provider
+I/O occurred; a new attempt needs an explicit control-plane decision.
 
 The client preserves binary PCM, stream commits, TTS cancellation and native
 error codes. Live usage updates remain progress events; only a terminal frame

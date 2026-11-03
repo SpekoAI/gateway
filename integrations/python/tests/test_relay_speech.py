@@ -237,6 +237,62 @@ async def test_native_speech_refuses_byok_or_auto_routes_before_network_io():
     assert seen == []
 
 
+async def test_pipecat_stt_interrupt_closes_the_live_native_socket_without_tts_cancel():
+    pytest.importorskip("pipecat")
+    from unittest.mock import AsyncMock
+
+    from speko_gateway.pipecat import SpekoSTTService
+
+    received = asyncio.Event()
+    closed = asyncio.Event()
+    controls = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                received.set()
+            else:
+                controls.append(json.loads(message.data))
+        closed.set()
+        return ws
+
+    async with server(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        service = SpekoSTTService(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            sample_rate=16000,
+        )
+        service._sample_rate = 16000
+        service.push_error = AsyncMock()
+        try:
+            await service._connect()
+            assert [event async for event in service.run_stt(b"\xff\x0f" * 160)] == [
+                None
+            ]
+            await asyncio.wait_for(received.wait(), 2)
+            task = service._receive_task
+            await service._finish(graceful=False)
+            await asyncio.wait_for(closed.wait(), 2)
+            assert service._session is None
+            assert task.done()
+            assert controls == []
+            service.push_error.assert_not_awaited()
+        finally:
+            await service._finish(graceful=False)
+            await client.aclose()
+
+
 async def test_parallel_session_clients_keep_credentials_private_and_report_only_terminal_usage(
     monkeypatch,
 ):

@@ -24,6 +24,7 @@ from livekit.agents import (
     stt,
     tts,
     utils,
+    vad,
 )
 from livekit.agents.llm.tool_context import get_raw_function_info
 from livekit.agents.utils import is_given
@@ -46,6 +47,19 @@ from .relay import (
     RelayLLMClient,
     validate_reasoning_effort,
 )
+from .relay_speech import RelaySpeechClient
+
+
+def _speech_connect_options(
+    client: SpeechClient, options: APIConnectOptions
+) -> APIConnectOptions:
+    # Some supported LiveKit releases retry STT regardless of error.retryable;
+    # outer chunked synthesis can also replay input. Fence every framework loop.
+    return (
+        dataclasses.replace(options, max_retry=0)
+        if isinstance(client, RelaySpeechClient)
+        else options
+    )
 
 
 def _report_stream_leg(kind: str, stream: Any) -> None:
@@ -119,7 +133,13 @@ class STT(stt.STT):
         keywords: Sequence[str] | None = None,
         noise_reduction: bool | None = None,
         provider_options: Mapping[str, Mapping[str, Any]] | None = None,
+        turn_vad: vad.VAD | None = None,
     ) -> None:
+        if isinstance(client, RelaySpeechClient) and turn_vad is None:
+            raise ValueError(
+                "Native relay STT requires a local turn_vad for speech boundaries"
+            )
+        self._turn_vad = turn_vad if isinstance(client, RelaySpeechClient) else None
         # Options are declared here and enforced at session create: a provider
         # that cannot honor a canonical ask refuses the session with the option
         # named (`stt_option_unsupported`), so the capabilities declared below
@@ -141,7 +161,8 @@ class STT(stt.STT):
                 offline_recognize=True,
                 keyterms=bool(keywords),
                 chat_context=False,
-                manual_flush=provider.strip().lower() in _FLUSH_ON_TURN_END_PROVIDERS,
+                manual_flush=provider.strip().lower() in _FLUSH_ON_TURN_END_PROVIDERS
+                and not isinstance(client, RelaySpeechClient),
             )
         )
         self._client = client or GatewayClient.from_env()
@@ -160,6 +181,19 @@ class STT(stt.STT):
     @property
     def provider(self) -> str:
         return "speko"
+
+    async def recognize(
+        self,
+        buffer: Any,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> stt.SpeechEvent:
+        return await super().recognize(
+            buffer,
+            language=language,
+            conn_options=_speech_connect_options(self._client, conn_options),
+        )
 
     async def _recognize_impl(
         self,
@@ -190,6 +224,7 @@ class STT(stt.STT):
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> SpeechStream:
+        conn_options = _speech_connect_options(self._client, conn_options)
         resolved_language = str(language) if is_given(language) else self._language
         bridge = LiveKitSTTBridge(
             self._client,
@@ -205,6 +240,7 @@ class STT(stt.STT):
             language=resolved_language,
             conn_options=conn_options,
             sample_rate=self._sample_rate,
+            turn_vad=self._turn_vad,
         )
         self._streams.add(stream)
         return stream
@@ -226,6 +262,7 @@ class SpeechStream(stt.RecognizeStream):
         language: str,
         conn_options: APIConnectOptions,
         sample_rate: int,
+        turn_vad: vad.VAD | None = None,
     ) -> None:
         super().__init__(
             stt=stt_instance,
@@ -239,6 +276,9 @@ class SpeechStream(stt.RecognizeStream):
         self._speaking = False
         self._saw_final_for_turn = False
         self._awaiting_final = False
+        self._turn_vad = turn_vad
+        self._vad_stream: vad.VADStream | None = None
+        self._vad_input_finished = False
 
     async def _run(self) -> None:
         first_frame = None
@@ -253,6 +293,9 @@ class SpeechStream(stt.RecognizeStream):
         try:
             self._gateway_stream = await self._bridge.start(first_frame)
             _report_stream_leg("stt", self._gateway_stream)
+            if self._turn_vad is not None:
+                self._vad_stream = self._turn_vad.stream()
+                self._vad_stream.push_frame(first_frame)
             await self._gateway_stream.push_frame(first_frame)
             send_task = asyncio.create_task(
                 self._send_audio(), name="speko.livekit.stt.send"
@@ -260,16 +303,24 @@ class SpeechStream(stt.RecognizeStream):
             receive_task = asyncio.create_task(
                 self._receive_events(), name="speko.livekit.stt.receive"
             )
+            vad_task = (
+                asyncio.create_task(self._receive_vad(), name="speko.livekit.stt.vad")
+                if self._vad_stream is not None
+                else None
+            )
+            tasks = (
+                send_task,
+                receive_task,
+                *([vad_task] if vad_task is not None else []),
+            )
             try:
-                done, _ = await asyncio.wait(
-                    (send_task, receive_task), return_when=asyncio.FIRST_COMPLETED
-                )
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     task.result()
                 if receive_task not in done:
-                    await receive_task
+                    await asyncio.gather(*tasks)
             finally:
-                await utils.aio.cancel_and_wait(send_task, receive_task)
+                await utils.aio.cancel_and_wait(*tasks)
         except asyncio.CancelledError:
             raise
         except GatewayError as err:
@@ -283,6 +334,8 @@ class SpeechStream(stt.RecognizeStream):
         except OSError as err:
             raise APIConnectionError("Speko Gateway STT transport failed") from err
         finally:
+            if self._vad_stream is not None:
+                await self._vad_stream.aclose()
             if self._gateway_stream is not None:
                 try:
                     await asyncio.shield(self._gateway_stream.aclose())
@@ -299,10 +352,36 @@ class SpeechStream(stt.RecognizeStream):
                 last_was_flush = True
             else:
                 await self._gateway_stream.push_frame(item)
+                if self._vad_stream is not None:
+                    self._vad_stream.push_frame(item)
                 last_was_flush = False
+        self._vad_input_finished = True
+        if self._vad_stream is not None:
+            self._vad_stream.end_input()
         if not last_was_flush:
             await self._gateway_stream.flush()
         await self._gateway_stream.finish()
+
+    async def _receive_vad(self) -> None:
+        assert self._vad_stream is not None and self._gateway_stream is not None
+        try:
+            async for event in self._vad_stream:
+                if event.type == vad.VADEventType.START_OF_SPEECH:
+                    self._emit(LiveKitSpeechEvent(type="speech.started"))
+                elif event.type == vad.VADEventType.END_OF_SPEECH:
+                    if not self._vad_input_finished:
+                        await self._gateway_stream.flush()
+                    self._emit(LiveKitSpeechEvent(type="speech.ended"))
+            if not self._vad_input_finished:
+                raise GatewayError(
+                    "Local speech boundary detector ended", retryable=False
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 -- supplied VAD errors may contain customer data
+            raise GatewayError(
+                "Local speech boundary detector failed", retryable=False
+            ) from None
 
     async def _receive_events(self) -> None:
         assert self._gateway_stream is not None
@@ -341,6 +420,26 @@ class SpeechStream(stt.RecognizeStream):
         if event.type not in {"transcript.delta", "transcript.final"} or not event.text:
             return
         is_final = event.type == "transcript.final"
+        if self._vad_stream is not None:
+            # Native finals can be segments within one turn, including delayed
+            # finals after VAD EOS. Only the actual local VAD starts/ends turns.
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT
+                    if is_final
+                    else stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                    request_id=self._request_id,
+                    alternatives=[
+                        stt.SpeechData(
+                            language=event.language or self._language,
+                            text=event.text,
+                            start_time=event.start_time or 0.0,
+                            end_time=event.end_time or 0.0,
+                        )
+                    ],
+                )
+            )
+            return
         if is_final and self._awaiting_final:
             self._awaiting_final = False
             self._event_ch.send_nowait(
@@ -470,13 +569,14 @@ class TTS(tts.TTS):
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> tts.ChunkedStream:
-        return self._synthesize_with_stream(text, conn_options=conn_options)
+        return self._synthesize_with_stream(text, conn_options=_speech_connect_options(self._client,conn_options))
 
     def stream(
         self,
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> SynthesisStream:
+        conn_options=_speech_connect_options(self._client,conn_options)
         bridge = LiveKitTTSBridge(
             self._client,
             voice=self._voice,
