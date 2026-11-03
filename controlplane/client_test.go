@@ -388,7 +388,7 @@ func TestRefreshCredentialBoundsAStalledRetry(t *testing.T) {
 
 func TestRefreshCredentialPreservesOpaquePathSegments(t *testing.T) {
 	t.Parallel()
-	for i, sessionID := range []string{"simple", "客户\x00\ufeff", "a/b%?#", "e\u0301"} {
+	for i, sessionID := range []string{"simple", "客户\x00\ufeff", "a/b%?#", "e\u0301", ".", ".."} {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			t.Parallel()
 			plan := validPlan()
