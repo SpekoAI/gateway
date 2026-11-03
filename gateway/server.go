@@ -130,6 +130,7 @@ type Server struct {
 // hosted customer control plane. It intentionally excludes local socket
 // paths, host resources, request bodies, and session identifiers.
 type Stats struct {
+	Capacity        protocol.CapacitySnapshot
 	ActiveSessions  int64
 	PendingSessions int
 	SessionCapacity int
@@ -140,6 +141,7 @@ type Stats struct {
 // localSession keeps local lifecycle state that must be updated atomically
 // with the session registry. Provider events remain owned by runtime.Session.
 type localSession struct {
+	capacity        trackedCapacity
 	session         *runtimepkg.Session
 	idempotencyKey  string
 	attached        bool
@@ -152,6 +154,8 @@ type localSession struct {
 // Its result is published before done is closed, so concurrent local retries
 // can reuse the leader's outcome without opening another provider session.
 type inflightCreate struct {
+	capacity    trackedCapacity
+	pending     bool
 	done        chan struct{}
 	fingerprint [sha256.Size]byte
 	outcome     createOutcome
@@ -303,10 +307,11 @@ func (s *Server) Handler() http.Handler {
 // operational tooling.
 func (s *Server) Stats() Stats {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	pending := s.pendingSessions
 	draining := s.draining
-	s.mu.Unlock()
 	return Stats{
+		Capacity:        s.capacityLocked(),
 		ActiveSessions:  s.sessionsActive.Load(),
 		PendingSessions: pending,
 		SessionCapacity: s.maxSessions,
@@ -501,11 +506,11 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 		writeError(writer, http.StatusTooManyRequests, "local_concurrency_exhausted", "gateway session limit reached")
 		return
 	}
-	inflight := &inflightCreate{done: make(chan struct{}), fingerprint: fingerprint}
+	inflight := &inflightCreate{done: make(chan struct{}), fingerprint: fingerprint, pending: true, capacity: trackedCapacity{source: body.Execution.CredentialSource}}
 	s.inflight[idempotencyKey] = inflight
 	s.pendingSessions++
 	s.mu.Unlock()
-	defer s.finishPendingSession()
+	defer s.finishPendingSession(inflight)
 	// Creation is shared by all callers with this idempotency key. It must not
 	// inherit cancellation from whichever request happened to become leader.
 	setupCtx, cancel := context.WithTimeout(context.Background(), s.setupTimeout)
@@ -518,7 +523,11 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 		writeCreateOutcome(writer, outcome, false)
 		return
 	}
-	session, plan, requestID, err := s.openWithFallback(setupCtx, body, plan, requestID, idempotencyKey)
+	session, plan, requestID, err := s.openWithFallback(setupCtx, body, plan, requestID, idempotencyKey, func(c *protocol.CapacityAttribution, source protocol.CredentialSource) {
+		s.mu.Lock()
+		inflight.capacity = verifiedCapacity(c, source)
+		s.mu.Unlock()
+	})
 	if err != nil {
 		outcome := createOutcome{status: http.StatusBadGateway, code: "session_open_failed", message: "provider session could not be opened", requestID: requestID}
 		var providerError *runtimepkg.ProviderError
@@ -563,10 +572,12 @@ func (s *Server) createSession(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	local := &localSession{
+		capacity:       inflight.capacity,
 		session:        session,
 		idempotencyKey: idempotencyKey,
 		attachDeadline: s.now().Add(s.attachTimeout),
 	}
+	s.finishPendingLocked(inflight)
 	s.sessions[plan.SessionID] = local
 	s.idempotency[idempotencyKey] = idempotencyRecord{response: response, fingerprint: fingerprint}
 	s.sessionsActive.Add(1)
@@ -605,8 +616,8 @@ func (s *Server) sessionPlan(ctx context.Context, request protocol.SessionPlanRe
 // verification, adapter wiring) never consume the single exchange, and the
 // whole recovery stays inside the caller's bounded setup context. A failed
 // exchange reports the original open failure; a failed reopen is terminal.
-func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest, plan protocol.SessionPlan, requestID, idempotencyKey string) (*runtimepkg.Session, protocol.SessionPlan, string, error) {
-	session, err := s.openSession(ctx, body, plan)
+func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest, plan protocol.SessionPlan, requestID, idempotencyKey string, onVerified func(*protocol.CapacityAttribution, protocol.CredentialSource)) (*runtimepkg.Session, protocol.SessionPlan, string, error) {
+	session, err := s.openSession(ctx, body, plan, onVerified)
 	if err == nil {
 		return session, plan, requestID, nil
 	}
@@ -621,7 +632,7 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 	// exchange in reserve for when the pool cannot help.
 	if s.warmPlans != nil {
 		if retryPlan, warm := s.warmPlans.Take(planRequestFor(body, s.runtime, s.workload)); warm {
-			retrySession, retryErr := s.openSession(ctx, body, retryPlan)
+			retrySession, retryErr := s.openSession(ctx, body, retryPlan, onVerified)
 			if retryErr == nil {
 				return retrySession, retryPlan, requestID, nil
 			}
@@ -644,7 +655,7 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 	if fallbackRequestID == "" {
 		fallbackRequestID = requestID
 	}
-	session, retryErr := s.openSession(ctx, body, fallbackPlan)
+	session, retryErr := s.openSession(ctx, body, fallbackPlan, onVerified)
 	if retryErr != nil {
 		return nil, fallbackPlan, fallbackRequestID, retryErr
 	}
@@ -655,7 +666,7 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 // STT ask the PLANNED provider cannot honor. The check runs per plan rather
 // than per create because failover may answer from a different provider than
 // the first attempt — every provider actually dialed must pass it.
-func (s *Server) openSession(ctx context.Context, body CreateSessionRequest, plan protocol.SessionPlan) (*runtimepkg.Session, error) {
+func (s *Server) openSession(ctx context.Context, body CreateSessionRequest, plan protocol.SessionPlan, onVerified func(*protocol.CapacityAttribution, protocol.CredentialSource)) (*runtimepkg.Session, error) {
 	if body.Kind == protocol.SessionKindSTT {
 		if err := validateSttRouteSupport(plan.Route.Provider, plan.Route.Model, body.Request.STT); err != nil {
 			return nil, err
@@ -666,7 +677,7 @@ func (s *Server) openSession(ctx context.Context, body CreateSessionRequest, pla
 			return nil, err
 		}
 	}
-	open := runtimepkg.OpenRequest{Kind: body.Kind, Plan: plan, Options: body.Request, Media: body.Media}
+	open := runtimepkg.OpenRequest{Kind: body.Kind, Plan: plan, Options: body.Request, Media: body.Media, OnVerifiedCapacity: onVerified}
 	if refresher, ok := s.plans.(CredentialRefresher); ok && plan.Execution.CredentialSource == protocol.CredentialsManaged && plan.Execution.ProviderRoute == protocol.RouteProviderDirect {
 		open.RefreshCredential = func(ctx context.Context) (protocol.DelegatedCredential, error) {
 			credential, _, err := refresher.RefreshCredential(ctx, plan, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"})
@@ -772,10 +783,16 @@ func (s *Server) detachSessionLocked(sessionID string, expected *runtimepkg.Sess
 	return local.session, true
 }
 
-func (s *Server) finishPendingSession() {
+func (s *Server) finishPendingLocked(inflight *inflightCreate) {
+	if inflight.pending {
+		inflight.pending = false
+		s.pendingSessions--
+		s.closeDrainedLocked()
+	}
+}
+func (s *Server) finishPendingSession(inflight *inflightCreate) {
 	s.mu.Lock()
-	s.pendingSessions--
-	s.closeDrainedLocked()
+	s.finishPendingLocked(inflight)
 	s.mu.Unlock()
 }
 
@@ -903,6 +920,7 @@ func (s *Server) finishCreate(idempotencyKey string, inflight *inflightCreate, o
 	s.mu.Lock()
 	if current, exists := s.inflight[idempotencyKey]; exists && current == inflight {
 		current.outcome = outcome
+		s.finishPendingLocked(current)
 		delete(s.inflight, idempotencyKey)
 		close(current.done)
 	}

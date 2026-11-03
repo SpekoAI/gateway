@@ -71,11 +71,14 @@ func (l Limits) validate() error {
 // OpenRequest supplies the operation-specific information omitted from a
 // signed SessionPlan because the plan is also used by local and remote APIs.
 type OpenRequest struct {
-	Kind     protocol.SessionKind
-	Plan     protocol.SessionPlan
-	Options  protocol.RequestOptions
-	Media    *protocol.MediaFormat
-	Delivery AudioDeliveryMode
+	// Called synchronously after verification and before provider I/O. Metrics
+	// consumers receive only the nonsecret, signed accounting projection.
+	OnVerifiedCapacity func(*protocol.CapacityAttribution, protocol.CredentialSource)
+	Kind               protocol.SessionKind
+	Plan               protocol.SessionPlan
+	Options            protocol.RequestOptions
+	Media              *protocol.MediaFormat
+	Delivery           AudioDeliveryMode
 	// RefreshCredential is passed through to AdapterRequest unchanged.
 	RefreshCredential CredentialRefresher
 }

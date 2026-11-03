@@ -137,6 +137,14 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if strings.TrimSpace(adapterOptions.Voice) == "" && (!languageVoice || strings.TrimSpace(adapterOptions.Language) == "") {
 		adapterOptions.Voice = adapterPlan.Route.Voice
 	}
+	if request.OnVerifiedCapacity != nil {
+		var capacity *protocol.CapacityAttribution
+		if request.Plan.Capacity != nil {
+			value := *request.Plan.Capacity
+			capacity = &value
+		}
+		request.OnVerifiedCapacity(capacity, request.Plan.Execution.CredentialSource)
+	}
 	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential})
 	if err != nil {
 		cancel()
@@ -210,6 +218,15 @@ func resolveLocalCredential(credential LocalCredential) (string, error) {
 }
 
 func validateOpenRequest(request OpenRequest, now time.Time) error {
+	if c := request.Plan.Capacity; c != nil {
+		expected := string(request.Kind) + "_streams"
+		if request.Kind == protocol.SessionKindRealtime {
+			expected = "realtime_sessions"
+		}
+		if c.Capability != expected {
+			return fmt.Errorf("invalid signed capacity kind")
+		}
+	}
 	if err := request.Plan.Validate(now); err != nil {
 		return fmt.Errorf("invalid session plan: %w", err)
 	}
