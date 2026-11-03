@@ -35,6 +35,7 @@ from ._livekit_bridge import (
     LiveKitTTSBridge,
     LiveKitTTSStream,
 )
+from ._speech_client import SpeechClient
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
 from .client import GatewayClient, GatewayError
 from .probe import report_leg as _report_probe_leg
@@ -107,7 +108,7 @@ class STT(stt.STT):
 
     def __init__(
         self,
-        client: GatewayClient | None = None,
+        client: SpeechClient | None = None,
         *,
         language: str = "en",
         model: str = "auto",
@@ -406,7 +407,7 @@ class TTS(tts.TTS):
 
     def __init__(
         self,
-        client: GatewayClient | None = None,
+        client: SpeechClient | None = None,
         *,
         voice: str = "",
         language: str = "en",

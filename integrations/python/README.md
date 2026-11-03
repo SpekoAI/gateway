@@ -1,10 +1,47 @@
 # Speko Gateway Python integration
 
 This package connects Python voice-agent frameworks to the authenticated local
-Speko Gateway socket, and optionally to the hosted Speko Router for LLM and
-typed evaluation. The
-voice classes read no Speko API key or provider credentials; only the relay
-hosted clients authenticate with `SPEKO_API_KEY`.
+Speko Gateway socket, or to the Speko Router's native STT, TTS, LLM and typed
+evaluation surfaces. Voice classes use an explicitly supplied transport client
+or the local Gateway socket. Relay clients carry their own Speko credential.
+
+## Native relay speech
+
+`RelaySpeechClient` sends STT/TTS streams through the router's native execution
+grants. Give each platform session its own registered model credential; the
+client takes the key, platform session UUID and configured relay origin
+explicitly and never reads `SPEKO_API_KEY` or shares warm plans. The relay and
+cell still perform admission, enforce the compiled route and settle usage.
+
+```python
+from speko_gateway import RelaySpeechClient
+from speko_gateway.livekit import STT, TTS
+
+speech = RelaySpeechClient(
+    api_key=model_key,
+    session_id=spec.session_id,
+    base_url=relay_origin,
+)
+stt = STT(speech, provider=stt_provider, model=stt_model,
+          language=stt_language, credential_source="managed")
+tts = TTS(speech, provider=tts_provider, model=tts_model, voice="",
+          language=tts_language, credential_source="managed")
+```
+
+The provider/model/language fields come from the compiled spec. A managed
+worker leaves the original TTS voice blank so the cell can sign its compiled
+voice override. `SpekoSTTService` and `SpekoTTSService` in `speko_gateway.pipecat`
+accept the same client and explicit managed configuration. Native admission's
+`session.ready` frame checks readiness; these clients use no local health probe
+and Pipecat's optional automatic provider fallback does not apply to them.
+Close both models and then `await speech.aclose()` at the end of the call.
+
+The client preserves binary PCM, stream commits, TTS cancellation and native
+error codes. Live usage updates remain progress events; only a terminal frame
+with final usage produces `usage.reported`. A lost terminal frame fails without
+an automatic retry. These transport tests use owned protocol peers; wiring
+worker claims through the actual cell and settling a full conversation remains
+an integration gate.
 
 For LiveKit Agents:
 

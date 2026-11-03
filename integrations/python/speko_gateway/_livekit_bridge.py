@@ -6,12 +6,11 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from ._speech_client import SpeechClient, SpeechSession
 from ._voice import CredentialSource, execution_from_env
 from .client import (
     CanonicalEvent,
-    GatewayClient,
     GatewayError,
-    GatewaySession,
     SessionConfig,
 )
 
@@ -48,7 +47,7 @@ class LiveKitSTTBridge:
 
     def __init__(
         self,
-        client: GatewayClient,
+        client: SpeechClient,
         *,
         language: str = "en",
         model: str = "auto",
@@ -96,7 +95,7 @@ class LiveKitTTSBridge:
 
     def __init__(
         self,
-        client: GatewayClient,
+        client: SpeechClient,
         *,
         voice: str = "",
         language: str = "en",
@@ -151,7 +150,7 @@ class LiveKitTTSBridge:
 
 
 class LiveKitTTSStream:
-    def __init__(self, session: GatewaySession) -> None:
+    def __init__(self, session: SpeechSession) -> None:
         self._session = session
 
     @property
@@ -193,7 +192,7 @@ class LiveKitTTSStream:
 
 
 class LiveKitSTTStream:
-    def __init__(self, session: GatewaySession) -> None:
+    def __init__(self, session: SpeechSession) -> None:
         self._session = session
 
     @property
