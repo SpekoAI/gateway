@@ -395,13 +395,22 @@ func TestRefreshCredentialPreservesOpaquePathSegments(t *testing.T) {
 			plan.Execution.CredentialSource = protocol.CredentialsManaged
 			plan.SessionID = sessionID
 			plan.AttemptID = "att:one/two"
-			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				expected := "/cell%20one/v1/sessions/" + url.PathEscape(plan.SessionID) + "/attempts/" + url.PathEscape(plan.AttemptID) + "/credentials"
+			mux := http.NewServeMux()
+			mux.HandleFunc("POST /", func(w http.ResponseWriter, r *http.Request) {
+				segment := url.PathEscape(plan.SessionID)
+				if plan.SessionID == "." {
+					segment = "%2E"
+				}
+				if plan.SessionID == ".." {
+					segment = "%2E%2E"
+				}
+				expected := "/cell%20one/v1/sessions/" + segment + "/attempts/" + url.PathEscape(plan.AttemptID) + "/credentials"
 				if r.URL.EscapedPath() != expected {
 					t.Errorf("escaped path = %q, want %q", r.URL.EscapedPath(), expected)
 				}
 				_ = json.NewEncoder(w).Encode(protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "fresh-token", ExpiresAt: time.Now().Add(time.Minute)})
-			}))
+			})
+			server := httptest.NewTLSServer(mux)
 			t.Cleanup(server.Close)
 			client, err := controlplane.New(controlplane.Config{BaseURL: server.URL + "/cell%20one", APIKey: "sk_speko_test", HTTPClient: server.Client()})
 			if err != nil {
@@ -412,5 +421,56 @@ func TestRefreshCredentialPreservesOpaquePathSegments(t *testing.T) {
 				t.Fatalf("refresh = %+v, %v", credential, err)
 			}
 		})
+	}
+}
+
+func TestRefreshAndPlanningShareEscapedBaseSemanticsAndDotIdentities(t *testing.T) {
+	for _, base := range []struct{ suffix, prefix string }{
+		{"/cell%2F", "/cell"}, {"/cell%2F/", "/cell"},
+		{"/cell%2f%2F///", "/cell"}, {"/control%2Fplane/", "/control%2Fplane"},
+		{"/cell%252F/", "/cell%252F"},
+	} {
+		for _, identity := range []struct{ session, attempt, encodedSession, encodedAttempt string }{
+			{".", "..", "%2E", "%2E%2E"}, {"..", ".", "%2E%2E", "%2E"},
+		} {
+			t.Run(base.suffix+"/"+identity.session, func(t *testing.T) {
+				var calls atomic.Int32
+				mux := http.NewServeMux()
+				mux.HandleFunc("POST /", func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					if strings.HasSuffix(r.URL.Path, "/session-plans") {
+						if r.URL.EscapedPath() != base.prefix+"/v1/session-plans" {
+							t.Errorf("plan prefix changed: %s", r.URL.EscapedPath())
+						}
+						_ = json.NewEncoder(w).Encode(validPlan())
+						return
+					}
+					expected := base.prefix + "/v1/sessions/" + identity.encodedSession + "/attempts/" + identity.encodedAttempt + "/credentials"
+					if r.URL.EscapedPath() != expected {
+						t.Errorf("refresh path changed: %s", r.URL.EscapedPath())
+					}
+					_ = json.NewEncoder(w).Encode(protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "owned-fresh", ExpiresAt: time.Now().Add(time.Minute)})
+				})
+				peer := httptest.NewTLSServer(mux)
+				defer peer.Close()
+				client, err := controlplane.New(controlplane.Config{BaseURL: peer.URL + base.suffix, APIKey: "sk_speko_owned", HTTPClient: peer.Client()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _, err = client.CreateSessionPlan(context.Background(), validRequest(), controlplane.CreateOptions{IdempotencyKey: "owned-plan"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				plan := validPlan()
+				plan.Execution.CredentialSource = protocol.CredentialsManaged
+				plan.SessionID, plan.AttemptID = identity.session, identity.attempt
+				if _, _, err := client.RefreshCredential(context.Background(), plan, controlplane.CredentialRefreshRequest{Reason: "owned-reconnect"}); err != nil {
+					t.Fatal(err)
+				}
+				if calls.Load() != 2 {
+					t.Fatal("the normalizing router changed a POST identity")
+				}
+			})
+		}
 	}
 }

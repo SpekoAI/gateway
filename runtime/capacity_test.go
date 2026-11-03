@@ -18,7 +18,13 @@ func TestInvalidSignatureNeverPublishesCapacityOrOpensProvider(t *testing.T) {
 	}
 	plan := validPlan(protocol.SessionKindSTT, adapter.ID(), 60)
 	called := false
-	_, err = engine.Open(context.Background(), runtimepkg.OpenRequest{Kind: protocol.SessionKindSTT, Plan: plan, Media: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1}, OnVerifiedCapacity: func(*protocol.CapacityAttribution, protocol.CredentialSource) { called = true }})
+	_, err = engine.Open(context.Background(), runtimepkg.OpenRequest{Kind: protocol.SessionKindSTT, Plan: plan, Media: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1},
+		OnVerifiedCapacity: func(*protocol.CapacityAttribution, protocol.CredentialSource) { called = true },
+		TrackVerifiedCapacity: func(*protocol.CapacityAttribution, protocol.CredentialSource) (func(), error) {
+			called = true
+			return func() {}, nil
+		},
+	})
 	if err == nil || called || adapter.LastStream() != nil {
 		t.Fatal("unverified plan crossed accounting/provider boundary")
 	}

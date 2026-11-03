@@ -137,46 +137,71 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if strings.TrimSpace(adapterOptions.Voice) == "" && (!languageVoice || strings.TrimSpace(adapterOptions.Language) == "") {
 		adapterOptions.Voice = adapterPlan.Route.Voice
 	}
-	if request.OnVerifiedCapacity != nil {
-		var capacity *protocol.CapacityAttribution
-		if request.Plan.Capacity != nil {
-			value := *request.Plan.Capacity
-			capacity = &value
+	var capacity *protocol.CapacityAttribution
+	if request.Plan.Capacity != nil {
+		value := *request.Plan.Capacity
+		capacity = &value
+	}
+	release := func() {}
+	if request.TrackVerifiedCapacity != nil {
+		tracked, err := request.TrackVerifiedCapacity(capacity, request.Plan.Execution.CredentialSource)
+		if err != nil {
+			cancel()
+			return nil, err
 		}
+		var once sync.Once
+		release = func() {
+			once.Do(func() {
+				if tracked != nil {
+					tracked()
+				}
+			})
+		}
+	}
+	if request.OnVerifiedCapacity != nil {
 		request.OnVerifiedCapacity(capacity, request.Plan.Execution.CredentialSource)
 	}
 	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential})
 	if err != nil {
 		cancel()
+		if stream == nil {
+			release()
+		} else {
+			go stopOpenedProvider(stream, release)
+		}
 		e.recordOpenFailure(request, err)
 		return nil, fmt.Errorf("open provider stream: %w", err)
 	}
 	openLatency := e.now().Sub(openStarted)
 	if stream == nil {
 		cancel()
+		release()
 		e.recordOpenFailure(request, errors.New("provider stream is required"))
 		return nil, errors.New("provider stream is required")
 	}
 	providerEvents := stream.Events()
 	if providerEvents == nil {
 		cancel()
+		go stopOpenedProvider(stream, release)
 		e.recordOpenFailure(request, errors.New("provider stream must expose an events channel"))
 		return nil, errors.New("provider stream must expose an events channel")
 	}
 
 	session := &Session{
-		kind:           request.Kind,
-		plan:           request.Plan,
-		stream:         stream,
-		providerEvents: providerEvents,
-		ctx:            sessionCtx,
-		cancel:         cancel,
-		input:          newInputQueue(e.limits.MaxInputMessages, e.limits.MaxInputBytes),
-		events:         make(chan protocol.Event, e.limits.MaxOutputEvents+1),
-		done:           make(chan struct{}),
-		limits:         e.limits,
-		telemetry:      e.telemetry,
-		now:            e.now,
+		kind:            request.Kind,
+		plan:            request.Plan,
+		stream:          stream,
+		providerEvents:  providerEvents,
+		ctx:             sessionCtx,
+		cancel:          cancel,
+		input:           newInputQueue(e.limits.MaxInputMessages, e.limits.MaxInputBytes),
+		events:          make(chan protocol.Event, e.limits.MaxOutputEvents+1),
+		done:            make(chan struct{}),
+		eventsStopped:   make(chan struct{}),
+		releasePhysical: release,
+		limits:          e.limits,
+		telemetry:       e.telemetry,
+		now:             e.now,
 	}
 	if request.Media != nil {
 		session.media = *request.Media
@@ -267,19 +292,21 @@ func validateOpenRequest(request OpenRequest, now time.Time) error {
 // Session is an active, single-provider attempt. Its methods are safe to call
 // from multiple goroutines; provider calls remain serialized by runInput.
 type Session struct {
-	kind           protocol.SessionKind
-	media          protocol.MediaFormat
-	plan           protocol.SessionPlan
-	stream         ProviderStream
-	providerEvents <-chan ProviderEvent
-	ctx            context.Context
-	cancel         context.CancelFunc
-	input          *inputQueue
-	events         chan protocol.Event
-	done           chan struct{}
-	limits         Limits
-	telemetry      TelemetrySink
-	now            func() time.Time
+	kind            protocol.SessionKind
+	media           protocol.MediaFormat
+	plan            protocol.SessionPlan
+	stream          ProviderStream
+	providerEvents  <-chan ProviderEvent
+	ctx             context.Context
+	cancel          context.CancelFunc
+	input           *inputQueue
+	events          chan protocol.Event
+	done            chan struct{}
+	eventsStopped   chan struct{}
+	releasePhysical func()
+	limits          Limits
+	telemetry       TelemetrySink
+	now             func() time.Time
 
 	sequence         atomic.Uint64
 	telemetryDropped atomic.Uint64
@@ -526,6 +553,7 @@ func (s *Session) dispatch(message inputMessage) error {
 }
 
 func (s *Session) runEvents() {
+	defer close(s.eventsStopped)
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -586,6 +614,32 @@ func (s *Session) abortProvider() {
 	s.closeProvider()
 }
 
+func stopOpenedProvider(stream ProviderStream, release func()) {
+	if aborter, ok := stream.(AbortingProviderStream); ok {
+		_ = aborter.Abort(context.Background())
+	} else {
+		_ = stream.Close(context.Background())
+	}
+	events := stream.Events()
+	// A broken adapter with no closure evidence cannot release physical use.
+	if events == nil {
+		return
+	}
+	for range events {
+	}
+	release()
+}
+
+func (s *Session) finishPhysical() {
+	s.abortProvider()
+	<-s.eventsStopped
+	// runEvents has left the channel; drain teardown output until the adapter
+	// proves that it stopped. Public Done alone is not that boundary.
+	for range s.providerEvents {
+	}
+	s.releasePhysical()
+}
+
 func (s *Session) fail(err error) {
 	if err == nil {
 		return
@@ -600,7 +654,7 @@ func (s *Session) fail(err error) {
 		s.recordUsageReported()
 		s.record("session.failed", telemetryErrorData(err))
 		s.emitTerminal(protocol.EventError, errorData(err), providerErrorExtensions(err), nil)
-		go s.abortProvider()
+		go s.finishPhysical()
 	})
 }
 
@@ -616,6 +670,7 @@ func (s *Session) finish(err error) {
 		s.recordUsageReported()
 		s.record("session.closed", nil)
 		s.emitTerminal(protocol.EventSessionClosed, nil, nil, nil)
+		go s.finishPhysical()
 	})
 }
 
