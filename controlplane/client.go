@@ -212,7 +212,13 @@ func (c *Client) RefreshCredential(ctx context.Context, plan protocol.SessionPla
 	if strings.TrimSpace(plan.SessionID) == "" || strings.TrimSpace(plan.AttemptID) == "" || strings.TrimSpace(request.Reason) == "" {
 		return protocol.DelegatedCredential{}, "", errors.New("controlplane: credential refresh needs a session, an attempt, and a reason")
 	}
-	endpoint := c.resolve("/v1/sessions/" + url.PathEscape(plan.SessionID) + "/attempts/" + url.PathEscape(plan.AttemptID) + "/credentials")
+	// PathEscape produces encoded segments. Assigning those bytes to URL.Path
+	// would encode '%' again, changing an opaque session or attempt identity.
+	reference, err := url.Parse(strings.TrimRight(c.baseURL.EscapedPath(), "/") + "/v1/sessions/" + url.PathEscape(plan.SessionID) + "/attempts/" + url.PathEscape(plan.AttemptID) + "/credentials")
+	if err != nil {
+		return protocol.DelegatedCredential{}, "", errors.New("controlplane: invalid credential refresh path")
+	}
+	endpoint := c.baseURL.ResolveReference(reference)
 	// The budget bounds the requests too, not only the waits between them: a
 	// stalled retry must not eat the caller's whole reconnect window.
 	ctx, cancel := context.WithTimeout(ctx, credentialRefreshRetryBudget)

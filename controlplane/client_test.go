@@ -385,3 +385,32 @@ func TestRefreshCredentialBoundsAStalledRetry(t *testing.T) {
 		t.Fatalf("a stalled retry held the refresh for %v, past its 5s budget", elapsed)
 	}
 }
+
+func TestRefreshCredentialPreservesOpaquePathSegments(t *testing.T) {
+	t.Parallel()
+	for i, sessionID := range []string{"simple", "客户\x00\ufeff", "a/b%?#", "e\u0301"} {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			t.Parallel()
+			plan := validPlan()
+			plan.Execution.CredentialSource = protocol.CredentialsManaged
+			plan.SessionID = sessionID
+			plan.AttemptID = "att:one/two"
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				expected := "/cell%20one/v1/sessions/" + url.PathEscape(plan.SessionID) + "/attempts/" + url.PathEscape(plan.AttemptID) + "/credentials"
+				if r.URL.EscapedPath() != expected {
+					t.Errorf("escaped path = %q, want %q", r.URL.EscapedPath(), expected)
+				}
+				_ = json.NewEncoder(w).Encode(protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "fresh-token", ExpiresAt: time.Now().Add(time.Minute)})
+			}))
+			t.Cleanup(server.Close)
+			client, err := controlplane.New(controlplane.Config{BaseURL: server.URL + "/cell%20one", APIKey: "sk_speko_test", HTTPClient: server.Client()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			credential, _, err := client.RefreshCredential(context.Background(), plan, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"})
+			if err != nil || credential.Value != "fresh-token" {
+				t.Fatalf("refresh = %+v, %v", credential, err)
+			}
+		})
+	}
+}
