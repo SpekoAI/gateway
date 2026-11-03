@@ -40,8 +40,18 @@ v2 reports remain a separate contract and establish no per-account attribution.
 Old Gateways ignore new plan fields; adding this metadata does not give them
 ownership-epoch or any other new financial enforcement.
 
-The private cell issuer now commits exact account/capability/model leases and
-its signed tail alongside funds and request evidence. At this checkpoint the
-cell v3 reader, MAX(heartbeat occupancy, reserved slots) integration and normal
-Gateway issuer/event routes still need their coordinated runtime acceptance.
-Neither new command behavior nor the new God switches have been deployed.
+The private cell issuer commits exact account/capability/model leases and its
+signed tail alongside funds and request evidence. The paired cell reader now
+accepts protocol 3, proves account authority from actual issued signed plans for
+that exact organization/process incarnation, and retains immutable observations
+with the original signed liveness TTL. Its common capacity allocator takes
+MAX(attributed physical sessions, reserved slot weight) per lifetime and model;
+covering agent parents count once. Incomplete reports preserve known occupancy,
+and exact lost-ACK retries never refresh it. The actual current command passes
+local TLS/PostgreSQL pairing for enablement, restart, lost ACK and stale shutdown.
+
+Normal hosted Gateway issuer/event routes, media execution and settlement of
+the same work still need their coordinated runtime acceptance. Process reporting
+retains the cell's durable `speko:write` authority; execute-only and managed-session
+credential integration remains a separate runtime concern. Neither the command
+nor the new God switches have been deployed.
