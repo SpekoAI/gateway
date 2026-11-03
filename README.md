@@ -43,13 +43,20 @@ its transport; SIGTERM drains existing work and refuses new requests.
 Native mode advertises `speko_relay` on its local `/v1/models`. It caps concurrent
 model operations with `SPEKO_MAX_SESSIONS` (default 100), WebSocket frames at
 2 MiB, and HTTP requests with `SPEKO_NATIVE_MAX_REQUEST_BYTES` (default 128 MiB).
-`SPEKO_NATIVE_SETUP_TIMEOUT` defaults to 30s; each physical downstream write is
-bounded by `SPEKO_NATIVE_WRITE_TIMEOUT` (15s). `/metrics` reports content-free
+`SPEKO_NATIVE_SETUP_TIMEOUT` defaults to 30s and bounds network establishment,
+WebSocket admission and stalled HTTP upload reads. A completed upload may wait
+for its model result beyond that setup bound. Each physical downstream write is
+bounded by `SPEKO_NATIVE_WRITE_TIMEOUT` (15s). Canonical relay handshake refusals
+retain their HTTP status, error code and request identity. `/metrics` reports content-free
 native request counts. These are local transport counts, not provider capacity
 or financial evidence.
 
 An explicit container template is in
 [`deploy/docker-compose.native.yml`](deploy/docker-compose.native.yml).
+The socket directory must belong to the process UID with mode 0700. Native
+mode retains a 0600 lock file beside the socket for its entire listener lifetime;
+leave that lock file in place. After SIGKILL or OOM, the next owner can reclaim
+its stale socket under the lock. A live listener or unrelated file is refused.
 This native transport does not complete actual platform claim issuance,
 realtime protocols, the general signed-plan relay adapter track, or a settled
 worker conversation; those require their integration gates.

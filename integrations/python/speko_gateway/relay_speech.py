@@ -39,16 +39,21 @@ _EVENT_NAMES = {
 }
 
 
-def _error(payload: dict[str, Any]) -> GatewayError:
+def _error(payload: dict[str, Any], *, status: int | None = None) -> GatewayError:
     value = payload.get("error", payload)
     value = value if isinstance(value, dict) else {}
     code = value.get("code", "")
     if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", code):
         code = ""
+    request_id = value.get("request_id", "")
+    if not isinstance(request_id, str) or not re.fullmatch(r"[!-~]{1,256}", request_id):
+        request_id = ""
     return GatewayError(
         "Relay speech request failed",
         code=code,
         source="relay",
+        request_id=request_id,
+        status=status,
         # A relay retry hint does not prove that this model request did no I/O.
         # Framework retries open a new request and could charge it twice.
         retryable=False,
@@ -140,6 +145,37 @@ class RelaySpeechClient:
             raise GatewayError("Relay redirects are not accepted", retryable=False)
 
         trace.on_request_redirect.append(reject_redirect)
+
+        async def preserve_rejection(_session, _context, params):
+            response = params.response
+            if response.status < 400:
+                return
+            try:
+                try:
+                    raw = await response.content.readexactly(8193)
+                except asyncio.IncompleteReadError as incomplete:
+                    raw = incomplete.partial
+                value = json.loads(raw) if len(raw) <= 8192 else None
+            except (ValueError, aiohttp.ClientError):
+                value = None
+            finally:
+                response.close()
+            if (
+                isinstance(value, dict)
+                and isinstance(value.get("error"), dict)
+                and isinstance(value["error"].get("hint"), str)
+                and isinstance(value["error"].get("retryable"), bool)
+            ):
+                raise _error(value, status=response.status)
+            raise GatewayError(
+                "Relay speech handshake failed",
+                source="relay",
+                code=f"http_{response.status}",
+                status=response.status,
+                retryable=False,
+            )
+
+        trace.on_request_end.append(preserve_rejection)
         self._session = aiohttp.ClientSession(
             connector=aiohttp.UnixConnector(path=socket_path)
             if socket_path is not None
@@ -246,6 +282,7 @@ class RelaySpeechClient:
                     "Relay speech handshake failed",
                     source="relay",
                     code=f"http_{error.status}",
+                    status=error.status,
                     retryable=False,
                 ) from None
             if isinstance(

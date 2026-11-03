@@ -3,8 +3,11 @@ package gateway_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"github.com/SpekoAI/gateway/gateway"
+	"github.com/SpekoAI/gateway/relayapi"
 	"github.com/coder/websocket"
 )
 
@@ -513,4 +517,94 @@ func TestNativeRelayDrainDeadlineCancelsAnOpenHTTPResponse(t *testing.T) {
 		t.Fatal("HTTP relay remained live after drain expiry")
 	}
 	nativeAwait(t, func() bool { return server.Stats().ActiveSessions == 0 })
+}
+
+func TestNativeRelaySetupTimeoutDoesNotLimitHTTPModelExecution(t *testing.T) {
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		time.Sleep(150 * time.Millisecond)
+		_, _ = w.Write([]byte("owned-model-result"))
+	}))
+	defer peer.Close()
+	_, local := nativeServer(t, peer, func(c *gateway.NativeRelayConfig) { c.SetupTimeout = 50 * time.Millisecond })
+	for _, path := range []string{"/v1/llm/responses", "/v1/stt/transcriptions", "/v1/tts/speech"} {
+		req, _ := http.NewRequest("POST", local.URL+path, strings.NewReader("{}"))
+		req.Header = nativeHeaders("sk_speko_agent_owned")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if err != nil || response.StatusCode != 200 || string(raw) != "owned-model-result" {
+			t.Fatalf("%s: status=%d result=%q error=%v", path, response.StatusCode, raw, err)
+		}
+	}
+}
+
+func TestNativeRelayStalledUploadReleasesSlotAndCancelsUpstream(t *testing.T) {
+	closed := make(chan struct{})
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.Copy(io.Discard, r.Body)
+		if err != nil {
+			close(closed)
+			return
+		}
+		_, _ = w.Write([]byte("owned"))
+	}))
+	defer peer.Close()
+	server, local := nativeServer(t, peer, func(c *gateway.NativeRelayConfig) { c.SetupTimeout = 100 * time.Millisecond; c.MaxSessions = 1 })
+	endpoint, _ := url.Parse(local.URL)
+	conn, err := net.Dial("tcp", endpoint.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, err = fmt.Fprintf(conn, "POST /v1/llm/responses HTTP/1.1\r\nHost: owned\r\nAuthorization: Bearer sk_speko_agent_owned\r\nSpeko-Local-Authorization: Bearer %s\r\nSpeko-Client-Session-ID: %s\r\nIdempotency-Key: owned-stalled\r\nContent-Length: 1000\r\n\r\n{", nativeTestLocal, nativeTestSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeAwait(t, func() bool { return server.Stats().SessionsTotal == 1 })
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stalled upload did not cancel the upstream body")
+	}
+	nativeAwait(t, func() bool { return server.Stats().ActiveSessions == 0 })
+	req, _ := http.NewRequest("POST", local.URL+"/v1/llm/responses", nil)
+	req.Header = nativeHeaders("sk_speko_agent_owned")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != 200 {
+		t.Fatal("stalled upload retained the only slot")
+	}
+}
+
+func TestNativeRelayWebSocketRefusalPreservesStatusEnvelopeAndRequestIdentity(t *testing.T) {
+	for _, status := range []int{402, 409, 429, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			envelope := relayapi.ErrorEnvelope{Error: relayapi.ErrorBody{Code: relayapi.ErrorCodeInsufficientCredit, Message: strings.Repeat("m", 700), Hint: strings.Repeat("h", 512), RequestID: "owned-rejection", Retryable: false}}
+			peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				_ = json.NewEncoder(w).Encode(envelope)
+			}))
+			defer peer.Close()
+			_, local := nativeServer(t, peer, nil)
+			req, _ := http.NewRequest("GET", local.URL+"/v1/stt/stream", nil)
+			req.Header = nativeHeaders("sk_speko_agent_owned")
+			response, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			var actual relayapi.ErrorEnvelope
+			if json.NewDecoder(response.Body).Decode(&actual) != nil || actual != envelope || response.StatusCode != status || response.Header.Get(relayapi.HeaderRequestID) != envelope.Error.RequestID {
+				t.Fatal("WebSocket rejection lost its normalized identity")
+			}
+		})
+	}
 }

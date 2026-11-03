@@ -82,7 +82,7 @@ def native_binary(tmp_path_factory, pytestconfig):
 
 
 @asynccontextmanager
-async def native_stack(native_binary, handler):
+async def native_stack(native_binary, handler, *, crash_once=False):
     binary, certificate, tls, image = native_binary
     app = web.Application()
     app.router.add_route("*", "/{path:.*}", handler)
@@ -92,6 +92,7 @@ async def native_stack(native_binary, handler):
         socket_path = str(Path(directory) / "runtime.sock")
         process = output = None
         container_name = None
+        prior_logs = []
         try:
             await web.TCPSite(runner, "127.0.0.1", 0, ssl_context=tls).start()
             origin = f"https://127.0.0.1:{runner.addresses[0][1]}"
@@ -142,31 +143,63 @@ async def native_stack(native_binary, handler):
                     image,
                     "native",
                 ]
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            output = asyncio.create_task(process.stdout.read())
-            async with aiohttp.ClientSession(
-                connector=aiohttp.UnixConnector(path=socket_path)
-            ) as probe:
-                deadline = asyncio.get_running_loop().time() + 5
-                while True:
-                    if process.returncode is not None:
-                        raise RuntimeError(
-                            "Native Gateway command exited during startup"
+            for boot in range(2 if crash_once else 1):
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                output = asyncio.create_task(process.stdout.read())
+                async with aiohttp.ClientSession(
+                    connector=aiohttp.UnixConnector(path=socket_path)
+                ) as probe:
+                    deadline = asyncio.get_running_loop().time() + 5
+                    while True:
+                        if process.returncode is not None:
+                            raise RuntimeError(
+                                "Native Gateway command exited during startup"
+                            )
+                        try:
+                            async with probe.get(
+                                "http://speko-gateway/readyz"
+                            ) as response:
+                                if response.status == 200:
+                                    break
+                        except aiohttp.ClientError:
+                            pass
+                        if asyncio.get_running_loop().time() > deadline:
+                            raise TimeoutError("Native Gateway did not start")
+                        await asyncio.sleep(0.01)
+                if crash_once and boot == 0:
+                    if container_name is None:
+                        process.kill()
+                    else:
+                        kill = await asyncio.create_subprocess_exec(
+                            "docker",
+                            "kill",
+                            "--signal",
+                            "KILL",
+                            container_name,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
                         )
-                    try:
-                        async with probe.get("http://speko-gateway/readyz") as response:
-                            if response.status == 200:
-                                break
-                    except aiohttp.ClientError:
-                        pass
-                    if asyncio.get_running_loop().time() > deadline:
-                        raise TimeoutError("Native Gateway did not start")
-                    await asyncio.sleep(0.01)
+                        assert await kill.wait() == 0
+                    assert await asyncio.wait_for(process.wait(), 5) != 0
+                    prior_logs.append(await output)
+                    assert Path(socket_path).is_socket(), (
+                        "SIGKILL must leave the stale socket"
+                    )
+                    if container_name is not None:
+                        remove = await asyncio.create_subprocess_exec(
+                            "docker",
+                            "rm",
+                            "--force",
+                            container_name,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await remove.wait()
             assert stat.S_IMODE(Path(socket_path).stat().st_mode) == 0o600
             yield socket_path, process
         finally:
@@ -178,7 +211,7 @@ async def native_stack(native_binary, handler):
                 except asyncio.TimeoutError:
                     process.kill()
                     await process.wait()
-                logs = await output
+                logs = b"".join([*prior_logs, await output])
                 if container_name is not None:
                     remove = await asyncio.create_subprocess_exec(
                         "docker",
@@ -409,6 +442,95 @@ async def test_actual_native_sidecar_sigterm_drains_a_live_python_sse_stream(
             assert await asyncio.wait_for(process.wait(), 4) == 0
         finally:
             release.set()
+            await client.aclose()
+
+
+async def test_actual_native_sidecar_restarts_after_sigkill_with_the_same_socket_volume(
+    native_binary,
+):
+    async def handle(request):
+        await request.read()
+        return web.Response(
+            text='event: response.completed\ndata: {"status":"completed"}\n\n',
+            content_type="text/event-stream",
+        )
+
+    async with native_stack(native_binary, handle, crash_once=True) as (socket, _):
+        client = RelayLLMClient(
+            api_key=MODEL_KEY,
+            session_id=str(uuid.uuid4()),
+            socket_path=socket,
+            local_auth_token=LOCAL_TOKEN,
+        )
+        try:
+            events = [event async for event in client.stream_response({"input": []})]
+            assert events == [("response.completed", {"status": "completed"})]
+        finally:
+            await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "status,code", [(402, "insufficient_credit"), (409, "idempotency_conflict")]
+)
+async def test_native_sidecar_python_speech_retains_canonical_handshake_rejection(
+    native_binary,
+    status,
+    code,
+):
+    async def handle(request):
+        response = web.StreamResponse(
+            status=status, headers={"Content-Type": "application/json"}
+        )
+        await response.prepare(request)
+        raw = json.dumps(
+            {
+                "error": {
+                    "code": code,
+                    "message": "owned rejection detail",
+                    "hint": "owned remediation",
+                    "retryable": False,
+                    "request_id": "owned-rejection",
+                }
+            }
+        ).encode()
+        await response.write(raw[:5])
+        await asyncio.sleep(0.01)
+        await response.write(raw[5:])
+        return response
+
+    async with native_stack(native_binary, handle) as (socket, _):
+        from speko_gateway.client import SessionConfig
+
+        client = RelaySpeechClient(
+            api_key=MODEL_KEY,
+            session_id=str(uuid.uuid4()),
+            socket_path=socket,
+            local_auth_token=LOCAL_TOKEN,
+        )
+        try:
+            with pytest.raises(GatewayError) as rejection:
+                await client.open(
+                    SessionConfig(
+                        kind="stt",
+                        execution={
+                            "credential_source": "managed",
+                            "provider_route": "speko_relay",
+                            "relay_policy": "required",
+                        },
+                        request={"provider": "fixture", "model": "fixture-model"},
+                        media={
+                            "encoding": "pcm_s16le",
+                            "sample_rate_hz": 16000,
+                            "channels": 1,
+                        },
+                    )
+                )
+            assert rejection.value.code == code
+            assert rejection.value.status == status
+            assert rejection.value.request_id == "owned-rejection"
+            assert not rejection.value.retryable
+            assert "owned rejection detail" not in str(rejection.value)
+        finally:
             await client.aclose()
 
 

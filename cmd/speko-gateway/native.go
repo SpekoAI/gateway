@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -58,11 +57,11 @@ func runNative() error {
 	if err != nil {
 		return err
 	}
-	listener, err := gateway.ListenUnix(socket)
+	listener, err := gateway.ListenNativeUnix(socket)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = listener.Close(); _ = os.Remove(socket) }()
+	defer listener.Close()
 	process, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	log.Printf("routing=native-relay")

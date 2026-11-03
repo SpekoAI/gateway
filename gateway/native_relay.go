@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -109,7 +110,19 @@ func NewNativeRelay(config NativeRelayConfig) (*NativeRelayServer, error) {
 	}
 	if original, ok := transport.(*http.Transport); ok {
 		bounded := original.Clone()
-		bounded.ResponseHeaderTimeout = config.SetupTimeout
+		// HTTP headers may follow a complete batch inference. Bound network
+		// establishment separately from the provider's execution lifetime.
+		bounded.ResponseHeaderTimeout = 0
+		bounded.TLSHandshakeTimeout = config.SetupTimeout
+		dial := bounded.DialContext
+		if dial == nil {
+			dial = (&net.Dialer{}).DialContext
+		}
+		bounded.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			setup, cancel := context.WithTimeout(ctx, config.SetupTimeout)
+			defer cancel()
+			return dial(setup, network, address)
+		}
 		bounded.MaxResponseHeaderBytes = 64 << 10
 		transport = bounded
 	}
@@ -286,12 +299,48 @@ func (s *NativeRelayServer) modelHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r = r.Clone(ctx)
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxRequestBytes)
 	control := http.NewResponseController(w)
+	bodyContext, cancelBody := context.WithCancel(ctx)
+	defer cancelBody()
+	r = r.WithContext(bodyContext)
+	r.Body = &nativeRelayBody{ReadCloser: http.MaxBytesReader(w, r.Body, s.maxRequestBytes), control: control, timeout: s.setupTimeout, cancel: cancelBody}
 	stop := context.AfterFunc(ctx, func() { _ = control.SetReadDeadline(time.Now()); _ = control.SetWriteDeadline(time.Now()) })
 	defer stop()
 	s.proxy.ServeHTTP(nativeRelayWriter{ResponseWriter: w, timeout: s.timeToWrite, ctx: ctx}, r)
 }
+
+// The setup bound applies to stalled upload reads, and is cleared once the
+// upload finishes. It must never become a model-execution deadline.
+type nativeRelayBody struct {
+	io.ReadCloser
+	control *http.ResponseController
+	timeout time.Duration
+	cancel  context.CancelFunc
+}
+
+func (b *nativeRelayBody) Read(p []byte) (int, error) {
+	_ = b.control.SetReadDeadline(time.Now().Add(b.timeout))
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			_ = b.control.SetReadDeadline(time.Time{})
+		} else {
+			_ = b.control.SetReadDeadline(time.Now())
+			b.cancel()
+		}
+	}
+	return n, err
+}
+func (b *nativeRelayBody) Close() error {
+	_ = b.control.SetReadDeadline(time.Now())
+	err := b.ReadCloser.Close()
+	_ = b.control.SetReadDeadline(time.Time{})
+	return err
+}
+
+type nativeRoundTrip func(*http.Request) (*http.Response, error)
+
+func (f nativeRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // Bound each physical write rather than the lifetime of a long SSE response.
 type nativeRelayWriter struct {
@@ -324,7 +373,24 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	endpoint := *s.origin
 	endpoint.Path = r.URL.Path
 	dialCtx, cancelDial := context.WithTimeout(ctx, s.setupTimeout)
-	upstream, response, err := websocket.Dial(dialCtx, endpoint.String(), &websocket.DialOptions{HTTPClient: s.client, HTTPHeader: nativeUpstreamHeaders(r.Header)})
+	// websocket.Dial retains only 1 KiB of an unsuccessful upgrade body.
+	// Capture the bounded canonical envelope before that diagnostic truncation.
+	client := *s.client
+	var rejection *relayapi.ErrorEnvelope
+	client.Transport = nativeRoundTrip(func(req *http.Request) (*http.Response, error) {
+		response, err := s.client.Transport.RoundTrip(req)
+		if err == nil && response.StatusCode >= 400 && response.StatusCode <= 599 && response.Body != nil {
+			raw, readErr := io.ReadAll(io.LimitReader(response.Body, 8193))
+			_ = response.Body.Close()
+			response.Body = io.NopCloser(strings.NewReader(string(raw)))
+			var envelope relayapi.ErrorEnvelope
+			if readErr == nil && len(raw) <= 8192 && json.Unmarshal(raw, &envelope) == nil && envelope.Validate() == nil && len(envelope.Error.Message) <= 1024 && len(envelope.Error.RequestID) <= 256 {
+				rejection = &envelope
+			}
+		}
+		return response, err
+	})
+	upstream, response, err := websocket.Dial(dialCtx, endpoint.String(), &websocket.DialOptions{HTTPClient: &client, HTTPHeader: nativeUpstreamHeaders(r.Header)})
 	cancelDial()
 	if err != nil {
 		status := http.StatusBadGateway
@@ -332,9 +398,19 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 			if response.Body != nil {
 				_ = response.Body.Close()
 			}
-			if response.StatusCode == 401 || response.StatusCode == 403 || response.StatusCode == 429 {
+			if response.StatusCode >= 400 && response.StatusCode <= 599 {
 				status = response.StatusCode
+				if requestID := response.Header.Get(relayapi.HeaderRequestID); nativeVisible(requestID, 256) {
+					w.Header().Set(relayapi.HeaderRequestID, requestID)
+				}
 			}
+		}
+		if rejection != nil {
+			if nativeVisible(rejection.Error.RequestID, 256) {
+				w.Header().Set(relayapi.HeaderRequestID, rejection.Error.RequestID)
+			}
+			writeJSON(w, status, rejection)
+			return
 		}
 		writeError(w, status, "relay_unavailable", "native relay handshake failed")
 		return
