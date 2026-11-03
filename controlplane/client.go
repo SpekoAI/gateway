@@ -214,7 +214,7 @@ func (c *Client) RefreshCredential(ctx context.Context, plan protocol.SessionPla
 	}
 	// PathEscape produces encoded segments. Assigning those bytes to URL.Path
 	// would encode '%' again, changing an opaque session or attempt identity.
-	rawPath := strings.TrimRight(c.baseURL.EscapedPath(), "/") + "/v1/sessions/" + url.PathEscape(plan.SessionID) + "/attempts/" + url.PathEscape(plan.AttemptID) + "/credentials"
+	rawPath := c.escapedBasePath() + "/v1/sessions/" + escapeIdentitySegment(plan.SessionID) + "/attempts/" + escapeIdentitySegment(plan.AttemptID) + "/credentials"
 	decodedPath, err := url.PathUnescape(rawPath)
 	if err != nil {
 		return protocol.DelegatedCredential{}, "", errors.New("controlplane: invalid credential refresh path")
@@ -346,8 +346,33 @@ func (c *Client) post(ctx context.Context, endpoint *url.URL, value any, idempot
 func (c *Client) resolve(path string) *url.URL {
 	endpoint := *c.baseURL
 	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + path
+	endpoint.RawPath = c.escapedBasePath() + (&url.URL{Path: path}).EscapedPath()
 	endpoint.RawQuery = ""
 	return &endpoint
+}
+
+func escapeIdentitySegment(value string) string {
+	if value == "." {
+		return "%2E"
+	}
+	if value == ".." {
+		return "%2E%2E"
+	}
+	return url.PathEscape(value)
+}
+
+// Match resolve's decoded trailing-slash interpretation while retaining
+// escaped slashes inside the configured prefix as their original segments.
+func (c *Client) escapedBasePath() string {
+	base := c.baseURL.EscapedPath()
+	for strings.HasSuffix(base, "/") || len(base) >= 3 && strings.EqualFold(base[len(base)-3:], "%2f") {
+		trim := 1
+		if base[len(base)-1] != '/' {
+			trim = 3
+		}
+		base = base[:len(base)-trim]
+	}
+	return base
 }
 
 func sameOrigin(left, right *url.URL) bool {
