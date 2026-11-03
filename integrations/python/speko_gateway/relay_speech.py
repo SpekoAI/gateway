@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from ._relay_socket import NATIVE_SOCKET_ORIGIN, socket_headers
 from ._user_agent import USER_AGENT
 from .client import CanonicalEvent, GatewayError, SessionConfig
 
@@ -80,8 +81,10 @@ class RelaySpeechClient:
         *,
         api_key: str,
         session_id: str,
-        base_url: str,
+        base_url: str | None = None,
         setup_timeout: float = 15,
+        socket_path: str | None = None,
+        local_auth_token: str | None = None,
     ) -> None:
         if not api_key.startswith("sk_speko_") or any(
             ord(char) < 33 or ord(char) > 126 for char in api_key
@@ -91,6 +94,21 @@ class RelaySpeechClient:
             uuid.UUID(session_id)
         except (ValueError, AttributeError):
             raise ValueError("A platform session UUID is required") from None
+        local_headers: dict[str, str] = {}
+        if socket_path is not None:
+            if base_url is not None:
+                raise ValueError("Specify a relay origin or native socket, not both")
+            local_headers = socket_headers(
+                socket_path=socket_path,
+                local_auth_token=local_auth_token,
+                api_key=api_key,
+                session_id=session_id,
+            )
+            base_url = NATIVE_SOCKET_ORIGIN
+        elif local_auth_token is not None:
+            raise ValueError("local_auth_token requires a native Gateway socket")
+        if base_url is None:
+            raise ValueError("A configured relay origin or native socket is required")
         parsed = urlsplit(base_url)
         loopback = parsed.hostname == "localhost"
         try:
@@ -99,7 +117,7 @@ class RelaySpeechClient:
             )
         except ValueError:
             pass
-        if (
+        if socket_path is None and (
             parsed.scheme not in {"https", "http"}
             or not parsed.hostname
             or parsed.scheme == "http"
@@ -123,10 +141,14 @@ class RelaySpeechClient:
 
         trace.on_request_redirect.append(reject_redirect)
         self._session = aiohttp.ClientSession(
+            connector=aiohttp.UnixConnector(path=socket_path)
+            if socket_path is not None
+            else None,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "User-Agent": USER_AGENT,
                 "Speko-Client-Session-ID": session_id,
+                **local_headers,
             },
             trace_configs=[trace],
             timeout=aiohttp.ClientTimeout(total=None, connect=setup_timeout),

@@ -28,6 +28,30 @@ tts = TTS(speech, provider=tts_provider, model=tts_model, voice="",
           language=tts_language, credential_source="managed")
 ```
 
+For the native Go sidecar, pass `socket_path` and `local_auth_token` instead of
+`base_url`. `RelayLLMClient` accepts the same explicit socket parameters and
+session credential. Start the sidecar with `speko-gateway native`; its HTTPS
+relay origin comes from `SPEKO_RELAY_URL`:
+
+```python
+from speko_gateway import RelayLLMClient, RelaySpeechClient
+
+speech = RelaySpeechClient(
+    api_key=model_key, session_id=spec.session_id,
+    socket_path="/run/speko/runtime.sock", local_auth_token=socket_token,
+)
+llm = RelayLLMClient(
+    api_key=model_key, session_id=spec.session_id,
+    socket_path="/run/speko/runtime.sock", local_auth_token=socket_token,
+)
+```
+
+The socket's local credential stays in the sidecar. Per-session model keys and
+identities reach only its configured relay. Both socket clients refuse implicit
+model-key fallback. Native LLM transport failures and retry hints remain
+non-retryable; the LiveKit LLM adapter also disables its automatic request replay
+for a native socket client.
+
 The provider/model/language fields come from the compiled spec. A managed
 worker leaves the original TTS voice blank so the cell can sign its compiled
 voice override. `SpekoSTTService` and `SpekoTTSService` in `speko_gateway.pipecat`

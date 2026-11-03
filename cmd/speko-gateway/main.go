@@ -85,6 +85,12 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "native" {
+		if len(os.Args) != 2 {
+			return errors.New("native relay mode accepts no command arguments")
+		}
+		return runNative()
+	}
 	apiKey, err := secret("SPEKO_API_KEY")
 	if err != nil {
 		return err

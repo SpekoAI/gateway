@@ -28,6 +28,10 @@ jobs:
         working-directory: integrations/python
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -45,6 +49,10 @@ jobs:
         working-directory: integrations/python
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -61,6 +69,12 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: spekoai/gateway:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv run --locked --extra dev pytest -q tests/test_native_sidecar.py --native-gateway-image spekoai/gateway:ci
+        working-directory: integrations/python

@@ -8,6 +8,52 @@ routing, observability, and consolidated billing.
 > Early preview: the protocol is versioned, but breaking changes may occur
 > before the first stable release.
 
+## Native relay sidecar for managed sessions
+
+Run `speko-gateway native` with `SPEKO_RELAY_URL` set to the configured HTTPS
+relay origin and `SPEKO_LOCAL_AUTH_TOKEN` (or `_FILE`) for local socket access.
+`SPEKO_SOCKET_PATH` defaults to `/run/speko/runtime.sock`. The native process
+loads per-session model credentials from each caller, rather than a process-wide
+model key. The relay obtains execution grants from its cell; the cell owns
+policy, reservations and settlement.
+
+The native socket carries STT/TTS streams, batch transcription, speech and LLM
+responses. Python clients select it explicitly:
+
+```python
+from speko_gateway import RelayLLMClient, RelaySpeechClient
+
+connection = dict(
+    socket_path="/run/speko/runtime.sock",
+    local_auth_token=socket_token,
+    api_key=registered_session_model_key,
+    session_id=spec.session_id,
+)
+speech = RelaySpeechClient(**connection)
+llm = RelayLLMClient(**connection)
+```
+
+Use these with the LiveKit/Pipecat integrations and the compiled concrete
+provider/model/language. LiveKit native STT also takes the worker's local
+`turn_vad`. The socket and worker use the same UID; the socket is owner-only.
+The local socket credential is consumed by the sidecar; only the session's model
+credential and identity reach the configured relay. Closing a session cancels
+its transport; SIGTERM drains existing work and refuses new requests.
+
+Native mode advertises `speko_relay` on its local `/v1/models`. It caps concurrent
+model operations with `SPEKO_MAX_SESSIONS` (default 100), WebSocket frames at
+2 MiB, and HTTP requests with `SPEKO_NATIVE_MAX_REQUEST_BYTES` (default 128 MiB).
+`SPEKO_NATIVE_SETUP_TIMEOUT` defaults to 30s; each physical downstream write is
+bounded by `SPEKO_NATIVE_WRITE_TIMEOUT` (15s). `/metrics` reports content-free
+native request counts. These are local transport counts, not provider capacity
+or financial evidence.
+
+An explicit container template is in
+[`deploy/docker-compose.native.yml`](deploy/docker-compose.native.yml).
+This native transport does not complete actual platform claim issuance,
+realtime protocols, the general signed-plan relay adapter track, or a settled
+worker conversation; those require their integration gates.
+
 ## Add Gateway to a Pipecat agent
 
 Gateway includes native Pipecat `STTService` and `TTSService` processors with

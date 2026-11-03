@@ -790,6 +790,8 @@ class LLM(llm.LLM):
         tool_choice: NotGivenOr[Any] = NOT_GIVEN,
         extra_kwargs: NotGivenOr[dict[str, Any]] = NOT_GIVEN,
     ) -> RelayLLMStream:
+        if isinstance(self._client, RelayLLMClient) and self._client._native_socket:
+            conn_options = dataclasses.replace(conn_options, max_retry=0)
         return RelayLLMStream(
             llm_instance=self,
             client=self._client,
