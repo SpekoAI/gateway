@@ -49,6 +49,17 @@ class VADAudio:
             offset += count
         return b"".join(kept)
 
+    def pending_real(self, raw: bytes) -> bytes:
+        """Recover unacknowledged capture for a fresh detector after flush."""
+        offset, kept = 0, []
+        for size, padding in self.spans:
+            if not padding:
+                kept.append(raw[offset:offset + size])
+            offset += size
+        if offset != len(raw):
+            raise GatewayError("Local speech pending input changed", retryable=False)
+        return b"".join(kept)
+
 
 class ProbabilityVAD:
     """Apply the SDK detector's thresholds using captured sample durations.

@@ -366,7 +366,10 @@ class NativeSpeechStream(stt.RecognizeStream):
         loop = asyncio.get_running_loop()
         self._vad_tail_timer = loop.call_later(max(0, self._vad_idle_deadline - loop.time()), drain)
 
-    def _bound_vad_onset(self) -> None:
+    def _bound_vad_onset(self, *, progress: bool) -> None:
+        if progress and self._vad_onset_timer is not None:
+            self._vad_onset_timer.cancel()
+            self._vad_onset_timer = None
         if not self._vad_onset_pending:
             if self._vad_onset_timer is not None:
                 self._vad_onset_timer.cancel()
@@ -433,7 +436,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 else:
                     self._vad_speaking = event.speaking
                     self._vad_onset_pending = not event.speaking and self._possible_onset(event)
-                self._bound_vad_onset()
+                self._bound_vad_onset(progress=samples > 0)
                 if self._gateway_stream is not None and real:
                     await self._send_audio(real)
                     self._assigned_until = self._processed_samples
