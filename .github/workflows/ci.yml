@@ -72,6 +72,26 @@ jobs:
       - run: uv pip install -e . "livekit-agents==1.8.10" "pytest>=8" "pytest-asyncio>=0.24"
       - run: .venv/bin/python -m pytest
 
+  python-livekit-python310:
+    # The Python package declares 3.10 support. Run retained-pipeline handoff
+    # coverage there too, without changing the existing required job names.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integrations/python
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv venv --python 3.10
+      - run: uv pip install -e . "livekit-agents==1.8.10" "pytest>=8" "pytest-asyncio>=0.24"
+      - run: .venv/bin/python -m pytest
+
   container:
     runs-on: ubuntu-latest
     steps:

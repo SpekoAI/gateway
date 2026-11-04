@@ -1341,9 +1341,11 @@ async def test_native_final_during_detached_handoff_binds_the_consuming_activity
             terminal.set()
             # Let the real retained pump queue the final while no SDK consumer
             # exists. The old activity is deliberately still visible here.
-            async with asyncio.timeout(3):
+            async def wait_for_queued_final():
                 while not any(getattr(stream, "_turn_commit", None) is not None for stream in model._streams):
                     await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_queued_final(), 3)
             assert session._activity is old
             attach.set()
             assert await asyncio.wait_for(turns.get(), 3) == "turn 1"
@@ -1357,6 +1359,77 @@ async def test_native_final_during_detached_handoff_binds_the_consuming_activity
             await audio.frames.put(None)
             await session.aclose()
             await model.aclose()
+            await client.aclose()
+
+
+async def test_native_model_handoffs_keep_only_the_active_recognition_owner_bound():
+    sources = [ControlledVAD(), ControlledVAD()]
+    seen, turns = [], asyncio.Queue()
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        seen.append(request.headers["Idempotency-Key"])
+        index, interims_sent = len(seen), False
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY and not interims_sent:
+                interims_sent = True
+                if index == 2:
+                    # Exercise actual pump -> recognition -> session events,
+                    # rather than directly calling either model's callback.
+                    for _ in range(600):
+                        await ws.send_json({"type": "transcript.delta", "text": "owned interim"})
+            elif (
+                message.type is aiohttp.WSMsgType.TEXT
+                and json.loads(message.data)["type"] == "session.close"
+            ):
+                await ws.send_json({"type": "transcript.final", "text": f"turn {index}"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        models = [STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source) for source in sources]
+        session = AgentSession(llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0.05, max_endpointing_delay=0.05)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        entered = asyncio.Queue()
+
+        class OwnedAgent(Agent):
+            async def on_enter(self):
+                entered.put_nowait(None)
+
+            async def on_user_turn_completed(self, turn_ctx, new_message):
+                turns.put_nowait(new_message.text_content)
+
+        for model in models:
+            model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned first model", stt=models[0]), **options)
+            await asyncio.wait_for(entered.get(), 3)
+            for index, owner in enumerate([0, 1, 0], start=1):
+                if index > 1:
+                    session.update_agent(OwnedAgent(instructions="Owned model handoff", stt=models[owner]))
+                    await asyncio.wait_for(entered.get(), 3)
+                source = sources[owner]
+                for value in (frame(), rtc.AudioFrame(data=b"\0\0" * 8800, sample_rate=16000, num_channels=1, samples_per_channel=8800)):
+                    await audio.frames.put(value)
+                    observed = await asyncio.wait_for(source.frames.get(), 3)
+                    source.processed(observed)
+                    source.emit(vad.VADEventType.START_OF_SPEECH if value.samples_per_channel == 320 else vad.VADEventType.END_OF_SPEECH, frames=[observed], silence_duration=0 if value.samples_per_channel == 320 else 0.55)
+                assert await asyncio.wait_for(turns.get(), 3) == f"turn {index}"
+                assert models[1 - owner]._turn_binding is None
+            assert len(seen) == len(set(seen)) == 3
+            assert all(not model._native_failed for model in models)
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            for model in models:
+                await model.aclose()
             await client.aclose()
 
 

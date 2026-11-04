@@ -227,6 +227,12 @@ class STT(stt.STT):
             raise ValueError(
                 "Native STT streaming requires a running AgentSession"
             )
+        if activity.stt is not self:
+            # Another native model may be bound to this same session for a
+            # later Agent. Only the active recognition owner can wrap its
+            # turn callback; passive listeners must never wrap each other.
+            self._restore_turn_binding()
+            return
         if self._turn_listener is None:
             # A retained pipeline can publish while its SDK consumer is
             # detached and the previous activity is still current. Observe
