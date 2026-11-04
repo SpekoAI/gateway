@@ -8,6 +8,18 @@ routing, observability, and consolidated billing.
 > Early preview: the protocol is versioned, but breaking changes may occur
 > before the first stable release.
 
+## Versions and changelog
+
+Pin a released version in production. Each release has notes on the
+[releases page](https://github.com/SpekoAI/gateway/releases). Watch the repo
+with **Custom → Releases** to get notified.
+
+| Tag | What it points to | Use it for |
+|---|---|---|
+| `0.1.0` | One exact release. Never moves. | Production, when you want to choose every upgrade. |
+| `0.1` | The newest `0.1.x` release. Gets fixes only. | Production, when you want fixes automatically. |
+| `latest`, `edge`, `sha-<commit>` | Every merge to `main`. Moves several times a day. | Testing unreleased changes. Not for production. |
+
 ## Add Gateway to a Pipecat agent
 
 Gateway includes native Pipecat `STTService` and `TTSService` processors with
@@ -24,7 +36,7 @@ Dockerfile:
 
 ```diff
  ARG PYTHON_VERSION=3.14
-+FROM spekoai/gateway:latest AS speko-gateway
++FROM spekoai/gateway:0.1 AS speko-gateway
  FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim AS base
 
  FROM base AS build
