@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any
 
@@ -13,6 +14,13 @@ from livekit.agents import APIConnectionError, APIConnectOptions, stt, utils, va
 
 from ._livekit_bridge import LiveKitSpeechEvent, LiveKitSTTBridge, LiveKitSTTStream
 from .client import GatewayError
+
+
+@dataclass
+class NativeInputTimeline:
+    """Exact accepted input duration for one SDK recognition pipeline."""
+
+    position: Fraction = Fraction(0)
 
 
 class NativeSpeechStream(stt.RecognizeStream):
@@ -37,6 +45,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         report_open: Callable[[LiveKitSTTStream], None],
         check_admission: Callable[[], None],
         wait_for_turn_commit: bool = False,
+        input_timeline: NativeInputTimeline | None = None,
     ) -> None:
         super().__init__(
             stt=stt_instance, conn_options=conn_options, sample_rate=sample_rate
@@ -45,6 +54,8 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._language = language
         self._sample_rate = sample_rate
         self._turn_vad = turn_vad
+        self._input_timeline = input_timeline
+        self._input_start = input_timeline.position if input_timeline is not None else None
         self._mark_failed = mark_failed
         self._report_open = report_open
         self._check_admission = check_admission
@@ -90,6 +101,15 @@ class NativeSpeechStream(stt.RecognizeStream):
             return
         super().push_frame(frame)
         self._queued_samples = queued
+        if self._input_timeline is not None:
+            self._input_timeline.position += Fraction(
+                frame.samples_per_channel, frame.sample_rate
+            )
+
+    def _stream_offset(self) -> float:
+        if self._input_start is not None:
+            return float(self._input_start)
+        return getattr(self, "start_time_offset", 0.0)
 
     def _frame(self, raw: bytes) -> rtc.AudioFrame:
         assert self._channels is not None
@@ -344,9 +364,7 @@ class NativeSpeechStream(stt.RecognizeStream):
             raise
 
     def _emit(self, event: LiveKitSpeechEvent, kind: stt.SpeechEventType) -> None:
-        offset = self._request_start_sample / self._sample_rate + getattr(
-            self, "start_time_offset", 0.0
-        )
+        offset = self._request_start_sample / self._sample_rate + self._stream_offset()
         self._event_ch.send_nowait(
             stt.SpeechEvent(
                 type=kind,
@@ -408,7 +426,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                             else speech_end
                         )
                         / self._sample_rate
-                        + getattr(self, "start_time_offset", 0.0),
+                        + self._stream_offset(),
                     )
                 ],
             )
