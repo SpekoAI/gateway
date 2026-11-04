@@ -61,15 +61,27 @@ and Pipecat's optional automatic provider fallback does not apply to them.
 Close both models and then `await speech.aclose()` at the end of the call.
 
 Relay-backed LiveKit STT requires `turn_vad`, the worker's local LiveKit VAD.
-Native transcript finals can be pieces within one turn and do not assert end
-of speech. The VAD's actual start/end events supply those boundaries, keep the
-stream open across turns, and finalize at speech end. Missing VAD is refused
-before admission. Pipecat uses its pipeline's VAD and explicit commits.
+It must acknowledge contiguous unchanged audio in `INFERENCE_DONE.frames`
+before its start/end events, as Silero does. The inference and audio sample
+rates may differ. Only acknowledged audio reaches the relay; queued input
+cannot overtake an earlier speech boundary. Missing VAD is refused before
+admission, and stalled processing has a bounded input backlog.
+
+The LiveKit stream stays open across turns. Each VAD turn uses a separate
+native request, streaming audio and interim text while speech continues.
+At speech end the request commits and closes; final transcript segments and
+`END_OF_SPEECH` are emitted only after terminal usage arrives. A final segment
+alone cannot complete a turn. Completed-buffer `recognize()` joins all final
+segments and chunks large PCM buffers to fit the native frame bound. Pipecat
+uses its pipeline's VAD and explicit commits.
 
 Native speech disables LiveKit automatic retries for streaming STT, recognition,
 streaming TTS and chunked synthesis, including when retry-enabled connection
 options were supplied. Relay retry hints and timeouts cannot prove no provider
 I/O occurred; a new attempt needs an explicit control-plane decision.
+A failed native STT instance also refuses new streams and new turn admissions,
+including LiveKit's outer AgentSession recovery loop. The worker must obtain
+its recovery decision before constructing a replacement instance.
 
 The client preserves binary PCM, stream commits, TTS cancellation and native
 error codes. Live usage updates remain progress events; only a terminal frame

@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import time
 import uuid
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
 from aiohttp import web
 from livekit import rtc
-from livekit.agents import APIConnectionError, APIConnectOptions, stt, vad
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    APIConnectionError,
+    APIConnectOptions,
+    stt,
+    vad,
+)
+from livekit.agents.voice import audio_recognition as recognition
+from livekit.agents.voice import io
 
 from speko_gateway import GatewayError, RelaySpeechClient
 from speko_gateway.livekit import STT, TTS
@@ -54,42 +66,192 @@ def frame():
 class ControlledVAD(vad.VAD):
     """A separate owned boundary source, never a transcript-derived endpoint."""
 
-    def __init__(self):
+    def __init__(self, *, automatic=False, inference_rate=16000):
         super().__init__(capabilities=vad.VADCapabilities(update_interval=0.02))
         self.current = None
         self.frames = asyncio.Queue()
+        self.automatic = automatic
+        self.inference_rate = inference_rate
+        self.index = 0
+        self.prefix = []
 
     def stream(self):
         self.current = ControlledVADStream(self)
         return self.current
 
-    def emit(self, kind):
+    def processed(self, value):
+        self.index += (
+            value.samples_per_channel * self.inference_rate // value.sample_rate
+        )
+        self.prefix.append(value)
+        self.emit(vad.VADEventType.INFERENCE_DONE, frames=[value])
+
+    def emit(self, kind, *, frames=None):
         assert self.current is not None
         self.current._event_ch.send_nowait(
             vad.VADEvent(
                 type=kind,
-                samples_index=320,
-                timestamp=0.02,
+                samples_index=self.index,
+                timestamp=self.index / self.inference_rate,
                 speech_duration=0.02,
                 silence_duration=0,
-                frames=[],
+                frames=list(self.prefix if frames is None else frames),
             )
         )
 
 
 class ControlledVADStream(vad.VADStream):
     async def _main_task(self):
+        speaking = False
         async for value in self._input_ch:
             if not isinstance(value, self._FlushSentinel):
                 await self._vad.frames.put(value)
+                if self._vad.automatic:
+                    self._vad.processed(value)
+                    if not speaking:
+                        speaking = True
+                        self._vad.emit(vad.VADEventType.START_OF_SPEECH)
+        if speaking:
+            self._vad.emit(vad.VADEventType.END_OF_SPEECH)
 
 
-async def test_livekit_native_stt_gets_two_live_turns_from_vad_not_multiple_finals():
-    source = ControlledVAD()
-    transcripts = [asyncio.Event(), asyncio.Event()]
-    late = asyncio.Event()
-    closed = asyncio.Event()
+class OwnedAudioInput(io.AudioInput):
+    def __init__(self):
+        super().__init__(label="owned-native-input")
+        self.frames = asyncio.Queue()
+
+    async def __anext__(self):
+        value = await self.frames.get()
+        if value is None:
+            raise StopAsyncIteration
+        return value
+
+
+async def test_actual_agent_session_commits_complete_native_turns_after_delayed_finals():
+    source = ControlledVAD(inference_rate=8000)
+    late, first_audio, commit_received = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
     seen = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        index = len(seen)
+        seen.append([])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                seen[index].append(message.data)
+                await ws.send_json(
+                    {
+                        "type": "transcript.final",
+                        "text": "first" if index == 0 else "second",
+                    }
+                )
+                first_audio.set()
+                continue
+            value = json.loads(message.data)
+            if value["type"] == "input.commit" and index == 0:
+                commit_received.set()
+                await late.wait()
+                await ws.send_json(
+                    {"type": "transcript.final", "text": "late remainder"}
+                )
+            if value["type"] == "session.close":
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=source,
+        )
+        session = AgentSession(
+            stt=model,
+            llm=None,
+            tts=None,
+            vad=None,
+            turn_detection="stt",
+            min_endpointing_delay=0,
+            max_endpointing_delay=0,
+        )
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        turns = asyncio.Queue()
+
+        class OwnedAgent(Agent):
+            async def on_user_turn_completed(self, turn_ctx, new_message):
+                turns.put_nowait(new_message.text_content)
+
+        try:
+            start_options = (
+                {"record": False}
+                if "record" in inspect.signature(session.start).parameters
+                else {}
+            )
+            await session.start(
+                agent=OwnedAgent(instructions="Owned local speech fixture"),
+                **start_options,
+            )
+            first = frame()
+            second = rtc.AudioFrame(
+                data=b"\x22\x11" * 320,
+                sample_rate=16000,
+                num_channels=1,
+                samples_per_channel=320,
+            )
+            await audio.frames.put(first)
+            await audio.frames.put(second)
+            await asyncio.wait_for(source.frames.get(), 3)
+            await asyncio.wait_for(source.frames.get(), 3)
+            source.processed(first)
+            source.emit(vad.VADEventType.START_OF_SPEECH)
+            await asyncio.wait_for(first_audio.wait(), 3)
+            source.emit(vad.VADEventType.END_OF_SPEECH)
+            source.processed(second)
+            await asyncio.wait_for(commit_received.wait(), 3)
+            await asyncio.sleep(0.03)
+            assert turns.empty(), (
+                "AgentSession committed an incomplete native transcript"
+            )
+            assert seen[0] == [bytes(first.data)]
+            late.set()
+            assert await asyncio.wait_for(turns.get(), 3) == "first late remainder"
+            source.emit(vad.VADEventType.START_OF_SPEECH, frames=[second])
+            source.emit(vad.VADEventType.END_OF_SPEECH, frames=[second])
+            assert await asyncio.wait_for(turns.get(), 3) == "second"
+            assert seen == [[bytes(first.data)], [bytes(second.data)]]
+        finally:
+            late.set()
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.skipif(
+    not hasattr(recognition, "_STTPipeline"),
+    reason="This SDK release predates AgentSession's outer STT recovery pump",
+)
+async def test_actual_agent_stt_recovery_pump_cannot_readmit_a_failed_native_request(
+    monkeypatch,
+):
+    monkeypatch.setattr(recognition, "_STT_RECONNECT_INTERVAL", 0)
+    seen = []
+    source = ControlledVAD(automatic=True)
 
     async def handle(request):
         ws = web.WebSocketResponse()
@@ -97,27 +259,98 @@ async def test_livekit_native_stt_gets_two_live_turns_from_vad_not_multiple_fina
         await ws.receive_json()
         seen.append(request.headers["Idempotency-Key"])
         await ready(ws)
-        turns = commits = 0
+        await ws.send_json(
+            {"type": "error", "error": {"code": "provider_failure", "retryable": True}}
+        )
+        await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=source,
+        )
+        agent = Agent(instructions="Owned recovery fixture")
+        agent._activity = SimpleNamespace(
+            stt=model,
+            vad=None,
+            _audio_recognition=None,
+            session=SimpleNamespace(
+                conn_options=SimpleNamespace(
+                    stt_conn_options=APIConnectOptions(max_retry=3, retry_interval=0)
+                ),
+                _recorder_io=None,
+                _started_at=time.time(),
+            ),
+        )
+        pipeline = recognition._STTPipeline(
+            lambda audio, settings: Agent.default.stt_node(agent, audio, settings)
+        )
+
+        async def continue_input():
+            for _ in range(100):
+                if pipeline._pump_task.done():
+                    return
+                pipeline.audio_ch.send_nowait(frame())
+                await asyncio.sleep(0.005)
+
+        producer = asyncio.create_task(continue_input())
+        try:
+            with pytest.raises(GatewayError, match="control-plane recovery"):
+                await asyncio.wait_for(pipeline._pump_task, 3)
+            assert len(seen) == 1
+            pipeline.audio_ch.send_nowait(frame())
+            assert pipeline._pump_task.done()
+            with pytest.raises(GatewayError, match="control-plane recovery"):
+                model.stream()
+            assert len(seen) == 1
+        finally:
+            await producer
+            await pipeline.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_livekit_native_stt_orders_processed_audio_and_waits_for_all_turn_finals():
+    source = ControlledVAD()
+    late = asyncio.Event()
+    committed = asyncio.Event()
+    first_audio = asyncio.Event()
+    seen = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        turn = len(seen)
+        seen.append({"key": request.headers["Idempotency-Key"], "audio": []})
+        await ready(ws)
         async for message in ws:
             if message.type is aiohttp.WSMsgType.BINARY:
-                turn = turns
-                turns += 1
-                await transcripts[turn].wait()
+                seen[turn]["audio"].append(message.data)
                 for suffix in ["a", "b"]:
                     await ws.send_json(
                         {"type": "transcript.final", "text": f"{turn + 1}{suffix}"}
                     )
+                if turn == 0:
+                    first_audio.set()
                 continue
             value = json.loads(message.data)
-            if value["type"] == "input.commit":
-                commits += 1
-                if commits == 1:
-                    await late.wait()
-                    await ws.send_json({"type": "transcript.final", "text": "late-1"})
+            if value["type"] == "input.commit" and turn == 0:
+                committed.set()
+                await late.wait()
+                await ws.send_json({"type": "transcript.final", "text": "late-1"})
             if value["type"] == "session.close":
                 await ws.send_json({"type": "session.closed", "usage": {}})
                 await ws.close()
-        closed.set()
         return ws
 
     async with peer(handle) as origin:
@@ -137,38 +370,64 @@ async def test_livekit_native_stt_gets_two_live_turns_from_vad_not_multiple_fina
             conn_options=APIConnectOptions(max_retry=3, retry_interval=0)
         )
         try:
-            for turn in range(2):
-                stream.push_frame(frame())
-                await asyncio.wait_for(source.frames.get(), 2)
-                source.emit(vad.VADEventType.START_OF_SPEECH)
-                assert (
-                    await asyncio.wait_for(anext(stream), 2)
-                ).type is stt.SpeechEventType.START_OF_SPEECH
-                transcripts[turn].set()
-                for suffix in ["a", "b"]:
-                    event = await asyncio.wait_for(anext(stream), 2)
-                    assert event.type is stt.SpeechEventType.FINAL_TRANSCRIPT
-                    assert event.alternatives[0].text == f"{turn + 1}{suffix}"
-                pending = asyncio.create_task(anext(stream))
-                await asyncio.sleep(0)
-                assert not pending.done()
-                source.emit(vad.VADEventType.END_OF_SPEECH)
-                assert (
-                    await asyncio.wait_for(pending, 2)
-                ).type is stt.SpeechEventType.END_OF_SPEECH
-                assert not closed.is_set()
-                if turn == 0:
-                    late.set()
-                    event = await asyncio.wait_for(anext(stream), 2)
-                    assert event.type is stt.SpeechEventType.FINAL_TRANSCRIPT
-                    assert event.alternatives[0].text == "late-1"
+            first, second = (
+                frame(),
+                rtc.AudioFrame(
+                    data=b"\x22\x11" * 320,
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=320,
+                ),
+            )
+            stream.push_frame(first)
+            stream.push_frame(second)
+            await asyncio.wait_for(source.frames.get(), 2)
+            await asyncio.wait_for(source.frames.get(), 2)
+            source.processed(first)
+            source.emit(vad.VADEventType.START_OF_SPEECH)
+            assert (
+                await asyncio.wait_for(anext(stream), 2)
+            ).type is stt.SpeechEventType.START_OF_SPEECH
+            await asyncio.wait_for(first_audio.wait(), 2)
+            source.emit(vad.VADEventType.END_OF_SPEECH)
+            source.processed(second)
+            await asyncio.wait_for(committed.wait(), 2)
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0.02)
+            assert not pending.done(), (
+                "a final segment cannot complete an unfinished native request"
+            )
+            assert seen[0]["audio"] == [bytes(first.data)]
+            late.set()
+            assert (await asyncio.wait_for(pending, 2)).alternatives[0].text == "1a"
+            assert (await asyncio.wait_for(anext(stream), 2)).alternatives[
+                0
+            ].text == "1b"
+            assert (await asyncio.wait_for(anext(stream), 2)).alternatives[
+                0
+            ].text == "late-1"
+            assert (
+                await asyncio.wait_for(anext(stream), 2)
+            ).type is stt.SpeechEventType.END_OF_SPEECH
+            source.emit(vad.VADEventType.START_OF_SPEECH, frames=[second])
+            source.emit(vad.VADEventType.END_OF_SPEECH, frames=[second])
+            assert (
+                await asyncio.wait_for(anext(stream), 2)
+            ).type is stt.SpeechEventType.START_OF_SPEECH
+            for suffix in ["a", "b"]:
+                assert (await asyncio.wait_for(anext(stream), 2)).alternatives[
+                    0
+                ].text == f"2{suffix}"
+            assert (
+                await asyncio.wait_for(anext(stream), 2)
+            ).type is stt.SpeechEventType.END_OF_SPEECH
+            assert seen[1]["audio"] == [bytes(second.data)]
+            assert seen[0]["key"] != seen[1]["key"]
             stream.end_input()
             assert [event async for event in stream] == []
-            assert len(seen) == 1
+            assert len(seen) == 2
         finally:
             late.set()
-            for event in transcripts:
-                event.set()
             await stream.aclose()
             await model.aclose()
             await client.aclose()
@@ -269,7 +528,7 @@ async def test_actual_livekit_stt_cannot_retry_an_ambiguous_native_error(method)
             provider="fixture",
             model="fixture-model",
             credential_source="managed",
-            turn_vad=ControlledVAD(),
+            turn_vad=ControlledVAD(automatic=True),
         )
         stream = None
         try:
@@ -311,6 +570,178 @@ async def test_native_livekit_stt_refuses_missing_speech_boundary_source_before_
             )
     finally:
         await client.aclose()
+
+
+async def test_native_recognition_chunks_a_completed_audio_buffer_and_keeps_every_final():
+    payload = b"\xff\x0f" * ((1 << 20) + 320)
+    observed = []
+
+    async def handle(request):
+        # aiohttp's uncompressed frame limit is exclusive; native Go peers
+        # accept a message whose size equals their 2 MiB read limit.
+        ws = web.WebSocketResponse(max_msg_size=(2 << 20) + 1)
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                observed.append(message.data)
+                await ws.send_json(
+                    {
+                        "type": "transcript.final",
+                        "text": "first" if len(observed) == 1 else "second",
+                    }
+                )
+            elif (
+                message.type is aiohttp.WSMsgType.TEXT
+                and json.loads(message.data)["type"] == "session.close"
+            ):
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        assert ws.exception() is None
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=ControlledVAD(),
+        )
+        try:
+            result = await model.recognize(
+                rtc.AudioFrame(
+                    data=payload,
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=len(payload) // 2,
+                )
+            )
+            assert result.alternatives[0].text == "first second"
+            assert [len(raw) for raw in observed] == [2 << 20, 640]
+            assert b"".join(observed) == payload
+        finally:
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_native_stt_publishes_interims_while_audio_is_still_streaming():
+    source = ControlledVAD()
+    observed = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                observed.append(message.data)
+                await ws.send_json({"type": "transcript.delta", "text": "streaming"})
+            elif json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "complete"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=source,
+        )
+        stream = model.stream()
+        try:
+            audio = frame()
+            stream.push_frame(audio)
+            await asyncio.wait_for(source.frames.get(), 2)
+            source.processed(audio)
+            source.emit(vad.VADEventType.START_OF_SPEECH)
+            assert (
+                await asyncio.wait_for(anext(stream), 2)
+            ).type is stt.SpeechEventType.START_OF_SPEECH
+            interim = await asyncio.wait_for(anext(stream), 2)
+            assert interim.type is stt.SpeechEventType.INTERIM_TRANSCRIPT
+            assert interim.alternatives[0].text == "streaming"
+            assert observed == [bytes(audio.data)]
+            source.emit(vad.VADEventType.END_OF_SPEECH)
+            assert (await asyncio.wait_for(anext(stream), 2)).alternatives[
+                0
+            ].text == "complete"
+            assert (
+                await asyncio.wait_for(anext(stream), 2)
+            ).type is stt.SpeechEventType.END_OF_SPEECH
+            stream.end_input()
+            assert [event async for event in stream] == []
+        finally:
+            await stream.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("failure", ["unprocessed-boundary", "stalled-detector-bound"])
+async def test_native_stt_refuses_unprocessed_or_unbounded_vad_input_without_admission(
+    failure,
+):
+    seen = []
+
+    async def handle(request):
+        seen.append(request.path)
+        return web.Response(status=500)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        source = ControlledVAD()
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=source,
+        )
+        stream = model.stream()
+        try:
+            if failure == "unprocessed-boundary":
+                audio = frame()
+                stream.push_frame(audio)
+                await asyncio.wait_for(source.frames.get(), 2)
+                source.emit(vad.VADEventType.START_OF_SPEECH, frames=[audio])
+            else:
+                stream.push_frame(
+                    rtc.AudioFrame(
+                        data=b"\0\0" * (31 * 16000),
+                        sample_rate=16000,
+                        num_channels=1,
+                        samples_per_channel=31 * 16000,
+                    )
+                )
+            with pytest.raises(APIConnectionError):
+                async for _ in stream:
+                    pass
+            assert seen == []
+            with pytest.raises(GatewayError, match="control-plane recovery"):
+                model.stream()
+        finally:
+            await stream.aclose()
+            await model.aclose()
+            await client.aclose()
 
 
 @pytest.mark.parametrize("status", [401, 403, 429, 503])

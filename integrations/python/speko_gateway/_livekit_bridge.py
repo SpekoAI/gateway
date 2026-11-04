@@ -196,6 +196,10 @@ class LiveKitSTTStream:
         self._session = session
 
     @property
+    def request_id(self) -> str:
+        return str(self._session.metadata.get("request_id", ""))
+
+    @property
     def session_id(self) -> str:
         """Gateway session identifier, exposed for profiler leg attachment."""
 

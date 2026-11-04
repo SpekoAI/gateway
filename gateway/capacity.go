@@ -10,6 +10,22 @@ type trackedCapacity struct {
 	attribution *protocol.CapacityAttribution
 }
 
+type physicalCapacity struct {
+	capacity trackedCapacity
+	pending  bool
+}
+
+// Caller holds s.mu. Teardown remains a slot even after local detachment.
+func (s *Server) physicalSlotsLocked() int {
+	count := len(s.physical)
+	for _, pending := range s.inflight {
+		if pending.pending && pending.current == nil {
+			count++
+		}
+	}
+	return count
+}
+
 func verifiedCapacity(c *protocol.CapacityAttribution, source protocol.CredentialSource) trackedCapacity {
 	var copy *protocol.CapacityAttribution
 	if c != nil {
@@ -53,12 +69,12 @@ func (s *Server) capacityLocked() protocol.CapacitySnapshot {
 			row.Active++
 		}
 	}
-	for _, session := range s.sessions {
-		add(session.capacity, false)
+	for resource := range s.physical {
+		add(resource.capacity, resource.pending)
 	}
 	for _, pending := range s.inflight {
-		if pending.pending {
-			add(pending.capacity, true)
+		if pending.pending && pending.current == nil {
+			add(trackedCapacity{}, true)
 		}
 	}
 	keys := make([]string, 0, len(rows))
