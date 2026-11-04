@@ -1,0 +1,277 @@
+"""Local SDK VAD streams with captured-audio durations at paused frontiers."""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import math
+
+from livekit import rtc
+from livekit.agents import utils, vad
+
+from ._livekit_vad_audio import ProbabilityVAD, VADAudio
+from .client import GatewayError
+
+
+class DrainingVAD(vad.VAD):
+    """Drain partial local-inference/Silero windows without inventing speech time.
+
+    Use for an AgentSession's independent VAD. Its underlying detector stays
+    local and keeps its configured thresholds; inference-only padding never
+    appears in outward event audio or contributes to a duration threshold.
+    Each stream owns its buffers, inference tasks and hard flush boundaries.
+    """
+
+    def __init__(self, detector: vad.VAD) -> None:
+        if type(detector).__module__ not in {
+            "livekit.agents.inference.vad",
+            "livekit.plugins.silero.vad",
+        }:
+            raise ValueError("DrainingVAD requires the local inference or Silero VAD")
+        super().__init__(capabilities=detector.capabilities)
+        self._detector = detector
+
+    @property
+    def model(self) -> str:
+        return self._detector.model
+
+    @property
+    def provider(self) -> str:
+        return self._detector.provider
+
+    @property
+    def min_silence_duration(self) -> float | None:
+        return self._detector._opts.min_silence_duration
+
+    def update_options(self, **kwargs: object) -> None:
+        self._detector.update_options(**kwargs)
+
+    def stream(self) -> vad.VADStream:
+        return _DrainingVADStream(self)
+
+
+class _DrainingVADStream(vad.VADStream):
+    def __init__(self, parent: DrainingVAD) -> None:
+        self._source = parent._detector
+        self._sample_rate = self._queued = 0
+        self._inner = None
+        self._probability = None
+        super().__init__(parent)
+
+    @property
+    def activation_threshold(self) -> float:
+        return self._inner._opts.activation_threshold
+
+    def push_frame(self, frame: rtc.AudioFrame) -> None:
+        if frame.num_channels != 1 or frame.sample_rate <= 0:
+            raise GatewayError("Local speech input must be mono PCM", retryable=False)
+        if self._sample_rate and frame.sample_rate != self._sample_rate:
+            raise GatewayError("Local speech input changed format", retryable=False)
+        if self._queued + frame.samples_per_channel > 30 * frame.sample_rate:
+            raise GatewayError(
+                "Local speech input exceeded its processing bound", retryable=False
+            )
+        super().push_frame(frame)
+        self._sample_rate = frame.sample_rate
+        self._queued += frame.samples_per_channel
+
+    def end_input(self) -> None:
+        # Drain actual queued audio before the inner SDK's reset marker.
+        self._check_input_not_ended()
+        self._check_not_closed()
+        self._input_ch.close()
+
+    def _reset(self) -> None:
+        self._inner = self._source.stream()
+        self._probability = None
+        self._audio = VADAudio()
+        self._unprocessed = bytearray()
+        self._history = bytearray()
+        self._speech = bytearray()
+        self._processed = self._last_index = 0
+        self._deadline = None
+
+    def _push(self, frame: rtc.AudioFrame, *, padding: bool = False) -> None:
+        raw = bytes(frame.data)
+        self._unprocessed.extend(raw)
+        self._audio.push(len(raw), padding=padding)
+        self._inner.push_frame(frame)
+
+    def _frame(self, raw: bytes) -> rtc.AudioFrame:
+        return rtc.AudioFrame(
+            data=raw,
+            sample_rate=self._sample_rate,
+            num_channels=1,
+            samples_per_channel=len(raw) // 2,
+        )
+
+    def _pad(self, *, final: bool = False) -> None:
+        audio, detector = self._audio, self._probability
+        if detector is None or not audio.real_pending:
+            return
+        size = detector.window_samples * 2
+        if not final and (
+            audio.last_padded == audio.real_fed or audio.padding_pending >= size
+        ):
+            return
+        audio.last_padded = audio.real_fed
+        self._push(self._frame(bytes(size)), padding=True)
+
+    def _observe(self, event: vad.VADEvent) -> None:
+        if event.type is not vad.VADEventType.INFERENCE_DONE:
+            return  # The SDK's boundary durations include inference-only padding.
+        if any(
+            frame.sample_rate != self._sample_rate or frame.num_channels != 1
+            for frame in event.frames
+        ):
+            raise GatewayError(
+                "Local speech detector changed audio format", retryable=False
+            )
+        raw = b"".join(bytes(frame.data) for frame in event.frames)
+        if (
+            not raw
+            or self._unprocessed[: len(raw)] != raw
+            or event.samples_index <= self._last_index
+        ):
+            raise GatewayError(
+                "Local speech detector did not acknowledge ordered input",
+                retryable=False,
+            )
+        self._last_index = event.samples_index
+        del self._unprocessed[: len(raw)]
+        real = self._audio.acknowledge(raw)
+        count = len(real) // 2
+        self._processed += count
+        self._queued -= count
+        if not real:
+            return
+        self._history.extend(real)
+        del self._history[: -30 * self._sample_rate * 2]
+        options = self._inner._opts
+        maximum = options.max_buffered_speech + options.prefix_padding_duration
+        if not math.isfinite(maximum) or maximum <= 0:
+            raise GatewayError("Invalid local speech buffer duration", retryable=False)
+        maximum_bytes = math.ceil(maximum * self._sample_rate) * 2
+        if self._probability.speaking:
+            self._speech.extend(real[: max(0, maximum_bytes - len(self._speech))])
+        boundary = self._probability.observe(
+            event,
+            samples=count,
+            end=self._processed,
+            history=bytes(self._history),
+            channels=1,
+        )
+        state = self._probability
+        self._event_ch.send_nowait(
+            dataclasses.replace(
+                event,
+                samples_index=self._processed,
+                timestamp=self._processed / self._sample_rate,
+                frames=[self._frame(real)],
+                speaking=state.speaking,
+                speech_duration=max(
+                    0, self._processed - state.started_at - state.silence_samples
+                )
+                / self._sample_rate
+                if state.speaking
+                else 0,
+                silence_duration=state.silence_samples / self._sample_rate,
+                raw_accumulated_speech=state.speech_samples / self._sample_rate,
+                raw_accumulated_silence=state.silence_samples / self._sample_rate,
+            )
+        )
+        if boundary is not None:
+            if boundary.type is vad.VADEventType.START_OF_SPEECH:
+                self._speech = bytearray(
+                    b"".join(bytes(frame.data) for frame in boundary.frames)[
+                        :maximum_bytes
+                    ]
+                )
+            else:
+                boundary.frames = [self._frame(bytes(self._speech))]
+                self._speech.clear()
+            self._event_ch.send_nowait(
+                dataclasses.replace(
+                    boundary,
+                    samples_index=self._processed,
+                    inference_duration=event.inference_duration,
+                )
+            )
+
+    async def _main_task(self) -> None:
+        incoming = observed = None
+        ending = flushing = False
+        self._reset()
+        try:
+            incoming = asyncio.create_task(self._input_ch.__anext__())
+            observed = asyncio.create_task(self._inner.__anext__())
+            while True:
+                waiting = [task for task in (incoming, observed) if task is not None]
+                timeout = (
+                    max(0, self._deadline - asyncio.get_running_loop().time())
+                    if self._deadline is not None
+                    else None
+                )
+                done, _ = await asyncio.wait(
+                    waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    self._deadline = None
+                    self._pad()
+                    continue
+                if observed in done:
+                    try:
+                        self._observe(observed.result())
+                    except StopAsyncIteration:
+                        if not (ending or flushing) or self._audio.real_pending:
+                            raise GatewayError(
+                                "Local speech detector ended before processing input",
+                                retryable=False,
+                            ) from None
+                        await self._inner.aclose()
+                        if ending:
+                            return
+                        self._reset()
+                        flushing = False
+                        incoming = asyncio.create_task(self._input_ch.__anext__())
+                    observed = asyncio.create_task(self._inner.__anext__())
+                if incoming in done:
+                    try:
+                        value = incoming.result()
+                    except StopAsyncIteration:
+                        ending = True
+                    else:
+                        if isinstance(value, self._FlushSentinel):
+                            flushing = True
+                        else:
+                            if self._probability is None:
+                                self._probability = ProbabilityVAD.for_stream(
+                                    self._inner, self._sample_rate
+                                )
+                                if self._probability is None:
+                                    raise GatewayError(
+                                        "Unsupported local speech detector stream",
+                                        retryable=False,
+                                    )
+                            self._push(value)
+                            interval = self._probability.interval
+                            self._deadline = (
+                                asyncio.get_running_loop().time()
+                                + max(interval, value.duration)
+                                + interval
+                            )
+                    if ending or flushing:
+                        incoming = None
+                        self._deadline = None
+                        self._pad(final=True)
+                        self._inner.end_input()
+                    else:
+                        incoming = asyncio.create_task(self._input_ch.__anext__())
+        finally:
+            await utils.aio.cancel_and_wait(
+                *(task for task in (incoming, observed) if task is not None)
+            )
+            await self._inner.aclose()
+            self._unprocessed.clear()
+            self._history.clear()
+            self._speech.clear()

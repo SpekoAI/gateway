@@ -201,6 +201,34 @@ Continuous input retains normal inference cadence. Padding is bounded
 independently from the real-input backlog, and a final drain completes remaining
 real samples before the SDK discards its buffers at end of input. Other supplied
 VAD implementations retain their ordered acknowledgement/boundary contract.
+
+An AgentSession with its own local VAD also needs to drain that independent
+stream. Wrap the local detector with `DrainingVAD`; retain the worker's local
+turn detector and VAD interruption policy:
+
+```python
+from livekit.agents import AgentSession, inference
+from speko_gateway.livekit import DrainingVAD
+
+session = AgentSession(
+    stt=stt,
+    llm=llm,
+    tts=tts,
+    vad=DrainingVAD(inference.VAD(model="silero")),
+    turn_handling={
+        "turn_detection": inference.TurnDetector(version="v1-mini"),
+        "interruption": {"mode": "vad", "enabled": True},
+    },
+)
+stt.bind_session(session)
+```
+
+`DrainingVAD` supports the installed local-inference and Silero VADs, with
+independent state per stream. It preserves captured PCM in inference/boundary
+events, applies the underlying detector's current duration thresholds, and
+drains input before a hard `flush()` resets the segment. It does not feed its
+padding into the separate turn detector. Close its streams through the owning
+AgentSession. Native STT already drains its own `turn_vad` stream separately.
 Binding is
 required for native AgentSession streaming. Explicit event consumers can use
 `stream(manual_turns=True)`; completed-buffer `recognize()` needs no binding
