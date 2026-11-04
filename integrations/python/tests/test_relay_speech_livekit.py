@@ -185,8 +185,8 @@ async def test_actual_agent_session_commits_complete_native_turns_after_delayed_
             tts=None,
             vad=None,
             turn_detection="stt",
-            min_endpointing_delay=0,
-            max_endpointing_delay=0,
+            min_endpointing_delay=0.2,
+            max_endpointing_delay=0.2,
         )
         audio = OwnedAudioInput()
         session.input.audio = audio
@@ -213,25 +213,34 @@ async def test_actual_agent_session_commits_complete_native_turns_after_delayed_
                 num_channels=1,
                 samples_per_channel=320,
             )
+            silence = rtc.AudioFrame(
+                data=b"\0" * 11200,
+                sample_rate=16000,
+                num_channels=1,
+                samples_per_channel=5600,
+            )
             await audio.frames.put(first)
+            await audio.frames.put(silence)
             await audio.frames.put(second)
+            await asyncio.wait_for(source.frames.get(), 3)
             await asyncio.wait_for(source.frames.get(), 3)
             await asyncio.wait_for(source.frames.get(), 3)
             source.processed(first)
             source.emit(vad.VADEventType.START_OF_SPEECH)
             await asyncio.wait_for(first_audio.wait(), 3)
             source.emit(vad.VADEventType.END_OF_SPEECH)
+            source.processed(silence)
             source.processed(second)
+            source.emit(vad.VADEventType.START_OF_SPEECH, frames=[second])
+            source.emit(vad.VADEventType.END_OF_SPEECH, frames=[second])
             await asyncio.wait_for(commit_received.wait(), 3)
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.35)
             assert turns.empty(), (
                 "AgentSession committed an incomplete native transcript"
             )
             assert seen[0] == [bytes(first.data)]
             late.set()
             assert await asyncio.wait_for(turns.get(), 3) == "first late remainder"
-            source.emit(vad.VADEventType.START_OF_SPEECH, frames=[second])
-            source.emit(vad.VADEventType.END_OF_SPEECH, frames=[second])
             assert await asyncio.wait_for(turns.get(), 3) == "second"
             assert seen == [[bytes(first.data)], [bytes(second.data)]]
         finally:
@@ -738,6 +747,219 @@ async def test_native_stt_refuses_unprocessed_or_unbounded_vad_input_without_adm
             assert seen == []
             with pytest.raises(GatewayError, match="control-plane recovery"):
                 model.stream()
+        finally:
+            await stream.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_cancelling_native_stt_after_configure_fences_admission_before_ready():
+    configured = asyncio.Event()
+    seen = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        seen.append(request.headers["Idempotency-Key"])
+        configured.set()
+        async for _ in ws:
+            pass
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            turn_vad=ControlledVAD(automatic=True),
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+        )
+        stream = model.stream()
+        try:
+            stream.push_frame(frame())
+            await asyncio.wait_for(configured.wait(), 2)
+            await asyncio.wait_for(stream.aclose(), 2)
+            with pytest.raises(GatewayError, match="control-plane recovery"):
+                model.stream()
+            assert len(seen) == 1
+        finally:
+            await stream.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("start_offset", [0, 7.25])
+async def test_native_vad_prefix_never_replays_prior_audio_and_times_follow_the_stream(
+    start_offset,
+):
+    source = ControlledVAD()
+    seen = []
+
+    def audio(raw):
+        return rtc.AudioFrame(
+            data=raw,
+            sample_rate=16000,
+            num_channels=1,
+            samples_per_channel=len(raw) // 2,
+        )
+
+    first = audio(b"\x11\x22" * 1600)
+    silence = audio(b"\0\0" * 640)
+    second = audio(b"\x33\x44" * 1600)
+    tail = audio(bytes(first.data)[-1920:])
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        index = len(seen)
+        seen.append(bytearray())
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                seen[index].extend(message.data)
+            elif json.loads(message.data)["type"] == "session.close":
+                await ws.send_json(
+                    {
+                        "type": "transcript.final",
+                        "text": "first" if index == 0 else "second",
+                        "audio_start_ms": 0,
+                        "audio_end_ms": 100 if index == 0 else 140,
+                    }
+                )
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            turn_vad=source,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+        )
+        stream = model.stream()
+        stream.start_time_offset = start_offset
+
+        async def completed_turn():
+            result = None
+            async for event in stream:
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    result = event.alternatives[0]
+                if event.type is stt.SpeechEventType.END_OF_SPEECH:
+                    return result
+
+        try:
+            stream.push_frame(first)
+            await asyncio.wait_for(source.frames.get(), 2)
+            source.processed(first)
+            source.emit(vad.VADEventType.START_OF_SPEECH)
+            source.emit(vad.VADEventType.END_OF_SPEECH)
+            first_result = await asyncio.wait_for(completed_turn(), 2)
+            for value in [silence, second]:
+                stream.push_frame(value)
+                await asyncio.wait_for(source.frames.get(), 2)
+                source.processed(value)
+            source.emit(
+                vad.VADEventType.START_OF_SPEECH, frames=[tail, silence, second]
+            )
+            source.emit(vad.VADEventType.END_OF_SPEECH)
+            second_result = await asyncio.wait_for(completed_turn(), 2)
+            stream.end_input()
+            assert [event async for event in stream] == []
+            assert [bytes(value) for value in seen] == [
+                bytes(first.data),
+                bytes(silence.data) + bytes(second.data),
+            ]
+            # LiveKit adds its own sub-millisecond task-start offset.
+            assert first_result.start_time == pytest.approx(start_offset, abs=0.001)
+            assert first_result.end_time == pytest.approx(start_offset + 0.1, abs=0.001)
+            assert second_result.start_time == pytest.approx(
+                start_offset + 0.1, abs=0.001
+            )
+            assert second_result.end_time == pytest.approx(
+                start_offset + 0.24, abs=0.001
+            )
+        finally:
+            await stream.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("large", ["prefix", "inference"])
+async def test_vad_audio_always_fits_native_message_bounds(large):
+    source = ControlledVAD()
+    observed = []
+
+    def audio(samples):
+        return rtc.AudioFrame(
+            data=b"\x11\x22" * samples,
+            sample_rate=48000,
+            num_channels=1,
+            samples_per_channel=samples,
+        )
+
+    prefix = audio(23 * 48000 if large == "prefix" else 960)
+    inference = audio(23 * 48000 if large == "inference" else 960)
+
+    async def handle(request):
+        ws = web.WebSocketResponse(max_msg_size=(2 << 20) + 1)
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                observed.append(message.data)
+            elif json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            turn_vad=source,
+            sample_rate=48000,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+        )
+        stream = model.stream()
+        try:
+            stream.push_frame(prefix)
+            await asyncio.wait_for(source.frames.get(), 2)
+            source.processed(prefix)
+            source.emit(vad.VADEventType.START_OF_SPEECH)
+            assert (
+                await asyncio.wait_for(anext(stream), 2)
+            ).type is stt.SpeechEventType.START_OF_SPEECH
+            stream.push_frame(inference)
+            await asyncio.wait_for(source.frames.get(), 2)
+            source.processed(inference)
+            source.emit(vad.VADEventType.END_OF_SPEECH)
+            stream.end_input()
+            assert [event.type async for event in stream] == [
+                stt.SpeechEventType.END_OF_SPEECH
+            ]
+            assert all(len(value) <= 2 << 20 for value in observed)
+            assert b"".join(observed) == bytes(prefix.data) + bytes(inference.data)
         finally:
             await stream.aclose()
             await model.aclose()
