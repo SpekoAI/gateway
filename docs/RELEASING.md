@@ -24,7 +24,9 @@ a release.
 
 4. The `Publish Docker image` workflow builds the image and pushes the
    `0.1.1` and `0.1` tags. It then creates the GitHub release with notes
-   generated from the merged pull requests.
+   generated from the merged pull requests. Only `vMAJOR.MINOR.PATCH` tags
+   publish; a tag that is already released, or older than a released patch
+   on the same minor, is refused.
 5. Edit the release notes on the releases page. Start with a short
    "What changed for you" section in plain words, and call out anything a
    customer must do.

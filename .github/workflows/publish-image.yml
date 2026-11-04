@@ -3,7 +3,8 @@ name: Publish Docker image
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # Stable releases only: vMAJOR.MINOR.PATCH. Prerelease tags are not published.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
 
 permissions:
@@ -12,10 +13,34 @@ permissions:
 env:
   IMAGE_NAME: spekoai/gateway
 
+# Release builds run one at a time and never cancel, so two tags pushed close
+# together cannot finish out of order and move the minor alias backwards.
+concurrency:
+  group: publish-${{ github.ref_type == 'tag' && 'release' || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      - name: Refuse to rebuild a released version
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A released image must never change under a customer who pinned it.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$TAG is already released; cut a new patch version instead"
+            exit 1
+          fi
+          # Never move the minor alias back to an older patch.
+          minor=$(printf '%s' "${TAG%.*}" | sed 's/\./\\./g')
+          newest=$( { gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 100 --json tagName --jq '.[].tagName'; echo "$TAG"; } | grep -E "^${minor}\.[0-9]+$" | sort -V | tail -1)
+          if [ "$newest" != "$TAG" ]; then
+            echo "::error::$newest is newer than $TAG on the same minor; refusing to move the ${TAG%.*} alias back"
+            exit 1
+          fi
       - uses: actions/checkout@v6
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -27,6 +52,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
+          # latest/edge follow main only; release tags never move them.
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=edge,enable={{is_default_branch}}

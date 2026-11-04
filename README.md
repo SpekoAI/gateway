@@ -16,7 +16,7 @@ with **Custom → Releases** to get notified.
 
 | Tag | What it points to | Use it for |
 |---|---|---|
-| `0.1.0` | One exact release. Never moves. | Production, when you want to choose every upgrade. |
+| `0.1.0` | One exact release. The workflow refuses to rebuild a released version. | Production, when you want to choose every upgrade. |
 | `0.1` | The newest `0.1.x` release. Gets fixes only. | Production, when you want fixes automatically. |
 | `latest`, `edge`, `sha-<commit>` | Every merge to `main`. Moves several times a day. | Testing unreleased changes. Not for production. |
 
