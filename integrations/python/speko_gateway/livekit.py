@@ -181,6 +181,7 @@ class STT(stt.STT):
         self._bound_agent: Agent | None = None
         self._bound_session: AgentSession | None = None
         self._turn_binding: tuple[Any, Any, Any] | None = None
+        self._turn_listener: Any = None
 
     def bind_agent(self, agent: Agent) -> None:
         """Locate the owned session through its initial Agent at stream start.
@@ -226,6 +227,18 @@ class STT(stt.STT):
             raise ValueError(
                 "Native STT streaming requires a running AgentSession"
             )
+        if self._turn_listener is None:
+            # A retained pipeline can publish while its SDK consumer is
+            # detached and the previous activity is still current. Observe
+            # the session's synchronous handoff and transcript-consumption
+            # events too, before the receiving activity can commit that final.
+            def observe_activity(_event: Any) -> None:
+                if getattr(self._bound_session, "_activity", None) is not None:
+                    self._bind_native_activity()
+
+            self._turn_listener = observe_activity
+            self._bound_session.on("conversation_item_added", observe_activity)
+            self._bound_session.on("user_input_transcribed", observe_activity)
         original = getattr(activity, "on_end_of_turn", None)
         if not callable(original) or inspect.iscoroutinefunction(original):
             raise ValueError("Unsupported native AgentSession turn interface")
@@ -402,6 +415,10 @@ class STT(stt.STT):
             )
 
     async def aclose(self) -> None:
+        if self._bound_session is not None and self._turn_listener is not None:
+            self._bound_session.off("conversation_item_added", self._turn_listener)
+            self._bound_session.off("user_input_transcribed", self._turn_listener)
+            self._turn_listener = None
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
