@@ -615,29 +615,40 @@ func (s *Session) abortProvider() {
 }
 
 func stopOpenedProvider(stream ProviderStream, release func()) {
-	if aborter, ok := stream.(AbortingProviderStream); ok {
-		_ = aborter.Abort(context.Background())
-	} else {
-		_ = stream.Close(context.Background())
+	releaseAfterProviderStop(stream.Events(), func() {
+		if aborter, ok := stream.(AbortingProviderStream); ok {
+			_ = aborter.Abort(context.Background())
+		} else {
+			_ = stream.Close(context.Background())
+		}
+	}, release)
+}
+
+func releaseAfterProviderStop(events <-chan ProviderEvent, stop, release func()) {
+	// Teardown may synchronously publish final events. Consume them before
+	// waiting for stop, then retain capacity until both boundaries complete.
+	drained := make(chan struct{})
+	if events != nil {
+		go func() {
+			for range events {
+			}
+			close(drained)
+		}()
 	}
-	events := stream.Events()
+	stop()
 	// A broken adapter with no closure evidence cannot release physical use.
 	if events == nil {
 		return
 	}
-	for range events {
-	}
+	<-drained
 	release()
 }
 
 func (s *Session) finishPhysical() {
-	s.abortProvider()
 	<-s.eventsStopped
-	// runEvents has left the channel; drain teardown output until the adapter
-	// proves that it stopped. Public Done alone is not that boundary.
-	for range s.providerEvents {
-	}
-	s.releasePhysical()
+	// runEvents has left the channel, so the teardown drain becomes its sole
+	// consumer. Public Done alone does not prove physical termination.
+	releaseAfterProviderStop(s.providerEvents, s.abortProvider, s.releasePhysical)
 }
 
 func (s *Session) fail(err error) {
