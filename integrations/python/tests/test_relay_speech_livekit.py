@@ -1201,7 +1201,7 @@ async def test_native_stt_publishes_interims_while_audio_is_still_streaming():
             await client.aclose()
 
 
-@pytest.mark.parametrize("failure", ["unprocessed-boundary", "stalled-detector-bound"])
+@pytest.mark.parametrize("failure", ["unprocessed-boundary", "stalled-detector-bound", "missing-activation-threshold", "invalid-probability", "invalid-activation-threshold"])
 async def test_native_stt_refuses_unprocessed_or_unbounded_vad_input_without_admission(
     failure,
 ):
@@ -1232,7 +1232,7 @@ async def test_native_stt_refuses_unprocessed_or_unbounded_vad_input_without_adm
                 stream.push_frame(audio)
                 await asyncio.wait_for(source.frames.get(), 2)
                 source.emit(vad.VADEventType.START_OF_SPEECH, frames=[audio])
-            else:
+            elif failure == "stalled-detector-bound":
                 stream.push_frame(
                     rtc.AudioFrame(
                         data=b"\0\0" * (31 * 16000),
@@ -1241,6 +1241,19 @@ async def test_native_stt_refuses_unprocessed_or_unbounded_vad_input_without_adm
                         samples_per_channel=31 * 16000,
                     )
                 )
+            else:
+                audio = frame()
+                stream.push_frame(audio)
+                await asyncio.wait_for(source.frames.get(), 2)
+                if failure != "missing-activation-threshold":
+                    source.activation_threshold = -1 if failure == "invalid-activation-threshold" else 0.5
+                source.current._event_ch.send_nowait(vad.VADEvent(
+                    type=vad.VADEventType.INFERENCE_DONE,
+                    samples_index=320, timestamp=0.02, frames=[audio],
+                    speech_duration=0, silence_duration=0,
+                    probability=float("nan") if failure == "invalid-probability" else 0.9,
+                ))
+                source.emit(vad.VADEventType.START_OF_SPEECH, frames=[audio])
             with pytest.raises(APIConnectionError):
                 async for _ in stream:
                     pass
@@ -3272,3 +3285,96 @@ async def test_native_websocket_http_refusal_is_never_a_retryable_connection_fai
         finally:
             await client.aclose()
     assert seen == [1]
+
+
+@pytest.mark.parametrize("frontier", ["partial_silence", "pending_onset", "cleared_onset"])
+@pytest.mark.parametrize("activation_threshold", [0.2, 0.8])
+async def test_native_actual_inference_vad_handles_incomplete_frontiers(frontier, activation_threshold):
+    # Keep the installed detector's buffering, threshold state, event ordering,
+    # executor and stream lifecycle. Only its owned model probabilities are
+    # deterministic, so this exercises the real 512-sample inference window.
+    from livekit.agents import inference
+
+    if not hasattr(inference, "VAD"):
+        pytest.skip("SDK predates local inference VAD")
+
+    class Predictor:
+        def predict(self, window):
+            return 0.9 if any(window) else 0.0
+
+        def reset(self):
+            pass
+
+    class OwnedVAD(inference.VAD):
+        def stream(self):
+            stream = super().stream()
+            if not hasattr(stream, "_native_vad"):
+                pytest.skip("SDK uses a different inference implementation")
+            stream._native_vad = Predictor()
+            return stream
+
+    detector = OwnedVAD(min_speech_duration=0.05, min_silence_duration=0.032, activation_threshold=activation_threshold)
+    terminal, turns, packets = asyncio.Event(), asyncio.Queue(), []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        index = len(packets)
+        packets.append([])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                packets[index].append(message.data)
+            elif message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "first" if index == 0 else "second"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                terminal.set()
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    def audio_frame(pcm):
+        return rtc.AudioFrame(data=pcm, sample_rate=16000, num_channels=1, samples_per_channel=len(pcm) // 2)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=detector)
+        session = AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0.2, max_endpointing_delay=0.2)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned real VAD frontiers"), **options)
+            speech, silence = b"\xff\x0f" * 512, b"\0\0" * 512
+            first = speech * 2 + silence
+            await audio.frames.put(audio_frame(first))
+            tail = b"\0\0" * 320 if frontier == "partial_silence" else speech
+            await audio.frames.put(audio_frame(tail))
+            await asyncio.wait_for(terminal.wait(), 3)
+            if frontier == "partial_silence":
+                assert await asyncio.wait_for(turns.get(), 1) == "first", "a partial silent inference window must not stall a completed turn"
+                assert len(packets) == 1
+            else:
+                await asyncio.sleep(0.35)
+                assert turns.empty(), "a possible onset before START_OF_SPEECH must keep the previous turn pending"
+                if frontier == "cleared_onset":
+                    await audio.frames.put(audio_frame(silence))
+                    assert await asyncio.wait_for(turns.get(), 2) == "first"
+                    assert len(packets) == 1
+                else:
+                    await audio.frames.put(audio_frame(speech + silence))
+                    assert await asyncio.wait_for(turns.get(), 2) == "first second"
+                    assert len(packets) == 2
+                    assert b"".join(packets[1]) == speech * 2 + silence
+            assert b"".join(packets[0]) == first, "detector processing must not invent provider PCM"
+            assert not model._native_failed
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()

@@ -146,6 +146,12 @@ Unprocessed VAD input and incomplete terminal transcripts defer framework
 acceptance. Draining input or delivering the complete transcript rearms a deferred
 decision, preserving an explicit `skip_reply` request. The SDK detector objects
 and streams are observed through owned recognition instances and restored on close.
+Probability-based VADs must expose their activation threshold on the owned
+stream/options or detector. Silero/local inference options supply it directly;
+custom detectors can expose `activation_threshold`. A window above that actual
+threshold keeps a possible onset pending before `START_OF_SPEECH`. A later real
+window below it clears the candidate. Invalid probabilities or thresholds and
+unqualified probability detectors refuse before native admission.
 Binding is
 required for native AgentSession streaming. Explicit event consumers can use
 `stream(manual_turns=True)`; completed-buffer `recognize()` needs no binding

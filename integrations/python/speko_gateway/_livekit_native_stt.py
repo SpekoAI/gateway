@@ -102,6 +102,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._continuation_delay = continuation_delay
         self._reconsider_turn = reconsider_turn
         self._vad_speaking = False
+        self._vad_onset_pending = False
         self._last_speech_end: int | None = None
         self._pending_transcript = False
         self._classifying_boundary = False
@@ -190,6 +191,31 @@ class NativeSpeechStream(stt.RecognizeStream):
                 "Local speech detector changed the audio format", retryable=False
             )
         return b"".join(bytes(frame.data) for frame in frames)
+
+    def _possible_onset(self, event: vad.VADEvent) -> bool:
+        # Silero/local inference publish INFERENCE_DONE before updating their
+        # minimum-speech threshold and emitting START_OF_SPEECH. A drained
+        # frontier is insufficient when this window is still accumulating an
+        # onset. Read the owned stream's actual, updateable threshold.
+        options = getattr(self._vad_stream, "_opts", None)
+        threshold = getattr(
+            self._vad_stream, "activation_threshold",
+            getattr(options, "activation_threshold", None),
+        )
+        if threshold is None:
+            threshold = getattr(self._turn_vad, "activation_threshold", None)
+        if threshold is None:
+            if event.probability:
+                raise GatewayError(
+                    "Local probability detector must expose its activation threshold",
+                    retryable=False,
+                )
+            return event.raw_accumulated_speech > 0
+        if not isinstance(threshold, (float, int)) or not math.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise GatewayError("Invalid local speech activation threshold", retryable=False)
+        if not math.isfinite(event.probability) or not 0 <= event.probability <= 1:
+            raise GatewayError("Invalid local speech probability", retryable=False)
+        return event.probability >= threshold
 
     async def _run(self) -> None:
         tasks: list[asyncio.Task[Any]] = []
@@ -315,6 +341,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 self._last_vad_index = event.samples_index
                 self._processed_samples += len(raw) // (2 * self._channels)
                 self._vad_speaking = event.speaking
+                self._vad_onset_pending = not event.speaking and self._possible_onset(event)
                 if self._gateway_stream is not None:
                     await self._send_audio(raw)
                     self._assigned_until = self._processed_samples
@@ -382,6 +409,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 self._awaiting_new_turn = False
                 self._pending_transcript = True
                 self._vad_speaking = True
+                self._vad_onset_pending = False
                 self._event_ch.send_nowait(
                     stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
                 )
@@ -389,6 +417,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 self._assigned_until = self._processed_samples
             elif event.type == vad.VADEventType.END_OF_SPEECH:
                 self._vad_speaking = False
+                self._vad_onset_pending = False
                 if event.samples_index != self._last_vad_index:
                     raise GatewayError(
                         "Local speech boundary overtook processed input",
@@ -533,7 +562,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         return not self._wait_for_turn_commit or self._task.done() or (
             not self._pending_transcript
             and not self._classifying_boundary
-            and (self._awaiting_new_turn or (not self._vad_speaking and self._available_samples == 0))
+            and (self._awaiting_new_turn or (not self._vad_speaking and not self._vad_onset_pending and self._available_samples == 0))
             and (not self._turn_text or " ".join(transcript.split()) == self._turn_text)
         )
 
