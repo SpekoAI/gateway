@@ -20,6 +20,8 @@ class NativeSpeechData(stt.SpeechData):
     _local_group: str | None = field(default=None, repr=False)
     _local_suppressed: bool = field(default=False, repr=False)
     _local_after_eos: bool = field(default=False, repr=False)
+    _local_terminal: bool = field(default=False, repr=False)
+    _local_filtered: bool = field(default=False, repr=False)
     provider_speaker_id: str | None = None
     _native_speaker_scope: str | None = field(default=None, repr=False)
 

@@ -44,7 +44,7 @@ def assert_marker(headers) -> None:
 
 
 @asynccontextmanager
-async def gateway_stt_peer(payloads, *, after_eos=False):
+async def gateway_stt_peer(payloads, *, after_eos=False, final_gate=None):
     async def create(request):
         await request.json()
         return web.json_response({"stream_url": "/v1/sessions/fixture/stream"}, status=201)
@@ -57,6 +57,8 @@ async def gateway_stt_peer(payloads, *, after_eos=False):
             if message.type is aiohttp.WSMsgType.BINARY:
                 final, ended = ("transcript.final", payloads(index)), ("speech.ended", {})
                 for kind, data in [("speech.started", {}), *( [ended, final] if after_eos else [final, ended])]:
+                    if kind == "transcript.final" and final_gate is not None:
+                        await final_gate.wait()
                     await ws.send_json({"type": kind, "data": data})
                 index += 1
             elif message.type is aiohttp.WSMsgType.TEXT and message.json()["type"] == "session.close":
@@ -81,7 +83,7 @@ async def test_gateway_background_suppression_keeps_filtered_canonical_turns(sha
 
     from speko_gateway.livekit import STT
 
-    turns, items, frames, finals = asyncio.Queue(), asyncio.Queue(), asyncio.Queue(), []
+    turns, items, frames, finals, envelopes = asyncio.Queue(), asyncio.Queue(), asyncio.Queue(), [], []
     first, release = asyncio.Event(), asyncio.Event()
 
     class Input(io.AudioInput):
@@ -100,6 +102,7 @@ async def test_gateway_background_suppression_keeps_filtered_canonical_turns(sha
                 event = dataclasses.replace(event, alternatives=[dataclasses.replace(data) for data in event.alternatives])
                 if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
                     finals.extend(data.text for data in event.alternatives if data.text)
+                    envelopes.append(dataclasses.asdict(event))
                 yield event
                 if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT and event.alternatives[0].text and not first.is_set():
                     first.set()
@@ -147,8 +150,78 @@ async def test_gateway_background_suppression_keeps_filtered_canonical_turns(sha
                 expected = ["甲", "乙", "丙"][index] if shape == "whole" else "你" if shape == "terminal" else "你吗"
                 assert await asyncio.wait_for((items if manual and shape != "whole" and index == 0 else turns).get(), 3) == expected
             assert "好" not in finals and "乙" not in finals
+            assert all("好" not in repr(event) and "乙" not in repr(event) for event in envelopes), "suppressed content must also be absent from all outward event metadata"
         finally:
             release.set()
+            await frames.put(None)
+            await session.aclose()
+            await wrapped.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("mode", ["manual", "vad"])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_gateway_late_final_obeys_the_active_framework_turn_policy(mode, nested):
+    from livekit import rtc
+    from livekit.agents import Agent, AgentSession, stt, vad
+    from livekit.agents.voice import io
+    from test_relay_speech_livekit import ControlledVAD
+
+    from speko_gateway.livekit import STT
+
+    frames, items, turns = asyncio.Queue(), asyncio.Queue(), asyncio.Queue()
+    allowed, final_received = asyncio.Event(), asyncio.Event()
+
+    class Input(io.AudioInput):
+        def __init__(self):
+            super().__init__(label="owned-late-policy-input")
+
+        async def __anext__(self):
+            value = await frames.get()
+            if value is None:
+                raise StopAsyncIteration
+            return value
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async for event in Agent.default.stt_node(self, audio, settings):
+                yield event
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    final_received.set()
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    detector = ControlledVAD() if mode == "vad" else None
+    async with gateway_stt_peer(lambda _: {"text": "hello"}, after_eos=True, final_gate=allowed) as address:
+        client = GatewayClient(socket_path=address, local_auth_token="owned-late-policy")
+        model = STT(client)
+        wrapped = stt.FallbackAdapter([model], max_retry_per_stt=0) if nested else model
+        session = AgentSession(stt=wrapped, llm=None, tts=None, vad=detector, turn_detection=mode, min_endpointing_delay=0, max_endpointing_delay=0)
+        session.input.audio = Input()
+        session.on("conversation_item_added", lambda event: items.put_nowait(event.item.text_content) if getattr(event.item, "role", None) == "user" else None)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned late final policy"), **options)
+            await frames.put(rtc.AudioFrame(data=b"\xff\x0f" * 320, sample_rate=16000, num_channels=1, samples_per_channel=320))
+            if detector is not None:
+                value = await asyncio.wait_for(detector.frames.get(), 3)
+                detector.processed(value)
+                detector.emit(vad.VADEventType.START_OF_SPEECH)
+                await asyncio.sleep(0.02)
+                assert session._activity._audio_recognition._speaking
+            allowed.set()
+            await asyncio.wait_for(final_received.wait(), 3)
+            await asyncio.sleep(0.15)
+            assert items.empty() and turns.empty(), "late final must wait for a manual commit or VAD end"
+            if mode == "manual":
+                await asyncio.wait_for(session.commit_user_turn(transcript_timeout=0, stt_flush_duration=0, skip_reply=True), 3)
+            else:
+                detector.emit(vad.VADEventType.END_OF_SPEECH, silence_duration=0.02)
+            assert await asyncio.wait_for((items if mode == "manual" else turns).get(), 3) == "hello"
+        finally:
+            allowed.set()
             await frames.put(None)
             await session.aclose()
             await wrapped.aclose()

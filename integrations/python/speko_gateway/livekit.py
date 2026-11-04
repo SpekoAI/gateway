@@ -757,6 +757,7 @@ class SpeechStream(stt.RecognizeStream):
             data._local_group = self._local_group
             data._local_after_eos = self._awaiting_final
             data.canonical_text = event.text if event.canonical_text is None else event.canonical_text
+            data._local_terminal = bool(data.canonical_text)
             if data.canonical_text:
                 self._local_group = None
         return data
