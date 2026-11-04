@@ -352,7 +352,7 @@ async def test_actual_agent_stt_recovery_pump_cannot_readmit_a_failed_native_req
         )
         agent._activity.session._activity = agent._activity
         pipeline = recognition._STTPipeline(
-            lambda audio, settings: Agent.default.stt_node(agent, audio, settings)
+            lambda audio, settings: agent.stt_node(audio, settings)
         )
 
         async def continue_input():
@@ -1230,6 +1230,7 @@ async def test_actual_native_agent_session_keeps_turn_authority_across_commits_a
         entered = asyncio.Event()
         agent = OwnedAgent(instructions="Owned native lifecycle fixture")
         original = agent.on_user_turn_completed
+        original_node, original_update = agent.stt_node, session._update_activity
         if binding == "session":
             model.bind_session(session)
         else:
@@ -1280,6 +1281,8 @@ async def test_actual_native_agent_session_keeps_turn_authority_across_commits_a
                 await recognition_model.aclose()
             await model.aclose()
             await client.aclose()
+            assert agent.stt_node == original_node
+            assert session._update_activity == original_update
 
 
 @pytest.mark.skipif(
@@ -1471,12 +1474,13 @@ async def test_native_model_handoffs_keep_only_the_active_recognition_owner_boun
 
 @pytest.mark.skipif(not hasattr(Agent, "update_options"), reason="SDK predates live model option updates")
 @pytest.mark.parametrize("wrapper", ["direct", "multi_speaker", "fallback", "nested"])
-@pytest.mark.parametrize("buffered", [True, False])
-async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpointing_after_live_model_swap(wrapper, buffered):
+@pytest.mark.parametrize("buffered,prefix_frames", [(True, 0), (False, 0), (False, 35)])
+async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpointing_after_live_model_swap(wrapper, buffered, prefix_frames):
     sources = [ControlledVAD(), ControlledVAD()]
     node_waiting, resume_node = asyncio.Event(), asyncio.Event()
+    prefix_consumed = asyncio.Event()
     turns = asyncio.Queue()
-    terminal_at, seen, speech_ends = [], [], []
+    terminal_at, seen, speech_ends, packets = [], [], [], []
 
     async def handle(request):
         ws = web.WebSocketResponse()
@@ -1484,8 +1488,12 @@ async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpoin
         await ws.receive_json()
         index = len(seen) + 1
         seen.append(request.headers["Idempotency-Key"])
+        pcm = bytearray()
+        packets.append(pcm)
         await ready(ws)
         async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                pcm.extend(message.data)
             if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
                 await ws.send_json({"type": "transcript.final", "text": f"turn {index}"})
                 await ws.send_json({"type": "session.closed", "usage": {}})
@@ -1506,6 +1514,9 @@ async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpoin
                 if self.stt is wrapped[1]:
                     node_waiting.set()
                     await resume_node.wait()
+                    for _ in range(prefix_frames):
+                        await anext(audio)
+                    prefix_consumed.set()
                 async for event in Agent.default.stt_node(self, audio, model_settings):
                     if self.stt is wrapped[1] and event.type is stt.SpeechEventType.END_OF_SPEECH:
                         speech_ends.append(event.alternatives[0].end_time)
@@ -1536,6 +1547,15 @@ async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpoin
             await asyncio.sleep(0.65)
             resume_node.set()
             if not buffered:
+                if prefix_frames:
+                    # Reuse one SDK frame too: each input occurrence still
+                    # needs its own position before custom-node filtering.
+                    ignored = rtc.AudioFrame(data=b"\x01\x00" * 320, sample_rate=16000, num_channels=1, samples_per_channel=320)
+                    for _ in range(prefix_frames):
+                        await audio.frames.put(ignored)
+                        await asyncio.sleep(0.02)
+                    await asyncio.wait_for(prefix_consumed.wait(), 3)
+                    assert ignored.userdata == {}, "tracking must not mutate the producer's reused frame"
                 async def stream_created():
                     while sources[1].current is None:
                         await asyncio.sleep(0.001)
@@ -1548,13 +1568,14 @@ async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpoin
             assert await asyncio.wait_for(turns.get(), 3) == "turn 2"
             # The SDK can rebase through an epoch-sized float; one 16 kHz
             # sample is the relevant precision, rather than nanoseconds.
-            assert speech_ends == pytest.approx([0.02], abs=1 / 16000), "the first 20 ms of speech stays at the pipeline's sample origin"
+            assert speech_ends == pytest.approx([prefix_frames * 0.02 + 0.02], abs=1 / 16000), "speech retains its position before custom input consumption"
             elapsed = time.monotonic() - terminal_at[1]
             if buffered:
                 assert elapsed < 0.2, "old buffered speech has already outlived the endpointing delay"
             else:
                 assert elapsed >= 0.2, "fresh input must retain the configured endpointing delay"
             assert len(seen) == len(set(seen)) == 2
+            assert bytes(packets[1]) == bytes(frame().data) + b"\0\0" * 320, "filtered input stays out of the provider and kept PCM is unchanged"
         finally:
             resume_node.set()
             await audio.frames.put(None)

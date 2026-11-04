@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable
-from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any
 
@@ -13,14 +13,8 @@ from livekit import rtc
 from livekit.agents import APIConnectionError, APIConnectOptions, stt, utils, vad
 
 from ._livekit_bridge import LiveKitSpeechEvent, LiveKitSTTBridge, LiveKitSTTStream
+from ._livekit_native_input import NativeInputTimeline
 from .client import GatewayError
-
-
-@dataclass
-class NativeInputTimeline:
-    """Exact accepted input duration for one SDK recognition pipeline."""
-
-    position: Fraction = Fraction(0)
 
 
 class NativeSpeechStream(stt.RecognizeStream):
@@ -55,7 +49,10 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._sample_rate = sample_rate
         self._turn_vad = turn_vad
         self._input_timeline = input_timeline
-        self._input_start = input_timeline.position if input_timeline is not None else None
+        self._received_duration = Fraction(0)
+        self._input_end: Fraction | None = None
+        self._input_positions: list[Fraction] = []
+        self._input_offsets: list[Fraction] = []
         self._mark_failed = mark_failed
         self._report_open = report_open
         self._check_admission = check_admission
@@ -99,17 +96,33 @@ class NativeSpeechStream(stt.RecognizeStream):
             self._input_failure = True
             self._input_ch.close()
             return
+        if self._input_timeline is not None:
+            try:
+                start = self._input_timeline.position_of(frame)
+                if self._input_end is not None and start < self._input_end:
+                    raise GatewayError("Native STT input moved backwards", retryable=False)
+            except GatewayError as error:
+                if not self._fatal.done():
+                    self._fatal.set_exception(error)
+                self._input_ch.close()
+                return
+            offset = start - self._received_duration
+            if not self._input_offsets or self._input_offsets[-1] != offset:
+                self._input_positions.append(self._received_duration)
+                self._input_offsets.append(offset)
+            self._input_end = start + Fraction(frame.samples_per_channel, frame.sample_rate)
         super().push_frame(frame)
         self._queued_samples = queued
-        if self._input_timeline is not None:
-            self._input_timeline.position += Fraction(
-                frame.samples_per_channel, frame.sample_rate
-            )
+        self._received_duration += Fraction(frame.samples_per_channel, frame.sample_rate)
 
-    def _stream_offset(self) -> float:
-        if self._input_start is not None:
-            return float(self._input_start)
-        return getattr(self, "start_time_offset", 0.0)
+    def _source_time(self, local: Fraction, *, end: bool = False) -> float:
+        if self._input_timeline is None or not self._input_positions:
+            return float(local) + getattr(self, "start_time_offset", 0.0)
+        # At a filtered gap, an end belongs to the preceding frame and a
+        # start to the following one. Do not fabricate PCM for omitted input.
+        search = bisect_left if end else bisect_right
+        index = max(0, search(self._input_positions, local) - 1)
+        return float(local + self._input_offsets[index])
 
     def _frame(self, raw: bytes) -> rtc.AudioFrame:
         assert self._channels is not None
@@ -364,7 +377,7 @@ class NativeSpeechStream(stt.RecognizeStream):
             raise
 
     def _emit(self, event: LiveKitSpeechEvent, kind: stt.SpeechEventType) -> None:
-        offset = self._request_start_sample / self._sample_rate + self._stream_offset()
+        offset = Fraction(self._request_start_sample, self._sample_rate)
         self._event_ch.send_nowait(
             stt.SpeechEvent(
                 type=kind,
@@ -373,10 +386,10 @@ class NativeSpeechStream(stt.RecognizeStream):
                     stt.SpeechData(
                         language=event.language or self._language,
                         text=event.text,
-                        start_time=event.start_time + offset
+                        start_time=self._source_time(offset + Fraction(str(event.start_time)))
                         if event.start_time is not None
                         else 0.0,
-                        end_time=event.end_time + offset
+                        end_time=self._source_time(offset + Fraction(str(event.end_time)), end=True)
                         if event.end_time is not None
                         else 0.0,
                     )
@@ -420,19 +433,22 @@ class NativeSpeechStream(stt.RecognizeStream):
                     stt.SpeechData(
                         language=self._language,
                         text="",
-                        end_time=(
+                        end_time=self._source_time(Fraction(
                             self._processed_samples
                             if speech_end is None
-                            else speech_end
-                        )
-                        / self._sample_rate
-                        + self._stream_offset(),
+                            else speech_end,
+                            self._sample_rate,
+                        ), end=True),
                     )
                 ],
             )
         )
         self._gateway_stream = None
         self._receiver = None
+        keep = max(0, bisect_right(self._input_positions, Fraction(self._assigned_until, self._sample_rate)) - 1)
+        if keep:
+            del self._input_positions[:keep]
+            del self._input_offsets[:keep]
         await stream.aclose()
         self._admission_started = False
         if self._turn_commit is not None:

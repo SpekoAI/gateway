@@ -31,7 +31,6 @@ from livekit.agents import (
 )
 from livekit.agents.llm.tool_context import get_raw_function_info
 from livekit.agents.utils import is_given
-from livekit.agents.voice import audio_recognition
 
 from ._livekit_bridge import (
     LiveKitSpeechEvent,
@@ -40,7 +39,12 @@ from ._livekit_bridge import (
     LiveKitTTSBridge,
     LiveKitTTSStream,
 )
-from ._livekit_native_stt import NativeInputTimeline, NativeSpeechStream
+from ._livekit_native_input import (
+    NativeInputBinding,
+    bind_native_input,
+    native_input_timeline,
+)
+from ._livekit_native_stt import NativeSpeechStream
 from ._speech_client import SpeechClient
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
 from .client import GatewayClient, GatewayError
@@ -101,27 +105,6 @@ _NEWER_STT_CAPABILITIES = frozenset({"keyterms", "chat_context", "manual_flush"}
 # transcript_timeout. Without the flush it already waited that long unless a
 # final had arrived in the previous 0.5 s.
 _FLUSH_ON_TURN_END_PROVIDERS = frozenset({"soniox"})
-
-
-_native_input_timelines: weakref.WeakKeyDictionary[Any, NativeInputTimeline] = weakref.WeakKeyDictionary()
-
-
-def _native_input_timeline(session: Any) -> NativeInputTimeline | None:
-    # Retained SDK pipelines keep the same audio epoch across handoffs. Their
-    # first sample is zero even when a node begins after input was buffered.
-    # Count sample durations instead of translating stream construction time.
-    context = getattr(audio_recognition, "_STTPipelineContextVar", None)
-    pipeline = context.get(None) if context is not None else None
-    if pipeline is None:
-        recognition = getattr(getattr(session, "_activity", None), "_audio_recognition", None)
-        pipeline = getattr(recognition, "_stt_pipeline", None)
-    if pipeline is None:
-        return None
-    timeline = _native_input_timelines.get(pipeline)
-    if timeline is None:
-        timeline = NativeInputTimeline()
-        _native_input_timelines[pipeline] = timeline
-    return timeline
 
 
 def _stt_capabilities(**declared: Any) -> stt.STTCapabilities:
@@ -205,6 +188,7 @@ class STT(stt.STT):
         self._turn_binding: tuple[Any, Any, Any] | None = None
         self._turn_listener: Any = None
         self._native_wrappers: dict[int, tuple[Any, Any, Any]] = {}
+        self._native_input_binding: NativeInputBinding | None = None
 
     def bind_agent(self, agent: Agent) -> None:
         """Locate the owned session through its initial Agent at stream start.
@@ -217,6 +201,7 @@ class STT(stt.STT):
         if self._bound_agent is not None or self._bound_session is not None:
             raise ValueError("Native STT is already bound to an AgentSession")
         self._bound_agent = agent
+        self._native_input_binding = bind_native_input(self, agent=agent)
 
     def bind_session(self, session: AgentSession) -> None:
         """Bind native turn ownership before starting the supplied session."""
@@ -225,6 +210,7 @@ class STT(stt.STT):
         if self._bound_agent is not None or self._bound_session is not None:
             raise ValueError("Native STT is already bound to an AgentSession")
         self._bound_session = session
+        self._native_input_binding = bind_native_input(self, session=session)
 
     def _restore_turn_binding(self) -> None:
         if self._turn_binding is not None:
@@ -488,7 +474,7 @@ class STT(stt.STT):
                 report_open=lambda stream: _report_stream_leg("stt", stream),
                 check_admission=prepare_native_turn,
                 wait_for_turn_commit=not recognize and not manual_turns,
-                input_timeline=_native_input_timeline(self._bound_session) if not recognize and not manual_turns else None,
+                input_timeline=native_input_timeline(self._native_input_binding) if not recognize and not manual_turns else None,
             )
         else:
             stream = SpeechStream(
@@ -525,6 +511,9 @@ class STT(stt.STT):
             if wrapper.stream is stream:
                 wrapper.stream = original
         self._native_wrappers.clear()
+        if self._native_input_binding is not None:
+            self._native_input_binding.release(self)
+            self._native_input_binding = None
         self._bound_agent = None
         self._bound_session = None
         if self._owns_client:
