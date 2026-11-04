@@ -2,21 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
 from livekit import rtc
-from livekit.agents import APIConnectionError, APIConnectOptions
+from livekit.agents import APIConnectionError, APIConnectOptions, APIError
 from livekit.agents import llm as agents_llm
 from livekit.agents import stt as agents_stt
 
+from speko_gateway import livekit as speko_livekit
 from speko_gateway._livekit_bridge import (
     LiveKitSpeechEvent,
     LiveKitTTSEvent,
     execution_from_env,
 )
-from speko_gateway.client import GatewayError
+from speko_gateway.client import CanonicalEvent, GatewayError, SessionConfig
 from speko_gateway.livekit import LLM, STT, TTS
 from speko_gateway.relay import RelayError
 
@@ -970,3 +972,452 @@ async def test_tts_update_options_replaces_and_clears_provider_options() -> None
     plugin.update_options(language="hi")
     assert plugin._tts_options is None
     await plugin.aclose()
+
+
+class FakeGatewaySession:
+    def __init__(
+        self,
+        number: int,
+        request: dict[str, Any],
+        *,
+        answer_delay: float,
+        quirk: str | None,
+    ) -> None:
+        self.metadata = {
+            "session_id": f"session_{number}",
+            "attempt_id": f"attempt_{number}",
+        }
+        self.request = request
+        self.appended: list[str] = []
+        self.first_text_at: float | None = None
+        self.closed = False
+        self._answer_delay = answer_delay
+        self._quirk = quirk
+        self._peer_closed = False
+        self._finished = asyncio.Event()
+        self._speaker: asyncio.Task[None] | None = None
+        self._events: asyncio.Queue[CanonicalEvent | None] = asyncio.Queue()
+        self._events.put_nowait(CanonicalEvent(type="session.ready"))
+        if quirk == "fails-at-open":
+            self.fail()
+        elif quirk == "closes-at-open":
+            self._events.put_nowait(CanonicalEvent(type="session.closed"))
+            self._events.put_nowait(None)
+
+    async def append_text(self, text: str) -> None:
+        if self._quirk == "refuses-text" or self.closed or self._peer_closed:
+            raise ConnectionResetError("Cannot write to closing transport")
+        if self._speaker is None:
+            self.first_text_at = time.perf_counter()
+            self._speaker = asyncio.create_task(self._speak())
+        self.appended.append(text)
+
+    async def commit_text(self) -> None:
+        pass
+
+    async def finish(self) -> None:
+        self._finished.set()
+
+    async def aclose(self) -> None:
+        self.closed = True
+        if self._speaker is not None:
+            self._speaker.cancel()
+        self._events.put_nowait(None)
+
+    def fail(self) -> None:
+        self._events.put_nowait(
+            CanonicalEvent(
+                type="error",
+                data={"code": "provider_closed", "source": "provider"},
+            )
+        )
+        self._events.put_nowait(None)
+
+    async def events(self) -> AsyncIterator[CanonicalEvent]:
+        while (event := await self._events.get()) is not None:
+            yield event
+        self._peer_closed = True
+
+    async def _speak(self) -> None:
+        await asyncio.sleep(self._answer_delay)
+        self._events.put_nowait(
+            CanonicalEvent(type="audio.started", data={"provider_request_id": "req"})
+        )
+        self._events.put_nowait(
+            CanonicalEvent(type="audio.frame", audio=b"\x01\x00" * 2_400)
+        )
+        await self._finished.wait()
+        self._events.put_nowait(CanonicalEvent(type="audio.done"))
+        self._events.put_nowait(None)
+
+
+class FakeGateway:
+    def __init__(self, *, open_delay: float = 0.01, answer_delay: float = 0.05) -> None:
+        self.open_delay = open_delay
+        self.answer_delay = answer_delay
+        self.opens_allowed = asyncio.Event()
+        self.opens_allowed.set()
+        self.opens = 0
+        self.cancelled_opens = 0
+        self.failed_opens = 0
+        self.failing_opens = 0
+        self.quirks: list[str] = []
+        self.sessions: list[FakeGatewaySession] = []
+
+    async def open(self, config: SessionConfig, **_: Any) -> FakeGatewaySession:
+        self.opens += 1
+        try:
+            await self.opens_allowed.wait()
+            await asyncio.sleep(self.open_delay)
+        except asyncio.CancelledError:
+            self.cancelled_opens += 1
+            raise
+        if self.failing_opens:
+            self.failing_opens -= 1
+            self.failed_opens += 1
+            raise GatewayError(
+                "Gateway rejected request",
+                code="provider_unavailable",
+                source="provider",
+            )
+        session = FakeGatewaySession(
+            len(self.sessions),
+            config.request,
+            answer_delay=self.answer_delay,
+            quirk=self.quirks.pop(0) if self.quirks else None,
+        )
+        self.sessions.append(session)
+        return session
+
+    def spoken(self) -> list[FakeGatewaySession]:
+        return [session for session in self.sessions if session.appended]
+
+    def nothing_left_open(self) -> bool:
+        settled = len(self.sessions) + self.cancelled_opens + self.failed_opens
+        return settled == self.opens and all(s.closed for s in self.sessions)
+
+    async def aclose(self) -> None:
+        pass
+
+
+async def until(condition: Callable[[], bool], timeout: float = 2.0) -> None:
+    deadline = time.perf_counter() + timeout
+    while not condition():
+        assert time.perf_counter() < deadline, "condition not reached in time"
+        await asyncio.sleep(0.005)
+
+
+async def speak(plugin: TTS, text: str) -> tuple[float, list[Any]]:
+    stream = plugin.stream(conn_options=APIConnectOptions(max_retry=0))
+    pushed_at = time.perf_counter()
+    stream.push_text(text)
+    stream.end_input()
+
+    async def audio() -> list[Any]:
+        return [event async for event in stream]
+
+    try:
+        return pushed_at, await asyncio.wait_for(audio(), timeout=5)
+    finally:
+        await stream.aclose()
+
+
+async def test_tts_second_reply_does_not_wait_for_a_session_to_open() -> None:
+    gateway = FakeGateway(open_delay=0.5)
+    plugin = TTS(gateway)  # type: ignore[arg-type]
+
+    first_pushed, first_audio = await speak(plugin, "first")
+    await until(lambda: len(gateway.sessions) == 2)
+    gateway.opens_allowed.clear()
+    _, second_audio = await speak(plugin, "second")
+
+    assert first_audio and second_audio
+    spoken = {session.appended[0]: session for session in gateway.spoken()}
+    assert set(spoken) == {"first", "second"}
+    assert spoken["first"].first_text_at - first_pushed >= 0.45, (
+        "the first reply waited"
+    )
+    assert len(gateway.sessions) == 2, "the second reply spoke on an open session"
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+async def test_tts_first_reply_after_prewarm_uses_the_standby() -> None:
+    gateway = FakeGateway(open_delay=0.3)
+    plugin = TTS(gateway)  # type: ignore[arg-type]
+    plugin.prewarm()
+    plugin.prewarm()
+    await until(lambda: len(gateway.sessions) == 1)
+    assert gateway.opens == 1, "a second prewarm() opens nothing more"
+    gateway.opens_allowed.clear()
+
+    _, audio = await speak(plugin, "hello")
+
+    assert audio
+    assert gateway.sessions[0].appended == ["hello"]
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+async def test_tts_language_change_replaces_the_standby() -> None:
+    gateway = FakeGateway()
+    plugin = TTS(gateway, language="en")  # type: ignore[arg-type]
+    plugin.prewarm()
+    await until(lambda: len(gateway.sessions) == 1)
+    english = gateway.sessions[0]
+
+    plugin.update_options(language="en")
+    assert gateway.opens == 1, "an unchanged language keeps the standby"
+    plugin.update_options(language="hi")
+    await until(lambda: english.closed and len(gateway.sessions) == 2)
+    gateway.opens_allowed.clear()
+    _, audio = await speak(plugin, "namaste")
+
+    assert audio
+    (spoken,) = gateway.spoken()
+    assert spoken.request["language"] == "hi"
+    assert english.appended == []
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+@pytest.mark.parametrize(
+    "death",
+    [
+        "ended-while-idle",
+        "closed-at-open",
+        "open-failed",
+        "opening-then-failed",
+        "opening-then-ended",
+    ],
+)
+async def test_tts_dead_standby_falls_back_to_a_fresh_session(death: str) -> None:
+    opening = death.startswith("opening-")
+    gateway = FakeGateway(open_delay=0.2 if opening else 0.01)
+    gateway.failing_opens = int(death in ("open-failed", "opening-then-failed"))
+    gateway.quirks = {
+        "closed-at-open": ["closes-at-open"],
+        "opening-then-ended": ["fails-at-open"],
+    }.get(death, [])
+    plugin = TTS(gateway)  # type: ignore[arg-type]
+    plugin.prewarm()
+    if death == "ended-while-idle":
+        await until(lambda: len(gateway.sessions) == 1)
+        gateway.sessions[0].fail()
+    elif death == "closed-at-open":
+        await until(lambda: len(gateway.sessions) == 1)
+    elif death == "open-failed":
+        await until(lambda: gateway.failed_opens == 1)
+    await asyncio.sleep(0 if opening else 0.05)
+
+    _, audio = await speak(plugin, "hello")
+
+    assert audio, "the reply speaks on a fresh session"
+    (spoken,) = gateway.spoken()
+    assert spoken.appended == ["hello"]
+    if gateway.sessions[0] is not spoken:
+        assert gateway.sessions[0].appended == []
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+async def test_tts_moves_a_reply_to_a_fresh_session_at_most_once() -> None:
+    gateway = FakeGateway(open_delay=0.2)
+    gateway.failing_opens = 3
+    plugin = TTS(gateway)  # type: ignore[arg-type]
+    plugin.prewarm()
+
+    with pytest.raises(APIConnectionError) as caught:
+        await speak(plugin, "hello")
+
+    assert (
+        caught.value.message
+        == "Speko Gateway TTS failed (provider/provider_unavailable)"
+    )
+    assert gateway.opens == 3, "the standby, its replacement, one fresh session"
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+async def test_tts_does_not_resend_text_a_standby_refused() -> None:
+    gateway = FakeGateway()
+    gateway.quirks = ["refuses-text"]
+    plugin = TTS(gateway)  # type: ignore[arg-type]
+    plugin.prewarm()
+    await until(lambda: len(gateway.sessions) == 1)
+
+    with pytest.raises(APIConnectionError) as caught:
+        await speak(plugin, "hello")
+
+    assert caught.value.message == "Speko Gateway TTS transport failed"
+    assert gateway.spoken() == []
+    assert gateway.opens == 2, "the standby and its replacement, no resend"
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+async def test_tts_without_standby_sessions_opens_each_session_at_its_text() -> None:
+    gateway = FakeGateway(open_delay=0.1)
+    plugin = TTS(gateway, standby_sessions=0)  # type: ignore[arg-type]
+    plugin.prewarm()
+    await asyncio.sleep(0.15)
+    assert gateway.opens == 0
+
+    first_pushed, _ = await speak(plugin, "first")
+    second_pushed, _ = await speak(plugin, "second")
+
+    first, second = gateway.spoken()
+    assert first.first_text_at - first_pushed >= 0.09
+    assert second.first_text_at - second_pushed >= 0.09
+    assert gateway.opens == 2
+    assert gateway.nothing_left_open()
+
+    await plugin.aclose()
+
+
+async def test_tts_sends_a_fresh_session_its_first_text_before_reading_it() -> None:
+    gateway = FakeGateway()
+    gateway.quirks = ["closes-at-open"]
+    plugin = TTS(gateway, standby_sessions=0)  # type: ignore[arg-type]
+
+    with pytest.raises(APIError):
+        await speak(plugin, "hello")
+
+    assert gateway.sessions[0].appended == ["hello"]
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+async def test_tts_reply_takes_a_live_standby_past_one_that_ended() -> None:
+    gateway = FakeGateway()
+    plugin = TTS(gateway, standby_sessions=2)  # type: ignore[arg-type]
+    plugin.prewarm()
+    await until(lambda: len(gateway.sessions) == 2)
+    gateway.sessions[0].fail()
+    await asyncio.sleep(0.05)
+    gateway.opens_allowed.clear()
+
+    _, audio = await speak(plugin, "hello")
+
+    assert audio
+    assert gateway.spoken() == [gateway.sessions[1]]
+    assert gateway.opens == 4, "replacements for the ended and the taken standby"
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+async def test_tts_stream_keeps_the_settings_it_was_created_with() -> None:
+    gateway = FakeGateway()
+    plugin = TTS(gateway, language="en")  # type: ignore[arg-type]
+    plugin.prewarm()
+    await until(lambda: len(gateway.sessions) == 1)
+    stream = plugin.stream(conn_options=APIConnectOptions(max_retry=0))
+    plugin.update_options(language="hi")
+    await until(lambda: len(gateway.sessions) == 2)
+
+    stream.push_text("hello")
+    stream.end_input()
+    audio = [event async for event in stream]
+    await stream.aclose()
+
+    assert audio
+    (spoken,) = gateway.spoken()
+    assert spoken.request["language"] == "en"
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [
+        "close-while-opening",
+        "close-while-open",
+        "interrupted-while-the-standby-opens",
+        "interrupted-reply",
+        "no-text-reply",
+    ],
+)
+async def test_tts_leaves_no_gateway_session_open(ending: str) -> None:
+    gateway = FakeGateway()
+    if ending in ("close-while-opening", "interrupted-while-the-standby-opens"):
+        gateway.opens_allowed.clear()
+    plugin = TTS(gateway)  # type: ignore[arg-type]
+    plugin.prewarm()
+    if gateway.opens_allowed.is_set():
+        await until(lambda: len(gateway.sessions) == 1)
+
+    if ending == "interrupted-while-the-standby-opens":
+        stream = plugin.stream()
+        stream.push_text("hello")
+        await until(lambda: gateway.opens == 2)
+        await stream.aclose()
+        assert gateway.cancelled_opens == 1, "the reply cancelled the open it awaited"
+    elif ending == "interrupted-reply":
+        stream = plugin.stream()
+        stream.push_text("hello")
+        await until(lambda: gateway.sessions[0].appended == ["hello"])
+        await stream.aclose()
+        assert gateway.sessions[0].closed
+    elif ending == "no-text-reply":
+        stream = plugin.stream()
+        stream.end_input()
+        assert [event async for event in stream] == []
+        assert gateway.opens == 1, "a reply without text takes no standby"
+        assert not gateway.sessions[0].closed
+
+    await plugin.aclose()
+
+    assert gateway.nothing_left_open()
+
+
+@pytest.mark.parametrize("path", ["standby", "opening-standby", "fresh"])
+async def test_tts_ttfb_counts_from_the_text_the_provider_got(path: str) -> None:
+    gateway = FakeGateway(open_delay=0.6, answer_delay=0.05)
+    plugin = TTS(gateway, standby_sessions=int(path != "fresh"))  # type: ignore[arg-type]
+    metrics: list[Any] = []
+    plugin.on("metrics_collected", metrics.append)
+    plugin.prewarm()
+    if path == "standby":
+        await until(lambda: len(gateway.sessions) == 1)
+
+    await speak(plugin, "hello")
+
+    assert len(metrics) == 1
+    assert 0.04 < metrics[0].ttfb < gateway.open_delay, "ttfb leaves out the open"
+
+    await plugin.aclose()
+
+
+async def test_tts_closes_a_standby_no_reply_took(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(speko_livekit, "_STANDBY_MAX_AGE", 0.1)
+    gateway = FakeGateway()
+    plugin = TTS(gateway)  # type: ignore[arg-type]
+    plugin.prewarm()
+    await until(lambda: len(gateway.sessions) == 1)
+
+    await until(lambda: gateway.sessions[0].closed)
+    await asyncio.sleep(0.15)
+    assert gateway.opens == 1, "an expired standby waits for the next reply"
+
+    _, audio = await speak(plugin, "hello")
+    assert audio
+    assert gateway.sessions[0].appended == []
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+def test_tts_rejects_a_negative_standby_count() -> None:
+    with pytest.raises(ValueError):
+        TTS(FakeClient(), standby_sessions=-1)  # type: ignore[arg-type]
