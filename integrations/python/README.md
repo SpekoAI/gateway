@@ -72,14 +72,20 @@ native request, streaming audio and interim text while speech continues.
 At speech end the request commits and closes; final transcript segments and
 `END_OF_SPEECH` are emitted only after terminal usage arrives. A final segment
 alone cannot complete a turn. Completed-buffer `recognize()` joins all final
-segments and chunks large PCM buffers to fit the native frame bound. Pipecat
+segments. Queued speech starts preserve the real silence interval after the
+prior complete end event, so delayed finalization cannot collapse distinct
+framework turns. Overlapping VAD prefixes exclude samples already assigned to
+an earlier request, and request timestamps map to the persistent stream's
+timeline. All PCM, including VAD prefixes and inference batches, is chunked to
+fit the native frame bound. Pipecat
 uses its pipeline's VAD and explicit commits.
 
 Native speech disables LiveKit automatic retries for streaming STT, recognition,
 streaming TTS and chunked synthesis, including when retry-enabled connection
 options were supplied. Relay retry hints and timeouts cannot prove no provider
 I/O occurred; a new attempt needs an explicit control-plane decision.
-A failed native STT instance also refuses new streams and new turn admissions,
+A failed native STT instance, including cancellation during admission before
+`session.ready`, also refuses new streams and new turn admissions,
 including LiveKit's outer AgentSession recovery loop. The worker must obtain
 its recovery decision before constructing a replacement instance.
 

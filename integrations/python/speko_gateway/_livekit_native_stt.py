@@ -60,6 +60,12 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._request_id = utils.shortuuid()
         self._finishing = False
         self._input_finished = False
+        self._admission_started = False
+        self._processed_samples = 0
+        self._assigned_until = 0
+        self._request_start_sample = 0
+        self._last_end_sample: int | None = None
+        self._last_end_emitted_at = 0.0
         self._fatal: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     def push_frame(self, frame: rtc.AudioFrame) -> None:
@@ -124,7 +130,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 self._fatal.result()
             await work
         except asyncio.CancelledError:
-            if self._gateway_stream is not None:
+            if self._admission_started:
                 self._mark_failed()
             raise
         except Exception:  # noqa: BLE001 -- supplied VAD/provider errors may contain content
@@ -168,14 +174,9 @@ class NativeSpeechStream(stt.RecognizeStream):
                     "Native speech input changed format", retryable=False
                 )
             if self._vad_stream is None:
-                # Completed audio buffers need not fit in one WebSocket frame.
-                raw = frame.data.cast("B")
-                for offset in range(0, len(raw), 2 << 20):
-                    chunk = bytes(raw[offset : offset + (2 << 20)])
-                    if self._gateway_stream is None:
-                        await self._open(chunk)
-                    else:
-                        await self._gateway_stream.push_frame(self._frame(chunk))
+                await self._send_audio(bytes(frame.data))
+                self._processed_samples += frame.samples_per_channel
+                self._assigned_until = self._processed_samples
                 self._queued_samples -= frame.samples_per_channel
             else:
                 self._unprocessed.extend(frame.data.cast("B"))
@@ -213,8 +214,10 @@ class NativeSpeechStream(stt.RecognizeStream):
                 self._history.extend(raw)
                 del self._history[: -30 * self._sample_rate * 2 * self._channels]
                 self._last_vad_index = event.samples_index
+                self._processed_samples += len(raw) // (2 * self._channels)
                 if self._gateway_stream is not None:
-                    await self._gateway_stream.push_frame(self._frame(raw))
+                    await self._send_audio(raw)
+                    self._assigned_until = self._processed_samples
             elif event.type == vad.VADEventType.START_OF_SPEECH:
                 raw = self._audio(event.frames)
                 if (
@@ -227,10 +230,35 @@ class NativeSpeechStream(stt.RecognizeStream):
                         "Local speech boundary did not match processed input",
                         retryable=False,
                     )
+                stride = 2 * self._channels
+                prefix_start = self._processed_samples - len(raw) // stride
+                request_start = max(prefix_start, self._assigned_until)
+                raw = raw[(request_start - prefix_start) * stride :]
+                if not raw:
+                    raise GatewayError(
+                        "Local speech boundary reused completed audio", retryable=False
+                    )
+                if self._last_end_sample is not None:
+                    # Delayed terminal usage can queue a later VAD start. Replay
+                    # its actual silence interval after the complete prior EOS
+                    # so framework endpointing gets the same opportunity to run.
+                    gap = max(
+                        0,
+                        (self._processed_samples - self._last_end_sample)
+                        / self._sample_rate
+                        - event.speech_duration,
+                    )
+                    remaining = gap - (
+                        asyncio.get_running_loop().time() - self._last_end_emitted_at
+                    )
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                self._request_start_sample = request_start
                 self._event_ch.send_nowait(
                     stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
                 )
-                await self._open(raw)
+                await self._send_audio(raw)
+                self._assigned_until = self._processed_samples
             elif event.type == vad.VADEventType.END_OF_SPEECH:
                 if event.samples_index != self._last_vad_index:
                     raise GatewayError(
@@ -247,17 +275,33 @@ class NativeSpeechStream(stt.RecognizeStream):
             # A short final inference window may remain when input closes.
             # No later utterance can arrive beyond this explicit input fence.
             if self._unprocessed:
-                await self._gateway_stream.push_frame(
-                    self._frame(bytes(self._unprocessed))
+                await self._send_audio(bytes(self._unprocessed))
+                self._processed_samples += len(self._unprocessed) // (
+                    2 * self._channels
                 )
+                self._assigned_until = self._processed_samples
                 self._unprocessed.clear()
             await self._finish_turn()
+
+    async def _send_audio(self, raw: bytes) -> None:
+        assert self._channels is not None
+        stride = 2 * self._channels
+        limit = (2 << 20) // stride * stride
+        for offset in range(0, len(raw), limit):
+            chunk = raw[offset : offset + limit]
+            if self._gateway_stream is None:
+                await self._open(chunk)
+            else:
+                await self._gateway_stream.push_frame(self._frame(chunk))
 
     async def _open(self, raw: bytes) -> None:
         self._check_admission()
         self._finishing = False
         self._finals = []
         self._final_chars = 0
+        # Cancellation after configure may already have spent admission even
+        # when ready has not returned a stream object to this caller.
+        self._admission_started = True
         self._gateway_stream = await self._bridge.start(self._frame(raw))
         self._report_open(self._gateway_stream)
         self._request_id = self._gateway_stream.request_id or utils.shortuuid()
@@ -293,6 +337,9 @@ class NativeSpeechStream(stt.RecognizeStream):
             raise
 
     def _emit(self, event: LiveKitSpeechEvent, kind: stt.SpeechEventType) -> None:
+        offset = self._request_start_sample / self._sample_rate + getattr(
+            self, "start_time_offset", 0.0
+        )
         self._event_ch.send_nowait(
             stt.SpeechEvent(
                 type=kind,
@@ -301,8 +348,12 @@ class NativeSpeechStream(stt.RecognizeStream):
                     stt.SpeechData(
                         language=event.language or self._language,
                         text=event.text,
-                        start_time=event.start_time or 0.0,
-                        end_time=event.end_time or 0.0,
+                        start_time=event.start_time + offset
+                        if event.start_time is not None
+                        else 0.0,
+                        end_time=event.end_time + offset
+                        if event.end_time is not None
+                        else 0.0,
                     )
                 ],
             )
@@ -319,9 +370,21 @@ class NativeSpeechStream(stt.RecognizeStream):
             self._emit(event, stt.SpeechEventType.FINAL_TRANSCRIPT)
         self._event_ch.send_nowait(
             stt.SpeechEvent(
-                type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id
+                type=stt.SpeechEventType.END_OF_SPEECH,
+                request_id=self._request_id,
+                alternatives=[
+                    stt.SpeechData(
+                        language=self._language,
+                        text="",
+                        end_time=self._processed_samples / self._sample_rate
+                        + getattr(self, "start_time_offset", 0.0),
+                    )
+                ],
             )
         )
+        self._last_end_sample = self._processed_samples
+        self._last_end_emitted_at = asyncio.get_running_loop().time()
         self._gateway_stream = None
         self._receiver = None
         await stream.aclose()
+        self._admission_started = False
