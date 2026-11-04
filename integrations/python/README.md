@@ -77,8 +77,9 @@ alone cannot complete a turn. `bind_session(session)` observes that session's
 actual synchronous turn acceptance, including `skip_reply=True`, and follows
 `update_agent()` handoffs. Public Agent lifecycle hooks remain untouched.
 `bind_agent(agent)` locates the same session when its first stream starts.
-The owned SDK activity interface is checked before admission and restored on
-close or handoff; the binding never changes the global SDK. A later speech
+The owned SDK activity interface is checked before admission and before each
+turn's final transcript, including SDKs that retain a stream across handoff.
+It is restored on close or handoff; the binding never changes the global SDK. A later speech
 request waits for the framework's actual complete-turn commit. Binding is
 required for native AgentSession streaming. Explicit event consumers can use
 `stream(manual_turns=True)`; completed-buffer `recognize()` needs no binding

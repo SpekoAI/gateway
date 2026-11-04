@@ -336,6 +336,7 @@ async def test_actual_agent_stt_recovery_pump_cannot_readmit_a_failed_native_req
                 _started_at=time.time(),
             ),
         )
+        agent._activity.session._activity = agent._activity
         pipeline = recognition._STTPipeline(
             lambda audio, settings: Agent.default.stt_node(agent, audio, settings)
         )
@@ -1243,7 +1244,14 @@ async def test_actual_native_agent_session_keeps_turn_authority_across_commits_a
                     session.commit_user_turn(stt_flush_duration=0), 3
                 )
             assert await asyncio.wait_for(turns.get(), 3) == "turn 2"
-            assert len(seen) == len(set(seen)) == 2
+            if transition == "handoff":
+                # Receiving the first transcript under the new Agent does not
+                # prove its commit released a retained stream for more input.
+                await utterance()
+                assert await asyncio.wait_for(transcripts.get(), 3) == "turn 3"
+                assert await asyncio.wait_for(turns.get(), 3) == "turn 3"
+            expected = 3 if transition == "handoff" else 2
+            assert len(seen) == len(set(seen)) == expected
             assert agent.on_user_turn_completed == original
             assert not model._native_failed
         finally:

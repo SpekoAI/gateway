@@ -382,6 +382,11 @@ class NativeSpeechStream(stt.RecognizeStream):
         await stream.flush()
         await stream.finish()
         await asyncio.wait_for(asyncio.shield(receiver), self._conn_options.timeout)
+        if self._wait_for_turn_commit:
+            # Some SDK versions retain this stream across Agent handoffs.
+            # Bind the actual current activity again before publishing finals,
+            # including a handoff while the physical request was in flight.
+            self._check_admission()
         self._turn_text = " ".join(
             " ".join(event.text for event in self._finals).split()
         )
