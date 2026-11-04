@@ -1052,26 +1052,48 @@ class FakeGatewaySession:
 
 
 class FakeGateway:
-    def __init__(self, *, open_delay: float = 0.01, answer_delay: float = 0.05) -> None:
+    def __init__(
+        self,
+        *,
+        open_delay: float = 0.01,
+        answer_delay: float = 0.05,
+        capacity: int | None = None,
+    ) -> None:
         self.open_delay = open_delay
         self.answer_delay = answer_delay
+        self.capacity = capacity
         self.opens_allowed = asyncio.Event()
         self.opens_allowed.set()
         self.opens = 0
+        self.pending_opens = 0
         self.cancelled_opens = 0
         self.failed_opens = 0
+        self.refused_opens = 0
         self.failing_opens = 0
         self.quirks: list[str] = []
         self.sessions: list[FakeGatewaySession] = []
 
     async def open(self, config: SessionConfig, **_: Any) -> FakeGatewaySession:
         self.opens += 1
+        in_use = self.pending_opens + sum(not s.closed for s in self.sessions)
+        if self.capacity is not None and in_use >= self.capacity:
+            self.failed_opens += 1
+            self.refused_opens += 1
+            raise GatewayError(
+                "Gateway rejected request",
+                code="local_concurrency_exhausted",
+                source="gateway",
+                retryable=False,
+            )
+        self.pending_opens += 1
         try:
             await self.opens_allowed.wait()
             await asyncio.sleep(self.open_delay)
         except asyncio.CancelledError:
             self.cancelled_opens += 1
             raise
+        finally:
+            self.pending_opens -= 1
         if self.failing_opens:
             self.failing_opens -= 1
             self.failed_opens += 1
@@ -1139,6 +1161,7 @@ async def test_tts_second_reply_does_not_wait_for_a_session_to_open() -> None:
     )
     assert len(gateway.sessions) == 2, "the second reply spoke on an open session"
 
+    gateway.opens_allowed.set()
     await plugin.aclose()
     assert gateway.nothing_left_open()
 
@@ -1157,21 +1180,29 @@ async def test_tts_first_reply_after_prewarm_uses_the_standby() -> None:
     assert audio
     assert gateway.sessions[0].appended == ["hello"]
 
+    gateway.opens_allowed.set()
     await plugin.aclose()
     assert gateway.nothing_left_open()
 
 
-async def test_tts_language_change_replaces_the_standby() -> None:
+@pytest.mark.parametrize("old_standby", ["open", "opening"])
+async def test_tts_language_change_replaces_the_standby(old_standby: str) -> None:
     gateway = FakeGateway()
+    if old_standby == "opening":
+        gateway.opens_allowed.clear()
     plugin = TTS(gateway, language="en")  # type: ignore[arg-type]
     plugin.prewarm()
-    await until(lambda: len(gateway.sessions) == 1)
-    english = gateway.sessions[0]
+    await until(lambda: gateway.opens == 1)
+    if old_standby == "open":
+        await until(lambda: len(gateway.sessions) == 1)
 
     plugin.update_options(language="en")
     assert gateway.opens == 1, "an unchanged language keeps the standby"
     plugin.update_options(language="hi")
-    await until(lambda: english.closed and len(gateway.sessions) == 2)
+    gateway.opens_allowed.set()
+    await until(lambda: len(gateway.sessions) == 2)
+    (english,) = [s for s in gateway.sessions if s.request["language"] == "en"]
+    await until(lambda: english.closed)
     gateway.opens_allowed.clear()
     _, audio = await speak(plugin, "namaste")
 
@@ -1180,7 +1211,9 @@ async def test_tts_language_change_replaces_the_standby() -> None:
     assert spoken.request["language"] == "hi"
     assert english.appended == []
 
+    gateway.opens_allowed.set()
     await plugin.aclose()
+    assert gateway.cancelled_opens == 0, "a replaced standby opens, then closes"
     assert gateway.nothing_left_open()
 
 
@@ -1227,7 +1260,7 @@ async def test_tts_dead_standby_falls_back_to_a_fresh_session(death: str) -> Non
 
 async def test_tts_moves_a_reply_to_a_fresh_session_at_most_once() -> None:
     gateway = FakeGateway(open_delay=0.2)
-    gateway.failing_opens = 3
+    gateway.failing_opens = 2
     plugin = TTS(gateway)  # type: ignore[arg-type]
     plugin.prewarm()
 
@@ -1238,7 +1271,7 @@ async def test_tts_moves_a_reply_to_a_fresh_session_at_most_once() -> None:
         caught.value.message
         == "Speko Gateway TTS failed (provider/provider_unavailable)"
     )
-    assert gateway.opens == 3, "the standby, its replacement, one fresh session"
+    assert gateway.opens == 2, "the standby and one fresh session"
 
     await plugin.aclose()
     assert gateway.nothing_left_open()
@@ -1310,6 +1343,7 @@ async def test_tts_reply_takes_a_live_standby_past_one_that_ended() -> None:
     assert gateway.spoken() == [gateway.sessions[1]]
     assert gateway.opens == 4, "replacements for the ended and the taken standby"
 
+    gateway.opens_allowed.set()
     await plugin.aclose()
     assert gateway.nothing_left_open()
 
@@ -1355,12 +1389,16 @@ async def test_tts_leaves_no_gateway_session_open(ending: str) -> None:
     if gateway.opens_allowed.is_set():
         await until(lambda: len(gateway.sessions) == 1)
 
-    if ending == "interrupted-while-the-standby-opens":
+    if ending == "close-while-opening":
+        asyncio.get_running_loop().call_later(0.05, gateway.opens_allowed.set)
+    elif ending == "interrupted-while-the-standby-opens":
         stream = plugin.stream()
         stream.push_text("hello")
-        await until(lambda: gateway.opens == 2)
-        await stream.aclose()
-        assert gateway.cancelled_opens == 1, "the reply cancelled the open it awaited"
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(stream.aclose(), timeout=1)
+        gateway.opens_allowed.set()
+        await until(lambda: len(gateway.sessions) == 1 and gateway.sessions[0].closed)
+        assert gateway.sessions[0].appended == []
     elif ending == "interrupted-reply":
         stream = plugin.stream()
         stream.push_text("hello")
@@ -1376,6 +1414,35 @@ async def test_tts_leaves_no_gateway_session_open(ending: str) -> None:
 
     await plugin.aclose()
 
+    assert gateway.cancelled_opens == 0, "a session closed while it opens still opens"
+    assert gateway.nothing_left_open()
+
+
+async def test_tts_cancels_an_open_that_outlasts_the_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(speko_livekit, "_OPEN_GRACE", 0.1)
+    gateway = FakeGateway()
+    gateway.opens_allowed.clear()
+    plugin = TTS(gateway)  # type: ignore[arg-type]
+    plugin.prewarm()
+
+    await asyncio.wait_for(plugin.aclose(), timeout=1)
+
+    assert gateway.cancelled_opens == 1
+    assert gateway.nothing_left_open()
+
+
+async def test_tts_reply_opens_before_the_next_standby() -> None:
+    gateway = FakeGateway(capacity=1)
+    plugin = TTS(gateway)  # type: ignore[arg-type]
+
+    _, audio = await speak(plugin, "hello")
+
+    assert audio, "the reply took the only Gateway slot"
+    assert gateway.refused_opens == 1, "the next standby found the slot taken"
+
+    await plugin.aclose()
     assert gateway.nothing_left_open()
 
 

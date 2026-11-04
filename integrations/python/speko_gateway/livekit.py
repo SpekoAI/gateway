@@ -411,6 +411,12 @@ class SpeechStream(stt.RecognizeStream):
 # which drop an idle provider connection without telling either end.
 _STANDBY_MAX_AGE = 180.0
 
+# Cancelling an open that is under way leaves its Gateway session unattached,
+# holding capacity until the Gateway's attach timeout (30 s by default). A
+# session closed while it opens waits up to this many seconds, far longer than
+# an open takes, so it can open and then close.
+_OPEN_GRACE = 10.0
+
 
 @dataclasses.dataclass(frozen=True)
 class _OpenSession:
@@ -447,6 +453,10 @@ class _TTSSession:
         next_event = self._open.result().next_event
         return next_event is None or not next_event.done()
 
+    @property
+    def opening(self) -> bool:
+        return not self._open.done()
+
     async def wait_opened(self) -> None:
         await asyncio.wait({self._open})
 
@@ -464,6 +474,7 @@ class _TTSSession:
             yield event
 
     async def aclose(self) -> None:
+        await asyncio.wait({self._open}, timeout=_OPEN_GRACE)
         await utils.aio.cancel_and_wait(self._open)
         if self._open.cancelled() or self._open.exception() is not None:
             return
@@ -664,11 +675,12 @@ class TTS(tts.TTS):
             timer.cancel()
             self._close_soon(session)
 
-    def _close_soon(self, session: _TTSSession) -> None:
+    def _close_soon(self, session: _TTSSession) -> asyncio.Task[None]:
         task = asyncio.create_task(session.aclose(), name="speko.livekit.tts.close")
         self._closing.add(task)
         task.add_done_callback(self._closing.discard)
         task.add_done_callback(_retrieve)
+        return task
 
 
 class SynthesisStream(tts.SynthesizeStream):
@@ -741,20 +753,26 @@ class SynthesisStream(tts.SynthesizeStream):
             raise APIConnectionError("Speko Gateway TTS transport failed") from err
         finally:
             if self._session is not None:
-                await asyncio.shield(self._session.aclose())
+                closing = self._plugin._close_soon(self._session)
+                if not self._session.opening:
+                    await asyncio.shield(closing)
 
     async def _send_first_text(self, token: str) -> None:
         standby = self._plugin._take_standby(self._options)
-        self._plugin._fill_standbys()
         if standby is not None:
             self._session = standby
             await standby.wait_opened()
             if standby.quiet:
+                self._plugin._fill_standbys()
                 await self._send(await standby.stream(), token)
                 return
             self._plugin._close_soon(standby)
         self._session = _TTSSession(self._bridge)
-        await self._send(await self._session.stream(), token)
+        stream = await self._session.stream()
+        # The next standby opens only now, so it cannot take the Gateway slot
+        # this reply's own open needs.
+        self._plugin._fill_standbys()
+        await self._send(stream, token)
 
     async def _send(self, stream: LiveKitTTSStream, token: str) -> None:
         self._gateway_stream = stream
