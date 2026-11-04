@@ -41,7 +41,7 @@ from ._livekit_bridge import (
     LiveKitTTSEvent,
     LiveKitTTSStream,
 )
-from ._livekit_local_transcript import bind_local_transcript
+from ._livekit_local_transcript import bind_local_transcript, restore_local_transcript
 from ._livekit_native_input import (
     NativeInputBinding,
     bind_native_input,
@@ -347,6 +347,7 @@ class STT(stt.STT):
                     "Native STT requires the active recognition model or a supported wrapper"
                 )
             return
+        restore_local_transcript(activity)
         if self._turn_listener is None:
             # A retained pipeline can publish while its SDK consumer is
             # detached and the previous activity is still current. Observe

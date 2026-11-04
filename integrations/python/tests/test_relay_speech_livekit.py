@@ -8,6 +8,7 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
+from functools import wraps
 from types import SimpleNamespace
 
 import aiohttp
@@ -2570,9 +2571,10 @@ async def test_valid_native_segments_keep_canonical_text_and_available_speakers(
                 source.processed(observed)
                 source.emit(kind, frames=[observed], silence_duration=0 if samples == 9600 else 0.55)
             if replay:
-                async with asyncio.timeout(3):
+                async def held_end():
                     while not any(event.type is stt.SpeechEventType.END_OF_SPEECH for event in current_recognition._transcript_buffer):
                         await asyncio.sleep(0)
+                await asyncio.wait_for(held_end(), 3)
                 assert not current_recognition._audio_transcript
                 assert turns.empty()
                 current_recognition._flush_held_transcripts()
@@ -2596,6 +2598,96 @@ async def test_valid_native_segments_keep_canonical_text_and_available_speakers(
                 bound_recognition, original, _ = transcript_binding
                 assert getattr(bound_recognition, original.__name__) is original
                 assert model._native_transcript_binding is None
+
+
+@pytest.mark.skipif(not hasattr(Agent, "update_options"), reason="SDK predates live model option updates")
+@pytest.mark.parametrize("native_first", [False, True])
+async def test_native_and_gateway_model_swaps_restore_the_actual_sdk_hooks(native_first):
+    from livekit.agents.voice.agent_activity import AgentActivity
+
+    from speko_gateway.client import CanonicalEvent
+
+    source, turns, requests = ControlledVAD(), asyncio.Queue(), []
+    text = "你好"
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        requests.append(request.headers["Idempotency-Key"])
+        await ready(ws)
+        sent = False
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY and not sent:
+                sent = True
+                await ws.send_json({"type": "transcript.final", "text": text, "segments": [{"text": "你", "speaker": "A", "start_ms": 0, "end_ms": 10}, {"text": "好", "speaker": "B", "start_ms": 10, "end_ms": 20}]})
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    class GatewayTransport:
+        # Exercise Gateway STT's stream/lifecycle with an owned, real speech
+        # transport. Actual Gateway Unix-socket attribution is covered above.
+        async def open(self, config):
+            session = await client.open(dataclasses.replace(config, execution={"credential_source": "managed", "provider_route": "speko_relay", "relay_policy": "required"}, request={**config.request, "provider": "fixture", "model": "fixture-model"}))
+            return GatewaySession(session)
+
+    class GatewaySession:
+        def __init__(self, session):
+            self.session = session
+
+        def __getattr__(self, name):
+            return getattr(self.session, name)
+
+        async def events(self):
+            async for event in self.session.events():
+                yield event
+                if event.type == "transcript.final":
+                    yield CanonicalEvent(type="speech.ended", data={})
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        models = [STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source), STT(GatewayTransport())]
+        order = [0, 1, 0] if native_first else [1, 0, 1]
+        agent = OwnedAgent(instructions="Owned mixed-model hook lifecycle", stt=models[order[0]])
+        session = AgentSession(llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        models[0].bind_session(session)
+        activity, recognizer = None, None
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=agent, **options)
+            activity = session._activity
+            recognizer = activity._audio_recognition
+            for index, selected in enumerate(order):
+                if index:
+                    agent.update_options(stt=models[selected])
+                if selected == 0:
+                    for samples, kind in [(320, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                        await audio.frames.put(rtc.AudioFrame(data=b"\xff\x0f" * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples))
+                        observed = await asyncio.wait_for(source.frames.get(), 3)
+                        source.processed(observed)
+                        source.emit(kind, frames=[observed], silence_duration=0 if samples == 320 else 0.55)
+                else:
+                    await audio.frames.put(frame())
+                assert await asyncio.wait_for(turns.get(), 3) == text
+            assert len(requests) == len(set(requests)) == 3
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            for model in reversed(models):
+                await model.aclose()
+            await client.aclose()
+            if activity is not None:
+                assert activity.on_end_of_turn.__func__ is AgentActivity.on_end_of_turn
+                method = "_process_stt_event" if hasattr(recognizer, "_process_stt_event") else "_on_stt_event"
+                assert getattr(recognizer, method).__func__ is getattr(recognition.AudioRecognition, method)
 
 
 @pytest.mark.parametrize("skip_reply", [False, True])
@@ -2774,6 +2866,7 @@ async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpoin
     prefix_consumed = asyncio.Event()
     turns = asyncio.Queue()
     terminal_at, seen, speech_ends, packets = [], [], [], []
+    end_anchors, turn_completed_at = [], []
 
     async def handle(request):
         ws = web.WebSocketResponse()
@@ -2816,6 +2909,7 @@ async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpoin
                     yield event
 
             async def on_user_turn_completed(self, turn_ctx, new_message):
+                turn_completed_at.append((time.time(), time.monotonic()))
                 turns.put_nowait(new_message.text_content)
 
         async def boundary(source, value, kind, silence):
@@ -2835,6 +2929,16 @@ async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpoin
             assert await asyncio.wait_for(turns.get(), 3) == "turn 1"
             agent.update_options(stt=wrapped[1])
             await asyncio.wait_for(node_waiting.wait(), 3)
+            current_recognition = session._activity._audio_recognition
+            original_eou = current_recognition._run_eou_detection
+
+            @wraps(original_eou)
+            def measure_eou(*args, **kwargs):
+                if current_recognition._audio_transcript == "turn 2" and current_recognition._last_speaking_time is not None:
+                    end_anchors.append(current_recognition._last_speaking_time)
+                return original_eou(*args, **kwargs)
+
+            current_recognition._run_eou_detection = measure_eou
             if buffered:
                 await audio.frames.put(frame())
             await asyncio.sleep(0.65)
@@ -2862,11 +2966,15 @@ async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpoin
             # The SDK can rebase through an epoch-sized float; one 16 kHz
             # sample is the relevant precision, rather than nanoseconds.
             assert speech_ends == pytest.approx([prefix_frames * 0.02 + 0.02], abs=1 / 16000), "speech retains its position before custom input consumption"
-            elapsed = time.monotonic() - terminal_at[1]
+            elapsed = turn_completed_at[1][1] - terminal_at[1]
             if buffered:
                 assert elapsed < 0.2, "old buffered speech has already outlived the endpointing delay"
             else:
-                assert elapsed >= 0.2, "fresh input must retain the configured endpointing delay"
+                # Provider closure can arrive after part of the SDK delay has
+                # elapsed. Measure the configured delay from its actual SDK
+                # speech anchor, including source-clock drift under load.
+                assert end_anchors
+                assert turn_completed_at[1][0] - end_anchors[-1] >= 0.3 - 1 / 16000, "fresh input must retain the configured endpointing delay"
             assert len(seen) == len(set(seen)) == 2
             assert bytes(packets[1]) == bytes(frame().data) + b"\0\0" * 320, "filtered input stays out of the provider and kept PCM is unchanged"
         finally:

@@ -15,6 +15,13 @@ from ._livekit_native_speaker import NativeSpeechData
 from ._livekit_native_transcript import _processing_method
 
 
+def restore_local_transcript(activity: Any) -> None:
+    binding = getattr(activity, "_speko_local_transcript_binding", None)
+    if binding is not None:
+        for owner in list(binding.owners):
+            binding.release(owner)
+
+
 def bind_local_transcript(owner: Any) -> None:
     # prewarm is called synchronously by these SDK activity methods, including
     # through nested adapters. Match their code objects; never retain frames.
@@ -145,6 +152,9 @@ class _Binding:
             self.startup = None
 
     def _bind(self) -> None:
+        previous = getattr(self.activity, "_speko_native_stt_turn_owner", None)
+        if previous is not None:
+            previous._restore_turn_binding()
         recognition = self.activity._audio_recognition
         if self.processing is not None and self.processing[0] is recognition:
             return
