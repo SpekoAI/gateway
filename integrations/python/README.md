@@ -55,8 +55,11 @@ and a new standby. LiveKit does not close the `TTS` when the session ends, so
 call `aclose()` to close the standby sooner. Between replies, each `TTS` holds
 one open Gateway session and provider connection, and during a reply it holds
 two. Both count toward your organization's concurrent-session limit and the
-provider's connection limits. Set `standby_sessions` to keep more standbys, or
-to `0` to open each session at its reply's first text.
+provider's connection limits. With managed credentials, Speko reserves credit
+for each open session's `max_input_characters`, so the standby holds a second
+reservation. Lower `max_input_characters` to reserve less. Set
+`standby_sessions` to keep more standbys, or to `0` to open each session at
+its reply's first text.
 
 `STT()` and `TTS()` read `SPEKO_SOCKET_PATH` and `SPEKO_LOCAL_AUTH_TOKEN`.
 `credential_source="auto"` preserves the original behavior: managed when
