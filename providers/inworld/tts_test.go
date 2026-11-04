@@ -406,7 +406,15 @@ func TestTTSOpenValidationAndLocalLimits(t *testing.T) {
 		})
 	}
 
-	harness := newTTSHarness(t, func(context.Context, *websocket.Conn, *http.Request) {})
+	harness := newTTSHarness(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		// Local input validation needs a live stream. Keep the owned peer
+		// connected until the test aborts it, rather than racing its EOF.
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+		}
+	})
 	defer harness.Close()
 	stream := openTTSStream(t, harness, nil)
 	defer func() { _ = stream.Abort(context.Background()) }()
