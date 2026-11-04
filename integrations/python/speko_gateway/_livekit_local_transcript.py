@@ -47,6 +47,13 @@ def bind_local_transcript(owner: Any) -> None:
                 stream = frame.f_locals.get("self")
                 if isinstance(stream, stt.RecognizeStream) and type(stream).__module__.startswith("livekit.agents.stt."):
                     models.append(stream._stt)
+                    if isinstance(stream._stt, stt.MultiSpeakerAdapter) and stream._stt._suppress_background:
+                        filtering = getattr(stream, "_speko_local_filter_binding", None)
+                        if filtering is None:
+                            filtering = _Filter(stream)
+                            stream._speko_local_filter_binding = filtering
+                        filtering.owners.add(owner)
+                        owner._local_transcript_bindings.add(filtering)
             frame = frame.f_back
     finally:
         del frame
@@ -83,6 +90,78 @@ def bind_local_transcript(owner: Any) -> None:
         binding.owners.add(owner)
         owner._local_transcript_bindings.add(binding)
         binding.start()
+
+
+class _Filter:
+    """Preserve an empty final's group marker after the SDK filters a part."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+        self.owners: weakref.WeakSet[Any] = weakref.WeakSet()
+        detector = stream._detector
+        self.original, self.original_close = detector.on_stt_event, stream.aclose
+
+        @wraps(self.original)
+        def filtered(event: Any) -> Any:
+            result = self.original(event)
+            data = event.alternatives[0] if event.alternatives else None
+            if (
+                result is None
+                and event.type is stt.SpeechEventType.FINAL_TRANSCRIPT
+                and isinstance(data, NativeSpeechData)
+                and data._local_group is not None
+            ):
+                # Same empty standard event as the SDK's None replacement;
+                # retain only our encodable association with the provider
+                # final so a suppressed terminal part can finish the group.
+                return stt.SpeechEvent(type=event.type, alternatives=[dataclasses.replace(
+                    data, language="", text="", speaker_id=None,
+                    is_primary_speaker=None, _local_suppressed=True,
+                )])
+            return result
+
+        async def close() -> None:
+            try:
+                await self.original_close()
+            finally:
+                self.restore()
+
+        self.observed, self.observed_close = filtered, close
+        detector.on_stt_event, stream.aclose = filtered, close
+
+    def restore(self) -> None:
+        if self.stream._detector.on_stt_event is self.observed:
+            self.stream._detector.on_stt_event = self.original
+        if self.stream.aclose is self.observed_close:
+            self.stream.aclose = self.original_close
+        if getattr(self.stream, "_speko_local_filter_binding", None) is self:
+            del self.stream._speko_local_filter_binding
+
+    def release(self, owner: Any) -> None:
+        self.owners.discard(owner)
+        if not self.owners:
+            self.restore()
+
+
+def _filtered_text(canonical: str, parts: list[tuple[str, bool]]) -> str | None:
+    if not any(suppressed for _, suppressed in parts):
+        return canonical
+    cursor, accepted = 0, []
+    for text, suppressed in parts:
+        start = canonical.find(text, cursor)
+        if start < 0:
+            # A custom node supplied a different set of parts. Its SDK text
+            # remains authoritative; never reconstruct omitted content.
+            return None
+        if suppressed:
+            gap = canonical[cursor:start]
+            if gap.strip():
+                accepted.append(gap)
+        else:
+            accepted.append(canonical[cursor:start + len(text)])
+        cursor = start + len(text)
+    accepted.append(canonical[cursor:])
+    return "".join(accepted).strip()
 
 
 class _Prewarm:
@@ -122,6 +201,25 @@ class _Binding:
         self.rewritten = False
         self.pending = False
         self.deferred: Any = None
+        self.group: str | None = None
+        self.parts: list[tuple[str, bool]] = []
+
+    def _owns_recognition(self) -> bool:
+        visited: set[int] = set()
+
+        def owns(model: Any) -> bool:
+            if model in self.owners:
+                return True
+            if id(model) in visited:
+                return False
+            visited.add(id(model))
+            if isinstance(model, stt.MultiSpeakerAdapter):
+                return owns(model._stt)
+            if isinstance(model, stt.FallbackAdapter):
+                return any(owns(child) for child in model._stt_instances)
+            return False
+
+        return owns(self.activity.stt)
 
     def start(self) -> None:
         if self.activity._audio_recognition is not None:
@@ -163,6 +261,9 @@ class _Binding:
         original = getattr(recognition, method)
 
         def prepare(event: Any) -> tuple[NativeSpeechData, str] | None:
+            if not self._owns_recognition():
+                restore_local_transcript(self.activity)
+                return None
             data = event.alternatives[0] if event.alternatives else None
             if (
                 not self.owners
@@ -170,13 +271,22 @@ class _Binding:
                 or not isinstance(data, NativeSpeechData)
                 or data._local_part_text is None
                 or data.canonical_text is None
+                or data._local_group is None
             ):
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    # A fallback/custom node emitted its own final. Leave
+                    # that SDK text in place and retire our incomplete group.
+                    self.prefix, self.pending, self.group = None, False, None
+                    self.parts.clear()
                 return None
             before = recognition._audio_transcript
-            if self.prefix is None:
+            if self.group != data._local_group:
                 self.prefix = before
                 self.rewritten = False
-            self.rewritten |= data.text != data._local_part_text
+                self.group = data._local_group
+                self.parts.clear()
+            self.parts.append((data._local_part_text, data._local_suppressed))
+            self.rewritten |= data.text != ("" if data._local_suppressed else data._local_part_text)
             self.pending = not bool(data.canonical_text)
             return data, before
 
@@ -185,15 +295,20 @@ class _Binding:
                 return
             data, before = part
             if data.canonical_text:
-                if not self.rewritten and recognition._audio_transcript != before:
+                filtered = _filtered_text(data.canonical_text, self.parts)
+                if not self.rewritten and filtered is not None and (recognition._audio_transcript != before or any(suppressed for _, suppressed in self.parts)):
                     recognition._audio_transcript = " ".join(
-                        text for text in (self.prefix, data.canonical_text) if text
+                        text for text in (self.prefix, filtered) if text
                     )
+                if any(suppressed for _, suppressed in self.parts):
+                    recognition._audio_interim_transcript = ""
                 self.prefix = None
                 self.pending = False
-                if self.deferred is not None and not recognition._closing.is_set():
+                self.group = None
+                self.parts.clear()
+                if (self.deferred is not None or data._local_after_eos) and not recognition._closing.is_set():
                     run = recognition._run_eou_detection
-                    options = {"skip_reply": self.deferred.skip_reply}
+                    options = {"skip_reply": self.deferred.skip_reply if self.deferred is not None else False}
                     if "trigger" in inspect.signature(run).parameters:
                         options["trigger"] = "manual" if recognition._turn_detection_mode == "manual" else "stt"
                     run(recognition._hooks.retrieve_chat_ctx().copy(), **options)
@@ -220,6 +335,9 @@ class _Binding:
 
             @wraps(original_turn)
             def completed(info: Any) -> bool:
+                if not self._owns_recognition():
+                    restore_local_transcript(self.activity)
+                    return original_turn(info)
                 if self.pending:
                     self.deferred = info
                     return False
@@ -240,6 +358,8 @@ class _Binding:
                 setattr(recognition, method, original)
             self.processing = None
         self.prefix, self.pending, self.deferred = None, False, None
+        self.group = None
+        self.parts.clear()
 
     def release(self, owner: Any) -> None:
         self.owners.discard(owner)

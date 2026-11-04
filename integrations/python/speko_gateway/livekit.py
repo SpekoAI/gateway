@@ -11,6 +11,7 @@ import asyncio
 import dataclasses
 import inspect
 import logging
+import uuid
 import weakref
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
@@ -672,6 +673,7 @@ class SpeechStream(stt.RecognizeStream):
         self._bridge = bridge
         self._language = language
         self._request_id = utils.shortuuid()
+        self._local_group: str | None = None
         self._gateway_stream: LiveKitSTTStream | None = None
         self._speaking = False
         self._saw_final_for_turn = False
@@ -747,6 +749,18 @@ class SpeechStream(stt.RecognizeStream):
         if self._speaking:
             self._emit_end()
 
+    def _data(self, event: LiveKitSpeechEvent) -> NativeSpeechData:
+        data = _speech_data(event, self._language)
+        if event.type == "transcript.final":
+            if self._local_group is None:
+                self._local_group = uuid.uuid4().hex
+            data._local_group = self._local_group
+            data._local_after_eos = self._awaiting_final
+            data.canonical_text = event.text if event.canonical_text is None else event.canonical_text
+            if data.canonical_text:
+                self._local_group = None
+        return data
+
     def _emit(self, event: LiveKitSpeechEvent) -> None:
         if event.provider_request_id:
             self._request_id = event.provider_request_id
@@ -777,14 +791,16 @@ class SpeechStream(stt.RecognizeStream):
         if event.type not in {"transcript.delta", "transcript.final"} or not event.text:
             return
         is_final = event.type == "transcript.final"
+        data = self._data(event)
         if is_final and self._awaiting_final:
-            self._awaiting_final = False
+            self._awaiting_final = not bool(data.canonical_text)
+            self._saw_final_for_turn = True
             self._event_ch.send_nowait(
                 stt.SpeechEvent(
                     type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                     request_id=self._request_id,
                     alternatives=[
-                        _speech_data(event, self._language)
+                        data
                     ],
                 )
             )
@@ -811,7 +827,7 @@ class SpeechStream(stt.RecognizeStream):
                 ),
                 request_id=self._request_id,
                 alternatives=[
-                    _speech_data(event, self._language)
+                    data
                 ],
             )
         )
