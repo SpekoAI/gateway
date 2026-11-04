@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import math
+from collections import deque
 
 from livekit import rtc
 from livekit.agents import utils, vad
@@ -56,6 +57,8 @@ class _DrainingVADStream(vad.VADStream):
         self._sample_rate = self._queued = 0
         self._inner = None
         self._probability = None
+        self._segment = self._flushes = 0
+        self._published: deque[tuple[vad.VADEvent, int]] = deque()
         super().__init__(parent)
 
     @property
@@ -81,6 +84,31 @@ class _DrainingVADStream(vad.VADStream):
         self._check_not_closed()
         self._input_ch.close()
 
+    def flush(self) -> None:
+        super().flush()
+        # Fence publication synchronously at the framework's boundary. The
+        # queued marker still drains accounting and resets the owned detector.
+        self._flushes += 1
+
+    async def __anext__(self) -> vad.VADEvent:
+        while True:
+            event = await super().__anext__()
+            original, segment = self._published.popleft()
+            if event is not original:
+                raise GatewayError("Local speech event order changed", retryable=False)
+            if segment == self._flushes:
+                return event
+
+    async def aclose(self) -> None:
+        try:
+            await super().aclose()
+        finally:
+            self._published.clear()
+
+    def _emit(self, event: vad.VADEvent) -> None:
+        self._published.append((event, self._segment))
+        self._event_ch.send_nowait(event)
+
     def _reset(self) -> None:
         self._inner = self._source.stream()
         self._probability = None
@@ -90,6 +118,18 @@ class _DrainingVADStream(vad.VADStream):
         self._speech = bytearray()
         self._processed = self._last_index = 0
         self._deadline = None
+        self._idle_at = 0.0
+
+    def _arm_tail(self) -> None:
+        audio, detector = self._audio, self._probability
+        self._deadline = (
+            self._idle_at
+            if detector is not None
+            and audio.real_pending
+            and audio.last_padded != audio.real_fed
+            and audio.padding_pending < detector.window_samples * 2
+            else None
+        )
 
     def _push(self, frame: rtc.AudioFrame, *, padding: bool = False) -> None:
         raw = bytes(frame.data)
@@ -154,6 +194,8 @@ class _DrainingVADStream(vad.VADStream):
         maximum_bytes = math.ceil(maximum * self._sample_rate) * 2
         if self._probability.speaking:
             self._speech.extend(real[: max(0, maximum_bytes - len(self._speech))])
+        was_speaking = self._probability.speaking
+        started_at = self._probability.started_at
         boundary = self._probability.observe(
             event,
             samples=count,
@@ -162,18 +204,21 @@ class _DrainingVADStream(vad.VADStream):
             channels=1,
         )
         state = self._probability
-        self._event_ch.send_nowait(
+        if self._segment != self._flushes:
+            return
+        # samples_index uses the detector rate; outward PCM keeps the source
+        # rate. Inference publishes speaking/duration before its transition.
+        inference_rate = getattr(options, "sample_rate", 16000)
+        index = self._processed * inference_rate // self._sample_rate
+        self._emit(
             dataclasses.replace(
                 event,
-                samples_index=self._processed,
+                samples_index=index,
                 timestamp=self._processed / self._sample_rate,
                 frames=[self._frame(real)],
-                speaking=state.speaking,
-                speech_duration=max(
-                    0, self._processed - state.started_at - state.silence_samples
-                )
-                / self._sample_rate
-                if state.speaking
+                speaking=was_speaking,
+                speech_duration=max(0, self._processed - started_at) / self._sample_rate
+                if was_speaking
                 else 0,
                 silence_duration=state.silence_samples / self._sample_rate,
                 raw_accumulated_speech=state.speech_samples / self._sample_rate,
@@ -190,10 +235,10 @@ class _DrainingVADStream(vad.VADStream):
             else:
                 boundary.frames = [self._frame(bytes(self._speech))]
                 self._speech.clear()
-            self._event_ch.send_nowait(
+            self._emit(
                 dataclasses.replace(
                     boundary,
-                    samples_index=self._processed,
+                    samples_index=index,
                     inference_duration=event.inference_duration,
                 )
             )
@@ -232,8 +277,11 @@ class _DrainingVADStream(vad.VADStream):
                         if ending:
                             return
                         self._reset()
+                        self._segment += 1
                         flushing = False
                         incoming = asyncio.create_task(self._input_ch.__anext__())
+                    if not (ending or flushing):
+                        self._arm_tail()
                     observed = asyncio.create_task(self._inner.__anext__())
                 if incoming in done:
                     try:
@@ -255,11 +303,10 @@ class _DrainingVADStream(vad.VADStream):
                                     )
                             self._push(value)
                             interval = self._probability.interval
-                            self._deadline = (
-                                asyncio.get_running_loop().time()
-                                + max(interval, value.duration)
-                                + interval
+                            self._idle_at = (
+                                asyncio.get_running_loop().time() + 2 * interval
                             )
+                            self._arm_tail()
                     if ending or flushing:
                         incoming = None
                         self._deadline = None

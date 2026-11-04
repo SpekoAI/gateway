@@ -230,7 +230,8 @@ async def test_gateway_late_final_obeys_the_active_framework_turn_policy(mode, n
 
 
 @pytest.mark.parametrize("nested", [False, True])
-async def test_gateway_deferred_manual_commit_waits_for_vad_end_and_keeps_skip_reply(nested):
+@pytest.mark.parametrize("clear", [False, True])
+async def test_gateway_deferred_manual_commit_waits_for_vad_end_and_keeps_skip_reply(nested, clear):
     from livekit import rtc
     from livekit.agents import Agent, AgentSession, stt, vad
     from livekit.agents.voice import io
@@ -299,12 +300,27 @@ async def test_gateway_deferred_manual_commit_waits_for_vad_end_and_keeps_skip_r
             await asyncio.wait_for(final.wait(), 3)
             await asyncio.sleep(0.05)
             assert items.empty(), "the explicit decision must wait while speech is active"
+            if clear:
+                session.clear_user_turn()
+                assert binding.deferred is None
+                final.clear()
+                await frames.put(rtc.AudioFrame(data=b"\xff\x0f" * 320, sample_rate=16000, num_channels=1, samples_per_channel=320))
+                value = await asyncio.wait_for(detector.frames.get(), 3)
+                detector.processed(value)
+                detector.emit(vad.VADEventType.START_OF_SPEECH)
+                await asyncio.wait_for(final.wait(), 3)
             detector.emit(vad.VADEventType.END_OF_SPEECH, silence_duration=0.02)
+            if clear:
+                await asyncio.sleep(0.1)
+                assert items.empty(), "a cleared deferred decision cannot commit the later utterance"
+                session.commit_user_turn(transcript_timeout=0, stt_flush_duration=0, skip_reply=True)
             assert await asyncio.wait_for(items.get(), 3) == "hello world"
             assert replies == []
             recognition = session._activity._audio_recognition
             await model.aclose()
             assert recognition._on_vad_event.__func__ is type(recognition)._on_vad_event
+            clear_method = "_clear_user_turn" if hasattr(recognition, "_clear_user_turn") else "clear_user_turn"
+            assert getattr(recognition, clear_method).__func__ is getattr(type(recognition), clear_method)
         finally:
             allowed.set()
             release.set()

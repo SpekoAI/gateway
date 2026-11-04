@@ -92,6 +92,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._vad_audio = VADAudio()
         self._probability_vad: ProbabilityVAD | None = None
         self._vad_tail_timer: asyncio.TimerHandle | None = None
+        self._vad_onset_timer: asyncio.TimerHandle | None = None
         self._vad_idle_deadline = 0.0
         self._vad_finished = False
         self._finals: list[LiveKitSpeechEvent] = []
@@ -257,6 +258,9 @@ class NativeSpeechStream(stt.RecognizeStream):
             ) from None
         finally:
             self._cancel_vad_tail()
+            if self._vad_onset_timer is not None:
+                self._vad_onset_timer.cancel()
+                self._vad_onset_timer = None
             await utils.aio.cancel_and_wait(*tasks)
             if work is not None:
                 await asyncio.gather(work, return_exceptions=True)
@@ -333,10 +337,9 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._vad_audio.push(len(raw), padding=padding)
         if not padding and self._probability_vad is not None:
             interval = self._probability_vad.interval
-            # A normal source can deliver packets longer than an inference
-            # window. Allow its packet duration plus an inference interval
-            # before concluding that capture paused.
-            delay = max(interval, frame.duration) + interval
+            # Captured packet samples have already arrived; packet duration
+            # must not add latency to a pending partial inference window.
+            delay = 2 * interval
             self._vad_idle_deadline = asyncio.get_running_loop().time() + delay
         assert self._vad_stream is not None
         self._vad_stream.push_frame(frame)
@@ -362,6 +365,25 @@ class NativeSpeechStream(stt.RecognizeStream):
 
         loop = asyncio.get_running_loop()
         self._vad_tail_timer = loop.call_later(max(0, self._vad_idle_deadline - loop.time()), drain)
+
+    def _bound_vad_onset(self) -> None:
+        if not self._vad_onset_pending:
+            if self._vad_onset_timer is not None:
+                self._vad_onset_timer.cancel()
+                self._vad_onset_timer = None
+            return
+        if self._vad_onset_timer is not None:
+            return
+
+        def unresolved() -> None:
+            self._vad_onset_timer = None
+            if self._vad_onset_pending and not self._fatal.done():
+                self._fatal.set_exception(GatewayError(
+                    "Local speech onset requires a control-plane recovery decision",
+                    retryable=False,
+                ))
+
+        self._vad_onset_timer = asyncio.get_running_loop().call_later(1.0, unresolved)
 
     def _pad_vad_tail(self, *, final: bool = False) -> None:
         detector, audio = self._probability_vad, self._vad_audio
@@ -411,6 +433,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 else:
                     self._vad_speaking = event.speaking
                     self._vad_onset_pending = not event.speaking and self._possible_onset(event)
+                self._bound_vad_onset()
                 if self._gateway_stream is not None and real:
                     await self._send_audio(real)
                     self._assigned_until = self._processed_samples
