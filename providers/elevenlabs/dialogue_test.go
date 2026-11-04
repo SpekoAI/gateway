@@ -43,6 +43,13 @@ func TestDialogueAdapterRegistersOneVoiceAndFlushesWithoutClosing(t *testing.T) 
 					t.Errorf("first input = %+v, err=%v", first, err)
 					return
 				}
+				// "Hello, " closes a clause, so it is flushed on its own before
+				// the rest of the reply arrives.
+				clause, err := readDialogueMessage(ctx, conn)
+				if err != nil || !clause.Flush || len(clause.Inputs) != 0 || clause.CloseSocket {
+					t.Errorf("clause flush = %+v, err=%v", clause, err)
+					return
+				}
 				second, err := readDialogueMessage(ctx, conn)
 				if err != nil || len(second.Inputs) != 1 || second.Inputs[0].Text != "world." {
 					t.Errorf("second input = %+v, err=%v", second, err)
@@ -53,13 +60,16 @@ func TestDialogueAdapterRegistersOneVoiceAndFlushesWithoutClosing(t *testing.T) 
 					t.Errorf("flush = %+v, err=%v", flush, err)
 					return
 				}
-				if err := writeServerJSON(ctx, conn, map[string]any{"audio": base64.StdEncoding.EncodeToString([]byte{1, 2, 3})}); err != nil {
-					t.Errorf("write audio: %v", err)
-					return
-				}
-				if err := writeServerJSON(ctx, conn, map[string]any{"is_final": true}); err != nil {
-					t.Errorf("write final: %v", err)
-					return
+				// One final per flush, as the live socket sends them.
+				for _, audio := range [][]byte{{1, 2, 3}, {4, 5, 6}} {
+					if err := writeServerJSON(ctx, conn, map[string]any{"audio": base64.StdEncoding.EncodeToString(audio)}); err != nil {
+						t.Errorf("write audio: %v", err)
+						return
+					}
+					if err := writeServerJSON(ctx, conn, map[string]any{"is_final": true}); err != nil {
+						t.Errorf("write final: %v", err)
+						return
+					}
 				}
 				closeSocket, err := readDialogueMessage(ctx, conn)
 				if err != nil || !closeSocket.CloseSocket {
@@ -87,8 +97,9 @@ func TestDialogueAdapterRegistersOneVoiceAndFlushesWithoutClosing(t *testing.T) 
 			if err := stream.CommitText(context.Background()); err != nil {
 				t.Fatalf("commit: %v", err)
 			}
-			events := collectEvents(t, stream.Events(), 3)
-			if got := eventTypes(events); strings.Join(got, ",") != "audio.started,audio.frame,audio.done" {
+			// The clause flush's final ends nothing: one audio.done, after both.
+			events := collectEvents(t, stream.Events(), 4)
+			if got := eventTypes(events); strings.Join(got, ",") != "audio.started,audio.frame,audio.frame,audio.done" {
 				t.Fatalf("event types = %v", got)
 			}
 			if err := stream.Close(context.Background()); err != nil {
