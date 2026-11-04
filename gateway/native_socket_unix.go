@@ -18,6 +18,10 @@ import (
 // insufficient evidence: another process may be between bind and listen.
 // The lock file remains in place so concurrent restarts share one lock inode.
 func ListenNativeUnix(socketPath string) (net.Listener, error) {
+	return listenNativeUnix(socketPath, persistNativeSocketOwner)
+}
+
+func listenNativeUnix(socketPath string, persist func(*os.File, nativeSocketOwner) error) (net.Listener, error) {
 	refuse := func() (net.Listener, error) {
 		return nil, errors.New("gateway: native socket ownership or listener is unavailable")
 	}
@@ -77,29 +81,55 @@ func ListenNativeUnix(socketPath string) (net.Listener, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return refuse()
 	}
-	listener, err := ListenUnix(socketPath)
+	// Bind privately before publishing. A crash during ownership persistence
+	// cannot leave an unrecorded socket at the stable runtime path.
+	staging, err := os.MkdirTemp(filepath.Dir(socketPath), ".native-")
+	if err != nil {
+		return refuse()
+	}
+	defer os.RemoveAll(staging)
+	stagedPath := filepath.Join(staging, "s")
+	listener, err := ListenUnix(stagedPath)
 	if err != nil {
 		return nil, err
 	}
-	entry, err = os.Lstat(socketPath)
+	listener.(*net.UnixListener).SetUnlinkOnClose(false)
+	entry, err = os.Lstat(stagedPath)
 	if err != nil {
 		_ = listener.Close()
 		return refuse()
 	}
 	socketStat, ok := entry.Sys().(*syscall.Stat_t)
-	if !ok || lock.Truncate(0) != nil {
+	if !ok {
 		_ = listener.Close()
 		return refuse()
 	}
-	if _, err = lock.Seek(0, io.SeekStart); err == nil {
-		err = json.NewEncoder(lock).Encode(nativeSocketOwner{Version: 1, Device: uint64(socketStat.Dev), Inode: uint64(socketStat.Ino), ModifiedAt: entry.ModTime().UnixNano()})
+	err = persist(lock, nativeSocketOwner{Version: 1, Device: uint64(socketStat.Dev), Inode: uint64(socketStat.Ino), ModifiedAt: entry.ModTime().UnixNano()})
+	if err != nil {
+		_ = listener.Close()
+		return refuse()
 	}
-	if err != nil || lock.Sync() != nil {
+	// link publishes without replacing a socket that an uncoordinated owner
+	// bound after our earlier Lstat. Both names refer to the recorded inode.
+	if os.Link(stagedPath, socketPath) != nil {
 		_ = listener.Close()
 		return refuse()
 	}
 	keep = true
-	return &nativeUnixListener{Listener: listener, lock: lock}, nil
+	return &nativeUnixListener{Listener: listener, lock: lock, path: socketPath, entry: entry}, nil
+}
+
+func persistNativeSocketOwner(lock *os.File, owner nativeSocketOwner) error {
+	if err := lock.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := lock.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := json.NewEncoder(lock).Encode(owner); err != nil {
+		return err
+	}
+	return lock.Sync()
 }
 
 type nativeSocketOwner struct {
@@ -111,12 +141,22 @@ type nativeSocketOwner struct {
 
 type nativeUnixListener struct {
 	net.Listener
-	lock *os.File
-	once sync.Once
-	err  error
+	lock  *os.File
+	path  string
+	entry os.FileInfo
+	once  sync.Once
+	err   error
 }
 
+func (l *nativeUnixListener) Addr() net.Addr { return &net.UnixAddr{Name: l.path, Net: "unix"} }
+
 func (l *nativeUnixListener) Close() error {
-	l.once.Do(func() { l.err = l.Listener.Close(); _ = l.lock.Close() })
+	l.once.Do(func() {
+		l.err = l.Listener.Close()
+		if current, err := os.Lstat(l.path); err == nil && os.SameFile(l.entry, current) {
+			_ = os.Remove(l.path)
+		}
+		_ = l.lock.Close()
+	})
 	return l.err
 }

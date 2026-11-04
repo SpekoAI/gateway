@@ -550,10 +550,18 @@ async def test_actual_native_sidecar_restarts_after_sigkill_with_the_same_socket
 @pytest.mark.parametrize(
     "status,code", [(402, "insufficient_credit"), (409, "idempotency_conflict")]
 )
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param("<" * 2000, id="html"),
+        pytest.param("x" + "\u2028" * 2000, id="unicode"),
+    ],
+)
 async def test_native_sidecar_python_speech_retains_canonical_handshake_rejection(
     native_binary,
     status,
     code,
+    message,
 ):
     async def handle(request):
         response = web.StreamResponse(
@@ -564,12 +572,13 @@ async def test_native_sidecar_python_speech_retains_canonical_handshake_rejectio
             {
                 "error": {
                     "code": code,
-                    "message": "m" * 1025,
+                    "message": message,
                     "hint": "owned remediation",
                     "retryable": False,
                     "request_id": "owned-rejection",
                 }
-            }
+            },
+            ensure_ascii=False,
         ).encode()
         await response.write(raw[:5])
         await asyncio.sleep(0.01)

@@ -57,7 +57,10 @@ The socket directory must belong to the process UID with mode 0700. Native
 mode retains a 0600 lock file beside the socket for its entire listener lifetime;
 leave that lock file in place. After SIGKILL or OOM, the next owner can reclaim
 its recorded socket under the lock. The lock file also records the exact socket
-device and inode after binding. An unrecorded socket, including a process still
+device and inode after binding in a private staging directory. The stable socket
+path is published only after that ownership record is synced, using a hard link
+that refuses to replace any entry. A crash before publication leaves the stable
+path available for restart. An unrecorded socket, including a process still
 between bind and listen, or an unrelated file is refused and needs operator cleanup.
 This native transport does not complete actual platform claim issuance,
 realtime protocols, the general signed-plan relay adapter track, or a settled

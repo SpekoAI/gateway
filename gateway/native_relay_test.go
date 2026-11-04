@@ -620,27 +620,37 @@ func TestNativeRelayStalledUploadReleasesSlotAndCancelsUpstream(t *testing.T) {
 }
 
 func TestNativeRelayWebSocketRefusalPreservesStatusEnvelopeAndRequestIdentity(t *testing.T) {
-	for _, status := range []int{402, 409, 429, 503} {
-		t.Run(fmt.Sprint(status), func(t *testing.T) {
-			envelope := relayapi.ErrorEnvelope{Error: relayapi.ErrorBody{Code: relayapi.ErrorCodeInsufficientCredit, Message: strings.Repeat("m", 1025), Hint: strings.Repeat("h", 512), RequestID: "req-123", Retryable: false}}
-			peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				_ = json.NewEncoder(w).Encode(envelope)
-			}))
-			defer peer.Close()
-			_, local := nativeServer(t, peer, nil)
-			req, _ := http.NewRequest("GET", local.URL+"/v1/stt/stream", nil)
-			req.Header = nativeHeaders("sk_speko_agent_owned")
-			response, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer response.Body.Close()
-			var actual relayapi.ErrorEnvelope
-			if json.NewDecoder(response.Body).Decode(&actual) != nil || actual != envelope || response.StatusCode != status || response.Header.Get(relayapi.HeaderRequestID) != envelope.Error.RequestID {
-				t.Fatal("WebSocket rejection lost its normalized identity")
-			}
-		})
+	for _, message := range []string{strings.Repeat("<", 2000), "x" + strings.Repeat("\u2028", 2000)} {
+		for _, status := range []int{402, 409, 429, 503} {
+			t.Run(fmt.Sprintf("%d/%x", status, []byte(message)[:3]), func(t *testing.T) {
+				envelope := relayapi.ErrorEnvelope{Error: relayapi.ErrorBody{Code: relayapi.ErrorCodeInsufficientCredit, Message: message, Hint: strings.Repeat("h", 512), RequestID: "req-123", Retryable: false}}
+				peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status)
+					var encoded bytes.Buffer
+					encoder := json.NewEncoder(&encoded)
+					encoder.SetEscapeHTML(false)
+					_ = encoder.Encode(envelope)
+					raw := bytes.ReplaceAll(encoded.Bytes(), []byte("\\u2028"), []byte("\u2028"))
+					if len(raw) > 8192 {
+						t.Fatal("fixture is outside the canonical wire bound")
+					}
+					_, _ = w.Write(raw)
+				}))
+				defer peer.Close()
+				_, local := nativeServer(t, peer, nil)
+				req, _ := http.NewRequest("GET", local.URL+"/v1/stt/stream", nil)
+				req.Header = nativeHeaders("sk_speko_agent_owned")
+				response, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer response.Body.Close()
+				var actual relayapi.ErrorEnvelope
+				if json.NewDecoder(response.Body).Decode(&actual) != nil || actual != envelope || response.StatusCode != status || response.Header.Get(relayapi.HeaderRequestID) != envelope.Error.RequestID {
+					t.Fatal("WebSocket rejection lost its normalized identity")
+				}
+			})
+		}
 	}
 }

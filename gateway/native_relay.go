@@ -380,6 +380,7 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	// Capture the bounded canonical envelope before that diagnostic truncation.
 	client := *s.client
 	var rejection *relayapi.ErrorEnvelope
+	var rejectionBody []byte
 	client.Transport = nativeRoundTrip(func(req *http.Request) (*http.Response, error) {
 		response, err := s.client.Transport.RoundTrip(req)
 		if err == nil && response.StatusCode >= 400 && response.StatusCode <= 599 && response.Body != nil {
@@ -389,6 +390,7 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 			var envelope relayapi.ErrorEnvelope
 			if readErr == nil && len(raw) <= 8192 && json.Unmarshal(raw, &envelope) == nil && envelope.Validate() == nil {
 				rejection = &envelope
+				rejectionBody = raw
 			}
 		}
 		return response, err
@@ -412,7 +414,12 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 			if nativeVisible(rejection.Error.RequestID, 256) {
 				w.Header().Set(relayapi.HeaderRequestID, rejection.Error.RequestID)
 			}
-			writeJSON(w, status, rejection)
+			// Re-encoding may expand HTML/JS characters beyond the same 8 KiB
+			// bound enforced by native clients. Preserve the validated JSON.
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.WriteHeader(status)
+			_, _ = w.Write(rejectionBody)
 			return
 		}
 		writeError(w, status, "relay_unavailable", "native relay handshake failed")
