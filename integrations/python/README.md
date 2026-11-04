@@ -167,6 +167,16 @@ custom detectors can expose `activation_threshold`. A window above that actual
 threshold keeps a possible onset pending before `START_OF_SPEECH`. A later real
 window below it clears the candidate. Invalid probabilities or thresholds and
 unqualified probability detectors refuse before native admission.
+For the installed local-inference and Silero detectors, a paused partial
+window receives one bounded window of detector-only zero padding. The ordered
+audio ledger removes that padding before provider delivery, history/RMS lookup,
+or source timestamp mapping. Speech/silence minimums and hysteresis use the
+detector's configured thresholds and real sample durations; virtual padding
+cannot create a start/end boundary or clear a possible onset by itself.
+Continuous input retains normal inference cadence. Padding is bounded
+independently from the real-input backlog, and a final drain completes remaining
+real samples before the SDK discards its buffers at end of input. Other supplied
+VAD implementations retain their ordered acknowledgement/boundary contract.
 Binding is
 required for native AgentSession streaming. Explicit event consumers can use
 `stream(manual_turns=True)`; completed-buffer `recognize()` needs no binding
