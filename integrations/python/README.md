@@ -76,7 +76,8 @@ MultiSpeaker detection and transcription events receive the labels. Its owned
 recognition hook preserves canonical turn text, including through nested SDK
 wrappers and manual commits partway through a final. Deliberate local wrapper
 formatting is preserved. Ambiguous spans stay unattributed even when a whole
-final has a different speaker label.
+final has a different speaker label. Live swaps between native and Gateway STT
+restore the preceding owner's hooks before installing the new binding.
 Speaker RMS lookup uses accepted audio positions, including after custom-node
 filtering; emitted transcript timestamps keep their original input positions.
 Multi-model fallback requires a control-plane recovery decision; wrappers
