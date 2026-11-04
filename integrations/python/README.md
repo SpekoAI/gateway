@@ -93,6 +93,10 @@ well as `text`; canonical filtering state stays inside the owned filter until
 the group finishes. Finals arriving after provider end-of-speech retain that
 boundary, and replacing Gateway STT with another SDK model retires its pending
 gate without requiring the old model to close.
+An explicit manual decision deferred during a segmented final retains its
+`skip_reply` value through active VAD speech and rearms when that speech ends.
+Without a manual request, late finals do not start a manual turn. The owned
+VAD callback is restored together with the local transcript hooks.
 Speaker RMS lookup uses accepted audio positions, including after custom-node
 filtering; emitted transcript timestamps keep their original input positions.
 Multi-model fallback requires a control-plane recovery decision; wrappers
