@@ -112,7 +112,7 @@ class NativeTurnPolicy:
         minimum, maximum = self.limits()
         task = getattr(self.recognition, "_end_of_turn_task", None)
         decision = self._decisions.get(task) if task is not None else None
-        if decision is not None and decision.transcript == transcript:
+        if decision is not None and " ".join(decision.transcript.split()) == transcript:
             if decision.delay is not None:
                 return decision.delay
             minimum = decision.minimum
@@ -136,7 +136,7 @@ class NativeTurnPolicy:
             decision = self._decisions.get(task) if task is not None else None
             if (
                 decision is not None
-                and decision.transcript == transcript
+                and " ".join(decision.transcript.split()) == transcript
                 and decision.delay is not None
             ):
                 return decision.delay

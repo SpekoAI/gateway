@@ -36,6 +36,10 @@ class LiveKitSpeechEvent:
     # provider identified none (a session pinned to one language).
     language: str = ""
     speaker_id: str | None = None
+    # A segmented native final carries its complete text on its last part.
+    # Empty strings mark earlier parts; None preserves standalone event fakes.
+    canonical_text: str | None = None
+    speaker_segments: tuple[LiveKitSpeechEvent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -266,6 +270,9 @@ def _speech_events(
         provider_request_id=str(data.get("provider_request_id", "")),
         language=str(data.get("language", "")),
         speaker_id=_speaker(data.get("speaker"), local_speakers=local_speakers),
+        canonical_text=str(data.get("text", ""))
+        if event.type == "transcript.final"
+        else None,
     )
     segments = data.get("segments")
     if (
@@ -277,20 +284,14 @@ def _speech_events(
         )
     ):
         return (mapped,)
-    # LiveKit alternatives represent competing hypotheses, not successive
-    # speakers. Publish each attributed span as its own final, once, while
-    # retaining the complete canonical transcript used for turn acceptance.
+    # Segment text is optional alignment evidence, not the canonical final.
+    # Forward and backward alignment agree only on unambiguous ordered spans.
     if any(
         not isinstance(segment, dict) or not isinstance(segment.get("text"), str)
         for segment in segments
     ):
         raise GatewayError("Native speech attribution is invalid", retryable=False)
-    complete_text = " ".join(" ".join(segment["text"] for segment in segments).split())
-    if complete_text != " ".join(mapped.text.split()):
-        raise GatewayError(
-            "Native speech attribution does not cover its transcript", retryable=False
-        )
-    parts = []
+    attributed = []
     for segment in segments:
         start = _milliseconds(segment.get("start_ms"))
         end = _milliseconds(segment.get("end_ms"))
@@ -302,7 +303,7 @@ def _speech_events(
             or not 0 <= start <= end
         ):
             raise GatewayError("Native speech attribution is invalid", retryable=False)
-        parts.append(
+        attributed.append(
             replace(
                 mapped,
                 text=segment["text"],
@@ -310,9 +311,60 @@ def _speech_events(
                 end_time=end,
                 speaker_id=_speaker(
                     segment.get("speaker"), local_speakers=local_speakers
-                ) or mapped.speaker_id,
+                )
+                or mapped.speaker_id,
             )
         )
+    attributed = [part for part in attributed if part.text]
+    forward, backward = [], []
+    cursor = 0
+    for part in attributed:
+        start = mapped.text.find(part.text, cursor) if part.text else -1
+        if start < 0:
+            return (mapped,)
+        forward.append(start)
+        cursor = start + len(part.text)
+    cursor = len(mapped.text)
+    for part in reversed(attributed):
+        start = mapped.text.rfind(part.text, 0, cursor) if part.text else -1
+        if start < 0:
+            return (mapped,)
+        backward.append(start)
+        cursor = start
+    backward.reverse()
+    parts, cursor = [], 0
+    for part, start, latest in zip(attributed, forward, backward):
+        if start != latest:
+            continue
+        if mapped.text[cursor:start].strip():
+            parts.append(
+                replace(
+                    mapped,
+                    text=mapped.text[cursor:start],
+                    start_time=None,
+                    end_time=None,
+                    canonical_text="",
+                )
+            )
+        parts.append(replace(part, canonical_text=""))
+        cursor = start + len(part.text)
+    if mapped.text[cursor:].strip():
+        parts.append(
+            replace(
+                mapped,
+                text=mapped.text[cursor:],
+                start_time=None,
+                end_time=None,
+                canonical_text="",
+            )
+        )
+    if not parts:
+        return (mapped,)
+    if local_speakers:
+        # A local STT stream has no owned SDK turn hook. Keep its complete
+        # final intact, with segment attribution available as structured data.
+        return (replace(mapped, speaker_segments=tuple(parts)),)
+    parts[-1] = replace(parts[-1], canonical_text=mapped.text)
     return tuple(parts)
 
 

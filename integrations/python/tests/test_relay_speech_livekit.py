@@ -425,7 +425,7 @@ async def test_native_continuation_is_transcribed_before_framework_turn_commit(o
     await assert_native_continuation(own_vad, wrapper, first_terminal_delay)
 
 
-async def assert_native_continuation(own_vad, wrapper, first_terminal_delay, *, turn_detector=None, expected_turns=("first second",), wait_for_first_terminal=False):
+async def assert_native_continuation(own_vad, wrapper, first_terminal_delay, *, turn_detector=None, expected_turns=("first second",), wait_for_first_terminal=False, first_text="first"):
     source = ControlledVAD()
     session_vad = ControlledVAD() if own_vad else None
     admitted, terminal, turns, packets = asyncio.Queue(), asyncio.Queue(), asyncio.Queue(), []
@@ -443,7 +443,7 @@ async def assert_native_continuation(own_vad, wrapper, first_terminal_delay, *, 
                 packets[index].extend(message.data)
             elif json.loads(message.data)["type"] == "session.close":
                 await asyncio.sleep(first_terminal_delay if index == 0 else 0.35)
-                await ws.send_json({"type": "transcript.final", "text": "first" if index == 0 else "second"})
+                await ws.send_json({"type": "transcript.final", "text": first_text if index == 0 else "second"})
                 await ws.send_json({"type": "session.closed", "usage": {}})
                 terminal.put_nowait(index)
                 await ws.close()
@@ -509,7 +509,8 @@ async def assert_native_continuation(own_vad, wrapper, first_terminal_delay, *, 
 
 
 @pytest.mark.parametrize("probability", [0.1, 0.9])
-async def test_native_turn_uses_actual_detector_decision_for_queued_intermediate_pause(probability):
+@pytest.mark.parametrize("first_text", ["first", "first  part"])
+async def test_native_turn_uses_actual_detector_decision_for_queued_intermediate_pause(probability, first_text):
     class OwnedTurnDetector:
         model, provider = "owned-turn-detector", "owned"
 
@@ -523,8 +524,8 @@ async def test_native_turn_uses_actual_detector_decision_for_queued_intermediate
             await asyncio.sleep(0.01)
             return probability
 
-    expected = ("first second",) if probability < 0.5 else ("first", "second")
-    await assert_native_continuation(True, "nested", 0.35, turn_detector=OwnedTurnDetector(), expected_turns=expected)
+    expected = (f"{first_text} second",) if probability < 0.5 else (first_text, "second")
+    await assert_native_continuation(True, "nested", 0.35, turn_detector=OwnedTurnDetector(), expected_turns=expected, first_text=first_text)
 
 
 @pytest.mark.skipif(not hasattr(recognition, "_StreamingTurnDetector"), reason="SDK predates streaming turn detection")
@@ -2270,7 +2271,211 @@ async def test_retained_closed_native_input_node_cannot_reinstall_hooks_in_local
         await client.aclose()
 
 
-@pytest.mark.parametrize("invalid", ["missing_words", "invalid_label", "invalid_time"])
+@pytest.mark.parametrize("wrapper", ["direct", "nested"])
+@pytest.mark.parametrize("shape", ["unspaced", "partial", "punctuation"])
+async def test_valid_native_segments_keep_canonical_text_and_available_speakers(wrapper, shape):
+    text = {"unspaced": "你好", "partial": "hello world", "punctuation": "Hello, world!"}[shape]
+    segments = [{"text": "你" if shape == "unspaced" else "hello" if shape == "partial" else "Hello", "start_ms": 0, "end_ms": 300, "speaker": "A"}]
+    if shape != "partial":
+        segments.append({"text": "好" if shape == "unspaced" else "world", "start_ms": 300, "end_ms": 600, "speaker": "B"})
+    source, turns, finals, seen = ControlledVAD(), asyncio.Queue(), [], []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        seen.append(request.headers["Idempotency-Key"])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": text, "segments": segments})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async for event in Agent.default.stt_node(self, audio, settings):
+                if shape == "punctuation":
+                    event = copy.deepcopy(event)
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    finals.extend(event.alternatives)
+                yield event
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source, diarization=True)
+        wrapped = wrap_native_stt(model, wrapper)
+        session = AgentSession(stt=wrapped, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        model.bind_session(session)
+        transcript_binding = None
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned canonical attribution"), **options)
+            transcript_binding = model._native_transcript_binding
+            for samples, kind in [(9600, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                value = rtc.AudioFrame(data=(b"\xff\x0f" if samples == 9600 else b"\0\0") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples)
+                await audio.frames.put(value)
+                observed = await asyncio.wait_for(source.frames.get(), 3)
+                source.processed(observed)
+                source.emit(kind, frames=[observed], silence_duration=0 if samples == 9600 else 0.55)
+            assert await asyncio.wait_for(turns.get(), 3) == text
+            assert len(seen) == 1
+            assert not model._native_failed
+            assert {data.speaker_id for data in finals} >= ({"A", None} if shape == "partial" else {"A", "B"})
+            assert "".join("".join(data.text.split()) for data in finals) == "".join(text.split())
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            if wrapped is not model:
+                await wrapped.aclose()
+            await model.aclose()
+            await client.aclose()
+            if transcript_binding is not None:
+                recognition, original, _ = transcript_binding
+                assert recognition._on_stt_event is original
+                assert model._native_transcript_binding is None
+
+
+@pytest.mark.parametrize("skip_reply", [False, True])
+async def test_manual_commit_promoted_interim_is_replaced_by_terminal_canonical_text(skip_reply):
+    source, interim, release = ControlledVAD(), asyncio.Event(), asyncio.Event()
+    turns, items = asyncio.Queue(), asyncio.Queue()
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        sent = False
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY and not sent:
+                sent = True
+                await ws.send_json({"type": "transcript.delta", "text": "draft"})
+            elif message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await release.wait()
+                await ws.send_json({"type": "transcript.final", "text": "draft final"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+        session = AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="manual", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        session.on("user_input_transcribed", lambda event: interim.set() if not event.is_final else None)
+        session.on("conversation_item_added", lambda event: items.put_nowait(event.item.text_content) if event.item.role == "user" else None)
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned manual transcript fallback"), **options)
+            for samples, kind in [(320, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                value = rtc.AudioFrame(data=(b"\xff\x0f" if samples == 320 else b"\0\0") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples)
+                await audio.frames.put(value)
+                observed = await asyncio.wait_for(source.frames.get(), 3)
+                source.processed(observed)
+                source.emit(kind, frames=[observed], silence_duration=0 if samples == 320 else 0.55)
+            await asyncio.wait_for(interim.wait(), 3)
+            await asyncio.wait_for(session.commit_user_turn(transcript_timeout=0.01, stt_flush_duration=0, skip_reply=skip_reply), 3)
+            assert items.empty(), "an interim cannot commit before physical terminal evidence"
+            if not hasattr(session._activity._audio_recognition, "_input_started_at"):
+                assert session._activity._audio_recognition._audio_transcript == "draft", "exercise the actual legacy interim promotion"
+            release.set()
+            if skip_reply:
+                assert await asyncio.wait_for(items.get(), 3) == "draft final"
+                assert turns.empty()
+            else:
+                # With no LLM, the legacy SDK calls the hook without adding
+                # a chat item; the accepted canonical message is the contract.
+                assert await asyncio.wait_for(turns.get(), 3) == "draft final"
+            assert not model._native_failed
+        finally:
+            release.set()
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("partial", [False, True])
+async def test_native_recognize_preserves_canonical_text_and_attributed_spans(partial):
+    text = "hello world" if partial else "你好"
+    segments = [{"text": "hello" if partial else "你", "speaker": "A", "start_ms": 0, "end_ms": 10}]
+    if not partial:
+        segments.append({"text": "好", "speaker": "B", "start_ms": 10, "end_ms": 20})
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": text, "segments": segments})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", diarization=True, turn_vad=ControlledVAD(automatic=True))
+        try:
+            event = await model.recognize(frame())
+            data = event.alternatives[0]
+            assert data.text == text
+            assert data.canonical_text == text
+            attributed = [part for part in data.speaker_segments if part.speaker_id is not None]
+            assert [(part.text, part.speaker_id) for part in attributed] == [(part["text"], part["speaker"]) for part in segments]
+            if partial:
+                assert any(part.text.strip() == "world" and part.speaker_id is None for part in data.speaker_segments)
+        finally:
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_native_recognize_keeps_every_provider_final_in_one_request():
+    requests = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        requests.append(request.headers["Idempotency-Key"])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "one", "speaker": "A"})
+                await ws.send_json({"type": "transcript.final", "text": "two", "speaker": "A"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=ControlledVAD())
+        silence = rtc.AudioFrame(data=b"\0\0" * 8800, sample_rate=16000, num_channels=1, samples_per_channel=8800)
+        try:
+            event = await model.recognize([frame(), silence, frame(), silence])
+            assert event.alternatives[0].text == "one two"
+            assert [part.text for part in event.alternatives[0].speaker_segments] == ["one", "two"]
+            assert len(requests) == 1
+        finally:
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("invalid", ["invalid_label", "invalid_time"])
 async def test_native_diarization_cannot_drop_words_or_publish_invalid_attribution(invalid):
     seen = []
 
@@ -2284,7 +2489,7 @@ async def test_native_diarization_cannot_drop_words_or_publish_invalid_attributi
             if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
                 await ws.send_json({
                     "type": "transcript.final", "text": "one two",
-                    "segments": [{"text": "one" if invalid == "missing_words" else "one two", "start_ms": -1 if invalid == "invalid_time" else 0, "end_ms": 20, "speaker": 7 if invalid == "invalid_label" else "A"}],
+                    "segments": [{"text": "one two", "start_ms": -1 if invalid == "invalid_time" else 0, "end_ms": 20, "speaker": 7 if invalid == "invalid_label" else "A"}],
                 })
                 await ws.send_json({"type": "session.closed", "usage": {}})
                 await ws.close()
