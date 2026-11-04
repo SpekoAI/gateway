@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+import uuid
 import weakref
 from dataclasses import dataclass
 from functools import wraps
@@ -10,6 +12,18 @@ from typing import Any
 from livekit.agents import stt
 
 from .client import GatewayError
+
+_batches: weakref.WeakValueDictionary[str, NativeFinalBatch] = weakref.WeakValueDictionary()
+
+
+def _final_witness(event: Any) -> tuple[NativeFinalBatch, int] | None:
+    data = event.alternatives[0] if event.alternatives else None
+    witness = getattr(data, "_native_final", None)
+    if witness is None:
+        return None
+    token, index = witness
+    batch = _batches.get(token)
+    return (batch, index) if batch is not None else None
 
 
 @dataclass(frozen=True, eq=False)
@@ -33,6 +47,9 @@ class NativeFinalBatch:
         self.transcript = transcript
         self.texts = texts
         self.next_index = 0
+        self.token = uuid.uuid4().hex
+        _batches[self.token] = self
+        stream._final_batches[self.token] = self
         self.commit = (
             weakref.ref(stream._turn_commit)
             if stream._turn_commit is not None
@@ -82,27 +99,38 @@ class NativeFinalBatch:
         recognition._audio_transcript = self.transcript.render()
         stream._reconsider_turn()
 
+    def release(self) -> None:
+        stream = self.stream()
+        if stream is not None:
+            stream._final_batches.pop(self.token, None)
+        _batches.pop(self.token, None)
+
 
 def validate_native_final(event: Any, binding: Any) -> None:
     if binding is None or event.type is not stt.SpeechEventType.FINAL_TRANSCRIPT:
         return
-    data = event.alternatives[0] if event.alternatives else None
-    witness = getattr(data, "_native_final", None)
+    witness = _final_witness(event)
     if witness is None:
         return
     batch, index = witness
     stream = batch.stream()
     if stream is None or stream._stt not in binding.owners:
         return
-    batch.validate(index, data.text)
+    batch.validate(index, event.alternatives[0].text)
+
+
+def _processing_method(recognition: Any) -> str:
+    # Adaptive replay bypasses the async enqueue callback on newer SDKs.
+    return "_process_stt_event" if hasattr(recognition, "_process_stt_event") else "_on_stt_event"
 
 
 def restore_native_transcript(owner: Any) -> None:
     previous = getattr(owner, "_native_transcript_binding", None)
     if previous is not None:
         recognition, original, observed = previous
-        if recognition._on_stt_event is observed:
-            recognition._on_stt_event = original
+        method = _processing_method(recognition)
+        if getattr(recognition, method) is observed:
+            setattr(recognition, method, original)
         owner._native_transcript_binding = None
 
 
@@ -111,18 +139,15 @@ def bind_native_transcript(owner: Any, recognition: Any) -> None:
     if (
         previous is not None
         and previous[0] is recognition
-        and recognition._on_stt_event is previous[2]
+        and getattr(recognition, _processing_method(recognition)) is previous[2]
     ):
         return
     restore_native_transcript(owner)
-    original = recognition._on_stt_event
+    method = _processing_method(recognition)
+    original = getattr(recognition, method)
 
-    @wraps(original)
-    async def observed(event: Any) -> Any:
-        before = recognition._audio_transcript
-        result = await original(event)
-        data = event.alternatives[0] if event.alternatives else None
-        witness = getattr(data, "_native_final", None)
+    def reconcile(event: Any, before: str) -> None:
+        witness = _final_witness(event)
         if witness is not None:
             batch, index = witness
             stream = batch.stream()
@@ -134,7 +159,23 @@ def bind_native_transcript(owner: Any, recognition: Any) -> None:
                 and recognition._audio_transcript != before
             ):
                 batch.complete(owner._native_input_binding, recognition)
-        return result
+            if index + 1 == len(batch.texts):
+                batch.release()
 
-    recognition._on_stt_event = observed
+    if inspect.iscoroutinefunction(original):
+        @wraps(original)
+        async def observed(event: Any) -> Any:
+            before = recognition._audio_transcript
+            result = await original(event)
+            reconcile(event, before)
+            return result
+    else:
+        @wraps(original)
+        def observed(event: Any) -> Any:
+            before = recognition._audio_transcript
+            result = original(event)
+            reconcile(event, before)
+            return result
+
+    setattr(recognition, method, observed)
     owner._native_transcript_binding = recognition, original, observed

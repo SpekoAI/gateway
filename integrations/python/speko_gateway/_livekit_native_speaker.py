@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
 from livekit.agents import stt
 
 
+@dataclass
 class NativeSpeechData(stt.SpeechData):
-    # A private witness, deliberately absent from the SDK dataclass's wire
-    # fields. The wrapper hears accepted PCM without custom-node filtered gaps.
-    _native_input_times: tuple[float, float] | None = None
+    # Dataclass fields survive the SDK's public lossless replace operation.
+    # Witnesses contain only scalar values, never streams, futures or owners.
+    _native_input_times: tuple[float, float] | None = field(default=None, repr=False)
     speaker_segments: tuple[stt.SpeechData, ...] = ()
     canonical_text: str | None = None
+    _native_final: tuple[str, int] | None = field(default=None, repr=False)
+    _local_part_text: str | None = field(default=None, repr=False)
 
 
 def bind_native_speaker_timing(stream: Any) -> None:
