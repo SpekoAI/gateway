@@ -17,14 +17,25 @@ class NativeSpeechData(stt.SpeechData):
     canonical_text: str | None = None
     _native_final: tuple[str, int] | None = field(default=None, repr=False)
     _local_part_text: str | None = field(default=None, repr=False)
+    provider_speaker_id: str | None = None
+    _native_speaker_scope: str | None = field(default=None, repr=False)
 
 
 def bind_native_speaker_timing(stream: Any) -> None:
     detector = stream._detector
     original, original_close = detector.on_stt_event, stream.aclose
+    scope: str | None = None
 
     def on_event(event: stt.SpeechEvent) -> stt.SpeechEvent | None:
+        nonlocal scope
         data = event.alternatives[0] if event.alternatives else None
+        if isinstance(data, NativeSpeechData) and data._native_speaker_scope is not None and data._native_speaker_scope != scope:
+            # Labels from a fresh physical request cannot compete with a
+            # previous request's primary identity. Keep the accepted PCM
+            # history and its timeline; only identity state starts over.
+            detector._primary_speaker = None
+            detector._speaker_data.clear()
+            scope = data._native_speaker_scope
         if not isinstance(data, NativeSpeechData) or data._native_input_times is None:
             return original(event)
         start, end = data.start_time, data.end_time

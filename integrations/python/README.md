@@ -76,6 +76,12 @@ single-model `stt.FallbackAdapter` wrappers, including nested wrappers. An
 ambiguous native failure fences their later stream and recovery calls too.
 Whole-final speaker labels reach LiveKit's `speaker_id`; attributed segments
 become individual timed finals, with explicit segment labels taking precedence.
+Native `speaker_id` values are opaque identities scoped to each physical
+request; the original vendor label is available as `provider_speaker_id`.
+The same vendor label in a later request does not identify the same person.
+MultiSpeaker primary selection restarts in that request's identity space,
+while its accepted PCM history and timeline remain intact. Local Gateway
+speaker identities keep their existing stream semantics.
 Unlabeled segments inherit a whole-final label when present. Otherwise they
 remain unattributed. The MultiSpeaker wrapper can use these labels and timings
 for primary-speaker detection. The complete provider final stays authoritative:
@@ -128,11 +134,21 @@ Handoffs release inactive Agent hooks so the Agent can join another session;
 the original session keeps its retained pipeline. A captured node stays inert
 after its last native owner closes, including SDK restarts for local STT.
 The running source observer follows the session's current native binding, so a
-later native model can reuse the source after a local-STT handoff. Startup input
-is observed even before recognition exists. SDK-generated flush audio is observed
-at recognition ingress and advances the same media clock; real input can resume
-after the flush. These instance hooks restore when their ownership ends, and
-input wrappers reuse an existing observer rather than counting a frame twice.
+later native model can reuse the source after a local-STT handoff, including its
+elapsed idle gap. Startup input is observed even before recognition exists.
+Legacy source clocks follow the underlying input through delegation, while
+already-buffered occurrences keep their timestamps. The public input keeps its
+identity, iterator setup and idempotent assignment behavior; modern SDKs use
+their pipeline clock without a source observer.
+
+SDK-generated flush audio is observed at recognition ingress. It retains its
+PCM duration for recognition and VAD, but occupies no captured-media time:
+its source position stays at the last real ingress. Resumed real input and
+source frames held across a flush therefore neither move backwards nor inherit
+the synthetic two-second duration. Enable/disable changes and later ownership
+reanchor new source deliveries without moving buffered frames. These instance
+hooks restore when their ownership ends, and input wrappers share the source
+clock rather than counting a frame twice.
 Duration-preserving DSP may deep-copy userdata without changing its source witness.
 `bind_agent(agent)` locates the same session when its first stream starts.
 The owned SDK activity interface is checked before admission and before each
