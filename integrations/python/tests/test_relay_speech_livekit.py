@@ -5,6 +5,7 @@ import copy
 import dataclasses
 import inspect
 import json
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -179,6 +180,198 @@ def assert_request_speakers(finals):
     assert len(set(identities.values())) == len(identities)
 
 
+def owned_probability_vad(engine, **options):
+    """Real buffering/resampling/threshold tasks, calibrated inference scores."""
+    public_events = options.pop("_events", None)
+    any_voice = options.pop("_any_voice", False)
+    windows = options.pop("_windows", None)
+    if engine == "inference":
+        from livekit.agents import inference
+
+        if not hasattr(inference, "VAD"):
+            pytest.skip("SDK predates local inference VAD")
+        detector = inference.VAD(**options)
+    else:
+        silero = pytest.importorskip("livekit.plugins.silero")
+        detector = silero.VAD.load(sample_rate=8000 if engine == "silero8" else 16000, **options)
+
+    def probability(window, *, scale):
+        values = [abs(float(value)) for value in window]
+        if windows is not None:
+            windows.append(values)
+        level = max(values) if any_voice else sum(values) / len(values)
+        return 0.9 if level > scale else 0.0
+
+    original = detector.stream
+
+    def stream():
+        result = original()
+        if public_events is not None:
+            emit = result._event_ch.send_nowait
+
+            def observed(event):
+                public_events.append(event.type)
+                emit(event)
+
+            result._event_ch.send_nowait = observed
+        if engine == "inference":
+            class Predictor:
+                def predict(self, window):
+                    return probability(window, scale=1000)
+
+                def reset(self):
+                    pass
+
+            result._native_vad = Predictor()
+        else:
+            model = result._model
+
+            class Predictor:
+                sample_rate, window_size_samples = model.sample_rate, model.window_size_samples
+
+                def __call__(self, window):
+                    return probability(window, scale=1000 / 32767)
+
+                def reset(self):
+                    pass
+
+            class Probability:
+                def apply(self, *, exp, sample):
+                    return sample
+
+                def reset(self):
+                    pass
+
+            result._model, result._exp_filter = Predictor(), Probability()
+        return result
+
+    detector.stream = stream
+    return detector
+
+
+async def test_native_end_input_drains_new_real_audio_behind_inflight_padding():
+    from livekit.agents import inference
+
+    if not hasattr(inference, "VAD"):
+        pytest.skip("SDK predates local inference VAD")
+    detector = owned_probability_vad("inference", min_speech_duration=0.02, min_silence_duration=0.032)
+    started, release = asyncio.Event(), threading.Event()
+    loop, original = asyncio.get_running_loop(), detector.stream
+
+    def paused_stream():
+        result = original()
+        predictor = result._native_vad
+
+        class Paused:
+            first = True
+
+            def predict(self, window):
+                if self.first:
+                    self.first = False
+                    loop.call_soon_threadsafe(started.set)
+                    if not release.wait(3):
+                        raise RuntimeError("owned inference release timed out")
+                return predictor.predict(window)
+
+            def reset(self):
+                predictor.reset()
+
+        result._native_vad = Paused()
+        return result
+
+    detector.stream = paused_stream
+    requests = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        requests.append([])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                requests[0].append(message.data)
+            elif message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "complete"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=detector)
+        stream = model.stream(manual_turns=True)
+        try:
+            quiet, voice = b"\0\0" * 320, b"\xff\x0f" * 320
+            stream.push_frame(rtc.AudioFrame(data=quiet, sample_rate=16000, num_channels=1, samples_per_channel=320))
+            await asyncio.wait_for(started.wait(), 3)
+            stream.push_frame(rtc.AudioFrame(data=voice, sample_rate=16000, num_channels=1, samples_per_channel=320))
+            stream.end_input()
+
+            async def ended():
+                while not stream._input_finished:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(ended(), 3)
+            release.set()
+
+            async def collect():
+                return [event async for event in stream]
+
+            events = await asyncio.wait_for(collect(), 3)
+            assert len(requests) == 1, "the final 8ms must complete the real 20ms speech minimum"
+            assert b"".join(requests[0]) == quiet + voice
+            assert [event.alternatives[0].text for event in events if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT] == ["complete"]
+            assert not model._native_failed
+        finally:
+            release.set()
+            await stream.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_native_continuous_40ms_packets_do_not_receive_idle_padding():
+    windows, received = [], []
+    detector = owned_probability_vad("inference", min_speech_duration=0.05, min_silence_duration=0.032, _windows=windows)
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                received.append(message.data)
+            elif message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "complete"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=detector)
+        stream = model.stream(manual_turns=True)
+        try:
+            data = b"\x11\x11" * 640
+            for _ in range(5):
+                stream.push_frame(rtc.AudioFrame(data=data, sample_rate=16000, num_channels=1, samples_per_channel=640))
+                await asyncio.sleep(0.04)
+            assert windows and all(all(value > 0 for value in window) for window in windows), "continuous captured speech must not be interleaved with synthetic silence"
+            stream.end_input()
+
+            async def collect():
+                return [event async for event in stream]
+
+            await asyncio.wait_for(collect(), 3)
+            assert b"".join(received) == data * 5
+            assert not model._native_failed
+        finally:
+            await stream.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
 @pytest.mark.parametrize(
     "gap,speech_duration,terminal_delay",
     [(0.35, 0.02, 0.35), (0.224, 0.064, 0.35), (1.0, 0.064, 1.0)],
@@ -330,6 +523,159 @@ async def test_actual_agent_session_commits_complete_native_turns_after_delayed_
             late.set()
             await audio.frames.put(None)
             await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("boundary", ["start", "end"])
+@pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
+async def test_native_padding_cannot_satisfy_real_speech_or_silence_minimums(boundary, engine):
+    public, turns, requests, finished = [], asyncio.Queue(), [], asyncio.Queue()
+    detector = owned_probability_vad(
+        engine, min_speech_duration=0.02 if boundary == "start" else 0.05,
+        min_silence_duration=0.032 if boundary == "start" else 0.02,
+        _events=public, _any_voice=True,
+    )
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        index = len(requests)
+        requests.append([])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                requests[index].append(message.data)
+            elif message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "first" if index == 0 else "second"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                finished.put_nowait(index)
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    def pcm(data):
+        return rtc.AudioFrame(data=data, sample_rate=16000, num_channels=1, samples_per_channel=len(data) // 2)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=detector)
+        session = AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0.2, max_endpointing_delay=0.2)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned real duration thresholds"), **options)
+            voice, quiet = b"\xff\x0f" * 512, b"\0\0" * 512
+            await audio.frames.put(pcm(voice * 2 + (quiet if boundary == "start" else b"")))
+            if boundary == "start":
+                assert await asyncio.wait_for(finished.get(), 3) == 0
+            await audio.frames.put(pcm((b"\xff\x0f" if boundary == "start" else b"\0\0") * 80))
+            await asyncio.sleep(0.35)
+            assert turns.empty()
+            if boundary == "start":
+                assert public.count(vad.VADEventType.START_OF_SPEECH) >= 2, "SDK virtual duration has reached its threshold"
+                assert len(requests) == 1, "5ms of real speech must not gain a second admission"
+            else:
+                assert public.count(vad.VADEventType.END_OF_SPEECH) >= 1, "SDK virtual silence has reached its threshold"
+                assert finished.empty(), "5ms of real silence must not close a request"
+            await audio.frames.put(pcm(voice * 3 + quiet * 3 if boundary == "start" else quiet * 3))
+            expected = "first second" if boundary == "start" else "first"
+            assert await asyncio.wait_for(turns.get(), 3) == expected
+            assert not model._native_failed
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
+@pytest.mark.parametrize("wrapper", ["direct", "multi_speaker"])
+async def test_native_repeated_padded_frontiers_keep_provider_pcm_and_source_times(engine, wrapper):
+    detector = owned_probability_vad(engine, min_speech_duration=0.05, min_silence_duration=0.032)
+    requests, turns, finals, source = [], asyncio.Queue(), asyncio.Queue(), []
+    captured = 0
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        index = len(requests)
+        requests.append([])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                requests[index].append(message.data)
+            elif message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": f"turn{index}", "speaker": "A", "segments": [{"text": f"turn{index}", "speaker": "A", "start_ms": 0, "end_ms": 20}]})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async def capture():
+                nonlocal captured
+                async for value in audio:
+                    witness = value.userdata["_speko_native_input_position"]
+                    source.append((captured, captured + value.samples_per_channel, float(witness.start)))
+                    captured += value.samples_per_channel
+                    yield value
+            async for event in Agent.default.stt_node(self, capture(), settings):
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    finals.put_nowait(event.alternatives[0])
+                yield event
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    def source_time(sample):
+        for start, end, timestamp in source:
+            if start <= sample < end:
+                return timestamp + (sample - start) / 16000
+        raise AssertionError("provider timestamp exceeded captured input")
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=detector, diarization=wrapper == "multi_speaker")
+        wrapped = wrap_native_stt(model, wrapper)
+        session = AgentSession(stt=wrapped, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0.05, max_endpointing_delay=0.05)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned repeated detector padding"), **options)
+            # Neither captured waveform contains zero bytes. Any invented
+            # silence reaching a physical request is directly observable.
+            voice, quiet = b"\x11\x11" * 1024, b"\x01\x01" * (1024 + 320)
+            payload = voice + quiet
+            all_captured = b""
+            assigned = 0
+            for index in range(4):
+                all_captured += payload
+                await audio.frames.put(rtc.AudioFrame(data=payload, sample_rate=16000, num_channels=1, samples_per_channel=len(payload) // 2))
+                assert await asyncio.wait_for(turns.get(), 3) == f"turn{index}"
+                data = await asyncio.wait_for(finals.get(), 3)
+                raw = b"".join(requests[index])
+                assert raw and b"\0" not in raw
+                assert raw == all_captured[assigned * 2:assigned * 2 + len(raw)]
+                assert data._native_input_times == pytest.approx((assigned / 16000, (assigned + 320) / 16000))
+                assert data.start_time == pytest.approx(source_time(assigned), abs=1 / 16000)
+                assert data.end_time == pytest.approx(source_time(assigned + 320), abs=1 / 16000)
+                assigned += len(raw) // 2
+            assert len(requests) == 4
+            assert not model._native_failed
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            await wrapped.aclose()
             await model.aclose()
             await client.aclose()
 
@@ -1201,7 +1547,7 @@ async def test_native_stt_publishes_interims_while_audio_is_still_streaming():
             await client.aclose()
 
 
-@pytest.mark.parametrize("failure", ["unprocessed-boundary", "stalled-detector-bound"])
+@pytest.mark.parametrize("failure", ["unprocessed-boundary", "stalled-detector-bound", "missing-activation-threshold", "invalid-probability", "invalid-activation-threshold"])
 async def test_native_stt_refuses_unprocessed_or_unbounded_vad_input_without_admission(
     failure,
 ):
@@ -1232,7 +1578,7 @@ async def test_native_stt_refuses_unprocessed_or_unbounded_vad_input_without_adm
                 stream.push_frame(audio)
                 await asyncio.wait_for(source.frames.get(), 2)
                 source.emit(vad.VADEventType.START_OF_SPEECH, frames=[audio])
-            else:
+            elif failure == "stalled-detector-bound":
                 stream.push_frame(
                     rtc.AudioFrame(
                         data=b"\0\0" * (31 * 16000),
@@ -1241,6 +1587,19 @@ async def test_native_stt_refuses_unprocessed_or_unbounded_vad_input_without_adm
                         samples_per_channel=31 * 16000,
                     )
                 )
+            else:
+                audio = frame()
+                stream.push_frame(audio)
+                await asyncio.wait_for(source.frames.get(), 2)
+                if failure != "missing-activation-threshold":
+                    source.activation_threshold = -1 if failure == "invalid-activation-threshold" else 0.5
+                source.current._event_ch.send_nowait(vad.VADEvent(
+                    type=vad.VADEventType.INFERENCE_DONE,
+                    samples_index=320, timestamp=0.02, frames=[audio],
+                    speech_duration=0, silence_duration=0,
+                    probability=float("nan") if failure == "invalid-probability" else 0.9,
+                ))
+                source.emit(vad.VADEventType.START_OF_SPEECH, frames=[audio])
             with pytest.raises(APIConnectionError):
                 async for _ in stream:
                     pass
@@ -3417,3 +3776,77 @@ async def test_native_websocket_http_refusal_is_never_a_retryable_connection_fai
         finally:
             await client.aclose()
     assert seen == [1]
+
+
+@pytest.mark.parametrize("frontier", ["partial_silence", "pending_onset", "cleared_onset"])
+@pytest.mark.parametrize("activation_threshold", [0.2, 0.8])
+@pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
+async def test_native_actual_inference_vad_handles_incomplete_frontiers(frontier, activation_threshold, engine):
+    # Keep the installed detector's buffering, threshold state, event ordering,
+    # executor and stream lifecycle. Only its owned model probabilities are
+    # deterministic, so this exercises the real 512-sample inference window.
+    detector = owned_probability_vad(engine, min_speech_duration=0.05, min_silence_duration=0.032, activation_threshold=activation_threshold)
+    terminal, turns, packets = asyncio.Event(), asyncio.Queue(), []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        index = len(packets)
+        packets.append([])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                packets[index].append(message.data)
+            elif message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "first" if index == 0 else "second"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                terminal.set()
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    def audio_frame(pcm):
+        return rtc.AudioFrame(data=pcm, sample_rate=16000, num_channels=1, samples_per_channel=len(pcm) // 2)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=detector)
+        session = AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0.2, max_endpointing_delay=0.2)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned real VAD frontiers"), **options)
+            speech, silence = b"\xff\x0f" * 512, b"\0\0" * 512
+            first = speech * 2 + silence
+            await audio.frames.put(audio_frame(first))
+            tail = b"\0\0" * 320 if frontier == "partial_silence" else speech
+            await audio.frames.put(audio_frame(tail))
+            await asyncio.wait_for(terminal.wait(), 3)
+            if frontier == "partial_silence":
+                assert await asyncio.wait_for(turns.get(), 1) == "first", "a partial silent inference window must not stall a completed turn"
+                assert len(packets) == 1
+            else:
+                await asyncio.sleep(0.35)
+                assert turns.empty(), "a possible onset before START_OF_SPEECH must keep the previous turn pending"
+                if frontier == "cleared_onset":
+                    await audio.frames.put(audio_frame(silence))
+                    assert await asyncio.wait_for(turns.get(), 2) == "first"
+                    assert len(packets) == 1
+                else:
+                    await audio.frames.put(audio_frame(speech + silence))
+                    assert await asyncio.wait_for(turns.get(), 2) == "first second"
+                    assert len(packets) == 2
+                    assert b"".join(packets[1]) == speech * 2 + silence
+            assert b"".join(packets[0]) == first, "detector processing must not invent provider PCM"
+            assert not model._native_failed
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()

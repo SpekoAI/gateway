@@ -8,7 +8,7 @@ import weakref
 from functools import wraps
 from typing import Any
 
-from livekit.agents import Agent, stt
+from livekit.agents import Agent, stt, vad
 from livekit.agents.voice.agent_activity import AgentActivity
 
 from ._livekit_native_speaker import NativeSpeechData
@@ -216,6 +216,7 @@ class _Binding:
         self.owners: weakref.WeakSet[Any] = weakref.WeakSet()
         self.startup: tuple[Any, Any] | None = None
         self.processing: tuple[Any, str, Any, Any] | None = None
+        self.vad_processing: tuple[Any, Any, Any] | None = None
         self.turn: tuple[Any, Any] | None = None
         self.prefix: str | None = None
         self.rewritten = False
@@ -268,6 +269,22 @@ class _Binding:
             if self.activity._start_session is start:
                 self.activity._start_session = original
             self.startup = None
+
+    def _rearm(self, recognition: Any, *, after_eos: bool = False) -> None:
+        if not self.owners or self.pending or recognition._closing.is_set() or recognition._speaking:
+            return
+        if not self._owns_recognition():
+            restore_local_transcript(self.activity)
+            return
+        manual = recognition._turn_detection_mode == "manual"
+        requested = bool(getattr(recognition, "_user_turn_committed", False))
+        if (manual and not requested and self.deferred is None) or (self.deferred is None and not after_eos):
+            return
+        run = recognition._run_eou_detection
+        options = {"skip_reply": self.deferred.skip_reply if self.deferred is not None else False}
+        if "trigger" in inspect.signature(run).parameters:
+            options["trigger"] = "manual" if manual else "stt"
+        run(recognition._hooks.retrieve_chat_ctx().copy(), **options)
 
     def _bind(self) -> None:
         previous = getattr(self.activity, "_speko_native_stt_turn_owner", None)
@@ -326,15 +343,7 @@ class _Binding:
                 self.pending = False
                 self.group = None
                 self.parts.clear()
-                manual = recognition._turn_detection_mode == "manual"
-                requested = bool(getattr(recognition, "_user_turn_committed", False))
-                allowed = (not manual or requested or self.deferred is not None) and not recognition._speaking
-                if allowed and (self.deferred is not None or data._local_after_eos) and not recognition._closing.is_set():
-                    run = recognition._run_eou_detection
-                    options = {"skip_reply": self.deferred.skip_reply if self.deferred is not None else False}
-                    if "trigger" in inspect.signature(run).parameters:
-                        options["trigger"] = "manual" if recognition._turn_detection_mode == "manual" else "stt"
-                    run(recognition._hooks.retrieve_chat_ctx().copy(), **options)
+                self._rearm(recognition, after_eos=data._local_after_eos)
 
         if inspect.iscoroutinefunction(original):
             @wraps(original)
@@ -342,6 +351,8 @@ class _Binding:
                 part = prepare(event)
                 result = await original(event)
                 reconcile(part)
+                if event.type is stt.SpeechEventType.END_OF_SPEECH:
+                    self._rearm(recognition)
                 return result
         else:
             @wraps(original)
@@ -349,10 +360,25 @@ class _Binding:
                 part = prepare(event)
                 result = original(event)
                 reconcile(part)
+                if event.type is stt.SpeechEventType.END_OF_SPEECH:
+                    self._rearm(recognition)
                 return result
 
         setattr(recognition, method, observed)
         self.processing = recognition, method, original, observed
+        original_vad = recognition._on_vad_event
+
+        @wraps(original_vad)
+        async def observed_vad(event: Any) -> Any:
+            result = await original_vad(event)
+            if event.type is vad.VADEventType.END_OF_SPEECH:
+                # A rejected manual EOU clears the SDK's committed flag. The
+                # explicit decision remains ours until actual speech ends.
+                self._rearm(recognition)
+            return result
+
+        recognition._on_vad_event = observed_vad
+        self.vad_processing = recognition, original_vad, observed_vad
         if self.turn is None:
             original_turn = self.activity.on_end_of_turn
 
@@ -375,6 +401,11 @@ class _Binding:
             self.turn = original_turn, completed
 
     def _restore_processing(self) -> None:
+        if self.vad_processing is not None:
+            recognition, original, observed = self.vad_processing
+            if recognition._on_vad_event is observed:
+                recognition._on_vad_event = original
+            self.vad_processing = None
         if self.processing is not None:
             recognition, method, original, observed = self.processing
             if getattr(recognition, method) is observed:

@@ -117,6 +117,10 @@ well as `text`; canonical filtering state stays inside the owned filter until
 the group finishes. Finals arriving after provider end-of-speech retain that
 boundary, and replacing Gateway STT with another SDK model retires its pending
 gate without requiring the old model to close.
+An explicit manual decision deferred during a segmented final retains its
+`skip_reply` value through active VAD speech and rearms when that speech ends.
+Without a manual request, late finals do not start a manual turn. The owned
+VAD callback is restored together with the local transcript hooks.
 Speaker RMS lookup uses accepted audio positions, including after custom-node
 filtering; emitted transcript timestamps keep their original input positions.
 Multi-model fallback requires a control-plane recovery decision; wrappers
@@ -181,6 +185,22 @@ Unprocessed VAD input and incomplete terminal transcripts defer framework
 acceptance. Draining input or delivering the complete transcript rearms a deferred
 decision, preserving an explicit `skip_reply` request. The SDK detector objects
 and streams are observed through owned recognition instances and restored on close.
+Probability-based VADs must expose their activation threshold on the owned
+stream/options or detector. Silero/local inference options supply it directly;
+custom detectors can expose `activation_threshold`. A window above that actual
+threshold keeps a possible onset pending before `START_OF_SPEECH`. A later real
+window below it clears the candidate. Invalid probabilities or thresholds and
+unqualified probability detectors refuse before native admission.
+For the installed local-inference and Silero detectors, a paused partial
+window receives one bounded window of detector-only zero padding. The ordered
+audio ledger removes that padding before provider delivery, history/RMS lookup,
+or source timestamp mapping. Speech/silence minimums and hysteresis use the
+detector's configured thresholds and real sample durations; virtual padding
+cannot create a start/end boundary or clear a possible onset by itself.
+Continuous input retains normal inference cadence. Padding is bounded
+independently from the real-input backlog, and a final drain completes remaining
+real samples before the SDK discards its buffers at end of input. Other supplied
+VAD implementations retain their ordered acknowledgement/boundary contract.
 Binding is
 required for native AgentSession streaming. Explicit event consumers can use
 `stream(manual_turns=True)`; completed-buffer `recognize()` needs no binding

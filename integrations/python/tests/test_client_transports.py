@@ -230,6 +230,92 @@ async def test_gateway_late_final_obeys_the_active_framework_turn_policy(mode, n
 
 
 @pytest.mark.parametrize("nested", [False, True])
+async def test_gateway_deferred_manual_commit_waits_for_vad_end_and_keeps_skip_reply(nested):
+    from livekit import rtc
+    from livekit.agents import Agent, AgentSession, stt, vad
+    from livekit.agents.voice import io
+    from test_relay_speech_livekit import ControlledVAD
+
+    from speko_gateway.livekit import STT
+
+    frames, items, replies = asyncio.Queue(), asyncio.Queue(), []
+    first, release, final = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    allowed = asyncio.Event()
+
+    class Input(io.AudioInput):
+        def __init__(self):
+            super().__init__(label="owned-deferred-manual-input")
+
+        async def __anext__(self):
+            value = await frames.get()
+            if value is None:
+                raise StopAsyncIteration
+            return value
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async for event in Agent.default.stt_node(self, audio, settings):
+                yield event
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    if not first.is_set():
+                        first.set()
+                        await release.wait()
+                    else:
+                        final.set()
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            replies.append(new_message.text_content)
+
+    payload = {"text": "hello world", "segments": [{"text": "hello", "speaker": 2, "start_ms": 0, "end_ms": 10}, {"text": "world", "speaker": 3, "start_ms": 10, "end_ms": 20}]}
+    async with gateway_stt_peer(lambda _: payload, after_eos=True, final_gate=allowed) as address:
+        client = GatewayClient(socket_path=address, local_auth_token="owned-deferred-manual")
+        model = STT(client, diarization=True)
+        wrapped = stt.FallbackAdapter([stt.MultiSpeakerAdapter(stt=model)], max_retry_per_stt=0) if nested else model
+        detector = ControlledVAD()
+        session = AgentSession(stt=wrapped, llm=None, tts=None, vad=detector, turn_detection="manual", min_endpointing_delay=0, max_endpointing_delay=0)
+        session.input.audio = Input()
+        session.on("conversation_item_added", lambda event: items.put_nowait(event.item.text_content) if getattr(event.item, "role", None) == "user" else None)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned deferred manual policy"), **options)
+            await frames.put(rtc.AudioFrame(data=b"\xff\x0f" * 320, sample_rate=16000, num_channels=1, samples_per_channel=320))
+            value = await asyncio.wait_for(detector.frames.get(), 3)
+            detector.processed(value)
+            detector.emit(vad.VADEventType.START_OF_SPEECH)
+            allowed.set()
+            await asyncio.wait_for(first.wait(), 3)
+            session.commit_user_turn(transcript_timeout=0, stt_flush_duration=0, skip_reply=True)
+            binding = session._activity._speko_local_transcript_binding
+
+            async def deferred():
+                while binding.deferred is None:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(deferred(), 3)
+            detector.emit(vad.VADEventType.START_OF_SPEECH)
+            await asyncio.sleep(0.02)
+            assert session._activity._audio_recognition._speaking
+            release.set()
+            await asyncio.wait_for(final.wait(), 3)
+            await asyncio.sleep(0.05)
+            assert items.empty(), "the explicit decision must wait while speech is active"
+            detector.emit(vad.VADEventType.END_OF_SPEECH, silence_duration=0.02)
+            assert await asyncio.wait_for(items.get(), 3) == "hello world"
+            assert replies == []
+            recognition = session._activity._audio_recognition
+            await model.aclose()
+            assert recognition._on_vad_event.__func__ is type(recognition)._on_vad_event
+        finally:
+            allowed.set()
+            release.set()
+            await frames.put(None)
+            await session.aclose()
+            await wrapped.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("nested", [False, True])
 async def test_gateway_partial_final_does_not_gate_a_replacement_stt(nested):
     from livekit import rtc
     from livekit.agents import DEFAULT_API_CONNECT_OPTIONS, Agent, AgentSession, stt

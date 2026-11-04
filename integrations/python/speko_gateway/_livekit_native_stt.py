@@ -17,6 +17,7 @@ from ._livekit_bridge import LiveKitSpeechEvent, LiveKitSTTBridge, LiveKitSTTStr
 from ._livekit_native_input import NativeInputTimeline
 from ._livekit_native_speaker import NativeSpeechData
 from ._livekit_native_transcript import NativeFinalBatch, NativeTranscript
+from ._livekit_vad_audio import ProbabilityVAD, VADAudio
 from .client import GatewayError
 
 
@@ -88,6 +89,11 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._gateway_stream: LiveKitSTTStream | None = None
         self._receiver: asyncio.Task[None] | None = None
         self._vad_stream: vad.VADStream | None = None
+        self._vad_audio = VADAudio()
+        self._probability_vad: ProbabilityVAD | None = None
+        self._vad_tail_timer: asyncio.TimerHandle | None = None
+        self._vad_idle_deadline = 0.0
+        self._vad_finished = False
         self._finals: list[LiveKitSpeechEvent] = []
         self._final_chars = 0
         self._request_id = utils.shortuuid()
@@ -102,6 +108,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._continuation_delay = continuation_delay
         self._reconsider_turn = reconsider_turn
         self._vad_speaking = False
+        self._vad_onset_pending = False
         self._last_speech_end: int | None = None
         self._pending_transcript = False
         self._classifying_boundary = False
@@ -191,12 +198,38 @@ class NativeSpeechStream(stt.RecognizeStream):
             )
         return b"".join(bytes(frame.data) for frame in frames)
 
+    def _possible_onset(self, event: vad.VADEvent) -> bool:
+        # Silero/local inference publish INFERENCE_DONE before updating their
+        # minimum-speech threshold and emitting START_OF_SPEECH. A drained
+        # frontier is insufficient when this window is still accumulating an
+        # onset. Read the owned stream's actual, updateable threshold.
+        options = getattr(self._vad_stream, "_opts", None)
+        threshold = getattr(
+            self._vad_stream, "activation_threshold",
+            getattr(options, "activation_threshold", None),
+        )
+        if threshold is None:
+            threshold = getattr(self._turn_vad, "activation_threshold", None)
+        if threshold is None:
+            if event.probability:
+                raise GatewayError(
+                    "Local probability detector must expose its activation threshold",
+                    retryable=False,
+                )
+            return event.raw_accumulated_speech > 0
+        if not isinstance(threshold, (float, int)) or not math.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise GatewayError("Invalid local speech activation threshold", retryable=False)
+        if not math.isfinite(event.probability) or not 0 <= event.probability <= 1:
+            raise GatewayError("Invalid local speech probability", retryable=False)
+        return event.probability >= threshold
+
     async def _run(self) -> None:
         tasks: list[asyncio.Task[Any]] = []
         work: asyncio.Future[Any] | None = None
         try:
             if self._turn_vad is not None:
                 self._vad_stream = self._turn_vad.stream()
+                self._probability_vad = ProbabilityVAD.for_stream(self._vad_stream, self._sample_rate)
             feed = asyncio.create_task(self._feed(), name="speko.native.stt.input")
             tasks.append(feed)
             if self._vad_stream is not None:
@@ -223,6 +256,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 retryable=False,
             ) from None
         finally:
+            self._cancel_vad_tail()
             await utils.aio.cancel_and_wait(*tasks)
             if work is not None:
                 await asyncio.gather(work, return_exceptions=True)
@@ -277,17 +311,70 @@ class NativeSpeechStream(stt.RecognizeStream):
                 self._queued_samples -= frame.samples_per_channel
                 self._available_samples -= frame.samples_per_channel
             else:
-                self._unprocessed.extend(frame.data.cast("B"))
-                self._vad_stream.push_frame(frame)
+                self._push_vad_audio(frame)
+                self._arm_vad_tail()
         if self._input_failure:
             raise GatewayError(
                 "Native speech input exceeded its processing bound", retryable=False
             )
+        self._cancel_vad_tail()
+        # The SDK's flush drops its partial window. Complete its real input
+        # before placing that explicit end marker behind the inference work.
+        self._pad_vad_tail(final=True)
         self._input_finished = True
         if self._vad_stream is not None:
             self._vad_stream.end_input()
         elif self._gateway_stream is not None:
             await self._finish_turn()
+
+    def _push_vad_audio(self, frame: rtc.AudioFrame, *, padding: bool = False) -> None:
+        raw = frame.data.cast("B")
+        self._unprocessed.extend(raw)
+        self._vad_audio.push(len(raw), padding=padding)
+        if not padding and self._probability_vad is not None:
+            interval = self._probability_vad.interval
+            # A normal source can deliver packets longer than an inference
+            # window. Allow its packet duration plus an inference interval
+            # before concluding that capture paused.
+            delay = max(interval, frame.duration) + interval
+            self._vad_idle_deadline = asyncio.get_running_loop().time() + delay
+        assert self._vad_stream is not None
+        self._vad_stream.push_frame(frame)
+
+    def _cancel_vad_tail(self) -> None:
+        if self._vad_tail_timer is not None:
+            self._vad_tail_timer.cancel()
+            self._vad_tail_timer = None
+
+    def _arm_vad_tail(self) -> None:
+        self._cancel_vad_tail()
+        detector = self._probability_vad
+        if detector is None or self._input_finished or not self._vad_audio.real_pending:
+            return
+
+        def drain() -> None:
+            self._vad_tail_timer = None
+            try:
+                self._pad_vad_tail()
+            except Exception:  # noqa: BLE001 -- detector errors can contain content
+                if not self._fatal.done():
+                    self._fatal.set_exception(GatewayError("Local speech inference could not drain input", retryable=False))
+
+        loop = asyncio.get_running_loop()
+        self._vad_tail_timer = loop.call_later(max(0, self._vad_idle_deadline - loop.time()), drain)
+
+    def _pad_vad_tail(self, *, final: bool = False) -> None:
+        detector, audio = self._probability_vad, self._vad_audio
+        if detector is None or self._input_finished or not audio.real_pending:
+            return
+        size = detector.window_samples * 2 * self._channels
+        # One bounded inference window completes a partial input window,
+        # including the detector resampler's filter tail. Never add repeated
+        # empty windows, and bound outstanding padding independently of PCM.
+        if not final and (audio.last_padded == audio.real_fed or audio.padding_pending >= size):
+            return
+        audio.last_padded = audio.real_fed
+        self._push_vad_audio(self._frame(bytes(size)), padding=True)
 
     async def _consume_vad(self) -> None:
         assert self._vad_stream is not None
@@ -308,111 +395,37 @@ class NativeSpeechStream(stt.RecognizeStream):
                         retryable=False,
                     )
                 del self._unprocessed[: len(raw)]
-                self._queued_samples -= Fraction(len(raw), 2 * self._channels)
-                self._available_samples -= len(raw) // (2 * self._channels)
-                self._history.extend(raw)
+                real = self._vad_audio.acknowledge(raw)
+                samples = len(real) // (2 * self._channels)
+                self._queued_samples -= samples
+                self._available_samples -= samples
+                self._history.extend(real)
                 del self._history[: -30 * self._sample_rate * 2 * self._channels]
                 self._last_vad_index = event.samples_index
-                self._processed_samples += len(raw) // (2 * self._channels)
-                self._vad_speaking = event.speaking
-                if self._gateway_stream is not None:
-                    await self._send_audio(raw)
+                self._processed_samples += samples
+                boundary = None
+                if self._probability_vad is not None:
+                    boundary = self._probability_vad.observe(event, samples=samples, end=self._processed_samples, history=bytes(self._history), channels=self._channels)
+                    self._vad_speaking = self._probability_vad.speaking
+                    self._vad_onset_pending = self._probability_vad.onset_pending
+                else:
+                    self._vad_speaking = event.speaking
+                    self._vad_onset_pending = not event.speaking and self._possible_onset(event)
+                if self._gateway_stream is not None and real:
+                    await self._send_audio(real)
                     self._assigned_until = self._processed_samples
+                if boundary is not None:
+                    if boundary.type is vad.VADEventType.START_OF_SPEECH:
+                        await self._vad_start(boundary)
+                    else:
+                        await self._vad_end(boundary)
                 self._reconsider_turn()
-            elif event.type == vad.VADEventType.START_OF_SPEECH:
-                raw = self._audio(event.frames)
-                if (
-                    self._gateway_stream is not None
-                    or not raw
-                    or not self._history.endswith(raw)
-                    or event.samples_index != self._last_vad_index
-                ):
-                    raise GatewayError(
-                        "Local speech boundary did not match processed input",
-                        retryable=False,
-                    )
-                stride = 2 * self._channels
-                prefix_start = self._processed_samples - len(raw) // stride
-                request_start = max(prefix_start, self._assigned_until)
-                raw = raw[(request_start - prefix_start) * stride :]
-                if not raw:
-                    raise GatewayError(
-                        "Local speech boundary reused completed audio", retryable=False
-                    )
-                self._request_start_sample = request_start
-                if (
-                    not math.isfinite(event.speech_duration)
-                    or event.speech_duration < 0
-                ):
-                    raise GatewayError(
-                        "Local speech detector changed its timeline", retryable=False
-                    )
-                if self._turn_commit is not None and not self._turn_commit.done():
-                    onset = self._processed_samples - round(
-                        event.speech_duration * self._sample_rate
-                    )
-                    gap = (
-                        max(0, (onset - self._last_speech_end) / self._sample_rate)
-                        if self._last_speech_end is not None
-                        else 0
-                    )
-                    self._classifying_boundary = True
-                    try:
-                        delay = (
-                            await asyncio.wait_for(
-                                self._continuation_delay(self._turn_text, gap),
-                                self._conn_options.timeout,
-                            )
-                            if self._continuation_delay is not None
-                            else None
-                        )
-                    finally:
-                        self._classifying_boundary = False
-                    if delay is None or gap >= delay:
-                        self._awaiting_new_turn = True
-                        self._reconsider_turn()
-                        await asyncio.wait_for(
-                            asyncio.shield(self._turn_commit),
-                            self._conn_options.timeout,
-                        )
-                if self._turn_commit is not None and self._turn_commit.done():
-                    self._turn_commit = None
-                    self._turn_text = ""
-                    self._canonical_turn = None
-                self._awaiting_new_turn = False
-                self._pending_transcript = True
-                self._vad_speaking = True
-                self._event_ch.send_nowait(
-                    stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
-                )
-                await self._send_audio(raw)
-                self._assigned_until = self._processed_samples
-            elif event.type == vad.VADEventType.END_OF_SPEECH:
-                self._vad_speaking = False
-                if event.samples_index != self._last_vad_index:
-                    raise GatewayError(
-                        "Local speech boundary overtook processed input",
-                        retryable=False,
-                    )
-                if self._gateway_stream is not None:
-                    if (
-                        not math.isfinite(event.silence_duration)
-                        or event.silence_duration < 0
-                    ):
-                        raise GatewayError(
-                            "Local speech detector changed its timeline",
-                            retryable=False,
-                        )
-                    speech_end = self._processed_samples - round(
-                        event.silence_duration * self._sample_rate
-                    )
-                    if speech_end < self._request_start_sample:
-                        raise GatewayError(
-                            "Local speech detector changed its timeline",
-                            retryable=False,
-                        )
-                    self._last_speech_end = speech_end
-                    await self._finish_turn(speech_end)
+                self._arm_vad_tail()
+            elif self._probability_vad is None:
+                if event.type == vad.VADEventType.START_OF_SPEECH:
+                    await self._vad_start(event)
+                elif event.type == vad.VADEventType.END_OF_SPEECH:
+                    await self._vad_end(event)
         if not self._input_finished:
             raise GatewayError(
                 "Local speech detector ended before input", retryable=False
@@ -421,17 +434,120 @@ class NativeSpeechStream(stt.RecognizeStream):
             # A short final inference window may remain when input closes.
             # No later utterance can arrive beyond this explicit input fence.
             if self._unprocessed:
-                await self._send_audio(bytes(self._unprocessed))
-                self._processed_samples += len(self._unprocessed) // (
-                    2 * self._channels
-                )
+                real = self._vad_audio.acknowledge(bytes(self._unprocessed))
+                if real:
+                    await self._send_audio(real)
+                samples = len(real) // (2 * self._channels)
+                self._processed_samples += samples
+                self._queued_samples -= samples
+                self._available_samples -= samples
                 self._assigned_until = self._processed_samples
                 self._unprocessed.clear()
             await self._finish_turn()
+        self._vad_finished = self._probability_vad is not None and not self._vad_audio.real_pending
+        self._reconsider_turn()
         if self._turn_commit is not None:
             await asyncio.wait_for(
                 asyncio.shield(self._turn_commit), self._conn_options.timeout
             )
+
+    async def _vad_start(self, event: vad.VADEvent) -> None:
+        raw = self._audio(event.frames)
+        if (
+            self._gateway_stream is not None
+            or not raw
+            or not self._history.endswith(raw)
+            or event.samples_index != self._last_vad_index
+        ):
+            raise GatewayError(
+                "Local speech boundary did not match processed input",
+                retryable=False,
+            )
+        stride = 2 * self._channels
+        prefix_start = self._processed_samples - len(raw) // stride
+        request_start = max(prefix_start, self._assigned_until)
+        raw = raw[(request_start - prefix_start) * stride :]
+        if not raw:
+            raise GatewayError(
+                "Local speech boundary reused completed audio", retryable=False
+            )
+        self._request_start_sample = request_start
+        if (
+            not math.isfinite(event.speech_duration)
+            or event.speech_duration < 0
+        ):
+            raise GatewayError(
+                "Local speech detector changed its timeline", retryable=False
+            )
+        if self._turn_commit is not None and not self._turn_commit.done():
+            onset = self._processed_samples - round(
+                event.speech_duration * self._sample_rate
+            )
+            gap = (
+                max(0, (onset - self._last_speech_end) / self._sample_rate)
+                if self._last_speech_end is not None
+                else 0
+            )
+            self._classifying_boundary = True
+            try:
+                delay = (
+                    await asyncio.wait_for(
+                        self._continuation_delay(self._turn_text, gap),
+                        self._conn_options.timeout,
+                    )
+                    if self._continuation_delay is not None
+                    else None
+                )
+            finally:
+                self._classifying_boundary = False
+            if delay is None or gap >= delay:
+                self._awaiting_new_turn = True
+                self._reconsider_turn()
+                await asyncio.wait_for(
+                    asyncio.shield(self._turn_commit),
+                    self._conn_options.timeout,
+                )
+        if self._turn_commit is not None and self._turn_commit.done():
+            self._turn_commit = None
+            self._turn_text = ""
+            self._canonical_turn = None
+        self._awaiting_new_turn = False
+        self._pending_transcript = True
+        self._vad_speaking = True
+        self._vad_onset_pending = False
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
+        )
+        await self._send_audio(raw)
+        self._assigned_until = self._processed_samples
+
+    async def _vad_end(self, event: vad.VADEvent) -> None:
+        self._vad_speaking = False
+        self._vad_onset_pending = False
+        if event.samples_index != self._last_vad_index:
+            raise GatewayError(
+                "Local speech boundary overtook processed input",
+                retryable=False,
+            )
+        if self._gateway_stream is not None:
+            if (
+                not math.isfinite(event.silence_duration)
+                or event.silence_duration < 0
+            ):
+                raise GatewayError(
+                    "Local speech detector changed its timeline",
+                    retryable=False,
+                )
+            speech_end = self._processed_samples - round(
+                event.silence_duration * self._sample_rate
+            )
+            if speech_end < self._request_start_sample:
+                raise GatewayError(
+                    "Local speech detector changed its timeline",
+                    retryable=False,
+                )
+            self._last_speech_end = speech_end
+            await self._finish_turn(speech_end)
 
     async def _send_audio(self, raw: bytes) -> None:
         assert self._channels is not None
@@ -533,7 +649,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         return not self._wait_for_turn_commit or self._task.done() or (
             not self._pending_transcript
             and not self._classifying_boundary
-            and (self._awaiting_new_turn or (not self._vad_speaking and self._available_samples == 0))
+            and (self._awaiting_new_turn or self._vad_finished or (not self._vad_speaking and not self._vad_onset_pending and self._available_samples == 0))
             and (not self._turn_text or " ".join(transcript.split()) == self._turn_text)
         )
 

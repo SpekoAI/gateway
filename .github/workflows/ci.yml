@@ -60,7 +60,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv venv
-      - run: uv pip install -e . "livekit-agents==1.4.5" "pytest>=8" "pytest-asyncio>=0.24"
+      - run: uv pip install -e . "livekit-agents==1.4.5" "livekit-plugins-silero==1.4.5" "pytest>=8" "pytest-asyncio>=0.24"
       - run: .venv/bin/python -m pytest
 
   python-livekit-retained-stream:
@@ -80,7 +80,9 @@ jobs:
         with:
           enable-cache: true
       - run: uv venv
-      - run: uv pip install -e . "livekit-agents==1.8.10" "pytest>=8" "pytest-asyncio>=0.24"
+      # Exercise actual Silero buffering at both inference rates as well as
+      # the SDK's local inference detector and retained-stream lifecycle.
+      - run: uv pip install -e . "livekit-agents==1.8.10" "livekit-plugins-silero==1.8.10" "pytest>=8" "pytest-asyncio>=0.24"
       - run: .venv/bin/python -m pytest
 
   python-livekit-python310:
@@ -100,7 +102,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv venv --python 3.10
-      - run: uv pip install -e . "livekit-agents==1.8.10" "pytest>=8" "pytest-asyncio>=0.24"
+      - run: uv pip install -e . "livekit-agents==1.8.10" "livekit-plugins-silero==1.8.10" "pytest>=8" "pytest-asyncio>=0.24"
       - run: .venv/bin/python -m pytest
 
   container:
