@@ -85,6 +85,7 @@ class _AgentHooks:
     node: Any = None
     original_update: Any = None
     update: Any = None
+    active: bool = False
 
 
 _sessions: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
@@ -185,10 +186,26 @@ class NativeInputBinding:
         ):
             raise ValueError("Native input binding cannot span AgentSessions")
         previous = _lookup(_agents, agent)
+        if (
+            previous is not None
+            and previous is not self
+            and previous._session is not None
+            and self._session is not None
+            and previous._session is not self._session
+            and activity is None
+            and previous._agents[agent].active
+        ):
+            # Older SDKs run on_enter before their session update returns.
+            # Release the already-detached Agent even while that old update
+            # is still unwinding; its captured pipeline is unaffected.
+            previous._detach_agent(agent)
+            previous = None
         if previous is not None and previous is not self:
             previous._join(self)
         _agents[agent] = weakref.ref(self)
         hooks = self._agents.setdefault(agent, _AgentHooks())
+        if activity is not None:
+            hooks.active = True
         if agent.stt_node is not hooks.node:
             original = agent.stt_node
 
@@ -290,6 +307,15 @@ def bind_native_input(
     binding = (
         _lookup(_sessions, session) if session is not None else _lookup(_agents, agent)
     )
+    if (
+        agent is not None
+        and binding is not None
+        and binding._session is not None
+        and getattr(agent, "_activity", None) is None
+        and binding._agents[agent].active
+    ):
+        binding._detach_agent(agent)
+        binding = None
     if binding is None:
         binding = NativeInputBinding()
     binding.owners.add(owner)
