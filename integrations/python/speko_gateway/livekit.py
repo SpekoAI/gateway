@@ -46,8 +46,12 @@ from ._livekit_native_input import (
     bind_native_input,
     native_input_timeline,
 )
-from ._livekit_native_speaker import bind_native_speaker_timing
+from ._livekit_native_speaker import NativeSpeechData, bind_native_speaker_timing
 from ._livekit_native_stt import NativeSpeechStream
+from ._livekit_native_transcript import (
+    bind_native_transcript,
+    restore_native_transcript,
+)
 from ._livekit_native_turns import NativeTurnPolicy
 from ._speech_client import SpeechClient
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
@@ -90,6 +94,19 @@ def _report_stream_leg(kind: str, stream: Any) -> None:
         session_id=str(getattr(stream, "session_id", "") or ""),
         attempt_id=str(getattr(stream, "attempt_id", "") or ""),
     )
+
+
+def _speech_data(event: LiveKitSpeechEvent, language: str) -> NativeSpeechData:
+    data = NativeSpeechData(
+        language=event.language or language,
+        text=event.text,
+        speaker_id=event.speaker_id,
+        start_time=event.start_time or 0.0,
+        end_time=event.end_time or 0.0,
+    )
+    data.speaker_segments = tuple(_speech_data(part, language) for part in event.speaker_segments)
+    data.canonical_text = event.canonical_text
+    return data
 
 
 # STTCapabilities fields added after livekit-agents 1.4.5: keyterms and
@@ -193,6 +210,7 @@ class STT(stt.STT):
         self._bound_agent: Agent | None = None
         self._bound_session: AgentSession | None = None
         self._turn_binding: tuple[Any, Any, Any] | None = None
+        self._native_transcript_binding: tuple[Any, Any, Any] | None = None
         self._turn_listener: Any = None
         self._native_wrappers: dict[int, tuple[Any, Any, Any]] = {}
         self._native_input_binding: NativeInputBinding | None = None
@@ -224,6 +242,7 @@ class STT(stt.STT):
         self._native_input_binding = bind_native_input(self, session=session)
 
     def _restore_turn_binding(self) -> None:
+        restore_native_transcript(self)
         if self._native_turn_policy is not None:
             self._native_turn_policy.close()
             self._native_turn_policy = None
@@ -346,6 +365,8 @@ class STT(stt.STT):
         if self._turn_binding is not None:
             bound, _, completed = self._turn_binding
             if bound is activity and original is completed:
+                if getattr(activity, "_audio_recognition", None) is not None:
+                    bind_native_transcript(self, activity._audio_recognition)
                 if self._native_turn_policy is not None:
                     self._native_turn_policy.refresh()
                 return
@@ -397,6 +418,7 @@ class STT(stt.STT):
         activity._speko_native_stt_turn_owner = self
         self._turn_binding = (activity, original, committed)
         if getattr(activity, "_audio_recognition", None) is not None:
+            bind_native_transcript(self, activity._audio_recognition)
             self._native_turn_policy = NativeTurnPolicy(activity._audio_recognition)
 
     async def _native_continuation_delay(
@@ -477,33 +499,35 @@ class STT(stt.STT):
                 stream.push_frame(frame)
             stream.end_input()
             final: stt.SpeechEvent | None = None
+            segments: list[stt.SpeechData] = []
+            canonical_parts: list[str] = []
             async for event in stream:
                 if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                    if (
-                        isinstance(self._client, RelaySpeechClient)
-                        and final is not None
-                    ):
-                        before, after = final.alternatives[0], event.alternatives[0]
-                        final = stt.SpeechEvent(
-                            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                            request_id=event.request_id,
-                            alternatives=[
-                                stt.SpeechData(
-                                    language=after.language,
-                                    text=" ".join(
-                                        part
-                                        for part in (before.text, after.text)
-                                        if part
-                                    ),
-                                    start_time=before.start_time,
-                                    end_time=after.end_time,
-                                )
-                            ],
-                        )
-                    else:
-                        final = event
+                    segments.extend(event.alternatives)
+                    data = event.alternatives[0]
+                    canonical = getattr(data, "canonical_text", None)
+                    if canonical is None:
+                        canonical = data.text
+                    if canonical:
+                        canonical_parts.append(canonical)
+                    final = event
             if final is None:
                 raise APIConnectionError("Speko STT ended without a final transcript")
+            if isinstance(stream, NativeSpeechStream):
+                if len(segments) > 1:
+                    final = stt.SpeechEvent(
+                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                        request_id=final.request_id,
+                        alternatives=[NativeSpeechData(
+                            language=segments[-1].language,
+                            text="",
+                            start_time=segments[0].start_time,
+                            end_time=segments[-1].end_time,
+                        )],
+                    )
+                final.alternatives[0].text = " ".join(canonical_parts)
+                final.alternatives[0].canonical_text = final.alternatives[0].text
+                final.alternatives[0].speaker_segments = tuple(segments) if len(segments) > 1 else ()
             return final
         finally:
             await stream.aclose()
@@ -748,13 +772,7 @@ class SpeechStream(stt.RecognizeStream):
                     type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                     request_id=self._request_id,
                     alternatives=[
-                        stt.SpeechData(
-                            language=event.language or self._language,
-                            text=event.text,
-                            speaker_id=event.speaker_id,
-                            start_time=event.start_time or 0.0,
-                            end_time=event.end_time or 0.0,
-                        )
+                        _speech_data(event, self._language)
                     ],
                 )
             )
@@ -781,13 +799,7 @@ class SpeechStream(stt.RecognizeStream):
                 ),
                 request_id=self._request_id,
                 alternatives=[
-                    stt.SpeechData(
-                        language=event.language or self._language,
-                        text=event.text,
-                        speaker_id=event.speaker_id,
-                        start_time=event.start_time or 0.0,
-                        end_time=event.end_time or 0.0,
-                    )
+                    _speech_data(event, self._language)
                 ],
             )
         )

@@ -14,6 +14,7 @@ from typing import Any
 from livekit import rtc
 from livekit.agents.voice import audio_recognition, io
 
+from ._livekit_native_transcript import validate_native_final
 from .client import GatewayError
 
 _POSITION = "_speko_native_input_position"
@@ -356,6 +357,7 @@ class NativeInputBinding:
                     if result is not None:
                         iterator = aiter(result)
                         async for event in iterator:
+                            validate_native_final(event, binding)
                             yield event
                 finally:
                     try:

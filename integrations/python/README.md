@@ -78,8 +78,21 @@ Whole-final speaker labels reach LiveKit's `speaker_id`; attributed segments
 become individual timed finals, with explicit segment labels taking precedence.
 Unlabeled segments inherit a whole-final label when present. Otherwise they
 remain unattributed. The MultiSpeaker wrapper can use these labels and timings
-for primary-speaker detection. Attributed segments must cover the final's full
-text in order; invalid attribution refuses the result and fences automatic retries.
+for primary-speaker detection. The complete provider final stays authoritative:
+partial attribution, punctuation and text without word spaces retain their
+canonical text. Uncovered spans remain unattributed unless the provider labels
+the whole final; ambiguous alignment preserves the text without inventing a
+speaker. Invalid labels or time ranges refuse the result and fence retries.
+The owned recognition callback reconciles canonical text after SDK processing,
+including an interim promoted by a timed-out manual commit. It validates that
+attributed final events reach the SDK unchanged and in order. The callback is
+restored when ownership changes or the model closes.
+
+Native streaming finals expose `canonical_text` on the last part of each
+provider final; earlier parts carry an empty string. `recognize()` returns the
+complete text with available `speaker_segments`. Local Gateway recognition
+keeps one complete final and carries segment attribution in the same metadata,
+so the SDK cannot insert word spaces into a Chinese final.
 Speaker RMS lookup uses accepted audio positions, including after custom-node
 filtering; emitted transcript timestamps keep their original input positions.
 Multi-model fallback requires a control-plane recovery decision; wrappers

@@ -272,6 +272,49 @@ async def test_local_gateway_preserves_modulate_speaker_labels(kind, speaker):
             await client.aclose()
 
 
+@pytest.mark.parametrize("partial", [False, True])
+async def test_local_gateway_sdk_final_retains_canonical_text_and_segment_metadata(partial):
+    from livekit import rtc
+
+    from speko_gateway.livekit import STT
+
+    text = "hello world" if partial else "你好"
+    segments = [{"text": "hello" if partial else "你", "speaker": 2, "start_ms": 0, "end_ms": 10}]
+    if not partial:
+        segments.append({"text": "好", "speaker": 3, "start_ms": 10, "end_ms": 20})
+
+    async def create(request):
+        await request.json()
+        return web.json_response({"stream_url": "/v1/sessions/fixture/stream"}, status=201)
+
+    async def websocket(request):
+        ws = web.WebSocketResponse(protocols=["speko.voice.v0.r3"])
+        await ws.prepare(request)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and message.json()["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "data": {"text": text, "segments": segments}})
+                await ws.close()
+        return ws
+
+    app = web.Application()
+    app.router.add_post("/v1/sessions", create)
+    app.router.add_get("/v1/sessions/fixture/stream", websocket)
+    async with server(app, unix=True) as address:
+        client = GatewayClient(socket_path=address, local_auth_token="owned-local-attribution")
+        model = STT(client)
+        try:
+            result = await asyncio.wait_for(model.recognize(rtc.AudioFrame(data=b"\0\0" * 320, sample_rate=16000, num_channels=1, samples_per_channel=320)), 3)
+            data = result.alternatives[0]
+            assert data.text == text
+            attributed = [part for part in data.speaker_segments if part.speaker_id is not None]
+            assert [(part.text, part.speaker_id) for part in attributed] == [(part["text"], str(part["speaker"])) for part in segments]
+            if partial:
+                assert any(part.text.strip() == "world" and part.speaker_id is None for part in data.speaker_segments)
+        finally:
+            await model.aclose()
+            await client.aclose()
+
+
 @pytest.mark.parametrize('status,code,retryable', [(403,'provider_not_entitled',False),(401,'authentication_failed',False),(429,'rate_limited',True),(503,'service_unavailable',True)])
 async def test_gateway_admission_error_preserves_code_and_retryability(status, code, retryable):
     from speko_gateway.client import GatewayError

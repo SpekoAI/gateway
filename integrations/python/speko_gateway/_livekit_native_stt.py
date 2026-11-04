@@ -15,6 +15,7 @@ from livekit.agents import APIConnectionError, APIConnectOptions, stt, utils, va
 from ._livekit_bridge import LiveKitSpeechEvent, LiveKitSTTBridge, LiveKitSTTStream
 from ._livekit_native_input import NativeInputTimeline
 from ._livekit_native_speaker import NativeSpeechData
+from ._livekit_native_transcript import NativeFinalBatch, NativeTranscript
 from .client import GatewayError
 
 
@@ -104,6 +105,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._awaiting_new_turn = False
         self._turn_commit: asyncio.Future[None] | None = None
         self._turn_text = ""
+        self._canonical_turn: NativeTranscript | None = None
         self._fatal: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     def push_frame(self, frame: rtc.AudioFrame) -> None:
@@ -359,6 +361,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 if self._turn_commit is not None and self._turn_commit.done():
                     self._turn_commit = None
                     self._turn_text = ""
+                    self._canonical_turn = None
                 self._awaiting_new_turn = False
                 self._pending_transcript = True
                 self._vad_speaking = True
@@ -466,7 +469,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 )
             raise
 
-    def _emit(self, event: LiveKitSpeechEvent, kind: stt.SpeechEventType) -> None:
+    def _emit(self, event: LiveKitSpeechEvent, kind: stt.SpeechEventType, batch: NativeFinalBatch | None = None, index: int = 0) -> None:
         offset = Fraction(self._request_start_sample, self._sample_rate)
         data = NativeSpeechData(
             language=event.language or self._language,
@@ -479,11 +482,14 @@ class NativeSpeechStream(stt.RecognizeStream):
             if event.end_time is not None
             else 0.0,
         )
+        data.canonical_text = event.canonical_text
         if event.start_time is not None and event.end_time is not None:
             data._native_input_times = (
                 float(offset) + event.start_time,
                 float(offset) + event.end_time,
             )
+        if batch is not None:
+            data._native_final = (batch, index)
         self._event_ch.send_nowait(
             stt.SpeechEvent(
                 type=kind,
@@ -521,17 +527,20 @@ class NativeSpeechStream(stt.RecognizeStream):
             # Bind the actual current activity again before publishing finals,
             # including a handoff while the physical request was in flight.
             self._check_admission()
-        previous = self._turn_text if self._turn_commit is not None and not self._turn_commit.done() else ""
-        self._turn_text = " ".join(
-            " ".join([previous, *(event.text for event in self._finals)]).split()
-        )
-        if len(self._turn_text) > 1 << 20:
+        previous = self._canonical_turn if self._turn_commit is not None and not self._turn_commit.done() else None
+        canonical = [event.text if event.canonical_text is None else event.canonical_text for event in self._finals]
+        text = " ".join(text for text in canonical if text)
+        self._canonical_turn = previous if previous is not None and not text else NativeTranscript(previous, text)
+        canonical_text = self._canonical_turn.render()
+        if len(canonical_text) > 1 << 20:
             raise GatewayError("Native speech transcript exceeded its bound", retryable=False)
+        self._turn_text = " ".join(canonical_text.split())
         if self._wait_for_turn_commit and self._turn_text and (self._turn_commit is None or self._turn_commit.done()):
             self._turn_commit = asyncio.get_running_loop().create_future()
         self._pending_transcript = False
-        for event in self._finals:
-            self._emit(event, stt.SpeechEventType.FINAL_TRANSCRIPT)
+        batch = NativeFinalBatch(self, self._canonical_turn, tuple(event.text for event in self._finals))
+        for index, event in enumerate(self._finals):
+            self._emit(event, stt.SpeechEventType.FINAL_TRANSCRIPT, batch, index)
         self._event_ch.send_nowait(
             stt.SpeechEvent(
                 type=stt.SpeechEventType.END_OF_SPEECH,

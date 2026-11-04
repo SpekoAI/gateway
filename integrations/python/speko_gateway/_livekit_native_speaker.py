@@ -11,6 +11,8 @@ class NativeSpeechData(stt.SpeechData):
     # A private witness, deliberately absent from the SDK dataclass's wire
     # fields. The wrapper hears accepted PCM without custom-node filtered gaps.
     _native_input_times: tuple[float, float] | None = None
+    speaker_segments: tuple[stt.SpeechData, ...] = ()
+    canonical_text: str | None = None
 
 
 def bind_native_speaker_timing(stream: Any) -> None:
