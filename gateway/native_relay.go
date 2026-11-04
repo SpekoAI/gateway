@@ -322,7 +322,10 @@ func (b *nativeRelayBody) Read(p []byte) (int, error) {
 	_ = b.control.SetReadDeadline(time.Now().Add(b.timeout))
 	n, err := b.ReadCloser.Read(p)
 	if err != nil {
-		if errors.Is(err, io.EOF) {
+		var tooLarge *http.MaxBytesError
+		if errors.Is(err, io.EOF) || errors.As(err, &tooLarge) {
+			// The transport must receive the size error itself. Cancelling here
+			// can replace it with context.Canceled before the proxy maps it to 413.
 			_ = b.control.SetReadDeadline(time.Time{})
 		} else {
 			_ = b.control.SetReadDeadline(time.Now())

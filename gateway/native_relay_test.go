@@ -398,6 +398,42 @@ func TestNativeRelayRejectsRedirectsAndOversizeBodies(t *testing.T) {
 	nativeAwait(t, func() bool { return server.Stats().ActiveSessions == 0 })
 }
 
+func TestNativeRelayChunkedUploadLimitRemains413ThroughRealTransport(t *testing.T) {
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength != -1 || len(r.TransferEncoding) != 1 || r.TransferEncoding[0] != "chunked" {
+			t.Error("expected an unknown-length chunked upstream upload")
+		}
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return
+		}
+		_, _ = w.Write([]byte("owned"))
+	}))
+	defer peer.Close()
+	server, local := nativeServer(t, peer, func(c *gateway.NativeRelayConfig) {
+		c.MaxRequestBytes = 8192
+		c.MaxSessions = 1
+	})
+	for index := 0; index < 20; index++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		// NopCloser hides the reader's known length, forcing real chunked HTTP.
+		body := io.NopCloser(strings.NewReader(strings.Repeat("x", 8193)))
+		req, _ := http.NewRequestWithContext(ctx, "POST", local.URL+"/v1/stt/transcriptions", body)
+		req.Header = nativeHeaders("sk_speko_agent_owned")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		raw, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		cancel()
+		if err != nil || response.StatusCode != 413 || !bytes.Contains(raw, []byte(`"code":"payload_too_large"`)) {
+			t.Fatalf("chunked overflow %d: status=%d body=%q error=%v", index, response.StatusCode, raw, err)
+		}
+		nativeAwait(t, func() bool { return server.Stats().ActiveSessions == 0 })
+	}
+}
+
 func TestNativeRelayDrainDeadlineCancelsLiveNativeSocket(t *testing.T) {
 	closed := make(chan struct{})
 	relay := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

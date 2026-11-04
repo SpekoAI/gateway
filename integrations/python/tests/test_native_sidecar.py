@@ -242,6 +242,84 @@ async def ready(ws):
     )
 
 
+@pytest.mark.parametrize("large", ["prefix", "inference"])
+async def test_actual_native_sidecar_accepts_large_livekit_vad_audio(
+    native_binary, large
+):
+    from livekit import rtc
+    from livekit.agents import stt, vad
+    from test_relay_speech_livekit import ControlledVAD
+
+    from speko_gateway.livekit import STT
+
+    observed = []
+    source = ControlledVAD()
+
+    def audio(samples):
+        return rtc.AudioFrame(
+            data=b"\x12\x34" * samples,
+            sample_rate=48000,
+            num_channels=1,
+            samples_per_channel=samples,
+        )
+
+    prefix = audio(23 * 48000 if large == "prefix" else 960)
+    inference = audio(23 * 48000 if large == "inference" else 960)
+
+    async def handle(request):
+        ws = web.WebSocketResponse(max_msg_size=(2 << 20) + 1)
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                observed.append(message.data)
+            elif json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with native_stack(native_binary, handle) as (socket, _):
+        client = RelaySpeechClient(
+            api_key=MODEL_KEY,
+            session_id=str(uuid.uuid4()),
+            socket_path=socket,
+            local_auth_token=LOCAL_TOKEN,
+        )
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=source,
+            sample_rate=48000,
+        )
+        stream = model.stream()
+        try:
+            stream.push_frame(prefix)
+            await asyncio.wait_for(source.frames.get(), 3)
+            source.processed(prefix)
+            source.emit(vad.VADEventType.START_OF_SPEECH)
+            assert (
+                await asyncio.wait_for(anext(stream), 3)
+            ).type is stt.SpeechEventType.START_OF_SPEECH
+            stream.push_frame(inference)
+            await asyncio.wait_for(source.frames.get(), 3)
+            source.processed(inference)
+            source.emit(vad.VADEventType.END_OF_SPEECH)
+            stream.end_input()
+            assert [event.type async for event in stream] == [
+                stt.SpeechEventType.END_OF_SPEECH
+            ]
+            assert len(observed) == 3
+            assert all(len(value) <= 2 << 20 for value in observed)
+            assert b"".join(observed) == bytes(prefix.data) + bytes(inference.data)
+        finally:
+            await stream.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
 @pytest.mark.parametrize("kind", ["stt", "tts"])
 async def test_actual_native_sidecar_carries_python_speech_frames_and_session_authority(
     native_binary, kind
