@@ -17,6 +17,7 @@ import aiohttp
 from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
+    Agent,
     APIConnectionError,
     APIConnectOptions,
     NotGivenOr,
@@ -175,6 +176,30 @@ class STT(stt.STT):
         self._credential_source = credential_source
         self._sample_rate = sample_rate
         self._streams: weakref.WeakSet[stt.RecognizeStream] = weakref.WeakSet()
+        self._bound_agent: tuple[Any, Any, Any] | None = None
+
+    def bind_agent(self, agent: Agent) -> None:
+        """Bind native turn completion to this Agent's public lifecycle hook.
+
+        Call before AgentSession.start. Only this owned Agent instance is
+        adapted; its original hook still receives every completed user turn.
+        """
+        if not isinstance(self._client, RelaySpeechClient):
+            return
+        if self._bound_agent is not None:
+            raise ValueError("Native STT is already bound to an Agent")
+        original = agent.on_user_turn_completed
+
+        async def completed(
+            turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
+        ) -> None:
+            for stream in list(self._streams):
+                if isinstance(stream, NativeSpeechStream):
+                    stream.acknowledge_turn(new_message.text_content or "")
+            await original(turn_ctx, new_message)
+
+        agent.on_user_turn_completed = completed
+        self._bound_agent = (agent, original, completed)
 
     @property
     def model(self) -> str:
@@ -249,9 +274,13 @@ class STT(stt.STT):
         *,
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+        manual_turns: bool = False,
     ) -> stt.RecognizeStream:
         return self._stream(
-            language=language, conn_options=conn_options, recognize=False
+            language=language,
+            conn_options=conn_options,
+            recognize=False,
+            manual_turns=manual_turns,
         )
 
     def _stream(
@@ -260,8 +289,18 @@ class STT(stt.STT):
         language: NotGivenOr[str],
         conn_options: APIConnectOptions,
         recognize: bool,
+        manual_turns: bool = False,
     ) -> stt.RecognizeStream:
         self._check_native_admission()
+        if (
+            isinstance(self._client, RelaySpeechClient)
+            and not recognize
+            and not manual_turns
+            and self._bound_agent is None
+        ):
+            raise ValueError(
+                "Native STT streaming requires bind_agent() before AgentSession starts; explicit event consumers use manual_turns=True"
+            )
         conn_options = _speech_connect_options(self._client, conn_options)
         resolved_language = str(language) if is_given(language) else self._language
         bridge = LiveKitSTTBridge(
@@ -283,6 +322,7 @@ class STT(stt.STT):
                 mark_failed=lambda: setattr(self, "_native_failed", True),
                 report_open=lambda stream: _report_stream_leg("stt", stream),
                 check_admission=self._check_native_admission,
+                wait_for_turn_commit=not recognize and not manual_turns,
             )
         else:
             stream = SpeechStream(
@@ -307,6 +347,11 @@ class STT(stt.STT):
             )
 
     async def aclose(self) -> None:
+        if self._bound_agent is not None:
+            agent, original, completed = self._bound_agent
+            if agent.on_user_turn_completed is completed:
+                agent.on_user_turn_completed = original
+            self._bound_agent = None
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
