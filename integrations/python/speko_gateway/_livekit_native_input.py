@@ -514,12 +514,13 @@ class NativeInputBinding:
             )
             pipeline = getattr(recognition, "_stt_pipeline", None)
         key = pipeline if pipeline is not None else audio
+        session_ref = weakref.ref(session) if legacy else None
         try:
             timeline = self._timelines.get(key)
         except TypeError:
-            return NativeInputTimeline(scope=self.scope, legacy=legacy, source_scope=self.source_scope, session=weakref.ref(session))
+            return NativeInputTimeline(scope=self.scope, legacy=legacy, source_scope=self.source_scope, session=session_ref)
         if timeline is None:
-            timeline = NativeInputTimeline(scope=self.scope, legacy=legacy, source_scope=self.source_scope, session=weakref.ref(session))
+            timeline = NativeInputTimeline(scope=self.scope, legacy=legacy, source_scope=self.source_scope, session=session_ref)
             self._timelines[key] = timeline
         return timeline
 
