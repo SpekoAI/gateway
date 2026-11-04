@@ -320,6 +320,7 @@ async def test_actual_agent_stt_recovery_pump_cannot_readmit_a_failed_native_req
         )
         agent = Agent(instructions="Owned recovery fixture")
         model.bind_agent(agent)
+        events = rtc.EventEmitter()
         agent._activity = SimpleNamespace(
             stt=model,
             vad=None,
@@ -328,6 +329,8 @@ async def test_actual_agent_stt_recovery_pump_cannot_readmit_a_failed_native_req
             # is authorized by this fixture. Actual sessions are covered below.
             on_end_of_turn=lambda _info: False,
             session=SimpleNamespace(
+                on=events.on,
+                off=events.off,
                 current_agent=agent,
                 conn_options=SimpleNamespace(
                     stt_conn_options=APIConnectOptions(max_retry=3, retry_interval=0)
@@ -1255,6 +1258,102 @@ async def test_actual_native_agent_session_keeps_turn_authority_across_commits_a
             assert agent.on_user_turn_completed == original
             assert not model._native_failed
         finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.skipif(
+    not hasattr(recognition.AudioRecognition, "_detach_stt"),
+    reason="SDK recreates STT instead of retaining its pipeline",
+)
+@pytest.mark.parametrize("binding", ["agent", "session"])
+async def test_native_final_during_detached_handoff_binds_the_consuming_activity(binding):
+    source = ControlledVAD()
+    closing, terminal, detached, attach = (asyncio.Event() for _ in range(4))
+    seen, turns = [], asyncio.Queue()
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        seen.append(request.headers["Idempotency-Key"])
+        index = len(seen)
+        await ready(ws)
+        async for message in ws:
+            if (
+                message.type is aiohttp.WSMsgType.TEXT
+                and json.loads(message.data)["type"] == "session.close"
+            ):
+                if index == 1:
+                    closing.set()
+                    await terminal.wait()
+                await ws.send_json({"type": "transcript.final", "text": f"turn {index}"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin,
+        )
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+        session = AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0.05, max_endpointing_delay=0.05)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+
+        class OwnedAgent(Agent):
+            async def on_user_turn_completed(self, turn_ctx, new_message):
+                turns.put_nowait(new_message.text_content)
+
+        async def utterance():
+            for value in (frame(), rtc.AudioFrame(data=b"\0\0" * 8800, sample_rate=16000, num_channels=1, samples_per_channel=8800)):
+                await audio.frames.put(value)
+                observed = await asyncio.wait_for(source.frames.get(), 3)
+                source.processed(observed)
+                source.emit(vad.VADEventType.START_OF_SPEECH if value.samples_per_channel == 320 else vad.VADEventType.END_OF_SPEECH, frames=[observed], silence_duration=0 if value.samples_per_channel == 320 else 0.55)
+
+        agent = OwnedAgent(instructions="Owned detached handoff fixture")
+        if binding == "session":
+            model.bind_session(session)
+        else:
+            model.bind_agent(agent)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=agent, **options)
+            await utterance()
+            await asyncio.wait_for(closing.wait(), 3)
+            old = session._activity
+            recognition_instance = old._audio_recognition
+            original = recognition_instance._detach_stt
+
+            async def pause_after_detach():
+                pipeline = await original()
+                detached.set()
+                await attach.wait()
+                return pipeline
+
+            recognition_instance._detach_stt = pause_after_detach
+            session.update_agent(OwnedAgent(instructions="Owned next activity"))
+            await asyncio.wait_for(detached.wait(), 3)
+            assert session._activity is old
+            terminal.set()
+            # Let the real retained pump queue the final while no SDK consumer
+            # exists. The old activity is deliberately still visible here.
+            async with asyncio.timeout(3):
+                while not any(getattr(stream, "_turn_commit", None) is not None for stream in model._streams):
+                    await asyncio.sleep(0)
+            assert session._activity is old
+            attach.set()
+            assert await asyncio.wait_for(turns.get(), 3) == "turn 1"
+            await utterance()
+            assert await asyncio.wait_for(turns.get(), 3) == "turn 2"
+            assert len(seen) == len(set(seen)) == 2
+            assert not model._native_failed
+        finally:
+            terminal.set()
+            attach.set()
             await audio.frames.put(None)
             await session.aclose()
             await model.aclose()
