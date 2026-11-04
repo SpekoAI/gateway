@@ -219,12 +219,13 @@ class STT(stt.STT):
                 raise ValueError(
                     "Native STT streaming requires a running AgentSession"
                 ) from None
-        try:
-            activity = getattr(self._bound_session.current_agent, "_activity", None)
-        except RuntimeError:
+        # current_agent can announce a handoff target before its activity is
+        # active. The actual session activity owns recognition and its commits.
+        activity = getattr(self._bound_session, "_activity", None)
+        if activity is None:
             raise ValueError(
                 "Native STT streaming requires a running AgentSession"
-            ) from None
+            )
         original = getattr(activity, "on_end_of_turn", None)
         if not callable(original) or inspect.iscoroutinefunction(original):
             raise ValueError("Unsupported native AgentSession turn interface")
@@ -359,6 +360,11 @@ class STT(stt.STT):
             stt_options=self._stt_options,
         )
         if isinstance(self._client, RelaySpeechClient):
+            def prepare_native_turn() -> None:
+                self._check_native_admission()
+                if not recognize and not manual_turns:
+                    self._bind_native_activity()
+
             if not recognize and not manual_turns:
                 self._bind_native_activity()
             stream = NativeSpeechStream(
@@ -370,7 +376,7 @@ class STT(stt.STT):
                 turn_vad=None if recognize else self._turn_vad,
                 mark_failed=lambda: setattr(self, "_native_failed", True),
                 report_open=lambda stream: _report_stream_leg("stt", stream),
-                check_admission=self._check_native_admission,
+                check_admission=prepare_native_turn,
                 wait_for_turn_commit=not recognize and not manual_turns,
             )
         else:

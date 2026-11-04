@@ -52,6 +52,26 @@ jobs:
       - run: uv pip install -e . "livekit-agents==1.4.5" "pytest>=8" "pytest-asyncio>=0.24"
       - run: .venv/bin/python -m pytest
 
+  python-livekit-retained-stream:
+    # This release retains the native STT stream across Agent handoffs. The
+    # floor and locked release alone do not exercise that lifecycle.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integrations/python
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv venv
+      - run: uv pip install -e . "livekit-agents==1.8.10" "pytest>=8" "pytest-asyncio>=0.24"
+      - run: .venv/bin/python -m pytest
+
   container:
     runs-on: ubuntu-latest
     steps:
