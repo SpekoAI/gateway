@@ -29,7 +29,7 @@ from livekit.agents.voice import audio_recognition as recognition
 from livekit.agents.voice import io
 
 from speko_gateway import GatewayError, RelaySpeechClient
-from speko_gateway.livekit import STT, TTS
+from speko_gateway.livekit import STT, TTS, DrainingVAD
 
 
 @asynccontextmanager
@@ -247,6 +247,259 @@ def owned_probability_vad(engine, **options):
 
     detector.stream = stream
     return detector
+
+
+def owned_local_turn_detector(predictions):
+    """The actual local v1-mini transport and stream, with calibrated scores."""
+    from livekit.agents import inference
+
+    if not hasattr(inference, "TurnDetector"):
+        pytest.skip("SDK predates local audio turn detection")
+    detector = inference.TurnDetector(version="v1-mini", unlikely_threshold=0.5)
+    original = detector.stream
+
+    def stream(**kwargs):
+        result = original(**kwargs)
+
+        class Predictor:
+            def predict(self, window):
+                predictions.append(window.copy())
+                return 0.9
+
+        result._transport._eot = Predictor()
+        return result
+
+    detector.stream = stream
+    return detector
+
+
+@pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
+async def test_draining_framework_vad_keeps_real_minimums_and_event_audio(engine):
+    public, events, completed = [], [], asyncio.Queue()
+    detector = DrainingVAD(owned_probability_vad(
+        engine, min_speech_duration=0.02, min_silence_duration=0.02,
+        prefix_padding_duration=0, _any_voice=True, _events=public,
+    ))
+    stream = detector.stream()
+
+    async def collect():
+        async for event in stream:
+            events.append(event)
+            completed.put_nowait(event)
+
+    collector = asyncio.create_task(collect())
+    async def push(raw):
+        stream.push_frame(rtc.AudioFrame(data=raw, sample_rate=16000, num_channels=1, samples_per_channel=len(raw) // 2))
+        remaining = len(raw)
+        while remaining:
+            event = await asyncio.wait_for(completed.get(), 3)
+            if event.type is vad.VADEventType.INFERENCE_DONE:
+                remaining -= sum(len(bytes(frame.data)) for frame in event.frames)
+        await asyncio.sleep(0)
+
+    try:
+        tiny_voice, voice = b"\xff\x0f" * 80, b"\xff\x0f" * 1536
+        tiny_quiet, quiet = b"\0\0" * 80, b"\0\0" * 1024
+        await push(tiny_voice)
+        assert vad.VADEventType.START_OF_SPEECH in public
+        assert not any(event.type is vad.VADEventType.START_OF_SPEECH for event in events)
+        await push(voice)
+        assert any(event.type is vad.VADEventType.START_OF_SPEECH for event in events)
+        await push(tiny_quiet)
+        assert not any(event.type is vad.VADEventType.END_OF_SPEECH for event in events)
+        await push(quiet)
+        stream.end_input()
+        await asyncio.wait_for(collector, 3)
+        actual = b"".join(bytes(frame.data) for event in events if event.type is vad.VADEventType.INFERENCE_DONE for frame in event.frames)
+        assert actual == tiny_voice + voice + tiny_quiet + quiet
+        ended = [event for event in events if event.type is vad.VADEventType.END_OF_SPEECH]
+        assert len(ended) == 1
+        assert ended[0].silence_duration >= 0.02
+        assert b"".join(bytes(frame.data) for frame in ended[0].frames) in actual
+        assert events[-1].timestamp == pytest.approx(len(actual) / 2 / 16000)
+    finally:
+        await stream.aclose()
+        await asyncio.gather(collector, return_exceptions=True)
+
+
+@pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
+async def test_draining_framework_vad_streams_keep_independent_audio_and_cleanup(engine):
+    detector = DrainingVAD(owned_probability_vad(engine))
+    speaking, silent = detector.stream(), detector.stream()
+    voice, quiet = b"\xff\x0f" * 1024, b"\0\0" * 320
+    try:
+        speaking.push_frame(rtc.AudioFrame(data=voice, sample_rate=16000, num_channels=1, samples_per_channel=1024))
+        silent.push_frame(rtc.AudioFrame(data=quiet, sample_rate=16000, num_channels=1, samples_per_channel=320))
+        speaking.end_input()
+        silent.end_input()
+
+        async def collect(stream):
+            return [event async for event in stream]
+
+        spoken, paused = await asyncio.wait_for(asyncio.gather(collect(speaking), collect(silent)), 3)
+        for events, expected in ((spoken, voice), (paused, quiet)):
+            assert b"".join(bytes(frame.data) for event in events if event.type is vad.VADEventType.INFERENCE_DONE for frame in event.frames) == expected
+        assert any(event.type is vad.VADEventType.START_OF_SPEECH for event in spoken)
+        assert not any(event.type is vad.VADEventType.START_OF_SPEECH for event in paused)
+    finally:
+        await asyncio.gather(speaking.aclose(), silent.aclose())
+    for stream in (speaking, silent):
+        assert stream._task.done() and stream._metrics_task.done()
+        assert stream._inner._task.done() and stream._inner._metrics_task.done()
+
+
+async def test_draining_framework_vad_end_input_keeps_audio_behind_inflight_padding():
+    detector = owned_probability_vad("inference", min_speech_duration=0.02)
+    started, ended, release = asyncio.Event(), asyncio.Event(), threading.Event()
+    loop, original = asyncio.get_running_loop(), detector.stream
+
+    def paused_stream():
+        result = original()
+        predictor, end_input = result._native_vad, result.end_input
+
+        class Paused:
+            first = True
+
+            def predict(self, window):
+                if self.first:
+                    self.first = False
+                    loop.call_soon_threadsafe(started.set)
+                    if not release.wait(3):
+                        raise RuntimeError("owned inference release timed out")
+                return predictor.predict(window)
+
+            def reset(self):
+                predictor.reset()
+
+        def end():
+            end_input()
+            ended.set()
+
+        result._native_vad, result.end_input = Paused(), end
+        return result
+
+    detector.stream = paused_stream
+    stream = DrainingVAD(detector).stream()
+    quiet, voice = b"\0\0" * 320, b"\xff\x0f" * 320
+    try:
+        stream.push_frame(rtc.AudioFrame(data=quiet, sample_rate=16000, num_channels=1, samples_per_channel=320))
+        await asyncio.wait_for(started.wait(), 3)
+        stream.push_frame(rtc.AudioFrame(data=voice, sample_rate=16000, num_channels=1, samples_per_channel=320))
+        stream.end_input()
+        await asyncio.wait_for(ended.wait(), 3)
+        release.set()
+
+        async def collect():
+            return [event async for event in stream]
+
+        events = await asyncio.wait_for(collect(), 3)
+        assert b"".join(bytes(frame.data) for event in events if event.type is vad.VADEventType.INFERENCE_DONE for frame in event.frames) == quiet + voice
+        assert sum(event.type is vad.VADEventType.START_OF_SPEECH for event in events) == 1
+    finally:
+        release.set()
+        await stream.aclose()
+
+
+@pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
+async def test_draining_framework_vad_flush_is_a_real_hard_boundary(engine):
+    detector = DrainingVAD(owned_probability_vad(engine, min_speech_duration=0.02, prefix_padding_duration=0, _any_voice=True))
+    stream = detector.stream()
+    first, second = b"\xff\x0f" * 160, b"\xff\x0f" * 320
+    try:
+        stream.push_frame(rtc.AudioFrame(data=first, sample_rate=16000, num_channels=1, samples_per_channel=160))
+        stream.flush()
+        stream.push_frame(rtc.AudioFrame(data=second, sample_rate=16000, num_channels=1, samples_per_channel=320))
+        stream.end_input()
+
+        async def collect():
+            return [event async for event in stream]
+
+        events = await asyncio.wait_for(collect(), 3)
+        actual = b"".join(bytes(frame.data) for event in events if event.type is vad.VADEventType.INFERENCE_DONE for frame in event.frames)
+        assert actual == first + second
+        starts = [event for event in events if event.type is vad.VADEventType.START_OF_SPEECH]
+        assert len(starts) == 1
+        assert b"".join(bytes(frame.data) for frame in starts[0].frames) == second
+        assert starts[0].speech_duration == pytest.approx(0.02)
+        assert starts[0].timestamp == pytest.approx(0.02)
+    finally:
+        await stream.aclose()
+
+
+@pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
+@pytest.mark.parametrize("binding", ["session", "agent"])
+@pytest.mark.parametrize("wrapper", ["direct", "nested"])
+async def test_native_worker_framework_vad_and_local_turn_detector_drain_partial_silence(engine, binding, wrapper):
+    source = owned_probability_vad("inference", min_silence_duration=0.032)
+    framework_vad = DrainingVAD(owned_probability_vad(engine, min_silence_duration=0.25))
+    predictions, turns, packets = [], asyncio.Queue(), []
+    detector = owned_local_turn_detector(predictions)
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        index = len(packets)
+        packets.append(bytearray())
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                packets[index].extend(message.data)
+            elif json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": f"worker turn {index}"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source, diarization=wrapper == "nested")
+        wrapped = wrap_native_stt(model, wrapper)
+        session = AgentSession(
+            stt=wrapped, llm=None, tts=None, vad=framework_vad,
+            turn_handling={"turn_detection": detector, "endpointing": {"min_delay": 0.05, "max_delay": 0.5}, "interruption": {"mode": "vad", "enabled": True}},
+        )
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        agent = OwnedAgent(instructions="Owned worker detector integration")
+        if binding == "session":
+            model.bind_session(session)
+        else:
+            model.bind_agent(agent)
+        try:
+            await session.start(agent=agent, record=False)
+            all_captured = b""
+            for index in range(3):
+                # The first pause reaches 250ms only in a partial inference
+                # window. Later turns have ordinary silence margin, since
+                # a mixed speech/silence window can legitimately classify
+                # some captured quiet as speech after a previous padded tail.
+                payload = b"\xff\x0f" * 1024 + b"\0\0" * (4000 if index == 0 else 5120)
+                all_captured += payload
+                await audio.frames.put(rtc.AudioFrame(data=payload, sample_rate=16000, num_channels=1, samples_per_channel=len(payload) // 2))
+                try:
+                    committed = await asyncio.wait_for(turns.get(), 3)
+                except TimeoutError:
+                    state = session._activity._audio_recognition
+                    pytest.fail(f"turn {index} stalled: requests={list(map(len, packets))}, predictions={len(predictions)}, speaking={state._speaking}, transcript={state._audio_transcript!r}, streams={[(value._available_samples, value._pending_transcript, value._vad_speaking) for value in model._streams]}")
+                assert committed == f"worker turn {index}"
+                assert len(predictions) >= index + 1, "the local audio turn detector must participate in each turn"
+                assert predictions[-1].tobytes() == payload, "VAD-only padding must not enter the independent turn detector"
+            assert len(packets) == 3
+            delivered = b"".join(map(bytes, packets))
+            assert delivered == all_captured[:len(delivered)]
+            assert not session._activity._audio_recognition._speaking
+            assert not model._native_failed
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            await wrapped.aclose()
+            await model.aclose()
+            await client.aclose()
 
 
 async def test_native_end_input_drains_new_real_audio_behind_inflight_padding():

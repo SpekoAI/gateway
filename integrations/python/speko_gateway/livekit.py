@@ -42,6 +42,7 @@ from ._livekit_bridge import (
     LiveKitTTSEvent,
     LiveKitTTSStream,
 )
+from ._livekit_draining_vad import DrainingVAD
 from ._livekit_local_transcript import bind_local_transcript, restore_local_transcript
 from ._livekit_native_input import (
     NativeInputBinding,
@@ -67,6 +68,8 @@ from .relay import (
     validate_reasoning_effort,
 )
 from .relay_speech import RelaySpeechClient
+
+__all__ = ["LLM", "STT", "TTS", "DrainingVAD"]
 
 
 def _speech_connect_options(
