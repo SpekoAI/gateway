@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import time
 import weakref
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -209,6 +210,8 @@ class STT(stt.STT):
             activity, original, completed = self._turn_binding
             if activity.on_end_of_turn is completed:
                 activity.on_end_of_turn = original
+            if getattr(activity, "_speko_native_stt_turn_owner", None) is self:
+                del activity._speko_native_stt_turn_owner
             self._turn_binding = None
 
     def _owns_native_recognition(self, candidate: Any) -> bool:
@@ -304,14 +307,21 @@ class STT(stt.STT):
             self._turn_listener = observe_activity
             self._bound_session.on("conversation_item_added", observe_activity)
             self._bound_session.on("user_input_transcribed", observe_activity)
+        previous = getattr(activity, "_speko_native_stt_turn_owner", None)
+        if previous is not None and previous is not self:
+            # update_options swaps recognition on this same activity before
+            # the previous model's session listener gets a chance to run.
+            # Restore its callback before capturing our own predecessor.
+            previous._restore_turn_binding()
         original = getattr(activity, "on_end_of_turn", None)
-        if not callable(original) or inspect.iscoroutinefunction(original):
-            raise ValueError("Unsupported native AgentSession turn interface")
         if self._turn_binding is not None:
             bound, _, completed = self._turn_binding
             if bound is activity and original is completed:
                 return
         self._restore_turn_binding()
+        original = getattr(activity, "on_end_of_turn", None)
+        if not callable(original) or inspect.iscoroutinefunction(original):
+            raise ValueError("Unsupported native AgentSession turn interface")
 
         def committed(info: Any) -> bool:
             accepted = original(info)
@@ -324,7 +334,25 @@ class STT(stt.STT):
             return accepted
 
         activity.on_end_of_turn = committed
+        activity._speko_native_stt_turn_owner = self
         self._turn_binding = (activity, original, committed)
+
+    def _native_stream_offset(self) -> float:
+        # Match the installed SDK's default STT node input epoch. Some SDK
+        # wrappers create their child asynchronously without forwarding the
+        # outer stream's offset; initialize the native child independently.
+        assert self._bound_session is not None
+        session = self._bound_session
+        recognition = getattr(session._activity, "_audio_recognition", None)
+        origin = getattr(recognition, "_input_started_at", None)
+        if origin is None:
+            recorder = getattr(session, "_recorder_io", None)
+            origin = (
+                getattr(recorder, "recording_started_at", None)
+                or getattr(session, "_started_at", None)
+                or time.time()
+            )
+        return time.time() - origin
 
     @property
     def model(self) -> str:
@@ -457,6 +485,8 @@ class STT(stt.STT):
                 check_admission=prepare_native_turn,
                 wait_for_turn_commit=not recognize and not manual_turns,
             )
+            if not recognize and not manual_turns:
+                stream.start_time_offset = self._native_stream_offset()
         else:
             stream = SpeechStream(
                 stt_instance=self,

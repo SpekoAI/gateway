@@ -1381,7 +1381,8 @@ async def test_native_final_during_detached_handoff_binds_the_consuming_activity
 
 
 @pytest.mark.parametrize("wrapper", ["direct", "nested"])
-async def test_native_model_handoffs_keep_only_the_active_recognition_owner_bound(wrapper):
+@pytest.mark.parametrize("change", ["handoff", pytest.param("update_options", marks=pytest.mark.skipif(not hasattr(Agent, "update_options"), reason="SDK predates live model option updates"))])
+async def test_native_model_handoffs_keep_only_the_active_recognition_owner_bound(wrapper, change):
     sources = [ControlledVAD(), ControlledVAD()]
     seen, turns = [], asyncio.Queue()
 
@@ -1431,10 +1432,16 @@ async def test_native_model_handoffs_keep_only_the_active_recognition_owner_boun
             options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
             await session.start(agent=OwnedAgent(instructions="Owned first model", stt=recognition_models[0]), **options)
             await asyncio.wait_for(entered.get(), 3)
-            for index, owner in enumerate([0, 1, 0], start=1):
+            owners = [0, 1, 0] if change == "handoff" else [0, 1, 0, 1, 0]
+            original_activity = session._activity
+            for index, owner in enumerate(owners, start=1):
                 if index > 1:
-                    session.update_agent(OwnedAgent(instructions="Owned model handoff", stt=recognition_models[owner]))
-                    await asyncio.wait_for(entered.get(), 3)
+                    if change == "handoff":
+                        session.update_agent(OwnedAgent(instructions="Owned model handoff", stt=recognition_models[owner]))
+                        await asyncio.wait_for(entered.get(), 3)
+                    else:
+                        session.current_agent.update_options(stt=recognition_models[owner])
+                        assert session._activity is original_activity
                 source = sources[owner]
                 for value in (frame(), rtc.AudioFrame(data=b"\0\0" * 8800, sample_rate=16000, num_channels=1, samples_per_channel=8800)):
                     await audio.frames.put(value)
@@ -1443,7 +1450,13 @@ async def test_native_model_handoffs_keep_only_the_active_recognition_owner_boun
                     source.emit(vad.VADEventType.START_OF_SPEECH if value.samples_per_channel == 320 else vad.VADEventType.END_OF_SPEECH, frames=[observed], silence_duration=0 if value.samples_per_channel == 320 else 0.55)
                 assert await asyncio.wait_for(turns.get(), 3) == f"turn {index}"
                 assert models[1 - owner]._turn_binding is None
-            assert len(seen) == len(set(seen)) == 3
+                callback, depth = session._activity.on_end_of_turn, 0
+                while getattr(callback, "__name__", None) == "committed":
+                    depth += 1
+                    assert depth == 1, "live swaps must not retain callbacks owned by previous models"
+                    callback = inspect.getclosurevars(callback).nonlocals["original"]
+                assert depth == 1
+            assert len(seen) == len(set(seen)) == len(owners)
             assert all(not model._native_failed for model in models)
         finally:
             await audio.frames.put(None)
@@ -1452,6 +1465,88 @@ async def test_native_model_handoffs_keep_only_the_active_recognition_owner_boun
                 if recognition_model is not model:
                     await recognition_model.aclose()
             for model in models:
+                await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.skipif(not hasattr(Agent, "update_options"), reason="SDK predates live model option updates")
+@pytest.mark.parametrize("wrapper", ["direct", "multi_speaker", "fallback", "nested"])
+async def test_delayed_wrapped_native_node_preserves_actual_endpointing_after_live_model_swap(wrapper):
+    sources = [ControlledVAD(), ControlledVAD()]
+    node_waiting, resume_node = asyncio.Event(), asyncio.Event()
+    turns = asyncio.Queue()
+    terminal_at, seen = [], []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        index = len(seen) + 1
+        seen.append(request.headers["Idempotency-Key"])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": f"turn {index}"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                terminal_at.append(time.monotonic())
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        models = [STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source, diarization=wrapper in ("multi_speaker", "nested")) for source in sources]
+        wrapped = [wrap_native_stt(model, wrapper) for model in models]
+        session = AgentSession(llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0.3, max_endpointing_delay=0.3)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+
+        class OwnedAgent(Agent):
+            async def stt_node(self, audio, model_settings):
+                if self.stt is wrapped[1]:
+                    node_waiting.set()
+                    await resume_node.wait()
+                async for event in Agent.default.stt_node(self, audio, model_settings):
+                    yield event
+
+            async def on_user_turn_completed(self, turn_ctx, new_message):
+                turns.put_nowait(new_message.text_content)
+
+        async def boundary(source, value, kind, silence):
+            await audio.frames.put(value)
+            observed = await asyncio.wait_for(source.frames.get(), 3)
+            source.processed(observed)
+            source.emit(kind, frames=[observed], silence_duration=silence)
+
+        for model in models:
+            model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            agent = OwnedAgent(instructions="Owned delayed STT fixture", stt=wrapped[0])
+            await session.start(agent=agent, **options)
+            await boundary(sources[0], frame(), vad.VADEventType.START_OF_SPEECH, 0)
+            await boundary(sources[0], rtc.AudioFrame(data=b"\0\0" * 8800, sample_rate=16000, num_channels=1, samples_per_channel=8800), vad.VADEventType.END_OF_SPEECH, 0.55)
+            assert await asyncio.wait_for(turns.get(), 3) == "turn 1"
+            agent.update_options(stt=wrapped[1])
+            await asyncio.wait_for(node_waiting.wait(), 3)
+            # The real session receives audio while its custom STT node waits.
+            # Its input epoch therefore precedes the new stream by >0.3 s.
+            await audio.frames.put(frame())
+            await asyncio.sleep(0.65)
+            resume_node.set()
+            observed = await asyncio.wait_for(sources[1].frames.get(), 3)
+            sources[1].processed(observed)
+            sources[1].emit(vad.VADEventType.START_OF_SPEECH, frames=[observed])
+            await boundary(sources[1], rtc.AudioFrame(data=b"\0\0" * 320, sample_rate=16000, num_channels=1, samples_per_channel=320), vad.VADEventType.END_OF_SPEECH, 0.02)
+            assert await asyncio.wait_for(turns.get(), 3) == "turn 2"
+            assert time.monotonic() - terminal_at[1] >= 0.2, "a wrapped child cannot lose the input epoch and commit immediately"
+            assert len(seen) == len(set(seen)) == 2
+        finally:
+            resume_node.set()
+            await audio.frames.put(None)
+            await session.aclose()
+            for recognition_model, model in zip(wrapped, models):
+                if recognition_model is not model:
+                    await recognition_model.aclose()
                 await model.aclose()
             await client.aclose()
 

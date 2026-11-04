@@ -80,7 +80,11 @@ At speech end the request commits and closes; final transcript segments and
 `END_OF_SPEECH` are emitted only after terminal usage arrives. A final segment
 alone cannot complete a turn. `bind_session(session)` observes that session's
 actual synchronous turn acceptance, including `skip_reply=True`, and follows
-`update_agent()` handoffs. Public Agent lifecycle hooks remain untouched.
+`update_agent()` handoffs and live `Agent.update_options(stt=...)` swaps. The
+current activity has one turn owner; the old callback is restored before a new
+model binds. Native streams use the SDK's audio-input epoch even when an outer
+wrapper omits its child's time offset, preserving configured endpointing delays.
+Public Agent lifecycle hooks remain untouched.
 `bind_agent(agent)` locates the same session when its first stream starts.
 The owned SDK activity interface is checked before admission and before each
 turn's final transcript, including SDKs that retain a stream across handoff.
