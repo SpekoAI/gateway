@@ -74,6 +74,14 @@ native request, streaming audio and interim text while speech continues.
 Turn ownership follows transcript-preserving `stt.MultiSpeakerAdapter` and
 single-model `stt.FallbackAdapter` wrappers, including nested wrappers. An
 ambiguous native failure fences their later stream and recovery calls too.
+Whole-final speaker labels reach LiveKit's `speaker_id`; attributed segments
+become individual timed finals, with explicit segment labels taking precedence.
+Unlabeled segments inherit a whole-final label when present. Otherwise they
+remain unattributed. The MultiSpeaker wrapper can use these labels and timings
+for primary-speaker detection. Attributed segments must cover the final's full
+text in order; invalid attribution refuses the result and fences automatic retries.
+Speaker RMS lookup uses accepted audio positions, including after custom-node
+filtering; emitted transcript timestamps keep their original input positions.
 Multi-model fallback requires a control-plane recovery decision; wrappers
 that rewrite or suppress transcripts are refused before native admission.
 At speech end the request commits and closes; final transcript segments and
@@ -92,6 +100,10 @@ original PCM and userdata; the producer's frames remain untouched. Custom DSP
 that replaces a frame must preserve its userdata and duration. Repacketization
 that loses the source position is refused. Public Agent lifecycle hooks remain
 untouched; the owned processing-node and option-update hooks are restored on close.
+Handoffs release inactive Agent hooks so the Agent can join another session;
+the original session keeps its retained pipeline. A captured node stays inert
+after its last native owner closes, including SDK restarts for local STT.
+Duration-preserving DSP may deep-copy userdata without changing its source witness.
 `bind_agent(agent)` locates the same session when its first stream starts.
 The owned SDK activity interface is checked before admission and before each
 turn's final transcript, including SDKs that retain a stream across handoff.
