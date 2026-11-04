@@ -7,10 +7,54 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func TestNativeSocketPreservesLongValidStablePaths(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux sockaddr_un boundary")
+	}
+	for _, length := range []int{100, 107} {
+		t.Run(strconv.Itoa(length), func(t *testing.T) {
+			base, err := os.MkdirTemp("", "native-long-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(base)
+			parent := filepath.Join(base, strings.Repeat("d", length-len(base)-3))
+			if err = os.Mkdir(parent, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(parent, "s")
+			if len(path) != length {
+				t.Fatal("incorrect long socket fixture", len(path))
+			}
+			direct, err := net.Listen("unix", path)
+			if err != nil {
+				t.Fatal("stable path should bind without staging", err)
+			}
+			_ = direct.Close()
+			listener, err := ListenNativeUnix(path)
+			if err != nil {
+				t.Fatal("native staging broke a valid stable path", err)
+			}
+			defer listener.Close()
+			connection, err := net.Dial("unix", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = connection.Close()
+			if listener.Addr().String() != path {
+				t.Fatal("listener exposed its private binding path")
+			}
+		})
+	}
+}
 
 func TestNativeSocketCrashBeforePublicationNeverBlocksStablePath(t *testing.T) {
 	if path := os.Getenv("SPEKO_NATIVE_SOCKET_PUBLICATION_CHILD"); path != "" {
