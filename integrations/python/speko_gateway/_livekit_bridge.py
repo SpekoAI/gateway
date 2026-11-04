@@ -14,6 +14,7 @@ from .client import (
     GatewayError,
     SessionConfig,
 )
+from .relay_speech import RelaySpeechClient
 
 _INTEGRATION_VERSION = "0.1.0"
 
@@ -89,7 +90,9 @@ class LiveKitSTTBridge:
                 },
             )
         )
-        return LiveKitSTTStream(session)
+        return LiveKitSTTStream(
+            session, local_speakers=not isinstance(self._client, RelaySpeechClient)
+        )
 
 
 class LiveKitTTSBridge:
@@ -194,8 +197,9 @@ class LiveKitTTSStream:
 
 
 class LiveKitSTTStream:
-    def __init__(self, session: SpeechSession) -> None:
+    def __init__(self, session: SpeechSession, *, local_speakers: bool = False) -> None:
         self._session = session
+        self._local_speakers = local_speakers
 
     @property
     def request_id(self) -> str:
@@ -229,7 +233,7 @@ class LiveKitSTTStream:
         async for event in self._session.events():
             if event.type == "error":
                 raise _stream_error(event)
-            for mapped in _speech_events(event):
+            for mapped in _speech_events(event, local_speakers=self._local_speakers):
                 yield mapped
 
 
@@ -243,7 +247,9 @@ def _stream_error(event: CanonicalEvent) -> GatewayError:
     )
 
 
-def _speech_events(event: CanonicalEvent) -> tuple[LiveKitSpeechEvent, ...]:
+def _speech_events(
+    event: CanonicalEvent, *, local_speakers: bool = False
+) -> tuple[LiveKitSpeechEvent, ...]:
     if event.type not in {
         "speech.started",
         "speech.ended",
@@ -259,7 +265,7 @@ def _speech_events(event: CanonicalEvent) -> tuple[LiveKitSpeechEvent, ...]:
         end_time=_milliseconds(data.get("audio_end_ms")),
         provider_request_id=str(data.get("provider_request_id", "")),
         language=str(data.get("language", "")),
-        speaker_id=_speaker(data.get("speaker")),
+        speaker_id=_speaker(data.get("speaker"), local_speakers=local_speakers),
     )
     segments = data.get("segments")
     if (
@@ -302,15 +308,21 @@ def _speech_events(event: CanonicalEvent) -> tuple[LiveKitSpeechEvent, ...]:
                 text=segment["text"],
                 start_time=start,
                 end_time=end,
-                speaker_id=_speaker(segment.get("speaker")) or mapped.speaker_id,
+                speaker_id=_speaker(
+                    segment.get("speaker"), local_speakers=local_speakers
+                ) or mapped.speaker_id,
             )
         )
     return tuple(parts)
 
 
-def _speaker(value: Any) -> str | None:
+def _speaker(value: Any, *, local_speakers: bool = False) -> str | None:
     if value is None or value == "":
         return None
+    # The local Gateway's existing Modulate adapter uses JSON integer IDs.
+    # Native relay labels remain strings; bool is never a speaker identifier.
+    if local_speakers and type(value) is int:
+        return str(value)
     if not isinstance(value, str):
         raise GatewayError("Native speech attribution is invalid", retryable=False)
     return value

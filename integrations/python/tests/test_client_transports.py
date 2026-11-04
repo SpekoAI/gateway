@@ -6,11 +6,13 @@ import uuid
 from contextlib import asynccontextmanager
 from importlib.metadata import version
 from pathlib import Path
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
 from aiohttp import web
 
+from speko_gateway._livekit_bridge import LiveKitSTTBridge
 from speko_gateway.client import GatewayClient, SessionConfig
 from speko_gateway.relay import RelayError, RelayLLMClient
 
@@ -233,6 +235,41 @@ async def test_marker_is_not_a_global_aiohttp_default() -> None:
     assert len(seen) == 1
     assert seen[0].getall("User-Agent") == ["caller-fixture"]
     assert "Authorization" not in seen[0]
+
+
+@pytest.mark.parametrize("kind,speaker", [
+    ("transcript.delta", 2),
+    ("transcript.final", 2),
+    ("transcript.final", "A"),
+])
+async def test_local_gateway_preserves_modulate_speaker_labels(kind, speaker):
+    async def create(request):
+        await request.json()
+        return web.json_response({"stream_url": "/v1/sessions/fixture/stream"}, status=201)
+
+    async def websocket(request):
+        ws = web.WebSocketResponse(protocols=["speko.voice.v0.r3"])
+        await ws.prepare(request)
+        await ws.send_json({"type": kind, "data": {"text": "synthetic", "speaker": speaker}})
+        await ws.receive_json(timeout=3)
+        await ws.close()
+        return ws
+
+    app = web.Application()
+    app.router.add_post("/v1/sessions", create)
+    app.router.add_get("/v1/sessions/fixture/stream", websocket)
+    async with server(app, unix=True) as address:
+        client = GatewayClient(socket_path=address, local_auth_token="owned-local-speaker")
+        stream = None
+        try:
+            stream = await LiveKitSTTBridge(client).start(SimpleNamespace(sample_rate=16000, num_channels=1))
+            await stream.finish()
+            events = [event async for event in stream.events()]
+            assert [(event.type, event.text, event.speaker_id) for event in events] == [(kind, "synthetic", str(speaker))]
+        finally:
+            if stream is not None:
+                await stream.aclose()
+            await client.aclose()
 
 
 @pytest.mark.parametrize('status,code,retryable', [(403,'provider_not_entitled',False),(401,'authentication_failed',False),(429,'rate_limited',True),(503,'service_unavailable',True)])
