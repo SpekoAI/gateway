@@ -43,6 +43,7 @@ func TestNativeCLIProcess(t *testing.T) {
 	if os.Getenv("SPEKO_TEST_NATIVE_CLI_PROCESS") != "1" {
 		return
 	}
+	trustOwnedCLIPeer(t)
 	os.Args = []string{os.Args[0], "native"}
 	if err := run(); err != nil {
 		t.Fatal(err)

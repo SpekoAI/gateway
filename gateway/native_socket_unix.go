@@ -25,7 +25,7 @@ func listenNativeUnix(socketPath string, persist func(*os.File, nativeSocketOwne
 	refuse := func() (net.Listener, error) {
 		return nil, errors.New("gateway: native socket ownership or listener is unavailable")
 	}
-	if !filepath.IsAbs(socketPath) {
+	if !filepath.IsAbs(socketPath) || len(socketPath) >= len(syscall.RawSockaddrUnix{}.Path) {
 		return refuse()
 	}
 	dir, err := os.Lstat(filepath.Dir(socketPath))

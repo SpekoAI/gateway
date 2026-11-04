@@ -108,6 +108,25 @@ func TestNativeSocketPreservesLongValidStablePaths(t *testing.T) {
 	}
 }
 
+func TestNativeSocketRefusesUnaddressablePathsBeforePublication(t *testing.T) {
+	directory, err := os.MkdirTemp("", "native-invalid-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	for _, length := range []int{len(syscall.RawSockaddrUnix{}.Path), len(syscall.RawSockaddrUnix{}.Path) + 20} {
+		path := filepath.Join(directory, strings.Repeat("s", length-len(directory)-1))
+		if listener, err := ListenNativeUnix(path); err == nil {
+			_ = listener.Close()
+			t.Fatal("advertised an unaddressable socket", len(path))
+		}
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil || len(entries) != 0 {
+		t.Fatal("invalid socket path mutated its directory", entries, err)
+	}
+}
+
 func TestNativeSocketCrashBeforePublicationNeverBlocksStablePath(t *testing.T) {
 	if path := os.Getenv("SPEKO_NATIVE_SOCKET_PUBLICATION_CHILD"); path != "" {
 		_, err := listenNativeUnix(path, func(lock *os.File, owner nativeSocketOwner) error {
