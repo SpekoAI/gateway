@@ -76,6 +76,10 @@ original PCM and userdata; the producer's frames remain untouched. Custom DSP
 that replaces a frame must preserve its userdata and duration. Repacketization
 that loses the source position is refused. Public Agent lifecycle hooks remain
 untouched; the owned processing-node and option-update hooks are restored on close.
+Handoffs release inactive Agent hooks so the Agent can join another session;
+the original session keeps its retained pipeline. A captured node stays inert
+after its last native owner closes, including SDK restarts for local STT.
+Duration-preserving DSP may deep-copy userdata without changing its source witness.
 `bind_agent(agent)` locates the same session when its first stream starts.
 The owned SDK activity interface is checked before admission and before each
 turn's final transcript, including SDKs that retain a stream across handoff.

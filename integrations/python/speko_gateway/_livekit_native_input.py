@@ -44,9 +44,12 @@ class NativeInputTimeline:
         if (
             not isinstance(witness, _InputPosition)
             or witness.timeline is not self
-            or witness.duration != Fraction(frame.samples_per_channel, frame.sample_rate)
+            or witness.duration
+            != Fraction(frame.samples_per_channel, frame.sample_rate)
         ):
-            raise GatewayError("Native STT lost its audio input position", retryable=False)
+            raise GatewayError(
+                "Native STT lost its audio input position", retryable=False
+            )
         return witness.start
 
 
@@ -55,6 +58,11 @@ class _InputPosition:
     timeline: NativeInputTimeline
     start: Fraction
     duration: Fraction
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _InputPosition:
+        # The immutable occurrence belongs to its original timeline even
+        # when a duration-preserving DSP replacement deep-copies userdata.
+        return self
 
 
 _active: contextvars.ContextVar[NativeInputTimeline | None] = contextvars.ContextVar(
@@ -65,7 +73,9 @@ _active: contextvars.ContextVar[NativeInputTimeline | None] = contextvars.Contex
 def native_input_timeline(binding: NativeInputBinding | None) -> NativeInputTimeline:
     timeline = _active.get()
     if timeline is None or binding is None or timeline.scope is not binding.scope:
-        raise ValueError("Native STT requires its observed Agent input; explicit consumers use manual_turns=True")
+        raise ValueError(
+            "Native STT requires its observed Agent input; explicit consumers use manual_turns=True"
+        )
     return timeline
 
 
@@ -93,7 +103,9 @@ class NativeInputBinding:
         self._session: Any = None
         self._session_update: tuple[Any, Any] | None = None
         self._agents: dict[Any, _AgentHooks] = {}
-        self._timelines: weakref.WeakKeyDictionary[Any, NativeInputTimeline] = weakref.WeakKeyDictionary()
+        self._timelines: weakref.WeakKeyDictionary[Any, NativeInputTimeline] = (
+            weakref.WeakKeyDictionary()
+        )
 
     def attach_session(self, session: Any) -> NativeInputBinding:
         # Small recovery-pump fixtures do not implement an AgentSession's
@@ -112,8 +124,14 @@ class NativeInputBinding:
 
             @wraps(original)
             async def update(agent: Any, *args: Any, **kwargs: Any) -> Any:
-                self.attach_agent(agent)
-                return await original(agent, *args, **kwargs)
+                if self.owners:
+                    self.attach_agent(agent)
+                try:
+                    return await original(agent, *args, **kwargs)
+                finally:
+                    for previous_agent in list(self._agents):
+                        if getattr(previous_agent, "_activity", None) is None:
+                            self._detach_agent(previous_agent)
 
             session._update_activity = update
             self._session_update = (original, update)
@@ -124,7 +142,11 @@ class NativeInputBinding:
         return self
 
     def _join(self, other: NativeInputBinding) -> NativeInputBinding:
-        if self._session is not None and other._session is not None and self._session is not other._session:
+        if (
+            self._session is not None
+            and other._session is not None
+            and self._session is not other._session
+        ):
             raise ValueError("Native input binding cannot span AgentSessions")
         agents = list(self._agents)
         for owner in list(self.owners):
@@ -140,7 +162,9 @@ class NativeInputBinding:
         context = getattr(audio_recognition, "_STTPipelineContextVar", None)
         pipeline = context.get(None) if context is not None else None
         if pipeline is None:
-            recognition = getattr(getattr(session, "_activity", None), "_audio_recognition", None)
+            recognition = getattr(
+                getattr(session, "_activity", None), "_audio_recognition", None
+            )
             pipeline = getattr(recognition, "_stt_pipeline", None)
         key = pipeline if pipeline is not None else audio
         try:
@@ -154,7 +178,11 @@ class NativeInputBinding:
 
     def attach_agent(self, agent: Any) -> NativeInputBinding:
         activity = getattr(agent, "_activity", None)
-        if self._session is not None and activity is not None and activity.session is not self._session:
+        if (
+            self._session is not None
+            and activity is not None
+            and activity.session is not self._session
+        ):
             raise ValueError("Native input binding cannot span AgentSessions")
         previous = _lookup(_agents, agent)
         if previous is not None and previous is not self:
@@ -166,21 +194,34 @@ class NativeInputBinding:
 
             @wraps(original)
             async def node(audio: Any, settings: Any) -> Any:
-                binding = self.attach_session(agent.session)
-                timeline = binding._timeline(audio, agent.session)
+                # The SDK may retain this callable after release, then restart
+                # it for a local STT model. A closed owner must stay inert.
+                binding = self.attach_session(agent.session) if self.owners else None
+                timeline = (
+                    binding._timeline(audio, agent.session)
+                    if binding is not None
+                    else None
+                )
                 # This is the owned SDK pump's task context, inherited by
                 # wrapper child tasks. Each node invocation sets its scope.
-                _active.set(timeline)
+                if timeline is not None:
+                    _active.set(timeline)
 
                 async def observed() -> Any:
                     async for frame in audio:
-                        yield timeline.observe(frame) if isinstance(frame, rtc.AudioFrame) and binding.owners else frame
+                        yield (
+                            timeline.observe(frame)
+                            if timeline is not None
+                            and isinstance(frame, rtc.AudioFrame)
+                            and binding.owners
+                            else frame
+                        )
 
                 input_audio, iterator = observed(), None
                 try:
                     # Install the active model's instance wrapper fences
                     # before even an outer SDK wrapper creates its stream.
-                    for owner in list(binding.owners):
+                    for owner in list(binding.owners) if binding is not None else []:
                         owner._bind_native_activity()
                     result = original(input_audio, settings)
                     if inspect.isawaitable(result):
@@ -209,7 +250,8 @@ class NativeInputBinding:
 
             @wraps(original_update)
             def update(*args: Any, **kwargs: Any) -> Any:
-                self.attach_agent(agent)
+                if self.owners:
+                    self.attach_agent(agent)
                 return original_update(*args, **kwargs)
 
             hooks.original_update, hooks.update = original_update, update
@@ -221,6 +263,15 @@ class NativeInputBinding:
         if not self.owners:
             self._restore()
 
+    def _detach_agent(self, agent: Any) -> None:
+        hooks = self._agents.pop(agent)
+        if agent.stt_node is hooks.node:
+            agent.stt_node = hooks.original_node
+        if hooks.update is not None and agent.update_options is hooks.update:
+            agent.update_options = hooks.original_update
+        if _lookup(_agents, agent) is self:
+            del _agents[agent]
+
     def _restore(self) -> None:
         if self._session_update is not None:
             original, update = self._session_update
@@ -229,18 +280,16 @@ class NativeInputBinding:
             if _lookup(_sessions, self._session) is self:
                 del _sessions[self._session]
             self._session_update = None
-        for agent, hooks in self._agents.items():
-            if agent.stt_node is hooks.node:
-                agent.stt_node = hooks.original_node
-            if hooks.update is not None and agent.update_options is hooks.update:
-                agent.update_options = hooks.original_update
-            if _lookup(_agents, agent) is self:
-                del _agents[agent]
-        self._agents.clear()
+        for agent in list(self._agents):
+            self._detach_agent(agent)
 
 
-def bind_native_input(owner: Any, *, agent: Any = None, session: Any = None) -> NativeInputBinding:
-    binding = _lookup(_sessions, session) if session is not None else _lookup(_agents, agent)
+def bind_native_input(
+    owner: Any, *, agent: Any = None, session: Any = None
+) -> NativeInputBinding:
+    binding = (
+        _lookup(_sessions, session) if session is not None else _lookup(_agents, agent)
+    )
     if binding is None:
         binding = NativeInputBinding()
     binding.owners.add(owner)

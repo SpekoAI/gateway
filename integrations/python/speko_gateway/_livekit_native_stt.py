@@ -48,6 +48,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._bridge = bridge
         self._language = language
         self._sample_rate = sample_rate
+        self._close_task: asyncio.Task[None] | None = None
         self._turn_vad = turn_vad
         self._input_timeline = input_timeline
         self._received_duration = Fraction(0)
@@ -196,6 +197,15 @@ class NativeSpeechStream(stt.RecognizeStream):
             if self._turn_commit is not None:
                 self._turn_commit.cancel()
             self._turn_text = ""
+
+    async def aclose(self) -> None:
+        # A live model swap and STT.aclose can both close the retained stream.
+        # Cancel its pump once, then let every closer join the same cleanup.
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                super().aclose(), name="speko.native.stt.close"
+            )
+        await asyncio.shield(self._close_task)
 
     async def _feed(self) -> None:
         async for frame in self._input_ch:
