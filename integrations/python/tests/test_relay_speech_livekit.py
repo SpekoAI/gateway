@@ -167,6 +167,18 @@ def wrap_native_stt(model, wrapper):
     return model
 
 
+def assert_request_speakers(finals):
+    identities = {}
+    for data in finals:
+        label = data.provider_speaker_id
+        if label is None:
+            assert data.speaker_id is None
+        else:
+            assert data.speaker_id and data.speaker_id != label
+            assert identities.setdefault(label, data.speaker_id) == data.speaker_id
+    assert len(set(identities.values())) == len(identities)
+
+
 @pytest.mark.parametrize(
     "gap,speech_duration,terminal_delay",
     [(0.35, 0.02, 0.35), (0.224, 0.064, 0.35), (1.0, 0.064, 1.0)],
@@ -1990,7 +2002,8 @@ async def test_native_actual_agent_preserves_provider_speakers_through_supported
             assert await asyncio.wait_for(turns.get(), 3) == "one two"
             if attribution != "whole_final":
                 expected = [(text, speaker, start + prefix_frames * 0.02, end + prefix_frames * 0.02) for text, speaker, start, end in expected]
-            assert [(item.text, item.speaker_id) for item in finals] == [(text, speaker) for text, speaker, _, _ in expected]
+            assert [(item.text, item.provider_speaker_id) for item in finals] == [(text, speaker) for text, speaker, _, _ in expected]
+            assert_request_speakers(finals)
             if attribution == "whole_final":
                 assert [(item.start_time, item.end_time) for item in finals] == [(0.0, 0.0)]
             else:
@@ -2583,7 +2596,8 @@ async def test_valid_native_segments_keep_canonical_text_and_available_speakers(
             assert not model._native_failed
             assert all(not stream._final_batches for stream in model._streams)
             expected = {None, "C"} if shape == "ambiguous" else {"A", None} if shape == "partial" else {"A", "B"}
-            assert {data.speaker_id for data in finals} >= expected
+            assert {data.provider_speaker_id for data in finals} >= expected
+            assert_request_speakers(finals)
             if shape == "ambiguous":
                 assert all(data.speaker_id is None for data in finals if "yes" in data.text)
             assert "".join("".join(data.text.split()) for data in finals) == "".join(text.split())
@@ -2598,6 +2612,64 @@ async def test_valid_native_segments_keep_canonical_text_and_available_speakers(
                 bound_recognition, original, _ = transcript_binding
                 assert getattr(bound_recognition, original.__name__) is original
                 assert model._native_transcript_binding is None
+
+
+@pytest.mark.parametrize("wrapper", ["multi_speaker", "nested"])
+async def test_native_request_speakers_are_independent_and_reset_primary_detection(wrapper):
+    source, turns, finals, requests = ControlledVAD(), asyncio.Queue(), [], []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        requests.append(request.headers["Idempotency-Key"])
+        text = f"speaker {len(requests)}"
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": text, "segments": [{"text": text, "speaker": "A", "start_ms": 0, "end_ms": 600}]})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async for event in Agent.default.stt_node(self, audio, settings):
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    finals.extend(event.alternatives)
+                yield event
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source, diarization=True)
+        wrapped = wrap_native_stt(model, wrapper)
+        session = AgentSession(stt=wrapped, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned request-local speakers"), **options)
+            for index, pcm in enumerate([b"\xff\x7f", b"\x20\x00"]):
+                for samples, kind in [(9600, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                    await audio.frames.put(rtc.AudioFrame(data=(pcm if samples == 9600 else b"\0\0") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples))
+                    observed = await asyncio.wait_for(source.frames.get(), 3)
+                    source.processed(observed)
+                    source.emit(kind, frames=[observed], silence_duration=0 if samples == 9600 else 0.55)
+                assert await asyncio.wait_for(turns.get(), 3) == f"speaker {index + 1}"
+            assert len(requests) == len(set(requests)) == len(finals) == 2
+            assert finals[0].speaker_id != finals[1].speaker_id, "the same vendor label in two requests is not a persistent speaker identity"
+            assert [data.provider_speaker_id for data in finals] == ["A", "A"]
+            assert [data.is_primary_speaker for data in finals] == [True, True], "primary detection must restart for a new request's identity space"
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            await wrapped.aclose()
+            await model.aclose()
+            await client.aclose()
 
 
 @pytest.mark.skipif(not hasattr(Agent, "update_options"), reason="SDK predates live model option updates")
@@ -2785,7 +2857,8 @@ async def test_native_recognize_preserves_canonical_text_and_attributed_spans(pa
             assert data.canonical_text == text
             assert data._native_final is None
             attributed = [part for part in data.speaker_segments if part.speaker_id is not None]
-            assert [(part.text, part.speaker_id) for part in attributed] == [(part["text"], part["speaker"]) for part in segments]
+            assert [(part.text, part.provider_speaker_id) for part in attributed] == [(part["text"], part["speaker"]) for part in segments]
+            assert_request_speakers(data.speaker_segments)
             if partial:
                 assert any(part.text.strip() == "world" and part.speaker_id is None for part in data.speaker_segments)
         finally:

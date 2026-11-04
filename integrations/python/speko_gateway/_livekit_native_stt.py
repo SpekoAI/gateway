@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import uuid
 from bisect import bisect_left, bisect_right
 from collections.abc import Awaitable, Callable
 from fractions import Fraction
@@ -89,6 +90,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._finals: list[LiveKitSpeechEvent] = []
         self._final_chars = 0
         self._request_id = utils.shortuuid()
+        self._speaker_scope = ""
         self._finishing = False
         self._input_finished = False
         self._admission_started = False
@@ -432,6 +434,9 @@ class NativeSpeechStream(stt.RecognizeStream):
 
     async def _open(self, raw: bytes) -> None:
         self._check_admission()
+        # Provider labels belong to this physical request. A provider request
+        # ID may be reused; generate an independent full-width namespace.
+        self._speaker_scope = uuid.uuid4().hex
         self._finishing = False
         self._finals = []
         self._final_chars = 0
@@ -477,7 +482,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         data = NativeSpeechData(
             language=event.language or self._language,
             text=event.text,
-            speaker_id=event.speaker_id,
+            speaker_id=f"{self._speaker_scope}:{event.speaker_id}" if event.speaker_id is not None else None,
             start_time=self._source_time(offset + Fraction(str(event.start_time)))
             if event.start_time is not None
             else 0.0,
@@ -486,6 +491,8 @@ class NativeSpeechStream(stt.RecognizeStream):
             else 0.0,
         )
         data.canonical_text = event.canonical_text
+        data.provider_speaker_id = event.speaker_id
+        data._native_speaker_scope = self._speaker_scope
         if event.start_time is not None and event.end_time is not None:
             data._native_input_times = (
                 float(offset) + event.start_time,

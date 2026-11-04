@@ -52,6 +52,12 @@ single-model `stt.FallbackAdapter` wrappers, including nested wrappers. An
 ambiguous native failure fences their later stream and recovery calls too.
 Whole-final speaker labels reach LiveKit's `speaker_id`; attributed segments
 become individual timed finals, with explicit segment labels taking precedence.
+Native `speaker_id` values are opaque identities scoped to each physical
+request; the original vendor label is available as `provider_speaker_id`.
+The same vendor label in a later request does not identify the same person.
+MultiSpeaker primary selection restarts in that request's identity space,
+while its accepted PCM history and timeline remain intact. Local Gateway
+speaker identities keep their existing stream semantics.
 Unlabeled segments inherit a whole-final label when present. Otherwise they
 remain unattributed. The MultiSpeaker wrapper can use these labels and timings
 for primary-speaker detection. The complete provider final stays authoritative:
