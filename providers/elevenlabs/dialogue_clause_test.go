@@ -3,6 +3,7 @@ package elevenlabs
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -278,5 +279,21 @@ func TestDialogueSocketEndFinishesAFullyFlushedTurn(t *testing.T) {
 	pending.committed.Store(true)
 	if events, _, _ := pending.apply(dialogueItem{ended: true}); len(events) != 0 {
 		t.Fatalf("socket end with a final pending emitted %v", eventTypes(events))
+	}
+}
+
+// A close without a status frame reaches the pump as a read error, and it can
+// overtake commitDone the same way a normal close does.
+func TestDialogueStatuslessCloseFinishesAFullyFlushedTurn(t *testing.T) {
+	t.Parallel()
+	s := &dialogueStream{speaking: true}
+	s.committed.Store(true)
+	s.closed.Store(true)
+	events, _, terminal := s.apply(dialogueItem{err: errors.New("read: EOF")})
+	if !terminal {
+		t.Fatal("read error did not end the stream")
+	}
+	if got := strings.Join(eventTypes(events), ","); got != "audio.done" {
+		t.Fatalf("events = %q, want audio.done", got)
 	}
 }

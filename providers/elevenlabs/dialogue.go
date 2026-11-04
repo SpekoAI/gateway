@@ -877,16 +877,17 @@ func (s *dialogueStream) apply(item dialogueItem) ([]runtimepkg.ProviderEvent, c
 			return nil, s.superseded, false
 		}
 		return []runtimepkg.ProviderEvent{s.finishTurn(nil)}, s.superseded, false
-	case item.ended:
-		// A graceful close can end the socket before the commitDone item for
-		// a fully flushed turn reaches the pump (LiveKit closes right after
-		// committing). That turn is complete, so it still gets its audio.done.
+	case item.ended, item.err != nil:
+		// A close can end the socket before the commitDone item for a fully
+		// flushed turn reaches the pump (LiveKit closes right after
+		// committing), and a close without a status frame arrives as a read
+		// error. That turn is complete either way, so it gets its audio.done
+		// before anything else.
 		if s.committed.Load() && s.pendingFlushes == 0 && s.speaking {
-			events = []runtimepkg.ProviderEvent{s.finishTurn(nil)}
+			events = append(events, s.finishTurn(nil))
 		}
-	case item.err != nil:
-		if !s.closed.Load() {
-			events = []runtimepkg.ProviderEvent{{Err: item.err}}
+		if item.err != nil && !s.closed.Load() {
+			events = append(events, runtimepkg.ProviderEvent{Err: item.err})
 		}
 	default:
 		var err error
