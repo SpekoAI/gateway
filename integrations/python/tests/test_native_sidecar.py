@@ -294,7 +294,7 @@ async def test_actual_native_sidecar_accepts_large_livekit_vad_audio(
             turn_vad=source,
             sample_rate=48000,
         )
-        stream = model.stream()
+        stream = model.stream(manual_turns=True)
         try:
             stream.push_frame(prefix)
             await asyncio.wait_for(source.frames.get(), 3)
