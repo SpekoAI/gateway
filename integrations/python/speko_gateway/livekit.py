@@ -629,10 +629,7 @@ class TTS(tts.TTS):
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
-        for session in list(self._standbys):
-            self._retire(session)
-        if self._closing:
-            await asyncio.wait(self._closing)
+        await self._release_standbys()
         if self._owns_client:
             await self._client.aclose()
 
@@ -674,6 +671,14 @@ class TTS(tts.TTS):
         if timer is not None:
             timer.cancel()
             self._close_soon(session)
+
+    async def _release_standbys(self) -> bool:
+        held = bool(self._standbys or self._closing)
+        for session in list(self._standbys):
+            self._retire(session)
+        if self._closing:
+            await asyncio.wait(self._closing)
+        return held
 
     def _close_soon(self, session: _TTSSession) -> asyncio.Task[None]:
         task = asyncio.create_task(session.aclose(), name="speko.livekit.tts.close")
@@ -768,7 +773,15 @@ class SynthesisStream(tts.SynthesizeStream):
                 return
             self._plugin._close_soon(standby)
         self._session = _TTSSession(self._bridge)
-        stream = await self._session.stream()
+        try:
+            stream = await self._session.stream()
+        except GatewayError:
+            # A standby that is still opening or closing can hold the Gateway
+            # slot or the credit this reply needs, so free them and try again.
+            if not await self._plugin._release_standbys():
+                raise
+            self._session = _TTSSession(self._bridge)
+            stream = await self._session.stream()
         # The next standby opens only now, so it cannot take the Gateway slot
         # this reply's own open needs.
         self._plugin._fill_standbys()

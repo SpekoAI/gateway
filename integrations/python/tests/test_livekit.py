@@ -1446,6 +1446,25 @@ async def test_tts_reply_opens_before_the_next_standby() -> None:
     assert gateway.nothing_left_open()
 
 
+async def test_tts_reply_waits_for_a_retired_standby_to_free_the_slot() -> None:
+    gateway = FakeGateway(capacity=1)
+    gateway.opens_allowed.clear()
+    plugin = TTS(gateway, language="en")  # type: ignore[arg-type]
+    plugin.prewarm()
+    await until(lambda: gateway.opens == 1)
+    plugin.update_options(language="hi")
+    asyncio.get_running_loop().call_later(0.1, gateway.opens_allowed.set)
+
+    _, audio = await speak(plugin, "namaste")
+
+    assert audio, "the reply opened once the retired standby freed the slot"
+    (spoken,) = gateway.spoken()
+    assert spoken.request["language"] == "hi"
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
 @pytest.mark.parametrize("path", ["standby", "opening-standby", "fresh"])
 async def test_tts_ttfb_counts_from_the_text_the_provider_got(path: str) -> None:
     gateway = FakeGateway(open_delay=0.6, answer_delay=0.05)
