@@ -81,6 +81,36 @@ def native_binary(tmp_path_factory, pytestconfig):
     return binary, certificate, context, image
 
 
+async def wait_for_container_start(name, process):
+    # OCI startup belongs to the Docker daemon. Start the application's own
+    # readiness budget only after the daemon reports its process running.
+    deadline = asyncio.get_running_loop().time() + 30
+    while True:
+        if process.returncode is not None:
+            raise RuntimeError(f"Native container command exited: {process.returncode}")
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError("Docker did not report the native container running")
+        inspect = await asyncio.create_subprocess_exec(
+            "docker", "inspect", "--format", "{{json .State}}", name,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            state, _ = await asyncio.wait_for(inspect.communicate(), min(5, remaining))
+        except asyncio.TimeoutError:
+            if inspect.returncode is None:
+                inspect.kill()
+            await inspect.wait()
+            raise TimeoutError("Docker inspection timed out during native startup") from None
+        if inspect.returncode == 0:
+            value = json.loads(state)
+            if value["Running"]:
+                return
+            if value["Status"] in {"exited", "dead", "removing"}:
+                raise RuntimeError(f"Native container stopped during startup: {value['ExitCode']}")
+        await asyncio.sleep(0.05)
+
+
 @asynccontextmanager
 async def native_stack(native_binary, handler, *, crash_once=False):
     binary, certificate, tls, image = native_binary
@@ -151,25 +181,32 @@ async def native_stack(native_binary, handler, *, crash_once=False):
                     stderr=asyncio.subprocess.STDOUT,
                 )
                 output = asyncio.create_task(process.stdout.read())
+                if container_name is not None:
+                    await wait_for_container_start(container_name, process)
                 async with aiohttp.ClientSession(
                     connector=aiohttp.UnixConnector(path=socket_path)
                 ) as probe:
                     deadline = asyncio.get_running_loop().time() + 5
+                    last_status = None
                     while True:
                         if process.returncode is not None:
                             raise RuntimeError(
-                                "Native Gateway command exited during startup"
+                                f"Native Gateway command exited during startup: {process.returncode}"
                             )
                         try:
                             async with probe.get(
-                                "http://speko-gateway/readyz"
+                                "http://speko-gateway/readyz",
+                                timeout=aiohttp.ClientTimeout(
+                                    total=max(0.001, deadline - asyncio.get_running_loop().time())
+                                ),
                             ) as response:
+                                last_status = response.status
                                 if response.status == 200:
                                     break
-                        except aiohttp.ClientError:
+                        except (aiohttp.ClientError, asyncio.TimeoutError):
                             pass
                         if asyncio.get_running_loop().time() > deadline:
-                            raise TimeoutError("Native Gateway did not start")
+                            raise TimeoutError(f"Native Gateway readiness timed out (last HTTP status: {last_status})")
                         await asyncio.sleep(0.01)
                 if crash_once and boot == 0:
                     if container_name is None:
