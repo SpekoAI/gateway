@@ -119,15 +119,42 @@ class ControlledVADStream(vad.VADStream):
 
 
 class OwnedAudioInput(io.AudioInput):
-    def __init__(self):
+    def __init__(self, *, track_delivery=False):
         super().__init__(label="owned-native-input")
         self.frames = asyncio.Queue()
+        self.delivery = asyncio.get_running_loop().create_future() if track_delivery else None
+        self._delivery_scheduled = False
 
     async def __anext__(self):
         value = await self.frames.get()
         if value is None:
             raise StopAsyncIteration
+        if self.delivery is not None and not self._delivery_scheduled:
+            self._delivery_scheduled = True
+            lower = time.time()
+            asyncio.get_running_loop().call_soon(self._record_delivery, lower)
         return value
+
+    def _record_delivery(self, lower):
+        if not self.delivery.done():
+            self.delivery.set_result((lower, time.time()))
+
+
+def input_epoch(session):
+    recorder = getattr(session, "_recorder_io", None)
+    return getattr(recorder, "recording_started_at", None) or session._started_at
+
+
+async def assert_source_times(session, audio, actual, expected):
+    legacy = not hasattr(session._activity._audio_recognition, "_input_started_at")
+    if legacy:
+        lower, upper = await asyncio.wait_for(asyncio.shield(audio.delivery), 3)
+        epoch = input_epoch(session)
+        assert len(actual) == len(expected)
+        for value, offset in zip(actual, expected):
+            assert lower - epoch + offset - 1 / 16000 <= value <= upper - epoch + offset + 1 / 16000
+    else:
+        assert actual == pytest.approx(expected, abs=1 / 16000)
 
 
 def wrap_native_stt(model, wrapper):
@@ -291,6 +318,104 @@ async def test_actual_agent_session_commits_complete_native_turns_after_delayed_
             await session.aclose()
             await model.aclose()
             await client.aclose()
+
+
+@pytest.mark.parametrize("wrapper", ["direct", "multi_speaker", "fallback", "nested"])
+@pytest.mark.parametrize("buffered,replace_input", [
+    pytest.param(False, False, id="fresh"),
+    pytest.param(True, False, id="buffered"),
+    pytest.param(False, True, id="replaced_input"),
+])
+@pytest.mark.parametrize("binding", ["session", "agent"])
+async def test_native_initial_node_timestamps_follow_the_sdk_input_epoch(wrapper, buffered, replace_input, binding):
+    source, waiting, resume = ControlledVAD(), asyncio.Event(), asyncio.Event()
+    turns, positions = asyncio.Queue(), []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "complete", "segments": [{"text": "complete", "start_ms": 0, "end_ms": 20}]})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            if replace_input:
+                await anext(audio)
+            waiting.set()
+            await resume.wait()
+            async for event in Agent.default.stt_node(self, audio, settings):
+                if event.type in (stt.SpeechEventType.FINAL_TRANSCRIPT, stt.SpeechEventType.END_OF_SPEECH):
+                    positions.append(event.alternatives[0].end_time)
+                yield event
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source, diarization=wrapper in ("multi_speaker", "nested"))
+        recognition_model = wrap_native_stt(model, wrapper)
+        session = AgentSession(stt=recognition_model, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0.05, max_endpointing_delay=0.05)
+        audio = OwnedAudioInput(track_delivery=True)
+        session.input.audio = audio
+        if replace_input:
+            await audio.frames.put(frame())
+        original_forward = session._forward_audio_task
+        agent = OwnedAgent(instructions="Owned initial input epoch")
+        if binding == "session":
+            model.bind_session(session)
+        else:
+            model.bind_agent(agent)
+        first_frame = frame()
+        first_frame.userdata["producer"] = {"fixture": "original"}
+        original_data = bytes(first_frame.data)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=agent, **options)
+            await asyncio.wait_for(waiting.wait(), 3)
+            if replace_input:
+                await asyncio.sleep(0.35)
+                audio = OwnedAudioInput(track_delivery=True)
+                session.input.audio = audio
+            if buffered:
+                await audio.frames.put(first_frame)
+                # Establish delivery before delaying the node: its startup
+                # cannot legitimately move this buffered frame's timestamp.
+                await asyncio.wait_for(asyncio.shield(audio.delivery), 3)
+            await asyncio.sleep(0.35)
+            resume.set()
+            if not buffered:
+                await audio.frames.put(first_frame)
+            observed = await asyncio.wait_for(source.frames.get(), 3)
+            source.processed(observed)
+            source.emit(vad.VADEventType.START_OF_SPEECH, frames=[observed])
+            await audio.frames.put(rtc.AudioFrame(data=b"\0\0" * 320, sample_rate=16000, num_channels=1, samples_per_channel=320))
+            observed = await asyncio.wait_for(source.frames.get(), 3)
+            source.processed(observed)
+            source.emit(vad.VADEventType.END_OF_SPEECH, frames=[observed], silence_duration=0.02)
+            assert await asyncio.wait_for(turns.get(), 3) == "complete"
+            assert len(positions) == 2
+            legacy = not hasattr(session._activity._audio_recognition, "_input_started_at")
+            end = 0.04 if replace_input and not legacy else 0.02
+            await assert_source_times(session, audio, positions, [end, end])
+            assert first_frame.userdata == {"producer": {"fixture": "original"}}
+            assert bytes(first_frame.data) == original_data
+        finally:
+            resume.set()
+            await audio.frames.put(None)
+            await session.aclose()
+            if recognition_model is not model:
+                await recognition_model.aclose()
+            await model.aclose()
+            await client.aclose()
+            assert session._forward_audio_task == original_forward
+            assert session.input.audio is None
 
 
 @pytest.mark.parametrize("own_vad", [False, True])
@@ -1818,7 +1943,7 @@ async def test_native_actual_agent_preserves_provider_speakers_through_supported
         model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source, diarization=True)
         recognition_model = wrap_native_stt(model, wrapper)
         session = AgentSession(llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
-        audio = OwnedAudioInput()
+        audio = OwnedAudioInput(track_delivery=True)
         session.input.audio = audio
 
         class OwnedAgent(Agent):
@@ -1859,8 +1984,11 @@ async def test_native_actual_agent_preserves_provider_speakers_through_supported
             if attribution != "whole_final":
                 expected = [(text, speaker, start + prefix_frames * 0.02, end + prefix_frames * 0.02) for text, speaker, start, end in expected]
             assert [(item.text, item.speaker_id) for item in finals] == [(text, speaker) for text, speaker, _, _ in expected]
-            assert [item.start_time for item in finals] == pytest.approx([start for _, _, start, _ in expected])
-            assert [item.end_time for item in finals] == pytest.approx([end for _, _, _, end in expected])
+            if attribution == "whole_final":
+                assert [(item.start_time, item.end_time) for item in finals] == [(0.0, 0.0)]
+            else:
+                await assert_source_times(session, audio, [item.start_time for item in finals], [start for _, _, start, _ in expected])
+                await assert_source_times(session, audio, [item.end_time for item in finals], [end for _, _, _, end in expected])
             if wrapper in ("multi_speaker", "nested") and attribution != "whole_final":
                 assert [item.is_primary_speaker for item in finals] == [True, None if attribution == "unattributed" else attribution in ("inherited", "louder")]
         finally:
@@ -1952,6 +2080,73 @@ async def test_detached_agent_can_run_in_second_session_without_disrupting_retai
             for client in clients:
                 await client.aclose()
             assert first.stt_node == original_node
+
+
+@pytest.mark.parametrize("binding", ["session", "agent"])
+async def test_native_source_observer_releases_its_owned_hooks_after_local_handoff(binding):
+    class LocalSTT(stt.STT):
+        def __init__(self):
+            super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=False))
+            self.started, self.frames = asyncio.Queue(), asyncio.Queue()
+
+        async def _recognize_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def stream(self, *, language=None, conn_options=DEFAULT_API_CONNECT_OPTIONS):
+            return LocalStream(stt=self, conn_options=conn_options)
+
+    class LocalStream(stt.RecognizeStream):
+        async def _run(self):
+            self._stt.started.put_nowait(self)
+            async for value in self._input_ch:
+                if isinstance(value, rtc.AudioFrame):
+                    self._stt.frames.put_nowait(value)
+
+    source = ControlledVAD()
+    client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url="http://127.0.0.1:1")
+    model, local = STT(client, turn_vad=source), LocalSTT()
+    session = AgentSession(stt=model, llm=None, tts=None, vad=None)
+    audio = OwnedAudioInput()
+    session.input.audio = audio
+    agent = Agent(instructions="Owned native input lifecycle")
+    original_node, original_forward = agent.stt_node, session._forward_audio_task
+    if binding == "session":
+        model.bind_session(session)
+    else:
+        model.bind_agent(agent)
+    try:
+        options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+        await session.start(agent=agent, **options)
+        await audio.frames.put(frame())
+        await asyncio.wait_for(source.frames.get(), 3)
+        captured_source = session.input.audio
+        legacy = not hasattr(session._activity._audio_recognition, "_input_started_at")
+        if legacy:
+            assert captured_source is not audio
+        session.update_agent(Agent(instructions="Owned local input lifecycle", stt=local))
+        await asyncio.wait_for(local.started.get(), 3)
+        owned_binding = model._native_input_binding
+        await model.aclose()
+        assert session.input.audio is audio
+        assert session._forward_audio_task == original_forward
+        assert agent.stt_node == original_node
+
+        value = frame()
+        value.userdata["producer"] = "untouched"
+        await audio.frames.put(value)
+        observed = await asyncio.wait_for(local.frames.get(), 3)
+        assert bytes(observed.data) == bytes(value.data)
+        assert observed.userdata == {"producer": "untouched"}
+        assert session.input.audio is audio
+        assert session._forward_audio_task == original_forward
+        assert not owned_binding.owners
+        assert model._native_input_binding is None
+    finally:
+        await audio.frames.put(None)
+        await session.aclose()
+        await model.aclose()
+        await local.aclose()
+        await client.aclose()
 
 
 @pytest.mark.skipif(not hasattr(Agent, "update_options"), reason="SDK predates live model option updates")
