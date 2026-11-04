@@ -124,6 +124,15 @@ already-buffered occurrences keep their timestamps. The public input keeps its
 identity, iterator setup and idempotent assignment behavior; modern SDKs use
 their pipeline clock without a source observer.
 
+Detaching and reattaching the same legacy input includes its elapsed gap;
+adding a continuous delegate keeps its existing clock. An owned instance read
+hook observes capture before a delegate can hold a frame. Capture positions stay
+absolute until recognition translates them into the session/recording epoch,
+including the recorder's first-frame epoch publication. Restarting the session
+resets its source scope and clock rather than inheriting the previous run's end.
+Read hooks restore when their captured source pump ends; input-change hooks
+restore with the final native owner.
+
 SDK-generated flush audio is observed at recognition ingress. It retains its
 PCM duration for recognition and VAD, but occupies no captured-media time:
 its source position stays at the last real ingress. Resumed real input and
