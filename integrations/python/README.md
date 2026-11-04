@@ -198,7 +198,9 @@ or source timestamp mapping. Speech/silence minimums and hysteresis use the
 detector's configured thresholds and real sample durations; virtual padding
 cannot create a start/end boundary or clear a possible onset by itself.
 An unresolved native onset fails with a control-plane recovery error after one
-second. Paused capture cannot hold the previous turn indefinitely or classify
+second without real inference progress. Each acknowledged real span renews this
+stall deadline, so continuous speech can reach configured minimums above one
+second. Padding-only inference never renews it. Paused capture cannot hold the previous turn indefinitely or classify
 unprocessed continuation speech as silence. This failure never retries admission.
 Continuous input retains normal inference cadence. Padding is bounded
 independently from the real-input backlog, and a final drain completes remaining
@@ -229,9 +231,12 @@ stt.bind_session(session)
 `DrainingVAD` supports the installed local-inference and Silero VADs, with
 independent state per stream. It preserves captured PCM in inference/boundary
 events, applies the underlying detector's current duration thresholds, and
-drains accounting before a hard `flush()` resets the segment. Flush immediately
-fences outstanding pre-boundary events, including events already queued for a
-consumer; only new segment activity can reach the framework afterward. Pending
+resets the detector at `flush()`. Flush fences already classified old-segment
+events and closes a delivered VAD segment without inventing audio or silence.
+Unprocessed real capture is recovered from the ordered ledger and classified
+again with fresh detector state and duration counters. This preserves resumed
+speech captured before a delayed STT end; old speech durations cannot become a
+new interruption. Recovery never replays detector-only padding. Pending
 real tails rearm after in-flight padding completes, with no packet-duration delay.
 Public sample indexes use the detector's inference rate, while event PCM retains
 its captured rate. Interruption durations include captured silence while the

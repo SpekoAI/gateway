@@ -58,6 +58,9 @@ class _DrainingVADStream(vad.VADStream):
         self._inner = None
         self._probability = None
         self._segment = self._flushes = 0
+        self._idle_at = 0.0
+        self._outward_speaking = False
+        self._outward_last = None
         self._published: deque[tuple[vad.VADEvent, int]] = deque()
         super().__init__(parent)
 
@@ -77,6 +80,12 @@ class _DrainingVADStream(vad.VADStream):
         super().push_frame(frame)
         self._sample_rate = frame.sample_rate
         self._queued += frame.samples_per_channel
+        interval = self._source.capabilities.update_interval
+        if not math.isfinite(interval) or interval <= 0:
+            raise GatewayError(
+                "Invalid local speech inference interval", retryable=False
+            )
+        self._idle_at = asyncio.get_running_loop().time() + 2 * interval
 
     def end_input(self) -> None:
         # Drain actual queued audio before the inner SDK's reset marker.
@@ -89,6 +98,23 @@ class _DrainingVADStream(vad.VADStream):
         # Fence publication synchronously at the framework's boundary. The
         # queued marker still drains accounting and resets the owned detector.
         self._flushes += 1
+        if self._outward_speaking:
+            # Explicitly close the delivered segment. This is the requested
+            # reset, without new inferred audio or invented silence. Pending
+            # real capture is classified again with fresh duration counters.
+            previous = self._outward_last
+            self._emit(
+                vad.VADEvent(
+                    type=vad.VADEventType.END_OF_SPEECH,
+                    timestamp=previous.timestamp,
+                    samples_index=previous.samples_index,
+                    speech_duration=previous.speech_duration,
+                    silence_duration=previous.silence_duration,
+                    frames=[],
+                    speaking=False,
+                ),
+                segment=self._flushes,
+            )
 
     async def __anext__(self) -> vad.VADEvent:
         while True:
@@ -97,6 +123,11 @@ class _DrainingVADStream(vad.VADStream):
             if event is not original:
                 raise GatewayError("Local speech event order changed", retryable=False)
             if segment == self._flushes:
+                self._outward_last = event
+                if event.type is vad.VADEventType.START_OF_SPEECH:
+                    self._outward_speaking = True
+                elif event.type is vad.VADEventType.END_OF_SPEECH:
+                    self._outward_speaking = False
                 return event
 
     async def aclose(self) -> None:
@@ -105,8 +136,8 @@ class _DrainingVADStream(vad.VADStream):
         finally:
             self._published.clear()
 
-    def _emit(self, event: vad.VADEvent) -> None:
-        self._published.append((event, self._segment))
+    def _emit(self, event: vad.VADEvent, *, segment: int | None = None) -> None:
+        self._published.append((event, self._segment if segment is None else segment))
         self._event_ch.send_nowait(event)
 
     def _reset(self) -> None:
@@ -118,13 +149,13 @@ class _DrainingVADStream(vad.VADStream):
         self._speech = bytearray()
         self._processed = self._last_index = 0
         self._deadline = None
-        self._idle_at = 0.0
 
     def _arm_tail(self) -> None:
         audio, detector = self._audio, self._probability
         self._deadline = (
             self._idle_at
             if detector is not None
+            and self._segment == self._flushes
             and audio.real_pending
             and audio.last_padded != audio.real_fed
             and audio.padding_pending < detector.window_samples * 2
@@ -135,7 +166,8 @@ class _DrainingVADStream(vad.VADStream):
         raw = bytes(frame.data)
         self._unprocessed.extend(raw)
         self._audio.push(len(raw), padding=padding)
-        self._inner.push_frame(frame)
+        if self._segment == self._flushes:
+            self._inner.push_frame(frame)
 
     def _frame(self, raw: bytes) -> rtc.AudioFrame:
         return rtc.AudioFrame(
@@ -158,6 +190,8 @@ class _DrainingVADStream(vad.VADStream):
         self._push(self._frame(bytes(size)), padding=True)
 
     def _observe(self, event: vad.VADEvent) -> None:
+        if self._segment != self._flushes:
+            return  # Preserve unacknowledged real input for reclassification.
         if event.type is not vad.VADEventType.INFERENCE_DONE:
             return  # The SDK's boundary durations include inference-only padding.
         if any(
@@ -245,7 +279,7 @@ class _DrainingVADStream(vad.VADStream):
 
     async def _main_task(self) -> None:
         incoming = observed = None
-        ending = flushing = False
+        ending = False
         self._reset()
         try:
             incoming = asyncio.create_task(self._input_ch.__anext__())
@@ -268,19 +302,14 @@ class _DrainingVADStream(vad.VADStream):
                     try:
                         self._observe(observed.result())
                     except StopAsyncIteration:
-                        if not (ending or flushing) or self._audio.real_pending:
+                        if not ending or self._audio.real_pending:
                             raise GatewayError(
                                 "Local speech detector ended before processing input",
                                 retryable=False,
                             ) from None
                         await self._inner.aclose()
-                        if ending:
-                            return
-                        self._reset()
-                        self._segment += 1
-                        flushing = False
-                        incoming = asyncio.create_task(self._input_ch.__anext__())
-                    if not (ending or flushing):
+                        return
+                    if not ending:
                         self._arm_tail()
                     observed = asyncio.create_task(self._inner.__anext__())
                 if incoming in done:
@@ -290,7 +319,23 @@ class _DrainingVADStream(vad.VADStream):
                         ending = True
                     else:
                         if isinstance(value, self._FlushSentinel):
-                            flushing = True
+                            pending = self._audio.pending_real(bytes(self._unprocessed))
+                            await utils.aio.cancel_and_wait(observed)
+                            await self._inner.aclose()
+                            self._reset()
+                            self._segment += 1
+                            if pending:
+                                self._probability = ProbabilityVAD.for_stream(
+                                    self._inner, self._sample_rate
+                                )
+                                if self._probability is None:
+                                    raise GatewayError(
+                                        "Unsupported local speech detector stream",
+                                        retryable=False,
+                                    )
+                                self._push(self._frame(pending))
+                            self._arm_tail()
+                            observed = asyncio.create_task(self._inner.__anext__())
                         else:
                             if self._probability is None:
                                 self._probability = ProbabilityVAD.for_stream(
@@ -302,12 +347,8 @@ class _DrainingVADStream(vad.VADStream):
                                         retryable=False,
                                     )
                             self._push(value)
-                            interval = self._probability.interval
-                            self._idle_at = (
-                                asyncio.get_running_loop().time() + 2 * interval
-                            )
                             self._arm_tail()
-                    if ending or flushing:
+                    if ending:
                         incoming = None
                         self._deadline = None
                         self._pad(final=True)
