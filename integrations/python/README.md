@@ -26,6 +26,8 @@ stt = STT(speech, provider=stt_provider, model=stt_model,
           language=stt_language, credential_source="managed", turn_vad=local_vad)
 tts = TTS(speech, provider=tts_provider, model=tts_model, voice="",
           language=tts_language, credential_source="managed")
+# Before AgentSession.start(agent=agent): bind its public turn-completion hook.
+stt.bind_agent(agent)
 ```
 
 For the native Go sidecar, pass `socket_path` and `local_auth_token` instead of
@@ -71,10 +73,14 @@ The LiveKit stream stays open across turns. Each VAD turn uses a separate
 native request, streaming audio and interim text while speech continues.
 At speech end the request commits and closes; final transcript segments and
 `END_OF_SPEECH` are emitted only after terminal usage arrives. A final segment
-alone cannot complete a turn. Completed-buffer `recognize()` joins all final
-segments. Queued speech starts preserve the real silence interval after the
-prior complete end event, so delayed finalization cannot collapse distinct
-framework turns. Overlapping VAD prefixes exclude samples already assigned to
+alone cannot complete a turn. `bind_agent(agent)` adapts only that Agent's
+`on_user_turn_completed` hook and preserves the original hook. A later speech
+request waits for the framework's actual complete-turn commit; elapsed silence
+is never replayed. Binding is required for native AgentSession streaming and
+is removed on close. Explicit event consumers that own turn handling can use
+`stream(manual_turns=True)`; completed-buffer `recognize()` needs no binding
+and joins all final segments. EOS timing excludes the detector's trailing
+silence. Overlapping VAD prefixes exclude samples already assigned to
 an earlier request, and request timestamps map to the persistent stream's
 timeline. All PCM, including VAD prefixes and inference batches, is chunked to
 fit the native frame bound. Pipecat

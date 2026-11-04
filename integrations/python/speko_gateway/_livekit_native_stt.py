@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable
 from fractions import Fraction
 from typing import Any
@@ -35,6 +36,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         mark_failed: Callable[[], None],
         report_open: Callable[[LiveKitSTTStream], None],
         check_admission: Callable[[], None],
+        wait_for_turn_commit: bool = False,
     ) -> None:
         super().__init__(
             stt=stt_instance, conn_options=conn_options, sample_rate=sample_rate
@@ -64,8 +66,9 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._processed_samples = 0
         self._assigned_until = 0
         self._request_start_sample = 0
-        self._last_end_sample: int | None = None
-        self._last_end_emitted_at = 0.0
+        self._wait_for_turn_commit = wait_for_turn_commit
+        self._turn_commit: asyncio.Future[None] | None = None
+        self._turn_text = ""
         self._fatal: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     def push_frame(self, frame: rtc.AudioFrame) -> None:
@@ -156,6 +159,9 @@ class NativeSpeechStream(stt.RecognizeStream):
             self._unprocessed.clear()
             self._history.clear()
             self._finals.clear()
+            if self._turn_commit is not None:
+                self._turn_commit.cancel()
+            self._turn_text = ""
 
     async def _feed(self) -> None:
         async for frame in self._input_ch:
@@ -238,21 +244,6 @@ class NativeSpeechStream(stt.RecognizeStream):
                     raise GatewayError(
                         "Local speech boundary reused completed audio", retryable=False
                     )
-                if self._last_end_sample is not None:
-                    # Delayed terminal usage can queue a later VAD start. Replay
-                    # its actual silence interval after the complete prior EOS
-                    # so framework endpointing gets the same opportunity to run.
-                    gap = max(
-                        0,
-                        (self._processed_samples - self._last_end_sample)
-                        / self._sample_rate
-                        - event.speech_duration,
-                    )
-                    remaining = gap - (
-                        asyncio.get_running_loop().time() - self._last_end_emitted_at
-                    )
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
                 self._request_start_sample = request_start
                 self._event_ch.send_nowait(
                     stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
@@ -266,7 +257,23 @@ class NativeSpeechStream(stt.RecognizeStream):
                         retryable=False,
                     )
                 if self._gateway_stream is not None:
-                    await self._finish_turn()
+                    if (
+                        not math.isfinite(event.silence_duration)
+                        or event.silence_duration < 0
+                    ):
+                        raise GatewayError(
+                            "Local speech detector changed its timeline",
+                            retryable=False,
+                        )
+                    speech_end = self._processed_samples - round(
+                        event.silence_duration * self._sample_rate
+                    )
+                    if speech_end < self._request_start_sample:
+                        raise GatewayError(
+                            "Local speech detector changed its timeline",
+                            retryable=False,
+                        )
+                    await self._finish_turn(speech_end)
         if not self._input_finished:
             raise GatewayError(
                 "Local speech detector ended before input", retryable=False
@@ -359,13 +366,27 @@ class NativeSpeechStream(stt.RecognizeStream):
             )
         )
 
-    async def _finish_turn(self) -> None:
+    def acknowledge_turn(self, transcript: str) -> None:
+        """The bound Agent hook runs only after LiveKit commits this user turn."""
+        if (
+            self._turn_commit is not None
+            and not self._turn_commit.done()
+            and " ".join(transcript.split()) == self._turn_text
+        ):
+            self._turn_commit.set_result(None)
+
+    async def _finish_turn(self, speech_end: int | None = None) -> None:
         assert self._gateway_stream is not None and self._receiver is not None
         stream, receiver = self._gateway_stream, self._receiver
         self._finishing = True
         await stream.flush()
         await stream.finish()
         await asyncio.wait_for(asyncio.shield(receiver), self._conn_options.timeout)
+        self._turn_text = " ".join(
+            " ".join(event.text for event in self._finals).split()
+        )
+        if self._wait_for_turn_commit and self._turn_text:
+            self._turn_commit = asyncio.get_running_loop().create_future()
         for event in self._finals:
             self._emit(event, stt.SpeechEventType.FINAL_TRANSCRIPT)
         self._event_ch.send_nowait(
@@ -376,15 +397,26 @@ class NativeSpeechStream(stt.RecognizeStream):
                     stt.SpeechData(
                         language=self._language,
                         text="",
-                        end_time=self._processed_samples / self._sample_rate
+                        end_time=(
+                            self._processed_samples
+                            if speech_end is None
+                            else speech_end
+                        )
+                        / self._sample_rate
                         + getattr(self, "start_time_offset", 0.0),
                     )
                 ],
             )
         )
-        self._last_end_sample = self._processed_samples
-        self._last_end_emitted_at = asyncio.get_running_loop().time()
         self._gateway_stream = None
         self._receiver = None
         await stream.aclose()
         self._admission_started = False
+        if self._turn_commit is not None:
+            # Await the framework's real endpointing decision rather than
+            # replaying an elapsed silence or guessing its configured delay.
+            await asyncio.wait_for(
+                asyncio.shield(self._turn_commit), self._conn_options.timeout
+            )
+            self._turn_commit = None
+        self._turn_text = ""

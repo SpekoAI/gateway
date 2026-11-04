@@ -86,15 +86,15 @@ class ControlledVAD(vad.VAD):
         self.prefix.append(value)
         self.emit(vad.VADEventType.INFERENCE_DONE, frames=[value])
 
-    def emit(self, kind, *, frames=None):
+    def emit(self, kind, *, frames=None, speech_duration=0.02, silence_duration=0):
         assert self.current is not None
         self.current._event_ch.send_nowait(
             vad.VADEvent(
                 type=kind,
                 samples_index=self.index,
                 timestamp=self.index / self.inference_rate,
-                speech_duration=0.02,
-                silence_duration=0,
+                speech_duration=speech_duration,
+                silence_duration=silence_duration,
                 frames=list(self.prefix if frames is None else frames),
             )
         )
@@ -127,7 +127,13 @@ class OwnedAudioInput(io.AudioInput):
         return value
 
 
-async def test_actual_agent_session_commits_complete_native_turns_after_delayed_finals():
+@pytest.mark.parametrize(
+    "gap,speech_duration,terminal_delay",
+    [(0.35, 0.02, 0.35), (0.224, 0.064, 0.35), (1.0, 0.064, 1.0)],
+)
+async def test_actual_agent_session_commits_complete_native_turns_after_delayed_finals(
+    gap, speech_duration, terminal_delay
+):
     source = ControlledVAD(inference_rate=8000)
     late, first_audio, commit_received = (
         asyncio.Event(),
@@ -135,6 +141,7 @@ async def test_actual_agent_session_commits_complete_native_turns_after_delayed_
         asyncio.Event(),
     )
     seen = []
+    second_admitted = asyncio.Event()
 
     async def handle(request):
         ws = web.WebSocketResponse()
@@ -142,16 +149,19 @@ async def test_actual_agent_session_commits_complete_native_turns_after_delayed_
         await ws.receive_json()
         index = len(seen)
         seen.append([])
+        if index == 1:
+            second_admitted.set()
         await ready(ws)
         async for message in ws:
             if message.type is aiohttp.WSMsgType.BINARY:
                 seen[index].append(message.data)
-                await ws.send_json(
-                    {
-                        "type": "transcript.final",
-                        "text": "first" if index == 0 else "second",
-                    }
-                )
+                if len(seen[index]) == 1:
+                    await ws.send_json(
+                        {
+                            "type": "transcript.final",
+                            "text": "first" if index == 0 else "second",
+                        }
+                    )
                 first_audio.set()
                 continue
             value = json.loads(message.data)
@@ -202,47 +212,68 @@ async def test_actual_agent_session_commits_complete_native_turns_after_delayed_
                 if "record" in inspect.signature(session.start).parameters
                 else {}
             )
+            agent = OwnedAgent(instructions="Owned local speech fixture")
+            model.bind_agent(agent)
             await session.start(
-                agent=OwnedAgent(instructions="Owned local speech fixture"),
+                agent=agent,
                 **start_options,
             )
             first = frame()
             second = rtc.AudioFrame(
-                data=b"\x22\x11" * 320,
+                data=b"\x22\x11" * round(speech_duration * 16000),
                 sample_rate=16000,
                 num_channels=1,
-                samples_per_channel=320,
+                samples_per_channel=round(speech_duration * 16000),
             )
             silence = rtc.AudioFrame(
-                data=b"\0" * 11200,
+                data=b"\0\0" * round((gap - speech_duration) * 16000),
                 sample_rate=16000,
                 num_channels=1,
-                samples_per_channel=5600,
+                samples_per_channel=round((gap - speech_duration) * 16000),
+            )
+            trailing = rtc.AudioFrame(
+                data=b"\0\0" * 8800,
+                sample_rate=16000,
+                num_channels=1,
+                samples_per_channel=8800,
             )
             await audio.frames.put(first)
+            await audio.frames.put(trailing)
             await audio.frames.put(silence)
             await audio.frames.put(second)
+            await asyncio.wait_for(source.frames.get(), 3)
             await asyncio.wait_for(source.frames.get(), 3)
             await asyncio.wait_for(source.frames.get(), 3)
             await asyncio.wait_for(source.frames.get(), 3)
             source.processed(first)
             source.emit(vad.VADEventType.START_OF_SPEECH)
             await asyncio.wait_for(first_audio.wait(), 3)
-            source.emit(vad.VADEventType.END_OF_SPEECH)
+            source.processed(trailing)
+            source.emit(vad.VADEventType.END_OF_SPEECH, silence_duration=0.55)
             source.processed(silence)
             source.processed(second)
-            source.emit(vad.VADEventType.START_OF_SPEECH, frames=[second])
+            source.emit(
+                vad.VADEventType.START_OF_SPEECH,
+                frames=[second],
+                speech_duration=speech_duration,
+            )
             source.emit(vad.VADEventType.END_OF_SPEECH, frames=[second])
             await asyncio.wait_for(commit_received.wait(), 3)
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(terminal_delay)
             assert turns.empty(), (
                 "AgentSession committed an incomplete native transcript"
             )
-            assert seen[0] == [bytes(first.data)]
+            assert seen[0] == [bytes(first.data), bytes(trailing.data)]
             late.set()
+            # The framework's actual commit releases admission. An elapsed
+            # one-second gap must not be replayed as another second of delay.
+            await asyncio.wait_for(second_admitted.wait(), 0.8)
             assert await asyncio.wait_for(turns.get(), 3) == "first late remainder"
             assert await asyncio.wait_for(turns.get(), 3) == "second"
-            assert seen == [[bytes(first.data)], [bytes(second.data)]]
+            assert seen == [
+                [bytes(first.data), bytes(trailing.data)],
+                [bytes(second.data)],
+            ]
         finally:
             late.set()
             await audio.frames.put(None)
@@ -288,6 +319,7 @@ async def test_actual_agent_stt_recovery_pump_cannot_readmit_a_failed_native_req
             turn_vad=source,
         )
         agent = Agent(instructions="Owned recovery fixture")
+        model.bind_agent(agent)
         agent._activity = SimpleNamespace(
             stt=model,
             vad=None,
@@ -376,7 +408,8 @@ async def test_livekit_native_stt_orders_processed_audio_and_waits_for_all_turn_
             turn_vad=source,
         )
         stream = model.stream(
-            conn_options=APIConnectOptions(max_retry=3, retry_interval=0)
+            manual_turns=True,
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=0),
         )
         try:
             first, second = (
@@ -549,7 +582,8 @@ async def test_actual_livekit_stt_cannot_retry_an_ambiguous_native_error(method)
                     )
                 else:
                     stream = model.stream(
-                        conn_options=APIConnectOptions(max_retry=3, retry_interval=0)
+                        manual_turns=True,
+                        conn_options=APIConnectOptions(max_retry=3, retry_interval=0),
                     )
                     stream.push_frame(frame())
                     stream.end_input()
@@ -672,7 +706,7 @@ async def test_native_stt_publishes_interims_while_audio_is_still_streaming():
             credential_source="managed",
             turn_vad=source,
         )
-        stream = model.stream()
+        stream = model.stream(manual_turns=True)
         try:
             audio = frame()
             stream.push_frame(audio)
@@ -725,7 +759,7 @@ async def test_native_stt_refuses_unprocessed_or_unbounded_vad_input_without_adm
             credential_source="managed",
             turn_vad=source,
         )
-        stream = model.stream()
+        stream = model.stream(manual_turns=True)
         try:
             if failure == "unprocessed-boundary":
                 audio = frame()
@@ -780,7 +814,7 @@ async def test_cancelling_native_stt_after_configure_fences_admission_before_rea
             model="fixture-model",
             credential_source="managed",
         )
-        stream = model.stream()
+        stream = model.stream(manual_turns=True)
         try:
             stream.push_frame(frame())
             await asyncio.wait_for(configured.wait(), 2)
@@ -850,7 +884,7 @@ async def test_native_vad_prefix_never_replays_prior_audio_and_times_follow_the_
             model="fixture-model",
             credential_source="managed",
         )
-        stream = model.stream()
+        stream = model.stream(manual_turns=True)
         stream.start_time_offset = start_offset
 
         async def completed_turn():
@@ -941,7 +975,7 @@ async def test_vad_audio_always_fits_native_message_bounds(large):
             model="fixture-model",
             credential_source="managed",
         )
-        stream = model.stream()
+        stream = model.stream(manual_turns=True)
         try:
             stream.push_frame(prefix)
             await asyncio.wait_for(source.frames.get(), 2)
@@ -963,6 +997,124 @@ async def test_vad_audio_always_fits_native_message_bounds(large):
         finally:
             await stream.aclose()
             await model.aclose()
+            await client.aclose()
+
+
+async def test_native_eos_uses_speech_end_before_vad_trailing_silence():
+    source = ControlledVAD()
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if (
+                message.type is aiohttp.WSMsgType.TEXT
+                and json.loads(message.data)["type"] == "session.close"
+            ):
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=source,
+        )
+        stream = model.stream(manual_turns=True)
+        stream.start_time_offset = 4
+        try:
+            speech = frame()
+            stream.push_frame(speech)
+            await asyncio.wait_for(source.frames.get(), 2)
+            source.processed(speech)
+            source.emit(vad.VADEventType.START_OF_SPEECH)
+            assert (
+                await asyncio.wait_for(anext(stream), 2)
+            ).type is stt.SpeechEventType.START_OF_SPEECH
+            trailing = rtc.AudioFrame(
+                data=b"\0\0" * 8800,
+                sample_rate=16000,
+                num_channels=1,
+                samples_per_channel=8800,
+            )
+            stream.push_frame(trailing)
+            await asyncio.wait_for(source.frames.get(), 2)
+            source.processed(trailing)
+            source.emit(vad.VADEventType.END_OF_SPEECH, silence_duration=0.55)
+            stream.end_input()
+            events = [event async for event in stream]
+            assert [event.type for event in events] == [
+                stt.SpeechEventType.END_OF_SPEECH
+            ]
+            assert events[0].alternatives[0].end_time == pytest.approx(4.02, abs=0.001)
+        finally:
+            await stream.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_native_framework_stream_requires_binding_and_fences_missing_commit():
+    seen = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        seen.append(request.headers["Idempotency-Key"])
+        await ready(ws)
+        async for message in ws:
+            if (
+                message.type is aiohttp.WSMsgType.TEXT
+                and json.loads(message.data)["type"] == "session.close"
+            ):
+                await ws.send_json({"type": "transcript.final", "text": "complete"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=ControlledVAD(automatic=True),
+        )
+        with pytest.raises(ValueError, match="bind_agent"):
+            model.stream()
+        assert seen == []
+        agent = Agent(instructions="Owned uncommitted turn fixture")
+        original = agent.on_user_turn_completed
+        model.bind_agent(agent)
+        stream = model.stream(conn_options=APIConnectOptions(timeout=0.2))
+        try:
+            stream.push_frame(frame())
+            stream.end_input()
+            with pytest.raises(APIConnectionError, match="control-plane recovery"):
+                async for _ in stream:
+                    pass
+            assert len(seen) == 1
+            with pytest.raises(GatewayError, match="control-plane recovery"):
+                model.stream()
+        finally:
+            await stream.aclose()
+            await model.aclose()
+            assert agent.on_user_turn_completed == original
             await client.aclose()
 
 
