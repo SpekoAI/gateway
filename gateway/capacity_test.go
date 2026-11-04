@@ -134,6 +134,103 @@ type capacityAbortingStream struct{ *capacityClosingStream }
 
 func (s *capacityAbortingStream) Abort(ctx context.Context) error { return s.Close(ctx) }
 
+type capacityPublishingClose struct {
+	runtimepkg.ProviderStream
+	events    chan runtimepkg.ProviderEvent
+	once      sync.Once
+	delivered chan struct{}
+	release   <-chan struct{}
+}
+
+func (s *capacityPublishingClose) Events() <-chan runtimepkg.ProviderEvent { return s.events }
+func (s *capacityPublishingClose) Close(context.Context) error {
+	s.once.Do(func() {
+		s.events <- runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal}
+		close(s.events)
+		close(s.delivered)
+		<-s.release
+	})
+	return nil
+}
+
+type capacityPublishingAbort struct{ *capacityPublishingClose }
+
+func (s *capacityPublishingAbort) Abort(ctx context.Context) error { return s.Close(ctx) }
+
+func TestCapacityDrainsTeardownEventsWithoutReleasingBeforeStopReturns(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		for _, fast := range []bool{false, true} {
+			name := "session/close"
+			if partial {
+				name = "partial-open/close"
+			}
+			if fast {
+				name += "/abort"
+			}
+			t.Run(name, func(t *testing.T) {
+				release, delivered := make(chan struct{}), make(chan struct{})
+				var once sync.Once
+				finish := func() { once.Do(func() { close(release) }) }
+				defer finish()
+				adapter := &capacityOwnedAdapter{open: func(context.Context, runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
+					base := &capacityPublishingClose{ProviderStream: mock.NewStream(8), events: make(chan runtimepkg.ProviderEvent), delivered: delivered, release: release}
+					var stream runtimepkg.ProviderStream = base
+					if fast {
+						stream = &capacityPublishingAbort{base}
+					}
+					if partial {
+						return stream, &runtimepkg.ProviderError{Code: "provider_unavailable", Retryable: true}
+					}
+					return stream, nil
+				}}
+				config, plans := newServerConfigWithAdapter(t, adapter, 1, time.Second, 0, 0)
+				plans.plan.Execution.CredentialSource = protocol.CredentialsManaged
+				plans.plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "owned-provider", ExpiresAt: plans.plan.ExpiresAt}
+				plans.plan.Capacity = &protocol.CapacityAttribution{Account: "owned-account", Capability: "stt_streams", Model: plans.plan.Route.Model, Slots: 1}
+				server, err := gateway.New(config)
+				if err != nil {
+					t.Fatal(err)
+				}
+				peer := httptest.NewServer(server.Handler())
+				defer peer.Close()
+				body := gatewayRequestBody()
+				body["execution"] = map[string]string{"provider_route": "provider_direct", "credential_source": "managed", "relay_policy": "forbidden"}
+				response := postJSON(t, peer.URL+"/v1/sessions", body, "local-token", "owned-publishing-stop")
+				_ = response.Body.Close()
+				if partial {
+					if response.StatusCode != 502 {
+						t.Fatal("partial open unexpectedly succeeded")
+					}
+				} else {
+					if response.StatusCode != 201 {
+						t.Fatal("create failed")
+					}
+					deleted := deleteSession(t, peer.URL+"/v1/sessions/"+plans.plan.SessionID, "local-token")
+					_ = deleted.Body.Close()
+				}
+				select {
+				case <-delivered:
+				case <-time.After(3 * time.Second):
+					t.Fatal("teardown event blocked after public reader stopped")
+				}
+				stats := server.Stats()
+				if stats.ActiveSessions+int64(stats.PendingSessions) != 1 || stats.Capacity.Validate(stats.ActiveSessions, stats.PendingSessions) != nil {
+					t.Fatalf("event closure released an unfinished stop: %+v", stats)
+				}
+				finish()
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				if err := server.Drain(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if server.Stats().ActiveSessions+int64(server.Stats().PendingSessions) != 0 {
+					t.Fatal("completed teardown retained capacity")
+				}
+			})
+		}
+	}
+}
+
 func TestCapacityRetainsDetachedExpiredAndRejectedProviderWorkThroughTeardown(t *testing.T) {
 	for _, mode := range []string{"delete", "expiry", "rejected-create"} {
 		for _, fast := range []bool{false, true} {
