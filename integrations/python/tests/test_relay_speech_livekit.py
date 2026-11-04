@@ -1471,11 +1471,12 @@ async def test_native_model_handoffs_keep_only_the_active_recognition_owner_boun
 
 @pytest.mark.skipif(not hasattr(Agent, "update_options"), reason="SDK predates live model option updates")
 @pytest.mark.parametrize("wrapper", ["direct", "multi_speaker", "fallback", "nested"])
-async def test_delayed_wrapped_native_node_preserves_actual_endpointing_after_live_model_swap(wrapper):
+@pytest.mark.parametrize("buffered", [True, False])
+async def test_delayed_wrapped_native_node_preserves_sample_timeline_and_endpointing_after_live_model_swap(wrapper, buffered):
     sources = [ControlledVAD(), ControlledVAD()]
     node_waiting, resume_node = asyncio.Event(), asyncio.Event()
     turns = asyncio.Queue()
-    terminal_at, seen = [], []
+    terminal_at, seen, speech_ends = [], [], []
 
     async def handle(request):
         ws = web.WebSocketResponse()
@@ -1506,6 +1507,8 @@ async def test_delayed_wrapped_native_node_preserves_actual_endpointing_after_li
                     node_waiting.set()
                     await resume_node.wait()
                 async for event in Agent.default.stt_node(self, audio, model_settings):
+                    if self.stt is wrapped[1] and event.type is stt.SpeechEventType.END_OF_SPEECH:
+                        speech_ends.append(event.alternatives[0].end_time)
                     yield event
 
             async def on_user_turn_completed(self, turn_ctx, new_message):
@@ -1528,17 +1531,29 @@ async def test_delayed_wrapped_native_node_preserves_actual_endpointing_after_li
             assert await asyncio.wait_for(turns.get(), 3) == "turn 1"
             agent.update_options(stt=wrapped[1])
             await asyncio.wait_for(node_waiting.wait(), 3)
-            # The real session receives audio while its custom STT node waits.
-            # Its input epoch therefore precedes the new stream by >0.3 s.
-            await audio.frames.put(frame())
+            if buffered:
+                await audio.frames.put(frame())
             await asyncio.sleep(0.65)
             resume_node.set()
+            if not buffered:
+                async def stream_created():
+                    while sources[1].current is None:
+                        await asyncio.sleep(0.001)
+                await asyncio.wait_for(stream_created(), 3)
+                await audio.frames.put(frame())
             observed = await asyncio.wait_for(sources[1].frames.get(), 3)
             sources[1].processed(observed)
             sources[1].emit(vad.VADEventType.START_OF_SPEECH, frames=[observed])
             await boundary(sources[1], rtc.AudioFrame(data=b"\0\0" * 320, sample_rate=16000, num_channels=1, samples_per_channel=320), vad.VADEventType.END_OF_SPEECH, 0.02)
             assert await asyncio.wait_for(turns.get(), 3) == "turn 2"
-            assert time.monotonic() - terminal_at[1] >= 0.2, "a wrapped child cannot lose the input epoch and commit immediately"
+            # The SDK can rebase through an epoch-sized float; one 16 kHz
+            # sample is the relevant precision, rather than nanoseconds.
+            assert speech_ends == pytest.approx([0.02], abs=1 / 16000), "the first 20 ms of speech stays at the pipeline's sample origin"
+            elapsed = time.monotonic() - terminal_at[1]
+            if buffered:
+                assert elapsed < 0.2, "old buffered speech has already outlived the endpointing delay"
+            else:
+                assert elapsed >= 0.2, "fresh input must retain the configured endpointing delay"
             assert len(seen) == len(set(seen)) == 2
         finally:
             resume_node.set()

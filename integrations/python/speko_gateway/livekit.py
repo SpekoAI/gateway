@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
-import time
 import weakref
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -32,6 +31,7 @@ from livekit.agents import (
 )
 from livekit.agents.llm.tool_context import get_raw_function_info
 from livekit.agents.utils import is_given
+from livekit.agents.voice import audio_recognition
 
 from ._livekit_bridge import (
     LiveKitSpeechEvent,
@@ -40,7 +40,7 @@ from ._livekit_bridge import (
     LiveKitTTSBridge,
     LiveKitTTSStream,
 )
-from ._livekit_native_stt import NativeSpeechStream
+from ._livekit_native_stt import NativeInputTimeline, NativeSpeechStream
 from ._speech_client import SpeechClient
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
 from .client import GatewayClient, GatewayError
@@ -101,6 +101,27 @@ _NEWER_STT_CAPABILITIES = frozenset({"keyterms", "chat_context", "manual_flush"}
 # transcript_timeout. Without the flush it already waited that long unless a
 # final had arrived in the previous 0.5 s.
 _FLUSH_ON_TURN_END_PROVIDERS = frozenset({"soniox"})
+
+
+_native_input_timelines: weakref.WeakKeyDictionary[Any, NativeInputTimeline] = weakref.WeakKeyDictionary()
+
+
+def _native_input_timeline(session: Any) -> NativeInputTimeline | None:
+    # Retained SDK pipelines keep the same audio epoch across handoffs. Their
+    # first sample is zero even when a node begins after input was buffered.
+    # Count sample durations instead of translating stream construction time.
+    context = getattr(audio_recognition, "_STTPipelineContextVar", None)
+    pipeline = context.get(None) if context is not None else None
+    if pipeline is None:
+        recognition = getattr(getattr(session, "_activity", None), "_audio_recognition", None)
+        pipeline = getattr(recognition, "_stt_pipeline", None)
+    if pipeline is None:
+        return None
+    timeline = _native_input_timelines.get(pipeline)
+    if timeline is None:
+        timeline = NativeInputTimeline()
+        _native_input_timelines[pipeline] = timeline
+    return timeline
 
 
 def _stt_capabilities(**declared: Any) -> stt.STTCapabilities:
@@ -337,23 +358,6 @@ class STT(stt.STT):
         activity._speko_native_stt_turn_owner = self
         self._turn_binding = (activity, original, committed)
 
-    def _native_stream_offset(self) -> float:
-        # Match the installed SDK's default STT node input epoch. Some SDK
-        # wrappers create their child asynchronously without forwarding the
-        # outer stream's offset; initialize the native child independently.
-        assert self._bound_session is not None
-        session = self._bound_session
-        recognition = getattr(session._activity, "_audio_recognition", None)
-        origin = getattr(recognition, "_input_started_at", None)
-        if origin is None:
-            recorder = getattr(session, "_recorder_io", None)
-            origin = (
-                getattr(recorder, "recording_started_at", None)
-                or getattr(session, "_started_at", None)
-                or time.time()
-            )
-        return time.time() - origin
-
     @property
     def model(self) -> str:
         return self._model
@@ -484,9 +488,8 @@ class STT(stt.STT):
                 report_open=lambda stream: _report_stream_leg("stt", stream),
                 check_admission=prepare_native_turn,
                 wait_for_turn_commit=not recognize and not manual_turns,
+                input_timeline=_native_input_timeline(self._bound_session) if not recognize and not manual_turns else None,
             )
-            if not recognize and not manual_turns:
-                stream.start_time_offset = self._native_stream_offset()
         else:
             stream = SpeechStream(
                 stt_instance=self,
