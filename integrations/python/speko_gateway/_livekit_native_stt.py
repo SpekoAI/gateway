@@ -1,11 +1,11 @@
-"""VAD-ordered native STT with a terminal request boundary for each turn."""
+"""VAD-ordered native STT with terminal evidence for each physical utterance."""
 
 from __future__ import annotations
 
 import asyncio
 import math
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from fractions import Fraction
 from typing import Any
 
@@ -18,13 +18,25 @@ from ._livekit_native_speaker import NativeSpeechData
 from .client import GatewayError
 
 
+class _InputChannel(utils.aio.Chan[Any]):
+    def __init__(self, on_audio: Callable[[rtc.AudioFrame], None]) -> None:
+        super().__init__()
+        self._on_audio = on_audio
+
+    def send_nowait(self, value: Any) -> None:
+        super().send_nowait(value)
+        if isinstance(value, rtc.AudioFrame):
+            self._on_audio(value)
+
+
 class NativeSpeechStream(stt.RecognizeStream):
     """Only processed VAD audio reaches a turn's separately admitted request.
 
     INFERENCE_DONE must identify contiguous, unchanged input frames before its
     boundary events. The inference sample rate can differ from the input rate.
-    A turn ends only after its request has delivered terminal usage; a final
-    segment alone cannot authorize LiveKit to commit the turn.
+    A logical SDK turn may continue through several physical utterances.
+    Every request must deliver terminal usage before its complete text can
+    participate in framework turn acceptance.
     """
 
     def __init__(
@@ -41,6 +53,8 @@ class NativeSpeechStream(stt.RecognizeStream):
         check_admission: Callable[[], None],
         wait_for_turn_commit: bool = False,
         input_timeline: NativeInputTimeline | None = None,
+        continuation_delay: Callable[[str, float], Awaitable[float | None]] | None = None,
+        reconsider_turn: Callable[[], None] = lambda: None,
     ) -> None:
         super().__init__(
             stt=stt_instance, conn_options=conn_options, sample_rate=sample_rate
@@ -59,6 +73,10 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._report_open = report_open
         self._check_admission = check_admission
         self._queued_samples = Fraction(0)
+        self._available_samples = 0
+        # The SDK resampler retains a filter tail across input pushes. Only
+        # its emitted frames can advance VAD's available-input frontier.
+        self._input_ch = _InputChannel(self._audio_available)
         self._input_failure = False
         self._unprocessed = bytearray()
         self._history = bytearray()
@@ -77,6 +95,13 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._assigned_until = 0
         self._request_start_sample = 0
         self._wait_for_turn_commit = wait_for_turn_commit
+        self._continuation_delay = continuation_delay
+        self._reconsider_turn = reconsider_turn
+        self._vad_speaking = False
+        self._last_speech_end: int | None = None
+        self._pending_transcript = False
+        self._classifying_boundary = False
+        self._awaiting_new_turn = False
         self._turn_commit: asyncio.Future[None] | None = None
         self._turn_text = ""
         self._fatal: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -134,6 +159,9 @@ class NativeSpeechStream(stt.RecognizeStream):
             num_channels=self._channels,
             samples_per_channel=len(raw) // (2 * self._channels),
         )
+
+    def _audio_available(self, frame: rtc.AudioFrame) -> None:
+        self._available_samples += frame.samples_per_channel
 
     def _audio(self, frames: list[rtc.AudioFrame]) -> bytes:
         if any(
@@ -228,6 +256,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 self._processed_samples += frame.samples_per_channel
                 self._assigned_until = self._processed_samples
                 self._queued_samples -= frame.samples_per_channel
+                self._available_samples -= frame.samples_per_channel
             else:
                 self._unprocessed.extend(frame.data.cast("B"))
                 self._vad_stream.push_frame(frame)
@@ -261,13 +290,16 @@ class NativeSpeechStream(stt.RecognizeStream):
                     )
                 del self._unprocessed[: len(raw)]
                 self._queued_samples -= Fraction(len(raw), 2 * self._channels)
+                self._available_samples -= len(raw) // (2 * self._channels)
                 self._history.extend(raw)
                 del self._history[: -30 * self._sample_rate * 2 * self._channels]
                 self._last_vad_index = event.samples_index
                 self._processed_samples += len(raw) // (2 * self._channels)
+                self._vad_speaking = event.speaking
                 if self._gateway_stream is not None:
                     await self._send_audio(raw)
                     self._assigned_until = self._processed_samples
+                self._reconsider_turn()
             elif event.type == vad.VADEventType.START_OF_SPEECH:
                 raw = self._audio(event.frames)
                 if (
@@ -289,12 +321,54 @@ class NativeSpeechStream(stt.RecognizeStream):
                         "Local speech boundary reused completed audio", retryable=False
                     )
                 self._request_start_sample = request_start
+                if (
+                    not math.isfinite(event.speech_duration)
+                    or event.speech_duration < 0
+                ):
+                    raise GatewayError(
+                        "Local speech detector changed its timeline", retryable=False
+                    )
+                if self._turn_commit is not None and not self._turn_commit.done():
+                    onset = self._processed_samples - round(
+                        event.speech_duration * self._sample_rate
+                    )
+                    gap = (
+                        max(0, (onset - self._last_speech_end) / self._sample_rate)
+                        if self._last_speech_end is not None
+                        else 0
+                    )
+                    self._classifying_boundary = True
+                    try:
+                        delay = (
+                            await asyncio.wait_for(
+                                self._continuation_delay(self._turn_text, gap),
+                                self._conn_options.timeout,
+                            )
+                            if self._continuation_delay is not None
+                            else None
+                        )
+                    finally:
+                        self._classifying_boundary = False
+                    if delay is None or gap >= delay:
+                        self._awaiting_new_turn = True
+                        self._reconsider_turn()
+                        await asyncio.wait_for(
+                            asyncio.shield(self._turn_commit),
+                            self._conn_options.timeout,
+                        )
+                if self._turn_commit is not None and self._turn_commit.done():
+                    self._turn_commit = None
+                    self._turn_text = ""
+                self._awaiting_new_turn = False
+                self._pending_transcript = True
+                self._vad_speaking = True
                 self._event_ch.send_nowait(
                     stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
                 )
                 await self._send_audio(raw)
                 self._assigned_until = self._processed_samples
             elif event.type == vad.VADEventType.END_OF_SPEECH:
+                self._vad_speaking = False
                 if event.samples_index != self._last_vad_index:
                     raise GatewayError(
                         "Local speech boundary overtook processed input",
@@ -317,6 +391,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                             "Local speech detector changed its timeline",
                             retryable=False,
                         )
+                    self._last_speech_end = speech_end
                     await self._finish_turn(speech_end)
         if not self._input_finished:
             raise GatewayError(
@@ -333,6 +408,10 @@ class NativeSpeechStream(stt.RecognizeStream):
                 self._assigned_until = self._processed_samples
                 self._unprocessed.clear()
             await self._finish_turn()
+        if self._turn_commit is not None:
+            await asyncio.wait_for(
+                asyncio.shield(self._turn_commit), self._conn_options.timeout
+            )
 
     async def _send_audio(self, raw: bytes) -> None:
         assert self._channels is not None
@@ -422,6 +501,14 @@ class NativeSpeechStream(stt.RecognizeStream):
         ):
             self._turn_commit.set_result(None)
 
+    def permits_framework_commit(self, transcript: str) -> bool:
+        return not self._wait_for_turn_commit or self._task.done() or (
+            not self._pending_transcript
+            and not self._classifying_boundary
+            and (self._awaiting_new_turn or (not self._vad_speaking and self._available_samples == 0))
+            and (not self._turn_text or " ".join(transcript.split()) == self._turn_text)
+        )
+
     async def _finish_turn(self, speech_end: int | None = None) -> None:
         assert self._gateway_stream is not None and self._receiver is not None
         stream, receiver = self._gateway_stream, self._receiver
@@ -434,11 +521,15 @@ class NativeSpeechStream(stt.RecognizeStream):
             # Bind the actual current activity again before publishing finals,
             # including a handoff while the physical request was in flight.
             self._check_admission()
+        previous = self._turn_text if self._turn_commit is not None and not self._turn_commit.done() else ""
         self._turn_text = " ".join(
-            " ".join(event.text for event in self._finals).split()
+            " ".join([previous, *(event.text for event in self._finals)]).split()
         )
-        if self._wait_for_turn_commit and self._turn_text:
+        if len(self._turn_text) > 1 << 20:
+            raise GatewayError("Native speech transcript exceeded its bound", retryable=False)
+        if self._wait_for_turn_commit and self._turn_text and (self._turn_commit is None or self._turn_commit.done()):
             self._turn_commit = asyncio.get_running_loop().create_future()
+        self._pending_transcript = False
         for event in self._finals:
             self._emit(event, stt.SpeechEventType.FINAL_TRANSCRIPT)
         self._event_ch.send_nowait(
@@ -467,11 +558,4 @@ class NativeSpeechStream(stt.RecognizeStream):
             del self._input_offsets[:keep]
         await stream.aclose()
         self._admission_started = False
-        if self._turn_commit is not None:
-            # Await the framework's real endpointing decision rather than
-            # replaying an elapsed silence or guessing its configured delay.
-            await asyncio.wait_for(
-                asyncio.shield(self._turn_commit), self._conn_options.timeout
-            )
-            self._turn_commit = None
-        self._turn_text = ""
+        self._reconsider_turn()

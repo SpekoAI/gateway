@@ -81,14 +81,14 @@ class ControlledVAD(vad.VAD):
         self.current = ControlledVADStream(self)
         return self.current
 
-    def processed(self, value):
+    def processed(self, value, *, raw_silence=0):
         self.index += (
             value.samples_per_channel * self.inference_rate // value.sample_rate
         )
         self.prefix.append(value)
-        self.emit(vad.VADEventType.INFERENCE_DONE, frames=[value])
+        self.emit(vad.VADEventType.INFERENCE_DONE, frames=[value], raw_silence=raw_silence)
 
-    def emit(self, kind, *, frames=None, speech_duration=0.02, silence_duration=0):
+    def emit(self, kind, *, frames=None, speech_duration=0.02, silence_duration=0, raw_silence=0):
         assert self.current is not None
         self.current._event_ch.send_nowait(
             vad.VADEvent(
@@ -97,6 +97,7 @@ class ControlledVAD(vad.VAD):
                 timestamp=self.index / self.inference_rate,
                 speech_duration=speech_duration,
                 silence_duration=silence_duration,
+                raw_accumulated_silence=raw_silence,
                 frames=list(self.prefix if frames is None else frames),
             )
         )
@@ -286,6 +287,304 @@ async def test_actual_agent_session_commits_complete_native_turns_after_delayed_
             ]
         finally:
             late.set()
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("own_vad", [False, True])
+@pytest.mark.parametrize("wrapper", ["direct", "nested"])
+@pytest.mark.parametrize("first_terminal_delay", [0, 0.35])
+async def test_native_continuation_is_transcribed_before_framework_turn_commit(own_vad, wrapper, first_terminal_delay):
+    await assert_native_continuation(own_vad, wrapper, first_terminal_delay)
+
+
+async def assert_native_continuation(own_vad, wrapper, first_terminal_delay, *, turn_detector=None, expected_turns=("first second",), wait_for_first_terminal=False):
+    source = ControlledVAD()
+    session_vad = ControlledVAD() if own_vad else None
+    admitted, terminal, turns, packets = asyncio.Queue(), asyncio.Queue(), asyncio.Queue(), []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        index = len(packets)
+        packets.append(bytearray())
+        await ready(ws)
+        admitted.put_nowait(index)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                packets[index].extend(message.data)
+            elif json.loads(message.data)["type"] == "session.close":
+                await asyncio.sleep(first_terminal_delay if index == 0 else 0.35)
+                await ws.send_json({"type": "transcript.final", "text": "first" if index == 0 else "second"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                terminal.put_nowait(index)
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source, diarization=wrapper == "nested")
+        recognition_model = wrap_native_stt(model, wrapper)
+        session = AgentSession(stt=recognition_model, llm=None, tts=None, vad=session_vad, turn_detection=turn_detector if turn_detector is not None else "stt", min_endpointing_delay=0.05 if turn_detector is not None else 0.2, max_endpointing_delay=0.5 if turn_detector is not None else 0.2)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+
+        async def boundary(samples, kind, silence=0):
+            value = rtc.AudioFrame(data=(b"\0\0" if silence else b"\xff\x0f") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples)
+            await audio.frames.put(value)
+            for detector in (source, session_vad) if session_vad is not None else (source,):
+                observed = await asyncio.wait_for(detector.frames.get(), 3)
+                detector.processed(observed, raw_silence=silence if detector is session_vad else 0)
+                detector.emit(kind, frames=[observed], silence_duration=silence)
+            return bytes(value.data)
+
+        model.bind_session(session)
+        framework_recognition = None
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned continued user turn"), **options)
+            framework_recognition = session._activity._audio_recognition
+            first = await boundary(320, vad.VADEventType.START_OF_SPEECH)
+            assert await asyncio.wait_for(admitted.get(), 3) == 0
+            await asyncio.sleep(0.02)
+            pause_seconds = 0.2 if turn_detector is not None else 0.02
+            pause = await boundary(round(pause_seconds * 16000), vad.VADEventType.END_OF_SPEECH, pause_seconds)
+            if wait_for_first_terminal:
+                assert await asyncio.wait_for(terminal.get(), 3) == 0
+            await asyncio.sleep(0.02)
+            second = await boundary(320, vad.VADEventType.START_OF_SPEECH)
+            if not wait_for_first_terminal:
+                assert await asyncio.wait_for(terminal.get(), 3) == 0
+            assert await asyncio.wait_for(admitted.get(), 0.1 if len(expected_turns) == 1 else 0.8) == 1, "resumed speech must transcribe before endpointing commits the first fragment"
+            if len(expected_turns) == 1:
+                assert turns.empty()
+            else:
+                assert await asyncio.wait_for(turns.get(), 3) == expected_turns[0]
+            trailing = await boundary(8800, vad.VADEventType.END_OF_SPEECH, 0.55)
+            assert await asyncio.wait_for(terminal.get(), 3) == 1
+            assert await asyncio.wait_for(turns.get(), 3) == expected_turns[-1]
+            assert turns.empty()
+            assert list(map(bytes, packets)) == [first + pause, second + trailing]
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            if recognition_model is not model:
+                await recognition_model.aclose()
+            await model.aclose()
+            await client.aclose()
+            if framework_recognition is not None:
+                assert framework_recognition._turn_detector is turn_detector
+
+
+@pytest.mark.parametrize("probability", [0.1, 0.9])
+async def test_native_turn_uses_actual_detector_decision_for_queued_intermediate_pause(probability):
+    class OwnedTurnDetector:
+        model, provider = "owned-turn-detector", "owned"
+
+        async def supports_language(self, language):
+            return True
+
+        async def unlikely_threshold(self, language):
+            return 0.5
+
+        async def predict_end_of_turn(self, chat_ctx, *, timeout=None):
+            await asyncio.sleep(0.01)
+            return probability
+
+    expected = ("first second",) if probability < 0.5 else ("first", "second")
+    await assert_native_continuation(True, "nested", 0.35, turn_detector=OwnedTurnDetector(), expected_turns=expected)
+
+
+@pytest.mark.skipif(not hasattr(recognition, "_StreamingTurnDetector"), reason="SDK predates streaming turn detection")
+@pytest.mark.parametrize("probability", [0.1, 0.9])
+@pytest.mark.parametrize("queued", [False, True])
+async def test_native_continuation_with_streaming_turn_detection(probability, queued):
+    expected = ("first second",) if queued or probability < 0.5 else ("first", "second")
+    await assert_native_continuation(True, "nested", 0.35 if queued else 0, turn_detector=owned_streaming_turn_detector(probability), expected_turns=expected, wait_for_first_terminal=not queued)
+
+
+def owned_streaming_turn_detector(probability):
+    from livekit.agents.voice.turn import TurnDetectionEvent
+
+    class OwnedStream:
+        model, provider, is_fallback, prediction_timeout = "owned-stream", "owned", False, 1.0
+
+        def __init__(self):
+            self.audio = bytearray()
+            self.closed = False
+
+        async def supports_language(self, language):
+            return True
+
+        async def unlikely_threshold(self, language):
+            return 0.5
+
+        async def backchannel_threshold(self, language):
+            return None
+
+        def predict(self):
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(TurnDetectionEvent(type="eot_prediction", end_of_turn_probability=probability, last_speaking_time=time.time()))
+            return future
+
+        def cancel_inference(self, *, timed_out=False):
+            pass
+
+        def push_audio(self, frame):
+            self.audio.extend(frame.data.cast("B"))
+
+        def flush(self, reason=None):
+            pass
+
+        def end_input(self):
+            pass
+
+        async def aclose(self):
+            self.closed = True
+
+    class OwnedDetector:
+        model, provider = "owned-stream", "owned"
+
+        def __init__(self):
+            self.streams = []
+
+        def stream(self, *, conn_options=None):
+            stream = OwnedStream()
+            self.streams.append(stream)
+            return stream
+
+    return OwnedDetector()
+
+
+@pytest.mark.skipif(not hasattr(recognition.AudioRecognition, "_detach_turn_detector"), reason="SDK predates retained streaming turn detection")
+async def test_native_handoffs_keep_one_live_turn_detector_stream_and_release_old_observers():
+    source, session_vad = ControlledVAD(), ControlledVAD()
+    entered, turns, seen = asyncio.Queue(), asyncio.Queue(), []
+    detector = owned_streaming_turn_detector(0.9)
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        seen.append(request.headers["Idempotency-Key"])
+        index = len(seen)
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": f"turn {index}"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_enter(self):
+            entered.put_nowait(self)
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+        session = AgentSession(stt=model, llm=None, tts=None, vad=session_vad, turn_detection=detector, min_endpointing_delay=0.01, max_endpointing_delay=0.01)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        model.bind_session(session)
+        recognitions, expected_audio = [], bytearray()
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            for index in range(1, 4):
+                agent = OwnedAgent(instructions="Owned streaming detector handoff")
+                if index == 1:
+                    await session.start(agent=agent, **options)
+                else:
+                    session.update_agent(agent)
+                assert await asyncio.wait_for(entered.get(), 3) is agent
+                recognitions.append(session._activity._audio_recognition)
+                for samples, kind in [(320, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                    value = rtc.AudioFrame(data=(b"\xff\x0f" if samples == 320 else b"\0\0") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples)
+                    expected_audio.extend(value.data.cast("B"))
+                    await audio.frames.put(value)
+                    for vad_model in (source, session_vad):
+                        observed = await asyncio.wait_for(vad_model.frames.get(), 3)
+                        vad_model.processed(observed, raw_silence=0.55 if samples == 8800 and vad_model is session_vad else 0)
+                        vad_model.emit(kind, frames=[observed], silence_duration=0.55 if samples == 8800 else 0)
+                assert await asyncio.wait_for(turns.get(), 3) == f"turn {index}"
+                assert len(detector.streams) == 1
+                assert not detector.streams[0].closed
+                observed_stream = recognitions[-1]._turn_detector_stream
+                assert observed_stream.original is detector.streams[0], "handoffs must not retain previous observers in a chain"
+                for old in recognitions[:-1]:
+                    assert old._turn_detector is detector
+            assert len(seen) == len(set(seen)) == 3
+            assert bytes(detector.streams[0].audio) == bytes(expected_audio)
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+            assert detector.streams[0].closed
+            assert all(item._turn_detector is detector for item in recognitions)
+
+
+@pytest.mark.parametrize("input_rate", [16000, 48000])
+async def test_native_turn_waits_for_vad_input_frontier_and_rearms_when_silence_drains(input_rate):
+    source, terminal, turns, seen = ControlledVAD(), asyncio.Event(), asyncio.Queue(), []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        seen.append(request.headers["Idempotency-Key"])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await asyncio.sleep(0.05)
+                await ws.send_json({"type": "transcript.final", "text": "complete"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                terminal.set()
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+        session = AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0.1, max_endpointing_delay=0.1)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned VAD processing frontier"), **options)
+            duration = 0.1 if input_rate != 16000 else 0.02
+            for kind in (vad.VADEventType.START_OF_SPEECH, vad.VADEventType.END_OF_SPEECH):
+                samples = round(input_rate * duration)
+                await audio.frames.put(rtc.AudioFrame(data=b"\xff\x0f" * samples, sample_rate=input_rate, num_channels=1, samples_per_channel=samples))
+                observed = await asyncio.wait_for(source.frames.get(), 3)
+                source.processed(observed)
+                source.emit(kind, frames=[observed], silence_duration=0.02 if kind is vad.VADEventType.END_OF_SPEECH else 0)
+            samples = round(input_rate * duration)
+            silence = rtc.AudioFrame(data=b"\0\0" * samples, sample_rate=input_rate, num_channels=1, samples_per_channel=samples)
+            await audio.frames.put(silence)
+            pending = await asyncio.wait_for(source.frames.get(), 3)
+            await asyncio.wait_for(terminal.wait(), 3)
+            await asyncio.sleep(0.25)
+            assert turns.empty(), "an unprocessed input frame can still contain continued speech"
+            source.processed(pending)
+            assert await asyncio.wait_for(turns.get(), 1) == "complete", "draining silence must rearm a deferred turn without another transcript"
+            assert len(seen) == 1
+        finally:
             await audio.frames.put(None)
             await session.aclose()
             await model.aclose()

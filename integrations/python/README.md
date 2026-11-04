@@ -83,8 +83,17 @@ Duration-preserving DSP may deep-copy userdata without changing its source witne
 `bind_agent(agent)` locates the same session when its first stream starts.
 The owned SDK activity interface is checked before admission and before each
 turn's final transcript, including SDKs that retain a stream across handoff.
-It is restored on close or handoff; the binding never changes the global SDK. A later speech
-request waits for the framework's actual complete-turn commit. Binding is
+It is restored on close or handoff; the binding never changes the global SDK.
+Short pauses can span several physical speech requests in one framework turn.
+Resumed speech transcribes while endpointing is pending; a genuinely separate
+queued turn still waits for the preceding framework commit. Between configured
+delay limits, the binding follows the SDK's observed turn-detector decision.
+Withdrawn streaming predictions follow the SDK's resumed-speech state.
+Unprocessed VAD input and incomplete terminal transcripts defer framework
+acceptance. Draining input or delivering the complete transcript rearms a deferred
+decision, preserving an explicit `skip_reply` request. The SDK detector objects
+and streams are observed through owned recognition instances and restored on close.
+Binding is
 required for native AgentSession streaming. Explicit event consumers can use
 `stream(manual_turns=True)`; completed-buffer `recognize()` needs no binding
 and joins all final segments. EOS timing excludes the detector's trailing
@@ -108,8 +117,8 @@ error codes. Live usage updates remain progress events; only a terminal frame
 with final usage produces `usage.reported`. A lost terminal frame fails without
 an automatic retry. These transport tests use owned protocol peers; wiring
 worker claims through the actual cell and settling a full conversation remains
-an integration gate. Short VAD pauses and a separately configured Session VAD
-still need logical-turn coordination before managed worker activation.
+an integration gate. Managed worker activation also requires current-head review
+of logical-turn coordination and the complete worker/cell/router lifecycle.
 
 For LiveKit Agents:
 

@@ -46,6 +46,7 @@ from ._livekit_native_input import (
 )
 from ._livekit_native_speaker import bind_native_speaker_timing
 from ._livekit_native_stt import NativeSpeechStream
+from ._livekit_native_turns import NativeTurnPolicy
 from ._speech_client import SpeechClient
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
 from .client import GatewayClient, GatewayError
@@ -190,6 +191,10 @@ class STT(stt.STT):
         self._turn_listener: Any = None
         self._native_wrappers: dict[int, tuple[Any, Any, Any]] = {}
         self._native_input_binding: NativeInputBinding | None = None
+        self._native_deferred_turn: tuple[Any, bool] | None = None
+        self._native_turn_rearmed = False
+        self._native_reconsider_scheduled = False
+        self._native_turn_policy: NativeTurnPolicy | None = None
 
     def bind_agent(self, agent: Agent) -> None:
         """Locate the owned session through its initial Agent at stream start.
@@ -214,6 +219,11 @@ class STT(stt.STT):
         self._native_input_binding = bind_native_input(self, session=session)
 
     def _restore_turn_binding(self) -> None:
+        if self._native_turn_policy is not None:
+            self._native_turn_policy.close()
+            self._native_turn_policy = None
+        self._native_deferred_turn = None
+        self._native_turn_rearmed = False
         if self._turn_binding is not None:
             activity, original, completed = self._turn_binding
             if activity.on_end_of_turn is completed:
@@ -314,6 +324,9 @@ class STT(stt.STT):
             def observe_activity(_event: Any) -> None:
                 if getattr(self._bound_session, "_activity", None) is not None:
                     self._bind_native_activity()
+                    if self._native_turn_policy is not None:
+                        asyncio.get_running_loop().call_soon(self._native_turn_policy.changed.set)
+                    self._schedule_native_reconsider()
 
             self._turn_listener = observe_activity
             self._bound_session.on("conversation_item_added", observe_activity)
@@ -328,6 +341,8 @@ class STT(stt.STT):
         if self._turn_binding is not None:
             bound, _, completed = self._turn_binding
             if bound is activity and original is completed:
+                if self._native_turn_policy is not None:
+                    self._native_turn_policy.refresh()
                 return
         self._restore_turn_binding()
         original = getattr(activity, "on_end_of_turn", None)
@@ -335,8 +350,37 @@ class STT(stt.STT):
             raise ValueError("Unsupported native AgentSession turn interface")
 
         def committed(info: Any) -> bool:
+            if self._native_failed:
+                return False
+            if any(
+                isinstance(stream, NativeSpeechStream)
+                and not stream.permits_framework_commit(info.new_transcript)
+                for stream in list(self._streams)
+            ):
+                previous = self._native_deferred_turn
+                self._native_deferred_turn = (
+                    activity,
+                    info.skip_reply
+                    or (
+                        previous[1]
+                        if previous is not None and previous[0] is activity
+                        else False
+                    ),
+                )
+                self._native_turn_rearmed = False
+                return False
+            previous = self._native_deferred_turn
+            if (
+                previous is not None
+                and previous[0] is activity
+                and previous[1]
+                and not info.skip_reply
+            ):
+                info = dataclasses.replace(info, skip_reply=True)
             accepted = original(info)
             if accepted is True:
+                self._native_deferred_turn = None
+                self._native_turn_rearmed = False
                 # AudioRecognition clears its transcript synchronously after
                 # this callback returns. Waking the waiter cannot overtake it.
                 for stream in list(self._streams):
@@ -347,6 +391,49 @@ class STT(stt.STT):
         activity.on_end_of_turn = committed
         activity._speko_native_stt_turn_owner = self
         self._turn_binding = (activity, original, committed)
+        if getattr(activity, "_audio_recognition", None) is not None:
+            self._native_turn_policy = NativeTurnPolicy(activity._audio_recognition)
+
+    async def _native_continuation_delay(
+        self, transcript: str, gap: float
+    ) -> float | None:
+        if self._native_turn_policy is None:
+            return None
+        return await self._native_turn_policy.delay_for(transcript, gap)
+
+    def _schedule_native_reconsider(self) -> None:
+        if self._native_failed:
+            return
+        if (
+            self._native_deferred_turn is not None
+            and not self._native_turn_rearmed
+            and not self._native_reconsider_scheduled
+        ):
+            self._native_reconsider_scheduled = True
+            asyncio.get_running_loop().call_soon(self._reconsider_native_turn)
+
+    def _reconsider_native_turn(self) -> None:
+        self._native_reconsider_scheduled = False
+        deferred = self._native_deferred_turn
+        if (
+            deferred is None
+            or self._native_turn_rearmed
+            or getattr(self._bound_session, "_activity", None) is not deferred[0]
+        ):
+            return
+        recognition = deferred[0]._audio_recognition
+        if recognition._closing.is_set():
+            return
+        transcript = recognition._audio_transcript
+        if not transcript or any(
+            isinstance(stream, NativeSpeechStream)
+            and not stream.permits_framework_commit(transcript)
+            for stream in list(self._streams)
+        ):
+            return
+        if self._native_turn_policy is not None:
+            self._native_turn_rearmed = True
+            self._native_turn_policy.reconsider(skip_reply=deferred[1])
 
     @property
     def model(self) -> str:
@@ -478,6 +565,8 @@ class STT(stt.STT):
                 report_open=lambda stream: _report_stream_leg("stt", stream),
                 check_admission=prepare_native_turn,
                 wait_for_turn_commit=not recognize and not manual_turns,
+                continuation_delay=self._native_continuation_delay,
+                reconsider_turn=self._schedule_native_reconsider,
                 input_timeline=native_input_timeline(self._native_input_binding) if not recognize and not manual_turns else None,
             )
         else:
