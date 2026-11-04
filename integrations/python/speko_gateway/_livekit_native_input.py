@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextvars
 import inspect
+import time
 import weakref
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -11,31 +12,73 @@ from functools import wraps
 from typing import Any
 
 from livekit import rtc
-from livekit.agents.voice import audio_recognition
+from livekit.agents.voice import audio_recognition, io
 
 from .client import GatewayError
 
 _POSITION = "_speko_native_input_position"
+_SOURCE_POSITION = "_speko_native_source_position"
+
+
+def _copy_frame(frame: rtc.AudioFrame) -> rtc.AudioFrame:
+    size = frame.samples_per_channel * frame.num_channels * 2
+    owned = rtc.AudioFrame(
+        data=bytearray(frame.data.cast("B")[:size]),
+        sample_rate=frame.sample_rate,
+        num_channels=frame.num_channels,
+        samples_per_channel=frame.samples_per_channel,
+    )
+    owned.userdata.update(frame.userdata)
+    return owned
+
+
+@dataclass(frozen=True)
+class _SourcePosition:
+    scope: object
+    start: Fraction
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _SourcePosition:
+        return self
+
+
+class _SourceInput(io.AudioInput):
+    def __init__(self, source: io.AudioInput, binding: NativeInputBinding) -> None:
+        super().__init__(label=source.label, source=source)
+        self.binding = binding
+        self._position: Fraction | None = None
+
+    async def __anext__(self) -> rtc.AudioFrame:
+        frame = await super().__anext__()
+        if not self.binding.owners:
+            return frame
+        if self._position is None:
+            self._position = self.binding.source_start()
+        owned = _copy_frame(frame)
+        owned.userdata[_SOURCE_POSITION] = _SourcePosition(
+            self.binding.scope, self._position
+        )
+        self._position += Fraction(frame.samples_per_channel, frame.sample_rate)
+        self.binding._source_end = max(self.binding._source_end, self._position)
+        return owned
 
 
 @dataclass
 class NativeInputTimeline:
     position: Fraction = Fraction(0)
     scope: object = field(default_factory=object)
+    legacy: bool = False
 
     def observe(self, frame: rtc.AudioFrame) -> rtc.AudioFrame:
         duration = Fraction(frame.samples_per_channel, frame.sample_rate)
         # One occurrence gets one immutable witness even if an input reuses
         # the same AudioFrame object. Preserve the SDK's valid PCM and userdata.
-        size = frame.samples_per_channel * frame.num_channels * 2
-        owned = rtc.AudioFrame(
-            data=bytearray(frame.data.cast("B")[:size]),
-            sample_rate=frame.sample_rate,
-            num_channels=frame.num_channels,
-            samples_per_channel=frame.samples_per_channel,
+        owned = _copy_frame(frame)
+        source = frame.userdata.get(_SOURCE_POSITION)
+        observed = isinstance(source, _SourcePosition) and source.scope is self.scope
+        start = source.start if self.legacy and observed else self.position
+        owned.userdata[_POSITION] = _InputPosition(
+            self, start, duration, not self.legacy or observed
         )
-        owned.userdata.update(frame.userdata)
-        owned.userdata[_POSITION] = _InputPosition(self, self.position, duration)
         self.position += duration
         return owned
 
@@ -44,6 +87,7 @@ class NativeInputTimeline:
         if (
             not isinstance(witness, _InputPosition)
             or witness.timeline is not self
+            or not witness.observed
             or witness.duration
             != Fraction(frame.samples_per_channel, frame.sample_rate)
         ):
@@ -58,6 +102,7 @@ class _InputPosition:
     timeline: NativeInputTimeline
     start: Fraction
     duration: Fraction
+    observed: bool = True
 
     def __deepcopy__(self, memo: dict[int, Any]) -> _InputPosition:
         # The immutable occurrence belongs to its original timeline even
@@ -103,6 +148,8 @@ class NativeInputBinding:
         self.owners: weakref.WeakSet[Any] = weakref.WeakSet()
         self._session: Any = None
         self._session_update: tuple[Any, Any] | None = None
+        self._session_forward: tuple[Any, Any] | None = None
+        self._source_end = Fraction(0)
         self._agents: dict[Any, _AgentHooks] = {}
         self._timelines: weakref.WeakKeyDictionary[Any, NativeInputTimeline] = (
             weakref.WeakKeyDictionary()
@@ -136,11 +183,58 @@ class NativeInputBinding:
 
             session._update_activity = update
             self._session_update = (original, update)
+            self._observe_source_task(session)
         activity = getattr(session, "_activity", None)
         agent = getattr(activity, "agent", None) or getattr(activity, "_agent", None)
         if agent is not None:
             self.attach_agent(agent)
         return self
+
+    def _observe_source_task(self, session: Any) -> None:
+        original = getattr(session, "_forward_audio_task", None)
+        if not callable(original):
+            return
+
+        @wraps(original)
+        async def forward() -> None:
+            recognition = getattr(
+                getattr(session, "_activity", None), "_audio_recognition", None
+            )
+            source = session.input.audio
+            if (
+                not self.owners
+                or recognition is None
+                or hasattr(recognition, "_input_started_at")
+                or source is None
+            ):
+                await original()
+                return
+            # Preserve the SDK's pump and attach/detach notifications. Its
+            # public setter would cancel this pump, so replace only its owned
+            # source reference for the duration of the captured invocation.
+            observed = _SourceInput(source, self)
+            session.input._audio_stream = observed
+            try:
+                await original()
+            finally:
+                if session.input.audio is observed:
+                    session.input._audio_stream = source
+
+        session._forward_audio_task = forward
+        self._session_forward = (original, forward)
+
+    def source_start(self) -> Fraction:
+        now = time.time()
+        recorder = getattr(self._session, "_recorder_io", None)
+        epoch = (
+            getattr(recorder, "recording_started_at", None)
+            or self._session._started_at
+            or now
+        )
+        # Anchor each attached input at its first actual delivery, before
+        # the SDK buffers it. A replacement includes its idle gap and never
+        # overlaps media that the previous input has already delivered.
+        return max(self._source_end, Fraction(str(max(0.0, now - epoch))))
 
     def _join(self, other: NativeInputBinding) -> NativeInputBinding:
         if (
@@ -160,6 +254,10 @@ class NativeInputBinding:
         return other
 
     def _timeline(self, audio: Any, session: Any) -> NativeInputTimeline:
+        recognition = getattr(
+            getattr(session, "_activity", None), "_audio_recognition", None
+        )
+        legacy = recognition is not None and not hasattr(recognition, "_input_started_at")
         context = getattr(audio_recognition, "_STTPipelineContextVar", None)
         pipeline = context.get(None) if context is not None else None
         if pipeline is None:
@@ -171,9 +269,9 @@ class NativeInputBinding:
         try:
             timeline = self._timelines.get(key)
         except TypeError:
-            return NativeInputTimeline(scope=self.scope)
+            return NativeInputTimeline(scope=self.scope, legacy=legacy)
         if timeline is None:
-            timeline = NativeInputTimeline(scope=self.scope)
+            timeline = NativeInputTimeline(scope=self.scope, legacy=legacy)
             self._timelines[key] = timeline
         return timeline
 
@@ -290,6 +388,14 @@ class NativeInputBinding:
             del _agents[agent]
 
     def _restore(self) -> None:
+        if self._session_forward is not None:
+            original, forward = self._session_forward
+            if self._session._forward_audio_task is forward:
+                self._session._forward_audio_task = original
+            source = self._session.input.audio
+            if isinstance(source, _SourceInput) and source.binding is self:
+                self._session.input._audio_stream = source.source
+            self._session_forward = None
         if self._session_update is not None:
             original, update = self._session_update
             if self._session._update_activity is update:

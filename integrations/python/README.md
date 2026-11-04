@@ -91,9 +91,11 @@ actual synchronous turn acceptance, including `skip_reply=True`, and follows
 `update_agent()` handoffs and live `Agent.update_options(stt=...)` swaps. The
 current activity has one turn owner; the old callback is restored before a new
 model binds. The binding observes the Agent's input before its custom
-`stt_node` consumes or buffers frames, keeping sample positions in the SDK
-recognition pipeline's timeline. Filtered frames advance that timeline without
-being sent to the provider. Buffered audio retains its original position, and
+`stt_node` consumes or buffers frames, keeping the SDK's timestamp basis.
+Newer SDKs use the recognition pipeline's timeline. LiveKit 1.4.5 uses the
+session or recording epoch, so the binding also observes source delivery before
+SDK buffering; replacing an input preserves its elapsed gap. Filtered frames
+advance that timeline without being sent to the provider. Buffered audio retains its original position, and
 fresh input retains its configured endpointing delay even when a wrapper omits
 its child's offset. Each input occurrence receives its own frame copy with the
 original PCM and userdata; the producer's frames remain untouched. Custom DSP
@@ -107,8 +109,17 @@ Duration-preserving DSP may deep-copy userdata without changing its source witne
 `bind_agent(agent)` locates the same session when its first stream starts.
 The owned SDK activity interface is checked before admission and before each
 turn's final transcript, including SDKs that retain a stream across handoff.
-It is restored on close or handoff; the binding never changes the global SDK. A later speech
-request waits for the framework's actual complete-turn commit. Binding is
+It is restored on close or handoff; the binding never changes the global SDK.
+Short pauses can span several physical speech requests in one framework turn.
+Resumed speech transcribes while endpointing is pending; a genuinely separate
+queued turn still waits for the preceding framework commit. Between configured
+delay limits, the binding follows the SDK's observed turn-detector decision.
+Withdrawn streaming predictions follow the SDK's resumed-speech state.
+Unprocessed VAD input and incomplete terminal transcripts defer framework
+acceptance. Draining input or delivering the complete transcript rearms a deferred
+decision, preserving an explicit `skip_reply` request. The SDK detector objects
+and streams are observed through owned recognition instances and restored on close.
+Binding is
 required for native AgentSession streaming. Explicit event consumers can use
 `stream(manual_turns=True)`; completed-buffer `recognize()` needs no binding
 and joins all final segments. EOS timing excludes the detector's trailing
@@ -132,8 +143,8 @@ error codes. Live usage updates remain progress events; only a terminal frame
 with final usage produces `usage.reported`. A lost terminal frame fails without
 an automatic retry. These transport tests use owned protocol peers; wiring
 worker claims through the actual cell and settling a full conversation remains
-an integration gate. Short VAD pauses and a separately configured Session VAD
-still need logical-turn coordination before managed worker activation.
+an integration gate. Managed worker activation also requires current-head review
+of logical-turn coordination and the complete worker/cell/router lifecycle.
 
 For LiveKit Agents:
 
@@ -168,6 +179,33 @@ the Indian-English way in a Hindi session, or `{"elevenlabs": {"stability":
 0.4, "similarity_boost": 0.8, "style": 0.2}}`. `update_options(provider_options=...)`
 changes them for the next reply. The Gateway refuses a setting the routed
 model cannot honor before the session opens.
+
+With `GatewayClient`, `TTS` keeps a Gateway session open in standby, so a reply's
+first text goes out without waiting for a session to open. Opening a session
+also connects to the provider, and some providers hold the first audio until that setup
+finishes. Managed ElevenLabs, for example, checks its token only after the
+WebSocket upgrade. LiveKit calls `prewarm()` when the agent starts, which
+opens the standby, and each reply opens the next standby when it takes the
+current one. A reply opens its own session at its first text, as before, when
+the standby has other settings, has ended, or failed to open. `update_options`
+replaces a standby that has the old settings, so an agent that changes
+language every turn opens one unused session per change. A standby that no
+reply takes within 3 minutes closes, and the next reply opens its own session
+and a new standby. LiveKit does not close the `TTS` when the session ends, so
+call `aclose()` to close the standby sooner. Between replies, each `TTS` holds
+one open Gateway session and provider connection, and during a reply it holds
+two. Both count toward your organization's concurrent-session limit and the
+provider's connection limits. With managed credentials, Speko reserves credit
+for each open session's `max_input_characters`, so the standby holds a second
+reservation. Lower `max_input_characters` to reserve less. Set
+`standby_sessions` to keep more standbys, or to `0` to open each session at
+its reply's first text.
+
+With `RelaySpeechClient`, `TTS` defaults to `standby_sessions=0`: provider
+admission starts at the reply's first text. Set a positive count explicitly
+to preopen native sessions; each standby consumes its own admission, credit
+reservation and provider connection. Native speech never retries a reply's
+failed open, including when standby sessions are enabled.
 
 `STT()` and `TTS()` read `SPEKO_SOCKET_PATH` and `SPEKO_LOCAL_AUTH_TOKEN`.
 `credential_source="auto"` preserves the original behavior: managed when
