@@ -84,15 +84,23 @@ canonical text. Uncovered spans remain unattributed unless the provider labels
 the whole final; ambiguous alignment preserves the text without inventing a
 speaker. Invalid labels or time ranges refuse the result and fence retries.
 The owned recognition callback reconciles canonical text after SDK processing,
+including adaptive interruption replay on SDKs with a separate processing step,
 including an interim promoted by a timed-out manual commit. It validates that
 attributed final events reach the SDK unchanged and in order. The callback is
-restored when ownership changes or the model closes.
+restored when ownership changes or the model closes. Event and SpeechData
+dataclass copies preserve the canonical text, timing witness and ordered-final
+association. Those fields contain only encodable values; pending native batches
+are released after processing or stream close.
 
 Native streaming finals expose `canonical_text` on the last part of each
 provider final; earlier parts carry an empty string. `recognize()` returns the
-complete text with available `speaker_segments`. Local Gateway recognition
-keeps one complete final and carries segment attribution in the same metadata,
-so the SDK cannot insert word spaces into a Chinese final.
+complete text with available `speaker_segments`. Local Gateway streaming also
+emits individual attributed finals through standard `speaker_id` fields, so
+MultiSpeaker detection and transcription events receive the labels. Its owned
+recognition hook preserves canonical turn text, including through nested SDK
+wrappers and manual commits partway through a final. Deliberate local wrapper
+formatting is preserved. Ambiguous spans stay unattributed even when a whole
+final has a different speaker label.
 Speaker RMS lookup uses accepted audio positions, including after custom-node
 filtering; emitted transcript timestamps keep their original input positions.
 Multi-model fallback requires a control-plane recovery decision; wrappers

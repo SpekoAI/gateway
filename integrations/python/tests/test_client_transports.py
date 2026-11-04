@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import inspect
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
@@ -313,6 +315,151 @@ async def test_local_gateway_sdk_final_retains_canonical_text_and_segment_metada
         finally:
             await model.aclose()
             await client.aclose()
+
+
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("manual", [None, False, True])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("formatted", [False, True])
+async def test_local_gateway_session_keeps_standard_speakers_and_canonical_turn(partial, manual, nested, formatted):
+    from livekit import rtc
+    from livekit.agents import Agent, AgentSession, stt
+    from livekit.agents.voice import io
+
+    from speko_gateway.livekit import STT
+
+    text = "hello world" if partial else "你好"
+    segments = [{"text": "hello" if partial else "你", "speaker": 2, "start_ms": 0, "end_ms": 400}]
+    if not partial:
+        segments.append({"text": "好", "speaker": 3, "start_ms": 400, "end_ms": 800})
+    first, release = asyncio.Event(), asyncio.Event()
+    next_final = asyncio.Event()
+    turns, items, entered, finals, transcription = asyncio.Queue(), asyncio.Queue(), asyncio.Queue(), [], []
+
+    class Audio(io.AudioInput):
+        def __init__(self):
+            super().__init__(label="owned-local-sdk-input")
+            self.frames = asyncio.Queue()
+
+        async def __anext__(self):
+            value = await self.frames.get()
+            if value is None:
+                raise StopAsyncIteration
+            return value
+
+    class OwnedAgent(Agent):
+        async def on_enter(self):
+            entered.put_nowait(self)
+
+        async def stt_node(self, audio, settings):
+            async for event in Agent.default.stt_node(self, audio, settings):
+                event = dataclasses.replace(event, alternatives=[dataclasses.replace(data) for data in event.alternatives])
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    finals.extend(event.alternatives)
+                yield event
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT and event.alternatives[0].canonical_text == "" and not first.is_set():
+                    first.set()
+                    if manual is not None:
+                        await release.wait()
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    class HandoffAgent(Agent):
+        async def on_enter(self):
+            entered.put_nowait(self)
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async def create(request):
+        await request.json()
+        return web.json_response({"stream_url": "/v1/sessions/fixture/stream"}, status=201)
+
+    async def websocket(request):
+        ws = web.WebSocketResponse(protocols=["speko.voice.v0.r3"])
+        await ws.prepare(request)
+        sent = False
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY and (not sent or next_final.is_set()):
+                sent = True
+                next_final.clear()
+                for kind, data in [("speech.started", {}), ("transcript.final", {"text": text, "segments": segments}), ("speech.ended", {})]:
+                    await ws.send_json({"type": kind, "data": data})
+            if message.type is aiohttp.WSMsgType.TEXT and message.json()["type"] == "session.close":
+                await ws.close()
+        return ws
+
+    app = web.Application()
+    app.router.add_post("/v1/sessions", create)
+    app.router.add_get("/v1/sessions/fixture/stream", websocket)
+    async with server(app, unix=True) as address:
+        client = GatewayClient(socket_path=address, local_auth_token="owned-local-sdk-attribution")
+        model = STT(client, diarization=True)
+        speaker_wrapper = stt.MultiSpeakerAdapter(stt=model, primary_format="[primary {speaker_id}] {text}" if formatted else "{text}", background_format="[background {speaker_id}] {text}" if formatted else "{text}")
+        wrapped = speaker_wrapper
+        if nested:
+            wrapped = stt.FallbackAdapter([wrapped], max_retry_per_stt=0)
+        session = AgentSession(stt=wrapped, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        session.on("user_input_transcribed", lambda event: transcription.append(event))
+        session.on("conversation_item_added", lambda event: items.put_nowait(event.item.text_content) if getattr(event.item, "role", None) == "user" else None)
+        audio = Audio()
+        session.input.audio = audio
+        bindings = []
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned local SDK attribution"), **options)
+            await asyncio.wait_for(entered.get(), 3)
+            binding = getattr(session._activity, "_speko_local_transcript_binding", None)
+            if binding is not None:
+                bindings.append(binding)
+            await audio.frames.put(rtc.AudioFrame(data=b"\xff\x0f" * 16000, sample_rate=16000, num_channels=1, samples_per_channel=16000))
+            if manual is not None:
+                await asyncio.wait_for(first.wait(), 3)
+                session.commit_user_turn(transcript_timeout=0, skip_reply=manual)
+                await asyncio.sleep(0.05)
+                assert turns.empty()
+                assert items.empty()
+                assert binding.deferred is not None
+                release.set()
+            event_texts = [f"[{'primary' if index == 0 else 'background'} {part['speaker']}] {part['text']}" if formatted else part["text"] for index, part in enumerate(segments)] + ([" world"] if partial else [])
+            expected_turn = " ".join(event_texts) if formatted else text
+            assert await asyncio.wait_for((items if manual is True else turns).get(), 3) == expected_turn
+            assert [(data.text.strip(), data.speaker_id) for data in finals] == [(part.strip(), str(segments[index]["speaker"]) if index < len(segments) else None) for index, part in enumerate(event_texts)]
+            assert {event.speaker_id for event in transcription if event.is_final} >= ({"2", None} if partial else {"2", "3"})
+            assert finals[0].is_primary_speaker is True
+            if not partial:
+                assert finals[-1].is_primary_speaker is False
+            assert not hasattr(session._activity._start_session, "__wrapped__")
+            if manual is None and not partial and not formatted:
+                # First move from the copying node to the SDK default, then
+                # hand off again so SDKs that retain default pipelines do so.
+                for index in range(2):
+                    previous_pipeline = getattr(session._activity._audio_recognition, "_stt_pipeline", None)
+                    target = HandoffAgent(instructions="Owned local SDK handoff")
+                    session.update_agent(target)
+                    assert await asyncio.wait_for(entered.get(), 3) is target
+                    if index and previous_pipeline is not None:
+                        assert session._activity._audio_recognition._stt_pipeline is previous_pipeline
+                    next_final.set()
+                    await audio.frames.put(rtc.AudioFrame(data=b"\xff\x0f" * 16000, sample_rate=16000, num_channels=1, samples_per_channel=16000))
+                    assert await asyncio.wait_for(turns.get(), 3) == text
+                    bindings.append(session._activity._speko_local_transcript_binding)
+        finally:
+            hooks = [binding.processing for binding in bindings if binding.processing is not None]
+            release.set()
+            await audio.frames.put(None)
+            await session.aclose()
+            await wrapped.aclose()
+            await model.aclose()
+            await client.aclose()
+            for binding in bindings:
+                assert binding.processing is None
+                assert binding.turn is None
+            for recognition, method, original, _ in hooks:
+                assert getattr(recognition, method) is original
+            assert not hasattr(speaker_wrapper, "_speko_local_prewarm_binding")
+            assert not hasattr(wrapped, "_speko_local_prewarm_binding")
 
 
 @pytest.mark.parametrize('status,code,retryable', [(403,'provider_not_entitled',False),(401,'authentication_failed',False),(429,'rate_limited',True),(503,'service_unavailable',True)])

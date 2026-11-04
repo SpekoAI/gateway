@@ -106,6 +106,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._turn_commit: asyncio.Future[None] | None = None
         self._turn_text = ""
         self._canonical_turn: NativeTranscript | None = None
+        self._final_batches: dict[str, NativeFinalBatch] = {}
         self._fatal: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     def push_frame(self, frame: rtc.AudioFrame) -> None:
@@ -236,6 +237,8 @@ class NativeSpeechStream(stt.RecognizeStream):
                 super().aclose(), name="speko.native.stt.close"
             )
         await asyncio.shield(self._close_task)
+        for batch in list(self._final_batches.values()):
+            batch.release()
 
     async def _feed(self) -> None:
         async for frame in self._input_ch:
@@ -489,7 +492,7 @@ class NativeSpeechStream(stt.RecognizeStream):
                 float(offset) + event.end_time,
             )
         if batch is not None:
-            data._native_final = (batch, index)
+            data._native_final = (batch.token, index)
         self._event_ch.send_nowait(
             stt.SpeechEvent(
                 type=kind,
@@ -538,7 +541,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         if self._wait_for_turn_commit and self._turn_text and (self._turn_commit is None or self._turn_commit.done()):
             self._turn_commit = asyncio.get_running_loop().create_future()
         self._pending_transcript = False
-        batch = NativeFinalBatch(self, self._canonical_turn, tuple(event.text for event in self._finals))
+        batch = NativeFinalBatch(self, self._canonical_turn, tuple(event.text for event in self._finals)) if self._wait_for_turn_commit else None
         for index, event in enumerate(self._finals):
             self._emit(event, stt.SpeechEventType.FINAL_TRANSCRIPT, batch, index)
         self._event_ch.send_nowait(

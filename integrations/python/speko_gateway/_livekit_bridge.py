@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from typing import Any, Protocol
 
 from ._speech_client import SpeechClient, SpeechSession
@@ -321,49 +322,49 @@ def _speech_events(
     for part in attributed:
         start = mapped.text.find(part.text, cursor) if part.text else -1
         if start < 0:
-            return (mapped,)
+            return (replace(mapped, speaker_id=None),)
         forward.append(start)
         cursor = start + len(part.text)
     cursor = len(mapped.text)
     for part in reversed(attributed):
         start = mapped.text.rfind(part.text, 0, cursor) if part.text else -1
         if start < 0:
-            return (mapped,)
+            return (replace(mapped, speaker_id=None),)
         backward.append(start)
         cursor = start
     backward.reverse()
+    uncertain = [
+        (start, latest + len(part.text))
+        for part, start, latest in zip(attributed, forward, backward)
+        if start != latest
+    ]
     parts, cursor = [], 0
+
+    def gap(start: int, end: int) -> None:
+        boundaries = sorted({start, end} | {
+            max(start, min(end, position))
+            for span in uncertain for position in span
+        })
+        for left, right in pairwise(boundaries):
+            if mapped.text[left:right].strip():
+                parts.append(replace(
+                    mapped,
+                    text=mapped.text[left:right],
+                    start_time=None,
+                    end_time=None,
+                    speaker_id=None if any(a < right and left < b for a, b in uncertain) else mapped.speaker_id,
+                    canonical_text="",
+                ))
+
     for part, start, latest in zip(attributed, forward, backward):
         if start != latest:
             continue
-        if mapped.text[cursor:start].strip():
-            parts.append(
-                replace(
-                    mapped,
-                    text=mapped.text[cursor:start],
-                    start_time=None,
-                    end_time=None,
-                    canonical_text="",
-                )
-            )
+        gap(cursor, start)
         parts.append(replace(part, canonical_text=""))
         cursor = start + len(part.text)
-    if mapped.text[cursor:].strip():
-        parts.append(
-            replace(
-                mapped,
-                text=mapped.text[cursor:],
-                start_time=None,
-                end_time=None,
-                canonical_text="",
-            )
-        )
+    gap(cursor, len(mapped.text))
     if not parts:
         return (mapped,)
-    if local_speakers:
-        # A local STT stream has no owned SDK turn hook. Keep its complete
-        # final intact, with segment attribution available as structured data.
-        return (replace(mapped, speaker_segments=tuple(parts)),)
     parts[-1] = replace(parts[-1], canonical_text=mapped.text)
     return tuple(parts)
 

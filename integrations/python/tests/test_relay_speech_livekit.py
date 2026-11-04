@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import inspect
 import json
 import time
@@ -2502,12 +2503,18 @@ async def test_retained_closed_native_input_node_cannot_reinstall_hooks_in_local
 
 
 @pytest.mark.parametrize("wrapper", ["direct", "nested"])
-@pytest.mark.parametrize("shape", ["unspaced", "partial", "punctuation"])
-async def test_valid_native_segments_keep_canonical_text_and_available_speakers(wrapper, shape):
-    text = {"unspaced": "你好", "partial": "hello world", "punctuation": "Hello, world!"}[shape]
+@pytest.mark.parametrize("shape", ["unspaced", "partial", "punctuation", "ambiguous"])
+@pytest.mark.parametrize("copy_fields", [False, True])
+@pytest.mark.parametrize("replay", [False, True])
+async def test_valid_native_segments_keep_canonical_text_and_available_speakers(wrapper, shape, copy_fields, replay):
+    if replay and not hasattr(recognition.AudioRecognition, "_process_stt_event"):
+        pytest.skip("SDK predates adaptive transcript replay")
+    text = {"unspaced": "你好", "partial": "hello world", "punctuation": "Hello, world!", "ambiguous": "yes yes done"}[shape]
     segments = [{"text": "你" if shape == "unspaced" else "hello" if shape == "partial" else "Hello", "start_ms": 0, "end_ms": 300, "speaker": "A"}]
     if shape != "partial":
         segments.append({"text": "好" if shape == "unspaced" else "world", "start_ms": 300, "end_ms": 600, "speaker": "B"})
+    if shape == "ambiguous":
+        segments = [{"text": "yes", "start_ms": 0, "end_ms": 300, "speaker": "B"}, {"text": "done", "start_ms": 300, "end_ms": 600, "speaker": "C"}]
     source, turns, finals, seen = ControlledVAD(), asyncio.Queue(), [], []
 
     async def handle(request):
@@ -2518,7 +2525,7 @@ async def test_valid_native_segments_keep_canonical_text_and_available_speakers(
         await ready(ws)
         async for message in ws:
             if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
-                await ws.send_json({"type": "transcript.final", "text": text, "segments": segments})
+                await ws.send_json({"type": "transcript.final", "text": text, "segments": segments, **({"speaker": "A"} if shape == "ambiguous" else {})})
                 await ws.send_json({"type": "session.closed", "usage": {}})
                 await ws.close()
         return ws
@@ -2528,6 +2535,11 @@ async def test_valid_native_segments_keep_canonical_text_and_available_speakers(
             async for event in Agent.default.stt_node(self, audio, settings):
                 if shape == "punctuation":
                     event = copy.deepcopy(event)
+                if copy_fields:
+                    event = dataclasses.replace(event, alternatives=[dataclasses.replace(data) for data in event.alternatives])
+                    # SDK telemetry must still be able to encode dataclasses;
+                    # the witness must not retain a stream, future or owner.
+                    json.dumps(dataclasses.asdict(event), ensure_ascii=False)
                 if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
                     finals.extend(event.alternatives)
                 yield event
@@ -2548,16 +2560,30 @@ async def test_valid_native_segments_keep_canonical_text_and_available_speakers(
             options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
             await session.start(agent=OwnedAgent(instructions="Owned canonical attribution"), **options)
             transcript_binding = model._native_transcript_binding
+            current_recognition = session._activity._audio_recognition
+            if replay:
+                current_recognition._transcript_gate_active = True
             for samples, kind in [(9600, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
                 value = rtc.AudioFrame(data=(b"\xff\x0f" if samples == 9600 else b"\0\0") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples)
                 await audio.frames.put(value)
                 observed = await asyncio.wait_for(source.frames.get(), 3)
                 source.processed(observed)
                 source.emit(kind, frames=[observed], silence_duration=0 if samples == 9600 else 0.55)
+            if replay:
+                async with asyncio.timeout(3):
+                    while not any(event.type is stt.SpeechEventType.END_OF_SPEECH for event in current_recognition._transcript_buffer):
+                        await asyncio.sleep(0)
+                assert not current_recognition._audio_transcript
+                assert turns.empty()
+                current_recognition._flush_held_transcripts()
             assert await asyncio.wait_for(turns.get(), 3) == text
             assert len(seen) == 1
             assert not model._native_failed
-            assert {data.speaker_id for data in finals} >= ({"A", None} if shape == "partial" else {"A", "B"})
+            assert all(not stream._final_batches for stream in model._streams)
+            expected = {None, "C"} if shape == "ambiguous" else {"A", None} if shape == "partial" else {"A", "B"}
+            assert {data.speaker_id for data in finals} >= expected
+            if shape == "ambiguous":
+                assert all(data.speaker_id is None for data in finals if "yes" in data.text)
             assert "".join("".join(data.text.split()) for data in finals) == "".join(text.split())
         finally:
             await audio.frames.put(None)
@@ -2567,8 +2593,8 @@ async def test_valid_native_segments_keep_canonical_text_and_available_speakers(
             await model.aclose()
             await client.aclose()
             if transcript_binding is not None:
-                recognition, original, _ = transcript_binding
-                assert recognition._on_stt_event is original
+                bound_recognition, original, _ = transcript_binding
+                assert getattr(bound_recognition, original.__name__) is original
                 assert model._native_transcript_binding is None
 
 
@@ -2665,6 +2691,7 @@ async def test_native_recognize_preserves_canonical_text_and_attributed_spans(pa
             data = event.alternatives[0]
             assert data.text == text
             assert data.canonical_text == text
+            assert data._native_final is None
             attributed = [part for part in data.speaker_segments if part.speaker_id is not None]
             assert [(part.text, part.speaker_id) for part in attributed] == [(part["text"], part["speaker"]) for part in segments]
             if partial:

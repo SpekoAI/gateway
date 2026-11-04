@@ -41,6 +41,7 @@ from ._livekit_bridge import (
     LiveKitTTSEvent,
     LiveKitTTSStream,
 )
+from ._livekit_local_transcript import bind_local_transcript
 from ._livekit_native_input import (
     NativeInputBinding,
     bind_native_input,
@@ -106,6 +107,7 @@ def _speech_data(event: LiveKitSpeechEvent, language: str) -> NativeSpeechData:
     )
     data.speaker_segments = tuple(_speech_data(part, language) for part in event.speaker_segments)
     data.canonical_text = event.canonical_text
+    data._local_part_text = event.text
     return data
 
 
@@ -218,6 +220,11 @@ class STT(stt.STT):
         self._native_turn_rearmed = False
         self._native_reconsider_scheduled = False
         self._native_turn_policy: NativeTurnPolicy | None = None
+        self._local_transcript_bindings: weakref.WeakSet[Any] = weakref.WeakSet()
+
+    def prewarm(self) -> None:
+        if not isinstance(self._client, RelaySpeechClient):
+            bind_local_transcript(self)
 
     def bind_agent(self, agent: Agent) -> None:
         """Locate the owned session through its initial Agent at stream start.
@@ -513,7 +520,7 @@ class STT(stt.STT):
                     final = event
             if final is None:
                 raise APIConnectionError("Speko STT ended without a final transcript")
-            if isinstance(stream, NativeSpeechStream):
+            if segments:
                 if len(segments) > 1:
                     final = stt.SpeechEvent(
                         type=stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -599,6 +606,7 @@ class STT(stt.STT):
                 input_timeline=native_input_timeline(self._native_input_binding) if not recognize and not manual_turns else None,
             )
         else:
+            bind_local_transcript(self)
             stream = SpeechStream(
                 stt_instance=self,
                 bridge=bridge,
@@ -628,6 +636,9 @@ class STT(stt.STT):
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
+        for binding in list(self._local_transcript_bindings):
+            binding.release(self)
+        self._local_transcript_bindings.clear()
         self._restore_turn_binding()
         for wrapper, original, stream in self._native_wrappers.values():
             if wrapper.stream is stream:
