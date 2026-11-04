@@ -44,6 +44,7 @@ from ._livekit_native_input import (
     bind_native_input,
     native_input_timeline,
 )
+from ._livekit_native_speaker import bind_native_speaker_timing
 from ._livekit_native_stt import NativeSpeechStream
 from ._speech_client import SpeechClient
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
@@ -270,7 +271,10 @@ class STT(stt.STT):
             # wrapper's synchronous entry too, so nested fallback recovery
             # cannot hide an ambiguous native outcome in an SDK retry loop.
             self._check_native_admission()
-            return original(*args, **kwargs)
+            result = original(*args, **kwargs)
+            if isinstance(wrapper, stt.MultiSpeakerAdapter):
+                bind_native_speaker_timing(result)
+            return result
 
         wrapper.stream = stream
         self._native_wrappers[id(wrapper)] = (wrapper, original, stream)
@@ -653,6 +657,7 @@ class SpeechStream(stt.RecognizeStream):
                         stt.SpeechData(
                             language=event.language or self._language,
                             text=event.text,
+                            speaker_id=event.speaker_id,
                             start_time=event.start_time or 0.0,
                             end_time=event.end_time or 0.0,
                         )
@@ -685,6 +690,7 @@ class SpeechStream(stt.RecognizeStream):
                     stt.SpeechData(
                         language=event.language or self._language,
                         text=event.text,
+                        speaker_id=event.speaker_id,
                         start_time=event.start_time or 0.0,
                         end_time=event.end_time or 0.0,
                     )

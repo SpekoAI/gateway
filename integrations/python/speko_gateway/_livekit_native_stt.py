@@ -14,6 +14,7 @@ from livekit.agents import APIConnectionError, APIConnectOptions, stt, utils, va
 
 from ._livekit_bridge import LiveKitSpeechEvent, LiveKitSTTBridge, LiveKitSTTStream
 from ._livekit_native_input import NativeInputTimeline
+from ._livekit_native_speaker import NativeSpeechData
 from .client import GatewayError
 
 
@@ -378,22 +379,27 @@ class NativeSpeechStream(stt.RecognizeStream):
 
     def _emit(self, event: LiveKitSpeechEvent, kind: stt.SpeechEventType) -> None:
         offset = Fraction(self._request_start_sample, self._sample_rate)
+        data = NativeSpeechData(
+            language=event.language or self._language,
+            text=event.text,
+            speaker_id=event.speaker_id,
+            start_time=self._source_time(offset + Fraction(str(event.start_time)))
+            if event.start_time is not None
+            else 0.0,
+            end_time=self._source_time(offset + Fraction(str(event.end_time)), end=True)
+            if event.end_time is not None
+            else 0.0,
+        )
+        if event.start_time is not None and event.end_time is not None:
+            data._native_input_times = (
+                float(offset) + event.start_time,
+                float(offset) + event.end_time,
+            )
         self._event_ch.send_nowait(
             stt.SpeechEvent(
                 type=kind,
                 request_id=self._request_id,
-                alternatives=[
-                    stt.SpeechData(
-                        language=event.language or self._language,
-                        text=event.text,
-                        start_time=self._source_time(offset + Fraction(str(event.start_time)))
-                        if event.start_time is not None
-                        else 0.0,
-                        end_time=self._source_time(offset + Fraction(str(event.end_time)), end=True)
-                        if event.end_time is not None
-                        else 0.0,
-                    )
-                ],
+                alternatives=[data],
             )
         )
 

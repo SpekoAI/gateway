@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from ._speech_client import SpeechClient, SpeechSession
@@ -33,6 +34,7 @@ class LiveKitSpeechEvent:
     # language is the provider-identified language of a final, "" when the
     # provider identified none (a session pinned to one language).
     language: str = ""
+    speaker_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -227,8 +229,7 @@ class LiveKitSTTStream:
         async for event in self._session.events():
             if event.type == "error":
                 raise _stream_error(event)
-            mapped = _speech_event(event)
-            if mapped is not None:
+            for mapped in _speech_events(event):
                 yield mapped
 
 
@@ -242,23 +243,77 @@ def _stream_error(event: CanonicalEvent) -> GatewayError:
     )
 
 
-def _speech_event(event: CanonicalEvent) -> LiveKitSpeechEvent | None:
+def _speech_events(event: CanonicalEvent) -> tuple[LiveKitSpeechEvent, ...]:
     if event.type not in {
         "speech.started",
         "speech.ended",
         "transcript.delta",
         "transcript.final",
     }:
-        return None
+        return ()
     data = event.data
-    return LiveKitSpeechEvent(
+    mapped = LiveKitSpeechEvent(
         type=event.type,
         text=str(data.get("text", "")),
         start_time=_milliseconds(data.get("audio_start_ms")),
         end_time=_milliseconds(data.get("audio_end_ms")),
         provider_request_id=str(data.get("provider_request_id", "")),
         language=str(data.get("language", "")),
+        speaker_id=_speaker(data.get("speaker")),
     )
+    segments = data.get("segments")
+    if (
+        event.type != "transcript.final"
+        or not isinstance(segments, list)
+        or not any(
+            isinstance(segment, dict) and segment.get("speaker") not in (None, "")
+            for segment in segments
+        )
+    ):
+        return (mapped,)
+    # LiveKit alternatives represent competing hypotheses, not successive
+    # speakers. Publish each attributed span as its own final, once, while
+    # retaining the complete canonical transcript used for turn acceptance.
+    if any(
+        not isinstance(segment, dict) or not isinstance(segment.get("text"), str)
+        for segment in segments
+    ):
+        raise GatewayError("Native speech attribution is invalid", retryable=False)
+    complete_text = " ".join(" ".join(segment["text"] for segment in segments).split())
+    if complete_text != " ".join(mapped.text.split()):
+        raise GatewayError(
+            "Native speech attribution does not cover its transcript", retryable=False
+        )
+    parts = []
+    for segment in segments:
+        start = _milliseconds(segment.get("start_ms"))
+        end = _milliseconds(segment.get("end_ms"))
+        if (
+            start is None
+            or end is None
+            or not math.isfinite(start)
+            or not math.isfinite(end)
+            or not 0 <= start <= end
+        ):
+            raise GatewayError("Native speech attribution is invalid", retryable=False)
+        parts.append(
+            replace(
+                mapped,
+                text=segment["text"],
+                start_time=start,
+                end_time=end,
+                speaker_id=_speaker(segment.get("speaker")) or mapped.speaker_id,
+            )
+        )
+    return tuple(parts)
+
+
+def _speaker(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise GatewayError("Native speech attribution is invalid", retryable=False)
+    return value
 
 
 def _milliseconds(value: Any) -> float | None:

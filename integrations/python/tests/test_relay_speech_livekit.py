@@ -1472,6 +1472,134 @@ async def test_native_model_handoffs_keep_only_the_active_recognition_owner_boun
             await client.aclose()
 
 
+@pytest.mark.parametrize("wrapper", ["direct", "multi_speaker", "fallback", "nested"])
+@pytest.mark.parametrize("attribution", ["whole_final", "segments", "louder", "inherited", "unattributed"])
+@pytest.mark.parametrize("prefix_frames", [0, 35])
+async def test_native_actual_agent_preserves_provider_speakers_through_supported_wrappers(monkeypatch, wrapper, attribution, prefix_frames):
+    source, turns, finals = ControlledVAD(), asyncio.Queue(), []
+    speaker_streams = []
+    original_stream = stt.MultiSpeakerAdapter.stream
+
+    def capture_stream(adapter, *args, **kwargs):
+        stream = original_stream(adapter, *args, **kwargs)
+        speaker_streams.append((stream, stream._detector.on_stt_event, stream.aclose))
+        return stream
+
+    monkeypatch.setattr(stt.MultiSpeakerAdapter, "stream", capture_stream)
+    payload = {"type": "transcript.final", "text": "one two", "speaker": "A"}
+    expected = [("one two", "A", 0.0, 0.0)]
+    if attribution != "whole_final":
+        payload["segments"] = [
+            {"text": "one", "start_ms": 0, "end_ms": 300, "speaker": "A"},
+            {"text": "two", "start_ms": 300, "end_ms": 600},
+        ]
+        if attribution in ("segments", "louder"):
+            payload["segments"][1]["speaker"] = "B"
+        if attribution == "unattributed":
+            del payload["speaker"]
+        second_speaker = "B" if attribution in ("segments", "louder") else None if attribution == "unattributed" else "A"
+        expected = [("one", "A", 0.0, 0.3), ("two", second_speaker, 0.3, 0.6)]
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json(payload)
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source, diarization=True)
+        recognition_model = wrap_native_stt(model, wrapper)
+        session = AgentSession(llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+
+        class OwnedAgent(Agent):
+            async def stt_node(self, audio, settings):
+                for _ in range(prefix_frames):
+                    await anext(audio)
+                async for event in Agent.default.stt_node(self, audio, settings):
+                    if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                        finals.append(event.alternatives[0])
+                    yield event
+
+            async def on_user_turn_completed(self, turn_ctx, new_message):
+                turns.put_nowait(new_message.text_content)
+
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned diarization fixture", stt=recognition_model), **options)
+            for _ in range(prefix_frames):
+                await audio.frames.put(frame())
+            for samples, kind in [(9600, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                pcm = (b"\xff\x0f" if samples == 9600 else b"\0\0") * samples
+                if attribution == "louder" and samples == 9600:
+                    pcm = b"\xff\x0f" * 4800 + b"\xff\x3f" * 4800
+                value = rtc.AudioFrame(data=pcm, sample_rate=16000, num_channels=1, samples_per_channel=samples)
+                await audio.frames.put(value)
+                observed = await asyncio.wait_for(source.frames.get(), 3)
+                source.processed(observed)
+                source.emit(kind, frames=[observed], silence_duration=0 if samples == 9600 else 0.55)
+            assert await asyncio.wait_for(turns.get(), 3) == "one two"
+            if attribution != "whole_final":
+                expected = [(text, speaker, start + prefix_frames * 0.02, end + prefix_frames * 0.02) for text, speaker, start, end in expected]
+            assert [(item.text, item.speaker_id) for item in finals] == [(text, speaker) for text, speaker, _, _ in expected]
+            assert [item.start_time for item in finals] == pytest.approx([start for _, _, start, _ in expected])
+            assert [item.end_time for item in finals] == pytest.approx([end for _, _, _, end in expected])
+            if wrapper in ("multi_speaker", "nested") and attribution != "whole_final":
+                assert [item.is_primary_speaker for item in finals] == [True, None if attribution == "unattributed" else attribution in ("inherited", "louder")]
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            if recognition_model is not model:
+                await recognition_model.aclose()
+            await model.aclose()
+            await client.aclose()
+            for stream, on_event, close in speaker_streams:
+                assert stream._detector.on_stt_event == on_event
+                assert stream.aclose == close
+
+
+@pytest.mark.parametrize("invalid", ["missing_words", "invalid_label", "invalid_time"])
+async def test_native_diarization_cannot_drop_words_or_publish_invalid_attribution(invalid):
+    seen = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        seen.append(request.headers["Idempotency-Key"])
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({
+                    "type": "transcript.final", "text": "one two",
+                    "segments": [{"text": "one" if invalid == "missing_words" else "one two", "start_ms": -1 if invalid == "invalid_time" else 0, "end_ms": 20, "speaker": 7 if invalid == "invalid_label" else "A"}],
+                })
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=ControlledVAD(), diarization=True)
+        try:
+            with pytest.raises(APIConnectionError):
+                await model.recognize(frame(), conn_options=APIConnectOptions(max_retry=3, retry_interval=0))
+            assert model._native_failed
+            assert len(seen) == 1
+        finally:
+            await model.aclose()
+            await client.aclose()
+
+
 @pytest.mark.skipif(not hasattr(Agent, "update_options"), reason="SDK predates live model option updates")
 @pytest.mark.parametrize("wrapper", ["direct", "multi_speaker", "fallback", "nested"])
 @pytest.mark.parametrize("buffered,prefix_frames", [(True, 0), (False, 0), (False, 35)])

@@ -50,6 +50,14 @@ native request, streaming audio and interim text while speech continues.
 Turn ownership follows transcript-preserving `stt.MultiSpeakerAdapter` and
 single-model `stt.FallbackAdapter` wrappers, including nested wrappers. An
 ambiguous native failure fences their later stream and recovery calls too.
+Whole-final speaker labels reach LiveKit's `speaker_id`; attributed segments
+become individual timed finals, with explicit segment labels taking precedence.
+Unlabeled segments inherit a whole-final label when present. Otherwise they
+remain unattributed. The MultiSpeaker wrapper can use these labels and timings
+for primary-speaker detection. Attributed segments must cover the final's full
+text in order; invalid attribution refuses the result and fences automatic retries.
+Speaker RMS lookup uses accepted audio positions, including after custom-node
+filtering; emitted transcript timestamps keep their original input positions.
 Multi-model fallback requires a control-plane recovery decision; wrappers
 that rewrite or suppress transcripts are refused before native admission.
 At speech end the request commits and closes; final transcript segments and
