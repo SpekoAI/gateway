@@ -199,3 +199,84 @@ func TestDialogueAdapterEndsAFullyFlushedTurnOnce(t *testing.T) {
 		})
 	}
 }
+
+func TestLastClauseSplit(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"Hello, how":         "Hello, ",
+		"Done. Next, then":   "Done. Next, ",
+		"Hi. ":               "", // boundary at the end: endsAtClause's case
+		"It costs 3.5 today": "",
+		"नमस्ते, मैं":        "नमस्ते, ",
+		"你好，我":               "你好，",
+		"\"Yes,\" she said":  "\"Yes,\" ",
+		"no punctuation":     "",
+	}
+	for text, head := range cases {
+		if got := text[:lastClauseSplit(text)]; got != head {
+			t.Errorf("lastClauseSplit(%q) head = %q, want %q", text, got, head)
+		}
+	}
+}
+
+// A chunk that carries a boundary inside it is split there, so its first
+// clause is flushed without waiting for the next chunk.
+func TestDialogueAdapterFlushesABoundaryInsideAChunk(t *testing.T) {
+	t.Parallel()
+	frames := make(chan string, 64)
+	server := newDialogueServer(t, tokenServer(t, frames, 0))
+	defer server.Close()
+
+	adapter, err := NewDialogue(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new dialogue adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), dialogueRequest(server.URL, "eleven_v4_turbo"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for _, chunk := range []string{"Hello, how", " can I help?"} {
+		if err := stream.AppendText(context.Background(), chunk); err != nil {
+			t.Fatalf("append %q: %v", chunk, err)
+		}
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := strings.Join(eventTypes(collectEvents(t, stream.Events(), 4)), ","); got != "audio.started,audio.frame,audio.frame,audio.done" {
+		t.Fatalf("event types = %s", got)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got, want := strings.Join(drainFrames(frames, "close"), "|"), "text:Hello, |flush|text:how|text: can I help?|flush|close"; got != want {
+		t.Fatalf("frames = %s, want %s", got, want)
+	}
+}
+
+// LiveKit closes the session right after committing. When the socket's end
+// reaches the pump before the commitDone item of a fully flushed turn, the
+// turn must still get its audio.done (Pullfrog review of gateway#143).
+func TestDialogueSocketEndFinishesAFullyFlushedTurn(t *testing.T) {
+	t.Parallel()
+	s := &dialogueStream{speaking: true, audioStarted: true}
+	s.committed.Store(true)
+	events, _, terminal := s.apply(dialogueItem{ended: true})
+	if !terminal {
+		t.Fatal("socket end did not end the stream")
+	}
+	if got := strings.Join(eventTypes(events), ","); got != "audio.done" {
+		t.Fatalf("events at socket end = %q, want audio.done", got)
+	}
+	// A late commitDone after the end changes nothing.
+	if late, _, _ := s.apply(dialogueItem{commitDone: true}); len(late) != 0 {
+		t.Fatalf("commitDone after the end emitted %v", eventTypes(late))
+	}
+
+	// A turn still waiting on a final is not complete: no audio.done.
+	pending := &dialogueStream{speaking: true, pendingFlushes: 1}
+	pending.committed.Store(true)
+	if events, _, _ := pending.apply(dialogueItem{ended: true}); len(events) != 0 {
+		t.Fatalf("socket end with a final pending emitted %v", eventTypes(events))
+	}
+}

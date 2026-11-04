@@ -398,6 +398,31 @@ func (s *dialogueStream) AppendText(ctx context.Context, text string) error {
 			return err
 		}
 	}
+	// A chunk can carry a boundary inside it ("Hello, how"): the part up to
+	// it is written and flushed on its own, the rest follows as the next input.
+	if split := lastClauseSplit(text); split > 0 {
+		if err := s.writeInput(ctx, text[:split]); err != nil {
+			return err
+		}
+		if err := s.flushClause(ctx); err != nil {
+			return err
+		}
+		text = text[split:]
+	}
+	if err := s.writeInput(ctx, text); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	boundaryAfter := endsAtClause(s.unflushed, true)
+	s.mu.RUnlock()
+	if boundaryAfter {
+		return s.flushClause(ctx)
+	}
+	return nil
+}
+
+// writeInput writes one inputs frame and records its text as unflushed.
+func (s *dialogueStream) writeInput(ctx context.Context, text string) error {
 	if err := s.writeJSON(ctx, map[string]any{
 		"inputs": []map[string]any{{"text": text, "voice_id": s.voiceID, "new_turn": false}},
 	}); err != nil {
@@ -406,12 +431,45 @@ func (s *dialogueStream) AppendText(ctx context.Context, text string) error {
 	s.mu.Lock()
 	s.speaking = true
 	s.unflushed += text
-	boundaryAfter := endsAtClause(s.unflushed, true)
 	s.mu.Unlock()
-	if boundaryAfter {
-		return s.flushClause(ctx)
-	}
 	return nil
+}
+
+// lastClauseSplit returns the byte offset just after the last clause boundary
+// strictly inside text, or 0 when there is none. A boundary is clause
+// punctuation, optional closing quotes or brackets, then whitespace (kept with
+// the clause); a full-width mark needs no whitespace. A boundary at the very
+// end is endsAtClause's case, not a split.
+func lastClauseSplit(text string) int {
+	split := 0
+	for i := 0; i < len(text); {
+		r, size := utf8.DecodeRuneInString(text[i:])
+		i += size
+		if !strings.ContainsRune(clauseEnd, r) {
+			continue
+		}
+		fullWidth := strings.ContainsRune(fullWidthClauseEnd, r)
+		j := i
+		for j < len(text) {
+			c, n := utf8.DecodeRuneInString(text[j:])
+			if !strings.ContainsRune(`"'”’»)]`, c) {
+				break
+			}
+			j += n
+		}
+		k := j
+		for k < len(text) {
+			c, n := utf8.DecodeRuneInString(text[k:])
+			if !unicode.IsSpace(c) {
+				break
+			}
+			k += n
+		}
+		if (k > j || fullWidth) && k < len(text) {
+			split = k
+		}
+	}
+	return split
 }
 
 // flushClause flushes the text appended so far without ending the turn. The
@@ -820,6 +878,12 @@ func (s *dialogueStream) apply(item dialogueItem) ([]runtimepkg.ProviderEvent, c
 		}
 		return []runtimepkg.ProviderEvent{s.finishTurn(nil)}, s.superseded, false
 	case item.ended:
+		// A graceful close can end the socket before the commitDone item for
+		// a fully flushed turn reaches the pump (LiveKit closes right after
+		// committing). That turn is complete, so it still gets its audio.done.
+		if s.committed.Load() && s.pendingFlushes == 0 && s.speaking {
+			events = []runtimepkg.ProviderEvent{s.finishTurn(nil)}
+		}
 	case item.err != nil:
 		if !s.closed.Load() {
 			events = []runtimepkg.ProviderEvent{{Err: item.err}}
