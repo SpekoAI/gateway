@@ -1070,20 +1070,26 @@ class FakeGateway:
         self.failed_opens = 0
         self.refused_opens = 0
         self.failing_opens = 0
+        self.refusing_code = ""
         self.quirks: list[str] = []
         self.sessions: list[FakeGatewaySession] = []
 
     async def open(self, config: SessionConfig, **_: Any) -> FakeGatewaySession:
         self.opens += 1
+        if self.refusing_code:
+            self.failed_opens += 1
+            raise GatewayError(
+                "Gateway rejected request",
+                code=self.refusing_code,
+                source="provider",
+                retryable=False,
+            )
         in_use = self.pending_opens + sum(not s.closed for s in self.sessions)
         if self.capacity is not None and in_use >= self.capacity:
             self.failed_opens += 1
             self.refused_opens += 1
             raise GatewayError(
-                "Gateway rejected request",
-                code="local_concurrency_exhausted",
-                source="gateway",
-                retryable=False,
+                "Gateway rejected request", code="local_concurrency_exhausted"
             )
         self.pending_opens += 1
         try:
@@ -1461,6 +1467,38 @@ async def test_tts_reply_waits_for_a_retired_standby_to_free_the_slot() -> None:
     (spoken,) = gateway.spoken()
     assert spoken.request["language"] == "hi"
 
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+async def test_tts_surfaces_a_permanent_refusal_without_retrying() -> None:
+    gateway = FakeGateway()
+    gateway.opens_allowed.clear()
+    plugin = TTS(gateway, language="en")  # type: ignore[arg-type]
+    plugin.prewarm()
+    await until(lambda: gateway.opens == 1)
+    stream = plugin.stream(conn_options=APIConnectOptions(max_retry=0))
+    plugin.update_options(language="hi")
+    await until(lambda: gateway.opens == 2)
+    gateway.refusing_code = "no_eligible_route"
+
+    stream.push_text("hello")
+    stream.end_input()
+
+    async def audio() -> list[Any]:
+        return [event async for event in stream]
+
+    with pytest.raises(APIConnectionError) as caught:
+        await asyncio.wait_for(audio(), timeout=1)
+
+    assert (
+        caught.value.message == "Speko Gateway TTS failed (provider/no_eligible_route)"
+    )
+    assert gateway.opens == 3, "one refused open for the reply, and no retry"
+
+    await stream.aclose()
+    gateway.refusing_code = ""
+    gateway.opens_allowed.set()
     await plugin.aclose()
     assert gateway.nothing_left_open()
 
