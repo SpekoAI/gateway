@@ -131,6 +131,7 @@ class _AgentHooks:
     original_update: Any = None
     update: Any = None
     active: bool = False
+    pending_updates: int = 0
 
 
 _sessions: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
@@ -172,13 +173,23 @@ class NativeInputBinding:
 
             @wraps(original)
             async def update(agent: Any, *args: Any, **kwargs: Any) -> Any:
+                hooks = None
                 if self.owners:
                     self.attach_agent(agent)
+                    hooks = self._agents[agent]
+                    hooks.pending_updates += 1
                 try:
                     return await original(agent, *args, **kwargs)
                 finally:
-                    for previous_agent in list(self._agents):
-                        if getattr(previous_agent, "_activity", None) is None:
+                    if hooks is not None:
+                        hooks.pending_updates -= 1
+                    for previous_agent, previous_hooks in list(self._agents.items()):
+                        # The SDK serializes updates after this wrapper runs.
+                        # No activity can also mean this Agent is still queued.
+                        if (
+                            not previous_hooks.pending_updates
+                            and getattr(previous_agent, "_activity", None) is None
+                        ):
                             self._detach_agent(previous_agent)
 
             session._update_activity = update
@@ -292,6 +303,7 @@ class NativeInputBinding:
             and previous._session is not self._session
             and activity is None
             and previous._agents[agent].active
+            and not previous._agents[agent].pending_updates
         ):
             # Older SDKs run on_enter before their session update returns.
             # Release the already-detached Agent even while that old update
@@ -419,6 +431,7 @@ def bind_native_input(
         and binding._session is not None
         and getattr(agent, "_activity", None) is None
         and binding._agents[agent].active
+        and not binding._agents[agent].pending_updates
     ):
         binding._detach_agent(agent)
         binding = None

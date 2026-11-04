@@ -2003,6 +2003,70 @@ async def test_native_actual_agent_preserves_provider_speakers_through_supported
                 assert stream.aclose == close
 
 
+async def test_overlapping_sdk_activity_updates_keep_the_queued_targets_input_binding():
+    source, turns = ControlledVAD(), asyncio.Queue()
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "queued target"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+        session = AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio, tasks, locked = OwnedAudioInput(), [], False
+        session.input.audio = audio
+        model.bind_session(session)
+        targets = [OwnedAgent(instructions="Owned queued target") for _ in range(2)]
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned initial activity"), **options)
+            await session._activity_lock.acquire()
+            locked = True
+            # AgentTask uses this same private SDK entrypoint. Both wrappers
+            # attach before either original update can acquire the SDK lock.
+            for target in targets:
+                tasks.append(asyncio.create_task(session._update_activity(target, wait_on_enter=False)))
+            await asyncio.sleep(0)
+            binding = model._native_input_binding
+            assert all(target in binding._agents for target in targets)
+            session._activity_lock.release()
+            locked = False
+            await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            assert targets[1] in binding._agents, "the waiting target must survive the first update's cleanup"
+            for samples, kind in [(320, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                value = rtc.AudioFrame(data=(b"\xff\x0f" if samples == 320 else b"\0\0") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples)
+                await audio.frames.put(value)
+                observed = await asyncio.wait_for(source.frames.get(), 3)
+                source.processed(observed)
+                source.emit(kind, frames=[observed], silence_duration=0 if samples == 320 else 0.55)
+            assert await asyncio.wait_for(turns.get(), 3) == "queued target"
+            assert not model._native_failed
+        finally:
+            if locked:
+                session._activity_lock.release()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
 @pytest.mark.parametrize("binding", ["agent", "session"])
 async def test_detached_agent_can_run_in_second_session_without_disrupting_retained_native_pipeline(binding):
     entered, turns, seen = asyncio.Queue(), asyncio.Queue(), []
