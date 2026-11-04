@@ -40,6 +40,27 @@ the Indian-English way in a Hindi session, or `{"elevenlabs": {"stability":
 changes them for the next reply. The Gateway refuses a setting the routed
 model cannot honor before the session opens.
 
+`TTS` keeps a Gateway session open in standby, so a reply's first text goes
+out without waiting for a session to open. Opening a session also connects to
+the provider, and some providers hold the first audio until that setup
+finishes. Managed ElevenLabs, for example, checks its token only after the
+WebSocket upgrade. LiveKit calls `prewarm()` when the agent starts, which
+opens the standby, and each reply opens the next standby when it takes the
+current one. A reply opens its own session at its first text, as before, when
+the standby has other settings, has ended, or failed to open. `update_options`
+replaces a standby that has the old settings, so an agent that changes
+language every turn opens one unused session per change. A standby that no
+reply takes within 3 minutes closes, and the next reply opens its own session
+and a new standby. LiveKit does not close the `TTS` when the session ends, so
+call `aclose()` to close the standby sooner. Between replies, each `TTS` holds
+one open Gateway session and provider connection, and during a reply it holds
+two. Both count toward your organization's concurrent-session limit and the
+provider's connection limits. With managed credentials, Speko reserves credit
+for each open session's `max_input_characters`, so the standby holds a second
+reservation. Lower `max_input_characters` to reserve less. Set
+`standby_sessions` to keep more standbys, or to `0` to open each session at
+its reply's first text.
+
 `STT()` and `TTS()` read `SPEKO_SOCKET_PATH` and `SPEKO_LOCAL_AUTH_TOKEN`.
 `credential_source="auto"` preserves the original behavior: managed when
 `SPEKO_API_KEY` is present and local BYOK otherwise. Set `"byok"` explicitly

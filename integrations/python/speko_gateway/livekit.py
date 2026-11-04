@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
 import aiohttp
@@ -33,6 +34,7 @@ from ._livekit_bridge import (
     LiveKitSTTBridge,
     LiveKitSTTStream,
     LiveKitTTSBridge,
+    LiveKitTTSEvent,
     LiveKitTTSStream,
 )
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
@@ -45,6 +47,8 @@ from .relay import (
     RelayLLMClient,
     validate_reasoning_effort,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 def _report_stream_leg(kind: str, stream: Any) -> None:
@@ -401,8 +405,127 @@ class SpeechStream(stt.RecognizeStream):
         )
 
 
+# LiveKit does not close the TTS when the AgentSession ends, so this bound is
+# what releases a finished call's Gateway session. 180 s also stays under the
+# default idle timeouts of the NAT gateways on Azure (4 minutes) and AWS (350 s),
+# which drop an idle provider connection without telling either end.
+_STANDBY_MAX_AGE = 180.0
+
+# Cancelling an open that is under way leaves its Gateway session unattached,
+# holding capacity until the Gateway's attach timeout (30 s by default). A
+# session closed while it opens waits up to this many seconds, far longer than
+# an open takes, so it can open and then close.
+_OPEN_GRACE = 10.0
+
+
+@dataclasses.dataclass(frozen=True)
+class _OpenSession:
+    stream: LiveKitTTSStream
+    events: AsyncIterator[LiveKitTTSEvent]
+    next_event: asyncio.Task[LiveKitTTSEvent | None] | None
+
+
+class _TTSSession:
+    """One Gateway TTS session. A standby is one opened with ``options``.
+
+    The Gateway reports the end of an idle session only as an event on its
+    socket, so a standby reads one event ahead, and no reply takes a standby
+    that is no longer quiet.
+    """
+
+    def __init__(
+        self, bridge: LiveKitTTSBridge, options: dict[str, Any] | None = None
+    ) -> None:
+        self.options = options
+        self._open = asyncio.create_task(
+            _open_session(bridge, read_ahead=options is not None),
+            name="speko.livekit.tts.open",
+        )
+        self._open.add_done_callback(_retrieve)
+
+    @property
+    def quiet(self) -> bool:
+        """Whether nothing, not even an end or an error, has come back yet."""
+        if not self._open.done():
+            return True
+        if self._open.cancelled() or self._open.exception() is not None:
+            return False
+        next_event = self._open.result().next_event
+        return next_event is None or not next_event.done()
+
+    @property
+    def opening(self) -> bool:
+        return not self._open.done()
+
+    async def wait_opened(self) -> None:
+        await asyncio.wait({self._open})
+
+    async def stream(self) -> LiveKitTTSStream:
+        return (await self._open).stream
+
+    async def events(self) -> AsyncIterator[LiveKitTTSEvent]:
+        opened = await self._open
+        if opened.next_event is not None:
+            event = await opened.next_event
+            if event is None:
+                return
+            yield event
+        async for event in opened.events:
+            yield event
+
+    async def aclose(self) -> None:
+        await asyncio.wait({self._open}, timeout=_OPEN_GRACE)
+        await utils.aio.cancel_and_wait(self._open)
+        if self._open.cancelled() or self._open.exception() is not None:
+            return
+        opened = self._open.result()
+        if opened.next_event is not None:
+            await utils.aio.cancel_and_wait(opened.next_event)
+        try:
+            await opened.stream.aclose()
+        except (GatewayError, OSError):
+            pass
+
+
+async def _open_session(bridge: LiveKitTTSBridge, *, read_ahead: bool) -> _OpenSession:
+    stream = await bridge.start()
+    events = stream.events()
+    next_event = None
+    if read_ahead:
+        next_event = asyncio.create_task(
+            _next_event(events), name="speko.livekit.tts.read_ahead"
+        )
+        next_event.add_done_callback(_retrieve)
+    return _OpenSession(stream, events, next_event)
+
+
+async def _next_event(
+    events: AsyncIterator[LiveKitTTSEvent],
+) -> LiveKitTTSEvent | None:
+    async for event in events:
+        return event
+    return None
+
+
+def _retrieve(task: asyncio.Task[Any]) -> None:
+    """Consume a task's failure so asyncio does not report it as unhandled.
+
+    A caller that awaits the task still gets the error.
+    """
+    if not task.cancelled() and task.exception() is not None:
+        _logger.debug(
+            "Speko Gateway TTS session task failed", exc_info=task.exception()
+        )
+
+
 class TTS(tts.TTS):
-    """Synthesize speech through a colocated Speko Gateway."""
+    """Synthesize speech through a colocated Speko Gateway.
+
+    ``prewarm()`` and each reply open up to ``standby_sessions`` Gateway
+    sessions in standby, so the next reply's first text does not wait for a
+    session to open. A standby that no reply takes within three minutes closes.
+    With ``standby_sessions=0``, each reply opens its session at its first text.
+    """
 
     def __init__(
         self,
@@ -416,7 +539,10 @@ class TTS(tts.TTS):
         max_input_characters: int = 100_000,
         credential_source: CredentialSource = "auto",
         provider_options: Mapping[str, Mapping[str, Any]] | None = None,
+        standby_sessions: int = 1,
     ) -> None:
+        if standby_sessions < 0:
+            raise ValueError("standby_sessions must not be negative")
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
             sample_rate=sample_rate,
@@ -432,6 +558,10 @@ class TTS(tts.TTS):
         self._credential_source = credential_source
         self._tts_options = tts_options_payload(provider_options=provider_options)
         self._streams: weakref.WeakSet[SynthesisStream] = weakref.WeakSet()
+        self._standby_sessions = standby_sessions
+        self._standbys: dict[_TTSSession, asyncio.TimerHandle] = {}
+        self._closing: set[asyncio.Task[None]] = set()
+        self._closed = False
 
     @property
     def model(self) -> str:
@@ -440,6 +570,10 @@ class TTS(tts.TTS):
     @property
     def provider(self) -> str:
         return "speko"
+
+    def prewarm(self) -> None:
+        """Open the standby sessions before the first reply needs one."""
+        self._fill_standbys()
 
     def update_options(
         self,
@@ -450,11 +584,12 @@ class TTS(tts.TTS):
     ) -> None:
         """Change the language, voice or provider settings of the next stream.
 
-        Every LiveKit reply opens its own Gateway session, so a multilingual
+        Every LiveKit reply speaks on its own Gateway session, so a multilingual
         agent can follow the caller turn by turn: pass the language the STT
         final reports, and an empty voice lets Speko pick one for it.
         ``provider_options`` replaces the previous settings; None clears them.
-        Streams already speaking keep their settings.
+        Streams already speaking keep their settings. A change also replaces
+        each standby session opened with the old settings.
         """
         if is_given(language):
             self._language = language
@@ -462,6 +597,9 @@ class TTS(tts.TTS):
             self._voice = voice
         if is_given(provider_options):
             self._tts_options = tts_options_payload(provider_options=provider_options)
+        options = self._session_options()
+        if any(session.options != options for session in self._standbys):
+            self._fill_standbys()
 
     def synthesize(
         self,
@@ -476,32 +614,78 @@ class TTS(tts.TTS):
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> SynthesisStream:
-        bridge = LiveKitTTSBridge(
-            self._client,
-            voice=self._voice,
-            language=self._language,
-            model=self._model,
-            provider=self._provider_name,
-            sample_rate=self.sample_rate,
-            num_channels=self.num_channels,
-            max_input_characters=self._max_input_characters,
-            credential_source=self._credential_source,
-            tts_options=self._tts_options,
-        )
+        options = self._session_options()
         stream = SynthesisStream(
             tts_instance=self,
-            bridge=bridge,
+            bridge=LiveKitTTSBridge(self._client, **options),
+            options=options,
             conn_options=conn_options,
         )
         self._streams.add(stream)
         return stream
 
     async def aclose(self) -> None:
+        self._closed = True
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
+        await self._release_standbys()
         if self._owns_client:
             await self._client.aclose()
+
+    def _session_options(self) -> dict[str, Any]:
+        return {
+            "voice": self._voice,
+            "language": self._language,
+            "model": self._model,
+            "provider": self._provider_name,
+            "sample_rate": self.sample_rate,
+            "num_channels": self.num_channels,
+            "max_input_characters": self._max_input_characters,
+            "credential_source": self._credential_source,
+            "tts_options": self._tts_options,
+        }
+
+    def _take_standby(self, options: dict[str, Any]) -> _TTSSession | None:
+        session = next(
+            (s for s in self._standbys if s.options == options and s.quiet), None
+        )
+        if session is not None:
+            self._standbys.pop(session).cancel()
+        return session
+
+    def _fill_standbys(self) -> None:
+        options = self._session_options()
+        for session in [
+            s for s in self._standbys if s.options != options or not s.quiet
+        ]:
+            self._retire(session)
+        while not self._closed and len(self._standbys) < self._standby_sessions:
+            session = _TTSSession(LiveKitTTSBridge(self._client, **options), options)
+            self._standbys[session] = asyncio.get_running_loop().call_later(
+                _STANDBY_MAX_AGE, self._retire, session
+            )
+
+    def _retire(self, session: _TTSSession) -> None:
+        timer = self._standbys.pop(session, None)
+        if timer is not None:
+            timer.cancel()
+            self._close_soon(session)
+
+    async def _release_standbys(self) -> bool:
+        held = bool(self._standbys or self._closing)
+        for session in list(self._standbys):
+            self._retire(session)
+        if self._closing:
+            await asyncio.wait(self._closing)
+        return held
+
+    def _close_soon(self, session: _TTSSession) -> asyncio.Task[None]:
+        task = asyncio.create_task(session.aclose(), name="speko.livekit.tts.close")
+        self._closing.add(task)
+        task.add_done_callback(self._closing.discard)
+        task.add_done_callback(_retrieve)
+        return task
 
 
 class SynthesisStream(tts.SynthesizeStream):
@@ -510,17 +694,20 @@ class SynthesisStream(tts.SynthesizeStream):
         *,
         tts_instance: TTS,
         bridge: LiveKitTTSBridge,
+        options: dict[str, Any],
         conn_options: APIConnectOptions,
     ) -> None:
         super().__init__(tts=tts_instance, conn_options=conn_options)
+        self._plugin = tts_instance
         self._bridge = bridge
+        self._options = options
+        self._session: _TTSSession | None = None
         self._gateway_stream: LiveKitTTSStream | None = None
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         # The emitter must be initialized even when no text ever arrives:
         # the base class calls end_input() on it unconditionally after _run
-        # returns, and an uninitialized emitter raises there. Only the
-        # gateway dial waits for the first token.
+        # returns, and an uninitialized emitter raises there.
         output_emitter.initialize(
             request_id=utils.shortuuid(),
             sample_rate=self._tts.sample_rate,
@@ -537,14 +724,10 @@ class SynthesisStream(tts.SynthesizeStream):
         if first_token is None:
             return
 
+        self._session = None
         try:
-            # The synthesis request begins at the Gateway dial, not at the
-            # first audio byte — that difference is the tts_first_audio metric.
             _report_probe_marker("tts.requested")
-            self._gateway_stream = await self._bridge.start()
-            _report_stream_leg("tts", self._gateway_stream)
-            self._mark_started()
-            await self._gateway_stream.append_text(first_token)
+            await self._send_first_text(first_token)
             send_task = asyncio.create_task(
                 self._send_text(), name="speko.livekit.tts.send"
             )
@@ -574,11 +757,44 @@ class SynthesisStream(tts.SynthesizeStream):
         except OSError as err:
             raise APIConnectionError("Speko Gateway TTS transport failed") from err
         finally:
-            if self._gateway_stream is not None:
-                try:
-                    await asyncio.shield(self._gateway_stream.aclose())
-                except (GatewayError, OSError):
-                    pass
+            if self._session is not None:
+                closing = self._plugin._close_soon(self._session)
+                if not self._session.opening:
+                    await asyncio.shield(closing)
+
+    async def _send_first_text(self, token: str) -> None:
+        standby = self._plugin._take_standby(self._options)
+        if standby is not None:
+            self._session = standby
+            await standby.wait_opened()
+            if standby.quiet:
+                self._plugin._fill_standbys()
+                await self._send(await standby.stream(), token)
+                return
+            self._plugin._close_soon(standby)
+        self._session = _TTSSession(self._bridge)
+        try:
+            stream = await self._session.stream()
+        except GatewayError as error:
+            # A retryable refusal, such as the Gateway's session limit, can come
+            # from a standby that is still opening or closing, so free them and
+            # try once more. Other refusals surface at once, credit_exhausted
+            # included: a closed standby frees its slot when it closes, but its
+            # credit only when the Gateway's batched usage report settles it.
+            if not (error.retryable and await self._plugin._release_standbys()):
+                raise
+            self._session = _TTSSession(self._bridge)
+            stream = await self._session.stream()
+        # The next standby opens only now, so it cannot take the Gateway slot
+        # this reply's own open needs.
+        self._plugin._fill_standbys()
+        await self._send(stream, token)
+
+    async def _send(self, stream: LiveKitTTSStream, token: str) -> None:
+        self._gateway_stream = stream
+        _report_stream_leg("tts", stream)
+        self._mark_started()
+        await stream.append_text(token)
 
     async def _send_text(self) -> None:
         assert self._gateway_stream is not None
@@ -596,14 +812,14 @@ class SynthesisStream(tts.SynthesizeStream):
         await self._gateway_stream.finish()
 
     async def _receive_audio(self, output_emitter: tts.AudioEmitter) -> None:
-        assert self._gateway_stream is not None
+        assert self._session is not None
         # LiveKit synthesizes one segment per stream instance, so audio after
         # the segment's audio.done is ignored rather than reopening a segment
         # the emitter would count as a mismatch.
         segment_open = False
         segment_done = False
         first_audio_reported = False
-        async for event in self._gateway_stream.events():
+        async for event in self._session.events():
             if segment_done:
                 continue
             if event.type == "audio.started":
