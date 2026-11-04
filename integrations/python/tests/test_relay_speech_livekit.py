@@ -1576,7 +1576,8 @@ async def test_native_actual_agent_preserves_provider_speakers_through_supported
                 assert stream.aclose == close
 
 
-async def test_detached_agent_can_run_in_second_session_without_disrupting_retained_native_pipeline():
+@pytest.mark.parametrize("binding", ["agent", "session"])
+async def test_detached_agent_can_run_in_second_session_without_disrupting_retained_native_pipeline(binding):
     entered, turns, seen = asyncio.Queue(), asyncio.Queue(), []
 
     async def handle(request):
@@ -1606,9 +1607,10 @@ async def test_detached_agent_can_run_in_second_session_without_disrupting_retai
         models = [STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source) for client, source in zip(clients, sources)]
         sessions = [AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0) for model in models]
         inputs = [OwnedAudioInput(), OwnedAudioInput()]
-        for session, model, audio in zip(sessions, models, inputs):
+        for index, (session, model, audio) in enumerate(zip(sessions, models, inputs)):
             session.input.audio = audio
-            model.bind_session(session)
+            if index == 0 or binding == "session":
+                model.bind_session(session)
 
         async def utterance(index):
             for samples, kind in [(320, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
@@ -1630,6 +1632,8 @@ async def test_detached_agent_can_run_in_second_session_without_disrupting_retai
             sessions[0].update_agent(next_agent)
             assert await asyncio.wait_for(entered.get(), 3) is next_agent
             assert first._activity is None
+            if binding == "agent":
+                models[1].bind_agent(first)
             await sessions[1].start(agent=first, **options)
             assert await asyncio.wait_for(entered.get(), 3) is first
             if hasattr(recognition.AudioRecognition, "_detach_stt"):
