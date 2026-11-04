@@ -778,7 +778,9 @@ class SynthesisStream(tts.SynthesizeStream):
         except GatewayError as error:
             # A retryable refusal, such as the Gateway's session limit, can come
             # from a standby that is still opening or closing, so free them and
-            # try once more. A permanent refusal surfaces at once.
+            # try once more. Other refusals surface at once, credit_exhausted
+            # included: a closed standby frees its slot when it closes, but its
+            # credit only when the Gateway's batched usage report settles it.
             if not (error.retryable and await self._plugin._release_standbys()):
                 raise
             self._session = _TTSSession(self._bridge)

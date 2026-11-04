@@ -1503,6 +1503,37 @@ async def test_tts_surfaces_a_permanent_refusal_without_retrying() -> None:
     assert gateway.nothing_left_open()
 
 
+async def test_tts_keeps_its_standby_when_a_reply_is_refused_credit() -> None:
+    gateway = FakeGateway()
+    plugin = TTS(gateway, language="en")  # type: ignore[arg-type]
+    plugin.prewarm()
+    await until(lambda: len(gateway.sessions) == 1)
+    stream = plugin.stream(conn_options=APIConnectOptions(max_retry=0))
+    plugin.update_options(language="hi")
+    await until(lambda: len(gateway.sessions) == 2)
+    (hindi,) = [s for s in gateway.sessions if s.request["language"] == "hi"]
+    gateway.refusing_code = "credit_exhausted"
+
+    stream.push_text("hello")
+    stream.end_input()
+
+    async def audio() -> list[Any]:
+        return [event async for event in stream]
+
+    with pytest.raises(APIConnectionError) as caught:
+        await asyncio.wait_for(audio(), timeout=1)
+    await stream.aclose()
+
+    assert "credit_exhausted" in caught.value.message
+    gateway.refusing_code = ""
+    _, next_audio = await speak(plugin, "namaste")
+    assert next_audio
+    assert hindi.appended == ["namaste"], "the next reply took the kept standby"
+
+    await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
 @pytest.mark.parametrize("path", ["standby", "opening-standby", "fresh"])
 async def test_tts_ttfb_counts_from_the_text_the_provider_got(path: str) -> None:
     gateway = FakeGateway(open_delay=0.6, answer_delay=0.05)
