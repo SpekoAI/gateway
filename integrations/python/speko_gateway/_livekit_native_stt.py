@@ -70,7 +70,8 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._received_duration = Fraction(0)
         self._input_end: Fraction | None = None
         self._input_positions: list[Fraction] = []
-        self._input_offsets: list[Fraction] = []
+        self._input_sources: list[Fraction] = []
+        self._input_synthetic: list[bool] = []
         self._mark_failed = mark_failed
         self._report_open = report_open
         self._check_admission = check_admission
@@ -130,19 +131,27 @@ class NativeSpeechStream(stt.RecognizeStream):
             return
         if self._input_timeline is not None:
             try:
-                start = self._input_timeline.position_of(frame)
-                if self._input_end is not None and start < self._input_end:
+                occurrence = self._input_timeline.occurrence_of(frame)
+                start, synthetic = occurrence.start, occurrence.synthetic
+                if not synthetic and self._input_end is not None and start < self._input_end:
                     raise GatewayError("Native STT input moved backwards", retryable=False)
             except GatewayError as error:
                 if not self._fatal.done():
                     self._fatal.set_exception(error)
                 self._input_ch.close()
                 return
-            offset = start - self._received_duration
-            if not self._input_offsets or self._input_offsets[-1] != offset:
+            previous = (
+                self._input_sources[-1] + (
+                    Fraction(0) if self._input_synthetic[-1]
+                    else self._received_duration - self._input_positions[-1]
+                ) if self._input_sources else None
+            )
+            if previous != start or self._input_synthetic[-1] != synthetic:
                 self._input_positions.append(self._received_duration)
-                self._input_offsets.append(offset)
-            self._input_end = start + Fraction(frame.samples_per_channel, frame.sample_rate)
+                self._input_sources.append(start)
+                self._input_synthetic.append(synthetic)
+            if not synthetic:
+                self._input_end = start + Fraction(frame.samples_per_channel, frame.sample_rate)
         super().push_frame(frame)
         self._queued_samples = queued
         self._received_duration += Fraction(frame.samples_per_channel, frame.sample_rate)
@@ -154,7 +163,10 @@ class NativeSpeechStream(stt.RecognizeStream):
         # start to the following one. Do not fabricate PCM for omitted input.
         search = bisect_left if end else bisect_right
         index = max(0, search(self._input_positions, local) - 1)
-        return float(local + self._input_offsets[index])
+        return float(self._input_sources[index] + (
+            Fraction(0) if self._input_synthetic[index]
+            else local - self._input_positions[index]
+        ))
 
     def _frame(self, raw: bytes) -> rtc.AudioFrame:
         assert self._channels is not None
@@ -574,7 +586,8 @@ class NativeSpeechStream(stt.RecognizeStream):
         keep = max(0, bisect_right(self._input_positions, Fraction(self._assigned_until, self._sample_rate)) - 1)
         if keep:
             del self._input_positions[:keep]
-            del self._input_offsets[:keep]
+            del self._input_sources[:keep]
+            del self._input_synthetic[:keep]
         await stream.aclose()
         self._admission_started = False
         self._reconsider_turn()

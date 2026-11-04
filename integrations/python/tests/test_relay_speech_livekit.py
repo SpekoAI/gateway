@@ -2194,6 +2194,7 @@ async def test_native_source_observer_releases_its_owned_hooks_after_local_hando
     session.input.audio = audio
     agent = Agent(instructions="Owned native input lifecycle")
     original_node, original_forward = agent.stt_node, session._forward_audio_task
+    original_enable = session.input.set_audio_enabled
     if binding == "session":
         model.bind_session(session)
     else:
@@ -2204,9 +2205,7 @@ async def test_native_source_observer_releases_its_owned_hooks_after_local_hando
         await audio.frames.put(frame())
         await asyncio.wait_for(source.frames.get(), 3)
         captured_source = session.input.audio
-        legacy = not hasattr(session._activity._audio_recognition, "_input_started_at")
-        if legacy:
-            assert captured_source is not audio
+        assert captured_source is audio
         session.update_agent(Agent(instructions="Owned local input lifecycle", stt=local))
         await asyncio.wait_for(local.started.get(), 3)
         owned_binding = model._native_input_binding
@@ -2225,6 +2224,7 @@ async def test_native_source_observer_releases_its_owned_hooks_after_local_hando
         assert session._forward_audio_task == original_forward
         assert not owned_binding.owners
         assert model._native_input_binding is None
+        assert session.input.set_audio_enabled == original_enable
     finally:
         await audio.frames.put(None)
         await session.aclose()
@@ -2233,7 +2233,8 @@ async def test_native_source_observer_releases_its_owned_hooks_after_local_hando
         await client.aclose()
 
 
-async def test_later_native_owner_rebinds_the_running_source_after_local_handoff():
+@pytest.mark.parametrize("idle_gap", [0, 0.15])
+async def test_later_native_owner_rebinds_the_running_source_after_local_handoff(idle_gap):
     class LocalSTT(stt.STT):
         def __init__(self):
             super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=False))
@@ -2258,14 +2259,20 @@ async def test_later_native_owner_rebinds_the_running_source_after_local_handoff
         await ready(ws)
         async for message in ws:
             if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
-                await ws.send_json({"type": "transcript.final", "text": "rebound"})
+                await ws.send_json({"type": "transcript.final", "text": "rebound", "segments": [{"text": "rebound", "start_ms": 0, "end_ms": 20}]})
                 await ws.send_json({"type": "session.closed", "usage": {}})
                 await ws.close()
         return ws
 
-    entered, turns = asyncio.Event(), asyncio.Queue()
+    entered, turns, finals = asyncio.Event(), asyncio.Queue(), []
 
     class NextAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async for event in Agent.default.stt_node(self, audio, settings):
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    finals.extend(event.alternatives)
+                yield event
+
         async def on_enter(self):
             entered.set()
 
@@ -2289,18 +2296,30 @@ async def test_later_native_owner_rebinds_the_running_source_after_local_handoff
             await asyncio.wait_for(local.started.wait(), 3)
             await models[0].aclose()
             assert session.input.audio is audio
+            await asyncio.sleep(idle_gap)
             target = NextAgent(instructions="Owned rebound native source", stt=models[1])
             models[1].bind_agent(target)
             session.update_agent(target)
             await asyncio.wait_for(entered.wait(), 3)
+            bounds = None
             for samples, kind in [(320, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
                 value = rtc.AudioFrame(data=(b"\xff\x0f" if samples == 320 else b"\0\0") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples)
+                before = time.time()
                 await audio.frames.put(value)
                 observed = await asyncio.wait_for(sources[1].frames.get(), 3)
+                if samples == 320:
+                    bounds = before, time.time()
                 sources[1].processed(observed)
                 sources[1].emit(kind, frames=[observed], silence_duration=0 if samples == 320 else 0.55)
             assert await asyncio.wait_for(turns.get(), 3) == "rebound"
             assert not models[1]._native_failed
+            if not hasattr(session._activity._audio_recognition, "_input_started_at"):
+                epoch = input_epoch(session)
+                # The fixture can deliver its first 20 ms faster than playout;
+                # that captured media must still precede the resumed frame.
+                assert bounds[0] - epoch - 1 / 16000 <= finals[0].start_time <= bounds[1] - epoch + 0.02 + 1 / 16000
+            else:
+                assert finals[0].start_time == pytest.approx(0, abs=1 / 16000)
         finally:
             await audio.frames.put(None)
             await session.aclose()
@@ -2310,7 +2329,9 @@ async def test_later_native_owner_rebinds_the_running_source_after_local_handoff
             await client.aclose()
 
 
-async def test_disabled_audio_manual_commit_accepts_sdk_generated_flush_frames():
+@pytest.mark.parametrize("flush_duration", [0.2, None])
+@pytest.mark.parametrize("held_frame", [False, True])
+async def test_disabled_audio_manual_commit_accepts_sdk_generated_flush_frames(flush_duration, held_frame):
     class SilenceVAD(ControlledVAD):
         def stream(self):
             self.current = SilenceStream(self)
@@ -2338,12 +2359,32 @@ async def test_disabled_audio_manual_commit_accepts_sdk_generated_flush_frames()
         await ready(ws)
         async for message in ws:
             if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
-                await ws.send_json({"type": "transcript.final", "text": "flushed"})
+                await ws.send_json({"type": "transcript.final", "text": "flushed", "segments": [{"text": "flushed", "start_ms": 0, "end_ms": 20}]})
                 await ws.send_json({"type": "session.closed", "usage": {}})
                 await ws.close()
         return ws
 
-    items = asyncio.Queue()
+    items, finals = asyncio.Queue(), []
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async for event in Agent.default.stt_node(self, audio, settings):
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    finals.extend(event.alternatives)
+                yield event
+
+    class HeldInput(io.AudioInput):
+        def __init__(self, source):
+            super().__init__(label="owned-held-source", source=source)
+            self.held, self.release = asyncio.Event(), asyncio.Event()
+
+        async def __anext__(self):
+            value = await super().__anext__()
+            if not self.held.is_set():
+                self.held.set()
+                await self.release.wait()
+            return value
+
     async with peer(handle) as origin:
         client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
         source = SilenceVAD()
@@ -2353,27 +2394,120 @@ async def test_disabled_audio_manual_commit_accepts_sdk_generated_flush_frames()
         session.input.audio = audio
         session.on("conversation_item_added", lambda event: items.put_nowait(event.item.text_content) if event.item.role == "user" else None)
         model.bind_session(session)
+        held = None
         try:
             options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
-            await session.start(agent=Agent(instructions="Owned disabled-input flush"), **options)
+            await session.start(agent=OwnedAgent(instructions="Owned disabled-input flush"), **options)
             await audio.frames.put(frame())
             await asyncio.wait_for(source.frames.get(), 3)
-            session.input.set_audio_enabled(False)
-            await asyncio.wait_for(session.commit_user_turn(transcript_timeout=1, stt_flush_duration=0.2, skip_reply=True), 3)
-            assert await asyncio.wait_for(items.get(), 3) == "flushed"
-            assert not model._native_failed
-            while not source.frames.empty():
-                source.frames.get_nowait()
-            # Real input resumes after the SDK's synthetic media has advanced
-            # the clock. It must not move backwards or fence the next turn.
-            session.input.set_audio_enabled(True)
-            await audio.frames.put(frame())
-            await asyncio.wait_for(source.frames.get(), 3)
-            await audio.frames.put(rtc.AudioFrame(data=b"\0\0" * 3200, sample_rate=16000, num_channels=1, samples_per_channel=3200))
-            await asyncio.wait_for(source.frames.get(), 3)
-            await asyncio.wait_for(session.commit_user_turn(transcript_timeout=1, stt_flush_duration=0, skip_reply=True), 3)
-            assert await asyncio.wait_for(items.get(), 3) == "flushed"
-            assert not model._native_failed
+            if held_frame:
+                held = HeldInput(session.input.audio)
+                session.input.audio = held
+                await audio.frames.put(frame())
+                await asyncio.wait_for(held.held.wait(), 3)
+            for index in range(3):
+                if index:
+                    # Resume at a real capture cadence, rather than queueing
+                    # several periods of PCM instantaneously in this fixture.
+                    await asyncio.sleep(0.03)
+                    session.input.set_audio_enabled(True)
+                    if index == 1 and held is not None:
+                        held.release.set()
+                    else:
+                        await audio.frames.put(frame())
+                    await asyncio.wait_for(source.frames.get(), 3)
+                delivered_at = time.time()
+                session.input.set_audio_enabled(False)
+                flush = {} if flush_duration is None else {"stt_flush_duration": flush_duration}
+                await asyncio.wait_for(session.commit_user_turn(transcript_timeout=1, skip_reply=True, **flush), 3)
+                assert await asyncio.wait_for(items.get(), 3) == "flushed"
+                assert not model._native_failed
+                while not source.frames.empty():
+                    source.frames.get_nowait()
+                if not hasattr(session._activity._audio_recognition, "_input_started_at"):
+                    # Injected silence is recognition input, never captured
+                    # media two seconds ahead of the session/recording clock.
+                    assert finals[-1].end_time <= delivered_at - input_epoch(session) + 0.04
+                if index:
+                    assert finals[-1].start_time >= finals[-2].end_time - 1 / 16000
+            assert len(finals) == 3
+        finally:
+            if held is not None:
+                held.release.set()
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("delegated", [False, True])
+async def test_observing_input_preserves_public_identity_and_same_input_assignment(delegated):
+    source, turns, identity = ControlledVAD(), asyncio.Queue(), []
+
+    class Input(OwnedAudioInput):
+        __hash__ = None  # AudioInput's public contract does not require hashing.
+
+        def __init__(self):
+            super().__init__()
+            self.attached = self.detached = 0
+            self.iterations = 0
+
+        def __aiter__(self):
+            self.iterations += 1
+            return super().__aiter__()
+
+        def on_attached(self):
+            self.attached += 1
+
+        def on_detached(self):
+            self.detached += 1
+            self.frames.put_nowait(None)
+
+        async def __anext__(self):
+            value = await super().__anext__()
+            identity.append(session.input.audio is public_input)
+            return value
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "same input"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+        session = AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio = Input()
+        public_input = io.AudioInput(label="owned-delegated-input", source=audio) if delegated else audio
+        session.input.audio = public_input
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned input identity"), **options)
+            for samples, kind in [(320, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                await audio.frames.put(rtc.AudioFrame(data=b"\xff\x0f" * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples))
+                observed = await asyncio.wait_for(source.frames.get(), 3)
+                source.processed(observed)
+                source.emit(kind, frames=[observed], silence_duration=0 if samples == 320 else 0.55)
+                counts = audio.attached, audio.detached
+                assert audio.iterations == (0 if delegated else 1)
+                assert session.input.audio is public_input
+                session.input.audio = public_input
+                await asyncio.sleep(0)
+                assert (audio.attached, audio.detached) == counts
+            assert await asyncio.wait_for(turns.get(), 3) == "same input"
+            assert identity and all(identity)
         finally:
             await audio.frames.put(None)
             await session.aclose()
