@@ -471,9 +471,11 @@ func run() error {
 			return err
 		}
 	}
-	if reporter != nil {
-		runtimeDescriptor.IncarnationID = reporter.incarnation
-	}
+	// The incarnation travels only on instance reports. Do not copy it into
+	// runtimeDescriptor: that descriptor rides every hosted plan request, and
+	// a control plane built before runtime.incarnation_id existed decodes plan
+	// requests with DisallowUnknownFields, so every session fails with
+	// invalid_request (400) before a plan is issued.
 	engine, err := runtimepkg.New(runtimepkg.Config{
 		Adapters: adapters, Verifier: verifier, LocalCredentials: localCredentials, Telemetry: telemetryExporter,
 	})
