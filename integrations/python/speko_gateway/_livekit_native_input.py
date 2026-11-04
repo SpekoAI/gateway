@@ -49,6 +49,9 @@ class _SourceClock:
     owner_scope: object | None = None
     generation: int = -1
     activity: weakref.ReferenceType[Any] | None = None
+    readers: int = 0
+    original_next: Any = None
+    capture_next: Any = None
 
 
 @dataclass
@@ -56,6 +59,7 @@ class _SourceState:
     scope: object = field(default_factory=object)
     end: Fraction = Fraction(0)
     generation: int = 0
+    epoch: tuple[Any, Any] | None = None
     clocks: dict[int, tuple[weakref.ReferenceType[Any], _SourceClock]] = field(default_factory=dict)
 
     def clock_for(self, source: Any) -> _SourceClock:
@@ -71,19 +75,44 @@ class _SourceState:
             clocks[key] = entry
         return entry[1]
 
+    def sync_epoch(self, session: Any) -> None:
+        recorder = getattr(session, "_recorder_io", None)
+        # A recorder publishes its wall-clock epoch only after receiving its
+        # first frame. Its identity, rather than that initial publication,
+        # distinguishes a new recording from the existing capture clock.
+        epoch = session._started_at, weakref.ref(recorder) if recorder is not None else None
+        if self.epoch is not None and epoch != self.epoch:
+            self.scope, self.end = object(), Fraction(0)
+            self.generation += 1
+            for _, clock in self.clocks.values():
+                clock.position = None
+        self.epoch = epoch
+
+
+def _source_root(source: Any) -> Any:
+    seen: set[int] = set()
+    while source is not None and source.source is not None and id(source) not in seen:
+        seen.add(id(source))
+        source = source.source
+    return source
+
+
+def _source_epoch(session: Any) -> Fraction:
+    recorder = getattr(session, "_recorder_io", None)
+    epoch = getattr(recorder, "recording_started_at", None) or session._started_at
+    return Fraction(str(epoch if epoch is not None else time.time()))
+
 
 class _SourceInput(io.AudioInput):
     def __init__(self, source: io.AudioInput, binding: NativeInputBinding) -> None:
         super().__init__(label=source.label, source=source)
         self.binding = binding
-        root, seen = source, set()
-        while root.source is not None and id(root) not in seen:
-            seen.add(id(root))
-            root = root.source
+        root = self._root = _source_root(source)
         # Adding a delegate around the same source does not replace its
         # captured media clock. Keep the clock weakly keyed by the source.
         self._clock = binding._source_state.clock_for(root)
         self._iterator: Any = None
+        self._capturing = False
 
     def __aiter__(self) -> Any:
         # The SDK has captured this iterator before its first suspension.
@@ -93,6 +122,21 @@ class _SourceInput(io.AudioInput):
         if session.input.audio is self:
             session.input._audio_stream = self.source
         if self._iterator is None:
+            if self._root is not self.source:
+                clock = self._clock
+                if not clock.readers:
+                    original = self._root.__anext__
+
+                    @wraps(original)
+                    async def capture() -> rtc.AudioFrame:
+                        # AudioInput delegates through this instance method.
+                        # Observe capture before a delegate buffers the frame.
+                        return self._observe(await original(), captured=True)
+
+                    clock.original_next, clock.capture_next = original, capture
+                    self._root.__anext__ = capture
+                clock.readers += 1
+                self._capturing = True
             self._iterator = aiter(self.source)
         return self
 
@@ -100,11 +144,30 @@ class _SourceInput(io.AudioInput):
         if self._iterator is None:
             self.__aiter__()
         frame = await anext(self._iterator)
+        return self._observe(frame)
+
+    def release(self) -> None:
+        if self._capturing:
+            self._capturing = False
+            clock = self._clock
+            clock.readers -= 1
+            if not clock.readers:
+                if self._root.__anext__ is clock.capture_next:
+                    self._root.__anext__ = clock.original_next
+                clock.original_next = clock.capture_next = None
+
+    def _observe(self, frame: rtc.AudioFrame, *, captured: bool = False) -> rtc.AudioFrame:
         if not isinstance(frame, rtc.AudioFrame) or frame.sample_rate <= 0:
             return frame
         active = _lookup(_sessions, self.binding._session)
         clock = active if active is not None and active.owners else self.binding
         state, observed = clock._source_state, self._clock
+        state.sync_epoch(self.binding._session)
+        witness = frame.userdata.get(_SOURCE_POSITION)
+        if not captured and isinstance(witness, _SourcePosition) and witness.scope is state.scope:
+            # An inner capture already assigned this occurrence. Enabling
+            # audio while a delegate holds it must not move it to release time.
+            return frame
         scope = active.scope if active is not None and active.owners else None
         activity = getattr(self.binding._session, "_activity", None)
         if (
@@ -133,6 +196,7 @@ class NativeInputTimeline:
     scope: object = field(default_factory=object)
     legacy: bool = False
     source_scope: object | None = None
+    session: weakref.ReferenceType[Any] | None = None
 
     def observe(self, frame: rtc.AudioFrame) -> rtc.AudioFrame:
         duration = Fraction(frame.samples_per_channel, frame.sample_rate)
@@ -141,7 +205,13 @@ class NativeInputTimeline:
         owned = _copy_frame(frame)
         source = frame.userdata.get(_SOURCE_POSITION)
         observed = isinstance(source, _SourcePosition) and source.scope is self.source_scope
-        start = source.start if self.legacy and observed else self.position
+        start = self.position
+        if self.legacy and observed:
+            # Capture can precede the recorder's first-frame epoch publication
+            # or a delegate's release. Translate its absolute media position
+            # only when the recognition pipeline receives this occurrence.
+            session = self.session() if self.session is not None else None
+            start = max(Fraction(0), source.start - _source_epoch(session))
         owned.userdata[_POSITION] = _InputPosition(
             self, start, duration, not self.legacy or observed,
             self.legacy and observed and source.synthetic,
@@ -221,6 +291,7 @@ class NativeInputBinding:
         self._session_update: tuple[Any, Any] | None = None
         self._session_forward: tuple[Any, Any] | None = None
         self._session_audio_enabled: tuple[Any, Any, Any] | None = None
+        self._session_audio_changed: tuple[Any, Any, Any] | None = None
         self._recognition_inputs: dict[Any, tuple[Any, Any]] = {}
         self._agents: dict[Any, _AgentHooks] = {}
         self._timelines: weakref.WeakKeyDictionary[Any, NativeInputTimeline] = (
@@ -315,11 +386,26 @@ class NativeInputBinding:
             try:
                 await original()
             finally:
+                observed.release()
                 if session.input.audio is observed:
                     session.input._audio_stream = source
 
         session._forward_audio_task = forward
         self._session_forward = (original, forward)
+        original_changed = session.input._audio_changed
+        previous_root = _source_root(session.input.audio)
+
+        @wraps(original_changed)
+        def changed() -> Any:
+            nonlocal previous_root
+            root = _source_root(session.input.audio)
+            if root is not previous_root:
+                self._source_state.generation += 1
+            previous_root = root
+            return original_changed()
+
+        session.input._audio_changed = changed
+        self._session_audio_changed = session.input, original_changed, changed
         original_enable = session.input.set_audio_enabled
 
         @wraps(original_enable)
@@ -365,7 +451,7 @@ class NativeInputBinding:
                     # captured in the session/recording timeline. Pin it to
                     # the last real ingress, including when a delegated input
                     # still holds an already-observed later source frame.
-                    start = real_end if real_end is not None else Fraction(0)
+                    start = real_end if real_end is not None else _source_epoch(self._session)
                     owned.userdata[_SOURCE_POSITION] = _SourcePosition(
                         active.source_scope, start, synthetic=True
                     )
@@ -387,17 +473,11 @@ class NativeInputBinding:
             del self._recognition_inputs[recognition]
 
     def source_start(self) -> Fraction:
-        now = time.time()
-        recorder = getattr(self._session, "_recorder_io", None)
-        epoch = (
-            getattr(recorder, "recording_started_at", None)
-            or self._session._started_at
-            or now
-        )
         # Anchor each attached input at its first actual delivery, before
         # the SDK buffers it. A replacement includes its idle gap and never
-        # overlaps media that the previous input has already delivered.
-        return max(self._source_state.end, Fraction(str(max(0.0, now - epoch))))
+        # overlaps media that the previous input has already delivered. Keep
+        # capture absolute until the session/recording epoch is available.
+        return max(self._source_state.end, Fraction(str(time.time())))
 
     def _join(self, other: NativeInputBinding) -> NativeInputBinding:
         if (
@@ -417,6 +497,7 @@ class NativeInputBinding:
         return other
 
     def _timeline(self, audio: Any, session: Any) -> NativeInputTimeline:
+        self._source_state.sync_epoch(session)
         recognition = getattr(
             getattr(session, "_activity", None), "_audio_recognition", None
         )
@@ -433,12 +514,13 @@ class NativeInputBinding:
             )
             pipeline = getattr(recognition, "_stt_pipeline", None)
         key = pipeline if pipeline is not None else audio
+        session_ref = weakref.ref(session) if legacy else None
         try:
             timeline = self._timelines.get(key)
         except TypeError:
-            return NativeInputTimeline(scope=self.scope, legacy=legacy, source_scope=self.source_scope)
+            return NativeInputTimeline(scope=self.scope, legacy=legacy, source_scope=self.source_scope, session=session_ref)
         if timeline is None:
-            timeline = NativeInputTimeline(scope=self.scope, legacy=legacy, source_scope=self.source_scope)
+            timeline = NativeInputTimeline(scope=self.scope, legacy=legacy, source_scope=self.source_scope, session=session_ref)
             self._timelines[key] = timeline
         return timeline
 
@@ -558,6 +640,11 @@ class NativeInputBinding:
 
     def _restore(self) -> None:
         self._restore_recognition_inputs()
+        if self._session_audio_changed is not None:
+            input_io, original, changed = self._session_audio_changed
+            if input_io._audio_changed is changed:
+                input_io._audio_changed = original
+            self._session_audio_changed = None
         if self._session_audio_enabled is not None:
             input_io, original, enabled = self._session_audio_enabled
             if input_io.set_audio_enabled is enabled:

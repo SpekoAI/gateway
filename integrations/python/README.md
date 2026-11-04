@@ -88,7 +88,9 @@ Local background-speaker suppression keeps the SDK's empty-final signal and
 its scalar group association, so a filtered terminal segment still finishes
 the group. Canonical turns include only the surviving parts; filtered speech
 is not restored from the full provider text. Entirely filtered groups do not
-poison later turns. Finals arriving after provider end-of-speech retain that
+poison later turns. Suppressed text is absent from outward event metadata as
+well as `text`; canonical filtering state stays inside the owned filter until
+the group finishes. Finals arriving after provider end-of-speech retain that
 boundary, and replacing Gateway STT with another SDK model retires its pending
 gate without requiring the old model to close.
 Speaker RMS lookup uses accepted audio positions, including after custom-node
@@ -123,6 +125,15 @@ Legacy source clocks follow the underlying input through delegation, while
 already-buffered occurrences keep their timestamps. The public input keeps its
 identity, iterator setup and idempotent assignment behavior; modern SDKs use
 their pipeline clock without a source observer.
+
+Detaching and reattaching the same legacy input includes its elapsed gap;
+adding a continuous delegate keeps its existing clock. An owned instance read
+hook observes capture before a delegate can hold a frame. Capture positions stay
+absolute until recognition translates them into the session/recording epoch,
+including the recorder's first-frame epoch publication. Restarting the session
+resets its source scope and clock rather than inheriting the previous run's end.
+Read hooks restore when their captured source pump ends; input-change hooks
+restore with the final native owner.
 
 SDK-generated flush audio is observed at recognition ingress. It retains its
 PCM duration for recognition and VAD, but occupies no captured-media time:

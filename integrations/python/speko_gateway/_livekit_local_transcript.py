@@ -98,6 +98,8 @@ class _Filter:
     def __init__(self, stream: Any) -> None:
         self.stream = stream
         self.owners: weakref.WeakSet[Any] = weakref.WeakSet()
+        self.group: str | None = None
+        self.parts: list[tuple[str, bool]] = []
         detector = stream._detector
         self.original, self.original_close = detector.on_stt_event, stream.aclose
 
@@ -106,18 +108,34 @@ class _Filter:
             result = self.original(event)
             data = event.alternatives[0] if event.alternatives else None
             if (
-                result is None
-                and event.type is stt.SpeechEventType.FINAL_TRANSCRIPT
+                event.type is stt.SpeechEventType.FINAL_TRANSCRIPT
                 and isinstance(data, NativeSpeechData)
                 and data._local_group is not None
             ):
-                # Same empty standard event as the SDK's None replacement;
-                # retain only our encodable association with the provider
-                # final so a suppressed terminal part can finish the group.
-                return stt.SpeechEvent(type=event.type, alternatives=[dataclasses.replace(
-                    data, language="", text="", speaker_id=None,
-                    is_primary_speaker=None, _local_suppressed=True,
-                )])
+                if self.group != data._local_group:
+                    self.group = data._local_group
+                    self.parts.clear()
+                self.parts.append((data._local_part_text or data.text, result is None))
+                terminal = data._local_terminal
+                canonical = _filtered_text(data.canonical_text, self.parts) if terminal and data.canonical_text is not None else ""
+                if result is None:
+                    # Only group/terminal scalar evidence and surviving text
+                    # leave this owned filter. Suppressed content stays in its
+                    # private reconciliation state, never on outward events.
+                    clean = NativeSpeechData(
+                        language="", text="", canonical_text=canonical,
+                        _local_part_text="", _local_group=data._local_group,
+                        _local_suppressed=True, _local_filtered=True,
+                        _local_terminal=terminal, _local_after_eos=data._local_after_eos,
+                    )
+                    result = stt.SpeechEvent(type=event.type, alternatives=[clean])
+                elif terminal:
+                    result = dataclasses.replace(result, alternatives=[dataclasses.replace(
+                        result.alternatives[0], canonical_text=canonical, _local_filtered=True,
+                    ), *result.alternatives[1:]])
+                if terminal:
+                    self.group = None
+                    self.parts.clear()
             return result
 
         async def close() -> None:
@@ -130,6 +148,8 @@ class _Filter:
         detector.on_stt_event, stream.aclose = filtered, close
 
     def restore(self) -> None:
+        self.group = None
+        self.parts.clear()
         if self.stream._detector.on_stt_event is self.observed:
             self.stream._detector.on_stt_event = self.original
         if self.stream.aclose is self.observed_close:
@@ -270,7 +290,7 @@ class _Binding:
                 or event.type is not stt.SpeechEventType.FINAL_TRANSCRIPT
                 or not isinstance(data, NativeSpeechData)
                 or data._local_part_text is None
-                or data.canonical_text is None
+                or (data.canonical_text is None and not data._local_terminal)
                 or data._local_group is None
             ):
                 if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
@@ -287,15 +307,15 @@ class _Binding:
                 self.parts.clear()
             self.parts.append((data._local_part_text, data._local_suppressed))
             self.rewritten |= data.text != ("" if data._local_suppressed else data._local_part_text)
-            self.pending = not bool(data.canonical_text)
+            self.pending = not data._local_terminal
             return data, before
 
         def reconcile(part: tuple[NativeSpeechData, str] | None) -> None:
             if part is None:
                 return
             data, before = part
-            if data.canonical_text:
-                filtered = _filtered_text(data.canonical_text, self.parts)
+            if data._local_terminal:
+                filtered = data.canonical_text if data._local_filtered else _filtered_text(data.canonical_text or "", self.parts)
                 if not self.rewritten and filtered is not None and (recognition._audio_transcript != before or any(suppressed for _, suppressed in self.parts)):
                     recognition._audio_transcript = " ".join(
                         text for text in (self.prefix, filtered) if text
@@ -306,7 +326,10 @@ class _Binding:
                 self.pending = False
                 self.group = None
                 self.parts.clear()
-                if (self.deferred is not None or data._local_after_eos) and not recognition._closing.is_set():
+                manual = recognition._turn_detection_mode == "manual"
+                requested = bool(getattr(recognition, "_user_turn_committed", False))
+                allowed = (not manual or requested or self.deferred is not None) and not recognition._speaking
+                if allowed and (self.deferred is not None or data._local_after_eos) and not recognition._closing.is_set():
                     run = recognition._run_eou_detection
                     options = {"skip_reply": self.deferred.skip_reply if self.deferred is not None else False}
                     if "trigger" in inspect.signature(run).parameters:

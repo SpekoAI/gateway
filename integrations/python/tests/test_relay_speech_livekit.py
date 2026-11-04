@@ -2528,6 +2528,151 @@ async def test_observing_input_preserves_public_identity_and_same_input_assignme
             await client.aclose()
 
 
+@pytest.mark.parametrize("change", ["reattach", "restart", "held_delegate"])
+@pytest.mark.parametrize("binding", ["session", "agent"])
+async def test_legacy_source_clock_tracks_capture_and_session_epochs(change, binding):
+    if hasattr(recognition.AudioRecognition, "_input_started_at"):
+        pytest.skip("modern SDK owns its input clock")
+    observed = asyncio.Queue()
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async def capture():
+                async for value in audio:
+                    witness = value.userdata["_speko_native_input_position"]
+                    observed.put_nowait((float(witness.start), bytes(value.data)))
+                    yield value
+            async for event in Agent.default.stt_node(self, capture(), settings):
+                yield event
+
+    class HeldInput(io.AudioInput):
+        def __init__(self, source):
+            super().__init__(label="owned-capture-hold", source=source)
+            self.captured, self.release = asyncio.Event(), asyncio.Event()
+
+        async def __anext__(self):
+            value = await super().__anext__()
+            self.captured.set()
+            await self.release.wait()
+            return value
+
+    client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url="http://127.0.0.1:1")
+    source = ControlledVAD()
+    model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+    session = AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+    audio = OwnedAudioInput()
+    session.input.audio = audio
+    original_changed, original_next = session.input._audio_changed, audio.__anext__
+    agent = OwnedAgent(instructions="Owned input clock lifecycle")
+    if binding == "session":
+        model.bind_session(session)
+    else:
+        model.bind_agent(agent)
+    held = None
+    try:
+        options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+        await session.start(agent=agent, **options)
+        samples = 16000 if change == "restart" else 320
+        await audio.frames.put(rtc.AudioFrame(data=b"\0\0" * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples))
+        await asyncio.wait_for(observed.get(), 3)
+        value = await asyncio.wait_for(source.frames.get(), 3)
+        source.processed(value)
+        if change == "reattach":
+            session.input.audio = None
+            await asyncio.sleep(0.2)
+            session.input.audio = audio
+        elif change == "restart":
+            await session.aclose()
+            while not observed.empty():
+                observed.get_nowait()  # closing the old recognition injects flush PCM
+            session.input.audio = audio
+            await session.start(agent=OwnedAgent(instructions="Owned restarted input clock"), **options)
+        else:
+            held = HeldInput(audio)
+            session.input.audio = held
+            await audio.frames.put(frame())
+            await asyncio.wait_for(held.captured.wait(), 3)
+            captured_at = time.time() - input_epoch(session)
+            session.input.set_audio_enabled(False)
+            await asyncio.sleep(0.2)
+            session.input.set_audio_enabled(True)
+            held.release.set()
+        lower = time.time() - input_epoch(session)
+        if held is None:
+            await audio.frames.put(frame())
+        start, pcm = await asyncio.wait_for(observed.get(), 3)
+        upper = time.time() - input_epoch(session)
+        if held is not None:
+            assert captured_at - 0.04 <= start <= captured_at + 0.04
+            assert session.input.audio is held and held.source is audio
+        else:
+            assert lower - 1 / 16000 <= start <= upper + 1 / 16000
+            assert session.input.audio is audio
+        assert pcm == bytes(frame().data)
+        assert not model._native_failed
+    finally:
+        if held is not None:
+            held.release.set()
+        await audio.frames.put(None)
+        await session.aclose()
+        await model.aclose()
+        await client.aclose()
+    assert session.input._audio_changed == original_changed
+    assert audio.__anext__ == original_next
+
+
+async def test_legacy_capture_uses_the_recorders_first_frame_epoch(tmp_path):
+    if hasattr(recognition.AudioRecognition, "_input_started_at"):
+        pytest.skip("modern SDK owns its input clock")
+    from livekit.agents.voice.recorder_io import RecorderIO
+
+    observed = asyncio.Queue()
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async def capture():
+                async for value in audio:
+                    observed.put_nowait(value.userdata["_speko_native_input_position"])
+                    yield value
+            async for event in Agent.default.stt_node(self, capture(), settings):
+                yield event
+
+    source = ControlledVAD()
+    client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url="http://127.0.0.1:1")
+    model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+    session = AgentSession(stt=model, llm=None, tts=None, vad=None)
+    audio = OwnedAudioInput()
+    session.input.audio = audio
+    model.bind_session(session)
+    recorder = RecorderIO(agent_session=session)
+    recorded = recorder.record_input(audio)
+    recorder.record_output(None)
+    original_next = audio.__anext__
+    try:
+        await session.start(agent=OwnedAgent(instructions="Owned recorder epoch"), record=False)
+        await asyncio.sleep(0.1)
+        await recorder.start(output_path=tmp_path / "owned-input.ogg")
+        session._recorder_io = recorder
+        session.input.audio = recorded
+        session.update_agent(OwnedAgent(instructions="Owned recorded input"))
+        await asyncio.wait_for(session._update_activity_atask, 3)
+        while not observed.empty():
+            observed.get_nowait()
+        await audio.frames.put(frame())
+        witness = await asyncio.wait_for(observed.get(), 3)
+        assert witness.observed
+        assert float(witness.start) == pytest.approx(0, abs=1 / 16000)
+        assert recorder.recording_started_at > session._started_at + 0.09
+        assert session.input.audio is recorded and recorded.source is audio
+    finally:
+        await audio.frames.put(None)
+        await session.aclose()
+        await recorder.aclose()
+        await model.aclose()
+        await client.aclose()
+    assert audio.__anext__ == original_next
+
+
 async def test_source_replaced_in_prewarm_stays_observed_before_recognition_exists():
     sources, entered, turns = [ControlledVAD(), ControlledVAD()], asyncio.Event(), asyncio.Queue()
     observations = []
