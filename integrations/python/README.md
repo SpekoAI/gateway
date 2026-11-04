@@ -88,7 +88,9 @@ Local background-speaker suppression keeps the SDK's empty-final signal and
 its scalar group association, so a filtered terminal segment still finishes
 the group. Canonical turns include only the surviving parts; filtered speech
 is not restored from the full provider text. Entirely filtered groups do not
-poison later turns. Finals arriving after provider end-of-speech retain that
+poison later turns. Suppressed text is absent from outward event metadata as
+well as `text`; canonical filtering state stays inside the owned filter until
+the group finishes. Finals arriving after provider end-of-speech retain that
 boundary, and replacing Gateway STT with another SDK model retires its pending
 gate without requiring the old model to close.
 Speaker RMS lookup uses accepted audio positions, including after custom-node
