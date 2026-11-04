@@ -3,23 +3,75 @@
 package gateway
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
 
-func TestNativeSocketPreservesLongValidStablePaths(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("Linux sockaddr_un boundary")
+func TestNativeSocketBindingPreservesConcurrentRelativeIO(t *testing.T) {
+	cwd, err := os.Stat(".")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, length := range []int{100, 107} {
+	directory, err := os.MkdirTemp("", "native-cwd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	stop := make(chan struct{})
+	errors := make(chan error, 4)
+	var ready, exited sync.WaitGroup
+	ready.Add(4)
+	exited.Add(4)
+	for range 4 {
+		go func() {
+			defer exited.Done()
+			ready.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(time.Millisecond):
+					actual, err := os.Stat(".")
+					if err != nil || !os.SameFile(cwd, actual) {
+						errors <- fmt.Errorf("native binding changed another goroutine's cwd: %v", err)
+						return
+					}
+				}
+			}
+		}()
+	}
+	ready.Wait()
+	defer func() {
+		close(stop)
+		exited.Wait()
+		select {
+		case err := <-errors:
+			t.Error(err)
+		default:
+		}
+	}()
+	for range 100 {
+		listener, err := ListenNativeUnix(filepath.Join(directory, "s"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestNativeSocketPreservesLongValidStablePaths(t *testing.T) {
+	for _, length := range []int{100, len(syscall.RawSockaddrUnix{}.Path) - 1} {
 		t.Run(strconv.Itoa(length), func(t *testing.T) {
 			base, err := os.MkdirTemp("", "native-long-")
 			if err != nil {

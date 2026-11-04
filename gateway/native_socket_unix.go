@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"syscall"
 )
@@ -95,7 +94,7 @@ func listenNativeUnix(socketPath string, persist func(*os.File, nativeSocketOwne
 		return refuse()
 	}
 	defer directory.Close()
-	listener, err := ListenUnix(nativeSocketBindPath(staging, directory))
+	listener, err := listenNativeStagedSocket(staging, directory)
 	if err != nil {
 		return nil, err
 	}
@@ -123,23 +122,6 @@ func listenNativeUnix(socketPath string, persist func(*os.File, nativeSocketOwne
 	}
 	keep = true
 	return &nativeUnixListener{Listener: listener, lock: lock, path: socketPath, entry: entry}, nil
-}
-
-// A directory descriptor alias keeps the sockaddr short even when the stable
-// filesystem path is near the Unix socket limit. Verify the alias names this
-// exact open directory, and keep it open until binding and publication finish.
-// This changes no process-wide working directory.
-func nativeSocketBindPath(staging string, directory *os.File) string {
-	entry, err := directory.Stat()
-	if err == nil {
-		for _, root := range []string{"/proc/self/fd", "/dev/fd"} {
-			alias := filepath.Join(root, strconv.FormatUint(uint64(directory.Fd()), 10))
-			if actual, err := os.Stat(alias + "/."); err == nil && os.SameFile(entry, actual) {
-				return filepath.Join(alias, "s")
-			}
-		}
-	}
-	return filepath.Join(staging, "s")
 }
 
 func persistNativeSocketOwner(lock *os.File, owner nativeSocketOwner) error {
