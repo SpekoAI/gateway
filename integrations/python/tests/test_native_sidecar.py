@@ -564,7 +564,7 @@ async def test_native_sidecar_python_speech_retains_canonical_handshake_rejectio
             {
                 "error": {
                     "code": code,
-                    "message": "owned rejection detail",
+                    "message": "m" * 1025,
                     "hint": "owned remediation",
                     "retryable": False,
                     "request_id": "owned-rejection",

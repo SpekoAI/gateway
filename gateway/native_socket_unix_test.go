@@ -5,25 +5,22 @@ package gateway_test
 import (
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/SpekoAI/gateway/gateway"
 )
 
-func TestNativeSocketReclaimsStaleEntryAndRetainsOneListenerOwner(t *testing.T) {
+func TestNativeSocketRetainsOneListenerOwner(t *testing.T) {
 	directory, err := os.MkdirTemp("", "native-socket-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(directory)
 	path := filepath.Join(directory, "runtime.sock")
-	old, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	old.SetUnlinkOnClose(false)
-	_ = old.Close()
 	first, err := gateway.ListenNativeUnix(path)
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +50,7 @@ func TestNativeSocketReclaimsStaleEntryAndRetainsOneListenerOwner(t *testing.T) 
 }
 
 func TestNativeSocketRefusesLiveUncoordinatedListenerAndUnrelatedEntries(t *testing.T) {
-	for _, kind := range []string{"live", "file", "socket-symlink", "lock-symlink"} {
+	for _, kind := range []string{"live", "bound", "stale-unrecorded", "file", "socket-symlink", "lock-symlink"} {
 		t.Run(kind, func(t *testing.T) {
 			directory, err := os.MkdirTemp("", "native-socket-")
 			if err != nil {
@@ -72,6 +69,32 @@ func TestNativeSocketRefusesLiveUncoordinatedListenerAndUnrelatedEntries(t *test
 				if err := os.WriteFile(path, []byte("owned-data"), 0600); err != nil {
 					t.Fatal(err)
 				}
+			case "bound":
+				fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer syscall.Close(fd)
+				if err = syscall.Bind(fd, &syscall.SockaddrUnix{Name: path}); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := syscall.Listen(fd, 1); err != nil {
+						t.Fatal(err)
+					}
+					probe, err := net.Dial("unix", path)
+					if err != nil {
+						t.Fatal("bound owner's socket was removed before listen", err)
+					}
+					_ = probe.Close()
+				}()
+			case "stale-unrecorded":
+				old, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				old.SetUnlinkOnClose(false)
+				_ = old.Close()
 			default:
 				target := filepath.Join(directory, "data")
 				if err := os.WriteFile(target, []byte("owned-data"), 0600); err != nil {
@@ -96,4 +119,56 @@ func TestNativeSocketRefusesLiveUncoordinatedListenerAndUnrelatedEntries(t *test
 			}
 		})
 	}
+}
+
+func TestNativeSocketRecoversOnlyItsRecordedDeadOwner(t *testing.T) {
+	if path := os.Getenv("SPEKO_NATIVE_SOCKET_TEST_CHILD"); path != "" {
+		listener, err := gateway.ListenNativeUnix(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		if err = os.WriteFile(path+".ready", []byte("ready"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			time.Sleep(time.Second)
+		}
+	}
+	directory, err := os.MkdirTemp("", "native-socket-crash-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	path := filepath.Join(directory, "runtime.sock")
+	child := exec.Command(os.Args[0], "-test.run=^TestNativeSocketRecoversOnlyItsRecordedDeadOwner$")
+	child.Env = append(os.Environ(), "SPEKO_NATIVE_SOCKET_TEST_CHILD="+path)
+	if err = child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err = os.Stat(path + ".ready"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("child listener did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err = child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = child.Wait()
+	listener, err := gateway.ListenNativeUnix(path)
+	if err != nil {
+		t.Fatal("recorded dead native socket was not recovered", err)
+	}
+	defer listener.Close()
+	probe, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = probe.Close()
 }

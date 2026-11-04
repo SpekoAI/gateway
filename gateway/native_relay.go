@@ -387,7 +387,7 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 			_ = response.Body.Close()
 			response.Body = io.NopCloser(strings.NewReader(string(raw)))
 			var envelope relayapi.ErrorEnvelope
-			if readErr == nil && len(raw) <= 8192 && json.Unmarshal(raw, &envelope) == nil && envelope.Validate() == nil && len(envelope.Error.Message) <= 1024 && len(envelope.Error.RequestID) <= 256 {
+			if readErr == nil && len(raw) <= 8192 && json.Unmarshal(raw, &envelope) == nil && envelope.Validate() == nil {
 				rejection = &envelope
 			}
 		}

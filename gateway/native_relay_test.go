@@ -622,7 +622,7 @@ func TestNativeRelayStalledUploadReleasesSlotAndCancelsUpstream(t *testing.T) {
 func TestNativeRelayWebSocketRefusalPreservesStatusEnvelopeAndRequestIdentity(t *testing.T) {
 	for _, status := range []int{402, 409, 429, 503} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
-			envelope := relayapi.ErrorEnvelope{Error: relayapi.ErrorBody{Code: relayapi.ErrorCodeInsufficientCredit, Message: strings.Repeat("m", 700), Hint: strings.Repeat("h", 512), RequestID: "owned-rejection", Retryable: false}}
+			envelope := relayapi.ErrorEnvelope{Error: relayapi.ErrorBody{Code: relayapi.ErrorCodeInsufficientCredit, Message: strings.Repeat("m", 1025), Hint: strings.Repeat("h", 512), RequestID: "req-123", Retryable: false}}
 			peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(status)

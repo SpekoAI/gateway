@@ -3,17 +3,19 @@
 package gateway
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
-	"time"
 )
 
 // ListenNativeUnix retains a process lock through listener cleanup. Only a
-// same-owner stale socket inside an owner-only directory can be reclaimed.
+// socket recorded by the previous native owner can be reclaimed. ECONNREFUSED is
+// insufficient evidence: another process may be between bind and listen.
 // The lock file remains in place so concurrent restarts share one lock inode.
 func ListenNativeUnix(socketPath string) (net.Listener, error) {
 	refuse := func() (net.Listener, error) {
@@ -55,12 +57,14 @@ func ListenNativeUnix(socketPath string) (net.Listener, error) {
 		if !ok || entry.Mode()&os.ModeSocket == 0 || stat.Uid != uint32(os.Getuid()) {
 			return refuse()
 		}
-		conn, dialErr := net.DialTimeout("unix", socketPath, time.Second)
-		if dialErr == nil {
-			_ = conn.Close()
-			return refuse()
-		}
-		if !errors.Is(dialErr, syscall.ECONNREFUSED) {
+		var prior nativeSocketOwner
+		decoder := json.NewDecoder(io.LimitReader(lock, 4096))
+		decoder.DisallowUnknownFields()
+		// This record was written only after binding under this same retained
+		// flock. A native owner releases the lock after closing its listener;
+		// process death releases both. No PID liveness probe is needed (PIDs
+		// may be reused, including PID 1 across container restarts).
+		if decoder.Decode(&prior) != nil || prior.Version != 1 || prior.Device != uint64(stat.Dev) || prior.Inode != uint64(stat.Ino) || prior.ModifiedAt != entry.ModTime().UnixNano() {
 			return refuse()
 		}
 		current, statErr := os.Lstat(socketPath)
@@ -77,8 +81,32 @@ func ListenNativeUnix(socketPath string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	entry, err = os.Lstat(socketPath)
+	if err != nil {
+		_ = listener.Close()
+		return refuse()
+	}
+	socketStat, ok := entry.Sys().(*syscall.Stat_t)
+	if !ok || lock.Truncate(0) != nil {
+		_ = listener.Close()
+		return refuse()
+	}
+	if _, err = lock.Seek(0, io.SeekStart); err == nil {
+		err = json.NewEncoder(lock).Encode(nativeSocketOwner{Version: 1, Device: uint64(socketStat.Dev), Inode: uint64(socketStat.Ino), ModifiedAt: entry.ModTime().UnixNano()})
+	}
+	if err != nil || lock.Sync() != nil {
+		_ = listener.Close()
+		return refuse()
+	}
 	keep = true
 	return &nativeUnixListener{Listener: listener, lock: lock}, nil
+}
+
+type nativeSocketOwner struct {
+	Version    int    `json:"version"`
+	Device     uint64 `json:"device"`
+	Inode      uint64 `json:"inode"`
+	ModifiedAt int64  `json:"modified_at"`
 }
 
 type nativeUnixListener struct {
