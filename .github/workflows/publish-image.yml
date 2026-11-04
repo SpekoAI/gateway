@@ -13,10 +13,10 @@ permissions:
 env:
   IMAGE_NAME: spekoai/gateway
 
-# Release builds run one at a time and never cancel, so two tags pushed close
-# together cannot finish out of order and move the minor alias backwards.
+# One build per ref at a time, never cancelled. A shared queue would drop
+# pending tags, so releases are cut one at a time instead (docs/RELEASING.md).
 concurrency:
-  group: publish-${{ github.ref_type == 'tag' && 'release' || github.ref }}
+  group: publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -30,13 +30,18 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           # A released image must never change under a customer who pinned it.
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # Only "not found" counts as absent; any other API failure stops the build.
+          if out=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName 2>&1); then
             echo "::error::$TAG is already released; cut a new patch version instead"
+            exit 1
+          elif ! printf '%s' "$out" | grep -qi "release not found"; then
+            echo "::error::could not check for an existing $TAG release: $out"
             exit 1
           fi
           # Never move the minor alias back to an older patch.
           minor=$(printf '%s' "${TAG%.*}" | sed 's/\./\\./g')
-          newest=$( { gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 100 --json tagName --jq '.[].tagName'; echo "$TAG"; } | grep -E "^${minor}\.[0-9]+$" | sort -V | tail -1)
+          released=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName')
+          newest=$(printf '%s\n%s\n' "$released" "$TAG" | grep -E "^${minor}\.[0-9]+$" | sort -V | tail -1)
           if [ "$newest" != "$TAG" ]; then
             echo "::error::$newest is newer than $TAG on the same minor; refusing to move the ${TAG%.*} alias back"
             exit 1

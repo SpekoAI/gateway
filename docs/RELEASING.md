@@ -26,7 +26,8 @@ a release.
    `0.1.1` and `0.1` tags. It then creates the GitHub release with notes
    generated from the merged pull requests. Only `vMAJOR.MINOR.PATCH` tags
    publish; a tag that is already released, or older than a released patch
-   on the same minor, is refused.
+   on the same minor, is refused. Cut one release at a time: wait for its
+   workflow run to finish before pushing the next tag.
 5. Edit the release notes on the releases page. Start with a short
    "What changed for you" section in plain words, and call out anything a
    customer must do.
