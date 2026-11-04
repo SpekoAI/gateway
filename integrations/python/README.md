@@ -58,11 +58,16 @@ alone cannot complete a turn. `bind_session(session)` observes that session's
 actual synchronous turn acceptance, including `skip_reply=True`, and follows
 `update_agent()` handoffs and live `Agent.update_options(stt=...)` swaps. The
 current activity has one turn owner; the old callback is restored before a new
-model binds. Where the SDK exposes its recognition pipeline, native sample
-positions follow that pipeline's input timeline rather than node startup time.
-Buffered audio retains its original position, and fresh input retains its
-configured endpointing delay even when a wrapper omits its child's offset.
-Public Agent lifecycle hooks remain untouched.
+model binds. The binding observes the Agent's input before its custom
+`stt_node` consumes or buffers frames, keeping sample positions in the SDK
+recognition pipeline's timeline. Filtered frames advance that timeline without
+being sent to the provider. Buffered audio retains its original position, and
+fresh input retains its configured endpointing delay even when a wrapper omits
+its child's offset. Each input occurrence receives its own frame copy with the
+original PCM and userdata; the producer's frames remain untouched. Custom DSP
+that replaces a frame must preserve its userdata and duration. Repacketization
+that loses the source position is refused. Public Agent lifecycle hooks remain
+untouched; the owned processing-node and option-update hooks are restored on close.
 `bind_agent(agent)` locates the same session when its first stream starts.
 The owned SDK activity interface is checked before admission and before each
 turn's final transcript, including SDKs that retain a stream across handoff.
