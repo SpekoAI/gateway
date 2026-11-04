@@ -34,7 +34,7 @@ type instanceWire struct {
 
 func decodeInstanceWire(t *testing.T, request *http.Request) instanceWire {
 	t.Helper()
-	if request.Header.Get(controlplane.InstanceProtocolHeader) != "2" || request.Header.Get("Authorization") != "Bearer sk_speko_fixture" {
+	if request.Header.Get(controlplane.InstanceProtocolHeader) != "3" || request.Header.Get("Authorization") != "Bearer sk_speko_fixture" {
 		t.Error("protocol or authenticated wire changed")
 	}
 	body, err := io.ReadAll(request.Body)
@@ -49,7 +49,7 @@ func decodeInstanceWire(t *testing.T, request *http.Request) instanceWire {
 }
 
 func acknowledgeInstance(writer http.ResponseWriter) {
-	writer.Header().Set(controlplane.InstanceProtocolHeader, "2")
+	writer.Header().Set(controlplane.InstanceProtocolHeader, "3")
 	writer.WriteHeader(http.StatusNoContent)
 }
 
@@ -281,5 +281,35 @@ func TestServingGatewayClosesLifetimeOnEveryExit(t *testing.T) {
 				t.Fatal("missing draining report")
 			}
 		})
+	}
+}
+
+func TestAttributedReporterFreezesAccountRowsAcrossLostAcknowledgement(t *testing.T) {
+	var bodies []string
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if len(bodies) <= 2 {
+			w.WriteHeader(503)
+			return
+		}
+		acknowledgeInstance(w)
+	}))
+	defer peer.Close()
+	reporter, err := newInstanceReporter(reporterClient(t, peer), "worker", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := protocol.CapacitySnapshot{Complete: true, Accounts: []protocol.CapacityOccupancy{{Account: "account/one", Capability: "stt_streams", Model: "nova-3", Active: 1}}}
+	heartbeat := controlplane.InstanceHeartbeat{RuntimeName: "go", RuntimeVersion: "test", SessionCapacity: 1, ActiveSessions: 1, Capacity: &snapshot}
+	if reporter.report(context.Background(), heartbeat) == nil {
+		t.Fatal("lost acknowledgement was not retained")
+	}
+	snapshot.Accounts[0].Account = "account/two"
+	if reporter.report(context.Background(), heartbeat) != nil {
+		t.Fatal("retry failed")
+	}
+	if len(bodies) != 4 || bodies[0] != bodies[1] || bodies[0] != bodies[2] || !strings.Contains(bodies[3], `"account":"account/two"`) {
+		t.Fatal("retry changed original attributed state")
 	}
 }

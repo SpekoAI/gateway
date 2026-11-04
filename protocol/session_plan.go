@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -140,6 +141,7 @@ type RuntimeDescriptor struct {
 	Name           string          `json:"name"`
 	Version        string          `json:"version"`
 	InstanceID     string          `json:"instance_id"`
+	IncarnationID  string          `json:"incarnation_id,omitempty"`
 	Placement      Placement       `json:"placement"`
 	ProviderRoutes []ProviderRoute `json:"provider_routes"`
 	Adapters       []string        `json:"adapters"`
@@ -322,16 +324,17 @@ func (m MediaFormat) Validate() error {
 // SessionPlan is the signed execution decision consumed by the runtime.
 // Signature verification is intentionally separate from structural validation.
 type SessionPlan struct {
-	PlanID       string       `json:"plan_id"`
-	SessionID    string       `json:"session_id"`
-	AttemptID    string       `json:"attempt_id"`
-	Execution    Execution    `json:"execution"`
-	ExpiresAt    time.Time    `json:"expires_at"`
-	Route        PlanRoute    `json:"route"`
-	Reservation  Reservation  `json:"reservation"`
-	Telemetry    Telemetry    `json:"telemetry"`
-	Fallback     *Fallback    `json:"fallback,omitempty"`
-	Requirements Requirements `json:"requirements"`
+	PlanID       string               `json:"plan_id"`
+	SessionID    string               `json:"session_id"`
+	AttemptID    string               `json:"attempt_id"`
+	Execution    Execution            `json:"execution"`
+	ExpiresAt    time.Time            `json:"expires_at"`
+	Route        PlanRoute            `json:"route"`
+	Reservation  Reservation          `json:"reservation"`
+	Telemetry    Telemetry            `json:"telemetry"`
+	Capacity     *CapacityAttribution `json:"capacity,omitempty"`
+	Fallback     *Fallback            `json:"fallback,omitempty"`
+	Requirements Requirements         `json:"requirements"`
 	// Signature is a compact JWS over a SessionPlanEnvelope containing this
 	// plan with Signature omitted. It is deliberately opaque to callers: only
 	// a runtime PlanVerifier may interpret it.
@@ -577,6 +580,9 @@ func (w Workload) validate() error {
 // Validate verifies structural and time-bound invariants. It does not verify
 // the signature; callers must do that with a trusted control-plane key first.
 func (p SessionPlan) Validate(now time.Time) error {
+	if p.Capacity != nil && (p.Execution.CredentialSource != CredentialsManaged || p.Capacity.Validate() != nil || p.Capacity.Model != p.Route.Model || p.Capacity.Slots != int64(p.Reservation.Concurrency.Slots)) {
+		return fmt.Errorf("capacity: invalid signed accounting metadata")
+	}
 	if strings.TrimSpace(p.PlanID) == "" || strings.TrimSpace(p.SessionID) == "" || strings.TrimSpace(p.AttemptID) == "" {
 		return fmt.Errorf("plan_id, session_id, and attempt_id are required")
 	}
@@ -667,7 +673,12 @@ func (p SessionPlan) validateCredential(now time.Time) error {
 	return nil
 }
 
+var runtimeIncarnation = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
 func (r RuntimeDescriptor) validate() error {
+	if r.IncarnationID != "" && !runtimeIncarnation.MatchString(r.IncarnationID) {
+		return fmt.Errorf("invalid runtime incarnation")
+	}
 	if strings.TrimSpace(r.Name) == "" || strings.TrimSpace(r.Version) == "" || strings.TrimSpace(r.InstanceID) == "" {
 		return fmt.Errorf("name, version, and instance_id are required")
 	}

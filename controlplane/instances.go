@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/SpekoAI/gateway/protocol"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -18,18 +18,20 @@ import (
 // dashboard. Workload identity is optional because one gateway may serve
 // framework-neutral sessions or several workloads.
 type InstanceHeartbeat struct {
-	RuntimeName      string            `json:"runtime_name"`
-	RuntimeVersion   string            `json:"runtime_version"`
-	WorkloadType     string            `json:"workload_type,omitempty"`
-	WorkloadID       string            `json:"workload_id,omitempty"`
-	StartedAt        time.Time         `json:"started_at"`
-	ActiveSessions   int64             `json:"active_sessions"`
-	PendingSessions  int               `json:"pending_sessions"`
-	SessionCapacity  int               `json:"session_capacity"`
-	SessionsTotal    uint64            `json:"sessions_total"`
-	TelemetryDropped uint64            `json:"telemetry_dropped"`
-	Draining         bool              `json:"draining"`
-	Labels           map[string]string `json:"labels,omitempty"`
+	// Local snapshot is serialized only by the explicit v3 envelope.
+	Capacity         *protocol.CapacitySnapshot `json:"-"`
+	RuntimeName      string                     `json:"runtime_name"`
+	RuntimeVersion   string                     `json:"runtime_version"`
+	WorkloadType     string                     `json:"workload_type,omitempty"`
+	WorkloadID       string                     `json:"workload_id,omitempty"`
+	StartedAt        time.Time                  `json:"started_at"`
+	ActiveSessions   int64                      `json:"active_sessions"`
+	PendingSessions  int                        `json:"pending_sessions"`
+	SessionCapacity  int                        `json:"session_capacity"`
+	SessionsTotal    uint64                     `json:"sessions_total"`
+	TelemetryDropped uint64                     `json:"telemetry_dropped"`
+	Draining         bool                       `json:"draining"`
+	Labels           map[string]string          `json:"labels,omitempty"`
 }
 
 // InstanceHeartbeatV2 opts into lifetime fencing, not capacity attribution.
@@ -42,6 +44,24 @@ type InstanceHeartbeatV2 struct {
 
 // InstanceLifetimeV2 identifies one process for a terminal DELETE.
 // Reserve a sequence for shutdown and never wrap it under one incarnation.
+type InstanceHeartbeatV3 struct {
+	InstanceHeartbeatV2
+	Capacity protocol.CapacitySnapshot `json:"capacity"`
+}
+
+func (c *Client) ReportInstanceV3(ctx context.Context, instanceID string, h InstanceHeartbeatV3) error {
+	if !validHeartbeat(instanceID, h.InstanceHeartbeat) || !incarnationPattern.MatchString(h.IncarnationID) || h.Sequence == 0 || h.Capacity.Validate(h.ActiveSessions, h.PendingSessions) != nil {
+		return errors.New("controlplane: invalid attributed runtime heartbeat")
+	}
+	return c.sendVersionedInstanceRequest(ctx, http.MethodPut, instanceID, h, "3")
+}
+func (c *Client) DeregisterInstanceV3(ctx context.Context, instanceID string, h InstanceLifetimeV2) error {
+	if strings.TrimSpace(instanceID) == "" || !incarnationPattern.MatchString(h.IncarnationID) || h.StartedAt.IsZero() || h.Sequence == 0 {
+		return errors.New("controlplane: invalid attributed runtime lifetime")
+	}
+	return c.sendVersionedInstanceRequest(ctx, http.MethodDelete, instanceID, h, "3")
+}
+
 type InstanceLifetimeV2 struct {
 	IncarnationID string    `json:"incarnation_id"`
 	StartedAt     time.Time `json:"started_at"`
@@ -58,7 +78,7 @@ func (c *Client) ReportInstanceV2(ctx context.Context, instanceID string, heartb
 	if !validHeartbeat(instanceID, heartbeat.InstanceHeartbeat) || !incarnationPattern.MatchString(heartbeat.IncarnationID) || heartbeat.Sequence == 0 {
 		return errors.New("controlplane: invalid versioned runtime instance heartbeat")
 	}
-	return c.sendVersionedInstanceRequest(ctx, http.MethodPut, instanceID, heartbeat, true)
+	return c.sendVersionedInstanceRequest(ctx, http.MethodPut, instanceID, heartbeat, "2")
 }
 
 // DeregisterInstanceV2 closes only the specified lifetime. A timeout is retried
@@ -67,7 +87,7 @@ func (c *Client) DeregisterInstanceV2(ctx context.Context, instanceID string, li
 	if strings.TrimSpace(instanceID) == "" || !incarnationPattern.MatchString(lifetime.IncarnationID) || lifetime.StartedAt.IsZero() || lifetime.Sequence == 0 {
 		return errors.New("controlplane: invalid runtime instance lifetime")
 	}
-	return c.sendVersionedInstanceRequest(ctx, http.MethodDelete, instanceID, lifetime, true)
+	return c.sendVersionedInstanceRequest(ctx, http.MethodDelete, instanceID, lifetime, "2")
 }
 
 func validHeartbeat(instanceID string, heartbeat InstanceHeartbeat) bool {
@@ -92,32 +112,26 @@ func (c *Client) DeregisterInstance(ctx context.Context, instanceID string) erro
 }
 
 func (c *Client) sendInstanceRequest(ctx context.Context, method, instanceID string, value any) error {
-	return c.sendVersionedInstanceRequest(ctx, method, instanceID, value, false)
+	return c.sendVersionedInstanceRequest(ctx, method, instanceID, value, "")
 }
 
-func (c *Client) sendVersionedInstanceRequest(ctx context.Context, method, instanceID string, value any, versioned bool) error {
+func (c *Client) sendVersionedInstanceRequest(ctx context.Context, method, instanceID string, value any, version string) error {
 	endpoint := c.resolve("/v1/runtime-instances/" + instanceID)
 	// URL.Path holds decoded text. Keep the ID as one escaped segment in
 	// RawPath so serialization escapes it once, preserving literal percent
 	// sequences as distinct identities and retaining the configured base path.
-	basePath := c.baseURL.EscapedPath()
-	// resolve trims decoded trailing slashes, so remove their escaped forms
-	// too. Otherwise URL.String discards an inconsistent RawPath entirely.
-	for strings.HasSuffix(basePath, "/") || len(basePath) >= 3 && strings.EqualFold(basePath[len(basePath)-3:], "%2f") {
-		trim := 1
-		if basePath[len(basePath)-1] != '/' {
-			trim = 3
-		}
-		basePath = basePath[:len(basePath)-trim]
-	}
-	endpoint.RawPath = basePath + "/v1/runtime-instances/" + url.PathEscape(instanceID)
+	endpoint.RawPath = c.escapedBasePath() + "/v1/runtime-instances/" + escapeIdentitySegment(instanceID)
 	var body io.Reader
 	if value != nil {
 		encoded, err := json.Marshal(value)
 		if err != nil {
 			return fmt.Errorf("controlplane: encode runtime instance heartbeat: %w", err)
 		}
-		if versioned && len(encoded) > 16*1024 {
+		limit := 16 * 1024
+		if version == "3" {
+			limit = 64 * 1024
+		}
+		if version != "" && len(encoded) > limit {
 			return errors.New("controlplane: runtime instance report exceeds 16 KiB")
 		}
 		body = bytes.NewReader(encoded)
@@ -128,8 +142,8 @@ func (c *Client) sendVersionedInstanceRequest(ctx context.Context, method, insta
 	}
 	request.Header.Set("Authorization", "Bearer "+c.bearer)
 	request.Header.Set("Accept", "application/json")
-	if versioned {
-		request.Header.Set(InstanceProtocolHeader, "2")
+	if version != "" {
+		request.Header.Set(InstanceProtocolHeader, version)
 	}
 	if value != nil {
 		request.Header.Set("Content-Type", "application/json")
@@ -146,8 +160,8 @@ func (c *Client) sendVersionedInstanceRequest(ctx context.Context, method, insta
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return &HTTPError{Status: response.StatusCode, RequestID: response.Header.Get("X-Request-ID")}
 	}
-	if versioned && (response.StatusCode != http.StatusNoContent || response.Header.Get(InstanceProtocolHeader) != "2") {
-		return errors.New("controlplane: runtime instance protocol 2 was not acknowledged")
+	if version != "" && (response.StatusCode != http.StatusNoContent || response.Header.Get(InstanceProtocolHeader) != version) {
+		return errors.New("controlplane: runtime instance protocol was not acknowledged")
 	}
 	return nil
 }

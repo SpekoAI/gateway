@@ -212,14 +212,22 @@ func (c *Client) RefreshCredential(ctx context.Context, plan protocol.SessionPla
 	if strings.TrimSpace(plan.SessionID) == "" || strings.TrimSpace(plan.AttemptID) == "" || strings.TrimSpace(request.Reason) == "" {
 		return protocol.DelegatedCredential{}, "", errors.New("controlplane: credential refresh needs a session, an attempt, and a reason")
 	}
-	endpoint := c.resolve("/v1/sessions/" + url.PathEscape(plan.SessionID) + "/attempts/" + url.PathEscape(plan.AttemptID) + "/credentials")
+	// PathEscape produces encoded segments. Assigning those bytes to URL.Path
+	// would encode '%' again, changing an opaque session or attempt identity.
+	rawPath := c.escapedBasePath() + "/v1/sessions/" + escapeIdentitySegment(plan.SessionID) + "/attempts/" + escapeIdentitySegment(plan.AttemptID) + "/credentials"
+	decodedPath, err := url.PathUnescape(rawPath)
+	if err != nil {
+		return protocol.DelegatedCredential{}, "", errors.New("controlplane: invalid credential refresh path")
+	}
+	endpoint := *c.baseURL
+	endpoint.Path, endpoint.RawPath, endpoint.RawQuery = decodedPath, rawPath, ""
 	// The budget bounds the requests too, not only the waits between them: a
 	// stalled retry must not eat the caller's whole reconnect window.
 	ctx, cancel := context.WithTimeout(ctx, credentialRefreshRetryBudget)
 	defer cancel()
 	deadline, _ := ctx.Deadline()
 	for delay := credentialRefreshFirstRetry; ; delay = min(2*delay, credentialRefreshMaxRetry) {
-		credential, requestID, err := c.refreshCredentialOnce(ctx, endpoint, plan.AttemptID, request)
+		credential, requestID, err := c.refreshCredentialOnce(ctx, &endpoint, plan.AttemptID, request)
 		if err == nil || !credentialRefreshRetryable(err) || time.Now().Add(delay).After(deadline) {
 			return credential, requestID, err
 		}
@@ -338,8 +346,33 @@ func (c *Client) post(ctx context.Context, endpoint *url.URL, value any, idempot
 func (c *Client) resolve(path string) *url.URL {
 	endpoint := *c.baseURL
 	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + path
+	endpoint.RawPath = c.escapedBasePath() + (&url.URL{Path: path}).EscapedPath()
 	endpoint.RawQuery = ""
 	return &endpoint
+}
+
+func escapeIdentitySegment(value string) string {
+	if value == "." {
+		return "%2E"
+	}
+	if value == ".." {
+		return "%2E%2E"
+	}
+	return url.PathEscape(value)
+}
+
+// Match resolve's decoded trailing-slash interpretation while retaining
+// escaped slashes inside the configured prefix as their original segments.
+func (c *Client) escapedBasePath() string {
+	base := c.baseURL.EscapedPath()
+	for strings.HasSuffix(base, "/") || len(base) >= 3 && strings.EqualFold(base[len(base)-3:], "%2f") {
+		trim := 1
+		if base[len(base)-1] != '/' {
+			trim = 3
+		}
+		base = base[:len(base)-trim]
+	}
+	return base
 }
 
 func sameOrigin(left, right *url.URL) bool {

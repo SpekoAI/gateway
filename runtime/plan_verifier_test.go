@@ -220,3 +220,40 @@ func testBYOKPlan(now, expiresAt time.Time) protocol.SessionPlan {
 		Requirements: protocol.Requirements{Protocol: protocol.VoiceV0, ProtocolRevision: protocol.CurrentRevision, RuntimeVersion: "test"},
 	}
 }
+
+func TestBothSignatureFamiliesBindCapacityAttribution(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := newJWKSFixture(t, "capacity-key", public)
+	now := time.Date(2026, time.November, 3, 0, 0, 0, 0, time.UTC)
+	for _, family := range []string{runtimepkg.SessionPlanJWSType, runtimepkg.SessionPlanCredentialDigestJWSType} {
+		t.Run(family, func(t *testing.T) {
+			plan := testBYOKPlan(now, now.Add(time.Minute))
+			plan.Execution.CredentialSource = protocol.CredentialsManaged
+			plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "private-delegated-token", ExpiresAt: plan.ExpiresAt}
+			plan.Capacity = &protocol.CapacityAttribution{Account: "account/one", Capability: "stt_streams", Model: plan.Route.Model, Slots: 1}
+			enclosed := plan.Unsigned()
+			if family == runtimepkg.SessionPlanCredentialDigestJWSType {
+				enclosed, err = plan.CredentialDigestBoundUnsigned()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			envelope := protocol.SessionPlanEnvelope{Issuer: "https://control.speko.test", Audience: []string{"speko-runtime"}, IssuedAt: now.Add(-time.Second), ExpiresAt: plan.ExpiresAt, ID: "capacity-" + family, Plan: enclosed}
+			signed := resignPlanWithType(t, private, "capacity-key", family, envelope, plan)
+			verifier := newVerifier(t, peer.URL, now)
+			if err := verifier.Verify(context.Background(), signed); err != nil {
+				t.Fatal(err)
+			}
+			altered := signed
+			capacity := *signed.Capacity
+			capacity.Account = "account/other"
+			altered.Capacity = &capacity
+			if err := verifier.Verify(context.Background(), altered); !errors.Is(err, runtimepkg.ErrPlanSignature) {
+				t.Fatal("unsigned account changed verified occupancy")
+			}
+		})
+	}
+}

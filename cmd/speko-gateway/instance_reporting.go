@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/SpekoAI/gateway/controlplane"
+	"github.com/SpekoAI/gateway/protocol"
 )
 
 var errInstanceSequenceExhausted = errors.New("runtime instance sequence exhausted")
@@ -25,7 +26,7 @@ type instanceReporter struct {
 	incarnation string
 	startedAt   time.Time
 	sequence    uint32
-	pending     *controlplane.InstanceHeartbeatV2
+	pending     *controlplane.InstanceHeartbeatV3
 	terminal    *controlplane.InstanceLifetimeV2
 }
 
@@ -65,7 +66,13 @@ func (r *instanceReporter) report(ctx context.Context, heartbeat controlplane.In
 		}
 		heartbeat.Labels = labels
 	}
-	r.pending = &controlplane.InstanceHeartbeatV2{InstanceHeartbeat: heartbeat, IncarnationID: r.incarnation, Sequence: r.sequence}
+	capacity := protocol.CapacitySnapshot{Accounts: []protocol.CapacityOccupancy{}, UnknownActive: heartbeat.ActiveSessions, UnknownPending: int64(heartbeat.PendingSessions)}
+	capacity.Complete = capacity.UnknownActive == 0 && capacity.UnknownPending == 0
+	if heartbeat.Capacity != nil {
+		capacity = *heartbeat.Capacity
+		capacity.Accounts = append([]protocol.CapacityOccupancy{}, capacity.Accounts...)
+	}
+	r.pending = &controlplane.InstanceHeartbeatV3{InstanceHeartbeatV2: controlplane.InstanceHeartbeatV2{InstanceHeartbeat: heartbeat, IncarnationID: r.incarnation, Sequence: r.sequence}, Capacity: capacity}
 	err := r.sendPending(ctx)
 	// A lost final PUT acknowledgement must not keep the process retrying
 	// forever. Always drain, retaining the final sequence for DELETE. Return
@@ -77,7 +84,7 @@ func (r *instanceReporter) report(ctx context.Context, heartbeat controlplane.In
 }
 
 func (r *instanceReporter) sendPending(ctx context.Context) error {
-	if err := retryInstanceRequest(ctx, func() error { return r.client.ReportInstanceV2(ctx, r.instanceID, *r.pending) }); err != nil {
+	if err := retryInstanceRequest(ctx, func() error { return r.client.ReportInstanceV3(ctx, r.instanceID, *r.pending) }); err != nil {
 		return err
 	}
 	r.pending = nil
@@ -94,7 +101,7 @@ func (r *instanceReporter) close(ctx context.Context) error {
 	}
 	// Preparing DELETE is terminal even if its acknowledgement is lost. No
 	// later PUT is allowed, and another close retries this identical identity.
-	return retryInstanceRequest(ctx, func() error { return r.client.DeregisterInstanceV2(ctx, r.instanceID, *r.terminal) })
+	return retryInstanceRequest(ctx, func() error { return r.client.DeregisterInstanceV3(ctx, r.instanceID, *r.terminal) })
 }
 
 // The caller's five-second context bounds both attempts together. The next

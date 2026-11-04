@@ -71,11 +71,18 @@ func (l Limits) validate() error {
 // OpenRequest supplies the operation-specific information omitted from a
 // signed SessionPlan because the plan is also used by local and remote APIs.
 type OpenRequest struct {
-	Kind     protocol.SessionKind
-	Plan     protocol.SessionPlan
-	Options  protocol.RequestOptions
-	Media    *protocol.MediaFormat
-	Delivery AudioDeliveryMode
+	// Called synchronously after verification and before provider I/O. Metrics
+	// consumers receive only the nonsecret, signed accounting projection.
+	OnVerifiedCapacity func(*protocol.CapacityAttribution, protocol.CredentialSource)
+	// TrackVerifiedCapacity acquires local physical capacity after verification,
+	// before provider I/O. Its release runs only after provider teardown returns
+	// and its event channel closes, independently of public session termination.
+	TrackVerifiedCapacity func(*protocol.CapacityAttribution, protocol.CredentialSource) (release func(), err error)
+	Kind                  protocol.SessionKind
+	Plan                  protocol.SessionPlan
+	Options               protocol.RequestOptions
+	Media                 *protocol.MediaFormat
+	Delivery              AudioDeliveryMode
 	// RefreshCredential is passed through to AdapterRequest unchanged.
 	RefreshCredential CredentialRefresher
 }
@@ -143,9 +150,10 @@ type ProviderStream interface {
 	Close(context.Context) error
 }
 
-// AbortingProviderStream is an optional fast-close capability used only after
-// a terminal runtime failure. Normal sessions always use ProviderStream.Close
-// so an upstream can flush final results first.
+// AbortingProviderStream is an optional fast-close capability used after the
+// runtime becomes terminal. Normal input draining uses ProviderStream.Close
+// first so an upstream can flush final results. Terminal cleanup then ensures
+// physical teardown completes before releasing tracked provider capacity.
 type AbortingProviderStream interface {
 	Abort(context.Context) error
 }

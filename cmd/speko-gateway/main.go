@@ -463,6 +463,17 @@ func run() error {
 		log.Printf("routing=speko local_byok_providers=%d optional_telemetry=%t", len(localCredentials), !telemetryDisabled)
 	}
 
+	startedAt := time.Now().UTC()
+	var reporter *instanceReporter
+	if hostedClient != nil {
+		reporter, err = newInstanceReporter(hostedClient, instanceID, startedAt)
+		if err != nil {
+			return err
+		}
+	}
+	if reporter != nil {
+		runtimeDescriptor.IncarnationID = reporter.incarnation
+	}
 	engine, err := runtimepkg.New(runtimepkg.Config{
 		Adapters: adapters, Verifier: verifier, LocalCredentials: localCredentials, Telemetry: telemetryExporter,
 	})
@@ -505,14 +516,6 @@ func run() error {
 	}()
 	processCtx, cancelProcess := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancelProcess()
-	startedAt := time.Now().UTC()
-	var reporter *instanceReporter
-	if hostedClient != nil {
-		reporter, err = newInstanceReporter(hostedClient, instanceID, startedAt)
-		if err != nil {
-			return err
-		}
-	}
 	heartbeat := func() controlplane.InstanceHeartbeat {
 		return instanceHeartbeat(server.Stats(), telemetryExporter.Stats().Dropped, runtimeDescriptor, workload, startedAt)
 	}
@@ -535,7 +538,7 @@ func instanceHeartbeat(stats gateway.Stats, telemetryDropped uint64, descriptor 
 		RuntimeName: descriptor.Name, RuntimeVersion: descriptor.Version, StartedAt: startedAt,
 		ActiveSessions: stats.ActiveSessions, PendingSessions: stats.PendingSessions,
 		SessionCapacity: stats.SessionCapacity, SessionsTotal: stats.SessionsTotal,
-		TelemetryDropped: telemetryDropped, Draining: stats.Draining,
+		TelemetryDropped: telemetryDropped, Draining: stats.Draining, Capacity: &stats.Capacity,
 	}
 	if workload != nil {
 		heartbeat.WorkloadType = workload.Type
