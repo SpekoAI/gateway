@@ -43,6 +43,209 @@ def assert_marker(headers) -> None:
     assert headers.getall("User-Agent") == [f"speko-gateway/{version('speko-gateway')}"]
 
 
+@asynccontextmanager
+async def gateway_stt_peer(payloads, *, after_eos=False):
+    async def create(request):
+        await request.json()
+        return web.json_response({"stream_url": "/v1/sessions/fixture/stream"}, status=201)
+
+    async def websocket(request):
+        ws = web.WebSocketResponse(protocols=["speko.voice.v0.r3"])
+        await ws.prepare(request)
+        index = 0
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                final, ended = ("transcript.final", payloads(index)), ("speech.ended", {})
+                for kind, data in [("speech.started", {}), *( [ended, final] if after_eos else [final, ended])]:
+                    await ws.send_json({"type": kind, "data": data})
+                index += 1
+            elif message.type is aiohttp.WSMsgType.TEXT and message.json()["type"] == "session.close":
+                await ws.close()
+        return ws
+
+    app = web.Application()
+    app.router.add_post("/v1/sessions", create)
+    app.router.add_get("/v1/sessions/fixture/stream", websocket)
+    async with server(app, unix=True) as address:
+        yield address
+
+
+@pytest.mark.parametrize("shape", ["terminal", "middle", "whole"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("after_eos", [False, True])
+async def test_gateway_background_suppression_keeps_filtered_canonical_turns(shape, nested, manual, after_eos):
+    from livekit import rtc
+    from livekit.agents import Agent, AgentSession, stt
+    from livekit.agents.voice import io
+
+    from speko_gateway.livekit import STT
+
+    turns, items, frames, finals = asyncio.Queue(), asyncio.Queue(), asyncio.Queue(), []
+    first, release = asyncio.Event(), asyncio.Event()
+
+    class Input(io.AudioInput):
+        def __init__(self):
+            super().__init__(label="owned-filtered-input")
+
+        async def __anext__(self):
+            value = await frames.get()
+            if value is None:
+                raise StopAsyncIteration
+            return value
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async for event in Agent.default.stt_node(self, audio, settings):
+                event = dataclasses.replace(event, alternatives=[dataclasses.replace(data) for data in event.alternatives])
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    finals.extend(data.text for data in event.alternatives if data.text)
+                yield event
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT and event.alternatives[0].text and not first.is_set():
+                    first.set()
+                    if manual and shape != "whole":
+                        await release.wait()
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    def payload(index):
+        offset = 1000 * index
+        if shape == "whole":
+            text = ["甲", "乙", "丙"][index]
+            parts = [(text, 3 if index == 1 else 2, 0, 900)]
+        else:
+            text = "你好" if shape == "terminal" else "你好吗"
+            parts = [("你", 2, 0, 300), ("好", 3, 300, 600)]
+            if shape == "middle":
+                parts.append(("吗", 2, 600, 900))
+        return {"text": text, "segments": [{"text": word, "speaker": speaker, "start_ms": start + offset, "end_ms": end + offset} for word, speaker, start, end in parts]}
+
+    async with gateway_stt_peer(payload, after_eos=after_eos) as address:
+        client = GatewayClient(socket_path=address, local_auth_token="owned-filtered-canonical")
+        model = STT(client, diarization=True)
+        speaker = stt.MultiSpeakerAdapter(stt=model, suppress_background_speaker=True)
+        wrapped = stt.FallbackAdapter([speaker], max_retry_per_stt=0) if nested else speaker
+        session = AgentSession(stt=wrapped, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        session.input.audio = Input()
+        session.on("conversation_item_added", lambda event: items.put_nowait(event.item.text_content) if getattr(event.item, "role", None) == "user" else None)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned filtered canonical turns"), **options)
+            for index in range(3 if shape == "whole" else 2):
+                loud, quiet = b"\xff\x3f", b"\x20\x00"
+                pcm = (quiet if index == 1 else loud) * 16000 if shape == "whole" else loud * 4800 + quiet * 4800 + loud * 6400
+                await frames.put(rtc.AudioFrame(data=pcm, sample_rate=16000, num_channels=1, samples_per_channel=16000))
+                if manual and shape != "whole" and index == 0:
+                    await asyncio.wait_for(first.wait(), 3)
+                    session.commit_user_turn(transcript_timeout=0, skip_reply=True)
+                    await asyncio.sleep(0.05)
+                    assert turns.empty() and items.empty()
+                    release.set()
+                if shape == "whole" and index == 1:
+                    continue
+                expected = ["甲", "乙", "丙"][index] if shape == "whole" else "你" if shape == "terminal" else "你吗"
+                assert await asyncio.wait_for((items if manual and shape != "whole" and index == 0 else turns).get(), 3) == expected
+            assert "好" not in finals and "乙" not in finals
+        finally:
+            release.set()
+            await frames.put(None)
+            await session.aclose()
+            await wrapped.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_gateway_partial_final_does_not_gate_a_replacement_stt(nested):
+    from livekit import rtc
+    from livekit.agents import DEFAULT_API_CONNECT_OPTIONS, Agent, AgentSession, stt
+    from livekit.agents.voice import io
+
+    from speko_gateway.livekit import STT
+
+    if not hasattr(Agent, "update_options"):
+        pytest.skip("SDK predates live model option updates")
+    frames, turns = asyncio.Queue(), asyncio.Queue()
+    first, release, started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class Input(io.AudioInput):
+        def __init__(self):
+            super().__init__(label="owned-replacement-input")
+
+        async def __anext__(self):
+            value = await frames.get()
+            if value is None:
+                raise StopAsyncIteration
+            return value
+
+    class Replacement(stt.STT):
+        def __init__(self):
+            super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=False))
+
+        async def _recognize_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def stream(self, *, language=None, conn_options=DEFAULT_API_CONNECT_OPTIONS):
+            return ReplacementStream(stt=self, conn_options=conn_options)
+
+    class ReplacementStream(stt.RecognizeStream):
+        async def _run(self):
+            started.set()
+            sent = False
+            async for value in self._input_ch:
+                if isinstance(value, rtc.AudioFrame) and not sent:
+                    sent = True
+                    for kind in [stt.SpeechEventType.START_OF_SPEECH, stt.SpeechEventType.FINAL_TRANSCRIPT, stt.SpeechEventType.END_OF_SPEECH]:
+                        self._event_ch.send_nowait(stt.SpeechEvent(type=kind, alternatives=[stt.SpeechData(language="en", text="replacement" if kind is stt.SpeechEventType.FINAL_TRANSCRIPT else "")]))
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async for event in Agent.default.stt_node(self, audio, settings):
+                yield event
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT and getattr(event.alternatives[0], "canonical_text", None) == "":
+                    first.set()
+                    await release.wait()
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    payload = {"text": "你好", "segments": [{"text": "你", "speaker": 2, "start_ms": 0, "end_ms": 400}, {"text": "好", "speaker": 3, "start_ms": 400, "end_ms": 800}]}
+    async with gateway_stt_peer(lambda _: payload) as address:
+        client = GatewayClient(socket_path=address, local_auth_token="owned-replacement-canonical")
+        model, replacement = STT(client, diarization=True), Replacement()
+        wrapped = stt.FallbackAdapter([stt.MultiSpeakerAdapter(stt=model)], max_retry_per_stt=0) if nested else model
+        agent = OwnedAgent(instructions="Owned local recognition replacement")
+        session = AgentSession(stt=wrapped, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        session.input.audio = Input()
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=agent, **options)
+            await frames.put(rtc.AudioFrame(data=b"\xff\x0f" * 16000, sample_rate=16000, num_channels=1, samples_per_channel=16000))
+            await asyncio.wait_for(first.wait(), 3)
+            binding = session._activity._speko_local_transcript_binding
+            async def pending():
+                while not binding.pending:
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(pending(), 3)
+            original_turn = binding.turn[0]
+            agent.update_options(stt=replacement)
+            await asyncio.wait_for(started.wait(), 3)
+            expected = f"{session._activity._audio_recognition._audio_transcript} replacement".lstrip()
+            await frames.put(rtc.AudioFrame(data=b"\xff\x0f" * 320, sample_rate=16000, num_channels=1, samples_per_channel=320))
+            assert await asyncio.wait_for(turns.get(), 3) == expected
+            assert binding.processing is None and binding.turn is None
+            assert session._activity.on_end_of_turn == original_turn
+        finally:
+            release.set()
+            await frames.put(None)
+            await session.aclose()
+            await wrapped.aclose()
+            await model.aclose()
+            await replacement.aclose()
+            await client.aclose()
+
+
 async def test_router_native_sse_preserves_headers_body_and_streaming() -> None:
     seen = []
     first_consumed = asyncio.Event()

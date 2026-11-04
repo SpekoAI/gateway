@@ -84,6 +84,13 @@ wrappers and manual commits partway through a final. Deliberate local wrapper
 formatting is preserved. Ambiguous spans stay unattributed even when a whole
 final has a different speaker label. Live swaps between native and Gateway STT
 restore the preceding owner's hooks before installing the new binding.
+Local background-speaker suppression keeps the SDK's empty-final signal and
+its scalar group association, so a filtered terminal segment still finishes
+the group. Canonical turns include only the surviving parts; filtered speech
+is not restored from the full provider text. Entirely filtered groups do not
+poison later turns. Finals arriving after provider end-of-speech retain that
+boundary, and replacing Gateway STT with another SDK model retires its pending
+gate without requiring the old model to close.
 Speaker RMS lookup uses accepted audio positions, including after custom-node
 filtering; emitted transcript timestamps keep their original input positions.
 Multi-model fallback requires a control-plane recovery decision; wrappers
