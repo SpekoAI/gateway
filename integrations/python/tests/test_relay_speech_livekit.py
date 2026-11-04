@@ -127,6 +127,14 @@ class OwnedAudioInput(io.AudioInput):
         return value
 
 
+def wrap_native_stt(model, wrapper):
+    if wrapper in ("multi_speaker", "nested"):
+        model = stt.MultiSpeakerAdapter(stt=model)
+    if wrapper in ("fallback", "nested"):
+        model = stt.FallbackAdapter([model], max_retry_per_stt=3, retry_interval=0)
+    return model
+
+
 @pytest.mark.parametrize(
     "gap,speech_duration,terminal_delay",
     [(0.35, 0.02, 0.35), (0.224, 0.064, 0.35), (1.0, 0.064, 1.0)],
@@ -286,8 +294,9 @@ async def test_actual_agent_session_commits_complete_native_turns_after_delayed_
     not hasattr(recognition, "_STTPipeline"),
     reason="This SDK release predates AgentSession's outer STT recovery pump",
 )
+@pytest.mark.parametrize("wrapper", ["direct", "multi_speaker", "fallback", "nested"])
 async def test_actual_agent_stt_recovery_pump_cannot_readmit_a_failed_native_request(
-    monkeypatch,
+    monkeypatch, wrapper,
 ):
     monkeypatch.setattr(recognition, "_STT_RECONNECT_INTERVAL", 0)
     seen = []
@@ -317,12 +326,14 @@ async def test_actual_agent_stt_recovery_pump_cannot_readmit_a_failed_native_req
             model="fixture-model",
             credential_source="managed",
             turn_vad=source,
+            diarization=wrapper in ("multi_speaker", "nested"),
         )
+        recognition_model = wrap_native_stt(model, wrapper)
         agent = Agent(instructions="Owned recovery fixture")
         model.bind_agent(agent)
         events = rtc.EventEmitter()
         agent._activity = SimpleNamespace(
-            stt=model,
+            stt=recognition_model,
             vad=None,
             _audio_recognition=None,
             # Isolate the real SDK recovery pump; no successful framework turn
@@ -364,6 +375,8 @@ async def test_actual_agent_stt_recovery_pump_cannot_readmit_a_failed_native_req
         finally:
             await producer
             await pipeline.aclose()
+            if recognition_model is not model:
+                await recognition_model.aclose()
             await model.aclose()
             await client.aclose()
 
@@ -1122,8 +1135,9 @@ async def test_native_framework_stream_requires_a_binding_to_a_running_session()
 
 @pytest.mark.parametrize("transition", ["skip_reply", "handoff"])
 @pytest.mark.parametrize("binding", ["agent", "session"])
+@pytest.mark.parametrize("wrapper", ["direct", "multi_speaker", "fallback", "nested"])
 async def test_actual_native_agent_session_keeps_turn_authority_across_commits_and_handoffs(
-    transition, binding,
+    transition, binding, wrapper,
 ):
     source = ControlledVAD()
     seen = []
@@ -1157,9 +1171,11 @@ async def test_actual_native_agent_session_keeps_turn_authority_across_commits_a
             model="fixture-model",
             credential_source="managed",
             turn_vad=source,
+            diarization=wrapper in ("multi_speaker", "nested"),
         )
+        recognition_model = wrap_native_stt(model, wrapper)
         session = AgentSession(
-            stt=model,
+            stt=recognition_model,
             llm=None,
             tts=None,
             vad=None,
@@ -1260,6 +1276,8 @@ async def test_actual_native_agent_session_keeps_turn_authority_across_commits_a
         finally:
             await audio.frames.put(None)
             await session.aclose()
+            if recognition_model is not model:
+                await recognition_model.aclose()
             await model.aclose()
             await client.aclose()
 
@@ -1362,7 +1380,8 @@ async def test_native_final_during_detached_handoff_binds_the_consuming_activity
             await client.aclose()
 
 
-async def test_native_model_handoffs_keep_only_the_active_recognition_owner_bound():
+@pytest.mark.parametrize("wrapper", ["direct", "nested"])
+async def test_native_model_handoffs_keep_only_the_active_recognition_owner_bound(wrapper):
     sources = [ControlledVAD(), ControlledVAD()]
     seen, turns = [], asyncio.Queue()
 
@@ -1392,7 +1411,8 @@ async def test_native_model_handoffs_keep_only_the_active_recognition_owner_boun
 
     async with peer(handle) as origin:
         client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
-        models = [STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source) for source in sources]
+        models = [STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source, diarization=wrapper == "nested") for source in sources]
+        recognition_models = [wrap_native_stt(model, wrapper) for model in models]
         session = AgentSession(llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0.05, max_endpointing_delay=0.05)
         audio = OwnedAudioInput()
         session.input.audio = audio
@@ -1409,11 +1429,11 @@ async def test_native_model_handoffs_keep_only_the_active_recognition_owner_boun
             model.bind_session(session)
         try:
             options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
-            await session.start(agent=OwnedAgent(instructions="Owned first model", stt=models[0]), **options)
+            await session.start(agent=OwnedAgent(instructions="Owned first model", stt=recognition_models[0]), **options)
             await asyncio.wait_for(entered.get(), 3)
             for index, owner in enumerate([0, 1, 0], start=1):
                 if index > 1:
-                    session.update_agent(OwnedAgent(instructions="Owned model handoff", stt=models[owner]))
+                    session.update_agent(OwnedAgent(instructions="Owned model handoff", stt=recognition_models[owner]))
                     await asyncio.wait_for(entered.get(), 3)
                 source = sources[owner]
                 for value in (frame(), rtc.AudioFrame(data=b"\0\0" * 8800, sample_rate=16000, num_channels=1, samples_per_channel=8800)):
@@ -1428,8 +1448,49 @@ async def test_native_model_handoffs_keep_only_the_active_recognition_owner_boun
         finally:
             await audio.frames.put(None)
             await session.aclose()
+            for recognition_model, model in zip(recognition_models, models):
+                if recognition_model is not model:
+                    await recognition_model.aclose()
             for model in models:
                 await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("wrapper", ["multiple_models", "rewritten", "suppressed", "foreign_model"])
+async def test_native_wrapper_refuses_unsupported_authority_before_admission(wrapper):
+    calls = []
+
+    async def handle(request):
+        calls.append(request.path)
+        return web.Response(status=500)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=ControlledVAD(), diarization=True)
+        other = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=ControlledVAD())
+        if wrapper == "multiple_models":
+            recognition_model = stt.FallbackAdapter([model, other], max_retry_per_stt=0, retry_interval=0)
+            message = "control-plane recovery"
+        elif wrapper == "foreign_model":
+            recognition_model = other
+            message = "active recognition model"
+        else:
+            recognition_model = stt.MultiSpeakerAdapter(stt=model, primary_format="speaker: {text}" if wrapper == "rewritten" else "{text}", suppress_background_speaker=wrapper == "suppressed")
+            message = "transcript-preserving"
+        session = AgentSession(stt=recognition_model, llm=None, tts=None, vad=None, turn_detection="stt")
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=Agent(instructions="Owned unsupported wrapper fixture"), **options)
+            with pytest.raises(ValueError, match=message):
+                model.stream()
+            assert calls == []
+            assert not model._native_failed
+        finally:
+            await session.aclose()
+            await recognition_model.aclose()
+            await model.aclose()
+            await other.aclose()
             await client.aclose()
 
 
