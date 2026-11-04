@@ -182,6 +182,7 @@ class STT(stt.STT):
         self._bound_session: AgentSession | None = None
         self._turn_binding: tuple[Any, Any, Any] | None = None
         self._turn_listener: Any = None
+        self._native_wrappers: dict[int, tuple[Any, Any, Any]] = {}
 
     def bind_agent(self, agent: Agent) -> None:
         """Locate the owned session through its initial Agent at stream start.
@@ -210,7 +211,61 @@ class STT(stt.STT):
                 activity.on_end_of_turn = original
             self._turn_binding = None
 
-    def _bind_native_activity(self) -> None:
+    def _owns_native_recognition(self, candidate: Any) -> bool:
+        """Resolve SDK wrappers without granting automatic model failover."""
+        visited: set[int] = set()
+
+        def owns(model: Any) -> bool:
+            if model is self:
+                return True
+            if id(model) in visited:
+                return False
+            visited.add(id(model))
+            if isinstance(model, stt.MultiSpeakerAdapter):
+                # Older supported SDKs expose only _stt; newer ones also
+                # provide wrapped_stt. The adapter forwards this same stream.
+                if not owns(getattr(model, "wrapped_stt", model._stt)):
+                    return False
+                if (
+                    model._suppress_background
+                    or model._primary_format != "{text}"
+                    or model._background_format != "{text}"
+                ):
+                    raise ValueError(
+                        "Native STT turn ownership requires a transcript-preserving MultiSpeakerAdapter"
+                    )
+                self._fence_native_wrapper(model)
+                return True
+            if isinstance(model, stt.FallbackAdapter):
+                models = model._stt_instances
+                if not any(owns(child) for child in models):
+                    return False
+                if len(models) != 1:
+                    raise ValueError(
+                        "Native STT model fallback requires a control-plane recovery decision"
+                    )
+                self._fence_native_wrapper(model)
+                return True
+            return False
+
+        return owns(candidate)
+
+    def _fence_native_wrapper(self, wrapper: Any) -> None:
+        if id(wrapper) in self._native_wrappers:
+            return
+        original = wrapper.stream
+
+        def stream(*args: Any, **kwargs: Any) -> Any:
+            # Some wrappers construct their child asynchronously. Fence the
+            # wrapper's synchronous entry too, so nested fallback recovery
+            # cannot hide an ambiguous native outcome in an SDK retry loop.
+            self._check_native_admission()
+            return original(*args, **kwargs)
+
+        wrapper.stream = stream
+        self._native_wrappers[id(wrapper)] = (wrapper, original, stream)
+
+    def _bind_native_activity(self, *, require_owner: bool = False) -> None:
         if self._bound_session is None:
             try:
                 assert self._bound_agent is not None
@@ -227,11 +282,15 @@ class STT(stt.STT):
             raise ValueError(
                 "Native STT streaming requires a running AgentSession"
             )
-        if activity.stt is not self:
+        if not self._owns_native_recognition(activity.stt):
             # Another native model may be bound to this same session for a
             # later Agent. Only the active recognition owner can wrap its
             # turn callback; passive listeners must never wrap each other.
             self._restore_turn_binding()
+            if require_owner:
+                raise ValueError(
+                    "Native STT requires the active recognition model or a supported wrapper"
+                )
             return
         if self._turn_listener is None:
             # A retained pipeline can publish while its SDK consumer is
@@ -382,10 +441,10 @@ class STT(stt.STT):
             def prepare_native_turn() -> None:
                 self._check_native_admission()
                 if not recognize and not manual_turns:
-                    self._bind_native_activity()
+                    self._bind_native_activity(require_owner=True)
 
             if not recognize and not manual_turns:
-                self._bind_native_activity()
+                self._bind_native_activity(require_owner=True)
             stream = NativeSpeechStream(
                 stt_instance=self,
                 bridge=bridge,
@@ -429,6 +488,10 @@ class STT(stt.STT):
             await stream.aclose()
         self._streams.clear()
         self._restore_turn_binding()
+        for wrapper, original, stream in self._native_wrappers.values():
+            if wrapper.stream is stream:
+                wrapper.stream = original
+        self._native_wrappers.clear()
         self._bound_agent = None
         self._bound_session = None
         if self._owns_client:

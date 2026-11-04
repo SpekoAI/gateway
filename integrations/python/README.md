@@ -47,6 +47,11 @@ admission, and stalled processing has a bounded input backlog.
 
 The LiveKit stream stays open across turns. Each VAD turn uses a separate
 native request, streaming audio and interim text while speech continues.
+Turn ownership follows transcript-preserving `stt.MultiSpeakerAdapter` and
+single-model `stt.FallbackAdapter` wrappers, including nested wrappers. An
+ambiguous native failure fences their later stream and recovery calls too.
+Multi-model fallback requires a control-plane recovery decision; wrappers
+that rewrite or suppress transcripts are refused before native admission.
 At speech end the request commits and closes; final transcript segments and
 `END_OF_SPEECH` are emitted only after terminal usage arrives. A final segment
 alone cannot complete a turn. `bind_session(session)` observes that session's
