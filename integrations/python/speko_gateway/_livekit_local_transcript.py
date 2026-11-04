@@ -217,6 +217,7 @@ class _Binding:
         self.startup: tuple[Any, Any] | None = None
         self.processing: tuple[Any, str, Any, Any] | None = None
         self.vad_processing: tuple[Any, Any, Any] | None = None
+        self.clear_processing: tuple[Any, str, Any, Any] | None = None
         self.turn: tuple[Any, Any] | None = None
         self.prefix: str | None = None
         self.rewritten = False
@@ -379,6 +380,18 @@ class _Binding:
 
         recognition._on_vad_event = observed_vad
         self.vad_processing = recognition, original_vad, observed_vad
+        clear_method = "_clear_user_turn" if hasattr(recognition, "_clear_user_turn") else "clear_user_turn"
+        original_clear = getattr(recognition, clear_method)
+
+        @wraps(original_clear)
+        def cleared(*args: Any, **kwargs: Any) -> Any:
+            self.prefix, self.pending, self.deferred = None, False, None
+            self.group = None
+            self.parts.clear()
+            return original_clear(*args, **kwargs)
+
+        setattr(recognition, clear_method, cleared)
+        self.clear_processing = recognition, clear_method, original_clear, cleared
         if self.turn is None:
             original_turn = self.activity.on_end_of_turn
 
@@ -401,6 +414,11 @@ class _Binding:
             self.turn = original_turn, completed
 
     def _restore_processing(self) -> None:
+        if self.clear_processing is not None:
+            recognition, method, original, observed = self.clear_processing
+            if getattr(recognition, method) is observed:
+                setattr(recognition, method, original)
+            self.clear_processing = None
         if self.vad_processing is not None:
             recognition, original, observed = self.vad_processing
             if recognition._on_vad_event is observed:

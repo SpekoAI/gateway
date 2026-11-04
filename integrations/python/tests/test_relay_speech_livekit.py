@@ -317,6 +317,9 @@ async def test_draining_framework_vad_keeps_real_minimums_and_event_audio(engine
         assert ended[0].silence_duration >= 0.02
         assert b"".join(bytes(frame.data) for frame in ended[0].frames) in actual
         assert events[-1].timestamp == pytest.approx(len(actual) / 2 / 16000)
+        rate = 8000 if engine == "silero8" else 16000
+        for event in events:
+            assert event.samples_index == round(event.timestamp * rate)
     finally:
         await stream.aclose()
         await asyncio.gather(collector, return_exceptions=True)
@@ -348,7 +351,8 @@ async def test_draining_framework_vad_streams_keep_independent_audio_and_cleanup
         assert stream._inner._task.done() and stream._inner._metrics_task.done()
 
 
-async def test_draining_framework_vad_end_input_keeps_audio_behind_inflight_padding():
+@pytest.mark.parametrize("finish", [False, True])
+async def test_draining_framework_vad_end_input_keeps_audio_behind_inflight_padding(finish):
     detector = owned_probability_vad("inference", min_speech_duration=0.02)
     started, ended, release = asyncio.Event(), asyncio.Event(), threading.Event()
     loop, original = asyncio.get_running_loop(), detector.stream
@@ -385,28 +389,47 @@ async def test_draining_framework_vad_end_input_keeps_audio_behind_inflight_padd
         stream.push_frame(rtc.AudioFrame(data=quiet, sample_rate=16000, num_channels=1, samples_per_channel=320))
         await asyncio.wait_for(started.wait(), 3)
         stream.push_frame(rtc.AudioFrame(data=voice, sample_rate=16000, num_channels=1, samples_per_channel=320))
-        stream.end_input()
-        await asyncio.wait_for(ended.wait(), 3)
+        if finish:
+            stream.end_input()
+            await asyncio.wait_for(ended.wait(), 3)
+        else:
+            # The later real frontier's idle deadline expires while the first
+            # padding window is still in inference. No further input follows.
+            await asyncio.sleep(0.15)
         release.set()
 
         async def collect():
-            return [event async for event in stream]
+            events, processed = [], 0
+            async for event in stream:
+                events.append(event)
+                if event.type is vad.VADEventType.INFERENCE_DONE:
+                    processed += sum(len(bytes(frame.data)) for frame in event.frames)
+                if not finish and processed == len(quiet + voice):
+                    break
+            return events
 
         events = await asyncio.wait_for(collect(), 3)
         assert b"".join(bytes(frame.data) for event in events if event.type is vad.VADEventType.INFERENCE_DONE for frame in event.frames) == quiet + voice
-        assert sum(event.type is vad.VADEventType.START_OF_SPEECH for event in events) == 1
+        if finish:
+            assert sum(event.type is vad.VADEventType.START_OF_SPEECH for event in events) == 1
     finally:
         release.set()
         await stream.aclose()
 
 
 @pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
-async def test_draining_framework_vad_flush_is_a_real_hard_boundary(engine):
+@pytest.mark.parametrize("queued", [False, True])
+async def test_draining_framework_vad_flush_is_a_real_hard_boundary(engine, queued):
     detector = DrainingVAD(owned_probability_vad(engine, min_speech_duration=0.02, prefix_padding_duration=0, _any_voice=True))
     stream = detector.stream()
-    first, second = b"\xff\x0f" * 160, b"\xff\x0f" * 320
+    first, second = b"\xff\x0f" * (1024 if queued else 160), b"\xff\x0f" * 320
     try:
-        stream.push_frame(rtc.AudioFrame(data=first, sample_rate=16000, num_channels=1, samples_per_channel=160))
+        stream.push_frame(rtc.AudioFrame(data=first, sample_rate=16000, num_channels=1, samples_per_channel=len(first) // 2))
+        if queued:
+            async def processed():
+                while getattr(stream, "_processed", 0) < len(first) // 2:
+                    await asyncio.sleep(0.005)
+            await asyncio.wait_for(processed(), 3)
         stream.flush()
         stream.push_frame(rtc.AudioFrame(data=second, sample_rate=16000, num_channels=1, samples_per_channel=320))
         stream.end_input()
@@ -416,7 +439,7 @@ async def test_draining_framework_vad_flush_is_a_real_hard_boundary(engine):
 
         events = await asyncio.wait_for(collect(), 3)
         actual = b"".join(bytes(frame.data) for event in events if event.type is vad.VADEventType.INFERENCE_DONE for frame in event.frames)
-        assert actual == first + second
+        assert actual == second, "flush fences all outstanding activity of the old segment"
         starts = [event for event in events if event.type is vad.VADEventType.START_OF_SPEECH]
         assert len(starts) == 1
         assert b"".join(bytes(frame.data) for frame in starts[0].frames) == second
@@ -424,6 +447,151 @@ async def test_draining_framework_vad_flush_is_a_real_hard_boundary(engine):
         assert starts[0].timestamp == pytest.approx(0.02)
     finally:
         await stream.aclose()
+
+
+@pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
+async def test_draining_framework_vad_buffered_silence_has_no_packet_duration_delay(engine):
+    stream = DrainingVAD(owned_probability_vad(engine, min_silence_duration=0.25)).stream()
+    events = asyncio.Queue()
+
+    async def collect():
+        async for event in stream:
+            events.put_nowait(event)
+
+    async def boundary(kind):
+        while True:
+            event = await events.get()
+            if event.type is kind:
+                return event
+
+    collector = asyncio.create_task(collect())
+    try:
+        stream.push_frame(rtc.AudioFrame(data=b"\xff\x0f" * 2048, sample_rate=16000, num_channels=1, samples_per_channel=2048))
+        await asyncio.wait_for(boundary(vad.VADEventType.START_OF_SPEECH), 3)
+        stream.push_frame(rtc.AudioFrame(data=b"\0\0" * 4000, sample_rate=16000, num_channels=1, samples_per_channel=4000))
+        ended = await asyncio.wait_for(boundary(vad.VADEventType.END_OF_SPEECH), 0.22)
+        assert ended.silence_duration >= 0.25
+    finally:
+        await stream.aclose()
+        await asyncio.gather(collector, return_exceptions=True)
+
+
+@pytest.mark.parametrize("mode", ["vad", "stt_flush"])
+async def test_draining_framework_vad_preserves_actual_response_interruption(mode):
+    if "capabilities" not in inspect.signature(io.AudioOutput).parameters:
+        pytest.skip("SDK predates the current audio output contract")
+    started, blocked, release = asyncio.Event(), asyncio.Event(), threading.Event()
+    hold, streams = asyncio.Event(), []
+    source = owned_probability_vad("inference", min_speech_duration=0.02, min_silence_duration=0.25, _any_voice=True)
+    original, loop = source.stream, asyncio.get_running_loop()
+
+    def owned_stream():
+        inner, count = original(), 0
+        predictor = inner._native_vad
+
+        class Predictor:
+            def predict(self, window):
+                nonlocal count
+                count += 1
+                if mode == "stt_flush" and count == 16:
+                    loop.call_soon_threadsafe(blocked.set)
+                    if not release.wait(3):
+                        raise RuntimeError("owned inference release timed out")
+                return predictor.predict(window)
+
+            def reset(self):
+                predictor.reset()
+
+        inner._native_vad = Predictor()
+        return inner
+
+    source.stream = owned_stream
+    detector = DrainingVAD(source)
+    original_stream = detector.stream
+
+    def framework_stream():
+        stream = original_stream()
+        streams.append(stream)
+        return stream
+
+    detector.stream = framework_stream
+
+    class LocalSTT(stt.STT):
+        def __init__(self):
+            super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=False))
+            self.started = asyncio.Queue()
+
+        async def _recognize_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def stream(self, *, language=None, conn_options=DEFAULT_API_CONNECT_OPTIONS):
+            return LocalStream(stt=self, conn_options=conn_options)
+
+    class LocalStream(stt.RecognizeStream):
+        async def _run(self):
+            self._stt.started.put_nowait(self)
+            async for _ in self._input_ch:
+                pass
+
+    class Output(io.AudioOutput):
+        def __init__(self):
+            super().__init__(label="owned-response", capabilities=io.AudioOutputCapabilities(pause=False))
+
+        async def capture_frame(self, frame):
+            await super().capture_frame(frame)
+            started.set()
+
+        def flush(self):
+            super().flush()
+            self.on_playback_finished(playback_position=0.02, interrupted=False)
+
+        def clear_buffer(self):
+            self.on_playback_finished(playback_position=0.02, interrupted=True)
+
+    def frame(raw):
+        return rtc.AudioFrame(data=raw, sample_rate=16000, num_channels=1, samples_per_channel=len(raw) // 2)
+
+    async def response():
+        yield frame(b"\0\0" * 320)
+        await hold.wait()
+
+    async def until(predicate):
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+    local, audio = LocalSTT(), OwnedAudioInput()
+    session = AgentSession(stt=local, llm=None, tts=None, vad=detector, turn_detection="vad" if mode == "vad" else "stt", min_interruption_duration=0.5, resume_false_interruption=False)
+    session.input.audio, session.output.audio = audio, Output()
+    try:
+        options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+        await session.start(agent=Agent(instructions="Owned response interruption"), **options)
+        stt_stream = await asyncio.wait_for(local.started.get(), 3)
+        speech = session.say("Owned ongoing response", audio=response(), allow_interruptions=True)
+        await asyncio.wait_for(started.wait(), 3)
+        await audio.frames.put(frame(b"\xff\x0f" * 7680))  # 480 ms of captured speech
+        await asyncio.wait_for(until(lambda: streams and streams[0]._processed >= 7680), 3)
+        assert not speech.interrupted
+        if mode == "vad":
+            await audio.frames.put(frame(b"\0\0" * 4096))
+            await asyncio.wait_for(until(lambda: speech.interrupted), 2)
+        else:
+            await audio.frames.put(frame(b"\0\0" * 1024 + b"\xff\x0f" * 320))
+            await asyncio.wait_for(blocked.wait(), 3)
+            stt_stream._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH))
+            await asyncio.wait_for(until(lambda: streams[0]._flushes > 0), 3)
+            release.set()
+            await asyncio.wait_for(until(lambda: streams[0]._segment == streams[0]._flushes), 3)
+            await asyncio.sleep(0.1)
+            assert not speech.interrupted, "pre-EOS speech cannot interrupt the response after flush"
+            assert not session._activity._audio_recognition._speaking
+            await audio.frames.put(frame(b"\xff\x0f" * 9216))
+            await asyncio.wait_for(until(lambda: speech.interrupted), 2)
+    finally:
+        release.set()
+        hold.set()
+        await audio.frames.put(None)
+        await session.aclose()
+        await local.aclose()
 
 
 @pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
@@ -4031,7 +4199,7 @@ async def test_native_websocket_http_refusal_is_never_a_retryable_connection_fai
     assert seen == [1]
 
 
-@pytest.mark.parametrize("frontier", ["partial_silence", "pending_onset", "cleared_onset"])
+@pytest.mark.parametrize("frontier", ["partial_silence", "pending_onset", "cleared_onset", "stalled_onset"])
 @pytest.mark.parametrize("activation_threshold", [0.2, 0.8])
 @pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
 async def test_native_actual_inference_vad_handles_incomplete_frontiers(frontier, activation_threshold, engine):
@@ -4087,7 +4255,14 @@ async def test_native_actual_inference_vad_handles_incomplete_frontiers(frontier
             else:
                 await asyncio.sleep(0.35)
                 assert turns.empty(), "a possible onset before START_OF_SPEECH must keep the previous turn pending"
-                if frontier == "cleared_onset":
+                if frontier == "stalled_onset":
+                    async def failed():
+                        while not model._native_failed:
+                            await asyncio.sleep(0.01)
+                    await asyncio.wait_for(failed(), 2)
+                    assert turns.empty(), "an ambiguous paused onset cannot authorize a turn"
+                    assert len(packets) == 1, "recovery never retries provider admission"
+                elif frontier == "cleared_onset":
                     await audio.frames.put(audio_frame(silence))
                     assert await asyncio.wait_for(turns.get(), 2) == "first"
                     assert len(packets) == 1
@@ -4097,7 +4272,7 @@ async def test_native_actual_inference_vad_handles_incomplete_frontiers(frontier
                     assert len(packets) == 2
                     assert b"".join(packets[1]) == speech * 2 + silence
             assert b"".join(packets[0]) == first, "detector processing must not invent provider PCM"
-            assert not model._native_failed
+            assert model._native_failed is (frontier == "stalled_onset")
         finally:
             await audio.frames.put(None)
             await session.aclose()
