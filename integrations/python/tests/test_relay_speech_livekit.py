@@ -325,6 +325,7 @@ async def test_actual_agent_session_commits_complete_native_turns_after_delayed_
     pytest.param(False, False, id="fresh"),
     pytest.param(True, False, id="buffered"),
     pytest.param(False, True, id="replaced_input"),
+    pytest.param(False, "delegate", id="delegated_input"),
 ])
 @pytest.mark.parametrize("binding", ["session", "agent"])
 async def test_native_initial_node_timestamps_follow_the_sdk_input_epoch(wrapper, buffered, replace_input, binding):
@@ -381,8 +382,11 @@ async def test_native_initial_node_timestamps_follow_the_sdk_input_epoch(wrapper
             await asyncio.wait_for(waiting.wait(), 3)
             if replace_input:
                 await asyncio.sleep(0.35)
-                audio = OwnedAudioInput(track_delivery=True)
-                session.input.audio = audio
+                if replace_input == "delegate":
+                    session.input.audio = io.AudioInput(label="owned-delegated-input", source=session.input.audio)
+                else:
+                    audio = OwnedAudioInput(track_delivery=True)
+                    session.input.audio = audio
             if buffered:
                 await audio.frames.put(first_frame)
                 # Establish delivery before delaying the node: its startup
@@ -402,7 +406,7 @@ async def test_native_initial_node_timestamps_follow_the_sdk_input_epoch(wrapper
             assert await asyncio.wait_for(turns.get(), 3) == "complete"
             assert len(positions) == 2
             legacy = not hasattr(session._activity._audio_recognition, "_input_started_at")
-            end = 0.04 if replace_input and not legacy else 0.02
+            end = 0.04 if replace_input == "delegate" or replace_input and not legacy else 0.02
             await assert_source_times(session, audio, positions, [end, end])
             assert first_frame.userdata == {"producer": {"fixture": "original"}}
             assert bytes(first_frame.data) == original_data
@@ -2212,6 +2216,232 @@ async def test_native_source_observer_releases_its_owned_hooks_after_local_hando
         await model.aclose()
         await local.aclose()
         await client.aclose()
+
+
+async def test_later_native_owner_rebinds_the_running_source_after_local_handoff():
+    class LocalSTT(stt.STT):
+        def __init__(self):
+            super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=False))
+            self.started = asyncio.Event()
+
+        async def _recognize_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def stream(self, *, language=None, conn_options=DEFAULT_API_CONNECT_OPTIONS):
+            return LocalStream(stt=self, conn_options=conn_options)
+
+    class LocalStream(stt.RecognizeStream):
+        async def _run(self):
+            self._stt.started.set()
+            async for _ in self._input_ch:
+                pass
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "rebound"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    entered, turns = asyncio.Event(), asyncio.Queue()
+
+    class NextAgent(Agent):
+        async def on_enter(self):
+            entered.set()
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        sources, local = [ControlledVAD(), ControlledVAD()], LocalSTT()
+        models = [STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source) for source in sources]
+        session = AgentSession(stt=models[0], llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        models[0].bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=Agent(instructions="Owned first native source"), **options)
+            await audio.frames.put(frame())
+            await asyncio.wait_for(sources[0].frames.get(), 3)
+            session.update_agent(Agent(instructions="Owned temporary local source", stt=local))
+            await asyncio.wait_for(local.started.wait(), 3)
+            await models[0].aclose()
+            assert session.input.audio is audio
+            target = NextAgent(instructions="Owned rebound native source", stt=models[1])
+            models[1].bind_agent(target)
+            session.update_agent(target)
+            await asyncio.wait_for(entered.wait(), 3)
+            for samples, kind in [(320, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                value = rtc.AudioFrame(data=(b"\xff\x0f" if samples == 320 else b"\0\0") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples)
+                await audio.frames.put(value)
+                observed = await asyncio.wait_for(sources[1].frames.get(), 3)
+                sources[1].processed(observed)
+                sources[1].emit(kind, frames=[observed], silence_duration=0 if samples == 320 else 0.55)
+            assert await asyncio.wait_for(turns.get(), 3) == "rebound"
+            assert not models[1]._native_failed
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            for model in models:
+                await model.aclose()
+            await local.aclose()
+            await client.aclose()
+
+
+async def test_disabled_audio_manual_commit_accepts_sdk_generated_flush_frames():
+    class SilenceVAD(ControlledVAD):
+        def stream(self):
+            self.current = SilenceStream(self)
+            return self.current
+
+    class SilenceStream(ControlledVADStream):
+        async def _main_task(self):
+            speaking = False
+            async for value in self._input_ch:
+                if isinstance(value, self._FlushSentinel):
+                    continue
+                self._vad.frames.put_nowait(value)
+                self._vad.processed(value)
+                if any(value.data.cast("B")) and not speaking:
+                    speaking = True
+                    self._vad.emit(vad.VADEventType.START_OF_SPEECH, frames=[value])
+                elif not any(value.data.cast("B")) and speaking:
+                    speaking = False
+                    self._vad.emit(vad.VADEventType.END_OF_SPEECH, frames=[value], silence_duration=value.duration)
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "flushed"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    items = asyncio.Queue()
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        source = SilenceVAD()
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+        session = AgentSession(stt=model, llm=None, tts=None, vad=None, turn_detection="manual", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        session.on("conversation_item_added", lambda event: items.put_nowait(event.item.text_content) if event.item.role == "user" else None)
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=Agent(instructions="Owned disabled-input flush"), **options)
+            await audio.frames.put(frame())
+            await asyncio.wait_for(source.frames.get(), 3)
+            session.input.set_audio_enabled(False)
+            await asyncio.wait_for(session.commit_user_turn(transcript_timeout=1, stt_flush_duration=0.2, skip_reply=True), 3)
+            assert await asyncio.wait_for(items.get(), 3) == "flushed"
+            assert not model._native_failed
+            while not source.frames.empty():
+                source.frames.get_nowait()
+            # Real input resumes after the SDK's synthetic media has advanced
+            # the clock. It must not move backwards or fence the next turn.
+            session.input.set_audio_enabled(True)
+            await audio.frames.put(frame())
+            await asyncio.wait_for(source.frames.get(), 3)
+            await audio.frames.put(rtc.AudioFrame(data=b"\0\0" * 3200, sample_rate=16000, num_channels=1, samples_per_channel=3200))
+            await asyncio.wait_for(source.frames.get(), 3)
+            await asyncio.wait_for(session.commit_user_turn(transcript_timeout=1, stt_flush_duration=0, skip_reply=True), 3)
+            assert await asyncio.wait_for(items.get(), 3) == "flushed"
+            assert not model._native_failed
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_source_replaced_in_prewarm_stays_observed_before_recognition_exists():
+    sources, entered, turns = [ControlledVAD(), ControlledVAD()], asyncio.Event(), asyncio.Queue()
+    observations = []
+
+    class ReplacementInput(OwnedAudioInput):
+        async def __anext__(self):
+            value = await super().__anext__()
+            observations.append(getattr(session._activity, "_audio_recognition", None) is None)
+            return value
+
+    class ReplacingSTT(STT):
+        def prewarm(self):
+            session.input.audio = replacement
+            replacement.frames.put_nowait(rtc.AudioFrame(data=b"\0\0" * 320, sample_rate=16000, num_channels=1, samples_per_channel=320))
+            activity = session._activity
+            original = activity._resume_scheduling_task
+
+            async def resume_after_source_delivery():
+                try:
+                    await replacement.delivery
+                    return await original()
+                finally:
+                    activity._resume_scheduling_task = original
+
+            # Hold this owned activity at a real asynchronous startup boundary.
+            activity._resume_scheduling_task = resume_after_source_delivery
+
+    class NextAgent(Agent):
+        async def on_enter(self):
+            await replacement.delivery
+            entered.set()
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "replaced early"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        models = [STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=sources[0]), ReplacingSTT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=sources[1])]
+        session = AgentSession(stt=models[0], llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio, replacement = OwnedAudioInput(), ReplacementInput(track_delivery=True)
+        session.input.audio = audio
+        for model in models:
+            model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=Agent(instructions="Owned original input"), **options)
+            session.update_agent(NextAgent(instructions="Owned early replacement", stt=models[1]))
+            await asyncio.wait_for(entered.wait(), 3)
+            assert observations[0], "the replacement pump must start before recognition is constructed"
+            for samples, kind in [(320, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                value = rtc.AudioFrame(data=(b"\xff\x0f" if samples == 320 else b"\0\0") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples)
+                await replacement.frames.put(value)
+                observed = await asyncio.wait_for(sources[1].frames.get(), 3)
+                sources[1].processed(observed)
+                sources[1].emit(kind, frames=[observed], silence_duration=0 if samples == 320 else 0.55)
+            assert await asyncio.wait_for(turns.get(), 3) == "replaced early"
+            assert not models[1]._native_failed
+        finally:
+            await audio.frames.put(None)
+            await replacement.frames.put(None)
+            await session.aclose()
+            for model in models:
+                await model.aclose()
+            await client.aclose()
 
 
 @pytest.mark.skipif(not hasattr(Agent, "update_options"), reason="SDK predates live model option updates")

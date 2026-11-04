@@ -50,16 +50,20 @@ class _SourceInput(io.AudioInput):
 
     async def __anext__(self) -> rtc.AudioFrame:
         frame = await super().__anext__()
-        if not self.binding.owners:
+        if not isinstance(frame, rtc.AudioFrame) or frame.sample_rate <= 0:
             return frame
+        active = _lookup(_sessions, self.binding._session)
+        clock = active if active is not None and active.owners else self.binding
         if self._position is None:
-            self._position = self.binding.source_start()
-        owned = _copy_frame(frame)
-        owned.userdata[_SOURCE_POSITION] = _SourcePosition(
-            self.binding.scope, self._position
-        )
+            self._position = clock.source_start()
+        self._position = max(self._position, clock._source_end)
+        start = self._position
         self._position += Fraction(frame.samples_per_channel, frame.sample_rate)
-        self.binding._source_end = max(self.binding._source_end, self._position)
+        clock._source_end = max(clock._source_end, self._position)
+        if active is None or not active.owners:
+            return frame
+        owned = _copy_frame(frame)
+        owned.userdata[_SOURCE_POSITION] = _SourcePosition(active.scope, start)
         return owned
 
 
@@ -152,6 +156,7 @@ class NativeInputBinding:
         self._session_update: tuple[Any, Any] | None = None
         self._session_forward: tuple[Any, Any] | None = None
         self._source_end = Fraction(0)
+        self._recognition_inputs: dict[Any, tuple[Any, Any]] = {}
         self._agents: dict[Any, _AgentHooks] = {}
         self._timelines: weakref.WeakKeyDictionary[Any, NativeInputTimeline] = (
             weakref.WeakKeyDictionary()
@@ -192,6 +197,7 @@ class NativeInputBinding:
                             and getattr(previous_agent, "_activity", None) is None
                         ):
                             self._detach_agent(previous_agent)
+                    self._restore_recognition_inputs(closed_only=True)
 
             session._update_activity = update
             self._session_update = (original, update)
@@ -209,18 +215,22 @@ class NativeInputBinding:
 
         @wraps(original)
         async def forward() -> None:
-            recognition = getattr(
-                getattr(session, "_activity", None), "_audio_recognition", None
-            )
             source = session.input.audio
-            if (
-                not self.owners
-                or recognition is None
-                or hasattr(recognition, "_input_started_at")
-                or source is None
-            ):
+            if not self.owners or source is None:
                 await original()
                 return
+            current, seen = source, set()
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                if (
+                    isinstance(current, _SourceInput)
+                    and current.binding._session is session
+                ):
+                    # A recording/input wrapper can already delegate to the
+                    # session observer. Keep a single clock for each frame.
+                    await original()
+                    return
+                current = getattr(current, "source", None)
             # Preserve the SDK's pump and attach/detach notifications. Its
             # public setter would cancel this pump, so replace only its owned
             # source reference for the duration of the captured invocation.
@@ -234,6 +244,53 @@ class NativeInputBinding:
 
         session._forward_audio_task = forward
         self._session_forward = (original, forward)
+
+    def _observe_recognition_input(self, recognition: Any) -> None:
+        self._restore_recognition_inputs(closed_only=True)
+        if recognition in self._recognition_inputs:
+            return
+        original = recognition.push_audio
+
+        @wraps(original)
+        def push(frame: rtc.AudioFrame, *args: Any, **kwargs: Any) -> Any:
+            active = _lookup(_sessions, self._session)
+            current = getattr(
+                getattr(self._session, "_activity", None), "_audio_recognition", None
+            )
+            if (
+                active is not None
+                and active.owners
+                and current is recognition
+                and isinstance(frame, rtc.AudioFrame)
+            ):
+                witness = frame.userdata.get(_SOURCE_POSITION)
+                if (
+                    not isinstance(witness, _SourcePosition)
+                    or witness.scope is not active.scope
+                ):
+                    # The SDK injects flush audio directly into recognition.
+                    # Observe it before custom nodes, just like source input.
+                    owned = _copy_frame(frame)
+                    start = active.source_start()
+                    owned.userdata[_SOURCE_POSITION] = _SourcePosition(
+                        active.scope, start
+                    )
+                    active._source_end = start + Fraction(
+                        frame.samples_per_channel, frame.sample_rate
+                    )
+                    frame = owned
+            return original(frame, *args, **kwargs)
+
+        recognition.push_audio = push
+        self._recognition_inputs[recognition] = original, push
+
+    def _restore_recognition_inputs(self, *, closed_only: bool = False) -> None:
+        for recognition, (original, push) in list(self._recognition_inputs.items()):
+            if closed_only and not recognition._closing.is_set():
+                continue
+            if recognition.push_audio is push:
+                recognition.push_audio = original
+            del self._recognition_inputs[recognition]
 
     def source_start(self) -> Fraction:
         now = time.time()
@@ -269,7 +326,11 @@ class NativeInputBinding:
         recognition = getattr(
             getattr(session, "_activity", None), "_audio_recognition", None
         )
-        legacy = recognition is not None and not hasattr(recognition, "_input_started_at")
+        legacy = recognition is not None and not hasattr(
+            recognition, "_input_started_at"
+        )
+        if legacy:
+            self._observe_recognition_input(recognition)
         context = getattr(audio_recognition, "_STTPipelineContextVar", None)
         pipeline = context.get(None) if context is not None else None
         if pipeline is None:
@@ -402,6 +463,7 @@ class NativeInputBinding:
             del _agents[agent]
 
     def _restore(self) -> None:
+        self._restore_recognition_inputs()
         if self._session_forward is not None:
             original, forward = self._session_forward
             if self._session._forward_audio_task is forward:
