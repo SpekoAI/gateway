@@ -26,8 +26,8 @@ stt = STT(speech, provider=stt_provider, model=stt_model,
           language=stt_language, credential_source="managed", turn_vad=local_vad)
 tts = TTS(speech, provider=tts_provider, model=tts_model, voice="",
           language=tts_language, credential_source="managed")
-# Before AgentSession.start(agent=agent): bind its public turn-completion hook.
-stt.bind_agent(agent)
+# Before AgentSession.start(agent=agent), bind the owned session.
+stt.bind_session(session)  # bind_agent(agent) also locates its initial session
 ```
 
 The provider/model/language fields come from the compiled spec. A managed
@@ -49,11 +49,14 @@ The LiveKit stream stays open across turns. Each VAD turn uses a separate
 native request, streaming audio and interim text while speech continues.
 At speech end the request commits and closes; final transcript segments and
 `END_OF_SPEECH` are emitted only after terminal usage arrives. A final segment
-alone cannot complete a turn. `bind_agent(agent)` adapts only that Agent's
-`on_user_turn_completed` hook and preserves the original hook. A later speech
-request waits for the framework's actual complete-turn commit; elapsed silence
-is never replayed. Binding is required for native AgentSession streaming and
-is removed on close. Explicit event consumers that own turn handling can use
+alone cannot complete a turn. `bind_session(session)` observes that session's
+actual synchronous turn acceptance, including `skip_reply=True`, and follows
+`update_agent()` handoffs. Public Agent lifecycle hooks remain untouched.
+`bind_agent(agent)` locates the same session when its first stream starts.
+The owned SDK activity interface is checked before admission and restored on
+close or handoff; the binding never changes the global SDK. A later speech
+request waits for the framework's actual complete-turn commit. Binding is
+required for native AgentSession streaming. Explicit event consumers can use
 `stream(manual_turns=True)`; completed-buffer `recognize()` needs no binding
 and joins all final segments. EOS timing excludes the detector's trailing
 silence. Overlapping VAD prefixes exclude samples already assigned to
@@ -76,7 +79,8 @@ error codes. Live usage updates remain progress events; only a terminal frame
 with final usage produces `usage.reported`. A lost terminal frame fails without
 an automatic retry. These transport tests use owned protocol peers; wiring
 worker claims through the actual cell and settling a full conversation remains
-an integration gate.
+an integration gate. Short VAD pauses and a separately configured Session VAD
+still need logical-turn coordination before managed worker activation.
 
 For LiveKit Agents:
 

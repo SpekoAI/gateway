@@ -367,7 +367,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         )
 
     def acknowledge_turn(self, transcript: str) -> None:
-        """The bound Agent hook runs only after LiveKit commits this user turn."""
+        """The owned activity accepted this complete framework user turn."""
         if (
             self._turn_commit is not None
             and not self._turn_commit.done()

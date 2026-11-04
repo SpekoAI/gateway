@@ -324,7 +324,11 @@ async def test_actual_agent_stt_recovery_pump_cannot_readmit_a_failed_native_req
             stt=model,
             vad=None,
             _audio_recognition=None,
+            # Isolate the real SDK recovery pump; no successful framework turn
+            # is authorized by this fixture. Actual sessions are covered below.
+            on_end_of_turn=lambda _info: False,
             session=SimpleNamespace(
+                current_agent=agent,
                 conn_options=SimpleNamespace(
                     stt_conn_options=APIConnectOptions(max_retry=3, retry_interval=0)
                 ),
@@ -1063,7 +1067,7 @@ async def test_native_eos_uses_speech_end_before_vad_trailing_silence():
             await client.aclose()
 
 
-async def test_native_framework_stream_requires_binding_and_fences_missing_commit():
+async def test_native_framework_stream_requires_a_binding_to_a_running_session():
     seen = []
 
     async def handle(request):
@@ -1101,20 +1105,151 @@ async def test_native_framework_stream_requires_binding_and_fences_missing_commi
         agent = Agent(instructions="Owned uncommitted turn fixture")
         original = agent.on_user_turn_completed
         model.bind_agent(agent)
-        stream = model.stream(conn_options=APIConnectOptions(timeout=0.2))
         try:
-            stream.push_frame(frame())
-            stream.end_input()
-            with pytest.raises(APIConnectionError, match="control-plane recovery"):
-                async for _ in stream:
-                    pass
-            assert len(seen) == 1
-            with pytest.raises(GatewayError, match="control-plane recovery"):
+            with pytest.raises(ValueError, match="running AgentSession"):
                 model.stream()
+            assert seen == []
+            assert agent.on_user_turn_completed == original
         finally:
-            await stream.aclose()
             await model.aclose()
             assert agent.on_user_turn_completed == original
+            await client.aclose()
+
+
+@pytest.mark.parametrize("transition", ["skip_reply", "handoff"])
+@pytest.mark.parametrize("binding", ["agent", "session"])
+async def test_actual_native_agent_session_keeps_turn_authority_across_commits_and_handoffs(
+    transition, binding,
+):
+    source = ControlledVAD()
+    seen = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        seen.append(request.headers["Idempotency-Key"])
+        text = f"turn {len(seen)}"
+        await ready(ws)
+        async for message in ws:
+            if (
+                message.type is aiohttp.WSMsgType.TEXT
+                and json.loads(message.data)["type"] == "session.close"
+            ):
+                await ws.send_json({"type": "transcript.final", "text": text})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=source,
+        )
+        session = AgentSession(
+            stt=model,
+            llm=None,
+            tts=None,
+            vad=None,
+            turn_detection="manual" if transition == "skip_reply" else "stt",
+            min_endpointing_delay=0.05,
+            max_endpointing_delay=0.05,
+        )
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        transcripts, turns, items = asyncio.Queue(), asyncio.Queue(), asyncio.Queue()
+        session.on(
+            "user_input_transcribed",
+            lambda event: transcripts.put_nowait(event.transcript)
+            if event.is_final
+            else None,
+        )
+        session.on(
+            "conversation_item_added",
+            lambda event: items.put_nowait(event.item.text_content)
+            if getattr(event.item, "role", None) == "user"
+            else None,
+        )
+
+        class OwnedAgent(Agent):
+            async def on_enter(self):
+                entered.set()
+
+            async def on_user_turn_completed(self, turn_ctx, new_message):
+                turns.put_nowait(new_message.text_content)
+
+        async def utterance():
+            for value in (
+                frame(),
+                rtc.AudioFrame(
+                    data=b"\0\0" * 8800,
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=8800,
+                ),
+            ):
+                await audio.frames.put(value)
+                observed = await asyncio.wait_for(source.frames.get(), 3)
+                source.processed(observed)
+                source.emit(
+                    vad.VADEventType.START_OF_SPEECH
+                    if value.samples_per_channel == 320
+                    else vad.VADEventType.END_OF_SPEECH,
+                    frames=[observed],
+                    silence_duration=0 if value.samples_per_channel == 320 else 0.55,
+                )
+
+        entered = asyncio.Event()
+        agent = OwnedAgent(instructions="Owned native lifecycle fixture")
+        original = agent.on_user_turn_completed
+        if binding == "session":
+            model.bind_session(session)
+        else:
+            model.bind_agent(agent)
+        try:
+            options = (
+                {"record": False}
+                if "record" in inspect.signature(session.start).parameters
+                else {}
+            )
+            await session.start(agent=agent, **options)
+            await utterance()
+            assert await asyncio.wait_for(transcripts.get(), 3) == "turn 1"
+            if transition == "skip_reply":
+                # Queue the next utterance before the first framework commit.
+                await utterance()
+                await asyncio.wait_for(
+                    session.commit_user_turn(skip_reply=True, stt_flush_duration=0), 3
+                )
+                assert await asyncio.wait_for(items.get(), 3) == "turn 1"
+                assert turns.empty(), "skip_reply must preserve the SDK's hook behavior"
+            else:
+                assert await asyncio.wait_for(turns.get(), 3) == "turn 1"
+                entered.clear()
+                session.update_agent(OwnedAgent(instructions="Owned handoff target"))
+                await asyncio.wait_for(entered.wait(), 3)
+                await utterance()
+            assert await asyncio.wait_for(transcripts.get(), 3) == "turn 2"
+            if transition == "skip_reply":
+                await asyncio.wait_for(
+                    session.commit_user_turn(stt_flush_duration=0), 3
+                )
+            assert await asyncio.wait_for(turns.get(), 3) == "turn 2"
+            assert len(seen) == len(set(seen)) == 2
+            assert agent.on_user_turn_completed == original
+            assert not model._native_failed
+        finally:
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
             await client.aclose()
 
 

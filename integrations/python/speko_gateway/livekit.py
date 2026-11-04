@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import weakref
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -18,6 +19,7 @@ from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
     Agent,
+    AgentSession,
     APIConnectionError,
     APIConnectOptions,
     NotGivenOr,
@@ -176,30 +178,74 @@ class STT(stt.STT):
         self._credential_source = credential_source
         self._sample_rate = sample_rate
         self._streams: weakref.WeakSet[stt.RecognizeStream] = weakref.WeakSet()
-        self._bound_agent: tuple[Any, Any, Any] | None = None
+        self._bound_agent: Agent | None = None
+        self._bound_session: AgentSession | None = None
+        self._turn_binding: tuple[Any, Any, Any] | None = None
 
     def bind_agent(self, agent: Agent) -> None:
-        """Bind native turn completion to this Agent's public lifecycle hook.
+        """Locate the owned session through its initial Agent at stream start.
 
-        Call before AgentSession.start. Only this owned Agent instance is
-        adapted; its original hook still receives every completed user turn.
+        The binding follows that session across Agent handoffs. Public Agent
+        lifecycle hooks remain untouched, including turns that skip a reply.
         """
         if not isinstance(self._client, RelaySpeechClient):
             return
-        if self._bound_agent is not None:
-            raise ValueError("Native STT is already bound to an Agent")
-        original = agent.on_user_turn_completed
+        if self._bound_agent is not None or self._bound_session is not None:
+            raise ValueError("Native STT is already bound to an AgentSession")
+        self._bound_agent = agent
 
-        async def completed(
-            turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
-        ) -> None:
-            for stream in list(self._streams):
-                if isinstance(stream, NativeSpeechStream):
-                    stream.acknowledge_turn(new_message.text_content or "")
-            await original(turn_ctx, new_message)
+    def bind_session(self, session: AgentSession) -> None:
+        """Bind native turn ownership before starting the supplied session."""
+        if not isinstance(self._client, RelaySpeechClient):
+            return
+        if self._bound_agent is not None or self._bound_session is not None:
+            raise ValueError("Native STT is already bound to an AgentSession")
+        self._bound_session = session
 
-        agent.on_user_turn_completed = completed
-        self._bound_agent = (agent, original, completed)
+    def _restore_turn_binding(self) -> None:
+        if self._turn_binding is not None:
+            activity, original, completed = self._turn_binding
+            if activity.on_end_of_turn is completed:
+                activity.on_end_of_turn = original
+            self._turn_binding = None
+
+    def _bind_native_activity(self) -> None:
+        if self._bound_session is None:
+            try:
+                assert self._bound_agent is not None
+                self._bound_session = self._bound_agent.session
+                self._bound_agent = None
+            except RuntimeError:
+                raise ValueError(
+                    "Native STT streaming requires a running AgentSession"
+                ) from None
+        try:
+            activity = getattr(self._bound_session.current_agent, "_activity", None)
+        except RuntimeError:
+            raise ValueError(
+                "Native STT streaming requires a running AgentSession"
+            ) from None
+        original = getattr(activity, "on_end_of_turn", None)
+        if not callable(original) or inspect.iscoroutinefunction(original):
+            raise ValueError("Unsupported native AgentSession turn interface")
+        if self._turn_binding is not None:
+            bound, _, completed = self._turn_binding
+            if bound is activity and original is completed:
+                return
+        self._restore_turn_binding()
+
+        def committed(info: Any) -> bool:
+            accepted = original(info)
+            if accepted is True:
+                # AudioRecognition clears its transcript synchronously after
+                # this callback returns. Waking the waiter cannot overtake it.
+                for stream in list(self._streams):
+                    if isinstance(stream, NativeSpeechStream):
+                        stream.acknowledge_turn(info.new_transcript)
+            return accepted
+
+        activity.on_end_of_turn = committed
+        self._turn_binding = (activity, original, committed)
 
     @property
     def model(self) -> str:
@@ -297,9 +343,10 @@ class STT(stt.STT):
             and not recognize
             and not manual_turns
             and self._bound_agent is None
+            and self._bound_session is None
         ):
             raise ValueError(
-                "Native STT streaming requires bind_agent() before AgentSession starts; explicit event consumers use manual_turns=True"
+                "Native STT streaming requires bind_agent() or bind_session() before AgentSession starts; explicit event consumers use manual_turns=True"
             )
         conn_options = _speech_connect_options(self._client, conn_options)
         resolved_language = str(language) if is_given(language) else self._language
@@ -312,6 +359,8 @@ class STT(stt.STT):
             stt_options=self._stt_options,
         )
         if isinstance(self._client, RelaySpeechClient):
+            if not recognize and not manual_turns:
+                self._bind_native_activity()
             stream = NativeSpeechStream(
                 stt_instance=self,
                 bridge=bridge,
@@ -347,14 +396,12 @@ class STT(stt.STT):
             )
 
     async def aclose(self) -> None:
-        if self._bound_agent is not None:
-            agent, original, completed = self._bound_agent
-            if agent.on_user_turn_completed is completed:
-                agent.on_user_turn_completed = original
-            self._bound_agent = None
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
+        self._restore_turn_binding()
+        self._bound_agent = None
+        self._bound_session = None
         if self._owns_client:
             await self._client.aclose()
 
