@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:8770a04be34b1fd1e2fabd05bde8e744baf98666df8ab23277edb5acc94dbe2a
-# yaml-body: sha256:cb1e1b637d528cdcb492e21306276a866073c575489d6f4b7f8024e56f875929
+# json-mirror: openapi.json sha256:7412530ee00f4d030c84b6b6b27773787b6aa223d1ba6872e4dc8fe3288c1c84
+# yaml-body: sha256:5a9bba69f2775223d2f2989c250eabe45a84ca508153b7e44953c4bd18899eaf
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -615,11 +615,15 @@ components:
         the request: the request is admitted the ordinary way and
         Speko-Prepared-Admission-Outcome says why. A ticket of this caller's
         that does not fit is retired first, so its reservation does not hold
-        the concurrency slot and credit the ordinary admission needs. The
-        one refusal is a ticket whose plan was already consumed, by its
-        first use or by a release: that is a replay of the request its
+        the concurrency slot and credit the ordinary admission needs. Two
+        refusals remain. A ticket whose plan was already consumed, by its
+        first use or by a release, is a replay of the request its
         Idempotency-Key registered, refused with 409
-        request_already_started and the original request id.
+        request_already_started and the original request id. And when a
+        second admission is needed but the Router cannot confirm this
+        caller's ticket retired, the request is refused as a retryable
+        provider_unavailable that still carries the outcome; release the
+        ticket and retry without it.
       schema:
         type: string
   headers:
@@ -666,8 +670,10 @@ components:
         reached the ticket check, which follows request validation and route
         selection, so an error response after that point carries it too.
         used means the ticket passed every check and its plan was presented
-        for dispatch; every other value means it was admitted the ordinary
-        way, and says why. A ticket whose plan was already consumed is
+        for dispatch; every other value says why the ticket was not used. On
+        a successful response the request was then admitted the ordinary
+        way; on a retryable provider_unavailable nothing was admitted,
+        because the Router could not confirm the ticket retired. A ticket whose plan was already consumed is
         discovered only at dispatch, so its 409 request_already_started
         refusal carries used as well, and nothing was dispatched. It is
         absent when the request never reached the ticket check: it failed
@@ -2236,8 +2242,10 @@ components:
         connector, with no admission round trip; the request was dispatched on
         it unless the plan had already been consumed, in which case the
         request is refused with 409 request_already_started and nothing was
-        dispatched. Every other value
-        means the request was admitted the ordinary way instead. invalid:
+        dispatched. Every other value says why the ticket was not used: the
+        request was then admitted the ordinary way, or, on a retryable
+        provider_unavailable, refused because the Router could not confirm
+        the ticket retired. invalid:
         the ticket did not decrypt, was issued to another API key,
         Speko-Client-Session-ID, or Router region, or was prepared under
         another Idempotency-Key. expired: its plan had less

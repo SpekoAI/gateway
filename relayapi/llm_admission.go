@@ -17,9 +17,12 @@ import (
 // under that same key and is dispatched on it without a second admission. A
 // ticket that does not fit the real request does not fail it: the Router
 // retires the ticket if it is the caller's own, admits the request the
-// ordinary way, and HeaderPreparedAdmissionOutcome says why. The one refusal
-// is a ticket whose plan was already consumed (used or released), a replay
-// refused as request_already_started. A request sent without its ticket
+// ordinary way, and HeaderPreparedAdmissionOutcome says why. Two refusals
+// remain: a ticket whose plan was already consumed (used or released) is a
+// replay refused as request_already_started, and a ticket of the caller's
+// that the Router could not confirm retired, when the request needed a second
+// admission, is refused as a retryable provider_unavailable that still
+// carries the outcome. A request sent without its ticket
 // must use a fresh Idempotency-Key. A ticket the client never presents is
 // released with POST /v1/llm/admissions/release.
 
@@ -90,7 +93,10 @@ func (r LLMAdmissionRelease) Validate() error {
 
 // PreparedAdmissionOutcome is the closed value set of
 // HeaderPreparedAdmissionOutcome. Every value but PreparedAdmissionUsed
-// means the request was admitted the ordinary way instead.
+// means the ticket was not used. On a successful response the request was
+// then admitted the ordinary way; on a retryable provider_unavailable the
+// Router could not confirm the ticket retired and admitted nothing, and the
+// client should release the ticket and retry without it.
 type PreparedAdmissionOutcome string
 
 const (
