@@ -103,6 +103,21 @@ class _DrainingVADStream(vad.VADStream):
             # reset, without new inferred audio or invented silence. Pending
             # real capture is classified again with fresh duration counters.
             previous = self._outward_last
+            # Classification can have queued the real end before its consumer
+            # reaches it. Retain that segment's canonical audio instead of a
+            # newer segment's buffer. Otherwise the active buffer contains
+            # only acknowledged capture, with detector padding removed.
+            completed = next(
+                (event for event, segment in self._published
+                 if segment == self._flushes - 1
+                 and event.type is vad.VADEventType.END_OF_SPEECH),
+                None,
+            )
+            frames = completed.frames if completed is not None else [self._frame(bytes(self._speech))]
+            if not frames or not any(frame.samples_per_channel for frame in frames):
+                raise GatewayError("Local speech reset lost captured audio", retryable=False)
+            if completed is not None:
+                previous = completed
             self._emit(
                 vad.VADEvent(
                     type=vad.VADEventType.END_OF_SPEECH,
@@ -110,7 +125,7 @@ class _DrainingVADStream(vad.VADStream):
                     samples_index=previous.samples_index,
                     speech_duration=previous.speech_duration,
                     silence_duration=previous.silence_duration,
-                    frames=[],
+                    frames=frames,
                     speaking=False,
                 ),
                 segment=self._flushes,
@@ -148,6 +163,7 @@ class _DrainingVADStream(vad.VADStream):
         self._history = bytearray()
         self._speech = bytearray()
         self._processed = self._last_index = 0
+        self._replay_until = 0
         self._deadline = None
 
     def _arm_tail(self) -> None:
@@ -240,6 +256,32 @@ class _DrainingVADStream(vad.VADStream):
         state = self._probability
         if self._segment != self._flushes:
             return
+        if boundary is not None:
+            if boundary.type is vad.VADEventType.START_OF_SPEECH:
+                self._speech = bytearray(
+                    b"".join(bytes(frame.data) for frame in boundary.frames)[:maximum_bytes]
+                )
+            else:
+                boundary.frames = [self._frame(bytes(self._speech))]
+                self._speech.clear()
+        replaying = self._replay_until > 0
+        if replaying:
+            # Classify the whole pre-reset frontier before calling any of it
+            # resumed speech. Old speech followed by silence has already
+            # ended, even if its inference was delayed across the STT EOS.
+            boundary = None
+            if self._processed >= self._replay_until:
+                self._replay_until = 0
+                if state.speaking:
+                    boundary = vad.VADEvent(
+                        type=vad.VADEventType.START_OF_SPEECH,
+                        samples_index=event.samples_index,
+                        timestamp=self._processed / self._sample_rate,
+                        speech_duration=(self._processed - state.started_at) / self._sample_rate,
+                        silence_duration=state.silence_samples / self._sample_rate,
+                        frames=[self._frame(bytes(self._speech))],
+                        speaking=True,
+                    )
         # samples_index uses the detector rate; outward PCM keeps the source
         # rate. Inference publishes speaking/duration before its transition.
         inference_rate = getattr(options, "sample_rate", 16000)
@@ -250,25 +292,16 @@ class _DrainingVADStream(vad.VADStream):
                 samples_index=index,
                 timestamp=self._processed / self._sample_rate,
                 frames=[self._frame(real)],
-                speaking=was_speaking,
+                speaking=was_speaking and not replaying,
                 speech_duration=max(0, self._processed - started_at) / self._sample_rate
-                if was_speaking
+                if was_speaking and not replaying
                 else 0,
-                silence_duration=state.silence_samples / self._sample_rate,
-                raw_accumulated_speech=state.speech_samples / self._sample_rate,
-                raw_accumulated_silence=state.silence_samples / self._sample_rate,
+                silence_duration=0 if replaying else state.silence_samples / self._sample_rate,
+                raw_accumulated_speech=0 if replaying else state.speech_samples / self._sample_rate,
+                raw_accumulated_silence=0 if replaying else state.silence_samples / self._sample_rate,
             )
         )
         if boundary is not None:
-            if boundary.type is vad.VADEventType.START_OF_SPEECH:
-                self._speech = bytearray(
-                    b"".join(bytes(frame.data) for frame in boundary.frames)[
-                        :maximum_bytes
-                    ]
-                )
-            else:
-                boundary.frames = [self._frame(bytes(self._speech))]
-                self._speech.clear()
             self._emit(
                 dataclasses.replace(
                     boundary,
@@ -325,6 +358,7 @@ class _DrainingVADStream(vad.VADStream):
                             self._reset()
                             self._segment += 1
                             if pending:
+                                self._replay_until = len(pending) // 2
                                 self._probability = ProbabilityVAD.for_stream(
                                     self._inner, self._sample_rate
                                 )
