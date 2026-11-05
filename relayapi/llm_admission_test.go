@@ -41,8 +41,8 @@ func TestPreparedAdmissionOutcomesAreClosedAndDistinct(t *testing.T) {
 	t.Parallel()
 
 	outcomes := relayapi.PreparedAdmissionOutcomes()
-	if len(outcomes) != 7 || outcomes[0] != relayapi.PreparedAdmissionUsed {
-		t.Fatalf("PreparedAdmissionOutcomes() = %v, want seven outcomes led by used", outcomes)
+	if len(outcomes) != 6 || outcomes[0] != relayapi.PreparedAdmissionUsed {
+		t.Fatalf("PreparedAdmissionOutcomes() = %v, want six outcomes led by used", outcomes)
 	}
 	seen := make(map[relayapi.PreparedAdmissionOutcome]bool, len(outcomes))
 	for _, outcome := range outcomes {

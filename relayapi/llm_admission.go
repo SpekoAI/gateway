@@ -14,17 +14,16 @@ import (
 // spoken, under the Idempotency-Key the real request will send, and returns
 // the admission sealed into an opaque ticket (LLMAdmission). The real
 // POST /v1/llm/responses presents the ticket in HeaderPreparedAdmission
-// under that same key and is dispatched on it without a second admission. A
-// ticket that does not fit the real request does not fail it: the Router
-// retires the ticket if it is the caller's own, admits the request the
-// ordinary way, and HeaderPreparedAdmissionOutcome says why. Two refusals
-// remain: a ticket whose plan was already consumed (used or released) is a
-// replay refused as request_already_started, and a ticket of the caller's
-// that the Router could not confirm retired, when the request needed a second
-// admission, is refused as a retryable provider_unavailable that still
-// carries the outcome. A request sent without its ticket
-// must use a fresh Idempotency-Key. A ticket the client never presents is
-// released with POST /v1/llm/admissions/release.
+// under that same key and is dispatched on it without a second admission,
+// and HeaderPreparedAdmissionOutcome reports what became of the ticket. The
+// Router never runs a second execution under a ticket's key: a ticket of the
+// caller's under the request's key that does not fit is refused with 409
+// idempotency_conflict, and an attempt on it that fails before the provider
+// connector accepts it is returned as that failure. The client then sends the
+// request again without the ticket, under a fresh Idempotency-Key. A ticket
+// that is not the caller's, or was prepared under another key, is ignored
+// and the request admitted the ordinary way. A ticket the client will not
+// present is released with POST /v1/llm/admissions/release.
 
 // Object tags of the two prepared-admission response bodies.
 const (
@@ -92,18 +91,18 @@ func (r LLMAdmissionRelease) Validate() error {
 }
 
 // PreparedAdmissionOutcome is the closed value set of
-// HeaderPreparedAdmissionOutcome. Every value but PreparedAdmissionUsed
-// means the ticket was not used. On a successful response the request was
-// then admitted the ordinary way; on a retryable provider_unavailable the
-// Router could not confirm the ticket retired and admitted nothing, and the
-// client should release the ticket and retry without it.
+// HeaderPreparedAdmissionOutcome. Every value but PreparedAdmissionUsed says
+// why the ticket was not used. PreparedAdmissionInvalid arrives on an
+// ordinary admission under the request's own key; the others arrive on a 409
+// idempotency_conflict, because the ticket owns the request's key, and the
+// client resends without the ticket under a fresh Idempotency-Key.
 type PreparedAdmissionOutcome string
 
 const (
 	// PreparedAdmissionUsed: the ticket passed every check and its plan was
-	// presented for dispatch, with no admission round trip. A plan that was
-	// already consumed is refused at that point with 409
-	// request_already_started, so on that response nothing was dispatched.
+	// presented for dispatch, with no admission round trip. An attempt on it
+	// that fails before the provider connector accepts it (including a
+	// ticket already used or released) is returned as that failure.
 	PreparedAdmissionUsed PreparedAdmissionOutcome = "used"
 	// PreparedAdmissionInvalid: the ticket did not decrypt, was issued to
 	// another API key, client session, or region, or was prepared under
@@ -121,13 +120,6 @@ const (
 	// PreparedAdmissionBudget: the request needs more input or output tokens
 	// than the ticket reserved.
 	PreparedAdmissionBudget PreparedAdmissionOutcome = "budget"
-	// PreparedAdmissionRedialed: the attempt on the ticket failed before the
-	// provider connector accepted it and the connector confirmed the ticket
-	// can never run, so the request was admitted again. When the connector
-	// cannot confirm that, the request is refused as a retryable
-	// provider_unavailable instead. A ticket whose plan was already consumed
-	// has no outcome of its own: it is refused as request_already_started.
-	PreparedAdmissionRedialed PreparedAdmissionOutcome = "redialed"
 )
 
 // PreparedAdmissionOutcomes returns the closed outcome set in a stable
@@ -140,6 +132,5 @@ func PreparedAdmissionOutcomes() []PreparedAdmissionOutcome {
 		PreparedAdmissionStale,
 		PreparedAdmissionRoute,
 		PreparedAdmissionBudget,
-		PreparedAdmissionRedialed,
 	}
 }
