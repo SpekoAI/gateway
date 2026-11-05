@@ -326,9 +326,10 @@ async def test_draining_framework_vad_keeps_real_minimums_and_event_audio(engine
 
 
 @pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
-@pytest.mark.parametrize("chunks", [1, 3])
-async def test_draining_framework_vad_end_input_completes_actual_batch_adapter(engine, chunks):
+@pytest.mark.parametrize("chunks,finish", [(1, "eager"), (3, "eager"), (3, "after_start"), (1, "after_all"), (3, "after_all"), (1, "eager_complete"), (1, "queued_timing")])
+async def test_draining_framework_vad_end_input_completes_actual_batch_adapter(engine, chunks, finish):
     captured = []
+    ends, read_rest = [], asyncio.Event()
 
     class BatchSTT(stt.STT):
         def __init__(self):
@@ -339,32 +340,72 @@ async def test_draining_framework_vad_end_input_completes_actual_batch_adapter(e
             return stt.SpeechEvent(type=stt.SpeechEventType.FINAL_TRANSCRIPT, alternatives=[stt.SpeechData(language="en", text="owned batch speech")])
 
     model = BatchSTT()
-    detector = DrainingVAD(owned_probability_vad(engine, min_speech_duration=0.02, prefix_padding_duration=0, _any_voice=True))
+    detector = DrainingVAD(owned_probability_vad(engine, min_speech_duration=0.02, min_silence_duration=0.128 if finish == "eager_complete" else 0.25, prefix_padding_duration=0, _any_voice=True))
     streams, original = [], detector.stream
 
     def observed_stream():
         result = original()
         streams.append(result)
+        if finish == "queued_timing":
+            class QueuedRead:
+                started = False
+
+                def __getattr__(self, name):
+                    return getattr(result, name)
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    if self.started:
+                        await read_rest.wait()
+                    event = await anext(result)
+                    if event.type is vad.VADEventType.START_OF_SPEECH:
+                        self.started = True
+                    elif event.type is vad.VADEventType.END_OF_SPEECH:
+                        ends.append(event)
+                    return event
+
+            return QueuedRead()
         return result
 
     detector.stream = observed_stream
     adapter = stt.StreamAdapter(stt=model, vad=detector)
     stream = adapter.stream()
     pieces = [(4095 + index).to_bytes(2, "little", signed=True) * 320 for index in range(chunks)]
+    if finish in ("eager_complete", "queued_timing"):
+        samples = 2048 if finish == "eager_complete" else 1024
+        pieces = [b"\xff\x0f" * samples + b"\0\0" * samples]
     voice = b"".join(pieces)
-    try:
-        for piece in pieces:
-            stream.push_frame(rtc.AudioFrame(data=piece, sample_rate=16000, num_channels=1, samples_per_channel=320))
-        async with asyncio.timeout(3):
+
+    async def finish_and_collect():
+        if not finish.startswith("eager"):
             while (await anext(stream)).type is not stt.SpeechEventType.START_OF_SPEECH:
                 pass
-            while not streams or streams[0]._processed < len(voice) // 2:
-                await asyncio.sleep(0.005)
-            stream.end_input()
-            events = [event async for event in stream]
+            if finish == "after_start":
+                for piece in pieces[1:]:
+                    stream.push_frame(rtc.AudioFrame(data=piece, sample_rate=16000, num_channels=1, samples_per_channel=320))
+            else:
+                while not streams or streams[0]._processed < len(voice) // 2:
+                    await asyncio.sleep(0.005)
+        stream.end_input()
+        read_rest.set()
+        return [event async for event in stream]
+
+    try:
+        for piece in pieces[:1] if finish == "after_start" else pieces:
+            stream.push_frame(rtc.AudioFrame(data=piece, sample_rate=16000, num_channels=1, samples_per_channel=len(piece) // 2))
+        events = await asyncio.wait_for(finish_and_collect(), 3)
         assert [event.alternatives[0].text for event in events if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT] == ["owned batch speech"]
         assert captured == [voice], "the actual batch adapter receives captured speech once, without detector padding"
+        if finish == "queued_timing":
+            assert len(ends) == 1
+            assert ends[0].timestamp == pytest.approx(0.128)
+            assert ends[0].speech_duration == pytest.approx(0.064)
+            assert ends[0].silence_duration == pytest.approx(0.064)
+            assert b"".join(bytes(frame.data) for frame in ends[0].frames) == voice
     finally:
+        read_rest.set()
         await stream.aclose()
         await adapter.aclose()
 
@@ -521,12 +562,14 @@ async def test_draining_framework_vad_buffered_silence_has_no_packet_duration_de
         await asyncio.gather(collector, return_exceptions=True)
 
 
-@pytest.mark.parametrize("mode", ["vad", "stt_flush", "stt_flush_resume", "stt_flush_old_backlog"])
+@pytest.mark.parametrize("mode", ["vad", "stt_flush", "stt_flush_resume", "stt_flush_old_backlog", "stt_flush_new_start"])
 async def test_draining_framework_vad_preserves_actual_response_interruption(mode):
     if "capabilities" not in inspect.signature(io.AudioOutput).parameters:
         pytest.skip("SDK predates the current audio output contract")
     started, blocked, release = asyncio.Event(), asyncio.Event(), threading.Event()
     hold, streams = asyncio.Event(), []
+    deliver_old_end, new_stt_start = asyncio.Event(), asyncio.Event()
+    delivered_vad_events = []
     source = owned_probability_vad("inference", min_speech_duration=0.02, min_silence_duration=0.25, _any_voice=True)
     original, loop = source.stream, asyncio.get_running_loop()
 
@@ -557,6 +600,22 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
     def framework_stream():
         stream = original_stream()
         streams.append(stream)
+        if mode == "stt_flush_new_start":
+            class DelayedEnd:
+                def __getattr__(self, name):
+                    return getattr(stream, name)
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    event = await anext(stream)
+                    if event.type is vad.VADEventType.END_OF_SPEECH:
+                        await deliver_old_end.wait()
+                    delivered_vad_events.append(event.type)
+                    return event
+
+            return DelayedEnd()
         return stream
 
     detector.stream = framework_stream
@@ -620,6 +679,23 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
             await audio.frames.put(frame(b"\0\0" * 4096))
             await asyncio.wait_for(until(lambda: speech.interrupted), 2)
         else:
+            if mode == "stt_flush_new_start":
+                # Both provider boundaries are ready before either SDK
+                # consumer yields to the other. A later real inference event
+                # witnesses that the queued old VAD end has been consumed.
+                await asyncio.wait_for(until(lambda: session.user_state == "speaking"), 3)
+                session.on("user_state_changed", lambda event: new_stt_start.set() if event.new_state == "speaking" else None)
+                stt_stream._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH))
+                stt_stream._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH))
+                await asyncio.wait_for(new_stt_start.wait(), 3)
+                deliver_old_end.set()
+                await asyncio.wait_for(until(lambda: streams[0]._flushes > 0 and streams[0]._segment == streams[0]._flushes), 3)
+                await audio.frames.put(frame(b"\0\0" * 320))
+                await asyncio.wait_for(until(lambda: streams[0]._processed >= 320 and delivered_vad_events[-1] is vad.VADEventType.INFERENCE_DONE), 3)
+                assert session._activity._audio_recognition._speaking
+                assert session.user_state == "speaking"
+                assert not speech.interrupted
+                return
             if mode == "stt_flush_old_backlog":
                 payload = b"\xff\x0f" * 11200 + b"\0\0" * 8000
             else:
@@ -635,10 +711,11 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
             await asyncio.sleep(0.1)
             assert not speech.interrupted, "pre-EOS speech cannot interrupt the response after flush"
             assert session._activity._audio_recognition._speaking is (mode == "stt_flush_resume")
-            assert session._activity._audio_recognition._vad_speech_started is (mode == "stt_flush_resume")
+            assert session.user_state == ("speaking" if mode == "stt_flush_resume" else "listening")
             await audio.frames.put(frame(b"\xff\x0f" * 9216))
             await asyncio.wait_for(until(lambda: speech.interrupted), 2)
     finally:
+        deliver_old_end.set()
         release.set()
         hold.set()
         await audio.frames.put(None)
