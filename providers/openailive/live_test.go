@@ -759,7 +759,7 @@ func TestRejectsIncompatibleMediaAndEndpoints(t *testing.T) {
 
 func TestManagedSessionsDialTheRouterOnASpekoRelayRoute(t *testing.T) {
 	t.Parallel()
-	router := newFakeLive(t, relayPath)
+	router := newFakeLive(t, "/v1/openai/gpt-live")
 	adapter, err := New(Config{RelayEndpointHosts: []string{router.host()}, AllowInsecureEndpoint: true, SetupTimeout: 2 * time.Second})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -791,5 +791,10 @@ func TestManagedSessionsDialTheRouterOnASpekoRelayRoute(t *testing.T) {
 	direct := liveRequest(router.endpoint(), 24_000)
 	if _, err := adapter.Open(ctx, direct); err == nil || !strings.Contains(err.Error(), "speko_relay") {
 		t.Fatalf("router accepted on provider-direct: %v", err)
+	}
+	retired := request
+	retired.Plan.Route.Endpoint = strings.TrimSuffix(router.endpoint(), "/v1/openai/gpt-live") + "/v1/live"
+	if _, err := adapter.Open(ctx, retired); err == nil || !strings.Contains(err.Error(), "/v1/openai/gpt-live") {
+		t.Fatalf("retired generic relay path accepted: %v", err)
 	}
 }

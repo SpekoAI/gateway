@@ -19,7 +19,7 @@
 // WebSocket authenticates with a server-side project key and mints no
 // ephemeral Realtime-style client secret, so a managed session never reaches
 // api.openai.com from a customer runtime. Managed sessions instead carry a
-// speko_relay route whose endpoint is the Speko Router's /v1/live, which
+// speko_relay route whose endpoint is the Speko Router's /v1/openai/gpt-live, which
 // speaks this same protocol natively; the Router's connector holds the
 // permanent key and dials the vendor with this adapter.
 package openailive
@@ -59,7 +59,7 @@ const (
 	officialHost = "api.openai.com"
 	sessionsPath = "/v1/live/sessions"
 	// relayPath is the Speko Router route that speaks this protocol.
-	relayPath = "/v1/live"
+	relayPath = relayapi.LiveRoutePath
 
 	// appendChunkBytes is 0.5 s of 24 kHz mono PCM16; chunks stay even so a
 	// 16-bit sample is never split across appends.
@@ -295,7 +295,7 @@ func validatePCM(direction string, media protocol.MediaFormat) error {
 
 // parseEndpoint admits exactly two shapes: the vendor sessions socket on an
 // allowed vendor host (provider-direct, or the Router connector's own
-// speko_relay plan) and the Router's /v1/live on a configured relay host
+// speko_relay plan) and the Router's /v1/openai/gpt-live on a configured relay host
 // (a customer runtime's managed speko_relay plan). Query strings are refused
 // on both — the Live socket takes none.
 func (a *Adapter) parseEndpoint(raw string, providerRoute protocol.ProviderRoute) (*url.URL, bool, error) {

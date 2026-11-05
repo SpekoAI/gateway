@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:21ae052d559ca4358c0a3c5b92fdd654573cb17439b95dfd33bffe8262854204
-# yaml-body: sha256:4e899b8eabf5c0bc8bb6307cd831021116b55cf631ac08dfe8e3a3d9a08950d0
+# json-mirror: openapi.json sha256:5928020440968ac368a8bc07c8a725aeb91e298286f77810a5c97cf31ddd79a5
+# yaml-body: sha256:ed53f7b5617df9f2227536c5ee8b15a3e24b4978453529a9a3d59a9d58cc744e
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -875,14 +875,14 @@ components:
           $ref: "#/components/schemas/BatchAudioLimits"
         endpoint:
           type: string
-          enum: [/v1/realtime, /v1/live, /v1/bidi, /v1/realtime/translations, /v1/realtime/translations/qwen]
+          enum: [/v1/openai/realtime, /v1/xai/realtime, /v1/openai/gpt-live, /v1/google/gemini-live, /v1/openai/realtime-translations, /v1/alibaba/qwen-livetranslate]
           description: >-
             The public Router WebSocket route an S2S model is served on;
             omitted for every other kind, whose routes are fixed per kind.
-            Select the model exactly: /v1/realtime, /v1/realtime/translations
-            and /v1/realtime/translations/qwen take it as the `model` query
-            parameter, /v1/live in the first session.start frame,
-            /v1/bidi in the first setup frame. A model sent to another route
+            Select the model exactly: /v1/openai/realtime, /v1/xai/realtime, /v1/openai/realtime-translations
+            and /v1/alibaba/qwen-livetranslate take it as the `model` query
+            parameter, /v1/openai/gpt-live in the first session.start frame,
+            /v1/google/gemini-live in the first setup frame. A model sent to another route
             is refused with capability_unsupported.
         protocol:
           type: string

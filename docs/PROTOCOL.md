@@ -243,7 +243,7 @@ transport disconnect is never reported as confirmed completion.
 Managed GPT-Live sessions never carry a vendor credential — the Live primary
 WebSocket authenticates with a server-side project key and mints no ephemeral
 client secret — so the control plane routes them on a `speko_relay` plan whose
-endpoint is the Speko Router's `/v1/live`, which speaks the same protocol. BYOK
+endpoint is the Speko Router's `/v1/openai/gpt-live`, which speaks the same protocol. BYOK
 sessions dial the vendor directly with the customer's key. Existing managed
 Realtime sessions keep their ephemeral client secrets and sideband accounting.
 

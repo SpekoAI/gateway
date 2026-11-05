@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,6 +69,25 @@ var nativeHTTPRoutes = map[string]bool{
 	"/v1/llm/responses":      true,
 	"/v1/stt/transcriptions": true,
 	"/v1/tts/speech":         true,
+}
+
+// The vendor-native voice paths are deliberately separate. Query-selected
+// protocols carry one exact model; GPT-Live and Gemini bind it in their first
+// frame. No arbitrary URL settings, credentials or alternate relay are accepted.
+var nativeVoiceRoutes = map[string]struct{}{
+	relayapi.RealtimeRoutePath:        {},
+	relayapi.XAIRealtimeRoutePath:     {},
+	relayapi.LiveRoutePath:            {},
+	relayapi.BidiRoutePath:            {},
+	relayapi.TranslationRoutePath:     {},
+	relayapi.QwenTranslationRoutePath: {},
+}
+
+func nativeQueryAllowed(r *http.Request) bool {
+	if _, voice := nativeVoiceRoutes[r.URL.Path]; voice {
+		return relayapi.ValidateNativeVoiceURL(r.URL) == nil
+	}
+	return r.URL.RawQuery == "" && !r.URL.ForceQuery && r.URL.RawPath == ""
 }
 
 func NewNativeRelay(config NativeRelayConfig) (*NativeRelayServer, error) {
@@ -189,6 +209,48 @@ func nativeOne(h http.Header, name string) string {
 	}
 	return values[0]
 }
+
+func nativeWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
+	contains := func(name, expected string) bool {
+		for _, line := range r.Header.Values(name) {
+			for _, token := range strings.Split(line, ",") {
+				if strings.EqualFold(strings.TrimSpace(token), expected) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if r.Method != http.MethodGet || !r.ProtoAtLeast(1, 1) || r.ProtoMajor != 1 ||
+		!contains("Connection", "Upgrade") || !contains("Upgrade", "websocket") ||
+		nativeOne(r.Header, "Sec-WebSocket-Version") != "13" {
+		return false
+	}
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(nativeOne(r.Header, "Sec-WebSocket-Key")))
+	if err != nil || len(key) != 16 {
+		return false
+	}
+	if origins := r.Header.Values("Origin"); len(origins) > 1 {
+		return false
+	} else if len(origins) == 1 && origins[0] != "" {
+		origin, err := url.Parse(origins[0])
+		if err != nil || origin.User != nil || !strings.EqualFold(origin.Host, r.Host) ||
+			(!strings.EqualFold(origin.Scheme, "http") && !strings.EqualFold(origin.Scheme, "https")) {
+			return false
+		}
+	}
+	for depth := 0; depth < 8; depth++ {
+		if _, ok := w.(http.Hijacker); ok {
+			return true
+		}
+		if wrapped, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
+			w = wrapped.Unwrap()
+		} else {
+			break
+		}
+	}
+	return false
+}
 func nativeUpstreamHeaders(source http.Header) http.Header {
 	target := make(http.Header)
 	for _, name := range []string{"Authorization", "Idempotency-Key", "Speko-Client-Session-ID", "User-Agent", "Content-Type", "Accept"} {
@@ -248,10 +310,13 @@ func (s *NativeRelayServer) Handler() http.Handler {
 		if !s.authorizeLocal(w, r) {
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"runtime": map[string]any{"name": "go-gateway", "placement": "sidecar", "provider_routes": []string{"speko_relay"}, "adapters": []string{"speko.relay.stt.v1", "speko.relay.tts.v1", "speko.relay.llm.v1"}}})
+		writeJSON(w, http.StatusOK, map[string]any{"runtime": map[string]any{"name": "go-gateway", "placement": "sidecar", "provider_routes": []string{"speko_relay"}, "adapters": []string{"speko.relay.stt.v1", "speko.relay.tts.v1", "speko.relay.llm.v1", "speko.relay.realtime.v1"}}})
 	})
 	mux.HandleFunc("GET /v1/stt/stream", s.speech)
 	mux.HandleFunc("GET /v1/tts/stream", s.speech)
+	for path := range nativeVoiceRoutes {
+		mux.HandleFunc("GET "+path, s.speech)
+	}
 	for path := range nativeHTTPRoutes {
 		mux.HandleFunc("POST "+path, s.modelHTTP)
 	}
@@ -261,8 +326,8 @@ func (s *NativeRelayServer) begin(w http.ResponseWriter, r *http.Request) (conte
 	if !s.authorizeLocal(w, r) || !s.authorizeModel(w, r) {
 		return nil, nil, false
 	}
-	if r.URL.RawQuery != "" || r.URL.ForceQuery || r.URL.RawPath != "" {
-		writeError(w, http.StatusBadRequest, "invalid_request", "native model routes do not accept URL parameters")
+	if !nativeQueryAllowed(r) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "native model route requires its exact bounded model selector")
 		return nil, nil, false
 	}
 	s.mu.Lock()
@@ -375,8 +440,16 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer done()
+	// Query-selected voice can start work as soon as the upstream upgrades.
+	// Validate the local handshake first, while retaining the ability to pass
+	// an upstream's canonical HTTP refusal back before upgrading this socket.
+	if !nativeWebSocketRequest(w, r) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "a valid local WebSocket upgrade is required")
+		return
+	}
 	endpoint := *s.origin
 	endpoint.Path = r.URL.Path
+	endpoint.RawQuery = r.URL.RawQuery
 	dialCtx, cancelDial := context.WithTimeout(ctx, s.setupTimeout)
 	// websocket.Dial retains only 1 KiB of an unsuccessful upgrade body.
 	// Capture the bounded canonical envelope before that diagnostic truncation.

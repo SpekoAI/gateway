@@ -33,6 +33,55 @@ func nativeHeaders(key string) http.Header {
 	headers.Set("Idempotency-Key", "owned-native-request")
 	return headers
 }
+
+func nativeUpgradeHeaders(key string) http.Header {
+	headers := nativeHeaders(key)
+	headers.Set("Connection", "Upgrade")
+	headers.Set("Upgrade", "websocket")
+	headers.Set("Sec-WebSocket-Version", "13")
+	headers.Set("Sec-WebSocket-Key", "MDEyMzQ1Njc4OWFiY2RlZg==")
+	return headers
+}
+
+func TestNativeRelayMalformedWebSocketCannotStartRealtime(t *testing.T) {
+	var calls atomic.Int32
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer peer.Close()
+	_, local := nativeServer(t, peer, nil)
+	for _, row := range []struct {
+		name, method string
+		change       func(http.Header)
+	}{
+		{"head", http.MethodHead, func(h http.Header) {}},
+		{"connection", http.MethodGet, func(h http.Header) { h.Del("Connection") }},
+		{"upgrade", http.MethodGet, func(h http.Header) { h.Set("Upgrade", "http") }},
+		{"version", http.MethodGet, func(h http.Header) { h.Set("Sec-WebSocket-Version", "12") }},
+		{"missing key", http.MethodGet, func(h http.Header) { h.Del("Sec-WebSocket-Key") }},
+		{"invalid key", http.MethodGet, func(h http.Header) { h.Set("Sec-WebSocket-Key", "not-base64") }},
+		{"duplicate key", http.MethodGet, func(h http.Header) { h.Add("Sec-WebSocket-Key", "MDEyMzQ1Njc4OWFiY2RlZg==") }},
+		{"foreign origin", http.MethodGet, func(h http.Header) { h.Set("Origin", "https://other.invalid") }},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			request, _ := http.NewRequest(row.method, local.URL+"/v1/xai/realtime?model=grok-voice-3.0", nil)
+			request.Header = nativeUpgradeHeaders("sk_speko_agent_owned")
+			row.change(request.Header)
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+			if response.StatusCode < 400 || response.StatusCode >= 500 {
+				t.Fatalf("invalid local WebSocket request reached upstream: %d", response.StatusCode)
+			}
+		})
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("invalid local handshakes started %d upstream requests", calls.Load())
+	}
+}
 func nativeServer(t *testing.T, peer *httptest.Server, change func(*gateway.NativeRelayConfig)) (*gateway.NativeRelayServer, *httptest.Server) {
 	t.Helper()
 	cfg := gateway.NativeRelayConfig{RelayOrigin: peer.URL, LocalAuthToken: nativeTestLocal, HTTPClient: peer.Client(), WriteTimeout: time.Second}
@@ -148,6 +197,110 @@ func TestNativeRelayPreservesContractSessionIdentity(t *testing.T) {
 				t.Fatalf("session refused: status %d, relay calls %d", response.StatusCode, calls.Load())
 			}
 		})
+	}
+}
+
+func TestNativeRelayRealtimeRoutesPreserveNativeWireAndModelBinding(t *testing.T) {
+	for _, target := range []string{
+		"/v1/openai/realtime?model=gpt-realtime-2.1",
+		"/v1/xai/realtime?model=grok-voice-3.0",
+		"/v1/openai/gpt-live",
+		"/v1/google/gemini-live",
+		"/v1/openai/realtime-translations?model=gpt-realtime-translate",
+		"/v1/alibaba/qwen-livetranslate?model=qwen3.8-livetranslate-flash-realtime",
+	} {
+		t.Run(target, func(t *testing.T) {
+			// The transport must not decode/re-encode vendor frames, including
+			// integers beyond JavaScript's exact range and opaque audio payloads.
+			input := []byte(`{"type":"owned.native","value":9007199254740993,"audio":"/w8ADw=="}`)
+			output := []byte(`{"serverContent":{"owned":9007199254740993,"audio":"AAH/"}}`)
+			peerResult := make(chan error, 1)
+			peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.RequestURI() != target || r.Header.Get("Authorization") != "Bearer sk_speko_agent_owned" || r.Header.Get("Speko-Client-Session-ID") != "ses_fixture_web" || r.Header.Get("Idempotency-Key") != "owned-native-request" || r.Header.Get(gateway.NativeLocalAuthorization) != "" {
+					peerResult <- errors.New("realtime target or scoped headers changed")
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					peerResult <- err
+					return
+				}
+				defer conn.CloseNow()
+				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+				defer cancel()
+				kind, raw, err := conn.Read(ctx)
+				if err == nil && (kind != websocket.MessageText || !bytes.Equal(raw, input)) {
+					err = errors.New("native client bytes changed")
+				}
+				if err == nil {
+					err = conn.Write(ctx, websocket.MessageText, output)
+				}
+				peerResult <- err
+				// Keep the provider side alive until the caller closes: dropping
+				// it here would race the proxy's final write to the local socket.
+				_, _, _ = conn.Read(ctx)
+			}))
+			defer peer.Close()
+			server, local := nativeServer(t, peer, nil)
+			headers := nativeHeaders("sk_speko_agent_owned")
+			headers.Set("Speko-Client-Session-ID", "ses_fixture_web")
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			conn, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(local.URL, "http")+target, &websocket.DialOptions{HTTPHeader: headers})
+			if err != nil {
+				status := 0
+				if response != nil {
+					status = response.StatusCode
+				}
+				t.Fatalf("native realtime upgrade: status=%d error=%v", status, err)
+			}
+			defer conn.CloseNow()
+			if err := conn.Write(ctx, websocket.MessageText, input); err != nil {
+				t.Fatal(err)
+			}
+			kind, raw, err := conn.Read(ctx)
+			if err != nil || kind != websocket.MessageText || !bytes.Equal(raw, output) {
+				t.Fatalf("native provider bytes changed: kind=%v error=%v", kind, err)
+			}
+			if err := <-peerResult; err != nil {
+				t.Fatal(err)
+			}
+			conn.CloseNow()
+			nativeAwait(t, func() bool { return server.Stats().ActiveSessions == 0 })
+		})
+	}
+}
+
+func TestNativeRelayRealtimeRefusesUnboundQueryBeforeUpstream(t *testing.T) {
+	var calls atomic.Int32
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer peer.Close()
+	_, local := nativeServer(t, peer, nil)
+	for _, target := range []string{
+		"/v1/openai/realtime", "/v1/openai/realtime?", "/v1/openai/realtime?model=",
+		"/v1/openai/realtime?model=one&model=two",
+		"/v1/openai/realtime?model=one&api_key=untrusted",
+		"/v1/openai/realtime?model=one%20two", "/v1/openai/realtime?model=%ff",
+		"/v1/openai/realtime?model=" + strings.Repeat("a", 129),
+		"/v1/openai/gpt-live?model=unbound", "/v1/google/gemini-live?model=unbound",
+	} {
+		request, _ := http.NewRequest(http.MethodGet, local.URL+target, nil)
+		request.Header = nativeHeaders("sk_speko_agent_owned")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("unbound query %q status=%d", target, response.StatusCode)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatal("unbound realtime query reached upstream")
 	}
 }
 
@@ -673,7 +826,7 @@ func TestNativeRelayWebSocketRefusalPreservesStatusEnvelopeAndRequestIdentity(t 
 				defer peer.Close()
 				_, local := nativeServer(t, peer, nil)
 				req, _ := http.NewRequest("GET", local.URL+"/v1/stt/stream", nil)
-				req.Header = nativeHeaders("sk_speko_agent_owned")
+				req.Header = nativeUpgradeHeaders("sk_speko_agent_owned")
 				response, err := http.DefaultClient.Do(req)
 				if err != nil {
 					t.Fatal(err)

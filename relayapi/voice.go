@@ -5,9 +5,35 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 )
+
+var nativeVoiceModel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+// ValidateNativeVoiceURL admits only the route's model selector. Model-bearing
+// first frames on GPT-Live/Gemini have no query; the other protocols require
+// exactly one bounded model and cannot carry alternate hosts or credentials.
+func ValidateNativeVoiceURL(value *url.URL) error {
+	invalid := errors.New("voice route requires its exact bounded model selector")
+	if value == nil || value.RawPath != "" || value.ForceQuery {
+		return invalid
+	}
+	switch value.Path {
+	case LiveRoutePath, BidiRoutePath:
+		if value.RawQuery == "" {
+			return nil
+		}
+	case RealtimeRoutePath, XAIRealtimeRoutePath, TranslationRoutePath, QwenTranslationRoutePath:
+		query, err := url.ParseQuery(value.RawQuery)
+		if err == nil && len(query) == 1 && len(query["model"]) == 1 && nativeVoiceModel.MatchString(query.Get("model")) {
+			return nil
+		}
+	}
+	return invalid
+}
 
 // Public speech-to-speech routes. Every socket speaks the vendor's NATIVE JSON
 // event protocol: the Router authenticates, admits, meters, and forwards, but
@@ -21,43 +47,45 @@ import (
 // whose frames are keyed by their top-level field instead of a "type" tag.
 const (
 	// RealtimeRoutePath serves the OpenAI Realtime protocol. The model is an
-	// exact query parameter: GET /v1/realtime?model=gpt-realtime-2.1. The
+	// exact query parameter: GET /v1/openai/realtime?model=gpt-realtime-2.1. The
 	// idempotency content hash covers the model query value.
-	RealtimeRoutePath = "/v1/realtime"
+	RealtimeRoutePath = "/v1/openai/realtime"
+	// XAIRealtimeRoutePath keeps xAI's native session shape separate from OpenAI.
+	XAIRealtimeRoutePath = "/v1/xai/realtime"
 	// LiveRoutePath serves the GPT-Live protocol. The first text frame MUST be
 	// session.start naming the model; its exact frame bytes are the
 	// idempotency content hash.
-	LiveRoutePath = "/v1/live"
+	LiveRoutePath = "/v1/openai/gpt-live"
 	// TranslationRoutePath serves OpenAI realtime speech translation
 	// (gpt-realtime-translate), mirroring the vendor's own
-	// /v1/realtime/translations socket. As on /v1/realtime the model is an
+	// wss://api.openai.com/v1/realtime/translations socket. As on /v1/openai/realtime the model is an
 	// exact query parameter (RealtimeModelQueryParam) and the idempotency
 	// content hash covers exactly its value. The target language is not part
 	// of admission: the caller names it in its first native session.update,
 	// just as it would against the vendor.
-	TranslationRoutePath = "/v1/realtime/translations"
+	TranslationRoutePath = "/v1/openai/realtime-translations"
 	// QwenTranslationRoutePath serves Alibaba's LiveTranslate protocol
-	// (alibaba.livetranslate.v1). Like /v1/realtime the model is an exact
+	// (alibaba.livetranslate.v1). Like /v1/openai/realtime the model is an exact
 	// query parameter and the idempotency content hash covers the model query
-	// value: GET /v1/realtime/translations/qwen?model=qwen3.8-livetranslate-flash-realtime.
+	// value: GET /v1/alibaba/qwen-livetranslate?model=qwen3.8-livetranslate-flash-realtime.
 	// Every other setting — the target language above all — rides the
 	// vendor's own session.update, which the caller sends after connecting.
 	// The caller ends the session with the vendor's session.finish, which
 	// the Router honours as the close: it flushes the last segment upstream
 	// and closes once the vendor answers session.finished.
 	//
-	// It is a separate path from /v1/realtime because the protocol is not
+	// It is a separate path from /v1/openai/realtime because the protocol is not
 	// conversational (no response.create, no instructions, no tools), and
 	// from any OpenAI translation route so the two vendors' session bodies
 	// never share a socket.
-	QwenTranslationRoutePath = "/v1/realtime/translations/qwen"
-	// RealtimeModelQueryParam is the /v1/realtime model selector. Both
+	QwenTranslationRoutePath = "/v1/alibaba/qwen-livetranslate"
+	// RealtimeModelQueryParam is the /v1/openai/realtime model selector. Both
 	// translation routes use the same parameter.
 	RealtimeModelQueryParam = "model"
 	// LiveTranslateFinishType is the client event that ends a
-	// /v1/realtime/translations/qwen session.
+	// /v1/alibaba/qwen-livetranslate session.
 	LiveTranslateFinishType = "session.finish"
-	// LiveSessionStartType is the type tag of the first /v1/live frame.
+	// LiveSessionStartType is the type tag of the first /v1/openai/gpt-live frame.
 	LiveSessionStartType = "session.start"
 )
 
@@ -92,7 +120,7 @@ const (
 	LiveTranslateOutputSampleRateHz = 24_000
 )
 
-// LiveSessionStart is the first text frame of a GET /v1/live session: the
+// LiveSessionStart is the first text frame of a GET /v1/openai/gpt-live session: the
 // native GPT-Live session.start command. Unknown session fields are refused
 // so the Router forwards exactly what it validated.
 type LiveSessionStart struct {

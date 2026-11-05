@@ -9,7 +9,7 @@ import (
 	"unicode/utf8"
 )
 
-// Gemini Live (BidiGenerateContent) on the Router's /v1/bidi socket.
+// Gemini Live (BidiGenerateContent) on the Router's /v1/google/gemini-live socket.
 //
 // The route is the third public speech-to-speech surface and behaves like the
 // other two: the Router authenticates, admits, meters and forwards, and does
@@ -23,8 +23,8 @@ const (
 	// BidiRoutePath serves the Gemini Live protocol. The first text frame MUST
 	// be the vendor's setup message naming the model; its exact frame bytes
 	// are the idempotency content hash, exactly as session.start is on
-	// /v1/live.
-	BidiRoutePath = "/v1/bidi"
+	// /v1/openai/gpt-live.
+	BidiRoutePath = "/v1/google/gemini-live"
 	// BidiSetupKey is the top-level key of that first frame.
 	BidiSetupKey = "setup"
 	// BidiRealtimeInputKey is the media key. A realtimeInput frame that
@@ -40,7 +40,7 @@ const (
 	MaxBidiSetupFrameBytes = 192 << 10
 )
 
-// Gemini Live setup bounds. They mirror the /v1/live bounds so one route
+// Gemini Live setup bounds. They mirror the /v1/openai/gpt-live bounds so one route
 // cannot accept a document the other would refuse, and exist so the setup
 // frame is validated before anything is hashed, admitted, or forwarded.
 const (
@@ -78,7 +78,7 @@ var BidiAudioSampleRates = []int{16_000}
 // vendor; the catalog row advertises it as the only output format.
 const BidiOutputSampleRateHz = 24_000
 
-// BidiSetup is the first text frame of a GET /v1/bidi session: the vendor's
+// BidiSetup is the first text frame of a GET /v1/google/gemini-live session: the vendor's
 // own setup message. Unknown fields are refused so the Router forwards
 // exactly what it validated.
 type BidiSetup struct {
