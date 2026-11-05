@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -12,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"regexp"
@@ -441,6 +443,34 @@ func (w nativeRelayWriter) Flush() {
 	}
 	_ = http.NewResponseController(w.ResponseWriter).Flush()
 }
+
+// Keep the physical sockets available independently of websocket.Conn's
+// closing state. CloseNow waits for an already-started Close and cannot abort
+// its unbounded bufio payload discard on a peer's partial in-flight frame.
+type nativeUpgradeWriter struct {
+	http.ResponseWriter
+	connection net.Conn
+}
+
+func (w *nativeUpgradeWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	connection, buffer, err := http.NewResponseController(w.ResponseWriter).Hijack()
+	if err == nil {
+		w.connection = connection
+	}
+	return connection, buffer, err
+}
+
+func nativeCloseSocket(connection net.Conn) {
+	if connection == nil {
+		return
+	}
+	if secure, ok := connection.(interface{ NetConn() net.Conn }); ok {
+		// Interrupt TCP/Unix I/O directly, without TLS close-notify writes.
+		connection = secure.NetConn()
+	}
+	_ = connection.Close()
+}
+
 func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	ctx, done, ok := s.begin(w, r)
 	if !ok {
@@ -463,8 +493,21 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	client := *s.client
 	var rejection *relayapi.ErrorEnvelope
 	var rejectionBody []byte
+	var socketMu sync.Mutex
+	var upstreamSocket net.Conn
+	var upstreamBody io.Closer
 	client.Transport = nativeRoundTrip(func(req *http.Request) (*http.Response, error) {
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				socketMu.Lock()
+				upstreamSocket = info.Conn
+				socketMu.Unlock()
+			},
+		}))
 		response, err := s.client.Transport.RoundTrip(req)
+		if err == nil && response.StatusCode == http.StatusSwitchingProtocols {
+			upstreamBody = response.Body
+		}
 		if err == nil && response.StatusCode >= 400 && response.StatusCode <= 599 && response.Body != nil {
 			raw, readErr := io.ReadAll(io.LimitReader(response.Body, 8193))
 			_ = response.Body.Close()
@@ -508,14 +551,33 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer upstream.CloseNow()
-	local, err := websocket.Accept(w, r, nil)
+	closeUpstream := func() {
+		socketMu.Lock()
+		connection := upstreamSocket
+		socketMu.Unlock()
+		if connection != nil {
+			nativeCloseSocket(connection)
+		} else if upstreamBody != nil {
+			// Custom RoundTrippers may not report GotConn. The upgraded
+			// transport body still bypasses websocket's closing-state gate.
+			_ = upstreamBody.Close()
+		}
+	}
+	defer closeUpstream()
+	upgrade := &nativeUpgradeWriter{ResponseWriter: w}
+	local, err := websocket.Accept(upgrade, r, nil)
 	if err != nil {
 		return
 	}
 	defer local.CloseNow()
+	closeSockets := func() {
+		closeUpstream()
+		nativeCloseSocket(upgrade.connection)
+	}
+	defer closeSockets()
 	upstream.SetReadLimit(nativeMaxFrameBytes)
 	local.SetReadLimit(nativeMaxFrameBytes)
-	stop := context.AfterFunc(ctx, func() { _ = upstream.CloseNow(); _ = local.CloseNow() })
+	stop := context.AfterFunc(ctx, closeSockets)
 	defer stop()
 	type copyResult struct {
 		destination *websocket.Conn
@@ -557,10 +619,14 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	var closed websocket.CloseError
 	if first.fromRead && errors.As(first.err, &closed) {
 		// A close frame is part of the native protocol. Forward its exact
-		// status/reason; an abnormal EOF stays abnormal. Close has its own
-		// bounded handshake and the opposite copy continues reading its ack.
+		// status/reason; an abnormal EOF stays abnormal. Bound the handshake
+		// at the physical sockets, including partial payloads that the
+		// WebSocket library discards outside its context-aware read loop.
+		deadline := time.AfterFunc(s.timeToWrite, closeSockets)
 		_ = first.destination.Close(closed.Code, closed.Reason)
+		deadline.Stop()
 	}
+	closeSockets()
 	_ = upstream.CloseNow()
 	_ = local.CloseNow()
 	if !secondReceived {
