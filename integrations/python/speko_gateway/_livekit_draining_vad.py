@@ -14,6 +14,12 @@ from ._livekit_vad_audio import ProbabilityVAD, VADAudio
 from .client import GatewayError
 
 
+class _ResetBoundary(vad.VADStream._FlushSentinel):
+    def __init__(self, progress: int) -> None:
+        self.progress = progress
+        self.processed = self.cancelled = False
+
+
 class DrainingVAD(vad.VAD):
     """Drain partial local-inference/Silero windows without inventing speech time.
 
@@ -59,8 +65,8 @@ class _DrainingVADStream(vad.VADStream):
         self._probability = None
         self._segment = self._flushes = 0
         self._idle_at = 0.0
-        self._outward_speaking = False
-        self._outward_last = None
+        self._progress = 0
+        self._pending_reset: _ResetBoundary | None = None
         self._published: deque[tuple[vad.VADEvent, int]] = deque()
         super().__init__(parent)
 
@@ -78,6 +84,7 @@ class _DrainingVADStream(vad.VADStream):
                 "Local speech input exceeded its processing bound", retryable=False
             )
         super().push_frame(frame)
+        self._pending_reset = None
         self._sample_rate = frame.sample_rate
         self._queued += frame.samples_per_channel
         interval = self._source.capabilities.update_interval
@@ -91,58 +98,36 @@ class _DrainingVADStream(vad.VADStream):
         # Drain actual queued audio before the inner SDK's reset marker.
         self._check_input_not_ended()
         self._check_not_closed()
+        reset = self._pending_reset
+        if reset is not None and not reset.processed and reset.progress == self._progress:
+            # The SDK batch adapter implements end_input by forwarding a
+            # flush immediately followed by EOF. Coalesce that pair before
+            # either consumer advances, so in-flight speech still drains as
+            # one terminal segment rather than being reset halfway through.
+            reset.cancelled = True
+            self._flushes -= 1
         self._input_ch.close()
 
     def flush(self) -> None:
-        super().flush()
+        self._check_input_not_ended()
+        self._check_not_closed()
+        reset = _ResetBoundary(self._progress)
+        self._input_ch.send_nowait(reset)
+        self._pending_reset = reset
         # Fence publication synchronously at the framework's boundary. The
         # queued marker still drains accounting and resets the owned detector.
         self._flushes += 1
-        if self._outward_speaking:
-            # Explicitly close the delivered segment. This is the requested
-            # reset, without new inferred audio or invented silence. Pending
-            # real capture is classified again with fresh duration counters.
-            previous = self._outward_last
-            # Classification can have queued the real end before its consumer
-            # reaches it. Retain that segment's canonical audio instead of a
-            # newer segment's buffer. Otherwise the active buffer contains
-            # only acknowledged capture, with detector padding removed.
-            completed = next(
-                (event for event, segment in self._published
-                 if segment == self._flushes - 1
-                 and event.type is vad.VADEventType.END_OF_SPEECH),
-                None,
-            )
-            frames = completed.frames if completed is not None else [self._frame(bytes(self._speech))]
-            if not frames or not any(frame.samples_per_channel for frame in frames):
-                raise GatewayError("Local speech reset lost captured audio", retryable=False)
-            if completed is not None:
-                previous = completed
-            self._emit(
-                vad.VADEvent(
-                    type=vad.VADEventType.END_OF_SPEECH,
-                    timestamp=previous.timestamp,
-                    samples_index=previous.samples_index,
-                    speech_duration=previous.speech_duration,
-                    silence_duration=previous.silence_duration,
-                    frames=frames,
-                    speaking=False,
-                ),
-                segment=self._flushes,
-            )
+        # The SDK already owns an out-of-band STT end. A detector reset must
+        # not enqueue another end that could overwrite its following start.
 
     async def __anext__(self) -> vad.VADEvent:
         while True:
             event = await super().__anext__()
+            self._progress += 1
             original, segment = self._published.popleft()
             if event is not original:
                 raise GatewayError("Local speech event order changed", retryable=False)
             if segment == self._flushes:
-                self._outward_last = event
-                if event.type is vad.VADEventType.START_OF_SPEECH:
-                    self._outward_speaking = True
-                elif event.type is vad.VADEventType.END_OF_SPEECH:
-                    self._outward_speaking = False
                 return event
 
     async def aclose(self) -> None:
@@ -151,8 +136,8 @@ class _DrainingVADStream(vad.VADStream):
         finally:
             self._published.clear()
 
-    def _emit(self, event: vad.VADEvent, *, segment: int | None = None) -> None:
-        self._published.append((event, self._segment if segment is None else segment))
+    def _emit(self, event: vad.VADEvent) -> None:
+        self._published.append((event, self._segment))
         self._event_ch.send_nowait(event)
 
     def _reset(self) -> None:
@@ -164,6 +149,7 @@ class _DrainingVADStream(vad.VADStream):
         self._speech = bytearray()
         self._processed = self._last_index = 0
         self._replay_until = 0
+        self._last_inference_duration = 0.0
         self._deadline = None
 
     def _arm_tail(self) -> None:
@@ -179,6 +165,7 @@ class _DrainingVADStream(vad.VADStream):
         )
 
     def _push(self, frame: rtc.AudioFrame, *, padding: bool = False) -> None:
+        self._progress += 1
         raw = bytes(frame.data)
         self._unprocessed.extend(raw)
         self._audio.push(len(raw), padding=padding)
@@ -206,6 +193,7 @@ class _DrainingVADStream(vad.VADStream):
         self._push(self._frame(bytes(size)), padding=True)
 
     def _observe(self, event: vad.VADEvent) -> None:
+        self._progress += 1
         if self._segment != self._flushes:
             return  # Preserve unacknowledged real input for reclassification.
         if event.type is not vad.VADEventType.INFERENCE_DONE:
@@ -235,6 +223,7 @@ class _DrainingVADStream(vad.VADStream):
         self._queued -= count
         if not real:
             return
+        self._last_inference_duration = event.inference_duration
         self._history.extend(real)
         del self._history[: -30 * self._sample_rate * 2]
         options = self._inner._opts
@@ -310,6 +299,31 @@ class _DrainingVADStream(vad.VADStream):
                 )
             )
 
+    def _finish_speech(self) -> None:
+        state = self._probability
+        if state is None or not state.speaking:
+            return
+        options = self._inner._opts
+        self._emit(
+            vad.VADEvent(
+                type=vad.VADEventType.END_OF_SPEECH,
+                samples_index=(
+                    self._processed * getattr(options, "sample_rate", 16000)
+                    // self._sample_rate
+                ),
+                timestamp=self._processed / self._sample_rate,
+                speech_duration=(
+                    max(0, self._processed - state.started_at - state.silence_samples)
+                    / self._sample_rate
+                ),
+                silence_duration=state.silence_samples / self._sample_rate,
+                inference_duration=self._last_inference_duration,
+                frames=[self._frame(bytes(self._speech))],
+                speaking=False,
+            )
+        )
+        state.speaking = False
+
     async def _main_task(self) -> None:
         incoming = observed = None
         ending = False
@@ -340,6 +354,7 @@ class _DrainingVADStream(vad.VADStream):
                                 "Local speech detector ended before processing input",
                                 retryable=False,
                             ) from None
+                        self._finish_speech()
                         await self._inner.aclose()
                         return
                     if not ending:
@@ -352,6 +367,11 @@ class _DrainingVADStream(vad.VADStream):
                         ending = True
                     else:
                         if isinstance(value, self._FlushSentinel):
+                            if isinstance(value, _ResetBoundary):
+                                value.processed = True
+                                if value.cancelled:
+                                    incoming = asyncio.create_task(self._input_ch.__anext__())
+                                    continue
                             pending = self._audio.pending_real(bytes(self._unprocessed))
                             await utils.aio.cancel_and_wait(observed)
                             await self._inner.aclose()
