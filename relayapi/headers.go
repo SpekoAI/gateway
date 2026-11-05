@@ -19,9 +19,27 @@ const (
 )
 
 // HeaderIdempotencyKey is required on every POST and on every WebSocket
-// upgrade request. See idempotency.go for the content-hash and replay
-// semantics attached to the key.
+// upgrade request, with one exception: POST /v1/llm/admissions/release
+// takes it optionally, because releasing a ticket replays nothing. See
+// idempotency.go for the content-hash and replay semantics attached to the
+// key.
 const HeaderIdempotencyKey = "Idempotency-Key"
+
+// HeaderClientSessionID is the optional request header that ties a request
+// to the caller's Speko session; the Router records it on the admission. A
+// prepared LLM admission is bound to the value its prepare call sent, so the
+// real request and any release must send the same value (or omit it alike).
+const HeaderClientSessionID = "Speko-Client-Session-ID"
+
+// Prepared LLM admission headers. HeaderPreparedAdmission carries a ticket
+// from POST /v1/llm/admissions on the POST /v1/llm/responses request it was
+// prepared for. HeaderPreparedAdmissionOutcome is the response header that
+// says, on a request that carried a ticket, whether the ticket was used and
+// if not why; its values are the closed PreparedAdmissionOutcome set.
+const (
+	HeaderPreparedAdmission        = "Speko-Prepared-Admission"
+	HeaderPreparedAdmissionOutcome = "Speko-Prepared-Admission-Outcome"
+)
 
 // Agent-readable lifecycle and throttling headers. RateLimit-Policy follows
 // the current IETF HTTPAPI structured-field draft; Retry-After, Deprecation,

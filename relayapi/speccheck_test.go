@@ -112,6 +112,9 @@ func TestHTTPFixturesMatchOpenAPISchemas(t *testing.T) {
 		{"llm-request-tools.json", "LLMRequest"},
 		{"llm-request-structured.json", "LLMRequest"},
 		{"llm-response.json", "LLMResponse"},
+		{"llm-admission.json", "LLMAdmission"},
+		{"llm-admission-release-request.json", "LLMAdmissionReleaseRequest"},
+		{"llm-admission-release.json", "LLMAdmissionRelease"},
 		{"evaluation-request.json", "EvaluationRequest"},
 		{"evaluation-response.json", "EvaluationResponse"},
 	} {
@@ -389,6 +392,9 @@ func wireSchemaTable() []struct {
 		{relayapi.ResponseFormat{}, openapi("ResponseFormat")},
 		{relayapi.LLMRequest{}, openapi("LLMRequest")},
 		{relayapi.LLMResponse{}, openapi("LLMResponse")},
+		{relayapi.LLMAdmission{}, openapi("LLMAdmission")},
+		{relayapi.LLMAdmissionReleaseRequest{}, openapi("LLMAdmissionReleaseRequest")},
+		{relayapi.LLMAdmissionRelease{}, openapi("LLMAdmissionRelease")},
 		{relayapi.EvaluationRequest{}, openapi("EvaluationRequest")},
 		{relayapi.EvaluationQuestion{}, openapi("EvaluationQuestion")},
 		{relayapi.EvaluationAnswer{}, openapi("EvaluationAnswer")},
@@ -650,8 +656,10 @@ func TestSpecRefsAllResolve(t *testing.T) {
 }
 
 // The OpenAPI plumbing around the schemas: the server, the bearer scheme,
-// the required Idempotency-Key parameter on every POST, the exact response
-// header set per endpoint (Speko-Usage-Characters on TTS only), and the LLM
+// the required Idempotency-Key parameter on every POST (optional only on the
+// prepared-admission release), the prepared-admission request headers, the
+// exact response header set per endpoint (Speko-Usage-Characters on TTS
+// only, Speko-Prepared-Admission-Outcome on LLM responses only), and the LLM
 // endpoint's JSON/SSE content duality.
 func TestOpenAPIDeclaresRelayEnvelope(t *testing.T) {
 	t.Parallel()
@@ -675,17 +683,41 @@ func TestOpenAPIDeclaresRelayEnvelope(t *testing.T) {
 	if parameter["name"] != relayapi.HeaderIdempotencyKey || parameter["in"] != "header" || parameter["required"] != true {
 		t.Fatalf("IdempotencyKey parameter must be the required %s header, got %v", relayapi.HeaderIdempotencyKey, parameter)
 	}
-	for _, path := range []string{"/v1/stt/transcriptions", "/v1/tts/speech", "/v1/llm/responses"} {
-		parameters := specNode(t, doc, "paths", path, "post", "parameters").([]any)
-		found := false
-		for _, entry := range parameters {
-			if entry.(map[string]any)["$ref"] == "#/components/parameters/IdempotencyKey" {
-				found = true
-			}
-		}
-		if !found {
+	for _, path := range []string{"/v1/stt/transcriptions", "/v1/tts/speech", "/v1/llm/responses", "/v1/llm/admissions"} {
+		if !postReferencesParameter(t, doc, path, "IdempotencyKey") {
 			t.Errorf("%s: POST must reference the IdempotencyKey parameter", path)
 		}
+	}
+	// Releasing a prepared admission replays nothing, so its key is the one
+	// optional Idempotency-Key on a POST, under its own parameter so the
+	// shared one stays required.
+	optional := specNode(t, doc, "components", "parameters", "IdempotencyKeyOptional").(map[string]any)
+	if optional["name"] != relayapi.HeaderIdempotencyKey || optional["in"] != "header" || optional["required"] != false {
+		t.Fatalf("IdempotencyKeyOptional parameter must be the optional %s header, got %v", relayapi.HeaderIdempotencyKey, optional)
+	}
+	if !postReferencesParameter(t, doc, "/v1/llm/admissions/release", "IdempotencyKeyOptional") ||
+		postReferencesParameter(t, doc, "/v1/llm/admissions/release", "IdempotencyKey") {
+		t.Errorf("/v1/llm/admissions/release: POST must reference IdempotencyKeyOptional, not IdempotencyKey")
+	}
+	// A prepared admission is bound to the client session it was prepared
+	// under, so every operation that issues, presents, or releases one
+	// declares the header, and only /v1/llm/responses accepts a ticket.
+	for name, header := range map[string]string{
+		"ClientSessionID":   relayapi.HeaderClientSessionID,
+		"PreparedAdmission": relayapi.HeaderPreparedAdmission,
+	} {
+		parameter := specNode(t, doc, "components", "parameters", name).(map[string]any)
+		if parameter["name"] != header || parameter["in"] != "header" || parameter["required"] != false {
+			t.Fatalf("%s parameter must be the optional %s header, got %v", name, header, parameter)
+		}
+	}
+	for _, path := range []string{"/v1/llm/responses", "/v1/llm/admissions", "/v1/llm/admissions/release"} {
+		if !postReferencesParameter(t, doc, path, "ClientSessionID") {
+			t.Errorf("%s: POST must reference the ClientSessionID parameter", path)
+		}
+	}
+	if !postReferencesParameter(t, doc, "/v1/llm/responses", "PreparedAdmission") {
+		t.Errorf("/v1/llm/responses: POST must reference the PreparedAdmission parameter")
 	}
 
 	routeHeaders := []string{
@@ -699,24 +731,32 @@ func TestOpenAPIDeclaresRelayEnvelope(t *testing.T) {
 	for _, tc := range []struct {
 		path    string
 		method  string
+		status  string
 		headers []string
 	}{
-		{"/openapi.json", "get", []string{relayapi.HeaderRateLimitPolicy}},
-		{"/v1/models", "get", []string{relayapi.HeaderRequestID, relayapi.HeaderRegion, relayapi.HeaderRateLimitPolicy}},
-		{"/v1/stt/transcriptions", "post", routeHeaders},
+		{"/openapi.json", "get", "200", []string{relayapi.HeaderRateLimitPolicy}},
+		{"/v1/models", "get", "200", []string{relayapi.HeaderRequestID, relayapi.HeaderRegion, relayapi.HeaderRateLimitPolicy}},
+		{"/v1/stt/transcriptions", "post", "200", routeHeaders},
 		// TTS is the only endpoint with a usage header: the raw audio
 		// body has no place for a usage object. STT deliberately has
 		// none — its usage lives in the response body.
-		{"/v1/tts/speech", "post", append(append([]string{}, routeHeaders...), relayapi.HeaderUsageCharacters)},
-		{"/v1/llm/responses", "post", routeHeaders},
+		{"/v1/tts/speech", "post", "200", append(append([]string{}, routeHeaders...), relayapi.HeaderUsageCharacters)},
+		// The outcome header is LLM-only: a prepared admission is an LLM
+		// admission.
+		{"/v1/llm/responses", "post", "200", append(append([]string{}, routeHeaders...), relayapi.HeaderPreparedAdmissionOutcome)},
+		// Preparing and releasing dispatch nothing, so there is no route
+		// to name.
+		{"/v1/llm/admissions", "post", "201", []string{relayapi.HeaderRateLimitPolicy}},
+		{"/v1/llm/admissions", "post", "204", []string{relayapi.HeaderRateLimitPolicy}},
+		{"/v1/llm/admissions/release", "post", "200", []string{relayapi.HeaderRateLimitPolicy}},
 	} {
-		declared := specNode(t, doc, "paths", tc.path, tc.method, "responses", "200", "headers").(map[string]any)
+		declared := specNode(t, doc, "paths", tc.path, tc.method, "responses", tc.status, "headers").(map[string]any)
 		if len(declared) != len(tc.headers) {
-			t.Errorf("%s: 200 declares %d headers, want %d", tc.path, len(declared), len(tc.headers))
+			t.Errorf("%s: %s declares %d headers, want %d", tc.path, tc.status, len(declared), len(tc.headers))
 		}
 		for _, header := range tc.headers {
 			if _, ok := declared[header]; !ok {
-				t.Errorf("%s: 200 must declare the %s header", tc.path, header)
+				t.Errorf("%s: %s must declare the %s header", tc.path, tc.status, header)
 			}
 		}
 	}
@@ -726,6 +766,44 @@ func TestOpenAPIDeclaresRelayEnvelope(t *testing.T) {
 		if _, ok := content[mediaType]; !ok {
 			t.Errorf("/v1/llm/responses: 200 must offer %s (stream=false JSON, stream=true SSE)", mediaType)
 		}
+	}
+}
+
+// postReferencesParameter reports whether the POST operation at path
+// references the named components/parameters entry.
+func postReferencesParameter(t *testing.T, doc *specDoc, path, name string) bool {
+	t.Helper()
+	for _, entry := range specNode(t, doc, "paths", path, "post", "parameters").([]any) {
+		if entry.(map[string]any)["$ref"] == "#/components/parameters/"+name {
+			return true
+		}
+	}
+	return false
+}
+
+// The OpenAPI document must carry the exact closed prepared-admission outcome
+// set, in the order PreparedAdmissionOutcomes returns, and the outcome header
+// must take its values from that schema.
+func TestSpecPreparedAdmissionOutcomeEnumMatchesGo(t *testing.T) {
+	t.Parallel()
+
+	doc := loadSpecDoc(t, "openapi.json")
+	want := relayapi.PreparedAdmissionOutcomes()
+	enum, ok := doc.schema(t, "PreparedAdmissionOutcome")["enum"].([]any)
+	if !ok {
+		t.Fatal("PreparedAdmissionOutcome schema has no enum")
+	}
+	if len(enum) != len(want) {
+		t.Fatalf("PreparedAdmissionOutcome enum has %d values, want %d", len(enum), len(want))
+	}
+	for i, outcome := range want {
+		if enum[i] != string(outcome) {
+			t.Fatalf("PreparedAdmissionOutcome enum[%d] = %v, want %q", i, enum[i], outcome)
+		}
+	}
+	header := specNode(t, doc, "components", "headers", "SpekoPreparedAdmissionOutcome", "schema").(map[string]any)
+	if header["$ref"] != "#/components/schemas/PreparedAdmissionOutcome" {
+		t.Fatalf("SpekoPreparedAdmissionOutcome header schema = %v, want the PreparedAdmissionOutcome ref", header)
 	}
 }
 

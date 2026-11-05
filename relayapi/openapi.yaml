@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:21ae052d559ca4358c0a3c5b92fdd654573cb17439b95dfd33bffe8262854204
-# yaml-body: sha256:4e899b8eabf5c0bc8bb6307cd831021116b55cf631ac08dfe8e3a3d9a08950d0
+# json-mirror: openapi.json sha256:d267099b71429ad4a3a940710eb60e9324f6d3eec33309a2a5a115a81cf468e4
+# yaml-body: sha256:0a458cd262577010e4657619fd86014c9f77c356c17b4455122faa047cf61c0b
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -25,7 +25,8 @@ info:
     Router serves at /asyncapi.json. This document is the HTTP contract, the
     request/response surface beside those sockets: model discovery, batch
     speech transcription, one-shot speech synthesis, LLM responses over JSON
-    or server-sent events, and Jev evaluations. The Go types in package
+    or server-sent events with their prepared admissions, and Jev
+    evaluations. The Go types in package
     relayapi are the source of truth for every shape in this document, and
     speccheck_test.go machine-checks the two against each other. The /v1
     prefix is the stable major version: compatible fields and capabilities
@@ -297,9 +298,14 @@ paths:
         ids never appear in output — they are captured only as content-free
         telemetry evidence. There is no previous_response_id anywhere in the
         contract: callers resend full history, including function results, on
-        every request.
+        every request. A request prepared with POST /v1/llm/admissions
+        carries its ticket in Speko-Prepared-Admission and is dispatched
+        without an admission round trip; a ticket never causes a refusal,
+        and Speko-Prepared-Admission-Outcome reports what became of it.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/ClientSessionID"
+        - $ref: "#/components/parameters/PreparedAdmission"
       requestBody:
         required: true
         content:
@@ -324,6 +330,8 @@ paths:
               $ref: "#/components/headers/SpekoRegion"
             RateLimit-Policy:
               $ref: "#/components/headers/RateLimitPolicy"
+            Speko-Prepared-Admission-Outcome:
+              $ref: "#/components/headers/SpekoPreparedAdmissionOutcome"
           content:
             application/json:
               schema:
@@ -346,6 +354,131 @@ paths:
                   success or error on failure — never both and never zero, so
                   a client that sees the connection close without a terminal
                   event knows the stream was truncated rather than finished.
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/llm/admissions:
+    post:
+      operationId: createLLMAdmission
+      summary: Prepare the admission for an LLM request before its last turn is known
+      description: >-
+        Takes the per-request admission (key authentication, credit check
+        and reservation, a signed single-use plan) off a voice turn's
+        critical path. Every POST /v1/llm/responses is admitted on its own,
+        and from a Router region far from Speko's control plane that is one
+        cross-region round trip per turn. A voice client calls this
+        operation when the caller starts speaking, with the
+        POST /v1/llm/responses body it would send if the conversation ended
+        now: the history so far, and the routing, tools, response_format,
+        max_output_tokens, and stream the real request will carry. The
+        Router admits it the ordinary way, reserving input tokens for this
+        body plus headroom for the turn still being spoken (8 KiB of content
+        and four items) and output tokens for its max_output_tokens, and
+        answers 201 with the admission sealed into an opaque ticket. The
+        client then sends the real POST /v1/llm/responses with the ticket in
+        Speko-Prepared-Admission, from the same API key and with the same
+        Speko-Client-Session-ID, and the Router dispatches it with no
+        admission round trip; Speko-Prepared-Admission-Outcome on that
+        response says whether the ticket was used. The answer is 204 instead
+        when this Router region would hand the request to another region,
+        where a ticket from here is useless: send the real request without
+        one. Failures are the ones admission of POST /v1/llm/responses
+        returns, such as insufficient_credit or route_not_found, in the same
+        error envelope. Use an Idempotency-Key distinct from the real
+        request's: the admission is recorded under this call's key and body
+        hash, so a real request that falls back to ordinary admission under
+        the same key would be an idempotency_conflict. A ticket that is
+        neither used nor released holds its reservation and one organization
+        concurrency slot until expires_at, so keep at most one unreleased
+        ticket per conversation, reuse it across false starts, and release it
+        with POST /v1/llm/admissions/release when it will not be used.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/ClientSessionID"
+      requestBody:
+        required: true
+        description: >-
+          An ordinary POST /v1/llm/responses body holding the conversation so
+          far, before the turn being spoken.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LLMRequest"
+      responses:
+        "201":
+          description: The prepared admission and its ticket.
+          headers:
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMAdmission"
+        "204":
+          description: >-
+            No ticket: this Router region would hand the request to another
+            region. Nothing was admitted or reserved. Send the real request
+            without Speko-Prepared-Admission.
+          headers:
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/llm/admissions/release:
+    post:
+      operationId: releaseLLMAdmission
+      summary: Release a prepared LLM admission that will not be used
+      description: >-
+        Releases a ticket from POST /v1/llm/admissions that the client will
+        not present, after a false start or a caller who hung up
+        mid-sentence. Send it with the same API key and
+        Speko-Client-Session-ID the ticket was issued to; like the ticket
+        itself, it is valid only in the Router region that issued it. The
+        Router first has the ticket's plan spent, so that no request can
+        still be dispatched on it, and only then settles the prepared request
+        at zero and frees its concurrency slot. released is true when this
+        call did that, and false when there was nothing left to release: the
+        ticket was already used, already released, or expired, or could not
+        be retired now, and its reservation then ends when its plan expires.
+        Releasing is therefore safe after any
+        Speko-Prepared-Admission-Outcome, and worth doing after every outcome
+        but used. Idempotency-Key is optional here, because a release replays
+        nothing.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyOptional"
+        - $ref: "#/components/parameters/ClientSessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LLMAdmissionReleaseRequest"
+      responses:
+        "200":
+          description: Whether this call released the admission.
+          headers:
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMAdmissionRelease"
+        "400":
+          description: >-
+            invalid_request: the body names no admission, or the ticket is
+            not valid for this API key, Speko-Client-Session-ID, or Router
+            region, which includes a ticket that does not decrypt. Nothing
+            was released.
+          headers:
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         default:
@@ -405,7 +538,9 @@ components:
       in: header
       required: true
       description: >-
-        Required on every POST. The Router persists only the key, a content
+        Required on every POST except POST /v1/llm/admissions/release, which
+        takes it optionally (IdempotencyKeyOptional). The Router persists
+        only the key, a content
         hash, and the request's execution status — never the content itself.
         For single-part bodies the content hash covers the raw body bytes
         exactly as sent; for multipart bodies it covers the decoded part
@@ -424,6 +559,49 @@ components:
         type: string
         minLength: 1
         maxLength: 256
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >-
+        Optional on POST /v1/llm/admissions/release, which replays nothing;
+        a key that is sent must still meet the IdempotencyKey bounds. Every
+        other POST requires the key.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+    ClientSessionID:
+      name: Speko-Client-Session-ID
+      in: header
+      required: false
+      description: >-
+        The caller's Speko session id, recorded on the admission so the
+        request is attributed to that session. A prepared admission is bound
+        to the value its POST /v1/llm/admissions call sent, absence included:
+        the POST /v1/llm/responses that presents the ticket and any
+        POST /v1/llm/admissions/release of it must send the same value.
+      schema:
+        type: string
+    PreparedAdmission:
+      name: Speko-Prepared-Admission
+      in: header
+      required: false
+      description: >-
+        A ticket from POST /v1/llm/admissions, sent verbatim. When it fits
+        this request, the Router dispatches on the ticket's admission with no
+        admission round trip. It fits when it was issued by this Router
+        region to this API key and Speko-Client-Session-ID, under the current
+        catalog release and the same routing mode; has at least five seconds
+        left before its expires_at; names a provider and model that are a
+        candidate for this request; and reserved at least the input and
+        output tokens this request needs. A ticket that does not fit, or
+        cannot be read, never fails the request: the request is admitted the
+        ordinary way and Speko-Prepared-Admission-Outcome says why. A ticket
+        admits one request; presenting it again ends in the redialed
+        outcome.
+      schema:
+        type: string
   headers:
     SpekoRequestID:
       description: >-
@@ -462,6 +640,18 @@ components:
       schema:
         type: integer
         minimum: 0
+    SpekoPreparedAdmissionOutcome:
+      description: >-
+        LLM only. Sent when the request carried Speko-Prepared-Admission and
+        reached the ticket check, which follows request validation and route
+        selection, so an error response after that point carries it too.
+        used means the request was dispatched on the ticket; every other
+        value means it was admitted the ordinary way, and says why. It is
+        absent when the request was handed to another Router region, which
+        does not see the ticket; the ticket is then unused and should be
+        released.
+      schema:
+        $ref: "#/components/schemas/PreparedAdmissionOutcome"
     RateLimitPolicy:
       description: >-
         The active infrastructure quota policy in the current HTTPAPI
@@ -1918,6 +2108,84 @@ components:
         - stop_reason
         - usage
       additionalProperties: false
+    LLMAdmission:
+      type: object
+      description: The 201 body of POST /v1/llm/admissions.
+      properties:
+        object:
+          type: string
+          enum: [llm.admission]
+        admission:
+          type: string
+          minLength: 1
+          description: >-
+            The ticket, to send verbatim in Speko-Prepared-Admission. It is
+            opaque and sealed: it carries the admission the Router made, which
+            the client can neither read nor alter, and it currently begins
+            with spa1. It is valid only in the Router region that issued it.
+        expires_at:
+          type: string
+          format: date-time
+          description: >-
+            When the admitted plan expires (RFC 3339), about five minutes
+            after issue in production. The ticket is redeemed only while at
+            least five seconds of that remain.
+      required:
+        - object
+        - admission
+        - expires_at
+      additionalProperties: false
+    LLMAdmissionReleaseRequest:
+      type: object
+      description: The POST /v1/llm/admissions/release body.
+      properties:
+        admission:
+          type: string
+          minLength: 1
+          description: The ticket, exactly as POST /v1/llm/admissions returned it.
+      required:
+        - admission
+      additionalProperties: false
+    LLMAdmissionRelease:
+      type: object
+      description: >-
+        The 200 body of POST /v1/llm/admissions/release. released is true
+        when this call released the admission, and false when the ticket was
+        already used, already released, or expired, or could not be retired
+        now; its reservation then ends when its plan expires.
+      properties:
+        object:
+          type: string
+          enum: [llm.admission.release]
+        released:
+          type: boolean
+      required:
+        - object
+        - released
+      additionalProperties: false
+    PreparedAdmissionOutcome:
+      type: string
+      description: >-
+        What became of a presented prepared admission, sent in
+        Speko-Prepared-Admission-Outcome. The set is closed. used: the
+        request was dispatched on the ticket's admission. Every other value
+        means the request was admitted the ordinary way instead. invalid:
+        the ticket did not decrypt, or was issued to another API key,
+        Speko-Client-Session-ID, or Router region. expired: its plan had less
+        than five seconds left. stale: it was issued under another catalog
+        release. route: the routing mode changed, or its provider and model
+        are not a candidate for this request. budget: this request needs
+        more input or output tokens than it reserved. redialed: the attempt
+        on it failed before the provider connector accepted it, as a ticket
+        presented a second time does, so the request was admitted again.
+      enum:
+        - used
+        - invalid
+        - expired
+        - stale
+        - route
+        - budget
+        - redialed
     ResponseCreated:
       type: object
       description: >-
