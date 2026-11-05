@@ -89,6 +89,8 @@ func TestModelsResponseRejectsEachRuleViolation(t *testing.T) {
 		{"s2s without output formats", func(r *relayapi.ModelsResponse) { r.Models[2].OutputAudioFormats = nil }, "output_audio_formats"},
 		{"s2s without endpoint", func(r *relayapi.ModelsResponse) { r.Models[2].Endpoint = "" }, "endpoint"},
 		{"s2s on a foreign route", func(r *relayapi.ModelsResponse) { r.Models[2].Endpoint = "/v1/stt/stream" }, "endpoint"},
+		{"s2s on another vendor route", func(r *relayapi.ModelsResponse) { r.Models[2].Endpoint = relayapi.XAIRealtimeRoutePath }, "endpoint and protocol"},
+		{"s2s on retired shared route", func(r *relayapi.ModelsResponse) { r.Models[2].Endpoint = "/v1/realtime" }, "endpoint"},
 		{"s2s without protocol", func(r *relayapi.ModelsResponse) { r.Models[3].Protocol = "" }, "protocol"},
 		{"s2s with batch limits", func(r *relayapi.ModelsResponse) {
 			r.Models[3].BatchAudioLimits = &relayapi.BatchAudioLimits{MaxPCMBytes: 1}

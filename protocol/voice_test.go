@@ -15,12 +15,12 @@ func TestSpeechProtocolsAndPublicRoutes(t *testing.T) {
 		protocol protocol.SpeechProtocol
 		route    string
 	}{
-		{protocol.SpeechProtocolOpenAIRealtimeV1, "/v1/realtime"},
-		{protocol.SpeechProtocolOpenAILiveV1, "/v1/live"},
-		{protocol.SpeechProtocolGoogleLiveV1, "/v1/bidi"},
-		{protocol.SpeechProtocolXAIRealtimeV1, "/v1/realtime"},
-		{protocol.SpeechProtocolOpenAIRealtimeTranslationV1, "/v1/realtime/translations"},
-		{protocol.SpeechProtocolAlibabaLiveTranslateV1, "/v1/realtime/translations/qwen"},
+		{protocol.SpeechProtocolOpenAIRealtimeV1, "/v1/openai/realtime"},
+		{protocol.SpeechProtocolOpenAILiveV1, "/v1/openai/gpt-live"},
+		{protocol.SpeechProtocolGoogleLiveV1, "/v1/google/gemini-live"},
+		{protocol.SpeechProtocolXAIRealtimeV1, "/v1/xai/realtime"},
+		{protocol.SpeechProtocolOpenAIRealtimeTranslationV1, "/v1/openai/realtime-translations"},
+		{protocol.SpeechProtocolAlibabaLiveTranslateV1, "/v1/alibaba/qwen-livetranslate"},
 	} {
 		if !protocol.ValidSpeechProtocol(tc.protocol) {
 			t.Fatalf("%s must be valid", tc.protocol)
@@ -32,10 +32,10 @@ func TestSpeechProtocolsAndPublicRoutes(t *testing.T) {
 	if protocol.ValidSpeechProtocol("openai.realtime.v2") {
 		t.Fatal("unknown protocol accepted")
 	}
-	// OpenAI and xAI deliberately share /v1/realtime. The exact model id
-	// selects the protocol before the session configuration is built.
-	if protocol.SpeechProtocolOpenAIRealtimeV1.PublicRoute() != protocol.SpeechProtocolXAIRealtimeV1.PublicRoute() {
-		t.Fatal("realtime-shaped protocols must share /v1/realtime")
+	// Their session shapes differ, so a model cannot select another vendor's
+	// protocol through a shared URL. The receiving route fixes the protocol.
+	if protocol.SpeechProtocolOpenAIRealtimeV1.PublicRoute() == protocol.SpeechProtocolXAIRealtimeV1.PublicRoute() {
+		t.Fatal("native realtime protocols must have separate vendor routes")
 	}
 
 	// LiveTranslate reuses Realtime event NAMES but is not conversational:

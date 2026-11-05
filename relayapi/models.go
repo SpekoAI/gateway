@@ -244,11 +244,21 @@ func (m Model) Validate() error {
 		if len(m.OutputAudioFormats) == 0 {
 			return fmt.Errorf("output_audio_formats: at least one format is required for s2s models")
 		}
-		if m.Endpoint != RealtimeRoutePath && m.Endpoint != LiveRoutePath && m.Endpoint != BidiRoutePath && m.Endpoint != TranslationRoutePath && m.Endpoint != QwenTranslationRoutePath {
-			return fmt.Errorf("endpoint: s2s models are served on %s, %s, %s, %s or %s, got %q", RealtimeRoutePath, LiveRoutePath, BidiRoutePath, TranslationRoutePath, QwenTranslationRoutePath, m.Endpoint)
+		if m.Endpoint != RealtimeRoutePath && m.Endpoint != XAIRealtimeRoutePath && m.Endpoint != LiveRoutePath && m.Endpoint != BidiRoutePath && m.Endpoint != TranslationRoutePath && m.Endpoint != QwenTranslationRoutePath {
+			return fmt.Errorf("endpoint: s2s models require a vendor-specific native voice route, got %q", m.Endpoint)
 		}
 		if strings.TrimSpace(m.Protocol) == "" || strings.ContainsAny(m.Protocol, " \t\r\n") {
 			return fmt.Errorf("protocol: required for s2s models")
+		}
+		if expected := map[string]string{
+			"openai.realtime.v1":             RealtimeRoutePath,
+			"xai.realtime.v1":                XAIRealtimeRoutePath,
+			"openai.live.v1":                 LiveRoutePath,
+			"google.live.v1":                 BidiRoutePath,
+			"openai.realtime.translation.v1": TranslationRoutePath,
+			"alibaba.livetranslate.v1":       QwenTranslationRoutePath,
+		}[m.Protocol]; expected == "" || m.Endpoint != expected {
+			return fmt.Errorf("endpoint and protocol: native voice route must match its protocol")
 		}
 		if m.BatchAudioLimits != nil {
 			return fmt.Errorf("batch_audio_limits: must be omitted for s2s models")

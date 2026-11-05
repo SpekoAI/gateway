@@ -15,28 +15,28 @@ import (
 // signed relay plans assert it, connectors verify it before touching a
 // credential, and the Router exposes the realtime-shaped protocols, GPT-Live,
 // Gemini Live, and Alibaba LiveTranslate natively on their own public routes
-// (/v1/realtime, /v1/live, /v1/bidi, /v1/realtime/translations/qwen).
+// (/v1/openai/realtime, /v1/openai/gpt-live, /v1/google/gemini-live, /v1/alibaba/qwen-livetranslate).
 type SpeechProtocol string
 
 const (
 	// SpeechProtocolOpenAIRealtimeV1 is the OpenAI Realtime event protocol
 	// (input_audio_buffer.append, response.output_audio.delta, ...). Public
-	// route: GET /v1/realtime?model=<id>.
+	// route: GET /v1/openai/realtime?model=<id>.
 	SpeechProtocolOpenAIRealtimeV1 SpeechProtocol = "openai.realtime.v1"
 	// SpeechProtocolOpenAILiveV1 is the GPT-Live event protocol
 	// (session.start, session.input_audio.append, session.output_audio.delta,
-	// delegation and response.event envelopes). Public route: GET /v1/live;
+	// delegation and response.event envelopes). Public route: GET /v1/openai/gpt-live;
 	// the model rides the initial session.start frame.
 	SpeechProtocolOpenAILiveV1 SpeechProtocol = "openai.live.v1"
 	// SpeechProtocolGoogleLiveV1 is Gemini Live (BidiGenerateContent), served
-	// natively on /v1/bidi. Unlike the two OpenAI protocols its frames are
+	// natively on /v1/google/gemini-live. Unlike the two OpenAI protocols its frames are
 	// KEY-tagged (`{"setup":…}`, `{"realtimeInput":…}`) rather than carrying a
 	// "type" field, so it uses the BidiControl family below instead of
 	// ProviderControl.
 	SpeechProtocolGoogleLiveV1 SpeechProtocol = "google.live.v1"
 	// SpeechProtocolXAIRealtimeV1 is xAI Grok Voice, a Realtime-shaped
 	// protocol with its own session body. Public route: GET
-	// /v1/realtime?model=<id>; the exact model selects this protocol.
+	// /v1/xai/realtime?model=<id>; the route fixes this protocol.
 	SpeechProtocolXAIRealtimeV1 SpeechProtocol = "xai.realtime.v1"
 	// SpeechProtocolOpenAIRealtimeTranslationV1 is OpenAI realtime speech
 	// translation (gpt-realtime-translate) on the vendor's dedicated
@@ -47,7 +47,7 @@ const (
 	// audio rides session.input_audio_buffer.append, and the answer is a
 	// continuous stream of session.output_audio.delta and transcript deltas
 	// rather than responses. Public route: GET
-	// /v1/realtime/translations?model=<id>.
+	// /v1/openai/realtime-translations?model=<id>.
 	SpeechProtocolOpenAIRealtimeTranslationV1 SpeechProtocol = "openai.realtime.translation.v1"
 	// SpeechProtocolAlibabaLiveTranslateV1 is Alibaba Model Studio's
 	// LiveTranslate event protocol (qwen3.8-livetranslate-flash-realtime):
@@ -57,9 +57,9 @@ const (
 	// not their meaning: the session body carries translation.language
 	// instead of instructions and tools, turns are cut by the vendor's own
 	// VAD, and the session must end with session.finish or the final segment
-	// is never translated. Sharing /v1/realtime would advertise a
+	// is never translated. Sharing /v1/openai/realtime would advertise a
 	// conversational surface this socket does not have, so it gets its own
-	// public route: GET /v1/realtime/translations/qwen?model=<id>.
+	// public route: GET /v1/alibaba/qwen-livetranslate?model=<id>.
 	SpeechProtocolAlibabaLiveTranslateV1 SpeechProtocol = "alibaba.livetranslate.v1"
 )
 
@@ -77,18 +77,20 @@ func ValidSpeechProtocol(p SpeechProtocol) bool {
 // natively, or "" for protocols the Router does not expose.
 func (p SpeechProtocol) PublicRoute() string {
 	switch p {
-	case SpeechProtocolOpenAIRealtimeV1, SpeechProtocolXAIRealtimeV1:
-		return "/v1/realtime"
+	case SpeechProtocolOpenAIRealtimeV1:
+		return "/v1/openai/realtime"
+	case SpeechProtocolXAIRealtimeV1:
+		return "/v1/xai/realtime"
 	case SpeechProtocolOpenAILiveV1:
-		return "/v1/live"
+		return "/v1/openai/gpt-live"
 	case SpeechProtocolGoogleLiveV1:
-		return "/v1/bidi"
+		return "/v1/google/gemini-live"
 	case SpeechProtocolOpenAIRealtimeTranslationV1:
-		return "/v1/realtime/translations"
+		return "/v1/openai/realtime-translations"
 	case SpeechProtocolAlibabaLiveTranslateV1:
 		// relayapi.QwenTranslationRoutePath; this package cannot import
 		// relayapi, and TestSpeechProtocolsAndPublicRoutes pins the two.
-		return "/v1/realtime/translations/qwen"
+		return "/v1/alibaba/qwen-livetranslate"
 	}
 	return ""
 }
@@ -111,7 +113,7 @@ const (
 	MinLiveMaxOutputTokens          = 16
 	MaxLiveMaxOutputTokens          = 131_072
 	// MaxBidiSetupBytes bounds the Gemini Live setup document forwarded from
-	// the public /v1/bidi socket. relayapi.MaxBidiSetupFrameBytes mirrors it
+	// the public /v1/google/gemini-live socket. relayapi.MaxBidiSetupFrameBytes mirrors it
 	// on the whole first frame, so a document the route accepts always fits
 	// through here; the two must move together.
 	MaxBidiSetupBytes = 192 << 10
@@ -639,7 +641,7 @@ func sortStrings(values []string) {
 }
 
 // VoiceSessionConfigure rides the connector handshake of a native
-// speech-to-speech relay session (the Router's /v1/realtime and /v1/live).
+// speech-to-speech relay session (the Router's /v1/openai/realtime and /v1/openai/gpt-live).
 // The edge builds it from what it admitted — the protocol, both audio
 // directions, the resolved voice, the voice instructions, and for GPT-Live
 // the bounded history and delegation — and the connector opens the provider
@@ -653,7 +655,7 @@ type VoiceSessionConfigure struct {
 	Instructions string         `json:"instructions,omitempty"`
 	Live         *LiveOptions   `json:"live,omitempty"`
 	// Bidi carries the caller's Gemini Live setup document on the native
-	// /v1/bidi route. Nil on every other protocol.
+	// /v1/google/gemini-live route. Nil on every other protocol.
 	Bidi *BidiOptions `json:"bidi,omitempty"`
 	// ThinkingLevel asks a Gemini Live model to think harder before speaking.
 	// Carried through to S2SOptions so the adapter sees what the caller asked

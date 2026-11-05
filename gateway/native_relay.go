@@ -1,9 +1,11 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"regexp"
@@ -68,6 +71,25 @@ var nativeHTTPRoutes = map[string]bool{
 	"/v1/llm/responses":      true,
 	"/v1/stt/transcriptions": true,
 	"/v1/tts/speech":         true,
+}
+
+// The vendor-native voice paths are deliberately separate. Query-selected
+// protocols carry one exact model; GPT-Live and Gemini bind it in their first
+// frame. No arbitrary URL settings, credentials or alternate relay are accepted.
+var nativeVoiceRoutes = map[string]struct{}{
+	relayapi.RealtimeRoutePath:        {},
+	relayapi.XAIRealtimeRoutePath:     {},
+	relayapi.LiveRoutePath:            {},
+	relayapi.BidiRoutePath:            {},
+	relayapi.TranslationRoutePath:     {},
+	relayapi.QwenTranslationRoutePath: {},
+}
+
+func nativeQueryAllowed(r *http.Request) bool {
+	if _, voice := nativeVoiceRoutes[r.URL.Path]; voice {
+		return relayapi.ValidateNativeVoiceURL(r.URL) == nil
+	}
+	return r.URL.RawQuery == "" && !r.URL.ForceQuery && r.URL.RawPath == ""
 }
 
 func NewNativeRelay(config NativeRelayConfig) (*NativeRelayServer, error) {
@@ -189,6 +211,55 @@ func nativeOne(h http.Header, name string) string {
 	}
 	return values[0]
 }
+
+func nativeWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
+	// net/http may drain an unread body while flushing the 101 response.
+	// Do not admit upstream work behind an incomplete local HTTP message,
+	// and close HTTP so writing the refusal cannot wait for that body either.
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		w.Header().Set("Connection", "close")
+		return false
+	}
+	contains := func(name, expected string) bool {
+		for _, line := range r.Header.Values(name) {
+			for _, token := range strings.Split(line, ",") {
+				if strings.EqualFold(strings.TrimSpace(token), expected) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if r.Method != http.MethodGet || !r.ProtoAtLeast(1, 1) || r.ProtoMajor != 1 ||
+		!contains("Connection", "Upgrade") || !contains("Upgrade", "websocket") ||
+		nativeOne(r.Header, "Sec-WebSocket-Version") != "13" {
+		return false
+	}
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(nativeOne(r.Header, "Sec-WebSocket-Key")))
+	if err != nil || len(key) != 16 {
+		return false
+	}
+	if origins := r.Header.Values("Origin"); len(origins) > 1 {
+		return false
+	} else if len(origins) == 1 && origins[0] != "" {
+		origin, err := url.Parse(origins[0])
+		if err != nil || origin.User != nil || !strings.EqualFold(origin.Host, r.Host) ||
+			(!strings.EqualFold(origin.Scheme, "http") && !strings.EqualFold(origin.Scheme, "https")) {
+			return false
+		}
+	}
+	for depth := 0; depth < 8; depth++ {
+		if _, ok := w.(http.Hijacker); ok {
+			return true
+		}
+		if wrapped, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
+			w = wrapped.Unwrap()
+		} else {
+			break
+		}
+	}
+	return false
+}
 func nativeUpstreamHeaders(source http.Header) http.Header {
 	target := make(http.Header)
 	for _, name := range []string{"Authorization", "Idempotency-Key", "Speko-Client-Session-ID", "User-Agent", "Content-Type", "Accept"} {
@@ -248,10 +319,13 @@ func (s *NativeRelayServer) Handler() http.Handler {
 		if !s.authorizeLocal(w, r) {
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"runtime": map[string]any{"name": "go-gateway", "placement": "sidecar", "provider_routes": []string{"speko_relay"}, "adapters": []string{"speko.relay.stt.v1", "speko.relay.tts.v1", "speko.relay.llm.v1"}}})
+		writeJSON(w, http.StatusOK, map[string]any{"runtime": map[string]any{"name": "go-gateway", "placement": "sidecar", "provider_routes": []string{"speko_relay"}, "adapters": []string{"speko.relay.stt.v1", "speko.relay.tts.v1", "speko.relay.llm.v1", "speko.relay.realtime.v1"}}})
 	})
 	mux.HandleFunc("GET /v1/stt/stream", s.speech)
 	mux.HandleFunc("GET /v1/tts/stream", s.speech)
+	for path := range nativeVoiceRoutes {
+		mux.HandleFunc("GET "+path, s.speech)
+	}
 	for path := range nativeHTTPRoutes {
 		mux.HandleFunc("POST "+path, s.modelHTTP)
 	}
@@ -261,8 +335,8 @@ func (s *NativeRelayServer) begin(w http.ResponseWriter, r *http.Request) (conte
 	if !s.authorizeLocal(w, r) || !s.authorizeModel(w, r) {
 		return nil, nil, false
 	}
-	if r.URL.RawQuery != "" || r.URL.ForceQuery || r.URL.RawPath != "" {
-		writeError(w, http.StatusBadRequest, "invalid_request", "native model routes do not accept URL parameters")
+	if !nativeQueryAllowed(r) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "native model route requires its exact bounded model selector")
 		return nil, nil, false
 	}
 	s.mu.Lock()
@@ -369,22 +443,71 @@ func (w nativeRelayWriter) Flush() {
 	}
 	_ = http.NewResponseController(w.ResponseWriter).Flush()
 }
+
+// Keep the physical sockets available independently of websocket.Conn's
+// closing state. CloseNow waits for an already-started Close and cannot abort
+// its unbounded bufio payload discard on a peer's partial in-flight frame.
+type nativeUpgradeWriter struct {
+	http.ResponseWriter
+	connection net.Conn
+}
+
+func (w *nativeUpgradeWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	connection, buffer, err := http.NewResponseController(w.ResponseWriter).Hijack()
+	if err == nil {
+		w.connection = connection
+	}
+	return connection, buffer, err
+}
+
+func nativeCloseSocket(connection net.Conn) {
+	if connection == nil {
+		return
+	}
+	if secure, ok := connection.(interface{ NetConn() net.Conn }); ok {
+		// Interrupt TCP/Unix I/O directly, without TLS close-notify writes.
+		connection = secure.NetConn()
+	}
+	_ = connection.Close()
+}
+
 func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	ctx, done, ok := s.begin(w, r)
 	if !ok {
 		return
 	}
 	defer done()
+	// Query-selected voice can start work as soon as the upstream upgrades.
+	// Validate the local handshake first, while retaining the ability to pass
+	// an upstream's canonical HTTP refusal back before upgrading this socket.
+	if !nativeWebSocketRequest(w, r) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "a valid local WebSocket upgrade is required")
+		return
+	}
 	endpoint := *s.origin
 	endpoint.Path = r.URL.Path
+	endpoint.RawQuery = r.URL.RawQuery
 	dialCtx, cancelDial := context.WithTimeout(ctx, s.setupTimeout)
 	// websocket.Dial retains only 1 KiB of an unsuccessful upgrade body.
 	// Capture the bounded canonical envelope before that diagnostic truncation.
 	client := *s.client
 	var rejection *relayapi.ErrorEnvelope
 	var rejectionBody []byte
+	var socketMu sync.Mutex
+	var upstreamSocket net.Conn
+	var upstreamBody io.Closer
 	client.Transport = nativeRoundTrip(func(req *http.Request) (*http.Response, error) {
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				socketMu.Lock()
+				upstreamSocket = info.Conn
+				socketMu.Unlock()
+			},
+		}))
 		response, err := s.client.Transport.RoundTrip(req)
+		if err == nil && response.StatusCode == http.StatusSwitchingProtocols {
+			upstreamBody = response.Body
+		}
 		if err == nil && response.StatusCode >= 400 && response.StatusCode <= 599 && response.Body != nil {
 			raw, readErr := io.ReadAll(io.LimitReader(response.Body, 8193))
 			_ = response.Body.Close()
@@ -428,36 +551,87 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer upstream.CloseNow()
-	local, err := websocket.Accept(w, r, nil)
+	closeUpstream := func() {
+		socketMu.Lock()
+		connection := upstreamSocket
+		socketMu.Unlock()
+		if connection != nil {
+			nativeCloseSocket(connection)
+		} else if upstreamBody != nil {
+			// Custom RoundTrippers may not report GotConn. The upgraded
+			// transport body still bypasses websocket's closing-state gate.
+			_ = upstreamBody.Close()
+		}
+	}
+	defer closeUpstream()
+	upgrade := &nativeUpgradeWriter{ResponseWriter: w}
+	local, err := websocket.Accept(upgrade, r, nil)
 	if err != nil {
 		return
 	}
 	defer local.CloseNow()
+	closeSockets := func() {
+		closeUpstream()
+		nativeCloseSocket(upgrade.connection)
+	}
+	defer closeSockets()
 	upstream.SetReadLimit(nativeMaxFrameBytes)
 	local.SetReadLimit(nativeMaxFrameBytes)
-	stop := context.AfterFunc(ctx, func() { _ = upstream.CloseNow(); _ = local.CloseNow() })
+	stop := context.AfterFunc(ctx, closeSockets)
 	defer stop()
-	copyFrame := func(dst, src *websocket.Conn) error {
+	type copyResult struct {
+		destination *websocket.Conn
+		err         error
+		fromRead    bool
+	}
+	copyFrame := func(dst, src *websocket.Conn) copyResult {
 		for {
 			kind, body, err := src.Read(ctx)
 			if err != nil {
-				return err
+				return copyResult{dst, err, true}
 			}
 			writeCtx, cancel := context.WithTimeout(ctx, s.timeToWrite)
 			err = dst.Write(writeCtx, kind, body)
 			cancel()
 			if err != nil {
-				return err
+				return copyResult{dst, err, false}
 			}
 		}
 	}
-	complete := make(chan error, 2)
+	complete := make(chan copyResult, 2)
 	go func() { complete <- copyFrame(upstream, local) }()
 	go func() { complete <- copyFrame(local, upstream) }()
-	<-complete
+	first := <-complete
+	secondReceived := false
+	if !first.fromRead {
+		// A concurrent writer can observe a closed socket before its reader
+		// returns the actual close frame. Let that reader finish within the
+		// existing network bound so its status is not replaced by a write EOF.
+		deadline := time.NewTimer(s.timeToWrite)
+		select {
+		case first = <-complete:
+			secondReceived = true
+		case <-deadline.C:
+		case <-ctx.Done():
+		}
+		deadline.Stop()
+	}
+	var closed websocket.CloseError
+	if first.fromRead && errors.As(first.err, &closed) {
+		// A close frame is part of the native protocol. Forward its exact
+		// status/reason; an abnormal EOF stays abnormal. Bound the handshake
+		// at the physical sockets, including partial payloads that the
+		// WebSocket library discards outside its context-aware read loop.
+		deadline := time.AfterFunc(s.timeToWrite, closeSockets)
+		_ = first.destination.Close(closed.Code, closed.Reason)
+		deadline.Stop()
+	}
+	closeSockets()
 	_ = upstream.CloseNow()
 	_ = local.CloseNow()
-	<-complete
+	if !secondReceived {
+		<-complete
+	}
 }
 func (s *NativeRelayServer) Stats() Stats {
 	s.mu.Lock()

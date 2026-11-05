@@ -3,7 +3,7 @@
   "info": {
     "title": "Speko Router streaming API",
     "version": "1.0.0",
-    "description": "WebSocket contract of the Speko Router: streaming speech-to-text and text-to-speech sessions, plus the five native speech-to-speech routes. On the STT and TTS routes JSON text frames carry the control messages and events documented here and binary frames carry raw audio in the format the session.configure frame declared, with no JSON envelope. On /v1/realtime, /v1/live, /v1/bidi, /v1/realtime/translations and /v1/realtime/translations/qwen the Router speaks the OpenAI/xAI Realtime, GPT-Live, Gemini Live, OpenAI realtime translation and Alibaba LiveTranslate protocols natively: audio travels base64-encoded inside the vendor's own JSON events, the Router forwards a bounded set of vendor commands and every vendor server event verbatim, and only its own error frame is Router-shaped. The Go types in package relayapi are the source of truth for every Router-defined shape in this document, and speccheck_test.go machine-checks the two against each other. The HTTP endpoints are specified separately in openapi.yaml."
+    "description": "WebSocket contract of the Speko Router: streaming speech-to-text and text-to-speech sessions, plus the six native speech-to-speech routes. On the STT and TTS routes JSON text frames carry the control messages and events documented here and binary frames carry raw audio in the format the session.configure frame declared, with no JSON envelope. On /v1/openai/realtime, /v1/xai/realtime, /v1/openai/gpt-live, /v1/google/gemini-live, /v1/openai/realtime-translations and /v1/alibaba/qwen-livetranslate the Router speaks the OpenAI/xAI Realtime, GPT-Live, Gemini Live, OpenAI realtime translation and Alibaba LiveTranslate protocols natively: audio travels base64-encoded inside the vendor's own JSON events, the Router forwards a bounded set of vendor commands and every vendor server event verbatim, and only its own error frame is Router-shaped. The Go types in package relayapi are the source of truth for every Router-defined shape in this document, and speccheck_test.go machine-checks the two against each other. The HTTP endpoints are specified separately in openapi.yaml."
   },
   "defaultContentType": "application/json",
   "servers": {
@@ -168,11 +168,11 @@
         }
       }
     },
-    "/v1/realtime": {
-      "description": "OpenAI or xAI Realtime speech-to-speech, spoken natively. The model is selected exactly with the `model` query parameter (for example, /v1/realtime?model=gpt-realtime-2.1 or a versioned grok-voice model), and its catalog row selects openai.realtime.v1 or xai.realtime.v1. The idempotency content hash is the SHA-256 of that model value. Once the session is admitted the Router relays that vendor's protocol: the client sends Realtime-shaped client events (session.update, input_audio_buffer.append with base64 PCM, input_audio_buffer.commit, conversation.item.create, response.create, response.cancel, ...) and receives every Realtime server event (session.created, session.updated, input_audio_buffer.speech_started, response.output_audio.delta, response.done, ...) verbatim. The Router pins the admitted model and mono PCM16 at 24 kHz: a session.update that names another model or audio format is refused with invalid_request, and GPT-Live-only commands are refused the same way. Audio is base64-encoded inside JSON text frames; binary frames are not accepted. The Router's own terminal error frame (lease_expired, budget_exhausted, provider_unavailable) uses the shared ErrorEvent shape; vendor `error` events pass through unchanged. xAI session.update keeps voice and turn_detection at the top level of session, as required by xAI's native protocol.",
+    "/v1/openai/realtime": {
+      "description": "OpenAI Realtime speech-to-speech, using openai.realtime.v1. The exact model query value is the idempotency content hash. Native JSON events and base64 PCM pass through unchanged; binary frames are refused. The admitted model and mono PCM16 at 24 kHz are pinned. The Router adds only its typed terminal error envelope. xAI models use their own route.",
       "parameters": {
         "model": {
-          "description": "Exact Realtime model id from GET /v1/models rows whose endpoint is /v1/realtime.",
+          "description": "Exact Realtime model id from GET /v1/models rows whose endpoint is /v1/openai/realtime.",
           "schema": {
             "type": "string",
             "minLength": 1,
@@ -214,14 +214,14 @@
       },
       "publish": {
         "operationId": "sendRealtimeEvents",
-        "summary": "OpenAI/xAI Realtime client events, forwarded to the model.",
+        "summary": "OpenAI Realtime client events, forwarded to the model.",
         "message": {
           "$ref": "#/components/messages/nativeClientEvent"
         }
       },
       "subscribe": {
         "operationId": "receiveRealtimeEvents",
-        "summary": "OpenAI/xAI Realtime server events, plus the Router error frame.",
+        "summary": "OpenAI Realtime server events, plus the Router error frame.",
         "message": {
           "oneOf": [
             {
@@ -234,11 +234,77 @@
         }
       }
     },
-    "/v1/realtime/translations": {
-      "description": "OpenAI realtime speech translation (gpt-realtime-translate), spoken natively on the Router's mirror of the vendor's dedicated /v1/realtime/translations socket. The model is selected exactly with the `model` query parameter (/v1/realtime/translations?model=gpt-realtime-translate) and its catalog row speaks openai.realtime.translation.v1; the idempotency content hash is the SHA-256 of that model value. This is not the conversational Realtime protocol: there is no voice, no instructions, no tools, no conversation items and no response.create. The client names the target language in a native session.update ({\"type\":\"session.update\",\"session\":{\"audio\":{\"output\":{\"language\":\"es\"}}}}); the only other settings accepted are session.audio.input.transcription (model gpt-realtime-whisper, or null) and session.audio.input.noise_reduction (type near_field or far_field, or null). Any other session field, and any target language outside es, pt, fr, ja, ru, zh, de, ko, hi, id, vi, it and en, is refused with invalid_request. Audio is mono PCM16 at 24 kHz in both directions, base64-encoded in session.input_audio_buffer.append events and streamed continuously, silence included. The client receives every vendor server event verbatim: session.created, session.output_audio.delta (translated audio), session.output_transcript.delta (target text), session.input_transcript.delta (source text) and session.closed; vendor `error` events pass through unchanged. Send session.close when the source ends and keep reading until session.closed: the vendor flushes pending input and emits the remaining translation first. The Router's own terminal error frame uses the shared ErrorEvent shape.",
+    "/v1/xai/realtime": {
+      "description": "xAI Grok Voice speech-to-speech, using xai.realtime.v1. The exact model query value is the idempotency content hash. Native JSON events and base64 PCM pass through unchanged; binary frames are refused. The admitted model and mono PCM16 at 24 kHz are pinned. xAI session.update keeps voice and turn_detection at the top level of session. The Router adds only its typed terminal error envelope. OpenAI uses its own route.",
       "parameters": {
         "model": {
-          "description": "Exact translation model id from GET /v1/models rows whose endpoint is /v1/realtime/translations.",
+          "description": "Exact Realtime model id from GET /v1/models rows whose endpoint is /v1/xai/realtime.",
+          "schema": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      },
+      "bindings": {
+        "ws": {
+          "method": "GET",
+          "query": {
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              }
+            },
+            "required": [
+              "model"
+            ]
+          },
+          "headers": {
+            "type": "object",
+            "properties": {
+              "Idempotency-Key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Required on the upgrade request. The content hash covers the exact `model` query value."
+              }
+            },
+            "required": [
+              "Idempotency-Key"
+            ]
+          }
+        }
+      },
+      "publish": {
+        "operationId": "sendXAIRealtimeEvents",
+        "summary": "xAI Realtime client events, forwarded to the model.",
+        "message": {
+          "$ref": "#/components/messages/nativeClientEvent"
+        }
+      },
+      "subscribe": {
+        "operationId": "receiveXAIRealtimeEvents",
+        "summary": "xAI Realtime server events, plus the Router error frame.",
+        "message": {
+          "oneOf": [
+            {
+              "$ref": "#/components/messages/nativeServerEvent"
+            },
+            {
+              "$ref": "#/components/messages/wsError"
+            }
+          ]
+        }
+      }
+    },
+    "/v1/openai/realtime-translations": {
+      "description": "OpenAI realtime speech translation (gpt-realtime-translate), spoken natively on the Router's mirror of the vendor's dedicated wss://api.openai.com/v1/realtime/translations socket. The model is selected exactly with the `model` query parameter (/v1/openai/realtime-translations?model=gpt-realtime-translate) and its catalog row speaks openai.realtime.translation.v1; the idempotency content hash is the SHA-256 of that model value. This is not the conversational Realtime protocol: there is no voice, no instructions, no tools, no conversation items and no response.create. The client names the target language in a native session.update ({\"type\":\"session.update\",\"session\":{\"audio\":{\"output\":{\"language\":\"es\"}}}}); the only other settings accepted are session.audio.input.transcription (model gpt-realtime-whisper, or null) and session.audio.input.noise_reduction (type near_field or far_field, or null). Any other session field, and any target language outside es, pt, fr, ja, ru, zh, de, ko, hi, id, vi, it and en, is refused with invalid_request. Audio is mono PCM16 at 24 kHz in both directions, base64-encoded in session.input_audio_buffer.append events and streamed continuously, silence included. The client receives every vendor server event verbatim: session.created, session.output_audio.delta (translated audio), session.output_transcript.delta (target text), session.input_transcript.delta (source text) and session.closed; vendor `error` events pass through unchanged. Send session.close when the source ends and keep reading until session.closed: the vendor flushes pending input and emits the remaining translation first. The Router's own terminal error frame uses the shared ErrorEvent shape.",
+      "parameters": {
+        "model": {
+          "description": "Exact translation model id from GET /v1/models rows whose endpoint is /v1/openai/realtime-translations.",
           "schema": {
             "type": "string",
             "minLength": 1,
@@ -300,11 +366,11 @@
         }
       }
     },
-    "/v1/realtime/translations/qwen": {
-      "description": "Alibaba Qwen LiveTranslate speech-to-speech translation, spoken natively (alibaba.livetranslate.v1). The model is selected exactly with the `model` query parameter (/v1/realtime/translations/qwen?model=qwen3.8-livetranslate-flash-realtime) and the idempotency content hash is the SHA-256 of that model value. The session is not conversational: there is no assistant turn, no response.create and no instructions. After connecting, send the vendor's session.update with session.translation.language (the target language) and optionally output_modalities, voice, input_audio_transcription, translation.corpus and turn_detection. Then stream input_audio_buffer.append events (base64 mono PCM16 at 16 kHz). input_audio_buffer.commit and input_audio_buffer.clear are forwarded. Every other command, including input_image_buffer.append, is refused with invalid_request. The Router pins the audio formats (PCM16 in at 16 kHz, PCM16 out at 24 kHz), so a session.update that names another format or sample rate is refused. The client receives every vendor server event verbatim: session.created, session.updated, conversation.item.input_audio_transcription.text/.completed (the source), response.audio_transcript.delta and response.text.delta (the translation), response.audio.delta (the translated speech), and response.done with the vendor's token usage. Send session.finish to end the session and keep reading until session.finished: the Router forwards the finish upstream so the last segment is translated, then closes. Closing the socket without session.finish drops the final segment.",
+    "/v1/alibaba/qwen-livetranslate": {
+      "description": "Alibaba Qwen LiveTranslate speech-to-speech translation, spoken natively (alibaba.livetranslate.v1). The model is selected exactly with the `model` query parameter (/v1/alibaba/qwen-livetranslate?model=qwen3.8-livetranslate-flash-realtime) and the idempotency content hash is the SHA-256 of that model value. The session is not conversational: there is no assistant turn, no response.create and no instructions. After connecting, send the vendor's session.update with session.translation.language (the target language) and optionally output_modalities, voice, input_audio_transcription, translation.corpus and turn_detection. Then stream input_audio_buffer.append events (base64 mono PCM16 at 16 kHz). input_audio_buffer.commit and input_audio_buffer.clear are forwarded. Every other command, including input_image_buffer.append, is refused with invalid_request. The Router pins the audio formats (PCM16 in at 16 kHz, PCM16 out at 24 kHz), so a session.update that names another format or sample rate is refused. The client receives every vendor server event verbatim: session.created, session.updated, conversation.item.input_audio_transcription.text/.completed (the source), response.audio_transcript.delta and response.text.delta (the translation), response.audio.delta (the translated speech), and response.done with the vendor's token usage. Send session.finish to end the session and keep reading until session.finished: the Router forwards the finish upstream so the last segment is translated, then closes. Closing the socket without session.finish drops the final segment.",
       "parameters": {
         "model": {
-          "description": "Exact LiveTranslate model id from GET /v1/models rows whose endpoint is /v1/realtime/translations/qwen.",
+          "description": "Exact LiveTranslate model id from GET /v1/models rows whose endpoint is /v1/alibaba/qwen-livetranslate.",
           "schema": {
             "type": "string",
             "minLength": 1,
@@ -366,7 +432,7 @@
         }
       }
     },
-    "/v1/live": {
+    "/v1/openai/gpt-live": {
       "description": "GPT-Live speech-to-speech, spoken natively. The first text frame MUST be the vendor's session.start command naming the exact model (gpt-live-1); its exact frame bytes are the idempotency content hash and the Router validates it strictly before admission — unknown fields, audio formats other than mono PCM16 at 16 or 24 kHz, store=true, and a responses delegation without a backend model are refused. After session.started the Router relays the vendor protocol: the client streams session.input_audio.append (base64 PCM, continuous — GPT-Live decides when to speak, there is no commit), forwards the bounded command set (session.update, session.instructions.append, session.thinking.append, session.commentary.append, session.input_audio.mute/unmute, response.item.create, response.create) and receives every server event verbatim: session.started, session.output_audio.delta, session.input_transcript.delta and session.output_transcript.delta with their start_ms/end_ms session-timeline intervals preserved (they may overlap and are not turn boundaries), session.delegation.created, response.event envelopes carrying nested Responses events, the append acknowledgments, session.usage.updated cumulative snapshots, and the final session.closed with its usage. Realtime-only commands (input_audio_buffer.commit, response.cancel) are refused with invalid_request. Send session.close and keep reading until session.closed; the Router drains up to 15 seconds and otherwise ends the session with its own error frame, which means final vendor usage was not confirmed.",
       "bindings": {
         "ws": {
@@ -416,8 +482,8 @@
         }
       }
     },
-    "/v1/bidi": {
-      "description": "Gemini Live (BidiGenerateContent) speech-to-speech, spoken natively. The first text frame MUST be the vendor's setup message naming the exact model (gemini-3.8-live); its exact frame bytes are the idempotency content hash and the Router validates it strictly before admission — unknown fields are refused. Frames on this protocol are keyed by their single top-level field (setup, realtimeInput, clientContent, toolResponse) rather than by a type tag, which is the one way it differs from /v1/realtime and /v1/live. After setupComplete the Router relays the vendor protocol: the client streams realtimeInput audio (continuous — Gemini decides when to speak, there is no commit) and may forward clientContent and toolResponse; every other key is refused with invalid_request. The client receives every server message verbatim: setupComplete, serverContent with its modelTurn audio parts and input/output transcriptions, toolCall, usageMetadata, goAway, and the final close. The Router pins the admitted model and mono PCM16 — 16 kHz in, 24 kHz out — and its own terminal error frame (lease_expired, budget_exhausted, provider_unavailable) uses the shared ErrorEvent shape; vendor errors pass through unchanged.",
+    "/v1/google/gemini-live": {
+      "description": "Gemini Live (BidiGenerateContent) speech-to-speech, spoken natively. The first text frame MUST be the vendor's setup message naming the exact model (gemini-3.8-live); its exact frame bytes are the idempotency content hash and the Router validates it strictly before admission — unknown fields are refused. Frames on this protocol are keyed by their single top-level field (setup, realtimeInput, clientContent, toolResponse) rather than by a type tag, which is the one way it differs from /v1/openai/realtime and /v1/openai/gpt-live. After setupComplete the Router relays the vendor protocol: the client streams realtimeInput audio (continuous — Gemini decides when to speak, there is no commit) and may forward clientContent and toolResponse; every other key is refused with invalid_request. The client receives every server message verbatim: setupComplete, serverContent with its modelTurn audio parts and input/output transcriptions, toolCall, usageMetadata, goAway, and the final close. The Router pins the admitted model and mono PCM16 — 16 kHz in, 24 kHz out — and its own terminal error frame (lease_expired, budget_exhausted, provider_unavailable) uses the shared ErrorEvent shape; vendor errors pass through unchanged.",
       "bindings": {
         "ws": {
           "method": "GET",
@@ -1571,7 +1637,7 @@
       },
       "BidiSetup": {
         "type": "object",
-        "description": "The first frame of a /v1/bidi session: the vendor's own setup message, validated strictly by the Router. Gemini Live frames are keyed by their single top-level field rather than a type tag.",
+        "description": "The first frame of a /v1/google/gemini-live session: the vendor's own setup message, validated strictly by the Router. Gemini Live frames are keyed by their single top-level field rather than a type tag.",
         "properties": {
           "setup": {
             "$ref": "#/components/schemas/BidiSetupConfig"
@@ -1584,7 +1650,7 @@
       },
       "BidiSetupConfig": {
         "type": "object",
-        "description": "The setup object of a /v1/bidi session. model is the exact Gemini Live model id, with or without the vendor's \"models/\" prefix. Every other field is a vendor document the Router bounds but never rewrites.",
+        "description": "The setup object of a /v1/google/gemini-live session. model is the exact Gemini Live model id, with or without the vendor's \"models/\" prefix. Every other field is a vendor document the Router bounds but never rewrites.",
         "properties": {
           "model": {
             "type": "string",
@@ -1654,7 +1720,7 @@
       },
       "BidiAudioChunk": {
         "type": "object",
-        "description": "Client audio for a /v1/bidi session. Both the current `audio` field and the older `mediaChunks` array are accepted because the vendor's own SDKs still emit the latter. `audioStreamEnd` marks the end of input audio.",
+        "description": "Client audio for a /v1/google/gemini-live session. Both the current `audio` field and the older `mediaChunks` array are accepted because the vendor's own SDKs still emit the latter. `audioStreamEnd` marks the end of input audio.",
         "properties": {
           "realtimeInput": {
             "type": "object",
@@ -1704,7 +1770,7 @@
       },
       "LiveSessionStart": {
         "type": "object",
-        "description": "The first frame of a /v1/live session: the native GPT-Live session.start command, validated strictly by the Router.",
+        "description": "The first frame of a /v1/openai/gpt-live session: the native GPT-Live session.start command, validated strictly by the Router.",
         "properties": {
           "type": {
             "type": "string",
