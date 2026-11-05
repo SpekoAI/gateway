@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import math
 from collections import deque
+from typing import Literal
 
 from livekit import rtc
 from livekit.agents import utils, vad
@@ -14,22 +15,21 @@ from ._livekit_vad_audio import ProbabilityVAD, VADAudio
 from .client import GatewayError
 
 
-class _ResetBoundary(vad.VADStream._FlushSentinel):
-    def __init__(self, progress: int) -> None:
-        self.progress = progress
-        self.processed = self.cancelled = False
-
-
 class DrainingVAD(vad.VAD):
     """Drain partial local-inference/Silero windows without inventing speech time.
 
-    Use for an AgentSession's independent VAD. Its underlying detector stays
-    local and keeps its configured thresholds; inference-only padding never
-    appears in outward event audio or contributes to a duration threshold.
-    Each stream owns its buffers, inference tasks and hard flush boundaries.
+    Choose reset for an AgentSession's independent VAD, or segment for a
+    batch STT StreamAdapter. The SDK uses the same flush API for these two
+    different operations; requiring the intent avoids silently discarding
+    batch speech or queuing a stale end after a newer streaming STT start.
+    Inference-only padding never enters event audio or duration thresholds.
     """
 
-    def __init__(self, detector: vad.VAD) -> None:
+    def __init__(
+        self, detector: vad.VAD, *, flush_mode: Literal["reset", "segment"]
+    ) -> None:
+        if flush_mode not in {"reset", "segment"}:
+            raise ValueError("DrainingVAD requires reset or segment flush mode")
         if type(detector).__module__ not in {
             "livekit.agents.inference.vad",
             "livekit.plugins.silero.vad",
@@ -37,6 +37,7 @@ class DrainingVAD(vad.VAD):
             raise ValueError("DrainingVAD requires the local inference or Silero VAD")
         super().__init__(capabilities=detector.capabilities)
         self._detector = detector
+        self._reset_on_flush = flush_mode == "reset"
 
     @property
     def model(self) -> str:
@@ -60,13 +61,12 @@ class DrainingVAD(vad.VAD):
 class _DrainingVADStream(vad.VADStream):
     def __init__(self, parent: DrainingVAD) -> None:
         self._source = parent._detector
+        self._reset_on_flush = parent._reset_on_flush
         self._sample_rate = self._queued = 0
         self._inner = None
         self._probability = None
         self._segment = self._flushes = 0
         self._idle_at = 0.0
-        self._progress = 0
-        self._pending_reset: _ResetBoundary | None = None
         self._published: deque[tuple[vad.VADEvent, int]] = deque()
         super().__init__(parent)
 
@@ -84,7 +84,6 @@ class _DrainingVADStream(vad.VADStream):
                 "Local speech input exceeded its processing bound", retryable=False
             )
         super().push_frame(frame)
-        self._pending_reset = None
         self._sample_rate = frame.sample_rate
         self._queued += frame.samples_per_channel
         interval = self._source.capabilities.update_interval
@@ -98,36 +97,24 @@ class _DrainingVADStream(vad.VADStream):
         # Drain actual queued audio before the inner SDK's reset marker.
         self._check_input_not_ended()
         self._check_not_closed()
-        reset = self._pending_reset
-        if reset is not None and not reset.processed and reset.progress == self._progress:
-            # The SDK batch adapter implements end_input by forwarding a
-            # flush immediately followed by EOF. Coalesce that pair before
-            # either consumer advances, so in-flight speech still drains as
-            # one terminal segment rather than being reset halfway through.
-            reset.cancelled = True
-            self._flushes -= 1
         self._input_ch.close()
 
     def flush(self) -> None:
-        self._check_input_not_ended()
-        self._check_not_closed()
-        reset = _ResetBoundary(self._progress)
-        self._input_ch.send_nowait(reset)
-        self._pending_reset = reset
+        super().flush()
         # Fence publication synchronously at the framework's boundary. The
         # queued marker still drains accounting and resets the owned detector.
-        self._flushes += 1
+        if self._reset_on_flush:
+            self._flushes += 1
         # The SDK already owns an out-of-band STT end. A detector reset must
         # not enqueue another end that could overwrite its following start.
 
     async def __anext__(self) -> vad.VADEvent:
         while True:
             event = await super().__anext__()
-            self._progress += 1
             original, segment = self._published.popleft()
             if event is not original:
                 raise GatewayError("Local speech event order changed", retryable=False)
-            if segment == self._flushes:
+            if not self._reset_on_flush or segment == self._flushes:
                 return event
 
     async def aclose(self) -> None:
@@ -165,7 +152,6 @@ class _DrainingVADStream(vad.VADStream):
         )
 
     def _push(self, frame: rtc.AudioFrame, *, padding: bool = False) -> None:
-        self._progress += 1
         raw = bytes(frame.data)
         self._unprocessed.extend(raw)
         self._audio.push(len(raw), padding=padding)
@@ -193,7 +179,6 @@ class _DrainingVADStream(vad.VADStream):
         self._push(self._frame(bytes(size)), padding=True)
 
     def _observe(self, event: vad.VADEvent) -> None:
-        self._progress += 1
         if self._segment != self._flushes:
             return  # Preserve unacknowledged real input for reclassification.
         if event.type is not vad.VADEventType.INFERENCE_DONE:
@@ -326,7 +311,7 @@ class _DrainingVADStream(vad.VADStream):
 
     async def _main_task(self) -> None:
         incoming = observed = None
-        ending = False
+        ending = finishing_segment = False
         self._reset()
         try:
             incoming = asyncio.create_task(self._input_ch.__anext__())
@@ -356,7 +341,18 @@ class _DrainingVADStream(vad.VADStream):
                             ) from None
                         self._finish_speech()
                         await self._inner.aclose()
-                        return
+                        if not finishing_segment:
+                            return
+                        # An explicit batch flush is a physical segment end,
+                        # including all inference queued before its marker.
+                        # Future input starts a separate owned detector stream.
+                        self._reset()
+                        self._segment += 1
+                        self._flushes += 1
+                        ending = finishing_segment = False
+                        observed = asyncio.create_task(self._inner.__anext__())
+                        incoming = asyncio.create_task(self._input_ch.__anext__())
+                        continue
                     if not ending:
                         self._arm_tail()
                     observed = asyncio.create_task(self._inner.__anext__())
@@ -367,11 +363,13 @@ class _DrainingVADStream(vad.VADStream):
                         ending = True
                     else:
                         if isinstance(value, self._FlushSentinel):
-                            if isinstance(value, _ResetBoundary):
-                                value.processed = True
-                                if value.cancelled:
-                                    incoming = asyncio.create_task(self._input_ch.__anext__())
-                                    continue
+                            if not self._reset_on_flush:
+                                ending = finishing_segment = True
+                                incoming = None
+                                self._deadline = None
+                                self._pad(final=True)
+                                self._inner.end_input()
+                                continue
                             pending = self._audio.pending_real(bytes(self._unprocessed))
                             await utils.aio.cancel_and_wait(observed)
                             await self._inner.aclose()

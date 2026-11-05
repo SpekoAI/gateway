@@ -279,7 +279,7 @@ async def test_draining_framework_vad_keeps_real_minimums_and_event_audio(engine
     detector = DrainingVAD(owned_probability_vad(
         engine, min_speech_duration=0.02, min_silence_duration=0.02,
         prefix_padding_duration=0, _any_voice=True, _events=public,
-    ))
+    ), flush_mode="reset")
     stream = detector.stream()
 
     async def collect():
@@ -340,7 +340,7 @@ async def test_draining_framework_vad_end_input_completes_actual_batch_adapter(e
             return stt.SpeechEvent(type=stt.SpeechEventType.FINAL_TRANSCRIPT, alternatives=[stt.SpeechData(language="en", text="owned batch speech")])
 
     model = BatchSTT()
-    detector = DrainingVAD(owned_probability_vad(engine, min_speech_duration=0.02, min_silence_duration=0.128 if finish == "eager_complete" else 0.25, prefix_padding_duration=0, _any_voice=True))
+    detector = DrainingVAD(owned_probability_vad(engine, min_speech_duration=0.02, min_silence_duration=0.128 if finish == "eager_complete" else 0.25, prefix_padding_duration=0, _any_voice=True), flush_mode="segment")
     streams, original = [], detector.stream
 
     def observed_stream():
@@ -411,8 +411,64 @@ async def test_draining_framework_vad_end_input_completes_actual_batch_adapter(e
 
 
 @pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
+@pytest.mark.parametrize("classified", [False, True])
+@pytest.mark.parametrize("continued", [False, True])
+async def test_draining_framework_vad_explicit_batch_flush(engine, classified, continued):
+    captured, streams = [], []
+
+    class BatchSTT(stt.STT):
+        def __init__(self):
+            super().__init__(capabilities=stt.STTCapabilities(streaming=False, interim_results=False))
+
+        async def _recognize_impl(self, buffer, **kwargs):
+            captured.append(bytes(rtc.combine_audio_frames(buffer).data))
+            return stt.SpeechEvent(type=stt.SpeechEventType.FINAL_TRANSCRIPT, alternatives=[stt.SpeechData(language="en", text=f"owned segment {len(captured)}")])
+
+    detector = DrainingVAD(owned_probability_vad(engine, min_speech_duration=0.02, prefix_padding_duration=0, _any_voice=True), flush_mode="segment")
+    original = detector.stream
+
+    def observed_stream():
+        result = original()
+        streams.append(result)
+        return result
+
+    detector.stream = observed_stream
+    model = BatchSTT()
+    adapter = stt.StreamAdapter(stt=model, vad=detector)
+    stream = adapter.stream()
+    first, second = b"\xff\x0f" * 1024, b"\xff\x1f" * 1024
+
+    def push(raw):
+        stream.push_frame(rtc.AudioFrame(data=raw, sample_rate=16000, num_channels=1, samples_per_channel=len(raw) // 2))
+
+    async def run():
+        push(first)
+        if classified:
+            while (await anext(stream)).type is not stt.SpeechEventType.START_OF_SPEECH:
+                pass
+            while streams[0]._processed < len(first) // 2:
+                await asyncio.sleep(0.005)
+        stream.flush()
+        while (await anext(stream)).type is not stt.SpeechEventType.FINAL_TRANSCRIPT:
+            pass
+        assert captured == [first], "explicit flush must finish speech without EOF"
+        if continued:
+            push(second)
+        stream.end_input()
+        events = [event async for event in stream]
+        assert len([event for event in events if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT]) == int(continued)
+        assert captured == ([first, second] if continued else [first])
+
+    try:
+        await asyncio.wait_for(run(), 3)
+    finally:
+        await stream.aclose()
+        await adapter.aclose()
+
+
+@pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
 async def test_draining_framework_vad_streams_keep_independent_audio_and_cleanup(engine):
-    detector = DrainingVAD(owned_probability_vad(engine))
+    detector = DrainingVAD(owned_probability_vad(engine), flush_mode="reset")
     speaking, silent = detector.stream(), detector.stream()
     voice, quiet = b"\xff\x0f" * 1024, b"\0\0" * 320
     try:
@@ -468,7 +524,7 @@ async def test_draining_framework_vad_end_input_keeps_audio_behind_inflight_padd
         return result
 
     detector.stream = paused_stream
-    stream = DrainingVAD(detector).stream()
+    stream = DrainingVAD(detector, flush_mode="reset").stream()
     quiet, voice = b"\0\0" * 320, b"\xff\x0f" * 320
     try:
         stream.push_frame(rtc.AudioFrame(data=quiet, sample_rate=16000, num_channels=1, samples_per_channel=320))
@@ -505,7 +561,7 @@ async def test_draining_framework_vad_end_input_keeps_audio_behind_inflight_padd
 @pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
 @pytest.mark.parametrize("queued", [False, True])
 async def test_draining_framework_vad_flush_is_a_real_hard_boundary(engine, queued):
-    detector = DrainingVAD(owned_probability_vad(engine, min_speech_duration=0.02, prefix_padding_duration=0, _any_voice=True))
+    detector = DrainingVAD(owned_probability_vad(engine, min_speech_duration=0.02, prefix_padding_duration=0, _any_voice=True), flush_mode="reset")
     stream = detector.stream()
     first, second = b"\xff\x0f" * (1024 if queued else 160), b"\xff\x0f" * 320
     try:
@@ -537,7 +593,7 @@ async def test_draining_framework_vad_flush_is_a_real_hard_boundary(engine, queu
 
 @pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
 async def test_draining_framework_vad_buffered_silence_has_no_packet_duration_delay(engine):
-    stream = DrainingVAD(owned_probability_vad(engine, min_silence_duration=0.25)).stream()
+    stream = DrainingVAD(owned_probability_vad(engine, min_silence_duration=0.25), flush_mode="reset").stream()
     events = asyncio.Queue()
 
     async def collect():
@@ -594,7 +650,7 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
         return inner
 
     source.stream = owned_stream
-    detector = DrainingVAD(source)
+    detector = DrainingVAD(source, flush_mode="reset")
     original_stream = detector.stream
 
     def framework_stream():
@@ -728,7 +784,7 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
 @pytest.mark.parametrize("wrapper", ["direct", "nested"])
 async def test_native_worker_framework_vad_and_local_turn_detector_drain_partial_silence(engine, binding, wrapper):
     source = owned_probability_vad("inference", min_silence_duration=0.032)
-    framework_vad = DrainingVAD(owned_probability_vad(engine, min_silence_duration=0.25))
+    framework_vad = DrainingVAD(owned_probability_vad(engine, min_silence_duration=0.25), flush_mode="reset")
     predictions, turns, packets = [], asyncio.Queue(), []
     detector = owned_local_turn_detector(predictions)
 
