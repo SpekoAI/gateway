@@ -326,7 +326,7 @@ async def test_native_tts_preserves_literal_text(native_binary, text):
 
 
 @pytest.mark.parametrize(
-    "first", ["Hello.", "This is a complete sentence.", "Wait<stop>please.", "a" * 240]
+    "first", ["Hello.", "This is a complete sentence.", "Wait<stop>please.", "a" * 240, "Call 911.", "Visit example.com."]
 )
 async def test_native_tts_emits_standalone_text_while_upstream_waits(
     native_binary, first

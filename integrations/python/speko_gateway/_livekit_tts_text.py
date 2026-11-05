@@ -41,11 +41,7 @@ class NativeTextBuffer:
     @property
     def can_flush_idle(self) -> bool:
         # A token boundary alone cannot complete a period: the next token
-        # may extend a decimal or hostname. Ordinary sentence endings get a
-        # short lookahead window in the feeder. A numeric or already dotted
-        # token needs a lexical delimiter, explicit flush, or EOF instead.
-        ending = _TRAILING_PERIOD.search(self._text)
-        if ending is None:
-            return False
-        word = ending.group(1)
-        return not word[-1].isdigit() and not any(c in word for c in ".:/@\\")
+        # may extend a decimal or hostname. All terminal periods get the
+        # feeder's bounded lookahead, including numeric/dotted endings: a
+        # completed "Call 911." must not wait indefinitely for another token.
+        return _TRAILING_PERIOD.search(self._text) is not None

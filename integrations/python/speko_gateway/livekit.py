@@ -1300,7 +1300,7 @@ class SynthesisStream(tts.SynthesizeStream):
                     # Keep the read task alive when the lookahead expires;
                     # cancelling a channel read can discard later text.
                     done, _ = await asyncio.wait(
-                        [incoming], timeout=0.1 if text.can_flush_idle else None
+                        [incoming], timeout=0.3 if text.can_flush_idle else None
                     )
                     if not done:
                         flush()
