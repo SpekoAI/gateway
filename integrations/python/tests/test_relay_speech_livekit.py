@@ -326,6 +326,50 @@ async def test_draining_framework_vad_keeps_real_minimums_and_event_audio(engine
 
 
 @pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
+@pytest.mark.parametrize("chunks", [1, 3])
+async def test_draining_framework_vad_end_input_completes_actual_batch_adapter(engine, chunks):
+    captured = []
+
+    class BatchSTT(stt.STT):
+        def __init__(self):
+            super().__init__(capabilities=stt.STTCapabilities(streaming=False, interim_results=False))
+
+        async def _recognize_impl(self, buffer, **kwargs):
+            captured.append(bytes(rtc.combine_audio_frames(buffer).data))
+            return stt.SpeechEvent(type=stt.SpeechEventType.FINAL_TRANSCRIPT, alternatives=[stt.SpeechData(language="en", text="owned batch speech")])
+
+    model = BatchSTT()
+    detector = DrainingVAD(owned_probability_vad(engine, min_speech_duration=0.02, prefix_padding_duration=0, _any_voice=True))
+    streams, original = [], detector.stream
+
+    def observed_stream():
+        result = original()
+        streams.append(result)
+        return result
+
+    detector.stream = observed_stream
+    adapter = stt.StreamAdapter(stt=model, vad=detector)
+    stream = adapter.stream()
+    pieces = [(4095 + index).to_bytes(2, "little", signed=True) * 320 for index in range(chunks)]
+    voice = b"".join(pieces)
+    try:
+        for piece in pieces:
+            stream.push_frame(rtc.AudioFrame(data=piece, sample_rate=16000, num_channels=1, samples_per_channel=320))
+        async with asyncio.timeout(3):
+            while (await anext(stream)).type is not stt.SpeechEventType.START_OF_SPEECH:
+                pass
+            while not streams or streams[0]._processed < len(voice) // 2:
+                await asyncio.sleep(0.005)
+            stream.end_input()
+            events = [event async for event in stream]
+        assert [event.alternatives[0].text for event in events if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT] == ["owned batch speech"]
+        assert captured == [voice], "the actual batch adapter receives captured speech once, without detector padding"
+    finally:
+        await stream.aclose()
+        await adapter.aclose()
+
+
+@pytest.mark.parametrize("engine", ["inference", "silero16", "silero8"])
 async def test_draining_framework_vad_streams_keep_independent_audio_and_cleanup(engine):
     detector = DrainingVAD(owned_probability_vad(engine))
     speaking, silent = detector.stream(), detector.stream()

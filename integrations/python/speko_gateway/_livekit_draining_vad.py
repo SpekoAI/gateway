@@ -103,6 +103,21 @@ class _DrainingVADStream(vad.VADStream):
             # reset, without new inferred audio or invented silence. Pending
             # real capture is classified again with fresh duration counters.
             previous = self._outward_last
+            # Classification can have queued the real end before its consumer
+            # reaches it. Retain that segment's canonical audio instead of a
+            # newer segment's buffer. Otherwise the active buffer contains
+            # only acknowledged capture, with detector padding removed.
+            completed = next(
+                (event for event, segment in self._published
+                 if segment == self._flushes - 1
+                 and event.type is vad.VADEventType.END_OF_SPEECH),
+                None,
+            )
+            frames = completed.frames if completed is not None else [self._frame(bytes(self._speech))]
+            if not frames or not any(frame.samples_per_channel for frame in frames):
+                raise GatewayError("Local speech reset lost captured audio", retryable=False)
+            if completed is not None:
+                previous = completed
             self._emit(
                 vad.VADEvent(
                     type=vad.VADEventType.END_OF_SPEECH,
@@ -110,7 +125,7 @@ class _DrainingVADStream(vad.VADStream):
                     samples_index=previous.samples_index,
                     speech_duration=previous.speech_duration,
                     silence_duration=previous.silence_duration,
-                    frames=[],
+                    frames=frames,
                     speaking=False,
                 ),
                 segment=self._flushes,
