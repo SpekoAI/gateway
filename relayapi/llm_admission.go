@@ -19,13 +19,16 @@ import (
 // Router never runs a second execution under a ticket's key. A ticket of the
 // caller's under the request's key that does not fit, or whose attempt fails
 // before the provider connector accepts it, is answered from what retiring it
-// established: 409 idempotency_conflict (retired, never ran: send the request
-// again without the ticket under a fresh Idempotency-Key), 409
-// request_already_started (already used, may have run: do not resend), or
-// another failure (unconfirmed: retry unchanged, ticket and key included;
-// lease_expired once it can no longer be confirmed). Only idempotency_conflict
-// licenses a fresh key; a failure after the connector accepted the request is
-// an ordinary failure of a request that may have run. A ticket
+// established: 409 idempotency_conflict with an outcome other than invalid
+// (retired, never ran: send the request again without the ticket under a
+// fresh Idempotency-Key; retiring is idempotent, so a resend after a lost
+// response gets the same answer), 409 request_already_started (used and may
+// have run, or expired unconfirmed: do not resend), or another failure
+// (unconfirmed: retry unchanged, ticket and key included). Only that
+// idempotency_conflict licenses a fresh key; one with outcome invalid comes
+// from the ordinary admission and keeps its ordinary meaning, and a failure
+// after the connector accepted the request is an ordinary failure of a
+// request that may have run. A ticket
 // that is not the caller's, or was prepared under another key, is ignored
 // and the request admitted the ordinary way. A ticket the client will not
 // present is released with POST /v1/llm/admissions/release.
@@ -76,10 +79,10 @@ func (r LLMAdmissionReleaseRequest) Validate() error {
 }
 
 // LLMAdmissionRelease is the 200 body of POST /v1/llm/admissions/release.
-// Released reports whether this call spent the ticket's plan, after which
-// the served-nothing report that frees its slot is delivered or still being
-// retried. false means the ticket was already used, already released or
-// retired by the Router after it did not fit a request, or expired, or the
+// Released reports whether the ticket's plan is retired, by this call or an
+// earlier release or retirement (so a release can be sent again), after
+// which the served-nothing report that frees its slot is delivered or still
+// being retried. false means a request used the ticket, it expired, or the
 // Router could not retire it now, and its reservation then ends the way any
 // unused admission's does.
 type LLMAdmissionRelease struct {
