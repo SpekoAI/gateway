@@ -93,8 +93,10 @@ their separate request identifiers.
 `SpekoLLMService(prepare_admissions=True)` takes the Router's per-request
 admission round trip (about 270 ms from Singapore) off the reply's critical
 path. On `UserStartedSpeakingFrame`, the service prepares an admission from the
-last context it received. The next reply request presents the ticket, waiting
-up to 3 s for a prepare still in flight. A ticket the Router did not use is
+last context it received. The next reply request presents the ticket, with
+the prepare call's `Idempotency-Key` (the Router binds the ticket to it). It
+waits up to 3 s for a prepare still in flight. Requests without a ticket keep
+fresh keys. A ticket the Router did not use is
 released when the response headers arrive. A ticket left unused at `EndFrame`,
 `CancelFrame` or cleanup is released too, including one whose prepare lands
 after the pipeline ends. `llm.prepared_admission_outcome` reports `"used"` or the Router's

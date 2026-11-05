@@ -138,7 +138,11 @@ await session.start(agent=MyAgent(), room=ctx.room)
 
 On each user speech start, the LLM prepares from the current agent's chat
 context and the tools of the last request (`POST /v1/llm/admissions`). The
-next request presents the ticket, and the ticket is then spent. A tool-call
+prepare call's `Idempotency-Key` is the one the real request will use: the
+Router binds the ticket to it. The next request presents the ticket with that
+same key, and the ticket is then spent. Every request without a ticket sends a
+fresh key. That includes a retry of a request that presented one, which goes
+the ordinary way. A tool-call
 follow-up and any request with no live ticket are admitted the ordinary way.
 There is at most one ticket per LLM. A false start keeps a ticket with more
 than a minute left. An older ticket is released, and the new prepare waits for
@@ -156,8 +160,10 @@ a ticket compete with a real request for one:
   the ordinary request goes out.
 - The session closing, the job shutting down, or `aclose()` releases the
   unused ticket, including one whose prepare is still in flight. `aclose()`
-  waits up to 3 s and never cancels a prepare. An LLM that owns its transport
-  keeps it open, for up to 12 s, until that ticket is released.
+  waits up to 3 s and never cancels a prepare. A prepare has no timeout of
+  its own beyond the transport's request timeout, so a late ticket is never
+  lost. An LLM that owns its transport keeps it open until that ticket is
+  released or the transport's timeout fires.
 
 `llm.prepared_admission_outcome` (and `prepared_admission_outcome` on each
 stream `llm.chat()` returns) says what the Router did with the last request's

@@ -11,9 +11,10 @@ from typing import Any
 
 import pytest
 from aiohttp import web
-from livekit.agents import APIConnectionError
+from livekit.agents import APIConnectionError, APIConnectOptions
 from livekit.agents import llm as agents_llm
 
+from speko_gateway import relay as speko_relay
 from speko_gateway.livekit import LLM
 from speko_gateway.relay import AdmissionPreparer, RelayLLMClient, _parse_rfc3339
 
@@ -36,6 +37,7 @@ class FakeRouter:
         self.expires_in = 300.0
         self.outcome: str | None = "used"
         self.response_status = 200
+        self.fail_responses = 0
         self.issued = 0
         self.release_delay = 0.0
         self.hold_stream: asyncio.Event | None = None
@@ -79,6 +81,13 @@ class FakeRouter:
         headers = {"Content-Type": "text/event-stream", "Speko-Request-ID": "req-1"}
         if "Speko-Prepared-Admission" in request.headers and self.outcome is not None:
             headers["Speko-Prepared-Admission-Outcome"] = self.outcome
+        if self.fail_responses > 0:
+            self.fail_responses -= 1
+            return web.json_response(
+                {"error": {"code": "provider_unavailable", "retryable": True}},
+                status=503,
+                headers={k: v for k, v in headers.items() if k != "Content-Type"},
+            )
         if self.response_status != 200:
             return web.json_response(
                 {"error": {"code": "insufficient_credit", "retryable": False}},
@@ -195,13 +204,18 @@ async def test_prepared_ticket_is_presented_once_and_used() -> None:
         headers, _ = router.responses[0]
         assert headers["Speko-Prepared-Admission"] == "spa1.ticket-1"
         assert headers["Speko-Client-Session-ID"] == SESSION_ID
-        assert headers["Idempotency-Key"] != prepare_headers["Idempotency-Key"]
+        # The ticket is bound to the prepare call's key: the request that
+        # presents it sends the same one.
+        assert headers["Idempotency-Key"] == prepare_headers["Idempotency-Key"]
         assert stream.prepared_admission_outcome == "used"
         assert plugin.prepared_admission_outcome == "used"
 
         # A tool-call follow-up has no ticket left and goes the ordinary way.
         follow_up = await reply(plugin)
         assert "Speko-Prepared-Admission" not in router.responses[1][0]
+        assert router.responses[1][0]["Idempotency-Key"] not in {
+            headers["Idempotency-Key"]
+        }
         assert follow_up.prepared_admission_outcome is None
         assert plugin.prepared_admission_outcome is None
 
@@ -267,6 +281,38 @@ async def test_refused_request_reports_its_outcome_and_releases(
 
         assert stream.prepared_admission_outcome == (outcome or "")
         await until(lambda: len(router.releases) == 1)
+        await plugin.aclose()
+
+
+@pytest.mark.parametrize("outcome", [None, "used"])
+async def test_retry_after_a_ticketed_failure_is_ordinary_with_a_fresh_key(
+    outcome: str | None,
+) -> None:
+    router = FakeRouter()
+    router.outcome = outcome
+    router.fail_responses = 1
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+        prepare_key = router.admissions[0][0]["Idempotency-Key"]
+
+        stream = plugin.chat(
+            chat_ctx=_turn(),
+            conn_options=APIConnectOptions(max_retry=1, retry_interval=0.01),
+        )
+        text = "".join(
+            [c.delta.content async for c in stream if c.delta and c.delta.content]
+        )
+
+        assert text == "Hi"
+        first, retry = (headers for headers, _ in router.responses)
+        assert first["Speko-Prepared-Admission"] == "spa1.ticket-1"
+        assert first["Idempotency-Key"] == prepare_key
+        assert "Speko-Prepared-Admission" not in retry
+        assert retry["Idempotency-Key"] != prepare_key
+        if outcome is None:
+            await until(lambda: len(router.releases) == 1)
         await plugin.aclose()
 
 
@@ -387,6 +433,30 @@ async def test_close_does_not_cancel_a_slow_prepare(monkeypatch) -> None:
 
         assert time.monotonic() - started < 0.4
         assert not owned._session.closed  # kept open for the release
+        await until(lambda: len(router.releases) == 1)
+        assert router.releases[0][1] == {"admission": "spa1.ticket-1"}
+        await until(lambda: owned._session.closed)
+
+
+async def test_prepare_slower_than_the_release_bound_still_lands_and_releases(
+    monkeypatch,
+) -> None:
+    # Stands in for a prepare answering after more than 10 s: the release
+    # bound is shrunk instead, and the prepare must not be held to it.
+    monkeypatch.setattr(speko_relay, "_RELEASE_CALL_TIMEOUT_SECONDS", 0.1)
+    router = FakeRouter()
+    router.admission_delay = 0.5
+    async with router_client(router) as fixture:
+        monkeypatch.setenv("SPEKO_API_KEY", "router-fixture-only")
+        monkeypatch.setenv("SPEKO_ROUTER_URL", fixture._base_url)
+        plugin = LLM(prepare_admissions=True)  # owns its transport
+        owned = plugin._client
+        plugin._preparer = AdmissionPreparer(owned, close_wait_seconds=0.05)
+        plugin.prepare(_history())
+        await until(lambda: len(router.admissions) == 1)
+
+        await plugin.aclose()
+
         await until(lambda: len(router.releases) == 1)
         assert router.releases[0][1] == {"admission": "spa1.ticket-1"}
         await until(lambda: owned._session.closed)

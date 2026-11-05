@@ -35,9 +35,12 @@ _logger = logging.getLogger(__name__)
 _HEADER_PREPARED_ADMISSION = "Speko-Prepared-Admission"
 _HEADER_PREPARED_ADMISSION_OUTCOME = "Speko-Prepared-Admission-Outcome"
 
-# Bounds one prepare or release call, and so how long a closed LLM keeps its
-# transport open to release a ticket whose prepare was still in flight.
-_ADMISSION_CALL_TIMEOUT_SECONDS = 10.0
+# Bounds one release call. A prepare call has no bound of its own: the Router
+# may already have issued its ticket, and only its answer lets the client
+# release it, so it runs under the transport's request timeout.
+_RELEASE_CALL_TIMEOUT_SECONDS = 10.0
+# The bound on waiting for a prepare when the transport has no total timeout.
+_DEFAULT_PREPARE_BOUND_SECONDS = 300.0
 
 # Detached tasks that close a transport once its last prepare has landed and
 # been released; held here so they are not collected mid-flight.
@@ -274,7 +277,7 @@ class RelayLLMClient:
         await self._session.close()
 
     async def prepare_admission(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], *, idempotency_key: str = ""
     ) -> PreparedAdmission | None:
         """POST /v1/llm/admissions: admit the next request ahead of time.
 
@@ -287,7 +290,10 @@ class RelayLLMClient:
         RelayError; a Router without the route (HTTP 404 or 405) raises
         AdmissionsUnsupported.
 
-        The ticket is bound to this client's key and session ID. Keep at most
+        The ticket is bound to this client's key, session ID and the
+        `Idempotency-Key` of this call, which is the key the real request must
+        send: `idempotency_key`, or a fresh one, returned on the ticket. A
+        request without the ticket uses a fresh key. Keep at most
         one unused ticket per conversation and release one you will not use
         with `release_admission`: until then it holds its credit reservation
         and one organization concurrency slot.
@@ -295,11 +301,11 @@ class RelayLLMClient:
 
         body = dict(request)
         body["stream"] = True
+        key = idempotency_key or str(uuid.uuid4())
         async with self._session.post(
             f"{self._base_url}/v1/llm/admissions",
             json=body,
-            headers=self._headers(),
-            timeout=aiohttp.ClientTimeout(total=_ADMISSION_CALL_TIMEOUT_SECONDS),
+            headers=self._headers(idempotency_key=key),
         ) as response:
             if response.status == 204:
                 return None
@@ -320,6 +326,7 @@ class RelayLLMClient:
             ticket=ticket,
             expires_at=expires_at,
             _deadline=time.monotonic() + (expires_at - time.time()),
+            idempotency_key=key,
         )
 
     async def release_admission(self, admission: str) -> bool:
@@ -333,15 +340,22 @@ class RelayLLMClient:
             f"{self._base_url}/v1/llm/admissions/release",
             json={"admission": admission},
             headers=self._headers(),
-            timeout=aiohttp.ClientTimeout(total=_ADMISSION_CALL_TIMEOUT_SECONDS),
+            timeout=aiohttp.ClientTimeout(total=_RELEASE_CALL_TIMEOUT_SECONDS),
         ) as response:
             decoded = await _decode_json(response)
             if response.status != 200:
                 raise _envelope_error(response.status, decoded)
         return decoded.get("released") is True
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"Idempotency-Key": str(uuid.uuid4())}
+    @property
+    def request_timeout_seconds(self) -> float:
+        """The transport's total request timeout, which bounds a prepare call."""
+
+        total = self._session.timeout.total
+        return float(total) if total else _DEFAULT_PREPARE_BOUND_SECONDS
+
+    def _headers(self, *, idempotency_key: str = "") -> dict[str, str]:
+        headers = {"Idempotency-Key": idempotency_key or str(uuid.uuid4())}
         if self._platform_session_id:
             headers["Speko-Client-Session-ID"] = self._platform_session_id
         return headers
@@ -351,6 +365,7 @@ class RelayLLMClient:
         request: dict[str, Any],
         *,
         prepared_admission: str = "",
+        idempotency_key: str = "",
         on_prepared_outcome: Callable[[str], None] | None = None,
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         """POST /v1/llm/responses with stream=true, yielding (event, payload).
@@ -363,7 +378,10 @@ class RelayLLMClient:
         success — yielded to the caller — or error, raised as RelayError. A
         socket that closes without either was truncated and raises too.
 
-        `prepared_admission` presents a ticket from `prepare_admission`. When
+        `prepared_admission` presents a ticket from `prepare_admission`, and
+        `idempotency_key` must then be the ticket's own `idempotency_key`: the
+        Router redeems a ticket only under the key it was prepared with. A
+        request without a ticket leaves it empty for a fresh key. When
         the Router answers, `on_prepared_outcome` receives its
         `Speko-Prepared-Admission-Outcome` (`PREPARED_ADMISSION_USED`, a
         reason the ticket was not used, or "" from a Router that sent none).
@@ -373,7 +391,7 @@ class RelayLLMClient:
         body = dict(request)
         body["stream"] = True
         headers = {
-            "Idempotency-Key": str(uuid.uuid4()),
+            "Idempotency-Key": idempotency_key or str(uuid.uuid4()),
             "Accept": "text/event-stream",
         }
         if self._platform_session_id:
@@ -412,6 +430,9 @@ class PreparedAdmission:
     expires_at: float
     """Plan expiry, Unix seconds, as the Router reported it."""
     _deadline: float = field(repr=False, compare=False)
+    idempotency_key: str = field(default="", repr=False)
+    """The prepare call's `Idempotency-Key`; the request presenting the ticket
+    must send the same one."""
 
     def remaining(self) -> float:
         """Seconds of plan life left, measured on this host's monotonic clock."""
@@ -587,8 +608,9 @@ class AdmissionPreparer:
 
         A prepare still in flight is not cancelled: the Router may already
         have issued its ticket, and only its answer lets the client release
-        it. Past the wait it keeps running and releases its ticket when it
-        lands; `close_client_when_done` keeps the transport open for that.
+        it. Past the wait it keeps running, under the transport's request
+        timeout only, and releases its ticket when it lands;
+        `close_client_when_done` keeps the transport open for that.
         """
 
         if self._closed:
@@ -601,8 +623,9 @@ class AdmissionPreparer:
         """Close the client once pending prepares and releases finish.
 
         Returns False, doing nothing, when nothing is pending: the caller
-        closes the client itself. Otherwise a detached task waits, bounded by
-        one prepare call and one release, then closes the client.
+        closes the client itself. Otherwise a detached task waits until the
+        prepare lands (or the transport's own request timeout fires) and its
+        ticket is released, then closes the client.
         """
 
         if not self.pending():
@@ -614,7 +637,10 @@ class AdmissionPreparer:
 
     async def _close_client_later(self) -> None:
         try:
-            await self._drain(_ADMISSION_CALL_TIMEOUT_SECONDS + self._release_timeout)
+            timeout = getattr(
+                self._client, "request_timeout_seconds", _DEFAULT_PREPARE_BOUND_SECONDS
+            )
+            await self._drain(float(timeout) + self._release_timeout)
         finally:
             await self._client.aclose()
 

@@ -902,6 +902,7 @@ class PreparingRelayClient(FakeRelayClient):
         self.prepared: list[dict] = []
         self.released: list[str] = []
         self.presented: list[str] = []
+        self.keys: list[str] = []
         self.prepare_delay = 0.0
 
     async def prepare_admission(self, request: dict):
@@ -914,6 +915,7 @@ class PreparingRelayClient(FakeRelayClient):
             ticket=f"spa1.ticket-{len(self.prepared)}",
             expires_at=time.time() + 300,
             _deadline=now + 300,
+            idempotency_key=f"key-{len(self.prepared)}",
         )
 
     async def release_admission(self, admission: str) -> bool:
@@ -921,10 +923,16 @@ class PreparingRelayClient(FakeRelayClient):
         return True
 
     async def stream_response(
-        self, request: dict, *, prepared_admission: str = "", on_prepared_outcome=None
+        self,
+        request: dict,
+        *,
+        prepared_admission: str = "",
+        idempotency_key: str = "",
+        on_prepared_outcome=None,
     ):
         self.requests.append(request)
         self.presented.append(prepared_admission)
+        self.keys.append(idempotency_key)
         if prepared_admission and on_prepared_outcome is not None:
             on_prepared_outcome(self.outcome)
         for event in self.events:
@@ -961,6 +969,7 @@ async def test_llm_prepares_on_user_speech_and_presents_the_ticket_once() -> Non
     await _feed_llm(llm, LLMContextFrame(context), LLMContextFrame(context))
 
     assert relay.presented == ["", "spa1.ticket-1", ""]
+    assert relay.keys == ["", "key-1", ""]  # fresh keys where no ticket
     assert llm.prepared_admission_outcome is None  # the last request had no ticket
     assert relay.released == []
     await llm.cleanup()

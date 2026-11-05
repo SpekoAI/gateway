@@ -1088,6 +1088,10 @@ class RelayLLMStream(llm.LLMStream):
         self._client = client
         self.prepared_admission_outcome: str | None = None
         """This request's `Speko-Prepared-Admission-Outcome`, as on the LLM."""
+        # Only the first attempt may present a ticket: its plan and key are
+        # spent by then, so a framework retry goes the ordinary way with a
+        # fresh key.
+        self._ticket_tried = False
 
     async def _run(self) -> None:
         request = self._relay_llm._request_body(self._chat_ctx, self._tools)
@@ -1100,7 +1104,8 @@ class RelayLLMStream(llm.LLMStream):
         _report_probe_marker("llm.requested")
         # Waiting on a prepare in flight is part of this request's latency,
         # so it comes after the marker.
-        preparer = self._relay_llm._preparer
+        preparer = None if self._ticket_tried else self._relay_llm._preparer
+        self._ticket_tried = True
         admission = await preparer.take() if preparer is not None else None
         self._relay_llm._prepared_admission_outcome = None
         presentation = (
@@ -1138,6 +1143,7 @@ class RelayLLMStream(llm.LLMStream):
             events = self._client.stream_response(
                 request,
                 prepared_admission=presentation.admission.ticket,
+                idempotency_key=presentation.admission.idempotency_key,
                 on_prepared_outcome=on_outcome,
             )
         try:

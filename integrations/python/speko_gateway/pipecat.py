@@ -846,6 +846,7 @@ class SpekoLLMService(LLMService):
             events = self._client.stream_response(
                 request,
                 prepared_admission=presentation.admission.ticket,
+                idempotency_key=presentation.admission.idempotency_key,
                 on_prepared_outcome=on_outcome,
             )
         try:
