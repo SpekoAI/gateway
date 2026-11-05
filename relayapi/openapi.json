@@ -387,10 +387,10 @@
             }
           },
           "429": {
-            "$ref": "#/components/responses/TooManyRequests"
+            "$ref": "#/components/responses/LLMTooManyRequests"
           },
           "default": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/LLMError"
           }
         }
       }
@@ -410,7 +410,7 @@
         ],
         "requestBody": {
           "required": true,
-          "description": "An ordinary POST /v1/llm/responses body holding the conversation so far, before the turn being spoken.",
+          "description": "An ordinary POST /v1/llm/responses body holding the conversation so far, before the turn being spoken. It is validated like one, so input needs at least one item; on a first turn with no history the agent's system instruction is that item.",
           "content": {
             "application/json": {
               "schema": {
@@ -706,6 +706,51 @@
           },
           "RateLimit-Policy": {
             "$ref": "#/components/headers/RateLimitPolicy"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        }
+      },
+      "LLMError": {
+        "description": "Normalized failure of POST /v1/llm/responses: the shared Error response plus the prepared-admission outcome, which a failure after the ticket check still carries.",
+        "headers": {
+          "Speko-Request-ID": {
+            "$ref": "#/components/headers/SpekoRequestID"
+          },
+          "RateLimit-Policy": {
+            "$ref": "#/components/headers/RateLimitPolicy"
+          },
+          "Speko-Prepared-Admission-Outcome": {
+            "$ref": "#/components/headers/SpekoPreparedAdmissionOutcome"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        }
+      },
+      "LLMTooManyRequests": {
+        "description": "TooManyRequests for POST /v1/llm/responses, plus the prepared-admission outcome.",
+        "headers": {
+          "Speko-Request-ID": {
+            "$ref": "#/components/headers/SpekoRequestID"
+          },
+          "RateLimit-Policy": {
+            "$ref": "#/components/headers/RateLimitPolicy"
+          },
+          "Retry-After": {
+            "$ref": "#/components/headers/RetryAfter"
+          },
+          "Speko-Prepared-Admission-Outcome": {
+            "$ref": "#/components/headers/SpekoPreparedAdmissionOutcome"
           }
         },
         "content": {
@@ -1961,7 +2006,8 @@
           },
           "input": {
             "type": "array",
-            "description": "Full conversation history, resent on every request. The InputItem union has no structured_json branch — those items are output-only, and resent history represents earlier structured output as ordinary assistant text.",
+            "minItems": 1,
+            "description": "Full conversation history, resent on every request; at least one item, and a system instruction counts. The InputItem union has no structured_json branch — those items are output-only, and resent history represents earlier structured output as ordinary assistant text.",
             "items": {
               "$ref": "#/components/schemas/InputItem"
             }

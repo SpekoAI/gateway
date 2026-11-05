@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:d267099b71429ad4a3a940710eb60e9324f6d3eec33309a2a5a115a81cf468e4
-# yaml-body: sha256:0a458cd262577010e4657619fd86014c9f77c356c17b4455122faa047cf61c0b
+# json-mirror: openapi.json sha256:a6c16b083bef68ce5fa29177839ecee18e75b529d49d77a4127c4fd33f5dcaba
+# yaml-body: sha256:46cfcda6004120fb9105b4aa6f71ec5244681038c3eb53d18060ccd7c682ca78
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -355,9 +355,9 @@ paths:
                   a client that sees the connection close without a terminal
                   event knows the stream was truncated rather than finished.
         "429":
-          $ref: "#/components/responses/TooManyRequests"
+          $ref: "#/components/responses/LLMTooManyRequests"
         default:
-          $ref: "#/components/responses/Error"
+          $ref: "#/components/responses/LLMError"
   /v1/llm/admissions:
     post:
       operationId: createLLMAdmission
@@ -400,7 +400,9 @@ paths:
         required: true
         description: >-
           An ordinary POST /v1/llm/responses body holding the conversation so
-          far, before the turn being spoken.
+          far, before the turn being spoken. It is validated like one, so input
+          needs at least one item; on a first turn with no history the agent's
+          system instruction is that item.
         content:
           application/json:
             schema:
@@ -693,6 +695,39 @@ components:
           $ref: "#/components/headers/SpekoRequestID"
         RateLimit-Policy:
           $ref: "#/components/headers/RateLimitPolicy"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    LLMError:
+      description: >-
+        Normalized failure of POST /v1/llm/responses: the shared Error
+        response plus the prepared-admission outcome, which a failure after
+        the ticket check still carries.
+      headers:
+        Speko-Request-ID:
+          $ref: "#/components/headers/SpekoRequestID"
+        RateLimit-Policy:
+          $ref: "#/components/headers/RateLimitPolicy"
+        Speko-Prepared-Admission-Outcome:
+          $ref: "#/components/headers/SpekoPreparedAdmissionOutcome"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    LLMTooManyRequests:
+      description: >-
+        TooManyRequests for POST /v1/llm/responses, plus the prepared-admission
+        outcome.
+      headers:
+        Speko-Request-ID:
+          $ref: "#/components/headers/SpekoRequestID"
+        RateLimit-Policy:
+          $ref: "#/components/headers/RateLimitPolicy"
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+        Speko-Prepared-Admission-Outcome:
+          $ref: "#/components/headers/SpekoPreparedAdmissionOutcome"
       content:
         application/json:
           schema:
@@ -1858,11 +1893,13 @@ components:
             Omitted entirely, routing means {mode: auto, objective: balanced}.
         input:
           type: array
+          minItems: 1
           description: >-
-            Full conversation history, resent on every request. The InputItem
-            union has no structured_json branch — those items are
-            output-only, and resent history represents earlier structured
-            output as ordinary assistant text.
+            Full conversation history, resent on every request; at least one
+            item, and a system instruction counts. The InputItem union has no
+            structured_json branch — those items are output-only, and resent
+            history represents earlier structured output as ordinary
+            assistant text.
           items:
             $ref: "#/components/schemas/InputItem"
         tools:

@@ -761,6 +761,30 @@ func TestOpenAPIDeclaresRelayEnvelope(t *testing.T) {
 		}
 	}
 
+	// A failure after the ticket check still says what became of the ticket,
+	// so the LLM operation's error responses declare the outcome header too,
+	// and the shared error responses (every other operation) do not.
+	for status, component := range map[string]string{"429": "LLMTooManyRequests", "default": "LLMError"} {
+		ref := specNode(t, doc, "paths", "/v1/llm/responses", "post", "responses", status).(map[string]any)["$ref"]
+		if ref != "#/components/responses/"+component {
+			t.Errorf("/v1/llm/responses: %s = %v, want the %s response", status, ref, component)
+		}
+		headers := specNode(t, doc, "components", "responses", component, "headers").(map[string]any)
+		if _, ok := headers[relayapi.HeaderPreparedAdmissionOutcome]; !ok {
+			t.Errorf("%s must declare the %s header", component, relayapi.HeaderPreparedAdmissionOutcome)
+		}
+	}
+	for _, component := range []string{"Error", "TooManyRequests"} {
+		headers := specNode(t, doc, "components", "responses", component, "headers").(map[string]any)
+		if _, ok := headers[relayapi.HeaderPreparedAdmissionOutcome]; ok {
+			t.Errorf("shared %s response must not declare the %s header", component, relayapi.HeaderPreparedAdmissionOutcome)
+		}
+	}
+	// Prepare is validated like /v1/llm/responses, which rejects empty input.
+	if minItems := doc.schema(t, "LLMRequest")["properties"].(map[string]any)["input"].(map[string]any)["minItems"]; minItems != float64(1) {
+		t.Errorf("LLMRequest.input minItems = %v, want 1 to match LLMRequest.Validate", minItems)
+	}
+
 	content := specNode(t, doc, "paths", "/v1/llm/responses", "post", "responses", "200", "content").(map[string]any)
 	for _, mediaType := range []string{"application/json", "text/event-stream"} {
 		if _, ok := content[mediaType]; !ok {
