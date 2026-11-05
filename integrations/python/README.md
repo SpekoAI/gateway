@@ -426,4 +426,3 @@ pipeline = Pipeline(
 Use a Pipecat VAD in the pipeline so `VADUserStoppedSpeakingFrame` commits the
 current Gateway STT utterance. The complete container and Pipecat Cloud setup
 is in the [Pipecat integration guide](../../docs/PIPECAT.md).
-
