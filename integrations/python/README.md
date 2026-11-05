@@ -5,6 +5,48 @@ Speko Gateway socket, or to the Speko Router's native STT, TTS, LLM and typed
 evaluation surfaces. Voice classes use an explicitly supplied transport client
 or the local Gateway socket. Relay clients carry their own Speko credential.
 
+## Native realtime voice
+
+`RelayRealtimeClient` opens one vendor-native socket attempt through the owned
+sidecar. Supply the per-session model key, session ID, socket path and local
+socket credential explicitly, as for the speech clients below. `open` requires
+the compiled protocol and concrete model. Frames and close status remain native;
+there is no automatic reconnect or second admission after a failed handshake.
+The raw client supports OpenAI realtime, xAI realtime, GPT-Live, Gemini Live,
+OpenAI realtime translation and Alibaba LiveTranslate.
+
+For conversational LiveKit agents, `speko_gateway.livekit.RealtimeModel` takes
+that client plus the compiled `protocol`, `model`, `voice`, and optional
+`temperature`. It supports `openai.realtime.v1`, `xai.realtime.v1`, and
+`google.live.v1`. OpenAI realtime refuses a sampling temperature. Input PCM
+waits for the acknowledgment of this model's configuration. Tool results and
+streamed output use the real LiveKit realtime interface. A separately paid ASR
+model is never enabled implicitly. Native `AgentSession.say` needs a framework
+release with realtime `supports_say`; older releases can use `generate_reply`.
+
+`GPTLiveModel` uses LiveKit's duplex audio adapter (tested with 1.8.10) and an
+explicitly supplied `LLM` backend. Configure that backend with a native
+`RelayLLMClient`, concrete provider/model and positive `max_output_tokens` from
+the compiled spec, using the same platform session as the voice client. The
+voice session uses client delegation; it never enables a vendor-selected
+Responses backend. Each delegated backend request passes through the native
+Speko LLM transport, and function tools run through `AgentSession`. Repeated
+delegation IDs do not repeat paid backend work. Tool results remain available
+to later delegations; results that request no reply are sent as silent context.
+Long Unicode results are split losslessly into bounded native appends.
+
+GPT-Live transcript deltas remain timed fragments, not completed caller turns.
+Use the separately selected and admitted STT leg for canonical caller reporting.
+The model's continuous audio and transcript fragments are segmented by LiveKit's
+duplex adapter. Use `generate_reply` for an explicit spoken response; GPT-Live
+does not provide the ordinary realtime cancel/commit or deterministic TTS API.
+Older frameworks can still import the speech integrations; constructing
+`GPTLiveModel` without the duplex interface fails before network activity.
+
+The caller owns the supplied clients and backend. Close the `AgentSession` and
+models, then their clients. These SDK interfaces do not select paid model legs
+or authorize execution: the cell must freeze, register and admit every leg.
+
 ## Native relay speech
 
 `RelaySpeechClient` sends STT/TTS streams through the router's native execution

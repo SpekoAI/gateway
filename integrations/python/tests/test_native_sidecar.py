@@ -21,7 +21,12 @@ from livekit.agents import Agent, AgentSession, APIConnectionError, APIConnectOp
 from livekit.agents import llm as agents_llm
 from livekit.agents.voice import io
 
-from speko_gateway import GatewayError, RelayLLMClient, RelaySpeechClient
+from speko_gateway import (
+    GatewayError,
+    RelayLLMClient,
+    RelayRealtimeClient,
+    RelaySpeechClient,
+)
 from speko_gateway._livekit_bridge import LiveKitSTTBridge, LiveKitTTSBridge
 from speko_gateway._relay_socket import NATIVE_LOCAL_AUTHORIZATION
 from speko_gateway.livekit import LLM, TTS
@@ -1171,3 +1176,90 @@ async def test_native_sidecar_llm_ambiguity_remains_nonretryable(
         finally:
             await client.aclose()
     assert seen == [1]
+
+
+@pytest.mark.parametrize(
+    "protocol,model,path",
+    [
+        ("openai.realtime.v1", "gpt-realtime-2.1", "/v1/openai/realtime?model=gpt-realtime-2.1"),
+        ("xai.realtime.v1", "grok-voice-3.0", "/v1/xai/realtime?model=grok-voice-3.0"),
+        ("openai.live.v1", "gpt-live-1", "/v1/openai/gpt-live"),
+        ("google.live.v1", "gemini-3.8-live", "/v1/google/gemini-live"),
+        ("openai.realtime.translation.v1", "gpt-realtime-translate", "/v1/openai/realtime-translations?model=gpt-realtime-translate"),
+        ("alibaba.livetranslate.v1", "qwen3.8-livetranslate-flash-realtime", "/v1/alibaba/qwen-livetranslate?model=qwen3.8-livetranslate-flash-realtime"),
+    ],
+)
+async def test_python_realtime_native_sidecar_preserves_protocol_bytes_and_one_attempt(
+    native_binary, protocol, model, path
+):
+    calls = []
+    text = '{"owned-private-prompt":"native","integer":9007199254740993,"decimal":0.70000000000000001}'
+    binary = b"\xff\x00" * 16000
+
+    async def handle(request):
+        calls.append(request.raw_path)
+        assert request.raw_path == path
+        assert request.headers["Authorization"] == "Bearer " + MODEL_KEY
+        assert request.headers["Speko-Client-Session-Id"] == "ses_native_realtime"
+        assert request.headers["Idempotency-Key"] == "owned-realtime"
+        assert NATIVE_LOCAL_AUTHORIZATION not in request.headers
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        incoming = await ws.receive()
+        assert incoming.type is aiohttp.WSMsgType.TEXT and incoming.data == text
+        await ws.send_str(text)
+        incoming = await ws.receive()
+        assert incoming.type is aiohttp.WSMsgType.BINARY and incoming.data == binary
+        await ws.send_bytes(binary)
+        await ws.close(code=1000, message=b"owned-normal-close")
+        return ws
+
+    async with native_stack(native_binary, handle) as (socket, _):
+        client = RelayRealtimeClient(
+            api_key=MODEL_KEY, session_id="ses_native_realtime",
+            socket_path=socket, local_auth_token=LOCAL_TOKEN,
+        )
+        try:
+            stream = await client.open(protocol=protocol, model=model, idempotency_key="owned-realtime")
+            await stream.send(text)
+            await stream.send(binary)
+            assert [event async for event in stream.events()] == [text, binary]
+            assert stream.close_code == 1000
+            with pytest.raises(GatewayError) as exhausted:
+                await client.open(protocol=protocol, model=model)
+            assert not exhausted.value.retryable
+        finally:
+            await client.aclose()
+    assert calls == [path]
+
+
+@pytest.mark.parametrize("status,code", [(402, "insufficient_credit"), (409, "idempotency_conflict"), (429, "rate_limited"), (503, "provider_unavailable")])
+async def test_python_realtime_keeps_canonical_refusal_without_readmission(native_binary, status, code):
+    calls = []
+
+    async def handle(request):
+        calls.append(request.path)
+        return web.json_response({"error": {
+            "code": code, "message": "owned-private-prompt",
+            "hint": "owned remediation", "retryable": True,
+            "request_id": "owned-realtime-refusal",
+        }}, status=status)
+
+    async with native_stack(native_binary, handle) as (socket, _):
+        client = RelayRealtimeClient(
+            api_key=MODEL_KEY, session_id="ses_native_refusal",
+            socket_path=socket, local_auth_token=LOCAL_TOKEN,
+        )
+        try:
+            with pytest.raises(GatewayError) as failure:
+                await client.open(protocol="xai.realtime.v1", model="grok-voice-3.0")
+            assert failure.value.code == code
+            assert failure.value.status == status
+            assert failure.value.request_id == "owned-realtime-refusal"
+            assert not failure.value.retryable
+            assert "owned-private-prompt" not in str(failure.value)
+            with pytest.raises(GatewayError):
+                await client.open(protocol="xai.realtime.v1", model="grok-voice-3.0")
+        finally:
+            await client.aclose()
+    assert len(calls) == 1

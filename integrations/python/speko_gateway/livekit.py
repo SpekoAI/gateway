@@ -31,7 +31,6 @@ from livekit.agents import (
     utils,
     vad,
 )
-from livekit.agents.llm.tool_context import get_raw_function_info
 from livekit.agents.utils import is_given
 
 from ._livekit_bridge import (
@@ -43,6 +42,7 @@ from ._livekit_bridge import (
     LiveKitTTSStream,
 )
 from ._livekit_draining_vad import DrainingVAD
+from ._livekit_gpt_live import GPTLiveModel
 from ._livekit_local_transcript import bind_local_transcript, restore_local_transcript
 from ._livekit_native_input import (
     NativeInputBinding,
@@ -56,6 +56,8 @@ from ._livekit_native_transcript import (
     restore_native_transcript,
 )
 from ._livekit_native_turns import NativeTurnPolicy
+from ._livekit_realtime import RealtimeModel
+from ._livekit_tools import _relay_tools
 from ._livekit_tts_text import NativeTextBuffer
 from ._speech_client import SpeechClient
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
@@ -70,7 +72,7 @@ from .relay import (
 )
 from .relay_speech import RelaySpeechClient
 
-__all__ = ["LLM", "STT", "TTS", "DrainingVAD"]
+__all__ = ["LLM", "STT", "TTS", "DrainingVAD", "GPTLiveModel", "RealtimeModel"]
 
 
 def _speech_connect_options(
@@ -1636,35 +1638,6 @@ def _relay_input(chat_ctx: llm.ChatContext) -> list[dict[str, Any]]:
     return items
 
 
-def _relay_tools(tools: list[llm.Tool]) -> list[dict[str, Any]]:
-    declarations: list[dict[str, Any]] = []
-    for tool in tools:
-        if llm.is_function_tool(tool):
-            schema = llm.utils.build_legacy_openai_schema(tool, internally_tagged=True)
-            raw: dict[str, Any] = {
-                "name": schema["name"],
-                "description": schema.get("description") or "",
-                "parameters": schema.get("parameters"),
-            }
-        elif llm.is_raw_function_tool(tool):
-            info = get_raw_function_info(tool)
-            raw = {
-                "name": info.raw_schema.get("name", info.name),
-                "description": info.raw_schema.get("description") or "",
-                "parameters": info.raw_schema.get("parameters"),
-            }
-        else:
-            raise ValueError(
-                "Speko Router LLM supports function tools only; got "
-                f"{type(tool).__name__}"
-            )
-        declaration: dict[str, Any] = {"name": raw["name"]}
-        if raw["description"]:
-            declaration["description"] = raw["description"]
-        if raw["parameters"] is not None:
-            declaration["parameters"] = raw["parameters"]
-        declarations.append(declaration)
-    return declarations
 
 
 def _completion_usage(usage: dict[str, Any]) -> llm.CompletionUsage:
