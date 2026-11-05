@@ -477,7 +477,7 @@ async def test_draining_framework_vad_buffered_silence_has_no_packet_duration_de
         await asyncio.gather(collector, return_exceptions=True)
 
 
-@pytest.mark.parametrize("mode", ["vad", "stt_flush", "stt_flush_resume"])
+@pytest.mark.parametrize("mode", ["vad", "stt_flush", "stt_flush_resume", "stt_flush_old_backlog"])
 async def test_draining_framework_vad_preserves_actual_response_interruption(mode):
     if "capabilities" not in inspect.signature(io.AudioOutput).parameters:
         pytest.skip("SDK predates the current audio output contract")
@@ -576,13 +576,18 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
             await audio.frames.put(frame(b"\0\0" * 4096))
             await asyncio.wait_for(until(lambda: speech.interrupted), 2)
         else:
-            quiet, voiced = (4096,1024) if mode == "stt_flush_resume" else (1024,80)
-            await audio.frames.put(frame(b"\0\0" * quiet + b"\xff\x0f" * voiced))
+            if mode == "stt_flush_old_backlog":
+                payload = b"\xff\x0f" * 11200 + b"\0\0" * 8000
+            else:
+                quiet, voiced = (4096,1024) if mode == "stt_flush_resume" else (1024,80)
+                payload = b"\0\0" * quiet + b"\xff\x0f" * voiced
+            await audio.frames.put(frame(payload))
             await asyncio.wait_for(blocked.wait(), 3)
             stt_stream._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH))
             await asyncio.wait_for(until(lambda: streams[0]._flushes > 0), 3)
             release.set()
             await asyncio.wait_for(until(lambda: streams[0]._segment == streams[0]._flushes), 3)
+            await asyncio.wait_for(until(lambda: streams[0]._processed >= len(payload) // 2), 3)
             await asyncio.sleep(0.1)
             assert not speech.interrupted, "pre-EOS speech cannot interrupt the response after flush"
             assert session._activity._audio_recognition._speaking is (mode == "stt_flush_resume")
