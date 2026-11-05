@@ -690,6 +690,8 @@ class PreparedPresentation:
     other than `used`, a missing header included, releases the ticket as soon
     as the response headers arrive, not when the stream ends. Call `finish`
     when the request ends; a request that never got a response releases then.
+    Then await `wait_released` before a retry or follow-up, so its ordinary
+    admission does not compete with the ticket's slot.
     """
 
     def __init__(self, preparer: AdmissionPreparer, admission: PreparedAdmission):
@@ -697,6 +699,7 @@ class PreparedPresentation:
         self.admission = admission
         self.outcome: str | None = None
         self._settled = False
+        self._release: asyncio.Task[None] | None = None
 
     def observe(self, outcome: str) -> None:
         self.outcome = outcome
@@ -707,10 +710,22 @@ class PreparedPresentation:
         if self.outcome is None:
             self._settle()
 
+    async def wait_released(self) -> None:
+        """Wait, bounded like an expiring ticket's release, for this release.
+
+        Returns at once when the ticket was used or no release is running.
+        """
+
+        release = self._release
+        if release is not None and not release.done():
+            await asyncio.wait(
+                {release}, timeout=self._preparer._expiring_release_wait
+            )
+
     def _settle(self) -> None:
         if not self._settled:
             self._settled = True
-            self._preparer._release_soon(self.admission)
+            self._release = self._preparer._release_soon(self.admission)
 
 
 _RFC3339 = re.compile(

@@ -810,13 +810,21 @@ class SpekoLLMService(LLMService):
             if preparer is not None and admission is not None
             else None
         )
+        cancelled = False
         try:
             function_calls = await self._stream_context(
                 context, request, presentation
             )
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             if presentation is not None:
                 presentation.finish()
+                if not cancelled:
+                    # A follow-up must not compete with the slot of a ticket
+                    # being released.
+                    await presentation.wait_released()
         if function_calls:
             await self.run_function_calls(function_calls)
 

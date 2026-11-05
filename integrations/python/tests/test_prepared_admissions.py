@@ -38,6 +38,11 @@ class FakeRouter:
         self.outcome: str | None = "used"
         self.response_status = 200
         self.fail_responses = 0
+        # One-slot organization: an unreleased, unused ticket holds the only
+        # concurrency slot, so any other admission is refused for it.
+        self.one_slot = False
+        self.live: dict[str, str] = {}
+        self.on_failure: Callable[[], None] | None = None
         self.issued = 0
         self.release_delay = 0.0
         self.hold_stream: asyncio.Event | None = None
@@ -58,7 +63,13 @@ class FakeRouter:
             return web.Response(status=int(self.admission_reply))
         if self.admission_reply == "malformed":
             return web.json_response({"object": "llm.admission"}, status=201)
+        if self.one_slot and self.live:
+            return web.json_response(
+                {"error": {"code": "concurrency_exhausted", "retryable": False}},
+                status=429,
+            )
         self.issued += 1
+        self.live[f"spa1.ticket-{self.issued}"] = request.headers["Idempotency-Key"]
         return web.json_response(
             {
                 "object": "llm.admission",
@@ -71,6 +82,7 @@ class FakeRouter:
     async def release(self, request: web.Request) -> web.Response:
         body = await request.json()
         await asyncio.sleep(self.release_delay)
+        self.live.pop(body.get("admission", ""), None)
         self.releases.append((dict(request.headers), body))
         self.log.append("released")
         return web.json_response({"object": "llm.admission.release", "released": True})
@@ -81,11 +93,29 @@ class FakeRouter:
         headers = {"Content-Type": "text/event-stream", "Speko-Request-ID": "req-1"}
         if "Speko-Prepared-Admission" in request.headers and self.outcome is not None:
             headers["Speko-Prepared-Admission-Outcome"] = self.outcome
+        presented = request.headers.get("Speko-Prepared-Admission", "")
+        if self.one_slot and presented and self.outcome == "used":
+            key = request.headers["Idempotency-Key"]
+            if self.live.get(presented) == key:
+                del self.live[presented]
+            else:
+                headers["Speko-Prepared-Admission-Outcome"] = "invalid"
         if self.fail_responses > 0:
             self.fail_responses -= 1
+            if self.on_failure is not None:
+                self.on_failure()
             return web.json_response(
                 {"error": {"code": "provider_unavailable", "retryable": True}},
                 status=503,
+                headers={k: v for k, v in headers.items() if k != "Content-Type"},
+            )
+        if self.one_slot and self.live and (
+            headers.get("Speko-Prepared-Admission-Outcome") != "used"
+        ):
+            # An ordinary admission while a ticket holds the only slot.
+            return web.json_response(
+                {"error": {"code": "concurrency_exhausted", "retryable": False}},
+                status=429,
                 headers={k: v for k, v in headers.items() if k != "Content-Type"},
             )
         if self.response_status != 200:
@@ -313,6 +343,78 @@ async def test_retry_after_a_ticketed_failure_is_ordinary_with_a_fresh_key(
         assert retry["Idempotency-Key"] != prepare_key
         if outcome is None:
             await until(lambda: len(router.releases) == 1)
+        await plugin.aclose()
+
+
+async def test_retry_presents_a_ticket_prepared_after_the_failure() -> None:
+    # One-slot organization: the first attempt spends ticket 1 and fails
+    # retryably; a speech start prepares ticket 2 before LiveKit retries. An
+    # ordinary retry would be refused while ticket 2 holds the slot, so the
+    # retry presents ticket 2 under its own key.
+    router = FakeRouter()
+    router.one_slot = True
+    router.fail_responses = 1
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        router.on_failure = lambda: plugin.prepare(_history())
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+
+        stream = plugin.chat(
+            chat_ctx=_turn(),
+            conn_options=APIConnectOptions(max_retry=1, retry_interval=0.05),
+        )
+        text = "".join(
+            [c.delta.content async for c in stream if c.delta and c.delta.content]
+        )
+
+        assert text == "Hi"
+        assert router.issued == 2
+        (first, _), (retry, _) = router.responses
+        keys = [headers["Idempotency-Key"] for headers, _ in router.admissions]
+        assert first["Speko-Prepared-Admission"] == "spa1.ticket-1"
+        assert first["Idempotency-Key"] == keys[0]
+        assert retry["Speko-Prepared-Admission"] == "spa1.ticket-2"
+        assert retry["Idempotency-Key"] == keys[1]
+        assert stream.prepared_admission_outcome == "used"
+        assert router.live == {}
+        assert router.releases == []
+        await plugin.aclose()
+
+
+async def test_retry_after_a_mismatch_refusal_releases_then_goes_ordinary() -> None:
+    # runtime#377 f11971a: a ticketed request the Router cannot re-admit
+    # without confirming the ticket retired is refused 503 provider_unavailable
+    # (retryable) with the mismatch outcome. The ticket is released before
+    # the retry, which goes the ordinary way with a fresh key.
+    router = FakeRouter()
+    router.one_slot = True
+    router.outcome = "budget"
+    router.fail_responses = 1
+    router.release_delay = 0.4
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+        prepare_key = router.admissions[0][0]["Idempotency-Key"]
+
+        stream = plugin.chat(
+            chat_ctx=_turn(),
+            conn_options=APIConnectOptions(max_retry=1, retry_interval=0.01),
+        )
+        text = "".join(
+            [c.delta.content async for c in stream if c.delta and c.delta.content]
+        )
+
+        assert text == "Hi"
+        (first, _), (retry, _) = router.responses
+        assert first["Speko-Prepared-Admission"] == "spa1.ticket-1"
+        assert "Speko-Prepared-Admission" not in retry
+        assert retry["Idempotency-Key"] != prepare_key
+        assert router.log == ["admit", "respond", "released", "respond"]
+        assert [body for _, body in router.releases] == [
+            {"admission": "spa1.ticket-1"}
+        ]
         await plugin.aclose()
 
 

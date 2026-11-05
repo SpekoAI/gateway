@@ -140,9 +140,10 @@ On each user speech start, the LLM prepares from the current agent's chat
 context and the tools of the last request (`POST /v1/llm/admissions`). The
 prepare call's `Idempotency-Key` is the one the real request will use: the
 Router binds the ticket to it. The next request presents the ticket with that
-same key, and the ticket is then spent. Every request without a ticket sends a
-fresh key. That includes a retry of a request that presented one, which goes
-the ordinary way. A tool-call
+same key, and the ticket is then spent. A ticket is never presented twice.
+Every request without a ticket sends a fresh key. A retry of a failed request
+can present only a ticket prepared since the failure, under that ticket's own
+key; otherwise it goes the ordinary way. A tool-call
 follow-up and any request with no live ticket are admitted the ordinary way.
 There is at most one ticket per LLM. A false start keeps a ticket with more
 than a minute left. An older ticket is released, and the new prepare waits for
@@ -155,7 +156,8 @@ a ticket compete with a real request for one:
 - A request waits up to 3 s for a prepare still in flight. Past that it goes
   the ordinary way, and the prepare releases its ticket when it lands.
 - A ticket the Router did not use is released as soon as the response headers
-  arrive.
+  arrive. A retry or follow-up waits up to 1 s for that release before its
+  ordinary admission.
 - A ticket too close to expiry is released, with a wait of up to 1 s, before
   the ordinary request goes out.
 - The session closing, the job shutting down, or `aclose()` releases the

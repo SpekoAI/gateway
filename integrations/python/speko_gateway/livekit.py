@@ -1088,10 +1088,6 @@ class RelayLLMStream(llm.LLMStream):
         self._client = client
         self.prepared_admission_outcome: str | None = None
         """This request's `Speko-Prepared-Admission-Outcome`, as on the LLM."""
-        # Only the first attempt may present a ticket: its plan and key are
-        # spent by then, so a framework retry goes the ordinary way with a
-        # fresh key.
-        self._ticket_tried = False
 
     async def _run(self) -> None:
         request = self._relay_llm._request_body(self._chat_ctx, self._tools)
@@ -1104,8 +1100,11 @@ class RelayLLMStream(llm.LLMStream):
         _report_probe_marker("llm.requested")
         # Waiting on a prepare in flight is part of this request's latency,
         # so it comes after the marker.
-        preparer = None if self._ticket_tried else self._relay_llm._preparer
-        self._ticket_tried = True
+        # take() hands out a ticket once and never caches it again, so a
+        # framework retry never presents a spent ticket or its key. It may
+        # present a fresh ticket prepared since the failed attempt, under that
+        # ticket's own key, rather than compete with it for a slot.
+        preparer = self._relay_llm._preparer
         admission = await preparer.take() if preparer is not None else None
         self._relay_llm._prepared_admission_outcome = None
         presentation = (
@@ -1113,11 +1112,19 @@ class RelayLLMStream(llm.LLMStream):
             if preparer is not None and admission is not None
             else None
         )
+        cancelled = False
         try:
             await self._stream_relay(request, presentation)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             if presentation is not None:
                 presentation.finish()
+                if not cancelled:
+                    # A retry or follow-up must not compete with the slot of
+                    # a ticket being released.
+                    await presentation.wait_released()
 
     def _on_prepared_outcome(self, outcome: str) -> None:
         self.prepared_admission_outcome = outcome
