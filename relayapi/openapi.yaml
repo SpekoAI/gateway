@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:52417569b217af6810077026a2227d999c737d395469a312ebdfa3b503adf1c3
-# yaml-body: sha256:00434d9efd46dfed1fb77889572824d886d942b5a5e40fb42ce2883f300c26f3
+# json-mirror: openapi.json sha256:a1143ffab4ce22bf1f1f22e6d9d088b33e28c887f39fb56f2f43937afaa5197f
+# yaml-body: sha256:9a9d48869754985c22fa55c809884f6310a1f224bd4c1c6c9218886d7bddbbf7
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -308,19 +308,21 @@ paths:
         the Router never runs a second execution under it. When such a
         ticket does not fit, or its attempt fails before the provider
         connector accepts it, the Router tries to retire it and answers from
-        what that established: 409 idempotency_conflict whose
-        Speko-Prepared-Admission-Outcome is anything but invalid means it was
-        retired and never ran, so send the request again without it under a
-        fresh Idempotency-Key (retiring is idempotent, so the same request
-        sent again after a lost response gets the same answer); 409
-        request_already_started means it was used and may have run, or
-        expired before it could be confirmed, so do not resend and treat it
-        like a request whose response was lost; any other failure means it
-        could not be confirmed either way, so retry the request unchanged,
-        ticket and key included, which its single-use plan keeps safe. Only
-        that idempotency_conflict licenses a fresh key: one carrying outcome
-        invalid comes from the ordinary admission under the request's own
-        key and keeps the ordinary idempotency meaning. A failure after the
+        what that established: 409 idempotency_conflict carrying
+        Speko-Replacement-Idempotency-Key means it was retired and never ran,
+        so send the request again without it under exactly that key, which
+        is derived from the ticket's key so every copy of a duplicated
+        request resends under one key and runs once (retiring is idempotent,
+        so the same request sent again after a lost response gets the same
+        answer and key); 409 request_already_started means it was used and
+        may have run, or expired before it could be confirmed, so do not
+        resend and treat it like a request whose response was lost; any
+        other failure means it could not be confirmed either way, so retry
+        the request unchanged, ticket and key included, which its single-use
+        plan keeps safe. Only that header licenses a resend under another
+        key: an idempotency_conflict without it (outcome invalid, or no
+        outcome after a handoff) comes from an ordinary admission and keeps
+        the ordinary idempotency meaning. A failure after the
         connector accepted the request is an ordinary failure of a request
         that may have run. A ticket of this caller's that
         will not be used is retired before the response, so its reservation
@@ -479,8 +481,7 @@ paths:
         particular one never presented, and one whose request came back
         without a Speko-Prepared-Admission-Outcome header (it failed
         validation or route selection before the ticket check, or was handed
-        to another region). A ticket the Router already retired answers
-        false. Releasing is always safe.
+        to another region). Releasing is always safe.
         Idempotency-Key is optional here, because a release replays nothing.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKeyOptional"
@@ -638,19 +639,21 @@ components:
         the Router never runs a second execution under it. When such a
         ticket does not fit, or its attempt fails before the provider
         connector accepts it, the Router tries to retire it and answers from
-        what that established: 409 idempotency_conflict whose
-        Speko-Prepared-Admission-Outcome is anything but invalid means it was
-        retired and never ran, so send the request again without it under a
-        fresh Idempotency-Key (retiring is idempotent, so the same request
-        sent again after a lost response gets the same answer); 409
-        request_already_started means it was used and may have run, or
-        expired before it could be confirmed, so do not resend and treat it
-        like a request whose response was lost; any other failure means it
-        could not be confirmed either way, so retry the request unchanged,
-        ticket and key included, which its single-use plan keeps safe. Only
-        that idempotency_conflict licenses a fresh key: one carrying outcome
-        invalid comes from the ordinary admission under the request's own
-        key and keeps the ordinary idempotency meaning. A failure after the
+        what that established: 409 idempotency_conflict carrying
+        Speko-Replacement-Idempotency-Key means it was retired and never ran,
+        so send the request again without it under exactly that key, which
+        is derived from the ticket's key so every copy of a duplicated
+        request resends under one key and runs once (retiring is idempotent,
+        so the same request sent again after a lost response gets the same
+        answer and key); 409 request_already_started means it was used and
+        may have run, or expired before it could be confirmed, so do not
+        resend and treat it like a request whose response was lost; any
+        other failure means it could not be confirmed either way, so retry
+        the request unchanged, ticket and key included, which its single-use
+        plan keeps safe. Only that header licenses a resend under another
+        key: an idempotency_conflict without it (outcome invalid, or no
+        outcome after a handoff) comes from an ordinary admission and keeps
+        the ordinary idempotency meaning. A failure after the
         connector accepted the request is an ordinary failure of a request
         that may have run. A ticket of this caller's that
         will not be used is retired before the response, so its reservation
@@ -695,6 +698,16 @@ components:
       schema:
         type: integer
         minimum: 0
+    SpekoReplacementIdempotencyKey:
+      description: >-
+        LLM only. Sent with 409 idempotency_conflict when the Router retired
+        the caller's prepared ticket and it never ran: the Idempotency-Key to
+        send the request again under, without the ticket. It is derived from
+        the ticket's key, so every copy of a duplicated request gets the same
+        value and the resend runs once. Its presence is the only signal that
+        a resend under another key is safe.
+      schema:
+        type: string
     SpekoPreparedAdmissionOutcome:
       description: >-
         LLM only. Sent when the request carried Speko-Prepared-Admission and
@@ -765,8 +778,8 @@ components:
         response plus the prepared-admission outcome, which a failure after
         the ticket check still carries. A ticketed request the Router will
         not run on its ticket is answered here: 409 idempotency_conflict with
-        an outcome other than invalid (retired, never ran: resend without the
-        ticket under a fresh key), 409 request_already_started (used and may
+        Speko-Replacement-Idempotency-Key (retired, never ran: resend without
+        the ticket under that key), 409 request_already_started (used and may
         have run, or expired unconfirmed: do not resend), or another failure
         (unconfirmed: retry unchanged).
       headers:
@@ -776,6 +789,8 @@ components:
           $ref: "#/components/headers/RateLimitPolicy"
         Speko-Prepared-Admission-Outcome:
           $ref: "#/components/headers/SpekoPreparedAdmissionOutcome"
+        Speko-Replacement-Idempotency-Key:
+          $ref: "#/components/headers/SpekoReplacementIdempotencyKey"
       content:
         application/json:
           schema:

@@ -19,16 +19,16 @@ import (
 // Router never runs a second execution under a ticket's key. A ticket of the
 // caller's under the request's key that does not fit, or whose attempt fails
 // before the provider connector accepts it, is answered from what retiring it
-// established: 409 idempotency_conflict with an outcome other than invalid
-// (retired, never ran: send the request again without the ticket under a
-// fresh Idempotency-Key; retiring is idempotent, so a resend after a lost
-// response gets the same answer), 409 request_already_started (used and may
-// have run, or expired unconfirmed: do not resend), or another failure
-// (unconfirmed: retry unchanged, ticket and key included). Only that
-// idempotency_conflict licenses a fresh key; one with outcome invalid comes
-// from the ordinary admission and keeps its ordinary meaning, and a failure
-// after the connector accepted the request is an ordinary failure of a
-// request that may have run. A ticket
+// established: 409 idempotency_conflict with HeaderReplacementIdempotencyKey
+// (retired, never ran: send the request again without the ticket under that
+// key, which every copy of a duplicated request receives alike; retiring is
+// idempotent, so a resend after a lost response gets the same answer), 409
+// request_already_started (used and may have run, or expired unconfirmed: do
+// not resend), or another failure (unconfirmed: retry unchanged, ticket and
+// key included). Only that header licenses a resend under another key; an
+// idempotency_conflict without it comes from an ordinary admission and keeps
+// its ordinary meaning, and a failure after the connector accepted the
+// request is an ordinary failure of a request that may have run. A ticket
 // that is not the caller's, or was prepared under another key, is ignored
 // and the request admitted the ordinary way. A ticket the client will not
 // present is released with POST /v1/llm/admissions/release.
@@ -102,8 +102,8 @@ func (r LLMAdmissionRelease) Validate() error {
 // HeaderPreparedAdmissionOutcome. Every value but PreparedAdmissionUsed says
 // why the ticket was not used. PreparedAdmissionInvalid arrives on an
 // ordinary admission under the request's own key; the others arrive on a
-// refusal, whose error code (not the outcome) says whether the client may
-// resend under a fresh Idempotency-Key.
+// refusal; only HeaderReplacementIdempotencyKey, never the outcome, says
+// whether the client may resend under another Idempotency-Key.
 type PreparedAdmissionOutcome string
 
 const (

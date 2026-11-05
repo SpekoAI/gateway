@@ -39,6 +39,11 @@ const HeaderClientSessionID = "Speko-Client-Session-ID"
 const (
 	HeaderPreparedAdmission        = "Speko-Prepared-Admission"
 	HeaderPreparedAdmissionOutcome = "Speko-Prepared-Admission-Outcome"
+	// HeaderReplacementIdempotencyKey, on a 409 idempotency_conflict for a
+	// ticket the Router retired unused, is the key to send the request
+	// again under, without the ticket. Derived from the ticket's key, so
+	// duplicated copies resend under one key.
+	HeaderReplacementIdempotencyKey = "Speko-Replacement-Idempotency-Key"
 )
 
 // Agent-readable lifecycle and throttling headers. RateLimit-Policy follows

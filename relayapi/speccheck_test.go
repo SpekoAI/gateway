@@ -774,6 +774,11 @@ func TestOpenAPIDeclaresRelayEnvelope(t *testing.T) {
 			t.Errorf("%s must declare the %s header", component, relayapi.HeaderPreparedAdmissionOutcome)
 		}
 	}
+	// The replacement key is what licenses a resend under another key after a
+	// retired ticket's 409; it rides the LLM error response.
+	if _, ok := specNode(t, doc, "components", "responses", "LLMError", "headers").(map[string]any)[relayapi.HeaderReplacementIdempotencyKey]; !ok {
+		t.Errorf("LLMError must declare the %s header", relayapi.HeaderReplacementIdempotencyKey)
+	}
 	for _, component := range []string{"Error", "TooManyRequests"} {
 		headers := specNode(t, doc, "components", "responses", component, "headers").(map[string]any)
 		if _, ok := headers[relayapi.HeaderPreparedAdmissionOutcome]; ok {
