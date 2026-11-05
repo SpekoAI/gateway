@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -60,6 +61,18 @@ const (
 	// defaultCloseDrainTimeout bounds how long a closed session keeps its
 	// socket open for the trailing speechComplete after endStream.
 	defaultCloseDrainTimeout = 10 * time.Second
+	// finalUsageTimeout bounds how long the read loop waits to hand the
+	// terminal usage observation to a consumer. The consumer normally reads
+	// until the channel closes, so the wait is immediate; the bound only stops
+	// a consumer that already walked away from pinning the goroutine.
+	finalUsageTimeout = 2 * time.Second
+	// processedCoverageSlackMs is how far the service's processed-audio
+	// position may trail the audio actually forwarded and still count as
+	// having processed all of it. The service reports progress in 80 ms
+	// steps, so a tail shorter than one step is never reported; the slack
+	// only ever lowers the bill, because the billed figure is the reported
+	// position, never the forwarded total.
+	processedCoverageSlackMs = 100
 )
 
 // sampleRateEncodings are the only rates the realtime socket listens at,
@@ -187,7 +200,9 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		setupDone:    make(chan error, 1),
 		done:         make(chan struct{}),
 		drainTimeout: a.closeDrainTimeout,
-		billing:      protocol.BillingObservation{OperationID: "session", Model: model, Mode: "streaming", Quantities: map[string]int64{}},
+		// mono pcm_s16le, validated above
+		bytesPerSecond: int64(request.Media.SampleRateHz) * 2,
+		billing:        protocol.BillingObservation{OperationID: "session", Model: model, Mode: "streaming", Quantities: map[string]int64{}},
 	}
 	if err := stream.writeJSON(ctx, buildHandshake(credential.Value, model, encoding, request.Options)); err != nil {
 		stream.abort()
@@ -280,13 +295,24 @@ type sttStream struct {
 	billing             protocol.BillingObservation
 	billingInvalid      bool
 	billingDurationSeen bool
-	conn                *websocket.Conn
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	events              chan runtimepkg.ProviderEvent
-	setupDone           chan error
-	done                chan struct{}
-	drainTimeout        time.Duration
+	// bytesPerSecond converts forwarded PCM bytes to audio time. The billed
+	// duration is never allowed above the audio this stream actually wrote
+	// to the service.
+	bytesPerSecond int64
+	forwardedBytes atomic.Int64
+	// endStreamSent records that Close delivered endStream: the caller ended
+	// the input, so no further audio can reach the service.
+	endStreamSent atomic.Bool
+	// aborted records a local abort (caller or connector gave up on the
+	// session); its evidence is never promoted to complete.
+	aborted      atomic.Bool
+	conn         *websocket.Conn
+	ctx          context.Context
+	cancel       context.CancelFunc
+	events       chan runtimepkg.ProviderEvent
+	setupDone    chan error
+	done         chan struct{}
+	drainTimeout time.Duration
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -325,6 +351,11 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	if s.inputClosed.Load() || s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
+	// Counted before the write so the cap can never trail what the service
+	// has received: a reply to this frame may be read before Write returns.
+	// A frame whose write fails ends the session, whose evidence then stays
+	// partial, and the service cannot report audio it never got.
+	s.forwardedBytes.Add(int64(len(audio)))
 	if err := s.conn.Write(ctx, websocket.MessageBinary, audio); err != nil {
 		return s.writeError(err)
 	}
@@ -372,6 +403,7 @@ func (s *sttStream) Close(ctx context.Context) error {
 			_ = s.abort()
 			return
 		}
+		s.endStreamSent.Store(true)
 		go s.drainThenClose()
 	})
 	return s.closeErr
@@ -395,6 +427,7 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 
 func (s *sttStream) abort() error {
 	s.abortOnce.Do(func() {
+		s.aborted.Store(true)
 		s.inputClosed.Store(true)
 		s.closed.Store(true)
 		s.cancel()
@@ -513,16 +546,7 @@ func (s *sttStream) handle(message serverMessage, raw []byte) {
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal(raw, &fields)
 	if _, present := fields["audioProcessedMs"]; present {
-		next := metering.Duration("session", s.billing.Model, "streaming", raw, 1, "audioProcessedMs")
-		next.ProviderRequestID = s.billing.ProviderRequestID
-		next.Complete = false
-		merged, err := protocol.MergeBillingObservation(s.billing, *next)
-		_, measured := next.Quantities["duration_seconds"]
-		s.billingInvalid = s.billingInvalid || err != nil || !measured
-		if err == nil {
-			s.billing = merged
-			s.billingDurationSeen = s.billingDurationSeen || measured
-		}
+		s.observeProcessedAudio(raw)
 		s.emitBilling(false)
 	}
 	switch message.Type {
@@ -630,20 +654,122 @@ func (s *sttStream) turnData(message serverMessage, fields map[string]any) json.
 	return marshalData(data)
 }
 
+// observeProcessedAudio folds one frame's audioProcessedMs into the session's
+// cumulative billing evidence.
+//
+// The field rides more than audioProgress: speechStart, transcript, speechEnd
+// and speechComplete carry it too, as the position of the turn they describe
+// (it is published as audio_end_ms). A turn event therefore routinely names a
+// position BEHIND the latest audioProgress — speechComplete arrives after the
+// turn's cleanup pass, by which time progress has moved on. That is not
+// contradictory evidence: every value is a point the service has processed,
+// so the session total is the largest one seen. A smaller valid value is
+// ignored instead of being merged, which would fail as a regression and mark
+// the whole session unbillable. A value that is not a non-negative number is
+// still malformed evidence and still invalidates the session.
+func (s *sttStream) observeProcessedAudio(raw []byte) {
+	next := metering.Duration("session", s.billing.Model, "streaming", raw, 1, "audioProcessedMs")
+	next.ProviderRequestID = s.billing.ProviderRequestID
+	next.Complete = false
+	if _, measured := next.Quantities["duration_seconds"]; !measured {
+		s.billingInvalid = true
+		return
+	}
+	if s.billingDurationSeen && durationOf(*next).Cmp(durationOf(s.billing)) < 0 {
+		return
+	}
+	merged, err := protocol.MergeBillingObservation(s.billing, *next)
+	if err != nil {
+		s.billingInvalid = true
+		return
+	}
+	s.billing = merged
+	s.billingDurationSeen = true
+}
+
+// durationOf is an observation's duration_seconds as an exact number of
+// seconds, so integer-millisecond and fractional reports compare correctly.
+func durationOf(o protocol.BillingObservation) *big.Rat {
+	return new(big.Rat).SetFrac(big.NewInt(o.Quantities["duration_seconds"]), big.NewInt(o.QuantityDenominator("duration_seconds")))
+}
+
+// forwardedDuration is the audio this stream has written to the service, in
+// seconds.
+func (s *sttStream) forwardedDuration() *big.Rat {
+	if s.bytesPerSecond <= 0 {
+		return new(big.Rat)
+	}
+	return new(big.Rat).SetFrac(big.NewInt(s.forwardedBytes.Load()), big.NewInt(s.bytesPerSecond))
+}
+
+// billedObservation is the evidence as published: the service's processed
+// position, capped at the audio actually forwarded. The service cannot have
+// processed audio it was never sent, so the cap only matters if its counter
+// ever ran ahead of the input — and then the customer pays for what was sent.
+func (s *sttStream) billedObservation() protocol.BillingObservation {
+	o := s.billing.Clone()
+	if _, ok := o.Quantities["duration_seconds"]; !ok {
+		return o
+	}
+	if forwarded := s.forwardedDuration(); durationOf(o).Cmp(forwarded) > 0 {
+		denominator := o.QuantityDenominator("duration_seconds")
+		capped := new(big.Int).Quo(new(big.Int).Mul(forwarded.Num(), big.NewInt(denominator)), forwarded.Denom())
+		o.Quantities["duration_seconds"] = capped.Int64()
+	}
+	return o
+}
+
+// processedCoversForwarded reports whether the service's processed position
+// has reached the forwarded audio, within one progress step. Once endStream
+// is out no further audio can be forwarded, so this is the point at which the
+// reported figure is final for everything that was served.
+func (s *sttStream) processedCoversForwarded() bool {
+	if !s.billingDurationSeen {
+		return false
+	}
+	slack := new(big.Rat).SetFrac64(processedCoverageSlackMs, 1000)
+	return new(big.Rat).Add(durationOf(s.billing), slack).Cmp(s.forwardedDuration()) >= 0
+}
+
+func (s *sttStream) billingEvent(complete bool) runtimepkg.ProviderEvent {
+	o := s.billedObservation()
+	o.Complete = complete && s.billingDurationSeen && !s.billingInvalid
+	return runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: &o}
+}
+
+func (s *sttStream) emitBilling(complete bool) {
+	s.emit(s.billingEvent(complete))
+}
+
+// emitFinalBilling hands over the terminal observation even when the stream
+// context is already cancelled — the drain timeout cancels it before the read
+// loop unwinds — because dropping it would leave the consumer holding the
+// last interim, incomplete snapshot.
+func (s *sttStream) emitFinalBilling(complete bool) {
+	timer := time.NewTimer(finalUsageTimeout)
+	defer timer.Stop()
+	select {
+	case s.events <- s.billingEvent(complete):
+	case <-timer.C:
+	}
+}
+
 // finish classifies how the socket ended. A clean close after the caller
 // closed is normal; anything else is a provider failure whose close code is
 // the only diagnostic the service offers.
-func (s *sttStream) emitBilling(complete bool) {
-	o := s.billing.Clone()
-	o.Complete = complete && s.billingDurationSeen && !s.billingInvalid
-	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: &o})
-}
-
 func (s *sttStream) finish(err error) {
-	// Only a provider's clean close after endStream confirms the final total.
-	// A locally forced drain timeout or cancellation retains partial evidence.
-	s.emitBilling(websocket.CloseStatus(err) == websocket.StatusNormalClosure && s.inputClosed.Load() && !s.closed.Load())
-	if isNormalClose(err) || (s.closed.Load() && s.ctx.Err() != nil) || (s.inputClosed.Load() && isNormalClose(err)) {
+	providerFailed := !(isNormalClose(err) || (s.closed.Load() && s.ctx.Err() != nil))
+	// The total is final when the service hung up cleanly after endStream, or
+	// when the caller ended the input (endStream delivered) and the service's
+	// processed position had already reached every byte forwarded — which is
+	// the client-close case where the service does not hang up within the
+	// drain window and the socket is closed locally. A provider failure, an
+	// abort, or a position still short of the forwarded audio keeps the
+	// evidence partial.
+	cleanClose := websocket.CloseStatus(err) == websocket.StatusNormalClosure && s.inputClosed.Load() && !s.closed.Load()
+	covered := s.endStreamSent.Load() && !s.aborted.Load() && !providerFailed && s.processedCoversForwarded()
+	s.emitFinalBilling(cleanClose || covered)
+	if !providerFailed {
 		return
 	}
 	status := websocket.CloseStatus(err)

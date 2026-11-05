@@ -28,7 +28,12 @@ type fakeRealtime struct {
 	closingReplies []string
 	// ackWith overrides the acknowledgement frame when non-empty.
 	ackWith string
-	server  *httptest.Server
+	// holdOpenAfterEndStream keeps the socket open after the closing replies
+	// until the client closes it, like a service that never hangs up.
+	holdOpenAfterEndStream bool
+	// closeStatus overrides the close code sent after the closing replies.
+	closeStatus websocket.StatusCode
+	server      *httptest.Server
 
 	mu        sync.Mutex
 	handshake map[string]any
@@ -119,7 +124,18 @@ func (f *fakeRealtime) handle(writer http.ResponseWriter, request *http.Request)
 				return
 			}
 		}
-		_ = conn.Close(websocket.StatusNormalClosure, "")
+		if f.holdOpenAfterEndStream {
+			for {
+				if _, _, err := conn.Read(ctx); err != nil {
+					return
+				}
+			}
+		}
+		status := f.closeStatus
+		if status == 0 {
+			status = websocket.StatusNormalClosure
+		}
+		_ = conn.Close(status, "")
 		return
 	}
 }
