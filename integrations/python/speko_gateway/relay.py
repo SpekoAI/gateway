@@ -8,10 +8,16 @@ conversation content travels to Router. The wire contract is the public
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
+import re
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal, TypedDict
 
 import aiohttp
@@ -23,6 +29,19 @@ from .probe import report_leg as _report_probe_leg
 
 _DEFAULT_RELAY_URL = "https://router.speko.dev"
 _TERMINAL_EVENTS = {"response.completed", "error"}
+
+_logger = logging.getLogger(__name__)
+
+_HEADER_PREPARED_ADMISSION = "Speko-Prepared-Admission"
+_HEADER_PREPARED_ADMISSION_OUTCOME = "Speko-Prepared-Admission-Outcome"
+
+PREPARED_ADMISSION_USED = "used"
+"""The `Speko-Prepared-Admission-Outcome` value of a request served on its ticket.
+
+Any other value names why the Router admitted the request the ordinary way
+instead: `invalid`, `expired`, `stale`, `route`, `budget` or `redialed`. The
+request proceeds either way; a ticket never causes a refusal.
+"""
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 """The Router's provider-neutral reasoning control, sent as `reasoning_effort`.
@@ -242,8 +261,78 @@ class RelayLLMClient:
     async def aclose(self) -> None:
         await self._session.close()
 
-    async def stream_response(
+    async def prepare_admission(
         self, request: dict[str, Any]
+    ) -> PreparedAdmission | None:
+        """POST /v1/llm/admissions: admit the next request ahead of time.
+
+        `request` is the body `stream_response` would send, built from the
+        conversation so far; the Router reserves headroom for the turn still
+        being spoken. Returns the ticket to present with
+        `stream_response(..., prepared_admission=...)`, or None when the
+        Router answers 204 (this region would hand the request to another
+        one, where a ticket from here is useless). A refusal raises
+        RelayError.
+
+        The ticket is bound to this client's key and session ID. Keep at most
+        one unused ticket per conversation and release one you will not use
+        with `release_admission`: until then it holds its credit reservation
+        and one organization concurrency slot.
+        """
+
+        body = dict(request)
+        body["stream"] = True
+        async with self._session.post(
+            f"{self._base_url}/v1/llm/admissions",
+            json=body,
+            headers=self._headers(),
+        ) as response:
+            if response.status == 204:
+                return None
+            decoded = await _decode_json(response)
+            if response.status != 201:
+                raise _envelope_error(response.status, decoded)
+        ticket = decoded.get("admission")
+        expires_at = _parse_rfc3339(decoded.get("expires_at"))
+        if not isinstance(ticket, str) or not ticket or expires_at is None:
+            raise RelayError(
+                "Router returned a malformed admission", retryable=False
+            )
+        return PreparedAdmission(
+            ticket=ticket,
+            expires_at=expires_at,
+            _deadline=time.monotonic() + (expires_at - time.time()),
+        )
+
+    async def release_admission(self, admission: str) -> bool:
+        """POST /v1/llm/admissions/release for a ticket that will not be used.
+
+        Returns True when this call released it, False when it was already
+        used, already released, or expired. A refusal raises RelayError.
+        """
+
+        async with self._session.post(
+            f"{self._base_url}/v1/llm/admissions/release",
+            json={"admission": admission},
+            headers=self._headers(),
+        ) as response:
+            decoded = await _decode_json(response)
+            if response.status != 200:
+                raise _envelope_error(response.status, decoded)
+        return decoded.get("released") is True
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Idempotency-Key": str(uuid.uuid4())}
+        if self._platform_session_id:
+            headers["Speko-Client-Session-ID"] = self._platform_session_id
+        return headers
+
+    async def stream_response(
+        self,
+        request: dict[str, Any],
+        *,
+        prepared_admission: str = "",
+        on_prepared_outcome: Callable[[str], None] | None = None,
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         """POST /v1/llm/responses with stream=true, yielding (event, payload).
 
@@ -254,6 +343,12 @@ class RelayLLMClient:
         Every stream carries exactly one terminal event: response.completed on
         success — yielded to the caller — or error, raised as RelayError. A
         socket that closes without either was truncated and raises too.
+
+        `prepared_admission` presents a ticket from `prepare_admission`. When
+        the Router answers, `on_prepared_outcome` receives its
+        `Speko-Prepared-Admission-Outcome` (`PREPARED_ADMISSION_USED`, a
+        reason the ticket was not used, or "" from a Router that sent none).
+        It is not called when no response arrived.
         """
 
         body = dict(request)
@@ -264,9 +359,15 @@ class RelayLLMClient:
         }
         if self._platform_session_id:
             headers["Speko-Client-Session-ID"] = self._platform_session_id
+        if prepared_admission:
+            headers[_HEADER_PREPARED_ADMISSION] = prepared_admission
         async with self._session.post(
             f"{self._base_url}/v1/llm/responses", json=body, headers=headers
         ) as response:
+            if prepared_admission and on_prepared_outcome is not None:
+                on_prepared_outcome(
+                    str(response.headers.get(_HEADER_PREPARED_ADMISSION_OUTCOME, ""))
+                )
             if response.status != 200:
                 raise _envelope_error(response.status, await _decode_json(response))
             _report_llm_leg(response)
@@ -282,6 +383,203 @@ class RelayLLMClient:
                     "relay stream ended without a terminal event",
                     retryable=True,
                 )
+
+
+@dataclass(frozen=True)
+class PreparedAdmission:
+    """A prepared LLM admission ticket. The ticket is a secret: never log it."""
+
+    ticket: str = field(repr=False)
+    expires_at: float
+    """Plan expiry, Unix seconds, as the Router reported it."""
+    _deadline: float = field(repr=False, compare=False)
+
+    def remaining(self) -> float:
+        """Seconds of plan life left, measured on this host's monotonic clock."""
+
+        return self._deadline - time.monotonic()
+
+
+class AdmissionPreparer:
+    """Hold at most one prepared LLM admission for one conversation.
+
+    The framework LLM classes drive it: `prepare` when the caller starts
+    speaking, `take` before the next LLM request, `settle` once the Router
+    reports the ticket's outcome, `aclose` at the end. Nothing here raises into
+    the agent: a failed prepare or release only costs the round trip it was
+    meant to save.
+    """
+
+    def __init__(
+        self,
+        client: RelayLLMClient,
+        *,
+        reuse_min_seconds: float = 60.0,
+        present_min_seconds: float = 10.0,
+        wait_seconds: float = 1.0,
+        release_timeout_seconds: float = 2.0,
+    ) -> None:
+        self._client = client
+        self._reuse_min = reuse_min_seconds
+        self._present_min = present_min_seconds
+        self._wait = wait_seconds
+        self._release_timeout = release_timeout_seconds
+        self._ticket: PreparedAdmission | None = None
+        self._inflight: asyncio.Task[None] | None = None
+        self._background: set[asyncio.Task[Any]] = set()
+        self._closed = False
+
+    def prepare(self, build_request: Callable[[], dict[str, Any] | None]) -> None:
+        """Prepare an admission for the next request, unless one is live.
+
+        Keeps a ticket with more than `reuse_min_seconds` of life, so a false
+        start reuses it. Starts nothing while a prepare is in flight. Otherwise
+        releases the old ticket in the background and prepares a new one from
+        `build_request()`, which returns the request body or None to skip.
+        Call it on the event loop; it never blocks and never raises.
+        """
+
+        try:
+            if self._closed:
+                return
+            if self._inflight is not None and not self._inflight.done():
+                return
+            ticket = self._ticket
+            if ticket is not None:
+                if ticket.remaining() > self._reuse_min:
+                    return
+                self._ticket = None
+                self._release_soon(ticket)
+            request = build_request()
+            if request is None or not request.get("input"):
+                return
+            self._inflight = asyncio.get_running_loop().create_task(
+                self._prepare(request)
+            )
+        except Exception:
+            _logger.debug("speko router admission prepare skipped", exc_info=True)
+
+    async def _prepare(self, request: dict[str, Any]) -> None:
+        try:
+            admission = await self._client.prepare_admission(request)
+        except Exception as error:  # noqa: BLE001 - a prepare never fails the agent
+            _logger.debug(
+                "speko router admission prepare failed: %s", type(error).__name__
+            )
+            return
+        if admission is None:
+            _logger.debug("speko router admission prepare: no ticket (204)")
+            return
+        if self._closed:
+            self._release_soon(admission)
+            return
+        self._ticket = admission
+
+    async def take(self) -> PreparedAdmission | None:
+        """Return the live ticket for the next request, and forget it.
+
+        A prepare still in flight started earlier than this request's own
+        admission would, so wait up to `wait_seconds` for it; past that the
+        request goes the ordinary way and a late ticket waits for the next one.
+        A ticket too close to expiry is released instead of presented.
+        """
+
+        inflight = self._inflight
+        if inflight is not None and not inflight.done():
+            # asyncio.wait neither raises the task's outcome nor cancels it.
+            await asyncio.wait({inflight}, timeout=self._wait)
+        ticket = self._ticket
+        self._ticket = None
+        if ticket is None:
+            return None
+        if ticket.remaining() < self._present_min:
+            self._release_soon(ticket)
+            return None
+        return ticket
+
+    def settle(self, admission: PreparedAdmission, outcome: str) -> None:
+        """Release a presented ticket the Router did not use.
+
+        `outcome` is the Router's outcome header, or "" when no response
+        arrived. Anything but `used` is released in the background; a release
+        of a ticket that was spent after all answers false.
+        """
+
+        if outcome != PREPARED_ADMISSION_USED:
+            self._release_soon(admission)
+
+    def release_unused(self) -> None:
+        """Release the live ticket, if any, in the background."""
+
+        ticket = self._ticket
+        self._ticket = None
+        if ticket is not None:
+            self._release_soon(ticket)
+
+    async def aclose(self) -> None:
+        """Release the unused ticket and wait, bounded, for pending releases."""
+
+        if self._closed:
+            return
+        self._closed = True
+        inflight = self._inflight
+        if inflight is not None and not inflight.done():
+            await asyncio.wait({inflight}, timeout=self._wait)
+            if not inflight.done():
+                inflight.cancel()
+        self.release_unused()
+        pending = [task for task in self._background if not task.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=self._release_timeout)
+
+    def _release_soon(self, admission: PreparedAdmission) -> None:
+        if admission.remaining() <= 0:
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(self._release(admission))
+        except RuntimeError:
+            return
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _release(self, admission: PreparedAdmission) -> None:
+        try:
+            released = await asyncio.wait_for(
+                self._client.release_admission(admission.ticket),
+                self._release_timeout,
+            )
+        except Exception as error:  # noqa: BLE001 - a release is best effort
+            _logger.debug(
+                "speko router admission release failed: %s", type(error).__name__
+            )
+            return
+        _logger.debug("speko router admission released=%s", released)
+
+
+_RFC3339 = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?([Zz]|[+-]\d{2}:\d{2})$"
+)
+
+
+def _parse_rfc3339(value: object) -> float | None:
+    """Unix seconds of an RFC 3339 timestamp, or None if it is not one.
+
+    Go writes up to nine fractional digits, which `datetime.fromisoformat`
+    refuses before Python 3.11.
+    """
+
+    if not isinstance(value, str):
+        return None
+    match = _RFC3339.match(value.strip())
+    if match is None:
+        return None
+    day, clock, fraction, offset = match.groups()
+    fraction = (fraction or "")[:6].ljust(6, "0")
+    offset = "+00:00" if offset in ("Z", "z") else offset
+    try:
+        return datetime.fromisoformat(f"{day}T{clock}.{fraction}{offset}").timestamp()
+    except ValueError:
+        return None
 
 
 def _report_llm_leg(response: aiohttp.ClientResponse) -> None:

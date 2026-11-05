@@ -90,6 +90,18 @@ and tool updates, cancellation, usage metrics, and out-of-band
 request and provider attempt with the Platform conversation while preserving
 their separate request identifiers.
 
+`SpekoLLMService(prepare_admissions=True)` takes the Router's per-request
+admission round trip (about 270 ms from Singapore) off the reply's critical
+path. On `UserStartedSpeakingFrame`, the service prepares an admission from the
+last context it received. The next reply request presents the ticket, waiting
+up to 1 s for a prepare still in flight. A ticket the Router did not use, or
+one left unused at `EndFrame`, `CancelFrame` or cleanup, is released in the
+background. `llm.prepared_admission_outcome` reports `"used"` or the Router's
+reason for admitting the last reply the ordinary way. Before the first context
+frame arrives, call `llm.prepare_admission(context)` to cover the first turn.
+The option is off by default. See the
+[Python integration README](../integrations/python/README.md#prepared-admissions).
+
 ## 2. Add the sidecar to the Pipecat image
 
 The public Gateway image contains both the binary and this Python package.

@@ -2,15 +2,18 @@
 
 from .client import CanonicalEvent, GatewayClient, GatewayError, GatewaySession
 from .relay import (
+    AdmissionPreparer,
     EvaluationAnswer,
     EvaluationQuestion,
     EvaluationResponse,
+    PreparedAdmission,
     ReasoningEffort,
     RelayEvaluationClient,
     RelayLLMClient,
 )
 
 __all__ = [
+    "AdmissionPreparer",
     "CanonicalEvent",
     "EvaluationAnswer",
     "EvaluationQuestion",
@@ -18,6 +21,7 @@ __all__ = [
     "GatewayClient",
     "GatewayError",
     "GatewaySession",
+    "PreparedAdmission",
     "ReasoningEffort",
     "RelayEvaluationClient",
     "RelayLLMClient",

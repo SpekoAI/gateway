@@ -122,6 +122,44 @@ provider-direct voice legs, the conversation history travels through the
 Speko Router. Function tools are supported; image and audio content is
 silently skipped — only text is forwarded.
 
+### Prepared admissions
+
+Each Router LLM request waits for an admission round trip (credit check and a
+signed plan) before the model is dialed: about 270 ms from Singapore. With
+`prepare_admissions=True`, the LLM makes that round trip when the caller starts
+speaking, and the reply's request skips it:
+
+```python
+llm = LLM(prepare_admissions=True)
+session = AgentSession(stt=STT(), llm=llm, tts=TTS())
+llm.attach(session)  # prepare on each user speech start
+await session.start(agent=MyAgent(), room=ctx.room)
+```
+
+On each user speech start, the LLM prepares from the current agent's chat
+context and the tools of the last request (`POST /v1/llm/admissions`). The
+next request presents the ticket, waiting up to 1 s for a prepare still in
+flight, and the ticket is then spent. A tool-call follow-up and any request
+with no live ticket are admitted the ordinary way. There is at most one ticket
+per LLM. A false start keeps a ticket with more than a minute left. An older
+ticket is released and replaced. A ticket the Router did not use is released
+in the background, and so is any unused ticket when the session closes, the
+job shuts down, or `aclose()` runs. Without an `AgentSession`, call
+`llm.prepare(chat_ctx)` yourself when the caller starts speaking.
+
+`llm.prepared_admission_outcome` (and `prepared_admission_outcome` on each
+stream `llm.chat()` returns) says what the Router did with the last request's
+ticket. `"used"` means the request skipped the round trip. `"invalid"`,
+`"expired"`, `"stale"`, `"route"`, `"budget"` or `"redialed"` mean it was
+admitted the ordinary way. `""` means no outcome arrived, and `None` means no
+ticket was presented. A ticket never fails a request, and a failed prepare or
+release never raises into the agent.
+
+An unused ticket holds a credit reservation and one organization concurrency
+slot until it is used, released, or expires (5 minutes). The option is off by
+default and needs a Router that serves `/v1/llm/admissions`. On an older Router,
+each prepare fails quietly and requests go the ordinary way.
+
 Jev evaluations use the separate pooled async client and require an explicit
 idempotency key:
 

@@ -23,6 +23,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStoppedFrame,
+    UserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
@@ -57,6 +58,8 @@ from .client import (
     SessionConfig,
 )
 from .relay import (
+    AdmissionPreparer,
+    PreparedAdmission,
     ReasoningEffort,
     RelayError,
     RelayLLMClient,
@@ -642,6 +645,12 @@ class SpekoLLMService(LLMService):
     Every other value, "minimal" included, needs a model that can reason: the
     Router refuses it for a pinned model that cannot, and auto routing considers
     only models that can.
+
+    `prepare_admissions=True` takes the Router's per-request admission round
+    trip off the reply's critical path: on `UserStartedSpeakingFrame` the
+    service admits the next request ahead of time from the last context it
+    saw, and that request presents the ticket. `prepared_admission_outcome`
+    reports what the Router did with the last request's ticket.
     """
 
     Settings = SpekoLLMSettings
@@ -660,6 +669,7 @@ class SpekoLLMService(LLMService):
         reasoning_effort: ReasoningEffort | None = None,
         system_instruction: str | None = None,
         session_id: str = "",
+        prepare_admissions: bool = False,
         **kwargs: Any,
     ) -> None:
         if (provider == "auto") != (model == "auto"):
@@ -691,9 +701,54 @@ class SpekoLLMService(LLMService):
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
         self._top_p = top_p
+        self._preparer = (
+            AdmissionPreparer(self._client) if prepare_admissions else None
+        )
+        self._last_context: LLMContext | None = None
+        self._prepared_admission_outcome: str | None = None
 
     def can_generate_metrics(self) -> bool:
         return True
+
+    @property
+    def prepared_admission_outcome(self) -> str | None:
+        """What the Router did with the ticket of the most recent reply request.
+
+        "used" when the request skipped its admission round trip; otherwise
+        the Router's reason for admitting it the ordinary way ("invalid",
+        "expired", "stale", "route", "budget", "redialed"), or "" when no
+        outcome arrived. None when that request presented no ticket.
+        """
+
+        return self._prepared_admission_outcome
+
+    def prepare_admission(self, context: LLMContext | None = None) -> None:
+        """Admit the next reply request ahead of time.
+
+        Runs on `UserStartedSpeakingFrame` from the last context the service
+        received; call it yourself to prepare from another context (the first
+        turn of a conversation, before any context frame has arrived). A
+        no-op unless built with `prepare_admissions=True`. Never raises and
+        never blocks.
+        """
+
+        preparer = self._preparer
+        target = context if context is not None else self._last_context
+        if preparer is None or target is None:
+            return
+        preparer.prepare(lambda: self._request(target))
+
+    async def stop(self, frame: EndFrame) -> None:
+        await self._release_prepared()
+        await super().stop(frame)
+
+    async def cancel(self, frame: CancelFrame) -> None:
+        await self._release_prepared()
+        await super().cancel(frame)
+
+    async def _release_prepared(self) -> None:
+        if self._preparer is not None:
+            await self._preparer.aclose()
 
     async def _update_settings(self, delta: LLMSettings) -> dict[str, Any]:
         # Settings deltas mark absent fields with Pipecat's own NOT_GIVEN, which
@@ -715,6 +770,7 @@ class SpekoLLMService(LLMService):
         return changed
 
     async def cleanup(self) -> None:
+        await self._release_prepared()
         if self._owns_client:
             await self._client.aclose()
         await super().cleanup()
@@ -743,9 +799,40 @@ class SpekoLLMService(LLMService):
     @traced_llm
     async def _process_context(self, context: LLMContext) -> None:
         await self.start_ttfb_metrics()
+        request = self._request(context)
+        preparer = self._preparer
+        admission = await preparer.take() if preparer is not None else None
+        self._prepared_admission_outcome = None
+        try:
+            function_calls = await self._stream_context(context, request, admission)
+        finally:
+            if admission is not None and preparer is not None:
+                preparer.settle(admission, self._prepared_admission_outcome or "")
+        if function_calls:
+            await self.run_function_calls(function_calls)
+
+    def _on_prepared_outcome(self, outcome: str) -> None:
+        self._prepared_admission_outcome = outcome
+        if outcome:
+            _logger.debug("speko router prepared admission outcome=%s", outcome)
+
+    async def _stream_context(
+        self,
+        context: LLMContext,
+        request: dict[str, Any],
+        admission: PreparedAdmission | None,
+    ) -> list[FunctionCallFromLLM]:
         function_calls: list[FunctionCallFromLLM] = []
         first_output = True
-        events = self._client.stream_response(self._request(context))
+        if admission is None:
+            events = self._client.stream_response(request)
+        else:
+            self._on_prepared_outcome("")
+            events = self._client.stream_response(
+                request,
+                prepared_admission=admission.ticket,
+                on_prepared_outcome=self._on_prepared_outcome,
+            )
         try:
             async for event, payload in events:
                 if event == "response.text.delta":
@@ -789,14 +876,17 @@ class SpekoLLMService(LLMService):
             await events.aclose()
             if first_output:
                 await self.stop_ttfb_metrics()
-        if function_calls:
-            await self.run_function_calls(function_calls)
+        return function_calls
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if not isinstance(frame, LLMContextFrame):
+            if isinstance(frame, UserStartedSpeakingFrame):
+                self.prepare_admission()
             await self.push_frame(frame, direction)
             return
+        if self._preparer is not None:
+            self._last_context = frame.context
         await self.push_frame(LLMFullResponseStartFrame())
         await self.start_processing_metrics()
         try:
