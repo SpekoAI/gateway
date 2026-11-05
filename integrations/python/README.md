@@ -253,6 +253,11 @@ timeline. All PCM, including VAD prefixes and inference batches, is chunked to
 fit the native frame bound. Pipecat
 uses its pipeline's VAD and explicit commits.
 
+Native LiveKit TTS commits completed sentences while upstream text is still
+arriving, including CJK and Arabic sentence boundaries. Short utterances flush
+promptly, and later provider utterances remain part of the same LiveKit speech
+segment and reported assistant turn. `end_input()` completes that segment.
+
 Native speech disables LiveKit automatic retries for streaming STT, recognition,
 streaming TTS and chunked synthesis, including when retry-enabled connection
 options were supplied. Relay retry hints and timeouts cannot prove no provider

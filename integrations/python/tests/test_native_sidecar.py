@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import ssl
@@ -15,17 +16,156 @@ from types import SimpleNamespace
 import aiohttp
 import pytest
 from aiohttp import web
-from livekit.agents import APIConnectionError, APIConnectOptions
+from livekit import rtc
+from livekit.agents import Agent, AgentSession, APIConnectionError, APIConnectOptions
 from livekit.agents import llm as agents_llm
+from livekit.agents.voice import io
 
 from speko_gateway import GatewayError, RelayLLMClient, RelaySpeechClient
 from speko_gateway._livekit_bridge import LiveKitSTTBridge, LiveKitTTSBridge
 from speko_gateway._relay_socket import NATIVE_LOCAL_AUTHORIZATION
-from speko_gateway.livekit import LLM
+from speko_gateway.livekit import LLM, TTS
 from speko_gateway.relay import RelayError
 
 LOCAL_TOKEN = "owned-native-local-token"
 MODEL_KEY = "sk_speko_agent_" + "a" * 64
+
+
+@pytest.mark.parametrize(
+    "first,prefix,ending",
+    [
+        (
+            "The first complete sentence is ready.",
+            " The next sentence ",
+            "will finish after the gate.",
+        ),
+        ("第一句话已经准备好了。", " 第二句话", "会在门控释放后完成。"),
+        ("هل الجملة الأولى جاهزة؟", " الجملة التالية ", "ستنتهي بعد البوابة."),
+    ],
+)
+@pytest.mark.parametrize("pcm_samples", [480, 4800])
+async def test_default_livekit_tts_starts_before_text_finishes_and_preserves_later_audio(
+    native_binary, first, prefix, ending, pcm_samples
+):
+    release, audible = asyncio.Event(), asyncio.Event()
+    commits, captured, opened, reported = [], [], [], []
+    rest = prefix + ending
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        opened.append(request.headers.copy())
+        await ready(ws)
+        pending = ""
+        async for message in ws:
+            control = json.loads(message.data)
+            if control["type"] == "input.append":
+                pending += control["text"]
+            elif control["type"] == "input.commit":
+                commits.append(pending)
+                pending = ""
+                sequence = len(commits)
+                await ws.send_json({"type": "utterance.started", "sequence": sequence})
+                await ws.send_bytes(
+                    (sequence * 1000).to_bytes(2, "little", signed=True) * pcm_samples
+                )
+                await ws.send_json({"type": "utterance.done", "sequence": sequence})
+            elif control["type"] == "session.close":
+                await ws.send_json(
+                    {
+                        "type": "session.closed",
+                        "usage": {"characters": len(first + rest)},
+                    }
+                )
+                await ws.close()
+        return ws
+
+    class Output(io.AudioOutput):
+        def __init__(self):
+            options = {"label": "owned-incremental-speech"}
+            if "capabilities" in inspect.signature(io.AudioOutput).parameters:
+                options["capabilities"] = io.AudioOutputCapabilities(pause=False)
+            super().__init__(**options)
+            self.duration = 0
+
+        async def capture_frame(self, frame: rtc.AudioFrame):
+            await super().capture_frame(frame)
+            captured.append(bytes(frame.data))
+            self.duration += frame.duration
+            audible.set()
+
+        def flush(self):
+            super().flush()
+            self.on_playback_finished(playback_position=self.duration, interrupted=False)
+
+        def clear_buffer(self):
+            self.on_playback_finished(playback_position=0, interrupted=True)
+
+    async def text():
+        yield first + prefix
+        await release.wait()
+        yield ending
+
+    async with native_stack(native_binary, handle) as (socket, _):
+        session_id = str(uuid.uuid4())
+        client = RelaySpeechClient(
+            api_key=MODEL_KEY,
+            session_id=session_id,
+            socket_path=socket,
+            local_auth_token=LOCAL_TOKEN,
+        )
+        model = TTS(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            standby_sessions=0,
+        )
+        session = AgentSession(stt=None, llm=None, tts=model, vad=None)
+        session.on(
+            "conversation_item_added",
+            lambda event: reported.append(event.item.text_content)
+            if isinstance(event.item, agents_llm.ChatMessage)
+            and event.item.role == "assistant"
+            else None,
+        )
+        session.output.audio = Output()
+        try:
+            options = (
+                {"record": False}
+                if "record" in inspect.signature(session.start).parameters
+                else {}
+            )
+            await session.start(
+                agent=Agent(instructions="Owned incremental TTS"), **options
+            )
+            speech = session.say(text(), allow_interruptions=False)
+            await asyncio.wait_for(audible.wait(), 3)
+            assert not release.is_set() and commits == [first], (
+                "first audio must precede the remaining LLM text"
+            )
+            release.set()
+            await asyncio.wait_for(speech.wait_for_playout(), 3)
+            assert commits == [first, rest]
+            expected = (1000).to_bytes(2, "little", signed=True) * pcm_samples + (
+                2000
+            ).to_bytes(2, "little", signed=True) * pcm_samples
+            # Recent SDK emitters add a single 10-ms silent final marker after
+            # flushing the last real frame. No payload may be lost/repeated.
+            marker = b"\0\0" * (model.sample_rate // 100)
+            assert b"".join(captured) in (expected, expected + marker), (
+                "later provider utterances must stay in the same SDK speech segment"
+            )
+            assert reported == [first + rest]
+            assert len(opened) == 1
+            assert opened[0]["Authorization"] == "Bearer " + MODEL_KEY
+            assert opened[0]["Speko-Client-Session-ID"] == session_id
+        finally:
+            release.set()
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
 
 
 def clean_environment():
