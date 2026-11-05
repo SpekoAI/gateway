@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:a6c16b083bef68ce5fa29177839ecee18e75b529d49d77a4127c4fd33f5dcaba
-# yaml-body: sha256:46cfcda6004120fb9105b4aa6f71ec5244681038c3eb53d18060ccd7c682ca78
+# json-mirror: openapi.json sha256:3e257bb54b43aca161cf926317690871ff344851d66071488944d1410b9aa4f4
+# yaml-body: sha256:b299e9119e0ed29ab46fea9e3adcdd9cb7b89ff1e8afb244fd1c3ce24da3d726
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -299,9 +299,12 @@ paths:
         telemetry evidence. There is no previous_response_id anywhere in the
         contract: callers resend full history, including function results, on
         every request. A request prepared with POST /v1/llm/admissions
-        carries its ticket in Speko-Prepared-Admission and is dispatched
-        without an admission round trip; a ticket never causes a refusal,
-        and Speko-Prepared-Admission-Outcome reports what became of it.
+        carries its ticket in Speko-Prepared-Admission, under the
+        Idempotency-Key the prepare call sent, and is dispatched without an
+        admission round trip. A ticket that does not fit is no reason to
+        refuse the request, and Speko-Prepared-Admission-Outcome reports what
+        became of it; only a ticket whose plan was already consumed is
+        refused, as 409 request_already_started.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
         - $ref: "#/components/parameters/ClientSessionID"
@@ -370,25 +373,28 @@ paths:
         cross-region round trip per turn. A voice client calls this
         operation when the caller starts speaking, with the
         POST /v1/llm/responses body it would send if the conversation ended
-        now: the history so far, and the routing, tools, response_format,
-        max_output_tokens, and stream the real request will carry. The
-        Router admits it the ordinary way, reserving input tokens for this
+        now (the history so far, and the routing, tools, response_format,
+        max_output_tokens, and stream the real request will carry) and the
+        Idempotency-Key the real request will send. The Router admits it the
+        ordinary way under that key, reserving input tokens for this
         body plus headroom for the turn still being spoken (8 KiB of content
         and four items) and output tokens for its max_output_tokens, and
         answers 201 with the admission sealed into an opaque ticket. The
         client then sends the real POST /v1/llm/responses with the ticket in
         Speko-Prepared-Admission, from the same API key and with the same
-        Speko-Client-Session-ID, and the Router dispatches it with no
-        admission round trip; Speko-Prepared-Admission-Outcome on that
+        Idempotency-Key and Speko-Client-Session-ID, and the Router
+        dispatches it with no admission round trip; Speko-Prepared-Admission-Outcome on that
         response says whether the ticket was used. The answer is 204 instead
         when this Router region would hand the request to another region,
         where a ticket from here is useless: send the real request without
         one. Failures are the ones admission of POST /v1/llm/responses
         returns, such as insufficient_credit or route_not_found, in the same
-        error envelope. Use an Idempotency-Key distinct from the real
-        request's: the admission is recorded under this call's key and body
-        hash, so a real request that falls back to ordinary admission under
-        the same key would be an idempotency_conflict. A ticket that is
+        error envelope. The ticket registers its Idempotency-Key for the
+        request it was prepared for: the real request must send that key
+        (under any other key the ticket's outcome is invalid), and a request
+        sent without the ticket must use a fresh key, because the prepared
+        body's hash is recorded under this one and a request without the
+        ticket under it is an idempotency_conflict. A ticket that is
         neither used nor released holds its reservation and one organization
         concurrency slot until expires_at, so keep at most one unreleased
         ticket per conversation, reuse it across false starts, and release it
@@ -440,15 +446,19 @@ paths:
         Speko-Client-Session-ID the ticket was issued to; like the ticket
         itself, it is valid only in the Router region that issued it. The
         Router first has the ticket's plan spent, so that no request can
-        still be dispatched on it, and only then settles the prepared request
-        at zero and frees its concurrency slot. released is true when this
-        call did that, and false when there was nothing left to release: the
-        ticket was already used, already released, or expired, or could not
-        be retired now, and its reservation then ends when its plan expires.
-        Releasing is therefore safe after any
-        Speko-Prepared-Admission-Outcome, and worth doing after every outcome
-        but used. Idempotency-Key is optional here, because a release replays
-        nothing.
+        still be dispatched on it, and only then reports the prepared request
+        as having served nothing, which frees its concurrency slot and lets
+        its reservation settle without charge. released is true once the plan
+        is spent; the served-nothing report is then delivered, or still being
+        retried in the background. released is false when there was nothing
+        left to release: the ticket was already used, already released, or
+        expired, or could not be retired now, and its reservation then ends
+        when its plan expires. A ticket presented on a POST /v1/llm/responses
+        that this region served is either used or, when it did not fit,
+        already retired by the Router, so a release of it answers false;
+        release is for a ticket that was never presented, or whose request
+        was handed to another region. Releasing is always safe.
+        Idempotency-Key is optional here, because a release replays nothing.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKeyOptional"
         - $ref: "#/components/parameters/ClientSessionID"
@@ -593,15 +603,20 @@ components:
         A ticket from POST /v1/llm/admissions, sent verbatim. When it fits
         this request, the Router dispatches on the ticket's admission with no
         admission round trip. It fits when it was issued by this Router
-        region to this API key and Speko-Client-Session-ID, under the current
-        catalog release and the same routing mode; has at least five seconds
-        left before its expires_at; names a provider and model that are a
-        candidate for this request; and reserved at least the input and
-        output tokens this request needs. A ticket that does not fit, or
-        cannot be read, never fails the request: the request is admitted the
-        ordinary way and Speko-Prepared-Admission-Outcome says why. A ticket
-        admits one request; presenting it again ends in the redialed
-        outcome.
+        region to this API key, Speko-Client-Session-ID, and
+        Idempotency-Key, under the current catalog release and the same
+        routing mode; has at least five seconds left before its expires_at;
+        names a provider and model that are a candidate for this request;
+        and reserved at least the input and output tokens this request
+        needs. A ticket that does not fit, or cannot be read, does not fail
+        the request: the request is admitted the ordinary way and
+        Speko-Prepared-Admission-Outcome says why. A ticket of this caller's
+        that does not fit is retired first, so its reservation does not hold
+        the concurrency slot and credit the ordinary admission needs. The
+        one refusal is a ticket whose plan was already consumed, by its
+        first use or by a release: that is a replay of the request its
+        Idempotency-Key registered, refused with 409
+        request_already_started and the original request id.
       schema:
         type: string
   headers:
@@ -647,8 +662,11 @@ components:
         LLM only. Sent when the request carried Speko-Prepared-Admission and
         reached the ticket check, which follows request validation and route
         selection, so an error response after that point carries it too.
-        used means the request was dispatched on the ticket; every other
-        value means it was admitted the ordinary way, and says why. It is
+        used means the ticket passed every check and the request was
+        dispatched on it; every other value means it was admitted the
+        ordinary way, and says why. A ticket whose plan was already consumed
+        is discovered only at dispatch, so its 409 request_already_started
+        refusal carries used as well. It is
         absent when the request was handed to another Router region, which
         does not see the ticket; the ticket is then unused and should be
         released.
@@ -703,7 +721,9 @@ components:
       description: >-
         Normalized failure of POST /v1/llm/responses: the shared Error
         response plus the prepared-admission outcome, which a failure after
-        the ticket check still carries.
+        the ticket check still carries. A ticket whose plan was already
+        consumed is refused here as 409 request_already_started with the
+        original request id.
       headers:
         Speko-Request-ID:
           $ref: "#/components/headers/SpekoRequestID"
@@ -2187,9 +2207,12 @@ components:
       type: object
       description: >-
         The 200 body of POST /v1/llm/admissions/release. released is true
-        when this call released the admission, and false when the ticket was
-        already used, already released, or expired, or could not be retired
-        now; its reservation then ends when its plan expires.
+        when this call spent the ticket's plan; the served-nothing report
+        that frees its slot is then delivered, or still being retried. It is
+        false when the ticket was already used, already released (including
+        the Router's own retirement of a ticket that did not fit its
+        request), or expired, or could not be retired now; its reservation
+        then ends when its plan expires.
       properties:
         object:
           type: string
@@ -2207,14 +2230,18 @@ components:
         Speko-Prepared-Admission-Outcome. The set is closed. used: the
         request was dispatched on the ticket's admission. Every other value
         means the request was admitted the ordinary way instead. invalid:
-        the ticket did not decrypt, or was issued to another API key,
-        Speko-Client-Session-ID, or Router region. expired: its plan had less
+        the ticket did not decrypt, was issued to another API key,
+        Speko-Client-Session-ID, or Router region, or was prepared under
+        another Idempotency-Key. expired: its plan had less
         than five seconds left. stale: it was issued under another catalog
         release. route: the routing mode changed, or its provider and model
         are not a candidate for this request. budget: this request needs
-        more input or output tokens than it reserved. redialed: the attempt
-        on it failed before the provider connector accepted it, as a ticket
-        presented a second time does, so the request was admitted again.
+        more input or output tokens than it reserved. redialed: the provider
+        connector refused the attempt on it before dispatch for a retryable
+        reason, so the Router retired the ticket where it could and admitted
+        the request again. A ticket whose plan was already consumed has no
+        outcome of its own: the request is refused with 409
+        request_already_started.
       enum:
         - used
         - invalid

@@ -33,7 +33,7 @@ const HeaderClientSessionID = "Speko-Client-Session-ID"
 
 // Prepared LLM admission headers. HeaderPreparedAdmission carries a ticket
 // from POST /v1/llm/admissions on the POST /v1/llm/responses request it was
-// prepared for. HeaderPreparedAdmissionOutcome is the response header that
+// prepared for, which must send the Idempotency-Key the prepare call sent. HeaderPreparedAdmissionOutcome is the response header that
 // says, on a request that carried a ticket, whether the ticket was used and
 // if not why; its values are the closed PreparedAdmissionOutcome set.
 const (

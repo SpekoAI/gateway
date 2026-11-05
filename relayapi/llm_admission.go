@@ -11,13 +11,17 @@ import (
 // soon as the caller starts speaking, before it knows the request's content.
 // POST /v1/llm/admissions takes an ordinary LLMRequest holding the
 // conversation so far, admits it with headroom for the turn still being
-// spoken, and returns the admission sealed into an opaque ticket
-// (LLMAdmission). The real POST /v1/llm/responses presents the ticket in
-// HeaderPreparedAdmission and is dispatched on it without a second
-// admission. A ticket never causes a refusal: one that does not fit the real
-// request is ignored, the request is admitted the ordinary way, and
-// HeaderPreparedAdmissionOutcome says why. A ticket the client will not use
-// is released with POST /v1/llm/admissions/release.
+// spoken, under the Idempotency-Key the real request will send, and returns
+// the admission sealed into an opaque ticket (LLMAdmission). The real
+// POST /v1/llm/responses presents the ticket in HeaderPreparedAdmission
+// under that same key and is dispatched on it without a second admission. A
+// ticket that does not fit the real request does not fail it: the Router
+// retires the ticket if it is the caller's own, admits the request the
+// ordinary way, and HeaderPreparedAdmissionOutcome says why. The one refusal
+// is a ticket whose plan was already consumed (used or released), a replay
+// refused as request_already_started. A request sent without its ticket
+// must use a fresh Idempotency-Key. A ticket the client never presents is
+// released with POST /v1/llm/admissions/release.
 
 // Object tags of the two prepared-admission response bodies.
 const (
@@ -65,10 +69,12 @@ func (r LLMAdmissionReleaseRequest) Validate() error {
 }
 
 // LLMAdmissionRelease is the 200 body of POST /v1/llm/admissions/release.
-// Released reports whether this call released the admission: false means
-// the ticket was already used, already released, or expired, or the Router
-// could not retire it now, and its reservation then ends the way any unused
-// admission's does.
+// Released reports whether this call spent the ticket's plan, after which
+// the served-nothing report that frees its slot is delivered or still being
+// retried. false means the ticket was already used, already released or
+// retired by the Router after it did not fit a request, or expired, or the
+// Router could not retire it now, and its reservation then ends the way any
+// unused admission's does.
 type LLMAdmissionRelease struct {
 	Object   string `json:"object"`
 	Released bool   `json:"released"`
@@ -91,8 +97,9 @@ const (
 	// PreparedAdmissionUsed: the request was dispatched on the ticket's
 	// admission, with no admission round trip.
 	PreparedAdmissionUsed PreparedAdmissionOutcome = "used"
-	// PreparedAdmissionInvalid: the ticket did not decrypt, or was issued to
-	// another API key, client session, or region.
+	// PreparedAdmissionInvalid: the ticket did not decrypt, was issued to
+	// another API key, client session, or region, or was prepared under
+	// another Idempotency-Key.
 	PreparedAdmissionInvalid PreparedAdmissionOutcome = "invalid"
 	// PreparedAdmissionExpired: the ticket's plan had less than five seconds
 	// left.
@@ -106,8 +113,11 @@ const (
 	// PreparedAdmissionBudget: the request needs more input or output tokens
 	// than the ticket reserved.
 	PreparedAdmissionBudget PreparedAdmissionOutcome = "budget"
-	// PreparedAdmissionRedialed: the attempt on the ticket failed before the
-	// provider connector accepted it, so the request was admitted again.
+	// PreparedAdmissionRedialed: the provider connector refused the attempt
+	// on the ticket before dispatch for a retryable reason, so the ticket
+	// was retired where possible and the request admitted again. A ticket
+	// whose plan was already consumed has no outcome of its own: it is
+	// refused as request_already_started.
 	PreparedAdmissionRedialed PreparedAdmissionOutcome = "redialed"
 )
 
