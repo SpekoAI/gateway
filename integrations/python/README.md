@@ -256,7 +256,11 @@ uses its pipeline's VAD and explicit commits.
 Native LiveKit TTS commits completed sentences while upstream text is still
 arriving, including CJK and Arabic sentence boundaries. Short utterances flush
 promptly, and later provider utterances remain part of the same LiveKit speech
-segment and reported assistant turn. `end_input()` completes that segment.
+segment and reported assistant turn. Standalone sentences such as `Hello.`
+commit without a following token; unpunctuated input commits within 240
+characters, preferring a word boundary. Text is split without replacing literal
+strings such as `<stop>` or `<prd>`. An explicit `flush()` completes the SDK
+segment after its audio drains, even before `end_input()`.
 Each native utterance waits for `utterance.done` before appending the next one
 or closing the session, while incoming LLM text continues buffering. This
 supports provider adapters with one active synthesis context.
