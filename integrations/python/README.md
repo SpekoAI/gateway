@@ -195,7 +195,7 @@ session = AgentSession(
     stt=stt,
     llm=llm,
     tts=tts,
-    vad=DrainingVAD(inference.VAD(model="silero")),
+    vad=DrainingVAD(inference.VAD(model="silero"), flush_mode="reset"),
     turn_handling={
         "turn_detection": inference.TurnDetector(version="v1-mini"),
         "interruption": {"mode": "vad", "enabled": True},
@@ -207,13 +207,21 @@ stt.bind_session(session)
 `DrainingVAD` supports the installed local-inference and Silero VADs, with
 independent state per stream. It preserves captured PCM in inference/boundary
 events, applies the underlying detector's current duration thresholds, and
-resets the detector at `flush()`. Flush fences already classified old-segment
-events and closes a delivered VAD segment without inventing audio or silence.
+uses an explicit `flush_mode`. The `"reset"` mode is for an AgentSession's
+independent VAD: STT already supplies the speech end, so flush fences classified
+old-segment events without adding a queued end that could overwrite newer speech.
 Unprocessed real capture is recovered from the ordered ledger and classified
 again with fresh detector state and duration counters. This preserves resumed
 speech captured before a delayed STT end; old speech durations cannot become a
 new interruption. Recovery never replays detector-only padding. Pending
 real tails rearm after in-flight padding completes, with no packet-duration delay.
+
+Use `DrainingVAD(detector, flush_mode="segment")` for a batch STT
+`StreamAdapter`. Its explicit flush drains captured audio through inference,
+finishes speech once, and starts a fresh detector for subsequent input. It does
+not require EOF to recognize the completed segment. Use separate instances for
+batch recognition and an independent session VAD. Physical EOF drains and
+completes remaining speech in either mode; event PCM and timing share one frontier.
 Public sample indexes use the detector's inference rate, while event PCM retains
 its captured rate. Interruption durations include captured silence while the
 detector is still speaking, following the SDK's transition ordering. It does not feed its
@@ -418,3 +426,4 @@ pipeline = Pipeline(
 Use a Pipecat VAD in the pipeline so `VADUserStoppedSpeakingFrame` commits the
 current Gateway STT utterance. The complete container and Pipecat Cloud setup
 is in the [Pipecat integration guide](../../docs/PIPECAT.md).
+
