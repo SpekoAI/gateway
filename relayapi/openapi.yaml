@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:2d9309052af69b9b63085ebad81cd3f72cdf6e82175e03971f63131718a6266f
-# yaml-body: sha256:199597f5397435b27c24b36a56ddb4b6b4611887482394d7750cd0de281cee37
+# json-mirror: openapi.json sha256:b0a2cd2781c151747a341f3e7eb9995cb75e73985bc65ddc610e94a8969cfc97
+# yaml-body: sha256:ab196aab5be99a49fb3d89a9389a8f6214a59ae7ff893e9992fb705091988f87
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -308,10 +308,16 @@ paths:
         key owns that key, so the Router never runs a second execution under
         it: when it does not fit, the request is refused with 409
         idempotency_conflict naming the prepared request, and when its
-        attempt fails before the provider connector accepts it (a connector
-        outage, a ticket already used or released), that failure is
-        returned as is. In both cases send the request again without the
-        ticket, under a fresh Idempotency-Key. A ticket of this caller's that
+        attempt fails before the provider connector accepts it, that failure
+        is returned as is. After a 409 idempotency_conflict, the Router
+        retired the ticket and nothing ran: send the request again without
+        it under a fresh Idempotency-Key. After a failure on the ticket's
+        first presentation nothing ran either, and the same resend applies.
+        Do not resend under a fresh key after presenting a ticket a second
+        time (a retry after a lost response): a ticket already used or
+        released fails as a non-retryable relay_error naming the prepared
+        request, whose first presentation may have run and been charged, so
+        treat it like any request whose response was lost. A ticket of this caller's that
         will not be used is retired before the response, so its reservation
         does not hold the concurrency slot the next request needs.
       parameters:
@@ -626,10 +632,16 @@ components:
         key owns that key, so the Router never runs a second execution under
         it: when it does not fit, the request is refused with 409
         idempotency_conflict naming the prepared request, and when its
-        attempt fails before the provider connector accepts it (a connector
-        outage, a ticket already used or released), that failure is
-        returned as is. In both cases send the request again without the
-        ticket, under a fresh Idempotency-Key. A ticket of this caller's that
+        attempt fails before the provider connector accepts it, that failure
+        is returned as is. After a 409 idempotency_conflict, the Router
+        retired the ticket and nothing ran: send the request again without
+        it under a fresh Idempotency-Key. After a failure on the ticket's
+        first presentation nothing ran either, and the same resend applies.
+        Do not resend under a fresh key after presenting a ticket a second
+        time (a retry after a lost response): a ticket already used or
+        released fails as a non-retryable relay_error naming the prepared
+        request, whose first presentation may have run and been charged, so
+        treat it like any request whose response was lost. A ticket of this caller's that
         will not be used is retired before the response, so its reservation
         does not hold the concurrency slot the next request needs.
       schema:
@@ -684,8 +696,9 @@ components:
         why the ticket was not used: invalid on a successful response means
         the request was admitted the ordinary way under its own key, and
         expired, stale, route, or budget arrive on a 409
-        idempotency_conflict, after which the client resends without the
-        ticket under a fresh Idempotency-Key. It is
+        idempotency_conflict, after which the ticket is retired, nothing ran,
+        and the client resends without it under a fresh Idempotency-Key. It
+        is
         absent when the request never reached the ticket check: it failed
         validation or route selection first, or was handed to another
         Router region, which does not see the ticket. A ticket whose request

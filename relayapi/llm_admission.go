@@ -19,8 +19,12 @@ import (
 // Router never runs a second execution under a ticket's key: a ticket of the
 // caller's under the request's key that does not fit is refused with 409
 // idempotency_conflict, and an attempt on it that fails before the provider
-// connector accepts it is returned as that failure. The client then sends the
-// request again without the ticket, under a fresh Idempotency-Key. A ticket
+// connector accepts it is returned as that failure. After the 409, or a
+// failure on the ticket's first presentation, nothing ran, and the client
+// sends the request again without the ticket under a fresh Idempotency-Key.
+// A ticket presented a second time (a retry after a lost response) that was
+// already used fails as a non-retryable relay_error: its first presentation
+// may have run, so the client must not resend under a fresh key. A ticket
 // that is not the caller's, or was prepared under another key, is ignored
 // and the request admitted the ordinary way. A ticket the client will not
 // present is released with POST /v1/llm/admissions/release.
@@ -94,8 +98,9 @@ func (r LLMAdmissionRelease) Validate() error {
 // HeaderPreparedAdmissionOutcome. Every value but PreparedAdmissionUsed says
 // why the ticket was not used. PreparedAdmissionInvalid arrives on an
 // ordinary admission under the request's own key; the others arrive on a 409
-// idempotency_conflict, because the ticket owns the request's key, and the
-// client resends without the ticket under a fresh Idempotency-Key.
+// idempotency_conflict, because the ticket owns the request's key; the
+// Router retired the ticket, nothing ran, and the client resends without it
+// under a fresh Idempotency-Key.
 type PreparedAdmissionOutcome string
 
 const (
