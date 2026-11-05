@@ -45,9 +45,12 @@ class FakeRouter:
         # Tickets a request ran on: presenting one again is already started.
         self.spent: set[str] = set()
         # What retiring a ticket that is not run establishes (runtime#377
-        # e1defd4): "retired", "spent", "unknown" or "expired".
+        # e1defd4, 5a59d83): "retired", "spent" or "unknown".
         self.retire_answer = "retired"
         self.break_stream_once = False
+        # The ordinary admission under the request's own key meets the
+        # ledger's conflict (it may have run already).
+        self.ledger_conflict = False
         self.on_failure: Callable[[], None] | None = None
         self.issued = 0
         self.release_delay = 0.0
@@ -137,15 +140,13 @@ class FakeRouter:
                         self.live.pop(presented)
                         self.spent.add(presented)
                         return refuse("request_already_started", 409, False)
-                    if self.retire_answer == "expired":
-                        return refuse("lease_expired", 500, True)
                     return refuse("provider_unavailable", 503, True)
                 self.live.pop(presented)
                 self.spent.add(presented)
                 used = True
         elif fail:
             return refuse("provider_unavailable", 503, True)
-        if not presented and key in self.live.values():
+        if self.ledger_conflict or (not presented and key in self.live.values()):
             # The ledger holds a ticket's key for its prepared request.
             return refuse("idempotency_conflict", 409, False)
         if self.one_slot and self.live and not used:
@@ -459,15 +460,12 @@ async def test_retry_presents_the_failed_ticket_not_a_newly_prepared_one() -> No
         await plugin.aclose()
 
 
-@pytest.mark.parametrize("retire_answer", ["spent", "expired"])
-async def test_already_started_or_unconfirmable_is_never_resent(
-    retire_answer: str,
-) -> None:
-    # request_already_started (may have run) and lease_expired (cannot be
-    # confirmed): neither the ticket nor a fresh key may retry the request.
+async def test_already_started_is_never_resent() -> None:
+    # request_already_started (used, or expired unconfirmed; may have run):
+    # neither the ticket nor a fresh key may retry the request.
     router = FakeRouter()
     router.outcome = "budget"
-    router.retire_answer = retire_answer
+    router.retire_answer = "spent"
     async with router_client(router) as client:
         plugin = LLM(client, prepare_admissions=True)
         plugin.prepare(_history())
@@ -477,11 +475,32 @@ async def test_already_started_or_unconfirmable_is_never_resent(
         with pytest.raises(APIConnectionError) as caught:
             await _drain_text(stream)
 
-        code = {"spent": "request_already_started", "expired": "lease_expired"}
-        assert code[retire_answer] in str(caught.value)
+        assert "request_already_started" in str(caught.value)
         assert len(router.responses) == 1
         await asyncio.sleep(0.05)
         assert router.releases == []  # dropped, not released
+        await plugin.aclose()
+
+
+async def test_conflict_with_an_invalid_outcome_is_not_resent() -> None:
+    # A conflict carrying `invalid` came from the ordinary admission under the
+    # request's own key, which may already have run: an ordinary error, never
+    # a fresh-key resend.
+    router = FakeRouter()
+    router.outcome = "invalid"
+    router.ledger_conflict = True
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+
+        stream = _chat_with_retries(plugin, retries=2)
+        with pytest.raises(APIConnectionError) as caught:
+            await _drain_text(stream)
+
+        assert "idempotency_conflict" in str(caught.value)
+        assert len(router.responses) == 1
+        assert stream.prepared_admission_outcome == "invalid"
         await plugin.aclose()
 
 

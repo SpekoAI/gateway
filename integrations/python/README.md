@@ -187,17 +187,20 @@ answers from what it found:
 
 - 409 `idempotency_conflict`: retired, never ran. The LLM at once sends the
   request again without the ticket, under a fresh key, in the same attempt.
-- 409 `request_already_started`: already used, and the request may have run.
-  The error is raised, not retried, and the ticket is dropped.
-- `lease_expired`: it cannot be confirmed either way. The error is raised,
-  not retried, and the ticket is dropped.
+  A conflict whose outcome is `invalid` is different. It came from the
+  ordinary admission under the request's own key, which may already have run,
+  so it is raised as an ordinary error and not resent.
+- 409 `request_already_started`: already used, or expired before it could be
+  confirmed, so the request may have run. The error is raised, not retried,
+  and the ticket is dropped.
 - Any other failure, such as a retryable 503 `provider_unavailable`: not
   confirmed. LiveKit's retry sends the same request unchanged, with the same
   ticket and key. It never uses a fresh key or a newly prepared ticket, and
   the ticket is not released in between. A failure after the connector
   accepted the request (mid-stream) is retried the same way.
 
-A failed prepare or release never raises into the agent.
+Releasing is idempotent and always safe. A failed prepare or release never
+raises into the agent.
 
 An unused ticket holds a credit reservation and one organization concurrency
 slot until it is used, released, or expires (5 minutes). The option is off by

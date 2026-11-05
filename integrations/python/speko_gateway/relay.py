@@ -60,18 +60,20 @@ The ticket and its `Idempotency-Key` are one idempotency unit. When a
 ticketed request is not run on its ticket (a mismatch, or a failure before the
 connector accepted it), the Router tries to retire the ticket and answers:
 
-- 409 `idempotency_conflict`: retired, never ran. `stream_response` sends the
-  request again at once without the ticket under a fresh key.
-- 409 `request_already_started`: already used, may have run. Not resent; the
-  ticket is dropped.
-- `lease_expired`: cannot be confirmed either way. Not resent; dropped.
+- 409 `idempotency_conflict` with an outcome other than `invalid`: retired,
+  never ran. `stream_response` sends the request again at once without the
+  ticket under a fresh key. With `invalid` the conflict came from the
+  ordinary admission under the request's own key, which may have run, so it
+  is an ordinary error and nothing is resent.
+- 409 `request_already_started`: already used, or expired unconfirmed; may
+  have run. Not resent; the ticket is dropped.
 - Any other failure: unconfirmed. The only safe retry is the same request
   unchanged, ticket and key included (`PreparedPresentation`).
 """
 
 # Answers to a ticketed request after which neither the ticket nor a fresh
 # key may be used for it.
-_PREPARED_FINAL_CODES = frozenset({"request_already_started", "lease_expired"})
+_PREPARED_FINAL_CODES = frozenset({"request_already_started"})
 
 _PREPARED_OUTCOMES = frozenset(
     {PREPARED_ADMISSION_USED, "invalid", "stale", "expired", "route", "budget"}
@@ -355,8 +357,10 @@ class RelayLLMClient:
     async def release_admission(self, admission: str) -> bool:
         """POST /v1/llm/admissions/release for a ticket that will not be used.
 
-        Returns True when this call released it, False when it was already
-        used, already released, or expired. A refusal raises RelayError.
+        Returns the Router's `released`: True once the ticket is retired,
+        including on a repeated release (it is idempotent), False when it was
+        used or expired. Callers must not depend on the value; the SDK only
+        logs it. A refusal raises RelayError.
         """
 
         async with self._session.post(
@@ -412,12 +416,14 @@ class RelayLLMClient:
         It is not called when no response arrived.
 
         When the Router answers a ticketed request with 409
-        `idempotency_conflict` (it retired the ticket, which never ran), the
-        request is sent again at once without the ticket under a fresh key,
-        after awaiting `before_resend`; a framework retry cannot do this, as a
-        409 is not retryable. `request_already_started` and `lease_expired`
-        on a ticketed request are raised as not retryable: the request may
-        have run, so it must not be sent again under any key.
+        `idempotency_conflict` and an outcome other than `invalid` (it retired
+        the ticket, which never ran), the request is sent again at once
+        without the ticket under a fresh key, after awaiting `before_resend`;
+        a framework retry cannot do this, as a 409 is not retryable. A
+        conflict with `invalid` came from the ordinary admission under the
+        request's own key and is raised. `request_already_started` on a
+        ticketed request is raised as not retryable: the request may have
+        run, so it must not be sent again under any key.
         """
 
         body = dict(request)
@@ -454,6 +460,7 @@ class RelayLLMClient:
                         ticket
                         and response.status == 409
                         and error.code == "idempotency_conflict"
+                        and outcome != "invalid"
                     ):
                         raise error
                 else:
@@ -757,10 +764,11 @@ class PreparedPresentation:
 
     - Pass `observe` as `stream_response`'s `on_prepared_outcome`, and
       `retired` as its `before_resend`.
-    - A request the Router refused with `idempotency_conflict` was resent
-      without the ticket; the ticket is retired and never presented again.
-    - `request_already_started` and `lease_expired` drop the ticket: the
-      request may have run, so neither the ticket nor a fresh key may retry it.
+    - A request the Router refused with `idempotency_conflict` (outcome not
+      `invalid`) was resent without the ticket; the ticket is retired and
+      never presented again.
+    - `request_already_started` drops the ticket: the request may have run,
+      so neither the ticket nor a fresh key may retry it.
     - Any other failure is unconfirmed: while `reusable`, a retry presents
       the same ticket under the same key, and nothing is released in between,
       since a release would retire the ticket and the unchanged retry would

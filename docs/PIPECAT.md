@@ -98,8 +98,9 @@ the prepare call's `Idempotency-Key` (the Router binds the ticket to it). It
 waits up to 3 s for a prepare still in flight. Requests without a ticket keep
 fresh keys. When the Router retires a ticket that does not fit and answers
 409 `idempotency_conflict`, the service sends the request again at once
-without it. Any other failure of a ticketed request is raised: `request_already_started`
-or `lease_expired` mean the request may have run. Pipecat does not retry, so
+without it. It does not resend a conflict whose outcome is `invalid`. Any other
+failure of a ticketed request is raised; `request_already_started` means the
+request may have run. Pipecat does not retry, so
 the request's ticket is released when it ends, unless the Router reported an
 outcome on a success or retired or spent it. A ticket left unused at `EndFrame`,
 `CancelFrame` or cleanup is released too, including one whose prepare lands
