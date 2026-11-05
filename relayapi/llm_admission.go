@@ -115,11 +115,12 @@ const (
 	// PreparedAdmissionBudget: the request needs more input or output tokens
 	// than the ticket reserved.
 	PreparedAdmissionBudget PreparedAdmissionOutcome = "budget"
-	// PreparedAdmissionRedialed: the provider connector refused the attempt
-	// on the ticket before dispatch for a retryable reason, so the ticket
-	// was retired where possible and the request admitted again. A ticket
-	// whose plan was already consumed has no outcome of its own: it is
-	// refused as request_already_started.
+	// PreparedAdmissionRedialed: the attempt on the ticket failed before the
+	// provider connector accepted it and the connector confirmed the ticket
+	// can never run, so the request was admitted again. When the connector
+	// cannot confirm that, the request is refused as a retryable
+	// provider_unavailable instead. A ticket whose plan was already consumed
+	// has no outcome of its own: it is refused as request_already_started.
 	PreparedAdmissionRedialed PreparedAdmissionOutcome = "redialed"
 )
 

@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:38b32936f3102bf479a20c100cca455ffe091ce419a79993832252ea821e20df
-# yaml-body: sha256:390041de57c383acd3500dca11570ca66762d9efba412e65b01a1ce896fd602f
+# json-mirror: openapi.json sha256:8770a04be34b1fd1e2fabd05bde8e744baf98666df8ab23277edb5acc94dbe2a
+# yaml-body: sha256:cb1e1b637d528cdcb492e21306276a866073c575489d6f4b7f8024e56f875929
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -453,14 +453,14 @@ paths:
         retried in the background. released is false when there was nothing
         left to release: the ticket was already used, already released, or
         expired, or could not be retired now, and its reservation then ends
-        when its plan expires. A ticket presented on a POST /v1/llm/responses
-        that this region served is either used or, when it did not fit,
-        already retired by the Router, so a release of it answers false.
-        Release any ticket whose request came back without a
-        Speko-Prepared-Admission-Outcome header: it was never presented, its
-        request was handed to another region, or the request failed
-        validation or route selection before the ticket check. Releasing is
-        always safe.
+        when its plan expires. Release every ticket the client will not
+        present again unless its request came back with outcome used: one
+        never presented, one whose request failed before the ticket check
+        (validation or route selection; no outcome header), one handed to
+        another region (no outcome header), and one whose request was refused
+        as retryable after a mismatch outcome, which the Router could not
+        retire. A ticket the Router already retired answers false. Releasing
+        is always safe.
         Idempotency-Key is optional here, because a release replays nothing.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKeyOptional"
@@ -2244,10 +2244,13 @@ components:
         than five seconds left. stale: it was issued under another catalog
         release. route: the routing mode changed, or its provider and model
         are not a candidate for this request. budget: this request needs
-        more input or output tokens than it reserved. redialed: the provider
-        connector refused the attempt on it before dispatch for a retryable
-        reason, so the Router retired the ticket where it could and admitted
-        the request again. A ticket whose plan was already consumed has no
+        more input or output tokens than it reserved. redialed: the attempt
+        on the ticket failed before the provider connector accepted it, and
+        the connector confirmed the ticket can never run, so the Router
+        admitted the request again. Before any such second admission the
+        Router retires the ticket; when the connector cannot confirm that,
+        the request is refused as a retryable provider_unavailable instead,
+        and the ticket should be released. A ticket whose plan was already consumed has no
         outcome of its own: the request is refused with 409
         request_already_started.
       enum:
