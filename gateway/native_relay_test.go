@@ -398,6 +398,10 @@ func TestNativeRelaySpeechPreservesFramesCredentialsAndTerminalUsage(t *testing.
 			if err != nil || typ != websocket.MessageText || !bytes.Equal(body, terminal) {
 				t.Fatalf("terminal frame: %v", err)
 			}
+			_, _, err = conn.Read(ctx)
+			if websocket.CloseStatus(err) != websocket.StatusNormalClosure {
+				t.Fatalf("normal terminal close lost: %v", err)
+			}
 			if err = <-peerErrors; err != nil {
 				t.Fatal(err)
 			}

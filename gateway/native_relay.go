@@ -211,6 +211,13 @@ func nativeOne(h http.Header, name string) string {
 }
 
 func nativeWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
+	// net/http may drain an unread body while flushing the 101 response.
+	// Do not admit upstream work behind an incomplete local HTTP message,
+	// and close HTTP so writing the refusal cannot wait for that body either.
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		w.Header().Set("Connection", "close")
+		return false
+	}
 	contains := func(name, expected string) bool {
 		for _, line := range r.Header.Values(name) {
 			for _, token := range strings.Split(line, ",") {
@@ -510,27 +517,55 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	local.SetReadLimit(nativeMaxFrameBytes)
 	stop := context.AfterFunc(ctx, func() { _ = upstream.CloseNow(); _ = local.CloseNow() })
 	defer stop()
-	copyFrame := func(dst, src *websocket.Conn) error {
+	type copyResult struct {
+		destination *websocket.Conn
+		err         error
+		fromRead    bool
+	}
+	copyFrame := func(dst, src *websocket.Conn) copyResult {
 		for {
 			kind, body, err := src.Read(ctx)
 			if err != nil {
-				return err
+				return copyResult{dst, err, true}
 			}
 			writeCtx, cancel := context.WithTimeout(ctx, s.timeToWrite)
 			err = dst.Write(writeCtx, kind, body)
 			cancel()
 			if err != nil {
-				return err
+				return copyResult{dst, err, false}
 			}
 		}
 	}
-	complete := make(chan error, 2)
+	complete := make(chan copyResult, 2)
 	go func() { complete <- copyFrame(upstream, local) }()
 	go func() { complete <- copyFrame(local, upstream) }()
-	<-complete
+	first := <-complete
+	secondReceived := false
+	if !first.fromRead {
+		// A concurrent writer can observe a closed socket before its reader
+		// returns the actual close frame. Let that reader finish within the
+		// existing network bound so its status is not replaced by a write EOF.
+		deadline := time.NewTimer(s.timeToWrite)
+		select {
+		case first = <-complete:
+			secondReceived = true
+		case <-deadline.C:
+		case <-ctx.Done():
+		}
+		deadline.Stop()
+	}
+	var closed websocket.CloseError
+	if first.fromRead && errors.As(first.err, &closed) {
+		// A close frame is part of the native protocol. Forward its exact
+		// status/reason; an abnormal EOF stays abnormal. Close has its own
+		// bounded handshake and the opposite copy continues reading its ack.
+		_ = first.destination.Close(closed.Code, closed.Reason)
+	}
 	_ = upstream.CloseNow()
 	_ = local.CloseNow()
-	<-complete
+	if !secondReceived {
+		<-complete
+	}
 }
 func (s *NativeRelayServer) Stats() Stats {
 	s.mu.Lock()
