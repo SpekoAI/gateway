@@ -42,6 +42,12 @@ class FakeRouter:
         # concurrency slot, so any other admission is refused for it.
         self.one_slot = False
         self.live: dict[str, str] = {}
+        # Tickets a request ran on: presenting one again is already started.
+        self.spent: set[str] = set()
+        # What retiring a ticket that is not run establishes (runtime#377
+        # e1defd4): "retired", "spent", "unknown" or "expired".
+        self.retire_answer = "retired"
+        self.break_stream_once = False
         self.on_failure: Callable[[], None] | None = None
         self.issued = 0
         self.release_delay = 0.0
@@ -91,68 +97,79 @@ class FakeRouter:
         self.responses.append((dict(request.headers), await request.json()))
         self.log.append("respond")
         headers = {"Content-Type": "text/event-stream", "Speko-Request-ID": "req-1"}
-        # The ticket check of runtime#377: `outcome` is what this Router
-        # decides for a ticket of the caller's under its own key, and None
-        # stands for a response without the header (a request that failed
-        # before the check, or was handed to another region), which leaves
-        # the ticket untouched.
+        key = request.headers["Idempotency-Key"]
         presented = request.headers.get("Speko-Prepared-Admission", "")
-        if presented and self.outcome is not None:
-            key = request.headers["Idempotency-Key"]
-            outcome = self.outcome
-            if self.live.get(presented) != key:
-                outcome = "invalid"
-            # The Router retires a ticket of the caller's that it reports on,
-            # whether it uses it or not.
-            self.live.pop(presented, None)
-            headers["Speko-Prepared-Admission-Outcome"] = outcome
-            if outcome in ("stale", "expired", "route", "budget"):
-                return web.json_response(
-                    {
-                        "error": {
-                            "code": "idempotency_conflict",
-                            "retryable": False,
-                            "request_id": "req-prepared",
-                        }
-                    },
-                    status=409,
-                    headers={k: v for k, v in headers.items() if k != "Content-Type"},
-                )
-        if self.fail_responses > 0:
+        fail = self.fail_responses > 0
+        if fail:
             self.fail_responses -= 1
             if self.on_failure is not None:
                 self.on_failure()
+
+        def refuse(code: str, status: int, retryable: bool) -> web.Response:
             return web.json_response(
-                {"error": {"code": "provider_unavailable", "retryable": True}},
-                status=503,
+                {"error": {"code": code, "retryable": retryable}},
+                status=status,
                 headers={k: v for k, v in headers.items() if k != "Content-Type"},
             )
-        if (
-            self.one_slot
-            and self.live
-            and headers.get("Speko-Prepared-Admission-Outcome") != "used"
-        ):
+
+        used = False
+        # The ticket check. `outcome` is what this Router decides for a ticket
+        # of the caller's under its own key; None stands for a response
+        # without the header (failed before the check, or served by another
+        # region), which leaves the ticket untouched.
+        if presented and presented in self.spent:
+            headers["Speko-Prepared-Admission-Outcome"] = "used"
+            return refuse("request_already_started", 409, False)
+        if presented and self.outcome is not None:
+            outcome = self.outcome
+            if self.live.get(presented) != key:
+                self.live.pop(presented, None)  # the caller's own is retired
+                outcome = "invalid"
+            headers["Speko-Prepared-Admission-Outcome"] = outcome
+            if outcome != "invalid":
+                if fail or outcome != "used":
+                    # Not run on its ticket: answer from what retiring it
+                    # established.
+                    if self.retire_answer == "retired":
+                        self.live.pop(presented)
+                        return refuse("idempotency_conflict", 409, False)
+                    if self.retire_answer == "spent":
+                        self.live.pop(presented)
+                        self.spent.add(presented)
+                        return refuse("request_already_started", 409, False)
+                    if self.retire_answer == "expired":
+                        return refuse("lease_expired", 500, True)
+                    return refuse("provider_unavailable", 503, True)
+                self.live.pop(presented)
+                self.spent.add(presented)
+                used = True
+        elif fail:
+            return refuse("provider_unavailable", 503, True)
+        if not presented and key in self.live.values():
+            # The ledger holds a ticket's key for its prepared request.
+            return refuse("idempotency_conflict", 409, False)
+        if self.one_slot and self.live and not used:
             # An ordinary admission while a ticket holds the only slot.
-            return web.json_response(
-                {"error": {"code": "concurrency_exhausted", "retryable": False}},
-                status=429,
-                headers={k: v for k, v in headers.items() if k != "Content-Type"},
-            )
+            return refuse("concurrency_exhausted", 429, False)
         if self.response_status != 200:
-            return web.json_response(
-                {"error": {"code": "insufficient_credit", "retryable": False}},
-                status=self.response_status,
-                headers={k: v for k, v in headers.items() if k != "Content-Type"},
-            )
+            return refuse("insufficient_credit", self.response_status, False)
         response = web.StreamResponse(headers=headers)
         await response.prepare(request)
         if self.hold_stream is not None:
             await self.hold_stream.wait()
-        for event, payload in (
+        events: list[tuple[str, dict[str, Any]]] = [
             ("response.created", {"response_id": "resp-1"}),
             ("response.text.delta", {"delta": "Hi"}),
-            ("response.completed", {"usage": {"input_tokens": 3, "output_tokens": 1}}),
-        ):
+        ]
+        if self.break_stream_once:
+            self.break_stream_once = False
+            events.append(
+                ("error", {"error": {"code": "provider_error", "retryable": True}})
+            )
+        else:
+            usage = {"input_tokens": 3, "output_tokens": 1}
+            events.append(("response.completed", {"usage": usage}))
+        for event, payload in events:
             await response.write(
                 f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
             )
@@ -340,9 +357,10 @@ async def test_missing_outcome_header_releases_the_ticket() -> None:
 
 
 @pytest.mark.parametrize("outcome", ["invalid", None])
-async def test_refused_request_reports_its_outcome_and_releases_only_without_one(
+async def test_refused_request_reports_its_outcome_and_releases(
     outcome: str | None,
 ) -> None:
+    # A failure that no retry follows ends the ticket; a release is safe.
     router = FakeRouter()
     router.outcome = outcome
     router.response_status = 402
@@ -357,7 +375,56 @@ async def test_refused_request_reports_its_outcome_and_releases_only_without_one
                 pass
 
         assert stream.prepared_admission_outcome == (outcome or "")
+        assert len(router.responses) == 1
+        await until(lambda: len(router.releases) == 1)
+        await plugin.aclose()
+
+
+def _chat_with_retries(plugin: LLM, retries: int = 1) -> Any:
+    return plugin.chat(
+        chat_ctx=_turn(),
+        conn_options=APIConnectOptions(max_retry=retries, retry_interval=0.01),
+    )
+
+
+async def _drain_text(stream: Any) -> str:
+    return "".join(
+        [c.delta.content async for c in stream if c.delta and c.delta.content]
+    )
+
+
+@pytest.mark.parametrize("outcome", ["used", "budget", None])
+async def test_unconfirmed_failure_is_retried_with_the_same_ticket_and_key(
+    outcome: str | None,
+) -> None:
+    # A retryable 503 the Router could not confirm either way: the only safe
+    # retry is the same request, ticket and key included, with no release in
+    # between (it would retire the ticket and the retry would be refused).
+    router = FakeRouter()
+    router.outcome = outcome
+    router.retire_answer = "unknown"
+    router.fail_responses = 1
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+        prepare_key = router.admissions[0][0]["Idempotency-Key"]
+
+        def fits_on_retry() -> None:
+            if outcome == "budget":
+                router.outcome = "used"
+
+        router.on_failure = fits_on_retry
+        stream = _chat_with_retries(plugin)
+        assert await _drain_text(stream) == "Hi"
+
+        (first, _), (retry, _) = router.responses
+        for headers in (first, retry):
+            assert headers["Speko-Prepared-Admission"] == "spa1.ticket-1"
+            assert headers["Idempotency-Key"] == prepare_key
+        assert router.log[:3] == ["admit", "respond", "respond"]
         if outcome is None:
+            # Served with no outcome (another region): released at the end.
             await until(lambda: len(router.releases) == 1)
         else:
             await asyncio.sleep(0.05)
@@ -365,104 +432,102 @@ async def test_refused_request_reports_its_outcome_and_releases_only_without_one
         await plugin.aclose()
 
 
-@pytest.mark.parametrize("outcome", [None, "used"])
-async def test_retry_after_a_ticketed_failure_is_ordinary_with_a_fresh_key(
-    outcome: str | None,
-) -> None:
-    router = FakeRouter()
-    router.outcome = outcome
-    router.fail_responses = 1
-    async with router_client(router) as client:
-        plugin = LLM(client, prepare_admissions=True)
-        plugin.prepare(_history())
-        await until(lambda: router.issued == 1)
-        prepare_key = router.admissions[0][0]["Idempotency-Key"]
-
-        stream = plugin.chat(
-            chat_ctx=_turn(),
-            conn_options=APIConnectOptions(max_retry=1, retry_interval=0.01),
-        )
-        text = "".join(
-            [c.delta.content async for c in stream if c.delta and c.delta.content]
-        )
-
-        assert text == "Hi"
-        first, retry = (headers for headers, _ in router.responses)
-        assert first["Speko-Prepared-Admission"] == "spa1.ticket-1"
-        assert first["Idempotency-Key"] == prepare_key
-        assert "Speko-Prepared-Admission" not in retry
-        assert retry["Idempotency-Key"] != prepare_key
-        if outcome is None:
-            await until(lambda: len(router.releases) == 1)
-        await plugin.aclose()
-
-
-async def test_retry_presents_a_ticket_prepared_after_the_failure() -> None:
-    # One-slot organization: the first attempt spends ticket 1 and fails
-    # retryably; a speech start prepares ticket 2 before LiveKit retries. An
-    # ordinary retry would be refused while ticket 2 holds the slot, so the
-    # retry presents ticket 2 under its own key.
+async def test_retry_presents_the_failed_ticket_not_a_newly_prepared_one() -> None:
+    # One slot: a speech start between the failure and the retry tries to
+    # prepare, but the unconfirmed ticket still holds the slot. The retry
+    # presents the original ticket under its key.
     router = FakeRouter()
     router.one_slot = True
+    router.retire_answer = "unknown"
     router.fail_responses = 1
     async with router_client(router) as client:
         plugin = LLM(client, prepare_admissions=True)
         router.on_failure = lambda: plugin.prepare(_history())
         plugin.prepare(_history())
         await until(lambda: router.issued == 1)
+        prepare_key = router.admissions[0][0]["Idempotency-Key"]
 
-        stream = plugin.chat(
-            chat_ctx=_turn(),
-            conn_options=APIConnectOptions(max_retry=1, retry_interval=0.05),
-        )
-        text = "".join(
-            [c.delta.content async for c in stream if c.delta and c.delta.content]
-        )
+        stream = _chat_with_retries(plugin)
+        assert await _drain_text(stream) == "Hi"
 
-        assert text == "Hi"
-        assert router.issued == 2
-        (first, _), (retry, _) = router.responses
-        keys = [headers["Idempotency-Key"] for headers, _ in router.admissions]
-        assert first["Speko-Prepared-Admission"] == "spa1.ticket-1"
-        assert first["Idempotency-Key"] == keys[0]
-        assert retry["Speko-Prepared-Admission"] == "spa1.ticket-2"
-        assert retry["Idempotency-Key"] == keys[1]
+        (_, _), (retry, _) = router.responses
+        assert retry["Speko-Prepared-Admission"] == "spa1.ticket-1"
+        assert retry["Idempotency-Key"] == prepare_key
+        assert router.issued == 1
         assert stream.prepared_admission_outcome == "used"
         assert router.live == {}
-        assert router.releases == []
         await plugin.aclose()
 
 
-async def test_retry_waits_for_a_release_slower_than_a_second() -> None:
-    # One slot: the ticketed attempt fails before the ticket check (no outcome
-    # header), so the ticket still holds the slot and the SDK releases it. The
-    # release takes longer than a second; the retry's ordinary admission must
-    # wait for it to complete or be refused for concurrency.
+@pytest.mark.parametrize("retire_answer", ["spent", "expired"])
+async def test_already_started_or_unconfirmable_is_never_resent(
+    retire_answer: str,
+) -> None:
+    # request_already_started (may have run) and lease_expired (cannot be
+    # confirmed): neither the ticket nor a fresh key may retry the request.
     router = FakeRouter()
-    router.one_slot = True
-    router.outcome = None
-    router.fail_responses = 1
-    router.release_delay = 1.5
+    router.outcome = "budget"
+    router.retire_answer = retire_answer
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+
+        stream = _chat_with_retries(plugin, retries=3)
+        with pytest.raises(APIConnectionError) as caught:
+            await _drain_text(stream)
+
+        code = {"spent": "request_already_started", "expired": "lease_expired"}
+        assert code[retire_answer] in str(caught.value)
+        assert len(router.responses) == 1
+        await asyncio.sleep(0.05)
+        assert router.releases == []  # dropped, not released
+        await plugin.aclose()
+
+
+async def test_mid_stream_failure_retries_with_the_same_ticket_and_key() -> None:
+    # After the connector accepted it, a failure is an ordinary failure of a
+    # request that may have run; its retry still never uses a fresh key. This
+    # Router answers the re-presented, spent ticket as already started.
+    router = FakeRouter()
+    router.break_stream_once = True
     async with router_client(router) as client:
         plugin = LLM(client, prepare_admissions=True)
         plugin.prepare(_history())
         await until(lambda: router.issued == 1)
         prepare_key = router.admissions[0][0]["Idempotency-Key"]
 
-        stream = plugin.chat(
-            chat_ctx=_turn(),
-            conn_options=APIConnectOptions(max_retry=1, retry_interval=0.01),
-        )
-        text = "".join(
-            [c.delta.content async for c in stream if c.delta and c.delta.content]
-        )
+        stream = _chat_with_retries(plugin)
+        with pytest.raises(APIConnectionError):
+            await _drain_text(stream)
 
-        assert text == "Hi"
         (first, _), (retry, _) = router.responses
-        assert first["Speko-Prepared-Admission"] == "spa1.ticket-1"
-        assert "Speko-Prepared-Admission" not in retry
-        assert retry["Idempotency-Key"] != prepare_key
-        assert router.log == ["admit", "respond", "released", "respond"]
+        for headers in (first, retry):
+            assert headers["Speko-Prepared-Admission"] == "spa1.ticket-1"
+            assert headers["Idempotency-Key"] == prepare_key
+        await asyncio.sleep(0.05)
+        assert router.releases == []
+        await plugin.aclose()
+
+
+async def test_ordinary_request_waits_for_a_release_slower_than_a_second() -> None:
+    # One slot: a ticket too close to expiry is released instead of
+    # presented, and the release takes 1.5 s. The ordinary request must wait
+    # for it to complete or be refused for concurrency.
+    router = FakeRouter()
+    router.one_slot = True
+    router.expires_in = 8.0
+    router.release_delay = 1.5
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+        await asyncio.sleep(0.05)
+
+        assert await _drain_text(_chat_with_retries(plugin, retries=0)) == "Hi"
+
+        assert router.log == ["admit", "released", "respond"]
+        assert "Speko-Prepared-Admission" not in router.responses[0][0]
         await plugin.aclose()
 
 
@@ -612,9 +677,11 @@ async def test_prepare_slower_than_the_release_bound_still_lands_and_releases(
         await until(lambda: owned._session.closed)
 
 
-async def test_ticket_without_outcome_is_released_at_the_headers() -> None:
+async def test_ticket_without_outcome_is_released_when_the_request_ends() -> None:
+    # Served with no outcome (another region). A mid-stream retry would have
+    # to present the ticket unchanged, so it is released only at the end.
     router = FakeRouter()
-    router.outcome = None  # served elsewhere: no outcome, ticket untouched
+    router.outcome = None
     router.hold_stream = asyncio.Event()
     async with router_client(router) as client:
         plugin = LLM(client, prepare_admissions=True)
@@ -623,13 +690,13 @@ async def test_ticket_without_outcome_is_released_at_the_headers() -> None:
 
         consumed = asyncio.ensure_future(reply(plugin))
         try:
-            await until(lambda: len(router.releases) == 1)
-            assert not consumed.done()
+            await until(lambda: len(router.responses) == 1)
+            await asyncio.sleep(0.1)
+            assert router.releases == []
         finally:
             router.hold_stream.set()
         await consumed
-        await asyncio.sleep(0.05)
-        assert len(router.releases) == 1
+        await until(lambda: len(router.releases) == 1)
         await plugin.aclose()
 
 

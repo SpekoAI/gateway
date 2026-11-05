@@ -54,17 +54,27 @@ The other values name why the ticket was not used:
 - `invalid`: not this caller's ticket, or prepared under another key. The
   request was admitted the ordinary way.
 - `stale`, `expired`, `route`, `budget`: this caller's ticket, under this key,
-  that does not fit. The Router retires it and refuses the request with 409
-  `idempotency_conflict`; `stream_response` resends it at once without the
-  ticket under a fresh key.
+  that does not fit. It is not run.
 
-The Router retires a ticket of the caller's that reports any of these, so the
-client releases a presented ticket only when no outcome arrived.
+The ticket and its `Idempotency-Key` are one idempotency unit. When a
+ticketed request is not run on its ticket (a mismatch, or a failure before the
+connector accepted it), the Router tries to retire the ticket and answers:
+
+- 409 `idempotency_conflict`: retired, never ran. `stream_response` sends the
+  request again at once without the ticket under a fresh key.
+- 409 `request_already_started`: already used, may have run. Not resent; the
+  ticket is dropped.
+- `lease_expired`: cannot be confirmed either way. Not resent; dropped.
+- Any other failure: unconfirmed. The only safe retry is the same request
+  unchanged, ticket and key included (`PreparedPresentation`).
 """
 
-_PREPARED_MISMATCH_OUTCOMES = frozenset({"stale", "expired", "route", "budget"})
+# Answers to a ticketed request after which neither the ticket nor a fresh
+# key may be used for it.
+_PREPARED_FINAL_CODES = frozenset({"request_already_started", "lease_expired"})
+
 _PREPARED_OUTCOMES = frozenset(
-    {PREPARED_ADMISSION_USED, "invalid", *_PREPARED_MISMATCH_OUTCOMES}
+    {PREPARED_ADMISSION_USED, "invalid", "stale", "expired", "route", "budget"}
 )
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
@@ -401,11 +411,13 @@ class RelayLLMClient:
         reason the ticket was not used, or "" from a Router that sent none).
         It is not called when no response arrived.
 
-        When the Router refuses the ticketed request with 409
-        `idempotency_conflict` because the ticket does not fit (`stale`,
-        `expired`, `route` or `budget`), the request is sent again at once
-        without the ticket under a fresh key, after awaiting `before_resend`.
-        A framework retry cannot do this: a 409 is not retryable.
+        When the Router answers a ticketed request with 409
+        `idempotency_conflict` (it retired the ticket, which never ran), the
+        request is sent again at once without the ticket under a fresh key,
+        after awaiting `before_resend`; a framework retry cannot do this, as a
+        409 is not retryable. `request_already_started` and `lease_expired`
+        on a ticketed request are raised as not retryable: the request may
+        have run, so it must not be sent again under any key.
         """
 
         body = dict(request)
@@ -433,11 +445,15 @@ class RelayLLMClient:
                     error = _envelope_error(
                         response.status, await _decode_json(response)
                     )
+                    if ticket and error.code in _PREPARED_FINAL_CODES:
+                        # Resending, under any key, could run the request
+                        # twice: surface it, never retry it.
+                        error.retryable = False
+                        raise error
                     if not (
                         ticket
                         and response.status == 409
                         and error.code == "idempotency_conflict"
-                        and outcome in _PREPARED_MISMATCH_OUTCOMES
                     ):
                         raise error
                 else:
@@ -455,7 +471,7 @@ class RelayLLMClient:
                             retryable=True,
                         )
                     return
-            # The Router retired the ticket and refused it; the key is spent.
+            # The Router retired the ticket, which never ran; the key is spent.
             ticket = ""
             key = ""
             if before_resend is not None:
@@ -734,41 +750,78 @@ class AdmissionPreparer:
 
 
 class PreparedPresentation:
-    """One request presenting a prepared ticket.
+    """One request presenting a prepared ticket, across its retries.
 
-    Pass `observe` as `stream_response`'s `on_prepared_outcome`. The Router
-    itself retires a ticket of the caller's that reports an outcome, so the
-    ticket is released only when no outcome arrived: a response without the
-    header (it failed before the ticket check, or another region served it)
-    releases at the headers, and `finish`, called when the request ends,
-    releases a ticket whose request got no response at all.
+    The ticket and its key are one idempotency unit, so the presentation
+    decides what a retry may send and whether the ticket is released:
+
+    - Pass `observe` as `stream_response`'s `on_prepared_outcome`, and
+      `retired` as its `before_resend`.
+    - A request the Router refused with `idempotency_conflict` was resent
+      without the ticket; the ticket is retired and never presented again.
+    - `request_already_started` and `lease_expired` drop the ticket: the
+      request may have run, so neither the ticket nor a fresh key may retry it.
+    - Any other failure is unconfirmed: while `reusable`, a retry presents
+      the same ticket under the same key, and nothing is released in between,
+      since a release would retire the ticket and the unchanged retry would
+      then be refused as already started.
+    - `finish` ends the presentation once no retry will follow. A ticket is
+      released then, unless the Router reported an outcome on a request that
+      succeeded, or the ticket was retired or dropped. Releasing is always
+      safe; it answers false for a ticket that was spent.
     """
 
     def __init__(self, preparer: AdmissionPreparer, admission: PreparedAdmission):
         self._preparer = preparer
         self.admission = admission
         self.outcome: str | None = None
-        self._settled = False
+        self._state = "presented"  # or "retired", "dropped", "finished"
+
+    @property
+    def reusable(self) -> bool:
+        """Whether a retry must present this ticket again, unchanged."""
+
+        return self._state == "presented"
 
     def observe(self, outcome: str) -> None:
-        if self.outcome is None:  # a resend after a 409 reports no new outcome
-            self.outcome = outcome
-        if outcome not in _PREPARED_OUTCOMES:
-            self._settle()
+        self.outcome = outcome
 
-    async def wait_releases(self) -> None:
-        """`AdmissionPreparer.wait_releases`, for `stream_response`'s resend."""
+    async def retired(self) -> None:
+        """The Router retired the ticket: it never ran, and a resend follows."""
 
+        self._state = "retired"
         await self._preparer.wait_releases()
 
-    def finish(self) -> None:
-        if self.outcome is None:
-            self._settle()
+    def finish(
+        self, error: BaseException | None = None, *, retry_follows: bool = False
+    ) -> None:
+        """Record how an attempt ended; release the ticket if it is over.
 
-    def _settle(self) -> None:
-        if not self._settled:
-            self._settled = True
-            self._preparer._release_soon(self.admission)
+        `error` is the attempt's exception (its RelayError cause is read for
+        the code), None for success. With `retry_follows` an unconfirmed
+        ticket is kept for the retry.
+        """
+
+        if self._state != "presented":
+            return
+        code = _relay_error_code(error)
+        if code in _PREPARED_FINAL_CODES:
+            self._state = "dropped"
+            return
+        if error is not None and retry_follows:
+            return
+        self._state = "finished"
+        if error is None and self.outcome in _PREPARED_OUTCOMES:
+            return
+        self._preparer._release_soon(self.admission)
+
+
+def _relay_error_code(error: BaseException | None) -> str:
+    while error is not None:
+        if isinstance(error, RelayError):
+            return error.code
+        error = error.__cause__
+    return ""
 
 
 _RFC3339 = re.compile(

@@ -812,13 +812,17 @@ class SpekoLLMService(LLMService):
         )
         if preparer is not None and admission is None:
             await preparer.wait_releases()
+        # Pipecat does not retry a request, so each ends its ticket here.
         try:
             function_calls = await self._stream_context(
                 context, request, presentation
             )
-        finally:
+        except BaseException as error:
             if presentation is not None:
-                presentation.finish()
+                presentation.finish(error)
+            raise
+        if presentation is not None:
+            presentation.finish()
         if function_calls:
             await self.run_function_calls(function_calls)
 
@@ -841,7 +845,6 @@ class SpekoLLMService(LLMService):
             self._on_prepared_outcome("")
 
             def on_outcome(outcome: str) -> None:
-                # Releases a ticket with no outcome at the response headers.
                 presentation.observe(outcome)
                 self._on_prepared_outcome(outcome)
 
@@ -850,7 +853,7 @@ class SpekoLLMService(LLMService):
                 prepared_admission=presentation.admission.ticket,
                 idempotency_key=presentation.admission.idempotency_key,
                 on_prepared_outcome=on_outcome,
-                before_resend=presentation.wait_releases,
+                before_resend=presentation.retired,
             )
         try:
             async for event, payload in events:

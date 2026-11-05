@@ -20,6 +20,7 @@ from livekit.agents import (
     NOT_GIVEN,
     APIConnectionError,
     APIConnectOptions,
+    APIError,
     NotGivenOr,
     llm,
     stt,
@@ -1088,6 +1089,8 @@ class RelayLLMStream(llm.LLMStream):
         self._client = client
         self.prepared_admission_outcome: str | None = None
         """This request's `Speko-Prepared-Admission-Outcome`, as on the LLM."""
+        self._presentation: PreparedPresentation | None = None
+        self._attempts = 0
 
     async def _run(self) -> None:
         request = self._relay_llm._request_body(self._chat_ctx, self._tools)
@@ -1100,25 +1103,36 @@ class RelayLLMStream(llm.LLMStream):
         _report_probe_marker("llm.requested")
         # Waiting on a prepare in flight is part of this request's latency,
         # so it comes after the marker.
-        # take() hands out a ticket once and never caches it again, so a
-        # framework retry never presents a spent ticket or its key. It may
-        # present a fresh ticket prepared since the failed attempt, under that
-        # ticket's own key, rather than compete with it for a slot.
+        self._attempts += 1
         preparer = self._relay_llm._preparer
-        admission = await preparer.take() if preparer is not None else None
+        presentation = self._presentation
+        if presentation is not None and not presentation.reusable:
+            presentation = None
+        if presentation is None and preparer is not None:
+            # A fresh attempt, or a retry after the ticket was retired: take()
+            # hands each ticket out once, so a spent ticket never comes back.
+            admission = await preparer.take()
+            if admission is not None:
+                presentation = preparer.present(admission)
+            else:
+                await preparer.wait_releases()
+        # Otherwise this retries a ticketed request that failed unconfirmed:
+        # the only safe retry is the same ticket under the same key.
+        self._presentation = presentation
         self._relay_llm._prepared_admission_outcome = None
-        presentation = (
-            preparer.present(admission)
-            if preparer is not None and admission is not None
-            else None
-        )
-        if preparer is not None and admission is None:
-            await preparer.wait_releases()
         try:
             await self._stream_relay(request, presentation)
-        finally:
+        except BaseException as error:
             if presentation is not None:
-                presentation.finish()
+                retryable = isinstance(error, APIError) and error.retryable
+                presentation.finish(
+                    error,
+                    retry_follows=retryable
+                    and self._attempts <= self._conn_options.max_retry,
+                )
+            raise
+        if presentation is not None:
+            presentation.finish()
 
     def _on_prepared_outcome(self, outcome: str) -> None:
         self.prepared_admission_outcome = outcome
@@ -1137,7 +1151,6 @@ class RelayLLMStream(llm.LLMStream):
             self._on_prepared_outcome("")
 
             def on_outcome(outcome: str) -> None:
-                # Releases a ticket with no outcome at the response headers.
                 presentation.observe(outcome)
                 self._on_prepared_outcome(outcome)
 
@@ -1146,7 +1159,7 @@ class RelayLLMStream(llm.LLMStream):
                 prepared_admission=presentation.admission.ticket,
                 idempotency_key=presentation.admission.idempotency_key,
                 on_prepared_outcome=on_outcome,
-                before_resend=presentation.wait_releases,
+                before_resend=presentation.retired,
             )
         try:
             async for event, payload in events:
