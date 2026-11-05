@@ -8,7 +8,31 @@ _MAX_CHARACTERS = 240
 _SENTENCE_END = re.compile(
     r"""\.["'”’»」』）)\]]*(?=\s)|[!?]["'”’»」』）)\]]*(?=\s|$)|[。！？؟]["'”’»」』）)\]]*|\r\n|[\r\n]"""
 )
-_TRAILING_PERIOD = re.compile(r"""(\S+)\.["'”’»」』）)\]]*$""")
+_TRAILING_PERIOD = re.compile(r"""\.["'”’»」』）)\]]*\s*$""")
+_PERIOD_WORD = re.compile(r"[A-Za-z]+(?:\.[A-Za-z]+)*$")
+_CONTINUING_PREFIXES = frozenset({
+    "mr", "mrs", "ms", "dr", "prof", "st", "capt", "cpt", "lt", "col",
+    "gen", "rev", "sgt", "fl",
+})
+_ABBREVIATIONS = _CONTINUING_PREFIXES | frozenset({
+    "jr", "sr", "inc", "ltd", "co", "vs", "etc", "fig", "no", "vol",
+    "oz", "lb", "lbs", "tsp", "tbsp", "ft", "in", "a.m", "p.m",
+    "i.e", "e.g", "ph.d",
+})
+
+
+def _word_before_period(text: str, position: int) -> str:
+    match = _PERIOD_WORD.search(text, 0, position)
+    return match.group() if match is not None else ""
+
+
+def _abbreviation(text: str, position: int) -> bool:
+    word = _word_before_period(text, position)
+    return (
+        word.lower() in _ABBREVIATIONS
+        or len(word) == 1 and word.isupper()
+        or re.fullmatch(r"(?:[A-Za-z]\.)+[A-Za-z]", word) is not None
+    )
 
 
 class NativeTextBuffer:
@@ -19,7 +43,12 @@ class NativeTextBuffer:
         self._text += token
         ready = []
         while self._text:
-            boundary = _SENTENCE_END.search(self._text)
+            boundary = next(
+                (match for match in _SENTENCE_END.finditer(self._text)
+                 if self._text[match.start()] != "."
+                 or not _abbreviation(self._text, match.start())),
+                None,
+            )
             if boundary is not None and boundary.end() <= _MAX_CHARACTERS:
                 end = boundary.end()
             elif len(self._text) >= _MAX_CHARACTERS:
@@ -44,4 +73,8 @@ class NativeTextBuffer:
         # may extend a decimal or hostname. All terminal periods get the
         # feeder's bounded lookahead, including numeric/dotted endings: a
         # completed "Call 911." must not wait indefinitely for another token.
-        return _TRAILING_PERIOD.search(self._text) is not None
+        ending = _TRAILING_PERIOD.search(self._text)
+        return ending is not None and (
+            _word_before_period(self._text, ending.start()).lower()
+            not in _CONTINUING_PREFIXES
+        )

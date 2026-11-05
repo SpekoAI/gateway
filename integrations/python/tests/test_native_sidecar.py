@@ -41,11 +41,14 @@ MODEL_KEY = "sk_speko_agent_" + "a" * 64
         ),
         ("第一句话已经准备好了。", " 第二句话", "会在门控释放后完成。"),
         ("هل الجملة الأولى جاهزة؟", " الجملة التالية ", "ستنتهي بعد البوابة."),
+        ("Meet Dr. Smith tomorrow.", " Please ", "bring the ID."),
+        ("Use 2 fl. oz. of water.", " Then ", "mix gently."),
     ],
 )
 @pytest.mark.parametrize("pcm_samples", [480, 4800])
+@pytest.mark.parametrize("chunked", [False, True])
 async def test_default_livekit_tts_starts_before_text_finishes_and_preserves_later_audio(
-    native_binary, first, prefix, ending, pcm_samples
+    native_binary, first, prefix, ending, pcm_samples, chunked
 ):
     release, audible = asyncio.Event(), asyncio.Event()
     commits, captured, opened, reported = [], [], [], []
@@ -120,7 +123,12 @@ async def test_default_livekit_tts_starts_before_text_finishes_and_preserves_lat
             self.on_playback_finished(playback_position=0, interrupted=True)
 
     async def text():
-        yield first + prefix
+        if chunked:
+            for character in first + prefix:
+                yield character
+                await asyncio.sleep(0)
+        else:
+            yield first + prefix
         await release.wait()
         yield ending
 
@@ -221,6 +229,8 @@ async def collect_stream(stream):
         ("Visit www.example.", "com for help.", 0.2),
         ("Email user@local.", "example for help.", 0.2),
         ("Read example.co.", "uk for help.", 0.2),
+        ("Meet Dr.", " Smith tomorrow.", 0.5),
+        ("Use 2 fl.", " oz. of water.", 0.5),
     ],
 )
 @pytest.mark.parametrize("chunked", [False, True])
@@ -326,7 +336,7 @@ async def test_native_tts_preserves_literal_text(native_binary, text):
 
 
 @pytest.mark.parametrize(
-    "first", ["Hello.", "This is a complete sentence.", "Wait<stop>please.", "a" * 240, "Call 911.", "Visit example.com."]
+    "first", ["Hello.", "This is a complete sentence.", "Wait<stop>please.", "a" * 240, "Call 911.", "Visit example.com.", "Use 2 fl. oz."]
 )
 async def test_native_tts_emits_standalone_text_while_upstream_waits(
     native_binary, first
