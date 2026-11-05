@@ -258,6 +258,12 @@ arriving, including CJK and Arabic sentence boundaries. Short utterances flush
 promptly, and later provider utterances remain part of the same LiveKit speech
 segment and reported assistant turn. `end_input()` completes that segment.
 
+Native clients preserve the platform's opaque session ID, including IDs such as
+`ses_fixture_web`. IDs follow the `speko.agents.v1` ASCII grammar (1–200 characters,
+starting with an alphanumeric character, then alphanumeric characters or
+`._:-`); they are never replaced with a generated UUID. The cell verifies the
+ID's binding to the per-session model credential.
+
 Native speech disables LiveKit automatic retries for streaming STT, recognition,
 streaming TTS and chunked synthesis, including when retry-enabled connection
 options were supplied. Relay retry hints and timeouts cannot prove no provider

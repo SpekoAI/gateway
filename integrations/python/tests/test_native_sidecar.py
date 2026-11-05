@@ -498,8 +498,12 @@ async def test_actual_native_sidecar_accepts_large_livekit_vad_audio(
 
 
 @pytest.mark.parametrize("kind", ["stt", "tts"])
+@pytest.mark.parametrize(
+    "session_id",
+    ["12345678-1234-4123-8123-123456789abc", "ses_fixture_web", "s" + "._:-A9" * 33 + "z"],
+)
 async def test_actual_native_sidecar_carries_python_speech_frames_and_session_authority(
-    native_binary, kind
+    native_binary, kind, session_id
 ):
     seen = []
     pcm = b"\xff\x0f" * 16000
@@ -532,7 +536,6 @@ async def test_actual_native_sidecar_carries_python_speech_frames_and_session_au
                 await ws.close()
         return ws
 
-    session_id = str(uuid.uuid4())
     async with native_stack(native_binary, handle) as (socket, _):
         client = RelaySpeechClient(
             api_key=MODEL_KEY,
@@ -603,7 +606,7 @@ async def test_actual_native_sidecar_keeps_two_llm_credentials_isolated_and_stre
         )
         return response
 
-    sessions = [str(uuid.uuid4()), str(uuid.uuid4())]
+    sessions = ["ses_fixture_web", "s" + "._:-A9" * 33 + "z"]
     async with native_stack(native_binary, handle) as (socket, _):
 
         async def run(index):

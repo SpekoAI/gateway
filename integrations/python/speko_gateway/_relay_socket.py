@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-import uuid
+import re
 from pathlib import Path
 
 import aiohttp
 
 NATIVE_SOCKET_ORIGIN = "http://speko-gateway"
 NATIVE_LOCAL_AUTHORIZATION = "Speko-Local-Authorization"
+_PLATFORM_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
+
+
+def validate_session_id(session_id: str) -> None:
+    # Match speko.agents.v1's opaque identity grammar without normalization.
+    # The cell still authenticates its binding to the model credential.
+    if not isinstance(session_id, str) or not _PLATFORM_SESSION_ID.fullmatch(session_id):
+        raise ValueError("A valid platform session identifier is required")
 
 
 def socket_headers(
@@ -24,10 +32,7 @@ def socket_headers(
         ord(char) < 33 or ord(char) > 126 for char in api_key
     ):
         raise ValueError("A Speko model credential is required")
-    try:
-        uuid.UUID(session_id)
-    except (ValueError, AttributeError):
-        raise ValueError("A platform session UUID is required") from None
+    validate_session_id(session_id)
     return {NATIVE_LOCAL_AUTHORIZATION: f"Bearer {local_auth_token}"}
 
 

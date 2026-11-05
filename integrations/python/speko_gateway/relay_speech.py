@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
-from ._relay_socket import NATIVE_SOCKET_ORIGIN, socket_headers
+from ._relay_socket import NATIVE_SOCKET_ORIGIN, socket_headers, validate_session_id
 from ._user_agent import USER_AGENT
 from .client import CanonicalEvent, GatewayError, SessionConfig
 
@@ -95,10 +95,7 @@ class RelaySpeechClient:
             ord(char) < 33 or ord(char) > 126 for char in api_key
         ):
             raise ValueError("A Speko model credential is required")
-        try:
-            uuid.UUID(session_id)
-        except (ValueError, AttributeError):
-            raise ValueError("A platform session UUID is required") from None
+        validate_session_id(session_id)
         local_headers: dict[str, str] = {}
         if socket_path is not None:
             if base_url is not None:

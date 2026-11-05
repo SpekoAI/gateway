@@ -85,7 +85,12 @@ func TestNativeRelayRefusesInvalidLocalOrModelAuthorityBeforeDial(t *testing.T) 
 		{"control token", func(h http.Header) { h.Set("Authorization", "Bearer swt1.not-a-model-key") }, 401},
 		{"duplicate model", func(h http.Header) { h.Add("Authorization", "Bearer sk_speko_second") }, 401},
 		{"missing session", func(h http.Header) { h.Del("Speko-Client-Session-ID") }, 400},
-		{"invalid session", func(h http.Header) { h.Set("Speko-Client-Session-ID", "another-session") }, 400},
+		{"invalid session", func(h http.Header) { h.Set("Speko-Client-Session-ID", "another/session") }, 400},
+		{"session whitespace", func(h http.Header) { h.Set("Speko-Client-Session-ID", "two sessions") }, 400},
+		{"session leading punctuation", func(h http.Header) { h.Set("Speko-Client-Session-ID", "_session") }, 400},
+		{"session oversized", func(h http.Header) { h.Set("Speko-Client-Session-ID", strings.Repeat("a", 201)) }, 400},
+		{"session unicode", func(h http.Header) { h.Set("Speko-Client-Session-ID", "session-é") }, 400},
+		{"duplicate session", func(h http.Header) { h.Add("Speko-Client-Session-ID", nativeTestSession) }, 400},
 		{"missing idempotency", func(h http.Header) { h.Del("Idempotency-Key") }, 400},
 	}
 	for _, row := range cases {
@@ -115,6 +120,34 @@ func TestNativeRelayRefusesInvalidLocalOrModelAuthorityBeforeDial(t *testing.T) 
 	}
 	if called.Load() != 0 {
 		t.Fatalf("unauthorized upstream calls: %d", called.Load())
+	}
+}
+
+func TestNativeRelayPreservesContractSessionIdentity(t *testing.T) {
+	for _, sessionID := range []string{"s", nativeTestSession, "ses_fixture_web", "s" + strings.Repeat("._:-A9", 33) + "z"} {
+		t.Run(sessionID, func(t *testing.T) {
+			var calls atomic.Int32
+			peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Header.Get("Speko-Client-Session-ID") != sessionID {
+					t.Error("canonical session identity changed")
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer peer.Close()
+			_, local := nativeServer(t, peer, nil)
+			req, _ := http.NewRequest(http.MethodPost, local.URL+"/v1/llm/responses", strings.NewReader(`{"input":[]}`))
+			req.Header = nativeHeaders("sk_speko_agent_owned")
+			req.Header.Set("Speko-Client-Session-ID", sessionID)
+			response, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusNoContent || calls.Load() != 1 {
+				t.Fatalf("session refused: status %d, relay calls %d", response.StatusCode, calls.Load())
+			}
+		})
 	}
 }
 

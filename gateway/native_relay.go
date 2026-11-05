@@ -61,7 +61,9 @@ type NativeRelayServer struct {
 	proxy                     *httputil.ReverseProxy
 }
 
-var nativeSessionID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+// speko.agents.v1 session IDs are opaque, bounded identifiers, not just UUIDs.
+// Keep their exact bytes: the cell verifies the canonical credential binding.
+var nativeSessionID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$`)
 var nativeHTTPRoutes = map[string]bool{
 	"/v1/llm/responses":      true,
 	"/v1/stt/transcriptions": true,
