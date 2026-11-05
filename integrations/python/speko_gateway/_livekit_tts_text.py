@@ -6,8 +6,9 @@ import re
 
 _MAX_CHARACTERS = 240
 _SENTENCE_END = re.compile(
-    r"""[.!?]["'”’»」』）)\]]*(?=\s|$)|[。！？؟]["'”’»」』）)\]]*|\r\n|[\r\n]"""
+    r"""\.["'”’»」』）)\]]*(?=\s)|[!?]["'”’»」』）)\]]*(?=\s|$)|[。！？؟]["'”’»」』）)\]]*|\r\n|[\r\n]"""
 )
+_TRAILING_PERIOD = re.compile(r"""(\S+)\.["'”’»」』）)\]]*$""")
 
 
 class NativeTextBuffer:
@@ -36,3 +37,15 @@ class NativeTextBuffer:
     def flush(self) -> str:
         text, self._text = self._text, ""
         return text
+
+    @property
+    def can_flush_idle(self) -> bool:
+        # A token boundary alone cannot complete a period: the next token
+        # may extend a decimal or hostname. Ordinary sentence endings get a
+        # short lookahead window in the feeder. A numeric or already dotted
+        # token needs a lexical delimiter, explicit flush, or EOF instead.
+        ending = _TRAILING_PERIOD.search(self._text)
+        if ending is None:
+            return False
+        word = ending.group(1)
+        return not word[-1].isdigit() and not any(c in word for c in ".:/@\\")

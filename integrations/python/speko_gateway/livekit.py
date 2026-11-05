@@ -1290,15 +1290,34 @@ class SynthesisStream(tts.SynthesizeStream):
                 pieces.send_nowait(remaining)
 
         async def feed() -> None:
+            incoming = None
             try:
                 push(first_token)
-                async for item in self._input_ch:
+                incoming = asyncio.create_task(self._input_ch.__anext__())
+                while True:
+                    # Coalesce an ambiguous final period across LLM tokens,
+                    # while still speaking "Hello." if its producer pauses.
+                    # Keep the read task alive when the lookahead expires;
+                    # cancelling a channel read can discard later text.
+                    done, _ = await asyncio.wait(
+                        [incoming], timeout=0.1 if text.can_flush_idle else None
+                    )
+                    if not done:
+                        flush()
+                        continue
+                    try:
+                        item = incoming.result()
+                    except StopAsyncIteration:
+                        break
                     if isinstance(item, self._FlushSentinel):
                         flush()
                         pieces.send_nowait(item)
                     else:
                         push(item)
+                    incoming = asyncio.create_task(self._input_ch.__anext__())
             finally:
+                if incoming is not None:
+                    await utils.aio.cancel_and_wait(incoming)
                 flush()
                 pieces.close()
 

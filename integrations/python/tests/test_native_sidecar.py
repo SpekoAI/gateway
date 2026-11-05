@@ -208,6 +208,72 @@ async def native_tts(native_binary, handle):
             await client.aclose()
 
 
+async def collect_stream(stream):
+    return [event async for event in stream]
+
+
+@pytest.mark.parametrize(
+    "first,rest,pause",
+    [
+        ("Give 0.", "05 mg of medicine.", 0.2),
+        ("Visit example.", "com for help.", 0),
+        ("Visit https://example.", "com for help.", 0.2),
+        ("Visit www.example.", "com for help.", 0.2),
+        ("Email user@local.", "example for help.", 0.2),
+        ("Read example.co.", "uk for help.", 0.2),
+    ],
+)
+@pytest.mark.parametrize("chunked", [False, True])
+async def test_native_tts_keeps_split_values_in_one_utterance(
+    native_binary, first, rest, pause, chunked
+):
+    commits = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        pending = ""
+        async for message in ws:
+            control = json.loads(message.data)
+            if control["type"] == "input.append":
+                pending += control["text"]
+            elif control["type"] == "input.commit":
+                commits.append(pending)
+                pending = ""
+                sequence = len(commits)
+                await ws.send_json({"type": "utterance.started", "sequence": sequence})
+                await ws.send_bytes(b"\x01\x00" * 480)
+                await ws.send_json({"type": "utterance.done", "sequence": sequence})
+            elif control["type"] == "session.close":
+                assert not pending
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with native_tts(native_binary, handle) as model:
+        stream = model.stream()
+
+        async def produce():
+            stream.push_text(first if chunked else first + rest)
+            if chunked:
+                await asyncio.sleep(pause)
+                stream.push_text(rest)
+            stream.end_input()
+
+        producer = asyncio.create_task(produce())
+        try:
+            frames = await asyncio.wait_for(collect_stream(stream), 3)
+            await producer
+            assert frames and sum(event.is_final for event in frames) == 1
+            assert commits == [first + rest]
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            await stream.aclose()
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -252,8 +318,7 @@ async def test_native_tts_preserves_literal_text(native_binary, text):
         try:
             stream.push_text(text)
             stream.end_input()
-            async with asyncio.timeout(3):
-                frames = [event async for event in stream]
+            frames = await asyncio.wait_for(collect_stream(stream), 3)
             assert frames and sum(event.is_final for event in frames) == 1
             assert "".join(appended) == text
         finally:
@@ -306,8 +371,7 @@ async def test_native_tts_emits_standalone_text_while_upstream_waits(
             initial = await asyncio.wait_for(anext(stream), 3)
             assert not release.is_set() and commits == [first]
             release.set()
-            async with asyncio.timeout(3):
-                frames = [initial] + [event async for event in stream]
+            frames = [initial] + await asyncio.wait_for(collect_stream(stream), 3)
             await producer
             assert commits == [first, rest]
             assert sum(event.is_final for event in frames) == 1
@@ -346,13 +410,15 @@ async def test_native_tts_explicit_flush_finishes_audio_before_end_input(native_
         try:
             stream.push_text("This segment ends on an explicit flush")
             stream.flush()
-            async with asyncio.timeout(3):
+
+            async def wait_for_final():
                 while not (await anext(stream)).is_final:
                     pass
+
+            await asyncio.wait_for(wait_for_final(), 3)
             assert not closed, "final audio must precede end_input and session.close"
             stream.end_input()
-            async with asyncio.timeout(3):
-                assert [event async for event in stream] == []
+            assert await asyncio.wait_for(collect_stream(stream), 3) == []
             assert closed
         finally:
             await stream.aclose()
