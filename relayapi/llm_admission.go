@@ -94,8 +94,10 @@ func (r LLMAdmissionRelease) Validate() error {
 type PreparedAdmissionOutcome string
 
 const (
-	// PreparedAdmissionUsed: the request was dispatched on the ticket's
-	// admission, with no admission round trip.
+	// PreparedAdmissionUsed: the ticket passed every check and its plan was
+	// presented for dispatch, with no admission round trip. A plan that was
+	// already consumed is refused at that point with 409
+	// request_already_started, so on that response nothing was dispatched.
 	PreparedAdmissionUsed PreparedAdmissionOutcome = "used"
 	// PreparedAdmissionInvalid: the ticket did not decrypt, was issued to
 	// another API key, client session, or region, or was prepared under
