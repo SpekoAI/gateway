@@ -257,6 +257,9 @@ Native LiveKit TTS commits completed sentences while upstream text is still
 arriving, including CJK and Arabic sentence boundaries. Short utterances flush
 promptly, and later provider utterances remain part of the same LiveKit speech
 segment and reported assistant turn. `end_input()` completes that segment.
+Each native utterance waits for `utterance.done` before appending the next one
+or closing the session, while incoming LLM text continues buffering. This
+supports provider adapters with one active synthesis context.
 
 Native clients preserve the platform's opaque session ID, including IDs such as
 `ses_fixture_web`. IDs follow the `speko.agents.v1` ASCII grammar (1–200 characters,

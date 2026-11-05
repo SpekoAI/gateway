@@ -58,27 +58,44 @@ async def test_default_livekit_tts_starts_before_text_finishes_and_preserves_lat
         opened.append(request.headers.copy())
         await ready(ws)
         pending = ""
-        async for message in ws:
-            control = json.loads(message.data)
-            if control["type"] == "input.append":
-                pending += control["text"]
-            elif control["type"] == "input.commit":
-                commits.append(pending)
-                pending = ""
-                sequence = len(commits)
-                await ws.send_json({"type": "utterance.started", "sequence": sequence})
-                await ws.send_bytes(
-                    (sequence * 1000).to_bytes(2, "little", signed=True) * pcm_samples
-                )
-                await ws.send_json({"type": "utterance.done", "sequence": sequence})
-            elif control["type"] == "session.close":
-                await ws.send_json(
-                    {
-                        "type": "session.closed",
-                        "usage": {"characters": len(first + rest)},
-                    }
-                )
-                await ws.close()
+        active = False
+        outputs = []
+
+        async def output(sequence):
+            nonlocal active
+            await ws.send_json({"type": "utterance.started", "sequence": sequence})
+            await ws.send_bytes(
+                (sequence * 1000).to_bytes(2, "little", signed=True) * pcm_samples
+            )
+            # Real Cartesia rejects appending the next utterance until this
+            # context completes. Continue reading controls while it generates.
+            await asyncio.sleep(0.1)
+            active = False
+            await ws.send_json({"type": "utterance.done", "sequence": sequence})
+
+        try:
+            async for message in ws:
+                control = json.loads(message.data)
+                if control["type"] == "input.append":
+                    assert not active, "next text arrived before utterance.done"
+                    pending += control["text"]
+                elif control["type"] == "input.commit":
+                    assert not active
+                    commits.append(pending)
+                    pending = ""
+                    active = True
+                    outputs.append(asyncio.create_task(output(len(commits))))
+                elif control["type"] == "session.close":
+                    assert not active, "session closed before final utterance.done"
+                    await ws.send_json(
+                        {"type": "session.closed", "usage": {"characters": len(first + rest)}}
+                    )
+                    await ws.close()
+        finally:
+            for task in outputs:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*outputs, return_exceptions=True)
         return ws
 
     class Output(io.AudioOutput):

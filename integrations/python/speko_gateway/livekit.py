@@ -1156,6 +1156,8 @@ class SynthesisStream(tts.SynthesizeStream):
         self._options = options
         self._session: _TTSSession | None = None
         self._gateway_stream: LiveKitTTSStream | None = None
+        self._native_utterance_done = asyncio.Event()
+        self._native_text_finished = False
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         # The emitter must be initialized even when no text ever arrives:
@@ -1304,9 +1306,15 @@ class SynthesisStream(tts.SynthesizeStream):
         feeding = asyncio.create_task(feed(), name="speko.livekit.tts.text")
         try:
             async for sentence in sentences:
+                self._native_utterance_done.clear()
                 await self._gateway_stream.append_text(sentence.token)
                 await self._gateway_stream.commit()
+                # Native adapters may own a single active provider context.
+                # Feed future LLM text concurrently, but do not append the
+                # next utterance or close while this one is still generating.
+                await self._native_utterance_done.wait()
             await feeding
+            self._native_text_finished = True
             await self._gateway_stream.finish()
         finally:
             await utils.aio.cancel_and_wait(feeding)
@@ -1340,13 +1348,17 @@ class SynthesisStream(tts.SynthesizeStream):
                     output_emitter.start_segment(segment_id=utils.shortuuid())
                 output_emitter.push(event.audio)
                 continue
-            if event.type == "audio.done" and segment_open:
+            if event.type == "audio.done":
                 if native:
-                    output_emitter.flush()
-                else:
+                    if segment_open:
+                        output_emitter.flush()
+                    self._native_utterance_done.set()
+                elif segment_open:
                     segment_open = False
                     segment_done = True
                     output_emitter.end_segment()
+        if native and not self._native_text_finished:
+            raise GatewayError("Relay speech ended before text completed", retryable=False)
         if segment_open:
             output_emitter.end_segment()
 
