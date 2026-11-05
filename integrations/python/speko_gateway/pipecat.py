@@ -59,7 +59,7 @@ from .client import (
 )
 from .relay import (
     AdmissionPreparer,
-    PreparedAdmission,
+    PreparedPresentation,
     ReasoningEffort,
     RelayError,
     RelayLLMClient,
@@ -771,7 +771,9 @@ class SpekoLLMService(LLMService):
 
     async def cleanup(self) -> None:
         await self._release_prepared()
-        if self._owns_client:
+        if self._owns_client and not (
+            self._preparer is not None and self._preparer.close_client_when_done()
+        ):
             await self._client.aclose()
         await super().cleanup()
 
@@ -803,11 +805,18 @@ class SpekoLLMService(LLMService):
         preparer = self._preparer
         admission = await preparer.take() if preparer is not None else None
         self._prepared_admission_outcome = None
+        presentation = (
+            preparer.present(admission)
+            if preparer is not None and admission is not None
+            else None
+        )
         try:
-            function_calls = await self._stream_context(context, request, admission)
+            function_calls = await self._stream_context(
+                context, request, presentation
+            )
         finally:
-            if admission is not None and preparer is not None:
-                preparer.settle(admission, self._prepared_admission_outcome or "")
+            if presentation is not None:
+                presentation.finish()
         if function_calls:
             await self.run_function_calls(function_calls)
 
@@ -820,18 +829,24 @@ class SpekoLLMService(LLMService):
         self,
         context: LLMContext,
         request: dict[str, Any],
-        admission: PreparedAdmission | None,
+        presentation: PreparedPresentation | None,
     ) -> list[FunctionCallFromLLM]:
         function_calls: list[FunctionCallFromLLM] = []
         first_output = True
-        if admission is None:
+        if presentation is None:
             events = self._client.stream_response(request)
         else:
             self._on_prepared_outcome("")
+
+            def on_outcome(outcome: str) -> None:
+                # Releases an unused ticket at the response headers.
+                presentation.observe(outcome)
+                self._on_prepared_outcome(outcome)
+
             events = self._client.stream_response(
                 request,
-                prepared_admission=admission.ticket,
-                on_prepared_outcome=self._on_prepared_outcome,
+                prepared_admission=presentation.admission.ticket,
+                on_prepared_outcome=on_outcome,
             )
         try:
             async for event, payload in events:

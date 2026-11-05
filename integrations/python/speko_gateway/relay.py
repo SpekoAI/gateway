@@ -35,6 +35,14 @@ _logger = logging.getLogger(__name__)
 _HEADER_PREPARED_ADMISSION = "Speko-Prepared-Admission"
 _HEADER_PREPARED_ADMISSION_OUTCOME = "Speko-Prepared-Admission-Outcome"
 
+# Bounds one prepare or release call, and so how long a closed LLM keeps its
+# transport open to release a ticket whose prepare was still in flight.
+_ADMISSION_CALL_TIMEOUT_SECONDS = 10.0
+
+# Detached tasks that close a transport once its last prepare has landed and
+# been released; held here so they are not collected mid-flight.
+_DEFERRED_CLOSES: set[asyncio.Task[None]] = set()
+
 PREPARED_ADMISSION_USED = "used"
 """The `Speko-Prepared-Admission-Outcome` value of a request served on its ticket.
 
@@ -291,6 +299,7 @@ class RelayLLMClient:
             f"{self._base_url}/v1/llm/admissions",
             json=body,
             headers=self._headers(),
+            timeout=aiohttp.ClientTimeout(total=_ADMISSION_CALL_TIMEOUT_SECONDS),
         ) as response:
             if response.status == 204:
                 return None
@@ -324,6 +333,7 @@ class RelayLLMClient:
             f"{self._base_url}/v1/llm/admissions/release",
             json={"admission": admission},
             headers=self._headers(),
+            timeout=aiohttp.ClientTimeout(total=_ADMISSION_CALL_TIMEOUT_SECONDS),
         ) as response:
             decoded = await _decode_json(response)
             if response.status != 200:
@@ -413,10 +423,16 @@ class AdmissionPreparer:
     """Hold at most one prepared LLM admission for one conversation.
 
     The framework LLM classes drive it: `prepare` when the caller starts
-    speaking, `take` before the next LLM request, `settle` once the Router
-    reports the ticket's outcome, `aclose` at the end. Nothing here raises into
-    the agent: a failed prepare or release only costs the round trip it was
-    meant to save.
+    speaking, `take` before the next LLM request, `present` around that
+    request, `aclose` at the end. Nothing here raises into the agent: a failed
+    prepare or release only costs the round trip it was meant to save.
+
+    An issued ticket holds a credit reservation and one organization
+    concurrency slot until it is used or released, so with a concurrency limit
+    of one any overlap refuses the real reply. Hence the ordering rules: a
+    discarded ticket is released before the admission that replaces it, a
+    prepare the reply stopped waiting for releases its ticket when it lands,
+    and close waits for a prepare in flight instead of dropping its ticket.
     """
 
     def __init__(
@@ -425,16 +441,23 @@ class AdmissionPreparer:
         *,
         reuse_min_seconds: float = 60.0,
         present_min_seconds: float = 10.0,
-        wait_seconds: float = 1.0,
+        wait_seconds: float = 3.0,
+        expiring_release_wait_seconds: float = 1.0,
         release_timeout_seconds: float = 2.0,
+        close_wait_seconds: float = 3.0,
     ) -> None:
         self._client = client
         self._reuse_min = reuse_min_seconds
         self._present_min = present_min_seconds
         self._wait = wait_seconds
+        self._expiring_release_wait = expiring_release_wait_seconds
         self._release_timeout = release_timeout_seconds
+        self._close_wait = close_wait_seconds
         self._ticket: PreparedAdmission | None = None
         self._inflight: asyncio.Task[None] | None = None
+        # Set when nobody will take the in-flight prepare's ticket (the reply
+        # stopped waiting, the session closed): it is released as it lands.
+        self._abandoned = False
         self._background: set[asyncio.Task[Any]] = set()
         self._closed = False
         self._unsupported = False
@@ -445,9 +468,10 @@ class AdmissionPreparer:
         Keeps a ticket with more than `reuse_min_seconds` of life, so a false
         start reuses it. Starts nothing while a prepare is in flight, nor ever
         again once the Router has answered 404 or 405 for the route. Otherwise
-        releases the old ticket in the background and prepares a new one from
-        `build_request()`, which returns the request body or None to skip.
-        Call it on the event loop; it never blocks and never raises.
+        releases the old ticket, waits for that release (bounded), and
+        prepares a new one from `build_request()`, which returns the request
+        body or None to skip. Call it on the event loop; it never blocks and
+        never raises.
         """
 
         try:
@@ -456,21 +480,30 @@ class AdmissionPreparer:
             if self._inflight is not None and not self._inflight.done():
                 return
             ticket = self._ticket
-            if ticket is not None:
-                if ticket.remaining() > self._reuse_min:
-                    return
-                self._ticket = None
-                self._release_soon(ticket)
+            if ticket is not None and ticket.remaining() > self._reuse_min:
+                return
             request = build_request()
             if request is None or not request.get("input"):
                 return
+            self._ticket = None
+            self._abandoned = False
             self._inflight = asyncio.get_running_loop().create_task(
-                self._prepare(request)
+                self._prepare(ticket, request)
             )
         except Exception:
             _logger.debug("speko router admission prepare skipped", exc_info=True)
 
-    async def _prepare(self, request: dict[str, Any]) -> None:
+    async def _prepare(
+        self, replaced: PreparedAdmission | None, request: dict[str, Any]
+    ) -> None:
+        if replaced is not None:
+            # The replaced ticket's slot must be free before the new admission
+            # asks for one. The release is bounded by its own timeout.
+            release = self._release_soon(replaced)
+            if release is not None:
+                await asyncio.wait({release})
+            if self._closed or self._abandoned:
+                return
         try:
             admission = await self._client.prepare_admission(request)
         except AdmissionsUnsupported:
@@ -489,7 +522,7 @@ class AdmissionPreparer:
         if admission is None:
             _logger.debug("speko router admission prepare: no ticket (204)")
             return
-        if self._closed:
+        if self._closed or self._abandoned:
             self._release_soon(admission)
             return
         self._ticket = admission
@@ -498,68 +531,117 @@ class AdmissionPreparer:
         """Return the live ticket for the next request, and forget it.
 
         A prepare still in flight started earlier than this request's own
-        admission would, so wait up to `wait_seconds` for it; past that the
-        request goes the ordinary way and a late ticket waits for the next one.
-        A ticket too close to expiry is released instead of presented.
+        admission would, so wait up to `wait_seconds` for it. Past that the
+        request goes the ordinary way, and the prepare, left running, releases
+        its ticket when it lands. A ticket too close to expiry is released,
+        waiting up to `expiring_release_wait_seconds` so the ordinary request
+        does not compete with its slot.
         """
 
         inflight = self._inflight
         if inflight is not None and not inflight.done():
             # asyncio.wait neither raises the task's outcome nor cancels it.
             await asyncio.wait({inflight}, timeout=self._wait)
+            if not inflight.done():
+                self._abandoned = True
+                return None
         ticket = self._ticket
         self._ticket = None
         if ticket is None:
             return None
         if ticket.remaining() < self._present_min:
-            self._release_soon(ticket)
+            release = self._release_soon(ticket)
+            if release is not None:
+                await asyncio.wait({release}, timeout=self._expiring_release_wait)
             return None
         return ticket
 
-    def settle(self, admission: PreparedAdmission, outcome: str) -> None:
-        """Release a presented ticket the Router did not use.
+    def present(self, admission: PreparedAdmission) -> PreparedPresentation:
+        """Track one request that presents `admission`; see PreparedPresentation."""
 
-        `outcome` is the Router's outcome header, or "" when no response
-        arrived. Anything but `used` is released in the background; a release
-        of a ticket that was spent after all answers false.
-        """
-
-        if outcome != PREPARED_ADMISSION_USED:
-            self._release_soon(admission)
+        return PreparedPresentation(self, admission)
 
     def release_unused(self) -> None:
-        """Release the live ticket, if any, in the background."""
+        """Release the live ticket, and the one a prepare in flight will bring.
 
+        For a conversation that has ended (a session close): nothing will take
+        either ticket. Releases run in the background.
+        """
+
+        self._abandoned = True
         ticket = self._ticket
         self._ticket = None
         if ticket is not None:
             self._release_soon(ticket)
 
+    def pending(self) -> bool:
+        """Whether a prepare or release is still running."""
+
+        inflight = self._inflight
+        return (inflight is not None and not inflight.done()) or any(
+            not task.done() for task in self._background
+        )
+
     async def aclose(self) -> None:
-        """Release the unused ticket and wait, bounded, for pending releases."""
+        """Release every ticket, waiting up to `close_wait_seconds`.
+
+        A prepare still in flight is not cancelled: the Router may already
+        have issued its ticket, and only its answer lets the client release
+        it. Past the wait it keeps running and releases its ticket when it
+        lands; `close_client_when_done` keeps the transport open for that.
+        """
 
         if self._closed:
             return
         self._closed = True
-        inflight = self._inflight
-        if inflight is not None and not inflight.done():
-            await asyncio.wait({inflight}, timeout=self._wait)
-            if not inflight.done():
-                inflight.cancel()
         self.release_unused()
-        pending = [task for task in self._background if not task.done()]
-        if pending:
-            await asyncio.wait(pending, timeout=self._release_timeout)
+        await self._drain(self._close_wait)
 
-    def _release_soon(self, admission: PreparedAdmission) -> None:
+    def close_client_when_done(self) -> bool:
+        """Close the client once pending prepares and releases finish.
+
+        Returns False, doing nothing, when nothing is pending: the caller
+        closes the client itself. Otherwise a detached task waits, bounded by
+        one prepare call and one release, then closes the client.
+        """
+
+        if not self.pending():
+            return False
+        task = asyncio.get_running_loop().create_task(self._close_client_later())
+        _DEFERRED_CLOSES.add(task)
+        task.add_done_callback(_DEFERRED_CLOSES.discard)
+        return True
+
+    async def _close_client_later(self) -> None:
+        try:
+            await self._drain(_ADMISSION_CALL_TIMEOUT_SECONDS + self._release_timeout)
+        finally:
+            await self._client.aclose()
+
+    async def _drain(self, timeout: float) -> None:
+        # A landing prepare starts a release, so wait again until both are done.
+        deadline = time.monotonic() + timeout
+        while self.pending():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            tasks = {task for task in self._background if not task.done()}
+            if self._inflight is not None and not self._inflight.done():
+                tasks.add(self._inflight)
+            await asyncio.wait(tasks, timeout=left)
+
+    def _release_soon(
+        self, admission: PreparedAdmission
+    ) -> asyncio.Task[None] | None:
         if admission.remaining() <= 0:
-            return
+            return None
         try:
             task = asyncio.get_running_loop().create_task(self._release(admission))
         except RuntimeError:
-            return
+            return None
         self._background.add(task)
         task.add_done_callback(self._background.discard)
+        return task
 
     async def _release(self, admission: PreparedAdmission) -> None:
         try:
@@ -573,6 +655,36 @@ class AdmissionPreparer:
             )
             return
         _logger.debug("speko router admission released=%s", released)
+
+
+class PreparedPresentation:
+    """One request presenting a prepared ticket.
+
+    Pass `observe` as `stream_response`'s `on_prepared_outcome`: an outcome
+    other than `used`, a missing header included, releases the ticket as soon
+    as the response headers arrive, not when the stream ends. Call `finish`
+    when the request ends; a request that never got a response releases then.
+    """
+
+    def __init__(self, preparer: AdmissionPreparer, admission: PreparedAdmission):
+        self._preparer = preparer
+        self.admission = admission
+        self.outcome: str | None = None
+        self._settled = False
+
+    def observe(self, outcome: str) -> None:
+        self.outcome = outcome
+        if outcome != PREPARED_ADMISSION_USED:
+            self._settle()
+
+    def finish(self) -> None:
+        if self.outcome is None:
+            self._settle()
+
+    def _settle(self) -> None:
+        if not self._settled:
+            self._settled = True
+            self._preparer._release_soon(self.admission)
 
 
 _RFC3339 = re.compile(

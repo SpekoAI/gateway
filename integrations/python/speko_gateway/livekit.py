@@ -43,7 +43,7 @@ from .probe import report_leg as _report_probe_leg
 from .probe import report_marker as _report_probe_marker
 from .relay import (
     AdmissionPreparer,
-    PreparedAdmission,
+    PreparedPresentation,
     ReasoningEffort,
     RelayError,
     RelayLLMClient,
@@ -1061,7 +1061,9 @@ class LLM(llm.LLM):
         for session, _ in list(self._attachments):
             self._detach(session)
         await self._release_prepared()
-        if self._owns_client:
+        if self._owns_client and not (
+            self._preparer is not None and self._preparer.close_client_when_done()
+        ):
             await self._client.aclose()
         await super().aclose()
 
@@ -1101,11 +1103,16 @@ class RelayLLMStream(llm.LLMStream):
         preparer = self._relay_llm._preparer
         admission = await preparer.take() if preparer is not None else None
         self._relay_llm._prepared_admission_outcome = None
+        presentation = (
+            preparer.present(admission)
+            if preparer is not None and admission is not None
+            else None
+        )
         try:
-            await self._stream_relay(request, admission)
+            await self._stream_relay(request, presentation)
         finally:
-            if admission is not None and preparer is not None:
-                preparer.settle(admission, self.prepared_admission_outcome or "")
+            if presentation is not None:
+                presentation.finish()
 
     def _on_prepared_outcome(self, outcome: str) -> None:
         self.prepared_admission_outcome = outcome
@@ -1114,18 +1121,24 @@ class RelayLLMStream(llm.LLMStream):
             _logger.debug("speko router prepared admission outcome=%s", outcome)
 
     async def _stream_relay(
-        self, request: dict[str, Any], admission: PreparedAdmission | None
+        self, request: dict[str, Any], presentation: PreparedPresentation | None
     ) -> None:
         response_id = utils.shortuuid()
         first_token_reported = False
-        if admission is None:
+        if presentation is None:
             events = self._client.stream_response(request)
         else:
             self._on_prepared_outcome("")
+
+            def on_outcome(outcome: str) -> None:
+                # Releases an unused ticket at the response headers.
+                presentation.observe(outcome)
+                self._on_prepared_outcome(outcome)
+
             events = self._client.stream_response(
                 request,
-                prepared_admission=admission.ticket,
-                on_prepared_outcome=self._on_prepared_outcome,
+                prepared_admission=presentation.admission.ticket,
+                on_prepared_outcome=on_outcome,
             )
         try:
             async for event, payload in events:

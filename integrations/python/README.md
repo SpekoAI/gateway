@@ -138,14 +138,26 @@ await session.start(agent=MyAgent(), room=ctx.room)
 
 On each user speech start, the LLM prepares from the current agent's chat
 context and the tools of the last request (`POST /v1/llm/admissions`). The
-next request presents the ticket, waiting up to 1 s for a prepare still in
-flight, and the ticket is then spent. A tool-call follow-up and any request
-with no live ticket are admitted the ordinary way. There is at most one ticket
-per LLM. A false start keeps a ticket with more than a minute left. An older
-ticket is released and replaced. A ticket the Router did not use is released
-in the background, and so is any unused ticket when the session closes, the
-job shuts down, or `aclose()` runs. Without an `AgentSession`, call
-`llm.prepare(chat_ctx)` yourself when the caller starts speaking.
+next request presents the ticket, and the ticket is then spent. A tool-call
+follow-up and any request with no live ticket are admitted the ordinary way.
+There is at most one ticket per LLM. A false start keeps a ticket with more
+than a minute left. An older ticket is released, and the new prepare waits for
+that release. Without an `AgentSession`, call `llm.prepare(chat_ctx)` yourself
+when the caller starts speaking.
+
+An unused ticket holds one organization concurrency slot, so the LLM never lets
+a ticket compete with a real request for one:
+
+- A request waits up to 3 s for a prepare still in flight. Past that it goes
+  the ordinary way, and the prepare releases its ticket when it lands.
+- A ticket the Router did not use is released as soon as the response headers
+  arrive.
+- A ticket too close to expiry is released, with a wait of up to 1 s, before
+  the ordinary request goes out.
+- The session closing, the job shutting down, or `aclose()` releases the
+  unused ticket, including one whose prepare is still in flight. `aclose()`
+  waits up to 3 s and never cancels a prepare. An LLM that owns its transport
+  keeps it open, for up to 12 s, until that ticket is released.
 
 `llm.prepared_admission_outcome` (and `prepared_admission_outcome` on each
 stream `llm.chat()` returns) says what the Router did with the last request's

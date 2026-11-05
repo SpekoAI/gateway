@@ -15,7 +15,7 @@ from livekit.agents import APIConnectionError
 from livekit.agents import llm as agents_llm
 
 from speko_gateway.livekit import LLM
-from speko_gateway.relay import RelayLLMClient, _parse_rfc3339
+from speko_gateway.relay import AdmissionPreparer, RelayLLMClient, _parse_rfc3339
 
 SESSION_ID = "conversation-7"
 
@@ -37,9 +37,13 @@ class FakeRouter:
         self.outcome: str | None = "used"
         self.response_status = 200
         self.issued = 0
+        self.release_delay = 0.0
+        self.hold_stream: asyncio.Event | None = None
+        self.log: list[str] = []
 
     async def admit(self, request: web.Request) -> web.StreamResponse:
         self.admissions.append((dict(request.headers), await request.json()))
+        self.log.append("admit")
         await asyncio.sleep(self.admission_delay)
         if self.admission_reply == "none":
             return web.Response(status=204)
@@ -63,11 +67,15 @@ class FakeRouter:
         )
 
     async def release(self, request: web.Request) -> web.Response:
-        self.releases.append((dict(request.headers), await request.json()))
+        body = await request.json()
+        await asyncio.sleep(self.release_delay)
+        self.releases.append((dict(request.headers), body))
+        self.log.append("released")
         return web.json_response({"object": "llm.admission.release", "released": True})
 
     async def respond(self, request: web.Request) -> web.StreamResponse:
         self.responses.append((dict(request.headers), await request.json()))
+        self.log.append("respond")
         headers = {"Content-Type": "text/event-stream", "Speko-Request-ID": "req-1"}
         if "Speko-Prepared-Admission" in request.headers and self.outcome is not None:
             headers["Speko-Prepared-Admission-Outcome"] = self.outcome
@@ -79,6 +87,8 @@ class FakeRouter:
             )
         response = web.StreamResponse(headers=headers)
         await response.prepare(request)
+        if self.hold_stream is not None:
+            await self.hold_stream.wait()
         for event, payload in (
             ("response.created", {"response_id": "resp-1"}),
             ("response.text.delta", {"delta": "Hi"}),
@@ -274,26 +284,40 @@ async def test_request_waits_for_a_prepare_in_flight() -> None:
         await plugin.aclose()
 
 
-async def test_request_does_not_wait_past_the_bound_for_a_slow_prepare() -> None:
+async def test_request_waits_longer_than_a_second_for_a_prepare_in_flight() -> None:
     router = FakeRouter()
-    router.admission_delay = 1.4
+    router.admission_delay = 1.3
     async with router_client(router) as client:
         plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+
+        await reply(plugin)
+
+        assert router.responses[0][0]["Speko-Prepared-Admission"] == "spa1.ticket-1"
+        await plugin.aclose()
+
+
+async def test_prepare_past_the_bound_runs_on_and_releases_when_it_lands() -> None:
+    router = FakeRouter()
+    router.admission_delay = 0.6
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin._preparer = AdmissionPreparer(client, wait_seconds=0.2)
         plugin.prepare(_history())
 
         started = time.monotonic()
         await reply(plugin)
 
-        assert time.monotonic() - started < 1.3
+        assert time.monotonic() - started < 0.55
         assert "Speko-Prepared-Admission" not in router.responses[0][0]
         assert plugin.prepared_admission_outcome is None
-        # The late ticket is kept for the next request, and released at close.
-        await until(lambda: router.issued == 1)
-        await asyncio.sleep(0.05)
+        # Nobody waits for the late ticket any more: it is released on landing,
+        # not cached for a later request.
+        await until(lambda: len(router.releases) == 1)
+        assert router.releases[0][1] == {"admission": "spa1.ticket-1"}
+        await reply(plugin)
+        assert "Speko-Prepared-Admission" not in router.responses[1][0]
         await plugin.aclose()
-        assert [body for _, body in router.releases] == [
-            {"admission": "spa1.ticket-1"}
-        ]
 
 
 async def test_close_releases_an_unused_ticket() -> None:
@@ -325,6 +349,103 @@ async def test_session_close_releases_an_unused_ticket() -> None:
 
         await until(lambda: len(router.releases) == 1)
         assert session.handlers == {"user_state_changed": [], "close": []}
+        await plugin.aclose()
+
+
+async def test_session_close_releases_a_ticket_still_being_prepared() -> None:
+    router = FakeRouter()
+    router.admission_delay = 0.3
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        session = FakeSession(_history())
+        plugin.attach(session)
+        session.user_starts_speaking()
+        await until(lambda: len(router.admissions) == 1)
+
+        # Outside a LiveKit job: no shutdown callback and no aclose follow.
+        session.emit("close", SimpleNamespace(reason="participant_disconnected"))
+
+        await until(lambda: len(router.releases) == 1)
+        assert router.releases[0][1] == {"admission": "spa1.ticket-1"}
+        assert plugin._preparer is not None and plugin._preparer._ticket is None
+
+
+async def test_close_does_not_cancel_a_slow_prepare(monkeypatch) -> None:
+    router = FakeRouter()
+    router.admission_delay = 0.6
+    async with router_client(router) as fixture:
+        monkeypatch.setenv("SPEKO_API_KEY", "router-fixture-only")
+        monkeypatch.setenv("SPEKO_ROUTER_URL", fixture._base_url)
+        plugin = LLM(prepare_admissions=True)  # owns its transport
+        owned = plugin._client
+        plugin._preparer = AdmissionPreparer(owned, close_wait_seconds=0.1)
+        plugin.prepare(_history())
+        await until(lambda: len(router.admissions) == 1)
+
+        started = time.monotonic()
+        await plugin.aclose()
+
+        assert time.monotonic() - started < 0.4
+        assert not owned._session.closed  # kept open for the release
+        await until(lambda: len(router.releases) == 1)
+        assert router.releases[0][1] == {"admission": "spa1.ticket-1"}
+        await until(lambda: owned._session.closed)
+
+
+async def test_unused_ticket_is_released_at_the_headers_not_the_stream_end() -> None:
+    router = FakeRouter()
+    router.outcome = "budget"
+    router.hold_stream = asyncio.Event()
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+
+        consumed = asyncio.ensure_future(reply(plugin))
+        try:
+            await until(lambda: len(router.releases) == 1)
+            assert not consumed.done()
+        finally:
+            router.hold_stream.set()
+        await consumed
+        await asyncio.sleep(0.05)
+        assert len(router.releases) == 1
+        await plugin.aclose()
+
+
+async def test_replacement_prepare_waits_for_the_old_release() -> None:
+    router = FakeRouter()
+    router.expires_in = 30.0
+    router.release_delay = 0.2
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        session = FakeSession(_history())
+        plugin.attach(session)
+        session.user_starts_speaking()
+        await until(lambda: router.issued == 1)
+        await asyncio.sleep(0.05)
+
+        session.user_starts_speaking()
+        await until(lambda: router.issued == 2)
+
+        assert router.log == ["admit", "released", "admit"]
+        await plugin.aclose()
+
+
+async def test_expiring_ticket_is_released_before_the_ordinary_request() -> None:
+    router = FakeRouter()
+    router.expires_in = 8.0  # under the 10 s a ticket needs to be presented
+    router.release_delay = 0.2
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+        await asyncio.sleep(0.05)
+
+        await reply(plugin)
+
+        assert router.log == ["admit", "released", "respond"]
+        assert "Speko-Prepared-Admission" not in router.responses[0][0]
         await plugin.aclose()
 
 

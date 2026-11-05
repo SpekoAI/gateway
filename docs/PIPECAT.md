@@ -94,9 +94,10 @@ their separate request identifiers.
 admission round trip (about 270 ms from Singapore) off the reply's critical
 path. On `UserStartedSpeakingFrame`, the service prepares an admission from the
 last context it received. The next reply request presents the ticket, waiting
-up to 1 s for a prepare still in flight. A ticket the Router did not use, or
-one left unused at `EndFrame`, `CancelFrame` or cleanup, is released in the
-background. `llm.prepared_admission_outcome` reports `"used"` or the Router's
+up to 3 s for a prepare still in flight. A ticket the Router did not use is
+released when the response headers arrive. A ticket left unused at `EndFrame`,
+`CancelFrame` or cleanup is released too, including one whose prepare lands
+after the pipeline ends. `llm.prepared_admission_outcome` reports `"used"` or the Router's
 reason for admitting the last reply the ordinary way. Before the first context
 frame arrives, call `llm.prepare_admission(context)` to cover the first turn.
 The option is off by default. See the

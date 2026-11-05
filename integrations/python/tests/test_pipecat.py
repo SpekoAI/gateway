@@ -902,11 +902,13 @@ class PreparingRelayClient(FakeRelayClient):
         self.prepared: list[dict] = []
         self.released: list[str] = []
         self.presented: list[str] = []
+        self.prepare_delay = 0.0
 
     async def prepare_admission(self, request: dict):
         from speko_gateway.relay import PreparedAdmission
 
         self.prepared.append(request)
+        await asyncio.sleep(self.prepare_delay)
         now = time.monotonic()
         return PreparedAdmission(
             ticket=f"spa1.ticket-{len(self.prepared)}",
@@ -1009,3 +1011,19 @@ async def test_llm_without_prepare_admissions_makes_no_new_calls() -> None:
 
     assert len(relay.requests) == 2
     assert llm.prepared_admission_outcome is None
+
+
+async def test_llm_cleanup_releases_a_ticket_still_being_prepared() -> None:
+    from speko_gateway.relay import AdmissionPreparer
+
+    relay = PreparingRelayClient()
+    relay.prepare_delay = 0.4
+    llm = SpekoLLMService(relay, prepare_admissions=True)  # type: ignore[arg-type]
+    llm._preparer = AdmissionPreparer(relay, close_wait_seconds=0.1)  # type: ignore[arg-type]
+    llm.prepare_admission(LLMContext(messages=[{"role": "user", "content": "Hi"}]))
+    await _until(lambda: len(relay.prepared) == 1)
+
+    await llm.cleanup()
+    assert relay.released == []  # still in flight: not cancelled, not dropped
+
+    await _until(lambda: relay.released == ["spa1.ticket-1"])
