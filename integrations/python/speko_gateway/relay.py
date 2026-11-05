@@ -8,6 +8,7 @@ conversation content travels to Router. The wire contract is the public
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -16,6 +17,7 @@ from typing import Any, Literal, TypedDict
 
 import aiohttp
 
+from ._relay_socket import NATIVE_SOCKET_ORIGIN, reject_redirects, socket_headers
 from ._user_agent import USER_AGENT
 from .client import _env_secret
 from .probe import ConversationProbe, active_probe
@@ -206,17 +208,38 @@ class RelayLLMClient:
         self,
         *,
         api_key: str,
-        base_url: str = _DEFAULT_RELAY_URL,
+        base_url: str | None = None,
         session_id: str = "",
+        socket_path: str | None = None,
+        local_auth_token: str | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("api_key is required")
-        self._base_url = base_url.rstrip("/")
+        local_headers: dict[str, str] = {}
+        self._native_socket = socket_path is not None
+        if socket_path is not None:
+            if base_url is not None:
+                raise ValueError("Specify a relay origin or native socket, not both")
+            local_headers = socket_headers(
+                socket_path=socket_path,
+                local_auth_token=local_auth_token,
+                api_key=api_key,
+                session_id=session_id,
+            )
+            base_url = NATIVE_SOCKET_ORIGIN
+        elif local_auth_token is not None:
+            raise ValueError("local_auth_token requires a native Gateway socket")
+        self._base_url = (base_url or _DEFAULT_RELAY_URL).rstrip("/")
         self._session = aiohttp.ClientSession(
+            connector=aiohttp.UnixConnector(path=socket_path)
+            if socket_path is not None
+            else None,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "User-Agent": USER_AGENT,
+                **local_headers,
             },
+            trace_configs=[reject_redirects()],
             raise_for_status=False,
         )
         self._platform_session_id = session_id
@@ -243,6 +266,29 @@ class RelayLLMClient:
         await self._session.close()
 
     async def stream_response(
+        self, request: dict[str, Any]
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        """Stream a response; socket failures never authorize a fresh attempt."""
+        try:
+            async for event in self._stream_response(request):
+                yield event
+        except RelayError as error:
+            if not self._native_socket:
+                raise
+            raise RelayError(
+                "Native relay LLM request failed",
+                code=error.code,
+                request_id=error.request_id,
+                retryable=False,
+            ) from None
+        except (aiohttp.ClientError, OSError, TimeoutError, asyncio.TimeoutError):
+            if not self._native_socket:
+                raise
+            raise RelayError(
+                "Native relay LLM transport failed", retryable=False
+            ) from None
+
+    async def _stream_response(
         self, request: dict[str, Any]
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         """POST /v1/llm/responses with stream=true, yielding (event, payload).

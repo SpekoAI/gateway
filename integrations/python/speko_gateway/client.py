@@ -31,11 +31,15 @@ class GatewayError(RuntimeError):
         code: str = "",
         source: str = "",
         retryable: bool = True,
+        request_id: str = "",
+        status: int | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.source = source
         self.retryable = retryable
+        self.request_id = request_id
+        self.status = status
 
 
 @dataclass(frozen=True)

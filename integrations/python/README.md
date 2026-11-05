@@ -30,6 +30,30 @@ tts = TTS(speech, provider=tts_provider, model=tts_model, voice="",
 stt.bind_session(session)  # bind_agent(agent) also locates its initial session
 ```
 
+For the native Go sidecar, pass `socket_path` and `local_auth_token` instead of
+`base_url`. `RelayLLMClient` accepts the same explicit socket parameters and
+session credential. Start the sidecar with `speko-gateway native`; its HTTPS
+relay origin comes from `SPEKO_RELAY_URL`:
+
+```python
+from speko_gateway import RelayLLMClient, RelaySpeechClient
+
+speech = RelaySpeechClient(
+    api_key=model_key, session_id=spec.session_id,
+    socket_path="/run/speko/runtime.sock", local_auth_token=socket_token,
+)
+llm = RelayLLMClient(
+    api_key=model_key, session_id=spec.session_id,
+    socket_path="/run/speko/runtime.sock", local_auth_token=socket_token,
+)
+```
+
+The socket's local credential stays in the sidecar. Per-session model keys and
+identities reach only its configured relay. Both socket clients refuse implicit
+model-key fallback. Native LLM transport failures and retry hints remain
+non-retryable; the LiveKit LLM adapter also disables its automatic request replay
+for a native socket client.
+
 The provider/model/language fields come from the compiled spec. A managed
 worker leaves the original TTS voice blank so the cell can sign its compiled
 voice override. `SpekoSTTService` and `SpekoTTSService` in `speko_gateway.pipecat`
@@ -236,6 +260,24 @@ an earlier request, and request timestamps map to the persistent stream's
 timeline. All PCM, including VAD prefixes and inference batches, is chunked to
 fit the native frame bound. Pipecat
 uses its pipeline's VAD and explicit commits.
+
+Native LiveKit TTS commits completed sentences while upstream text is still
+arriving, including CJK and Arabic sentence boundaries. Short utterances flush
+promptly, and later provider utterances remain part of the same LiveKit speech
+segment and reported assistant turn. Standalone sentences such as `Hello.`
+commit without a following token; unpunctuated input commits within 240
+characters, preferring a word boundary. Text is split without replacing literal
+strings such as `<stop>` or `<prd>`. An explicit `flush()` completes the SDK
+segment after its audio drains, even before `end_input()`.
+Each native utterance waits for `utterance.done` before appending the next one
+or closing the session, while incoming LLM text continues buffering. This
+supports provider adapters with one active synthesis context.
+
+Native clients preserve the platform's opaque session ID, including IDs such as
+`ses_fixture_web`. IDs follow the `speko.agents.v1` ASCII grammar (1–200 characters,
+starting with an alphanumeric character, then alphanumeric characters or
+`._:-`); they are never replaced with a generated UUID. The cell verifies the
+ID's binding to the per-session model credential.
 
 Native speech disables LiveKit automatic retries for streaming STT, recognition,
 streaming TTS and chunked synthesis, including when retry-enabled connection

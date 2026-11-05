@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -135,7 +136,7 @@ func TestSTTAdapterSendsDocumentedSetupAndStreamsPartialsDuringAudio(t *testing.
 	})
 	defer server.Close()
 
-	adapter, err := NewSTT(sttConfig(server.URL))
+	adapter, err := NewSTT(sttConfig(server))
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}
@@ -143,6 +144,7 @@ func TestSTTAdapterSendsDocumentedSetupAndStreamsPartialsDuringAudio(t *testing.
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
+	defer func() { _ = stream.(*sttStream).conn.Close(websocket.StatusNormalClosure, "") }()
 	events := stream.Events()
 
 	// ready carries the only request id Gradium ever gives us, and managed
@@ -242,7 +244,7 @@ func TestSTTAdapterUsesOneCredentialPathForManagedAndBYOK(t *testing.T) {
 	})
 	defer server.Close()
 
-	adapter, err := NewSTT(sttConfig(server.URL))
+	adapter, err := NewSTT(sttConfig(server))
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}
@@ -310,7 +312,7 @@ func TestSTTAdapterDropsStepFramesWithoutEmitting(t *testing.T) {
 	})
 	defer server.Close()
 
-	adapter, err := NewSTT(sttConfig(server.URL))
+	adapter, err := NewSTT(sttConfig(server))
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}
@@ -380,7 +382,7 @@ func TestSTTAdapterClassifiesErrorFrames(t *testing.T) {
 			})
 			defer server.Close()
 
-			adapter, err := NewSTT(sttConfig(server.URL))
+			adapter, err := NewSTT(sttConfig(server))
 			if err != nil {
 				t.Fatalf("new adapter: %v", err)
 			}
@@ -439,7 +441,7 @@ func TestSTTAdapterClassifiesHandshakeFailures(t *testing.T) {
 			}))
 			defer server.Close()
 
-			adapter, err := NewSTT(sttConfig(server.URL))
+			adapter, err := NewSTT(sttConfig(server))
 			if err != nil {
 				t.Fatalf("new adapter: %v", err)
 			}
@@ -544,7 +546,7 @@ func TestSTTAdapterOmitsLanguageWhenUnset(t *testing.T) {
 	})
 	defer server.Close()
 
-	adapter, err := NewSTT(sttConfig(server.URL))
+	adapter, err := NewSTT(sttConfig(server))
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}
@@ -584,7 +586,7 @@ func TestSTTAdapterRejectsTextOperations(t *testing.T) {
 	})
 	defer server.Close()
 
-	adapter, err := NewSTT(sttConfig(server.URL))
+	adapter, err := NewSTT(sttConfig(server))
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}
@@ -611,7 +613,10 @@ func TestSTTAdapterRejectsTextOperations(t *testing.T) {
 
 func newSocketServer(t *testing.T, path string, callback func(context.Context, *http.Request, *websocket.Conn)) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var callbacks sync.WaitGroup
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbacks.Add(1)
+		defer callbacks.Done()
 		if r.URL.Path != path {
 			http.NotFound(w, r)
 			return
@@ -621,13 +626,15 @@ func newSocketServer(t *testing.T, path string, callback func(context.Context, *
 			t.Errorf("accept websocket: %v", err)
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		go func() {
-			defer cancel()
-			defer conn.CloseNow()
-			callback(ctx, r, conn)
-		}()
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		defer conn.CloseNow()
+		callback(ctx, r, conn)
 	}))
+	// httptest.Close does not join hijacked WebSocket handlers. End their
+	// context and join them before testing.T can become unavailable.
+	t.Cleanup(func() { server.Close(); callbacks.Wait() })
+	return server
 }
 
 // readFrame decodes into an untyped map on purpose. Unmarshalling into the
@@ -718,14 +725,14 @@ func decodeNumber(t *testing.T, data json.RawMessage, field string) float64 {
 	return value
 }
 
-func sttConfig(serverURL string) STTConfig {
-	endpoint, _ := url.Parse(serverURL)
-	return STTConfig{AllowedEndpointHosts: []string{endpoint.Hostname()}, AllowInsecureEndpoint: true}
+func sttConfig(server *httptest.Server) STTConfig {
+	endpoint, _ := url.Parse(server.URL)
+	return STTConfig{AllowedEndpointHosts: []string{endpoint.Hostname()}, AllowInsecureEndpoint: true, HTTPClient: server.Client()}
 }
 
-func ttsConfig(serverURL string) TTSConfig {
-	endpoint, _ := url.Parse(serverURL)
-	return TTSConfig{AllowedEndpointHosts: []string{endpoint.Hostname()}, AllowInsecureEndpoint: true}
+func ttsConfig(server *httptest.Server) TTSConfig {
+	endpoint, _ := url.Parse(server.URL)
+	return TTSConfig{AllowedEndpointHosts: []string{endpoint.Hostname()}, AllowInsecureEndpoint: true, HTTPClient: server.Client()}
 }
 
 func sttRequest(serverURL string) runtimepkg.AdapterRequest {

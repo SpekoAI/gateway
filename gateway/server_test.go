@@ -254,7 +254,10 @@ func TestGatewayExpiresUnattachedSessions(t *testing.T) {
 
 func TestGatewayAttachmentClaimSurvivesAttachmentTimeout(t *testing.T) {
 	t.Parallel()
-	gatewayServer, _ := newServerWithOptions(t, 1, 25*time.Millisecond)
+	// Leave time for both HTTP setup and attachment under race instrumentation.
+	// The media assertion still runs beyond the entire original deadline.
+	const attachmentTimeout = time.Second
+	gatewayServer, _ := newServerWithOptions(t, 1, attachmentTimeout)
 	httpServer := httptest.NewServer(gatewayServer.Handler())
 	t.Cleanup(httpServer.Close)
 
@@ -278,7 +281,7 @@ func TestGatewayAttachmentClaimSurvivesAttachmentTimeout(t *testing.T) {
 	defer connection.Close(websocket.StatusNormalClosure, "")
 	expectEvent(t, connection, protocol.EventSessionReady)
 
-	time.Sleep(75 * time.Millisecond)
+	time.Sleep(attachmentTimeout + 50*time.Millisecond)
 	if err := connection.Write(context.Background(), websocket.MessageBinary, []byte{1}); err != nil {
 		t.Fatalf("write after attachment timeout: %v", err)
 	}

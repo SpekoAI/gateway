@@ -983,6 +983,7 @@ class FakeGatewaySession:
         *,
         answer_delay: float,
         quirk: str | None,
+        native: bool = False,
     ) -> None:
         self.metadata = {
             "session_id": f"session_{number}",
@@ -994,6 +995,8 @@ class FakeGatewaySession:
         self.closed = False
         self._answer_delay = answer_delay
         self._quirk = quirk
+        self._native = native
+        self._committed = asyncio.Event()
         self._peer_closed = False
         self._finished = asyncio.Event()
         self._speaker: asyncio.Task[None] | None = None
@@ -1014,7 +1017,7 @@ class FakeGatewaySession:
         self.appended.append(text)
 
     async def commit_text(self) -> None:
-        pass
+        self._committed.set()
 
     async def finish(self) -> None:
         self._finished.set()
@@ -1040,6 +1043,8 @@ class FakeGatewaySession:
         self._peer_closed = True
 
     async def _speak(self) -> None:
+        if self._native:
+            await self._committed.wait()
         await asyncio.sleep(self._answer_delay)
         self._events.put_nowait(
             CanonicalEvent(type="audio.started", data={"provider_request_id": "req"})
@@ -1047,8 +1052,11 @@ class FakeGatewaySession:
         self._events.put_nowait(
             CanonicalEvent(type="audio.frame", audio=b"\x01\x00" * 2_400)
         )
-        await self._finished.wait()
+        if not self._native:
+            await self._finished.wait()
         self._events.put_nowait(CanonicalEvent(type="audio.done"))
+        if self._native:
+            await self._finished.wait()
         self._events.put_nowait(None)
 
 
@@ -1059,10 +1067,12 @@ class FakeGateway:
         open_delay: float = 0.01,
         answer_delay: float = 0.05,
         capacity: int | None = None,
+        native: bool = False,
     ) -> None:
         self.open_delay = open_delay
         self.answer_delay = answer_delay
         self.capacity = capacity
+        self.native = native
         self.opens_allowed = asyncio.Event()
         self.opens_allowed.set()
         self.opens = 0
@@ -1113,6 +1123,7 @@ class FakeGateway:
             len(self.sessions),
             config.request,
             answer_delay=self.answer_delay,
+            native=self.native,
             quirk=self.quirks.pop(0) if self.quirks else None,
         )
         self.sessions.append(session)
@@ -1196,7 +1207,7 @@ async def test_tts_first_reply_after_prewarm_uses_the_standby() -> None:
 async def test_native_tts_only_preopens_sessions_when_requested(
     monkeypatch: pytest.MonkeyPatch, standbys: int | None
 ) -> None:
-    gateway = FakeGateway()
+    gateway = FakeGateway(native=True)
     client = RelaySpeechClient(
         api_key="sk_speko_owned_fixture",
         session_id="00000000-0000-4000-8000-000000000001",
@@ -1224,7 +1235,7 @@ async def test_native_tts_only_preopens_sessions_when_requested(
 async def test_native_tts_does_not_retry_an_open_even_with_standbys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gateway = FakeGateway()
+    gateway = FakeGateway(native=True)
     client = RelaySpeechClient(
         api_key="sk_speko_owned_fixture",
         session_id="00000000-0000-4000-8000-000000000001",

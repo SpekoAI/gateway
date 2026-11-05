@@ -56,6 +56,7 @@ from ._livekit_native_transcript import (
     restore_native_transcript,
 )
 from ._livekit_native_turns import NativeTurnPolicy
+from ._livekit_tts_text import NativeTextBuffer
 from ._speech_client import SpeechClient
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
 from .client import GatewayClient, GatewayError
@@ -1155,6 +1156,9 @@ class SynthesisStream(tts.SynthesizeStream):
         self._options = options
         self._session: _TTSSession | None = None
         self._gateway_stream: LiveKitTTSStream | None = None
+        self._native_utterance_done = asyncio.Event()
+        self._native_text_finished = False
+        self._native_segment_open = False
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         # The emitter must be initialized even when no text ever arrives:
@@ -1179,9 +1183,9 @@ class SynthesisStream(tts.SynthesizeStream):
         self._session = None
         try:
             _report_probe_marker("tts.requested")
-            await self._send_first_text(first_token)
+            await self._open_for_text(first_token)
             send_task = asyncio.create_task(
-                self._send_text(), name="speko.livekit.tts.send"
+                self._send_text(first_token, output_emitter), name="speko.livekit.tts.send"
             )
             receive_task = asyncio.create_task(
                 self._receive_audio(output_emitter), name="speko.livekit.tts.receive"
@@ -1214,14 +1218,16 @@ class SynthesisStream(tts.SynthesizeStream):
                 if not self._session.opening:
                     await asyncio.shield(closing)
 
-    async def _send_first_text(self, token: str) -> None:
+    async def _open_for_text(self, first_token: str) -> None:
         standby = self._plugin._take_standby(self._options)
         if standby is not None:
             self._session = standby
             await standby.wait_opened()
             if standby.quiet:
                 self._plugin._fill_standbys()
-                await self._send(await standby.stream(), token)
+                self._attach_stream(await standby.stream())
+                if not isinstance(self._plugin._client, RelaySpeechClient):
+                    await self._gateway_stream.append_text(first_token)
                 return
             self._plugin._close_soon(standby)
         self._session = _TTSSession(self._bridge)
@@ -1244,43 +1250,123 @@ class SynthesisStream(tts.SynthesizeStream):
         # The next standby opens only now, so it cannot take the Gateway slot
         # this reply's own open needs.
         self._plugin._fill_standbys()
-        await self._send(stream, token)
+        self._attach_stream(stream)
+        if not isinstance(self._plugin._client, RelaySpeechClient):
+            await stream.append_text(first_token)
 
-    async def _send(self, stream: LiveKitTTSStream, token: str) -> None:
+    def _attach_stream(self, stream: LiveKitTTSStream) -> None:
         self._gateway_stream = stream
         _report_stream_leg("tts", stream)
         self._mark_started()
-        await stream.append_text(token)
 
-    async def _send_text(self) -> None:
+    async def _send_text(self, first_token: str, output_emitter: tts.AudioEmitter) -> None:
         assert self._gateway_stream is not None
-        pending = True
-        async for item in self._input_ch:
-            if isinstance(item, self._FlushSentinel):
-                if pending:
-                    await self._gateway_stream.commit()
-                pending = False
-            else:
-                await self._gateway_stream.append_text(item)
-                pending = True
-        if pending:
-            await self._gateway_stream.commit()
-        await self._gateway_stream.finish()
+        if not isinstance(self._plugin._client, RelaySpeechClient):
+            # The local Gateway accepts streaming append immediately. Preserve
+            # its token/flush contract; native speech starts each utterance only
+            # on commit and therefore needs sentence commits below.
+            pending = True
+            async for item in self._input_ch:
+                if isinstance(item, self._FlushSentinel):
+                    if pending:
+                        await self._gateway_stream.commit()
+                    pending = False
+                else:
+                    await self._gateway_stream.append_text(item)
+                    pending = True
+            if pending:
+                await self._gateway_stream.commit()
+            await self._gateway_stream.finish()
+            return
+        text = NativeTextBuffer()
+        pieces = utils.aio.Chan()
+
+        def push(token: str) -> None:
+            for piece in text.push(token):
+                pieces.send_nowait(piece)
+
+        def flush() -> None:
+            if remaining := text.flush():
+                pieces.send_nowait(remaining)
+
+        async def feed() -> None:
+            incoming = None
+            try:
+                push(first_token)
+                incoming = asyncio.create_task(self._input_ch.__anext__())
+                while True:
+                    # Coalesce an ambiguous final period across LLM tokens,
+                    # while still speaking "Hello." if its producer pauses.
+                    # Keep the read task alive when the lookahead expires;
+                    # cancelling a channel read can discard later text.
+                    done, _ = await asyncio.wait(
+                        [incoming], timeout=0.3 if text.can_flush_idle else None
+                    )
+                    if not done:
+                        flush()
+                        continue
+                    try:
+                        item = incoming.result()
+                    except StopAsyncIteration:
+                        break
+                    if isinstance(item, self._FlushSentinel):
+                        flush()
+                        pieces.send_nowait(item)
+                    else:
+                        push(item)
+                    incoming = asyncio.create_task(self._input_ch.__anext__())
+            finally:
+                if incoming is not None:
+                    await utils.aio.cancel_and_wait(incoming)
+                flush()
+                pieces.close()
+
+        feeding = asyncio.create_task(feed(), name="speko.livekit.tts.text")
+        try:
+            async for piece in pieces:
+                if isinstance(piece, self._FlushSentinel):
+                    self._end_native_segment(output_emitter)
+                    continue
+                await self._gateway_stream.append_text(piece)
+                # Preserve separators on the wire without asking a provider
+                # to synthesize an otherwise empty whitespace-only context.
+                if not piece.strip():
+                    continue
+                self._native_utterance_done.clear()
+                await self._gateway_stream.commit()
+                # Native adapters may own a single active provider context.
+                # Feed future LLM text concurrently, but do not append the
+                # next utterance or close while this one is still generating.
+                await self._native_utterance_done.wait()
+            await feeding
+            self._end_native_segment(output_emitter)
+            self._native_text_finished = True
+            await self._gateway_stream.finish()
+        finally:
+            await utils.aio.cancel_and_wait(feeding)
+
+    def _end_native_segment(self, output_emitter: tts.AudioEmitter) -> None:
+        if self._native_segment_open:
+            output_emitter.end_segment()
+            self._native_segment_open = False
 
     async def _receive_audio(self, output_emitter: tts.AudioEmitter) -> None:
         assert self._session is not None
-        # LiveKit synthesizes one segment per stream instance, so audio after
-        # the segment's audio.done is ignored rather than reopening a segment
-        # the emitter would count as a mismatch.
+        # Internal sentence commits share an SDK segment. An explicit input
+        # flush ends it only after the current provider utterance has drained.
         segment_open = False
         segment_done = False
+        native = isinstance(self._plugin._client, RelaySpeechClient)
         first_audio_reported = False
         async for event in self._session.events():
             if segment_done:
                 continue
             if event.type == "audio.started":
-                if not segment_open:
-                    segment_open = True
+                if not (self._native_segment_open if native else segment_open):
+                    if native:
+                        self._native_segment_open = True
+                    else:
+                        segment_open = True
                     output_emitter.start_segment(
                         segment_id=event.provider_request_id or utils.shortuuid()
                     )
@@ -1289,15 +1375,29 @@ class SynthesisStream(tts.SynthesizeStream):
                 if not first_audio_reported:
                     first_audio_reported = True
                     _report_probe_marker("tts.first_audio")
-                if not segment_open:
-                    segment_open = True
+                if not (self._native_segment_open if native else segment_open):
+                    if native:
+                        self._native_segment_open = True
+                    else:
+                        segment_open = True
                     output_emitter.start_segment(segment_id=utils.shortuuid())
                 output_emitter.push(event.audio)
                 continue
-            if event.type == "audio.done" and segment_open:
-                segment_open = False
-                segment_done = True
-                output_emitter.end_segment()
+            if event.type == "audio.done":
+                if native:
+                    if self._native_segment_open:
+                        output_emitter.flush()
+                    self._native_utterance_done.set()
+                elif segment_open:
+                    segment_open = False
+                    segment_done = True
+                    output_emitter.end_segment()
+        if native and not self._native_text_finished:
+            raise GatewayError("Relay speech ended before text completed", retryable=False)
+        if native:
+            self._end_native_segment(output_emitter)
+        elif segment_open:
+            output_emitter.end_segment()
 
 
 class LLM(llm.LLM):
@@ -1361,6 +1461,8 @@ class LLM(llm.LLM):
         tool_choice: NotGivenOr[Any] = NOT_GIVEN,
         extra_kwargs: NotGivenOr[dict[str, Any]] = NOT_GIVEN,
     ) -> RelayLLMStream:
+        if isinstance(self._client, RelayLLMClient) and self._client._native_socket:
+            conn_options = dataclasses.replace(conn_options, max_retry=0)
         return RelayLLMStream(
             llm_instance=self,
             client=self._client,
