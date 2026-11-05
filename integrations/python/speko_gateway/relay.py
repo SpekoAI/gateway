@@ -106,6 +106,10 @@ class RelayError(RuntimeError):
         self.request_id = request_id
 
 
+class AdmissionsUnsupported(RelayError):
+    """The Router has no `/v1/llm/admissions` route (an older deployment)."""
+
+
 JSONValue = str | int | float | bool | None | list["JSONValue"] | dict[str, "JSONValue"]
 
 
@@ -272,7 +276,8 @@ class RelayLLMClient:
         `stream_response(..., prepared_admission=...)`, or None when the
         Router answers 204 (this region would hand the request to another
         one, where a ticket from here is useless). A refusal raises
-        RelayError.
+        RelayError; a Router without the route (HTTP 404 or 405) raises
+        AdmissionsUnsupported.
 
         The ticket is bound to this client's key and session ID. Keep at most
         one unused ticket per conversation and release one you will not use
@@ -290,6 +295,10 @@ class RelayLLMClient:
             if response.status == 204:
                 return None
             decoded = await _decode_json(response)
+            if response.status in (404, 405):
+                raise AdmissionsUnsupported(
+                    f"Router does not serve prepared admissions (HTTP {response.status})"
+                )
             if response.status != 201:
                 raise _envelope_error(response.status, decoded)
         ticket = decoded.get("admission")
@@ -428,19 +437,21 @@ class AdmissionPreparer:
         self._inflight: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[Any]] = set()
         self._closed = False
+        self._unsupported = False
 
     def prepare(self, build_request: Callable[[], dict[str, Any] | None]) -> None:
         """Prepare an admission for the next request, unless one is live.
 
         Keeps a ticket with more than `reuse_min_seconds` of life, so a false
-        start reuses it. Starts nothing while a prepare is in flight. Otherwise
+        start reuses it. Starts nothing while a prepare is in flight, nor ever
+        again once the Router has answered 404 or 405 for the route. Otherwise
         releases the old ticket in the background and prepares a new one from
         `build_request()`, which returns the request body or None to skip.
         Call it on the event loop; it never blocks and never raises.
         """
 
         try:
-            if self._closed:
+            if self._closed or self._unsupported:
                 return
             if self._inflight is not None and not self._inflight.done():
                 return
@@ -462,6 +473,14 @@ class AdmissionPreparer:
     async def _prepare(self, request: dict[str, Any]) -> None:
         try:
             admission = await self._client.prepare_admission(request)
+        except AdmissionsUnsupported:
+            # Until the Router serves the route, every prepare would be a
+            # wasted call; stop for the rest of this conversation.
+            self._unsupported = True
+            _logger.debug(
+                "speko router serves no prepared admissions; preparing turned off"
+            )
+            return
         except Exception as error:  # noqa: BLE001 - a prepare never fails the agent
             _logger.debug(
                 "speko router admission prepare failed: %s", type(error).__name__

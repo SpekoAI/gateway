@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 from aiohttp import web
+from livekit.agents import APIConnectionError
 from livekit.agents import llm as agents_llm
 
 from speko_gateway.livekit import LLM
@@ -33,7 +34,8 @@ class FakeRouter:
         self.admission_delay = 0.0
         self.admission_reply = "ticket"
         self.expires_in = 300.0
-        self.outcome = "used"
+        self.outcome: str | None = "used"
+        self.response_status = 200
         self.issued = 0
 
     async def admit(self, request: web.Request) -> web.StreamResponse:
@@ -46,6 +48,8 @@ class FakeRouter:
                 {"error": {"code": "insufficient_credit", "retryable": False}},
                 status=402,
             )
+        if self.admission_reply in ("404", "405"):
+            return web.Response(status=int(self.admission_reply))
         if self.admission_reply == "malformed":
             return web.json_response({"object": "llm.admission"}, status=201)
         self.issued += 1
@@ -65,8 +69,14 @@ class FakeRouter:
     async def respond(self, request: web.Request) -> web.StreamResponse:
         self.responses.append((dict(request.headers), await request.json()))
         headers = {"Content-Type": "text/event-stream", "Speko-Request-ID": "req-1"}
-        if "Speko-Prepared-Admission" in request.headers:
+        if "Speko-Prepared-Admission" in request.headers and self.outcome is not None:
             headers["Speko-Prepared-Admission-Outcome"] = self.outcome
+        if self.response_status != 200:
+            return web.json_response(
+                {"error": {"code": "insufficient_credit", "retryable": False}},
+                status=self.response_status,
+                headers={k: v for k, v in headers.items() if k != "Content-Type"},
+            )
         response = web.StreamResponse(headers=headers)
         await response.prepare(request)
         for event, payload in (
@@ -205,6 +215,48 @@ async def test_ticket_the_router_did_not_use_is_released(outcome: str) -> None:
         headers, body = router.releases[0]
         assert body == {"admission": "spa1.ticket-1"}
         assert headers["Speko-Client-Session-ID"] == SESSION_ID
+        await plugin.aclose()
+
+
+async def test_missing_outcome_header_releases_the_ticket() -> None:
+    # A request handed off to another region does not carry the ticket on, and
+    # its response has no outcome header at all.
+    router = FakeRouter()
+    router.outcome = None
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+
+        stream = await reply(plugin)
+
+        assert router.responses[0][0]["Speko-Prepared-Admission"] == "spa1.ticket-1"
+        assert stream.prepared_admission_outcome == ""
+        assert plugin.prepared_admission_outcome == ""
+        await until(lambda: len(router.releases) == 1)
+        assert router.releases[0][1] == {"admission": "spa1.ticket-1"}
+        await plugin.aclose()
+
+
+@pytest.mark.parametrize("outcome", ["budget", None])
+async def test_refused_request_reports_its_outcome_and_releases(
+    outcome: str | None,
+) -> None:
+    router = FakeRouter()
+    router.outcome = outcome
+    router.response_status = 402
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+
+        stream = plugin.chat(chat_ctx=_turn())
+        with pytest.raises(APIConnectionError):
+            async for _ in stream:
+                pass
+
+        assert stream.prepared_admission_outcome == (outcome or "")
+        await until(lambda: len(router.releases) == 1)
         await plugin.aclose()
 
 
@@ -356,6 +408,42 @@ async def test_prepare_failures_are_swallowed(admission_reply: str) -> None:
         assert "Speko-Prepared-Admission" not in router.responses[0][0]
         assert plugin.prepared_admission_outcome is None
         assert router.releases == []
+
+
+@pytest.mark.parametrize("status", ["404", "405"])
+async def test_router_without_the_route_turns_preparing_off(status: str) -> None:
+    router = FakeRouter()
+    router.admission_reply = status
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        session = FakeSession(_history())
+        plugin.attach(session)
+        session.user_starts_speaking()
+        await until(lambda: len(router.admissions) == 1)
+        await asyncio.sleep(0.05)
+
+        await reply(plugin)
+        session.user_starts_speaking()
+        await asyncio.sleep(0.05)
+        await reply(plugin)
+
+        assert len(router.admissions) == 1
+        assert all("Speko-Prepared-Admission" not in h for h, _ in router.responses)
+        await plugin.aclose()
+
+
+async def test_refusal_does_not_turn_preparing_off() -> None:
+    router = FakeRouter()
+    router.admission_reply = "refused"
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: len(router.admissions) == 1)
+        await asyncio.sleep(0.05)
+        router.admission_reply = "ticket"
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+        await plugin.aclose()
 
 
 async def test_unreachable_router_never_raises_into_the_agent() -> None:

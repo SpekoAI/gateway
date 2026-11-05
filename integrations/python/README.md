@@ -151,14 +151,17 @@ job shuts down, or `aclose()` runs. Without an `AgentSession`, call
 stream `llm.chat()` returns) says what the Router did with the last request's
 ticket. `"used"` means the request skipped the round trip. `"invalid"`,
 `"expired"`, `"stale"`, `"route"`, `"budget"` or `"redialed"` mean it was
-admitted the ordinary way. `""` means no outcome arrived, and `None` means no
-ticket was presented. A ticket never fails a request, and a failed prepare or
+admitted the ordinary way. `""` means no outcome arrived: no response, or a
+request handed off to another region, which does not carry the ticket on.
+`None` means no ticket was presented. Any outcome but `"used"` releases the
+ticket. A ticket never fails a request, and a failed prepare or
 release never raises into the agent.
 
 An unused ticket holds a credit reservation and one organization concurrency
 slot until it is used, released, or expires (5 minutes). The option is off by
 default and needs a Router that serves `/v1/llm/admissions`. On an older Router,
-each prepare fails quietly and requests go the ordinary way.
+the first prepare gets a 404, the LLM stops preparing, and requests go the
+ordinary way.
 
 Jev evaluations use the separate pooled async client and require an explicit
 idempotency key:
