@@ -91,15 +91,33 @@ class FakeRouter:
         self.responses.append((dict(request.headers), await request.json()))
         self.log.append("respond")
         headers = {"Content-Type": "text/event-stream", "Speko-Request-ID": "req-1"}
-        if "Speko-Prepared-Admission" in request.headers and self.outcome is not None:
-            headers["Speko-Prepared-Admission-Outcome"] = self.outcome
+        # The ticket check of runtime#377: `outcome` is what this Router
+        # decides for a ticket of the caller's under its own key, and None
+        # stands for a response without the header (a request that failed
+        # before the check, or was handed to another region), which leaves
+        # the ticket untouched.
         presented = request.headers.get("Speko-Prepared-Admission", "")
-        if self.one_slot and presented and self.outcome == "used":
+        if presented and self.outcome is not None:
             key = request.headers["Idempotency-Key"]
-            if self.live.get(presented) == key:
-                del self.live[presented]
-            else:
-                headers["Speko-Prepared-Admission-Outcome"] = "invalid"
+            outcome = self.outcome
+            if self.live.get(presented) != key:
+                outcome = "invalid"
+            # The Router retires a ticket of the caller's that it reports on,
+            # whether it uses it or not.
+            self.live.pop(presented, None)
+            headers["Speko-Prepared-Admission-Outcome"] = outcome
+            if outcome in ("stale", "expired", "route", "budget"):
+                return web.json_response(
+                    {
+                        "error": {
+                            "code": "idempotency_conflict",
+                            "retryable": False,
+                            "request_id": "req-prepared",
+                        }
+                    },
+                    status=409,
+                    headers={k: v for k, v in headers.items() if k != "Content-Type"},
+                )
         if self.fail_responses > 0:
             self.fail_responses -= 1
             if self.on_failure is not None:
@@ -109,8 +127,10 @@ class FakeRouter:
                 status=503,
                 headers={k: v for k, v in headers.items() if k != "Content-Type"},
             )
-        if self.one_slot and self.live and (
-            headers.get("Speko-Prepared-Admission-Outcome") != "used"
+        if (
+            self.one_slot
+            and self.live
+            and headers.get("Speko-Prepared-Admission-Outcome") != "used"
         ):
             # An ordinary admission while a ticket holds the only slot.
             return web.json_response(
@@ -253,10 +273,38 @@ async def test_prepared_ticket_is_presented_once_and_used() -> None:
         assert router.releases == []
 
 
-@pytest.mark.parametrize("outcome", ["budget", "redialed", "invalid"])
-async def test_ticket_the_router_did_not_use_is_released(outcome: str) -> None:
+@pytest.mark.parametrize("outcome", ["stale", "expired", "route", "budget"])
+async def test_ticket_that_does_not_fit_is_resent_at_once_without_it(
+    outcome: str,
+) -> None:
+    # One slot: the Router retires the ticket before its 409, so the resend's
+    # ordinary admission gets the slot.
     router = FakeRouter()
+    router.one_slot = True
     router.outcome = outcome
+    async with router_client(router) as client:
+        plugin = LLM(client, prepare_admissions=True)
+        plugin.prepare(_history())
+        await until(lambda: router.issued == 1)
+        prepare_key = router.admissions[0][0]["Idempotency-Key"]
+
+        stream = await reply(plugin)
+
+        (first, _), (resend, _) = router.responses
+        assert first["Speko-Prepared-Admission"] == "spa1.ticket-1"
+        assert first["Idempotency-Key"] == prepare_key
+        assert "Speko-Prepared-Admission" not in resend
+        assert resend["Idempotency-Key"] != prepare_key
+        assert stream.prepared_admission_outcome == outcome
+        assert plugin.prepared_admission_outcome == outcome
+        await asyncio.sleep(0.05)
+        assert router.releases == []  # the Router retired it already
+        await plugin.aclose()
+
+
+async def test_invalid_ticket_is_served_the_ordinary_way() -> None:
+    router = FakeRouter()
+    router.outcome = "invalid"
     async with router_client(router) as client:
         plugin = LLM(client, prepare_admissions=True)
         plugin.prepare(_history())
@@ -264,11 +312,10 @@ async def test_ticket_the_router_did_not_use_is_released(outcome: str) -> None:
 
         stream = await reply(plugin)
 
-        assert stream.prepared_admission_outcome == outcome
-        await until(lambda: len(router.releases) == 1)
-        headers, body = router.releases[0]
-        assert body == {"admission": "spa1.ticket-1"}
-        assert headers["Speko-Client-Session-ID"] == SESSION_ID
+        assert len(router.responses) == 1
+        assert stream.prepared_admission_outcome == "invalid"
+        await asyncio.sleep(0.05)
+        assert router.releases == []
         await plugin.aclose()
 
 
@@ -292,8 +339,8 @@ async def test_missing_outcome_header_releases_the_ticket() -> None:
         await plugin.aclose()
 
 
-@pytest.mark.parametrize("outcome", ["budget", None])
-async def test_refused_request_reports_its_outcome_and_releases(
+@pytest.mark.parametrize("outcome", ["invalid", None])
+async def test_refused_request_reports_its_outcome_and_releases_only_without_one(
     outcome: str | None,
 ) -> None:
     router = FakeRouter()
@@ -310,7 +357,11 @@ async def test_refused_request_reports_its_outcome_and_releases(
                 pass
 
         assert stream.prepared_admission_outcome == (outcome or "")
-        await until(lambda: len(router.releases) == 1)
+        if outcome is None:
+            await until(lambda: len(router.releases) == 1)
+        else:
+            await asyncio.sleep(0.05)
+            assert router.releases == []
         await plugin.aclose()
 
 
@@ -382,16 +433,16 @@ async def test_retry_presents_a_ticket_prepared_after_the_failure() -> None:
         await plugin.aclose()
 
 
-async def test_retry_after_a_mismatch_refusal_releases_then_goes_ordinary() -> None:
-    # runtime#377 f11971a: a ticketed request the Router cannot re-admit
-    # without confirming the ticket retired is refused 503 provider_unavailable
-    # (retryable) with the mismatch outcome. The ticket is released before
-    # the retry, which goes the ordinary way with a fresh key.
+async def test_retry_waits_for_a_release_slower_than_a_second() -> None:
+    # One slot: the ticketed attempt fails before the ticket check (no outcome
+    # header), so the ticket still holds the slot and the SDK releases it. The
+    # release takes longer than a second; the retry's ordinary admission must
+    # wait for it to complete or be refused for concurrency.
     router = FakeRouter()
     router.one_slot = True
-    router.outcome = "budget"
+    router.outcome = None
     router.fail_responses = 1
-    router.release_delay = 0.4
+    router.release_delay = 1.5
     async with router_client(router) as client:
         plugin = LLM(client, prepare_admissions=True)
         plugin.prepare(_history())
@@ -412,9 +463,6 @@ async def test_retry_after_a_mismatch_refusal_releases_then_goes_ordinary() -> N
         assert "Speko-Prepared-Admission" not in retry
         assert retry["Idempotency-Key"] != prepare_key
         assert router.log == ["admit", "respond", "released", "respond"]
-        assert [body for _, body in router.releases] == [
-            {"admission": "spa1.ticket-1"}
-        ]
         await plugin.aclose()
 
 
@@ -564,9 +612,9 @@ async def test_prepare_slower_than_the_release_bound_still_lands_and_releases(
         await until(lambda: owned._session.closed)
 
 
-async def test_unused_ticket_is_released_at_the_headers_not_the_stream_end() -> None:
+async def test_ticket_without_outcome_is_released_at_the_headers() -> None:
     router = FakeRouter()
-    router.outcome = "budget"
+    router.outcome = None  # served elsewhere: no outcome, ticket untouched
     router.hold_stream = asyncio.Event()
     async with router_client(router) as client:
         plugin = LLM(client, prepare_admissions=True)

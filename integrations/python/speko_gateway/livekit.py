@@ -913,7 +913,7 @@ class LLM(llm.LLM):
 
         `"used"` when the request skipped its admission round trip; otherwise
         the Router's reason for admitting it the ordinary way (`"invalid"`,
-        `"expired"`, `"stale"`, `"route"`, `"budget"`, `"redialed"`), or `""`
+        `"expired"`, `"stale"`, `"route"`, `"budget"`), or `""`
         when no outcome arrived. None when that request presented no ticket.
         Each `RelayLLMStream` carries its own request's value too.
         """
@@ -1112,19 +1112,13 @@ class RelayLLMStream(llm.LLMStream):
             if preparer is not None and admission is not None
             else None
         )
-        cancelled = False
+        if preparer is not None and admission is None:
+            await preparer.wait_releases()
         try:
             await self._stream_relay(request, presentation)
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
         finally:
             if presentation is not None:
                 presentation.finish()
-                if not cancelled:
-                    # A retry or follow-up must not compete with the slot of
-                    # a ticket being released.
-                    await presentation.wait_released()
 
     def _on_prepared_outcome(self, outcome: str) -> None:
         self.prepared_admission_outcome = outcome
@@ -1143,7 +1137,7 @@ class RelayLLMStream(llm.LLMStream):
             self._on_prepared_outcome("")
 
             def on_outcome(outcome: str) -> None:
-                # Releases an unused ticket at the response headers.
+                # Releases a ticket with no outcome at the response headers.
                 presentation.observe(outcome)
                 self._on_prepared_outcome(outcome)
 
@@ -1152,6 +1146,7 @@ class RelayLLMStream(llm.LLMStream):
                 prepared_admission=presentation.admission.ticket,
                 idempotency_key=presentation.admission.idempotency_key,
                 on_prepared_outcome=on_outcome,
+                before_resend=presentation.wait_releases,
             )
         try:
             async for event, payload in events:

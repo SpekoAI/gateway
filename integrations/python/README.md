@@ -155,11 +155,15 @@ a ticket compete with a real request for one:
 
 - A request waits up to 3 s for a prepare still in flight. Past that it goes
   the ordinary way, and the prepare releases its ticket when it lands.
-- A ticket the Router did not use is released as soon as the response headers
-  arrive. A retry or follow-up waits up to 1 s for that release before its
-  ordinary admission.
-- A ticket too close to expiry is released, with a wait of up to 1 s, before
-  the ordinary request goes out.
+- The Router retires a ticket that it reports an outcome for. The LLM releases
+  a presented ticket only when no outcome arrived: a response without the
+  header (a request that failed before the ticket check, or was served by
+  another region) releases at the headers, and a request with no response
+  releases when it ends.
+- A ticket too close to expiry is released instead of presented.
+- A request that presents no ticket (a retry, a tool follow-up, a resend)
+  first waits for any release of this LLM's tickets to complete, bounded by
+  the release call's own timeout.
 - The session closing, the job shutting down, or `aclose()` releases the
   unused ticket, including one whose prepare is still in flight. `aclose()`
   waits up to 3 s and never cancels a prepare. A prepare has no timeout of
@@ -169,13 +173,24 @@ a ticket compete with a real request for one:
 
 `llm.prepared_admission_outcome` (and `prepared_admission_outcome` on each
 stream `llm.chat()` returns) says what the Router did with the last request's
-ticket. `"used"` means the request skipped the round trip. `"invalid"`,
-`"expired"`, `"stale"`, `"route"`, `"budget"` or `"redialed"` mean it was
-admitted the ordinary way. `""` means no outcome arrived: no response, or a
-request handed off to another region, which does not carry the ticket on.
-`None` means no ticket was presented. Any outcome but `"used"` releases the
-ticket. A ticket never fails a request, and a failed prepare or
-release never raises into the agent.
+ticket:
+
+- `"used"`: the request skipped the round trip.
+- `"invalid"`: the ticket was not this caller's, or was prepared under another
+  key, and the request was admitted the ordinary way.
+- `"stale"`, `"expired"`, `"route"` or `"budget"`: the ticket did not fit. The
+  Router retires it and refuses the request with 409 `idempotency_conflict`.
+  The LLM at once sends the request again without the ticket, under a fresh
+  key, in the same attempt.
+- `""`: no outcome arrived. There was no response, or another region served
+  the request, which does not carry the ticket on.
+- `None`: no ticket was presented.
+
+A request that presented a ticket and failed before the Router's connector
+accepted it is returned as that failure with `"used"`: the ticket is spent. A
+framework retry is then an ordinary request with a fresh key, or presents a
+ticket prepared since. A ticket never fails a request on its own, and a failed
+prepare or release never raises into the agent.
 
 An unused ticket holds a credit reservation and one organization concurrency
 slot until it is used, released, or expires (5 minutes). The option is off by

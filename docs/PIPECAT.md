@@ -96,8 +96,10 @@ path. On `UserStartedSpeakingFrame`, the service prepares an admission from the
 last context it received. The next reply request presents the ticket, with
 the prepare call's `Idempotency-Key` (the Router binds the ticket to it). It
 waits up to 3 s for a prepare still in flight. Requests without a ticket keep
-fresh keys. A ticket the Router did not use is
-released when the response headers arrive. A ticket left unused at `EndFrame`,
+fresh keys. A ticket that does not fit is refused with 409
+`idempotency_conflict`, and the service sends the request again at once without
+it. A presented ticket that got no outcome is released when the response
+headers arrive. A ticket left unused at `EndFrame`,
 `CancelFrame` or cleanup is released too, including one whose prepare lands
 after the pipeline ends. `llm.prepared_admission_outcome` reports `"used"` or the Router's
 reason for admitting the last reply the ordinary way. Before the first context

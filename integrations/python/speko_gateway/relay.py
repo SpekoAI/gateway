@@ -15,7 +15,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal, TypedDict
@@ -49,10 +49,23 @@ _DEFERRED_CLOSES: set[asyncio.Task[None]] = set()
 PREPARED_ADMISSION_USED = "used"
 """The `Speko-Prepared-Admission-Outcome` value of a request served on its ticket.
 
-Any other value names why the Router admitted the request the ordinary way
-instead: `invalid`, `expired`, `stale`, `route`, `budget` or `redialed`. The
-request proceeds either way; a ticket never causes a refusal.
+The other values name why the ticket was not used:
+
+- `invalid`: not this caller's ticket, or prepared under another key. The
+  request was admitted the ordinary way.
+- `stale`, `expired`, `route`, `budget`: this caller's ticket, under this key,
+  that does not fit. The Router retires it and refuses the request with 409
+  `idempotency_conflict`; `stream_response` resends it at once without the
+  ticket under a fresh key.
+
+The Router retires a ticket of the caller's that reports any of these, so the
+client releases a presented ticket only when no outcome arrived.
 """
+
+_PREPARED_MISMATCH_OUTCOMES = frozenset({"stale", "expired", "route", "budget"})
+_PREPARED_OUTCOMES = frozenset(
+    {PREPARED_ADMISSION_USED, "invalid", *_PREPARED_MISMATCH_OUTCOMES}
+)
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 """The Router's provider-neutral reasoning control, sent as `reasoning_effort`.
@@ -367,6 +380,7 @@ class RelayLLMClient:
         prepared_admission: str = "",
         idempotency_key: str = "",
         on_prepared_outcome: Callable[[str], None] | None = None,
+        before_resend: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         """POST /v1/llm/responses with stream=true, yielding (event, payload).
 
@@ -386,40 +400,66 @@ class RelayLLMClient:
         `Speko-Prepared-Admission-Outcome` (`PREPARED_ADMISSION_USED`, a
         reason the ticket was not used, or "" from a Router that sent none).
         It is not called when no response arrived.
+
+        When the Router refuses the ticketed request with 409
+        `idempotency_conflict` because the ticket does not fit (`stale`,
+        `expired`, `route` or `budget`), the request is sent again at once
+        without the ticket under a fresh key, after awaiting `before_resend`.
+        A framework retry cannot do this: a 409 is not retryable.
         """
 
         body = dict(request)
         body["stream"] = True
-        headers = {
-            "Idempotency-Key": idempotency_key or str(uuid.uuid4()),
-            "Accept": "text/event-stream",
-        }
-        if self._platform_session_id:
-            headers["Speko-Client-Session-ID"] = self._platform_session_id
-        if prepared_admission:
-            headers[_HEADER_PREPARED_ADMISSION] = prepared_admission
-        async with self._session.post(
-            f"{self._base_url}/v1/llm/responses", json=body, headers=headers
-        ) as response:
-            if prepared_admission and on_prepared_outcome is not None:
-                on_prepared_outcome(
-                    str(response.headers.get(_HEADER_PREPARED_ADMISSION_OUTCOME, ""))
+        ticket = prepared_admission
+        key = idempotency_key
+        while True:
+            headers = {
+                "Idempotency-Key": key or str(uuid.uuid4()),
+                "Accept": "text/event-stream",
+            }
+            if self._platform_session_id:
+                headers["Speko-Client-Session-ID"] = self._platform_session_id
+            if ticket:
+                headers[_HEADER_PREPARED_ADMISSION] = ticket
+            async with self._session.post(
+                f"{self._base_url}/v1/llm/responses", json=body, headers=headers
+            ) as response:
+                outcome = str(
+                    response.headers.get(_HEADER_PREPARED_ADMISSION_OUTCOME, "")
                 )
-            if response.status != 200:
-                raise _envelope_error(response.status, await _decode_json(response))
-            _report_llm_leg(response)
-            terminal = False
-            async for event, payload in _sse_events(response):
-                if event == "error":
-                    raise _event_error(payload)
-                yield event, payload
-                if event in _TERMINAL_EVENTS:
-                    terminal = True
-            if not terminal:
-                raise RelayError(
-                    "relay stream ended without a terminal event",
-                    retryable=True,
-                )
+                if ticket and on_prepared_outcome is not None:
+                    on_prepared_outcome(outcome)
+                if response.status != 200:
+                    error = _envelope_error(
+                        response.status, await _decode_json(response)
+                    )
+                    if not (
+                        ticket
+                        and response.status == 409
+                        and error.code == "idempotency_conflict"
+                        and outcome in _PREPARED_MISMATCH_OUTCOMES
+                    ):
+                        raise error
+                else:
+                    _report_llm_leg(response)
+                    terminal = False
+                    async for event, payload in _sse_events(response):
+                        if event == "error":
+                            raise _event_error(payload)
+                        yield event, payload
+                        if event in _TERMINAL_EVENTS:
+                            terminal = True
+                    if not terminal:
+                        raise RelayError(
+                            "relay stream ended without a terminal event",
+                            retryable=True,
+                        )
+                    return
+            # The Router retired the ticket and refused it; the key is spent.
+            ticket = ""
+            key = ""
+            if before_resend is not None:
+                await before_resend()
 
 
 @dataclass(frozen=True)
@@ -451,9 +491,10 @@ class AdmissionPreparer:
     An issued ticket holds a credit reservation and one organization
     concurrency slot until it is used or released, so with a concurrency limit
     of one any overlap refuses the real reply. Hence the ordering rules: a
-    discarded ticket is released before the admission that replaces it, a
-    prepare the reply stopped waiting for releases its ticket when it lands,
-    and close waits for a prepare in flight instead of dropping its ticket.
+    discarded ticket's release completes before any other admission of the
+    conversation (`wait_releases`), a prepare the reply stopped waiting for
+    releases its ticket when it lands, and close waits for a prepare in flight
+    instead of dropping its ticket.
     """
 
     def __init__(
@@ -463,7 +504,6 @@ class AdmissionPreparer:
         reuse_min_seconds: float = 60.0,
         present_min_seconds: float = 10.0,
         wait_seconds: float = 3.0,
-        expiring_release_wait_seconds: float = 1.0,
         release_timeout_seconds: float = 2.0,
         close_wait_seconds: float = 3.0,
     ) -> None:
@@ -471,7 +511,6 @@ class AdmissionPreparer:
         self._reuse_min = reuse_min_seconds
         self._present_min = present_min_seconds
         self._wait = wait_seconds
-        self._expiring_release_wait = expiring_release_wait_seconds
         self._release_timeout = release_timeout_seconds
         self._close_wait = close_wait_seconds
         self._ticket: PreparedAdmission | None = None
@@ -518,11 +557,11 @@ class AdmissionPreparer:
         self, replaced: PreparedAdmission | None, request: dict[str, Any]
     ) -> None:
         if replaced is not None:
-            # The replaced ticket's slot must be free before the new admission
-            # asks for one. The release is bounded by its own timeout.
-            release = self._release_soon(replaced)
-            if release is not None:
-                await asyncio.wait({release})
+            self._release_soon(replaced)
+        if self._background:
+            # A ticket being released still holds its slot until the release
+            # completes, so the new admission waits for it.
+            await self.wait_releases()
             if self._closed or self._abandoned:
                 return
         try:
@@ -554,9 +593,8 @@ class AdmissionPreparer:
         A prepare still in flight started earlier than this request's own
         admission would, so wait up to `wait_seconds` for it. Past that the
         request goes the ordinary way, and the prepare, left running, releases
-        its ticket when it lands. A ticket too close to expiry is released,
-        waiting up to `expiring_release_wait_seconds` so the ordinary request
-        does not compete with its slot.
+        its ticket when it lands. A ticket too close to expiry is released;
+        call `wait_releases` before the ordinary request then goes out.
         """
 
         inflight = self._inflight
@@ -571,11 +609,23 @@ class AdmissionPreparer:
         if ticket is None:
             return None
         if ticket.remaining() < self._present_min:
-            release = self._release_soon(ticket)
-            if release is not None:
-                await asyncio.wait({release}, timeout=self._expiring_release_wait)
+            self._release_soon(ticket)
             return None
         return ticket
+
+    async def wait_releases(self) -> None:
+        """Wait until every release this preparer started has completed.
+
+        A ticket being released holds its organization concurrency slot until
+        the release completes, so call this before any admission of this
+        conversation that presents no ticket: a retry, a tool follow-up, a
+        resend after a refused ticket. Bounded by the release call's own
+        timeout; it returns at once when nothing is being released.
+        """
+
+        pending = {task for task in self._background if not task.done()}
+        if pending:
+            await asyncio.wait(pending, timeout=self._release_timeout + 0.5)
 
     def present(self, admission: PreparedAdmission) -> PreparedPresentation:
         """Track one request that presents `admission`; see PreparedPresentation."""
@@ -686,12 +736,12 @@ class AdmissionPreparer:
 class PreparedPresentation:
     """One request presenting a prepared ticket.
 
-    Pass `observe` as `stream_response`'s `on_prepared_outcome`: an outcome
-    other than `used`, a missing header included, releases the ticket as soon
-    as the response headers arrive, not when the stream ends. Call `finish`
-    when the request ends; a request that never got a response releases then.
-    Then await `wait_released` before a retry or follow-up, so its ordinary
-    admission does not compete with the ticket's slot.
+    Pass `observe` as `stream_response`'s `on_prepared_outcome`. The Router
+    itself retires a ticket of the caller's that reports an outcome, so the
+    ticket is released only when no outcome arrived: a response without the
+    header (it failed before the ticket check, or another region served it)
+    releases at the headers, and `finish`, called when the request ends,
+    releases a ticket whose request got no response at all.
     """
 
     def __init__(self, preparer: AdmissionPreparer, admission: PreparedAdmission):
@@ -699,33 +749,26 @@ class PreparedPresentation:
         self.admission = admission
         self.outcome: str | None = None
         self._settled = False
-        self._release: asyncio.Task[None] | None = None
 
     def observe(self, outcome: str) -> None:
-        self.outcome = outcome
-        if outcome != PREPARED_ADMISSION_USED:
+        if self.outcome is None:  # a resend after a 409 reports no new outcome
+            self.outcome = outcome
+        if outcome not in _PREPARED_OUTCOMES:
             self._settle()
+
+    async def wait_releases(self) -> None:
+        """`AdmissionPreparer.wait_releases`, for `stream_response`'s resend."""
+
+        await self._preparer.wait_releases()
 
     def finish(self) -> None:
         if self.outcome is None:
             self._settle()
 
-    async def wait_released(self) -> None:
-        """Wait, bounded like an expiring ticket's release, for this release.
-
-        Returns at once when the ticket was used or no release is running.
-        """
-
-        release = self._release
-        if release is not None and not release.done():
-            await asyncio.wait(
-                {release}, timeout=self._preparer._expiring_release_wait
-            )
-
     def _settle(self) -> None:
         if not self._settled:
             self._settled = True
-            self._release = self._preparer._release_soon(self.admission)
+            self._preparer._release_soon(self.admission)
 
 
 _RFC3339 = re.compile(

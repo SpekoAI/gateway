@@ -929,6 +929,7 @@ class PreparingRelayClient(FakeRelayClient):
         prepared_admission: str = "",
         idempotency_key: str = "",
         on_prepared_outcome=None,
+        before_resend=None,
     ):
         self.requests.append(request)
         self.presented.append(prepared_admission)
@@ -976,8 +977,8 @@ async def test_llm_prepares_on_user_speech_and_presents_the_ticket_once() -> Non
     assert relay.released == []
 
 
-async def test_llm_releases_a_ticket_the_router_did_not_use() -> None:
-    relay = PreparingRelayClient(outcome="route")
+async def test_llm_releases_a_ticket_that_got_no_outcome() -> None:
+    relay = PreparingRelayClient(outcome="")
     llm = SpekoLLMService(relay, prepare_admissions=True)  # type: ignore[arg-type]
     context = LLMContext(messages=[{"role": "user", "content": "Hi"}])
     llm.prepare_admission(context)
@@ -988,7 +989,7 @@ async def test_llm_releases_a_ticket_the_router_did_not_use() -> None:
     await _feed_llm(llm, LLMContextFrame(context))
 
     assert relay.presented == ["spa1.ticket-1"]
-    assert llm.prepared_admission_outcome == "route"
+    assert llm.prepared_admission_outcome == ""
     await _until(lambda: relay.released == ["spa1.ticket-1"])
     await llm.cleanup()
 
