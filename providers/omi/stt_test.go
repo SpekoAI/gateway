@@ -871,6 +871,59 @@ func TestAnErrorFromAPeerThatStoppedReadingIsPublishedPromptly(t *testing.T) {
 	}
 }
 
+// A commit racing the error frame, while nobody is draining events yet, must
+// not end the session before the estimate and the error are published: it
+// waits for them and returns the terminal error, as WriteAudio does.
+func TestACommitRacingAnErrorFrameWaitsForTheEvidence(t *testing.T) {
+	t.Parallel()
+	fake := newFakeStream(t)
+	fake.onAudio = []string{`{"type":"error","code":"INTERNAL_ERROR","message":"vendor detail"}`}
+	fake.stallAfterAudio = true
+	stream := openSTT(t, fake, STTConfig{EventBuffer: 1}, sttRequest(fake.endpoint()))
+	if err := stream.WriteAudio(context.Background(), make([]byte, 3200)); err != nil {
+		t.Fatal(err)
+	}
+	commitErr := make(chan error, 1)
+	go func() {
+		for {
+			if err := stream.CommitAudio(context.Background()); err != nil {
+				commitErr <- err
+				return
+			}
+		}
+	}()
+	// Back-pressure: the event queue holds one event and nobody reads it
+	// until the commits have had time to race the error.
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case err := <-commitErr:
+		t.Fatalf("CommitAudio returned %v before the evidence was consumed", err)
+	default:
+	}
+	events := drainSTT(t, stream)
+	estimate, failure := -1, -1
+	for i, event := range events {
+		if event.Type == protocol.EventUsageObserved && dataOf(t, event)["billing_evidence"] == "pcm_bytes_sent" {
+			estimate = i
+		}
+		if event.Err != nil && failure < 0 {
+			failure = i
+		}
+	}
+	if estimate < 0 || failure < 0 || estimate > failure {
+		t.Fatalf("estimate at %d, terminal error at %d", estimate, failure)
+	}
+	select {
+	case err := <-commitErr:
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) {
+			t.Fatalf("CommitAudio returned %v, want the terminal provider error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("CommitAudio stayed blocked after the session ended")
+	}
+}
+
 // A close reason is vendor text. If Omi ever echoed the key in one, it must
 // not reach the error's message, cause or extension, before or after ready.
 func TestACloseReasonNeverCarriesTheKey(t *testing.T) {

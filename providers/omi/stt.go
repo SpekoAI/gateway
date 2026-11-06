@@ -509,13 +509,27 @@ func (s *sttStream) CommitAudio(ctx context.Context) error {
 	if s.inputClosed.Load() || s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
+	if s.estimated.Load() {
+		return s.afterTerminal(ctx)
+	}
 	frame := marshalData(map[string]string{"type": "finalize", "id": strconv.FormatInt(s.finalizeID.Add(1), 10)})
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if s.inputClosed.Load() {
+		s.writeMu.Unlock()
 		return runtimepkg.ErrSessionClosed
 	}
-	return s.writeLocked(ctx, websocket.MessageText, frame)
+	if s.estimated.Load() {
+		s.writeMu.Unlock()
+		return s.afterTerminal(ctx)
+	}
+	err := s.writeLocked(ctx, websocket.MessageText, frame)
+	s.writeMu.Unlock()
+	if err != nil && s.estimated.Load() {
+		// Like WriteAudio: a commit the estimate interrupted waits for the
+		// evidence and the error to be published, then returns that error.
+		return s.afterTerminal(ctx)
+	}
+	return err
 }
 
 func (s *sttStream) AppendText(context.Context, string) error {
@@ -540,10 +554,20 @@ func (s *sttStream) Close(ctx context.Context) error {
 		if s.closed.Load() {
 			return
 		}
+		if s.estimated.Load() {
+			// The session is ending on a provider error: let the reader publish
+			// the evidence and the error rather than aborting under it.
+			s.closeErr = s.afterTerminal(ctx)
+			return
+		}
 		s.writeMu.Lock()
 		s.inputClosed.Store(true)
-		err := s.conn.Write(ctx, websocket.MessageText, stopFrame)
+		err := s.writeStop(ctx)
 		s.writeMu.Unlock()
+		if err != nil && s.estimated.Load() {
+			s.closeErr = s.afterTerminal(ctx)
+			return
+		}
 		if err != nil {
 			if s.TerminalError() == nil {
 				s.closeErr = &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Omi STT stop could not be sent", Retryable: true, Cause: err}
@@ -554,6 +578,16 @@ func (s *sttStream) Close(ctx context.Context) error {
 		go s.drainThenClose()
 	})
 	return s.closeErr
+}
+
+// writeStop sends stop under the stream write context, so reportEstimate can
+// interrupt it like any other write. The caller holds writeMu.
+func (s *sttStream) writeStop(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(s.writeCtx, cancel)
+	defer stop()
+	return s.conn.Write(ctx, websocket.MessageText, stopFrame)
 }
 
 func (s *sttStream) drainThenClose() {
@@ -733,6 +767,10 @@ func (s *sttStream) handle(frameType string, raw []byte) bool {
 		// must be reported first or finish never gets the chance.
 		s.reportEstimate()
 		s.fail(providerError("Omi STT reported an error", &detail, 0, raw))
+		// An error frame ends the session. Omi follows it with a 1008 close,
+		// but the reader does not wait on a peer that may never send one.
+		_ = s.conn.CloseNow()
+		return true
 	default:
 		if _, quiet := quietFrames[frameType]; quiet {
 			return false
