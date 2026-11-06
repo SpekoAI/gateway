@@ -124,6 +124,92 @@ provider-direct voice legs, the conversation history travels through the
 Speko Router. Function tools are supported; image and audio content is
 silently skipped — only text is forwarded.
 
+### Prepared admissions
+
+Each Router LLM request waits for an admission round trip (credit check and a
+signed plan) before the model is dialed: about 270 ms from Singapore. With
+`prepare_admissions=True`, the LLM makes that round trip when the caller starts
+speaking, and the reply's request skips it:
+
+```python
+llm = LLM(prepare_admissions=True)
+session = AgentSession(stt=STT(), llm=llm, tts=TTS())
+llm.attach(session)  # prepare on each user speech start
+await session.start(agent=MyAgent(), room=ctx.room)
+```
+
+On each user speech start, the LLM prepares from the current agent's chat
+context and the tools of the last request (`POST /v1/llm/admissions`). The
+prepare call's `Idempotency-Key` is the one the real request will use: the
+Router binds the ticket to it. The next request presents the ticket with that
+same key. Every request without a ticket sends a fresh key. A tool-call
+follow-up and any request with no live ticket are admitted the ordinary way.
+There is at most one ticket per LLM. A false start keeps a ticket with more
+than a minute left. An older ticket is released, and the new prepare waits for
+that release. Without an `AgentSession`, call `llm.prepare(chat_ctx)` yourself
+when the caller starts speaking.
+
+An unused ticket holds one organization concurrency slot, so the LLM never lets
+a ticket compete with a real request for one:
+
+- A request waits up to 3 s for a prepare still in flight. Past that it goes
+  the ordinary way, and the prepare releases its ticket when it lands.
+- A presented ticket is released only once no retry will follow, and not when
+  the Router has retired it, reported it already started, or reported an
+  outcome on a request that succeeded. Releasing earlier would retire a ticket
+  an unchanged retry still needs.
+- A ticket too close to expiry is released instead of presented.
+- A request that presents no ticket (a retry, a tool follow-up, a resend)
+  first waits for any release of this LLM's tickets to complete, bounded by
+  the release call's own timeout.
+- The session closing, the job shutting down, or `aclose()` releases the
+  unused ticket, including one whose prepare is still in flight. `aclose()`
+  waits up to 3 s and never cancels a prepare. A prepare has no timeout of
+  its own beyond the transport's request timeout, so a late ticket is never
+  lost. An LLM that owns its transport keeps it open until that ticket is
+  released or the transport's timeout fires.
+
+`llm.prepared_admission_outcome` (and `prepared_admission_outcome` on each
+stream `llm.chat()` returns) says what the Router did with the last request's
+ticket:
+
+- `"used"`: the request skipped the round trip.
+- `"invalid"`: the ticket was not this caller's, or was prepared under another
+  key, and the request was admitted the ordinary way.
+- `"stale"`, `"expired"`, `"route"` or `"budget"`: the ticket did not fit and
+  was not run.
+- `""`: no outcome arrived. There was no response, or another region served
+  the request, which does not carry the ticket on.
+- `None`: no ticket was presented.
+
+A ticket and its `Idempotency-Key` are one idempotency unit. When a ticketed
+request is not run on its ticket (a mismatch, or a failure before the
+Router's connector accepted it), the Router tries to retire the ticket and
+answers from what it found:
+
+- 409 `idempotency_conflict`: retired, never ran. The LLM at once sends the
+  request again without the ticket, under a fresh key, in the same attempt.
+  A conflict whose outcome is `invalid` is different. It came from the
+  ordinary admission under the request's own key, which may already have run,
+  so it is raised as an ordinary error and not resent.
+- 409 `request_already_started`: already used, or expired before it could be
+  confirmed, so the request may have run. The error is raised, not retried,
+  and the ticket is dropped.
+- Any other failure, such as a retryable 503 `provider_unavailable`: not
+  confirmed. LiveKit's retry sends the same request unchanged, with the same
+  ticket and key. It never uses a fresh key or a newly prepared ticket, and
+  the ticket is not released in between. A failure after the connector
+  accepted the request (mid-stream) is retried the same way.
+
+Releasing is idempotent and always safe. A failed prepare or release never
+raises into the agent.
+
+An unused ticket holds a credit reservation and one organization concurrency
+slot until it is used, released, or expires (5 minutes). The option is off by
+default and needs a Router that serves `/v1/llm/admissions`. On an older Router,
+the first prepare gets a 404, the LLM stops preparing, and requests go the
+ordinary way.
+
 Jev evaluations use the separate pooled async client and require an explicit
 idempotency key:
 

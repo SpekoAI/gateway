@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -892,3 +893,147 @@ async def test_tts_provider_options_ride_every_session_request() -> None:
 def test_tts_without_provider_options_sends_no_tts_block() -> None:
     service = SpekoTTSService(FakeGatewayClient())  # type: ignore[arg-type]
     assert service._tts_options is None
+
+
+class PreparingRelayClient(FakeRelayClient):
+    def __init__(self, outcome: str = "used") -> None:
+        super().__init__([("response.completed", {})])
+        self.outcome = outcome
+        self.prepared: list[dict] = []
+        self.released: list[str] = []
+        self.presented: list[str] = []
+        self.keys: list[str] = []
+        self.prepare_delay = 0.0
+
+    async def prepare_admission(self, request: dict):
+        from speko_gateway.relay import PreparedAdmission
+
+        self.prepared.append(request)
+        await asyncio.sleep(self.prepare_delay)
+        now = time.monotonic()
+        return PreparedAdmission(
+            ticket=f"spa1.ticket-{len(self.prepared)}",
+            expires_at=time.time() + 300,
+            _deadline=now + 300,
+            idempotency_key=f"key-{len(self.prepared)}",
+        )
+
+    async def release_admission(self, admission: str) -> bool:
+        self.released.append(admission)
+        return True
+
+    async def stream_response(
+        self,
+        request: dict,
+        *,
+        prepared_admission: str = "",
+        idempotency_key: str = "",
+        on_prepared_outcome=None,
+        before_resend=None,
+    ):
+        self.requests.append(request)
+        self.presented.append(prepared_admission)
+        self.keys.append(idempotency_key)
+        if prepared_admission and on_prepared_outcome is not None:
+            on_prepared_outcome(self.outcome)
+        for event in self.events:
+            yield event
+
+
+async def _feed_llm(llm: SpekoLLMService, *frames) -> None:
+    from pipecat.services.llm_service import LLMService
+
+    llm.push_frame = AsyncMock()  # type: ignore[method-assign]
+    with patch.object(LLMService, "process_frame", AsyncMock()):
+        for frame in frames:
+            await llm.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+
+async def _until(condition, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not met in time"
+        await asyncio.sleep(0.01)
+
+
+async def test_llm_prepares_on_user_speech_and_presents_the_ticket_once() -> None:
+    from pipecat.frames.frames import LLMContextFrame, UserStartedSpeakingFrame
+
+    relay = PreparingRelayClient()
+    llm = SpekoLLMService(relay, prepare_admissions=True)  # type: ignore[arg-type]
+    context = LLMContext(messages=[{"role": "user", "content": "Hi"}])
+
+    await _feed_llm(llm, LLMContextFrame(context), UserStartedSpeakingFrame())
+    await _until(lambda: len(relay.prepared) == 1)
+    assert relay.prepared[0] == llm._request(context)
+    context.add_message({"role": "user", "content": "And the weather?"})
+    await _feed_llm(llm, LLMContextFrame(context), LLMContextFrame(context))
+
+    assert relay.presented == ["", "spa1.ticket-1", ""]
+    assert relay.keys == ["", "key-1", ""]  # fresh keys where no ticket
+    assert llm.prepared_admission_outcome is None  # the last request had no ticket
+    assert relay.released == []
+    await llm.cleanup()
+    assert relay.released == []
+
+
+async def test_llm_releases_a_ticket_that_got_no_outcome() -> None:
+    relay = PreparingRelayClient(outcome="")
+    llm = SpekoLLMService(relay, prepare_admissions=True)  # type: ignore[arg-type]
+    context = LLMContext(messages=[{"role": "user", "content": "Hi"}])
+    llm.prepare_admission(context)
+    await _until(lambda: len(relay.prepared) == 1)
+
+    from pipecat.frames.frames import LLMContextFrame
+
+    await _feed_llm(llm, LLMContextFrame(context))
+
+    assert relay.presented == ["spa1.ticket-1"]
+    assert llm.prepared_admission_outcome == ""
+    await _until(lambda: relay.released == ["spa1.ticket-1"])
+    await llm.cleanup()
+
+
+async def test_llm_cleanup_releases_an_unused_ticket() -> None:
+    relay = PreparingRelayClient()
+    llm = SpekoLLMService(relay, prepare_admissions=True)  # type: ignore[arg-type]
+    llm.prepare_admission(LLMContext(messages=[{"role": "user", "content": "Hi"}]))
+    await _until(lambda: len(relay.prepared) == 1)
+    await asyncio.sleep(0)
+
+    await llm.cleanup()
+
+    assert relay.released == ["spa1.ticket-1"]
+
+
+async def test_llm_without_prepare_admissions_makes_no_new_calls() -> None:
+    from pipecat.frames.frames import LLMContextFrame, UserStartedSpeakingFrame
+
+    relay = FakeRelayClient([("response.completed", {})])  # no admission methods
+    llm = SpekoLLMService(relay)  # type: ignore[arg-type]
+    context = LLMContext(messages=[{"role": "user", "content": "Hi"}])
+
+    await _feed_llm(
+        llm, UserStartedSpeakingFrame(), LLMContextFrame(context), LLMContextFrame(context)
+    )
+    llm.prepare_admission(context)
+    await llm.cleanup()
+
+    assert len(relay.requests) == 2
+    assert llm.prepared_admission_outcome is None
+
+
+async def test_llm_cleanup_releases_a_ticket_still_being_prepared() -> None:
+    from speko_gateway.relay import AdmissionPreparer
+
+    relay = PreparingRelayClient()
+    relay.prepare_delay = 0.4
+    llm = SpekoLLMService(relay, prepare_admissions=True)  # type: ignore[arg-type]
+    llm._preparer = AdmissionPreparer(relay, close_wait_seconds=0.1)  # type: ignore[arg-type]
+    llm.prepare_admission(LLMContext(messages=[{"role": "user", "content": "Hi"}]))
+    await _until(lambda: len(relay.prepared) == 1)
+
+    await llm.cleanup()
+    assert relay.released == []  # still in flight: not cancelled, not dropped
+
+    await _until(lambda: relay.released == ["spa1.ticket-1"])
