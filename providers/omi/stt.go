@@ -401,10 +401,13 @@ type sttStream struct {
 	// finalizeID numbers the finalize controls.
 	finalizeID atomic.Int64
 
-	gracefulOnce  sync.Once
-	abortOnce     sync.Once
-	setupOnce     sync.Once
-	inputClosed   atomic.Bool
+	gracefulOnce sync.Once
+	abortOnce    sync.Once
+	setupOnce    sync.Once
+	inputClosed  atomic.Bool
+	// estimated is set under writeMu when the bytes-sent estimate is taken,
+	// so no write can land after the count it reports.
+	estimated     atomic.Bool
 	closed        atomic.Bool
 	drainTimedOut atomic.Bool
 	readyOnce     atomic.Bool
@@ -440,7 +443,7 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.inputClosed.Load() || s.closed.Load() {
+	if s.inputClosed.Load() || s.closed.Load() || s.estimated.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
 	pcm := append(s.carry, audio...)
@@ -1008,6 +1011,11 @@ func (s *sttStream) reportEstimate() {
 		return
 	}
 	s.billed = true
+	// Taking the write lock waits out a frame in flight and closes input,
+	// so the count below covers every byte that reached the socket.
+	s.writeMu.Lock()
+	s.estimated.Store(true)
+	s.writeMu.Unlock()
 	data := s.usageData()
 	data["audio_bytes"] = s.sentBytes.Load()
 	data["billing_evidence"] = "pcm_bytes_sent"

@@ -771,6 +771,40 @@ func TestAMidSessionErrorFrameReportsTheBytesSentFirst(t *testing.T) {
 	}
 }
 
+// A write racing the error frame must not land after the estimate: the
+// estimate closes input under the write lock, so it covers exactly the audio
+// WriteAudio accepted.
+func TestTheEstimateCoversEveryWriteThatRacedTheErrorFrame(t *testing.T) {
+	t.Parallel()
+	fake := newFakeStream(t)
+	fake.onAudio = []string{`{"type":"error","code":"INTERNAL_ERROR","message":"vendor detail"}`}
+	fake.closeAfterAudio = websocket.StatusPolicyViolation
+	stream := openSTT(t, fake, STTConfig{}, sttRequest(fake.endpoint()))
+	var accepted atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		chunk := make([]byte, 1<<20)
+		for {
+			if stream.WriteAudio(context.Background(), chunk) != nil {
+				return
+			}
+			accepted.Add(int64(len(chunk)))
+		}
+	}()
+	events := drainSTT(t, stream)
+	<-done
+	var estimate *protocol.BillingObservation
+	for _, event := range events {
+		if event.Type == protocol.EventUsageObserved && event.Billing != nil && event.Billing.Quantities["duration_seconds"] > 0 {
+			estimate = event.Billing
+		}
+	}
+	if estimate == nil || estimate.Quantities["duration_seconds"] != accepted.Load() {
+		t.Fatalf("estimate = %+v, WriteAudio accepted %d bytes", estimate, accepted.Load())
+	}
+}
+
 // A close reason is vendor text. If Omi ever echoed the key in one, it must
 // not reach the error's message, cause or extension, before or after ready.
 func TestACloseReasonNeverCarriesTheKey(t *testing.T) {
