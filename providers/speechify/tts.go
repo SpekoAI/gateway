@@ -31,12 +31,13 @@ const (
 	defaultMaxResponseBytes = 128 << 20
 	defaultCloseIdleTimeout = 30 * time.Second
 	// Raw HTTP callers are expected to pin a date version. This is the version
-	// used by Speechify's current official SDK examples and includes Simba 3.2.
+	// used by Speechify's current official SDK examples and includes Simba 3.2;
+	// simba-3.5 answers under it too, as 24 kHz PCM (measured 2026-10-20).
 	apiVersion = "2026-07-07"
 )
 
 var simbaModels = map[string]struct{}{
-	"simba-3.2": {}, "simba-3.0": {}, "simba-multilingual": {}, "simba-english": {},
+	"simba-3.5": {}, "simba-3.2": {}, "simba-3.0": {}, "simba-multilingual": {}, "simba-english": {},
 }
 
 type Config struct {
@@ -519,6 +520,16 @@ func statusError(response *http.Response) error {
 	}
 	if json.Valid(body) {
 		providerErr.Extensions = map[string]json.RawMessage{extensionID: append(json.RawMessage(nil), body...)}
+		// Speechify names the refusal in error.code, e.g. model_retired,
+		// pronunciations_unsupported or content_policy_violation.
+		var envelope struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(body, &envelope) == nil && strings.TrimSpace(envelope.Error.Code) != "" {
+			providerErr.Message += " (" + strings.TrimSpace(envelope.Error.Code) + ")"
+		}
 	}
 	return providerErr
 }

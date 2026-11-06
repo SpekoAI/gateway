@@ -77,7 +77,7 @@ func TestAdapterAcceptsCompletePublishedSimbaFamily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, model := range []string{"simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"} {
+	for _, model := range []string{"simba-3.5", "simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"} {
 		stream, err := adapter.Open(context.Background(), adapterRequest("https://api.speechify.ai/v1/audio/stream", model))
 		if err != nil {
 			t.Errorf("model %s: %v", model, err)
@@ -87,6 +87,73 @@ func TestAdapterAcceptsCompletePublishedSimbaFamily(t *testing.T) {
 	}
 	if _, err := adapter.Open(context.Background(), adapterRequest("https://api.speechify.ai/v1/audio/stream", "simba-turbo")); err == nil {
 		t.Fatal("deprecated simba-turbo was accepted")
+	}
+}
+
+// Speechify resolves the language tag itself (nb/no, fil/tl, tags outside its
+// documented list), so simba-3.5 gets the caller's tag verbatim.
+func TestCommitTextSendsSimba35WithLanguageUnchanged(t *testing.T) {
+	requestSeen := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var decoded map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&decoded); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		requestSeen <- decoded
+		w.Header().Set("Content-Type", "audio/L16;rate=24000;channels=1")
+		_, _ = w.Write([]byte{0, 1})
+	}))
+	defer server.Close()
+	parsed, _ := url.Parse(server.URL)
+	adapter, err := New(Config{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := adapterRequest(server.URL+streamPath, "simba-3.5")
+	request.Options.Language = "ja-JP"
+	stream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = stream.Close(context.Background()) }()
+	if err := stream.AppendText(context.Background(), "こんにちは"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if body := <-requestSeen; body["model"] != "simba-3.5" || body["language"] != "ja-JP" {
+		t.Fatalf("body = %#v", body)
+	}
+}
+
+func TestStatusErrorNamesSpeechifyErrorCode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":"model_retired","message":"simba-turbo is retired"}}`))
+	}))
+	defer server.Close()
+	parsed, _ := url.Parse(server.URL)
+	adapter, _ := New(Config{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+	stream, err := adapter.Open(context.Background(), adapterRequest(server.URL+streamPath, DefaultModel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close(context.Background()) }()
+	if err := stream.AppendText(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	err = stream.CommitText(context.Background())
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != "provider_rejected_request" || providerErr.Retryable {
+		t.Fatalf("commit error = %v, want non-retryable provider_rejected_request", err)
+	}
+	if providerErr.Message != "Speechify TTS rejected the synthesis request with status 400 (model_retired)" {
+		t.Fatalf("message = %q", providerErr.Message)
+	}
+	if _, ok := providerErr.Extensions[extensionID]; !ok {
+		t.Fatalf("extensions = %v, want the raw body", providerErr.Extensions)
 	}
 }
 
