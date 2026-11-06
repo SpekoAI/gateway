@@ -682,6 +682,9 @@ func (s *sttStream) handle(frameType string, raw []byte) bool {
 	case "error":
 		var detail errorDetail
 		_ = json.Unmarshal(raw, &detail)
+		// The runtime aborts on the terminal error, so the bytes already sent
+		// must be reported first or finish never gets the chance.
+		s.reportEstimate()
 		s.fail(providerError("Omi STT reported an error", &detail, 0, raw))
 	default:
 		if _, quiet := quietFrames[frameType]; quiet {
@@ -740,7 +743,15 @@ func (s *sttStream) opened(raw []byte) {
 	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventSessionReady, Data: marshalData(data), Extensions: extension(raw)})
 	// The opening observation stays incomplete until canonical_record
 	// reports the metered audio.
-	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(s.baseData()), Billing: s.observation()})
+	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(s.usageData()), Billing: s.observation()})
+}
+
+// usageData is the public payload of a usage.observed event: the provider
+// correlation ID and the bytes sent, as other adapters report. Omi's own
+// session statistics travel in the namespaced extension, which telemetry
+// never copies.
+func (s *sttStream) usageData() map[string]any {
+	return map[string]any{"provider_request_id": s.sessionID}
 }
 
 func (s *sttStream) baseData() map[string]any {
@@ -940,13 +951,14 @@ func (s *sttStream) record(raw []byte) bool {
 	s.writeMu.Unlock()
 	observation := metering.Duration("stream", s.model, "streaming", raw, 1, "session_stats", "audio_ms")
 	observation.ProviderRequestID = s.sessionID
-	data := s.baseData()
+	data := s.usageData()
 	data["audio_bytes"] = s.sentBytes.Load()
+	stats := map[string]any{}
 	if audioMS, ok := metering.Quantity(raw, 1, "session_stats", "audio_ms"); ok {
-		data["audio_ms"] = audioMS
+		stats["audio_ms"] = audioMS
 	}
 	if frame.SessionStats != nil && frame.SessionStats.Utterances != nil {
-		data["utterances"] = *frame.SessionStats.Utterances
+		stats["utterances"] = *frame.SessionStats.Utterances
 	}
 	if !observation.Complete {
 		// A record without audio_ms is not evidence of the metered audio:
@@ -955,7 +967,7 @@ func (s *sttStream) record(raw []byte) bool {
 		data["billing_evidence"] = "pcm_bytes_sent"
 	}
 	s.billed = true
-	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(data), Billing: observation})
+	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(data), Extensions: extension(marshalData(map[string]any{"session_stats": stats})), Billing: observation})
 	if !stopped {
 		return false
 	}
@@ -987,18 +999,29 @@ func (s *sttStream) estimate() *protocol.BillingObservation {
 	return observation
 }
 
+// reportEstimate reports, once, the bytes sent as incomplete evidence for a
+// ready session that will not get its canonical_record: the socket closed or
+// Omi sent a terminal error frame. It is a no-op once a record billed the
+// session.
+func (s *sttStream) reportEstimate() {
+	if !s.readyOnce.Load() || s.billed {
+		return
+	}
+	s.billed = true
+	data := s.usageData()
+	data["audio_bytes"] = s.sentBytes.Load()
+	data["billing_evidence"] = "pcm_bytes_sent"
+	s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(data), Billing: s.estimate()})
+}
+
 // finish classifies how the socket ended. A close after Abort, or after the
 // canonical_record that answered stop, is normal. A session that ends
 // without its record reports the bytes it sent as incomplete evidence. A
 // failure an error frame already explained is not reported twice; anything
 // else is classified from the close status.
 func (s *sttStream) finish(err error) {
-	if s.readyOnce.Load() && !s.billed && !s.closed.Load() {
-		s.billed = true
-		data := s.baseData()
-		data["audio_bytes"] = s.sentBytes.Load()
-		data["billing_evidence"] = "pcm_bytes_sent"
-		s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(data), Billing: s.estimate()})
+	if !s.closed.Load() {
+		s.reportEstimate()
 	}
 	if s.drainTimedOut.Load() {
 		s.fail(&runtimepkg.ProviderError{Code: "request_timeout", Message: fmt.Sprintf("Omi STT sent no canonical_record within %s of stop", s.drainTimeout), Retryable: false, Cause: err})
@@ -1013,9 +1036,13 @@ func (s *sttStream) finish(err error) {
 	}
 	status := websocket.CloseStatus(err)
 	reason := ""
+	cause := err
 	var closeErr websocket.CloseError
 	if errors.As(err, &closeErr) {
-		reason = strings.TrimSpace(closeErr.Reason)
+		// A close reason is vendor text: scrub the credential from it before
+		// it reaches the message, the cause or the extension.
+		reason = strings.TrimSpace(string(s.redact([]byte(closeErr.Reason))))
+		cause = websocket.CloseError{Code: closeErr.Code, Reason: reason}
 	}
 	failure := socketFailure(int(status), reason)
 	switch {
@@ -1024,7 +1051,7 @@ func (s *sttStream) finish(err error) {
 	case s.inputClosed.Load() && status == websocket.StatusNormalClosure:
 		failure.Message = "Omi STT closed the session after stop without a canonical_record"
 	}
-	failure.Cause = err
+	failure.Cause = cause
 	if status != -1 {
 		failure.Extensions = map[string]json.RawMessage{extensionID: marshalData(map[string]any{"close_status": int(status), "close_reason": reason})}
 	}

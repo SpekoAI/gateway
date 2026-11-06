@@ -608,8 +608,13 @@ func TestCloseSendsStopAndBillsTheRecordsAudioMS(t *testing.T) {
 		billing.Mode != "streaming" || billing.Model != Model || billing.Language != "" || billing.ProviderRequestID != start["session_id"] {
 		t.Fatalf("closing billing = %+v", billing)
 	}
-	if data := dataOf(t, usage); data["audio_ms"] != float64(1990) || data["audio_bytes"] != float64(64_000) {
+	// The public payload is the correlation ID and the bytes sent; Omi's
+	// session statistics stay in the namespaced extension telemetry never copies.
+	if data := dataOf(t, usage); len(data) != 2 || data["audio_bytes"] != float64(64_000) || data["provider_request_id"] != start["session_id"] {
 		t.Fatalf("closing usage data = %v", data)
+	}
+	if raw := string(usage.Extensions[extensionID]); !strings.Contains(raw, `"audio_ms":1990`) {
+		t.Fatalf("closing usage extension = %s", raw)
 	}
 	if len(controls) != 1 || controls[0] != `{"type":"stop"}` {
 		t.Fatalf("controls = %v, want one stop", controls)
@@ -734,6 +739,76 @@ func TestMidSessionDisconnectBillsTheBytesSentAndIsRetryable(t *testing.T) {
 	if billing := lastUsage(t, events).Billing; billing.Complete || billing.Quantities["duration_seconds"] != 3200 {
 		t.Fatalf("billing = %+v", billing)
 	}
+}
+
+// A terminal error frame mid-session makes the runtime abort the stream, so
+// the bytes already sent must be reported before the error, not left to the
+// close that never gets read.
+func TestAMidSessionErrorFrameReportsTheBytesSentFirst(t *testing.T) {
+	t.Parallel()
+	fake := newFakeStream(t)
+	fake.onAudio = []string{`{"type":"error","code":"INTERNAL_ERROR","message":"vendor detail"}`}
+	fake.closeAfterAudio = websocket.StatusPolicyViolation
+	stream := openSTT(t, fake, STTConfig{}, sttRequest(fake.endpoint()))
+	if err := stream.WriteAudio(context.Background(), make([]byte, 3200)); err != nil {
+		t.Fatal(err)
+	}
+	events := drainSTT(t, stream)
+	estimate, failure := -1, -1
+	for i, event := range events {
+		if event.Type == protocol.EventUsageObserved && event.Billing != nil && event.Billing.Quantities["duration_seconds"] == 3200 {
+			estimate = i
+			if event.Billing.Complete || dataOf(t, event)["billing_evidence"] != "pcm_bytes_sent" {
+				t.Fatalf("estimate = %+v %s", event.Billing, event.Data)
+			}
+		}
+		if event.Err != nil && failure < 0 {
+			failure = i
+		}
+	}
+	if estimate < 0 || failure < 0 || estimate > failure {
+		t.Fatalf("estimate at %d, terminal error at %d: the bytes sent must be reported first", estimate, failure)
+	}
+}
+
+// A close reason is vendor text. If Omi ever echoed the key in one, it must
+// not reach the error's message, cause or extension, before or after ready.
+func TestACloseReasonNeverCarriesTheKey(t *testing.T) {
+	t.Parallel()
+	leaks := func(where string, failure *runtimepkg.ProviderError) {
+		t.Helper()
+		texts := []string{failure.Message}
+		if failure.Cause != nil {
+			texts = append(texts, failure.Cause.Error())
+		}
+		for _, raw := range failure.Extensions {
+			texts = append(texts, string(raw))
+		}
+		for _, text := range texts {
+			if strings.Contains(text, testKey) {
+				t.Fatalf("%s: the key leaked into %q", where, text)
+			}
+		}
+	}
+	before := newFakeStream(t)
+	before.open = []string{}
+	before.closeAfterOpen = websocket.StatusTryAgainLater
+	before.closeReason = "bad " + testKey
+	_, err := newTestSTT(t, before, STTConfig{}).Open(context.Background(), sttRequest(before.endpoint()))
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) {
+		t.Fatalf("Open error = %#v", err)
+	}
+	leaks("before ready", providerErr)
+
+	after := newFakeStream(t)
+	after.closeAfterAudio = websocket.StatusInternalError
+	after.closeReason = "bad " + testKey
+	stream := openSTT(t, after, STTConfig{}, sttRequest(after.endpoint()))
+	if err := stream.WriteAudio(context.Background(), make([]byte, 3200)); err != nil {
+		t.Fatal(err)
+	}
+	leaks("after ready", terminalFailure(t, drainSTT(t, stream)))
 }
 
 func TestAServerEndedSessionAtItsCapIsInputTooLarge(t *testing.T) {
