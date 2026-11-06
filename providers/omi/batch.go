@@ -319,6 +319,10 @@ func (a *BatchAdapter) awaitJob(ctx context.Context, endpoint *url.URL, credenti
 	pollCtx, cancel := context.WithTimeout(ctx, a.pollDeadline)
 	defer cancel()
 	backoff := a.pollInterval
+	// text holds a finished transcript whose speaker labels or word timings
+	// were still being attached. If the deadline passes first, the caller
+	// gets the final text without them, as for a language Omi cannot align.
+	var text *runtimepkg.BatchTranscription
 	for {
 		pollRequest, err := http.NewRequestWithContext(pollCtx, http.MethodGet, pollURL.String(), nil)
 		if err != nil {
@@ -328,6 +332,9 @@ func (a *BatchAdapter) awaitJob(ctx context.Context, endpoint *url.URL, credenti
 		pollRequest.Header.Set("Authorization", "Bearer "+credential)
 		polled, err := batchhttp.Do(a.httpClient, pollRequest, a.maxResponseBytes)
 		if err != nil {
+			if text != nil && pollCtx.Err() != nil {
+				return text, nil
+			}
 			return nil, a.pollError(pollCtx, err)
 		}
 		wait := a.pollInterval
@@ -344,14 +351,23 @@ func (a *BatchAdapter) awaitJob(ctx context.Context, endpoint *url.URL, credenti
 				return nil, err
 			}
 			done, result, err := a.jobState(pollCtx, endpoint, credential, state, requestID, requested)
+			if err != nil && text != nil && pollCtx.Err() != nil {
+				return text, nil
+			}
 			if err != nil || done {
 				return result, err
+			}
+			if result != nil {
+				text = result
 			}
 		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-pollCtx.Done():
 			timer.Stop()
+			if text != nil {
+				return text, nil
+			}
 			return nil, a.pollError(pollCtx, pollCtx.Err())
 		case <-timer.C:
 		}
@@ -410,31 +426,38 @@ func (a *BatchAdapter) jobState(ctx context.Context, endpoint *url.URL, credenti
 			content = []byte(inner)
 		}
 		result, err := parseBatchResponse(content, requestID, requested)
+		if err == nil && decorating(content, requested) {
+			// The text is final; poll again for the labels the caller asked for.
+			return false, result, nil
+		}
 		return true, result, err
 	}
 	download := strings.TrimSpace(state.Result.DownloadURL)
 	if download == "" {
 		return true, nil, batchhttp.Malformed(errors.New("omi job result carries neither content nor download_url"))
 	}
-	result, err := a.download(ctx, endpoint, credential, download, requestID, requested)
-	return true, result, err
+	result, still, err := a.download(ctx, endpoint, credential, download, requestID, requested)
+	return !still, result, err
 }
 
 // download fetches a job's stored result. The bearer goes only to the API's
 // own origin; a signed storage URL authenticates itself and must not see the
 // key. The URL is never quoted in an error: its signature is a credential.
-func (a *BatchAdapter) download(ctx context.Context, endpoint *url.URL, credential, raw, requestID string, requested batchRequest) (*runtimepkg.BatchTranscription, error) {
+// The second result reports whether Omi is still attaching the speaker labels
+// or word timings the caller asked for, so the poll should fetch it again
+// (each poll may carry a fresh download_url).
+func (a *BatchAdapter) download(ctx context.Context, endpoint *url.URL, credential, raw, requestID string, requested batchRequest) (*runtimepkg.BatchTranscription, bool, error) {
 	target, err := url.Parse(raw)
 	if err != nil || target.Hostname() == "" || target.User != nil || target.Fragment != "" {
-		return nil, batchhttp.Malformed(errors.New("omi job download_url is not a clean absolute URL"))
+		return nil, false, batchhttp.Malformed(errors.New("omi job download_url is not a clean absolute URL"))
 	}
 	if target.Scheme != "https" && !(a.allowInsecureEndpoint && target.Scheme == "http") {
-		return nil, batchhttp.Malformed(errors.New("omi job download_url must use https"))
+		return nil, false, batchhttp.Malformed(errors.New("omi job download_url must use https"))
 	}
 	authorize := sameOrigin(endpoint, target)
 	downloadRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
-		return nil, batchhttp.Malformed(errors.New("omi job download_url could not be requested"))
+		return nil, false, batchhttp.Malformed(errors.New("omi job download_url could not be requested"))
 	}
 	downloadRequest.Header.Set("Accept", "application/json")
 	if authorize {
@@ -442,13 +465,14 @@ func (a *BatchAdapter) download(ctx context.Context, endpoint *url.URL, credenti
 	}
 	fetched, err := batchhttp.Do(a.httpClient, downloadRequest, a.maxResponseBytes)
 	if err != nil {
-		return nil, withoutURL(err)
+		return nil, false, withoutURL(err)
 	}
 	if fetched.Status < 200 || fetched.Status >= 300 {
 		// A storage error body may restate the signed URL, so it is not kept.
-		return nil, providerError(fmt.Sprintf("Omi job result download failed with status %d", fetched.Status), nil, fetched.Status, nil)
+		return nil, false, providerError(fmt.Sprintf("Omi job result download failed with status %d", fetched.Status), nil, fetched.Status, nil)
 	}
-	return parseBatchResponse(fetched.Body, requestID, requested)
+	result, err := parseBatchResponse(fetched.Body, requestID, requested)
+	return result, err == nil && decorating(fetched.Body, requested), err
 }
 
 // sameOrigin resolves a poll URL against the submit endpoint and accepts it
@@ -503,6 +527,25 @@ type batchResponse struct {
 	Duration   float64        `json:"duration"`
 	Segments   []batchSegment `json:"segments"`
 	Words      []batchWord    `json:"words"`
+	// Decoration reports speaker labelling on a diarized job. Omi delivers
+	// the final text first; while Status is "processing" the speaker labels
+	// and word timings are still being attached (docs.omi.health/async).
+	Decoration *struct {
+		Status string `json:"status"`
+	} `json:"decoration"`
+}
+
+// decorating reports whether a result still lacks the speaker labels or word
+// timings the caller asked for because Omi is attaching them.
+func decorating(body []byte, requested batchRequest) bool {
+	if !requested.wantSpeakers && !requested.wantWords {
+		return false
+	}
+	var payload batchResponse
+	if json.Unmarshal(body, &payload) != nil || payload.Decoration == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(payload.Decoration.Status), "processing")
 }
 
 type batchSegment struct {

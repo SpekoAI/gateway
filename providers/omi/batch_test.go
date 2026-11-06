@@ -555,6 +555,68 @@ func TestBatchJobIsLongPolledToItsInlineResult(t *testing.T) {
 	}
 }
 
+// A diarized job can reach succeeded with the final text while Omi is still
+// attaching speaker labels (decoration.status processing). A caller who asked
+// for words keeps polling until they arrive.
+func TestBatchJobWaitsForDecorationTheCallerAskedFor(t *testing.T) {
+	t.Parallel()
+	textFirst := strings.Replace(verboseResponse, `"language_source":"requested"`, `"language_source":"requested","decoration":{"status":"processing"}`, 1)
+	decorated := strings.Replace(diarizedResponse, `"request_id":"req_diarized"`, `"request_id":"req_diarized","decoration":{"status":"complete"}`, 1)
+	fake := newFakeOmiAPI(t, http.StatusAccepted, `{"id":"job_d","status":"accepted","poll_url":"/v1/jobs/job_d"}`)
+	fake.polls = []fakeAnswer{
+		{200, `{"id":"job_d","status":"succeeded","result":{"inline":true,"content":` + textFirst + `}}`},
+		{200, `{"id":"job_d","status":"succeeded","result":{"inline":true,"content":` + decorated + `}}`},
+	}
+	on := true
+	request := uploadRequest(fake.endpoint(), "en", wav(3200, 3200))
+	request.Options.STT = &protocol.SttOptions{WordTimestamps: &on}
+	result, err := transcribe(t, fake, BatchConfig{}, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Words) != 4 {
+		t.Fatalf("words = %d, want the 4 the decorated result carries", len(result.Words))
+	}
+	fake.mu.Lock()
+	polls := len(fake.pollQueries)
+	fake.mu.Unlock()
+	if polls != 2 {
+		t.Fatalf("polls = %d, want 2", polls)
+	}
+
+	// Without a request for words or speakers the first succeeded result ends
+	// the job.
+	plain := newFakeOmiAPI(t, http.StatusAccepted, `{"id":"job_p","status":"accepted","poll_url":"/v1/jobs/job_p"}`)
+	plain.polls = []fakeAnswer{{200, `{"id":"job_p","status":"succeeded","result":{"inline":true,"content":` + textFirst + `}}`}}
+	if _, err := transcribe(t, plain, BatchConfig{}, uploadRequest(plain.endpoint(), "en", wav(3200, 3200))); err != nil {
+		t.Fatal(err)
+	}
+	plain.mu.Lock()
+	defer plain.mu.Unlock()
+	if len(plain.pollQueries) != 1 {
+		t.Fatalf("plain polls = %d, want 1", len(plain.pollQueries))
+	}
+}
+
+// If decoration never finishes inside the poll deadline, the caller gets the
+// final text without labels, as for a language Omi cannot align.
+func TestBatchJobReturnsTheTextWhenDecorationOutlastsTheDeadline(t *testing.T) {
+	t.Parallel()
+	textFirst := strings.Replace(verboseResponse, `"language_source":"requested"`, `"language_source":"requested","decoration":{"status":"processing"}`, 1)
+	fake := newFakeOmiAPI(t, http.StatusAccepted, `{"id":"job_s","status":"accepted","poll_url":"/v1/jobs/job_s"}`)
+	for range 200 {
+		fake.polls = append(fake.polls, fakeAnswer{200, `{"id":"job_s","status":"succeeded","result":{"inline":true,"content":` + textFirst + `}}`})
+	}
+	on := true
+	request := uploadRequest(fake.endpoint(), "en", wav(3200, 3200))
+	request.Options.STT = &protocol.SttOptions{Diarization: &on}
+	result, err := transcribe(t, fake, BatchConfig{PollDeadline: 150 * time.Millisecond}, request)
+	if err != nil || result.Text != "Patient reports chest pain." {
+		t.Fatalf("result = %+v, err = %v; want the text-only transcript", result, err)
+	}
+	checkBilling(t, result, 7380, "req_abc123")
+}
+
 func TestBatchJobResultCanBeAJSONString(t *testing.T) {
 	t.Parallel()
 	fake := newFakeOmiAPI(t, http.StatusAccepted, `{"id":"job_2","status":"queued"}`)
