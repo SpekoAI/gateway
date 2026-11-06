@@ -421,7 +421,7 @@ func TestBatchRefusesWhatItCannotServeWithoutUploading(t *testing.T) {
 		}, "invalid_request"},
 		"japanese":       {func(r *runtimepkg.BatchTranscribeRequest) { r.Options.Language = "ja" }, "unsupported_language"},
 		"stereo":         {func(r *runtimepkg.BatchTranscribeRequest) { r.Media.Channels = 2 }, "unsupported_media"},
-		"over the limit": {func(r *runtimepkg.BatchTranscribeRequest) { r.AudioBytes = BatchMaxAudioBytes + 1 }, "input_too_large"},
+		"over the limit": {func(r *runtimepkg.BatchTranscribeRequest) { r.AudioBytes = wavHeaderBytes + BatchMaxAudioBytes + 2 }, "input_too_large"},
 	}
 	for name, test := range cases {
 		fake := newFakeOmiAPI(t, http.StatusOK, verboseResponse)
@@ -502,10 +502,34 @@ func TestBatchRefusesARedirect(t *testing.T) {
 	}
 }
 
+// The relay admits an upload whose PCM is exactly the catalog's
+// MaxPCMBytes (BatchMaxAudioBytes); its WAV container, 44 bytes larger,
+// must not be refused here.
+func TestBatchAcceptsAWAVWhosePCMIsExactlyTheLimit(t *testing.T) {
+	t.Parallel()
+	for _, extra := range []int64{0, 1} {
+		fake := newFakeOmiAPI(t, http.StatusOK, verboseResponse)
+		request := uploadRequest(fake.endpoint(), "en", wav(3200, 3200))
+		request.AudioBytes = wavHeaderBytes + BatchMaxAudioBytes + extra
+		_, err := transcribe(t, fake, BatchConfig{}, request)
+		var providerErr *runtimepkg.ProviderError
+		refused := errors.As(err, &providerErr) && providerErr.Code == batchhttp.CodeInputTooLarge
+		if refused != (extra > 0) {
+			t.Fatalf("PCM %d bytes over the limit: refused=%v (%v)", extra, refused, err)
+		}
+	}
+	if wavHeaderBytes+BatchMaxAudioBytes+16<<10-wavHeaderBytes > 100_000_000 {
+		t.Fatal("the header and the multipart reserve no longer fit under Omi's 100 MB")
+	}
+}
+
 func TestBatchJobIsLongPolledToItsInlineResult(t *testing.T) {
 	t.Parallel()
-	fake := newFakeOmiAPI(t, http.StatusAccepted, `{"id":"job_1","status":"queued","poll_url":"/v1/jobs/job_1"}`)
+	// The documented flow: a 202 that says accepted, then accepted and
+	// running polls, then succeeded.
+	fake := newFakeOmiAPI(t, http.StatusAccepted, `{"id":"job_1","status":"accepted","poll_url":"/v1/jobs/job_1"}`)
 	fake.polls = []fakeAnswer{
+		{200, `{"id":"job_1","status":"accepted"}`},
 		{200, `{"id":"job_1","status":"running"}`},
 		{503, `{"error":{"code":"service_unavailable"}}`},
 		{429, `{"error":{"code":"queue_full"}}`},
@@ -521,8 +545,8 @@ func TestBatchJobIsLongPolledToItsInlineResult(t *testing.T) {
 	checkBilling(t, result, 7380, "req_abc123")
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if len(fake.pollQueries) != 4 {
-		t.Fatalf("polls = %d, want 4", len(fake.pollQueries))
+	if len(fake.pollQueries) != 5 {
+		t.Fatalf("polls = %d, want 5", len(fake.pollQueries))
 	}
 	for index, query := range fake.pollQueries {
 		if query.Get("wait") != "20" || query.Get("include_result") != "true" || fake.pollAuth[index] != "Bearer "+testKey {

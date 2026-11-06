@@ -32,9 +32,11 @@ const (
 	BatchEndpoint = "https://api.us.omi.health/v1/audio/transcriptions"
 	// BatchModel is the model an upload asks for.
 	BatchModel = Model
-	// BatchMaxAudioBytes holds the file under Omi's 100 MB upload limit,
-	// read as decimal megabytes, with room left for the multipart envelope
-	// around it. A larger upload is refused before any of it is sent.
+	// BatchMaxAudioBytes is the largest PCM payload an upload carries: the
+	// relay catalog's MaxPCMBytes for this row. The WAV header and the
+	// multipart envelope fit in the 16 KiB left under Omi's 100 MB upload
+	// limit, read as decimal megabytes. A larger payload is refused before
+	// any of it is sent.
 	BatchMaxAudioBytes int64 = 100_000_000 - 16<<10
 	// BatchMaxDurationSeconds is Omi's two-hour cap (422 audio_too_long).
 	// At the rates the relay carries, BatchMaxAudioBytes binds first.
@@ -147,7 +149,9 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	}
 	// Refuse before reading the file rather than after streaming a body the
 	// service would refuse.
-	if request.AudioBytes > BatchMaxAudioBytes || audioSeconds(request.Media, request.AudioBytes) > BatchMaxDurationSeconds {
+	// The limit is on the PCM, so the relay's MaxPCMBytes check and this one
+	// agree at the boundary; the 44-byte header fits in the envelope reserve.
+	if request.AudioBytes-wavHeaderBytes > BatchMaxAudioBytes || audioSeconds(request.Media, request.AudioBytes) > BatchMaxDurationSeconds {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInputTooLarge, Message: "the upload exceeds Omi's 100 MB transcription limit", Hint: "Split the audio into files under 100 MB (about 52 minutes at 16 kHz)."}
 	}
 	credential, err := batchhttp.Credential(request.Plan)
@@ -387,7 +391,9 @@ func (a *BatchAdapter) jobState(ctx context.Context, endpoint *url.URL, credenti
 		return true, nil, batchhttp.Failed(batchExtensionID, "")
 	case "expired", "canceled", "cancelled":
 		return true, nil, batchhttp.Failed(batchExtensionID, state.Status)
-	case "queued", "pending", "running", "processing", "in_progress", "":
+	// Omi documents awaiting_upload, accepted, running, succeeded and failed
+	// (docs.omi.health/async); the rest are tolerated spellings.
+	case "awaiting_upload", "accepted", "queued", "pending", "running", "processing", "in_progress", "":
 		return false, nil, nil
 	default:
 		return true, nil, batchhttp.Malformed(fmt.Errorf("omi job status %q", state.Status))
