@@ -277,3 +277,33 @@ func TestSonioxEndpointOptionsAreRangeChecked(t *testing.T) {
 		}
 	}
 }
+
+// Omi's realtime socket takes only its endpointer's silence window, bounded
+// 200 to 1100 ms; its speaker labels are provisional, it has no keyterms and
+// no word timings, so each of those asks is refused by name.
+func TestOmiTakesOnlyABoundedSilenceWindow(t *testing.T) {
+	t.Parallel()
+	settings := func(values map[string]any) *protocol.SttOptions {
+		return &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"omi": values}}
+	}
+	for _, value := range []float64{200, 640, 1100} {
+		if err := validateSttRouteSupport("omi", "omi-medical-1", settings(map[string]any{"silence_ms": value})); err != nil {
+			t.Fatalf("silence_ms %v: %v", value, err)
+		}
+	}
+	for name, options := range map[string]*protocol.SttOptions{
+		"silence below 200":    settings(map[string]any{"silence_ms": float64(150)}),
+		"silence above 1100":   settings(map[string]any{"silence_ms": float64(1200)}),
+		"fractional silence":   settings(map[string]any{"silence_ms": 500.5}),
+		"silence as a string":  settings(map[string]any{"silence_ms": "500"}),
+		"unlisted vendor knob": settings(map[string]any{"vocabulary": "metformin"}),
+		"diarization":          {Diarization: boolPointer(true)},
+		"keywords":             {Keywords: []string{"metformin"}},
+		"word timestamps":      {WordTimestamps: boolPointer(true)},
+	} {
+		var supportError *SttSupportError
+		if err := validateSttRouteSupport("omi", "omi-medical-1", options); !errors.As(err, &supportError) {
+			t.Fatalf("%s: want a support error, got %v", name, err)
+		}
+	}
+}
