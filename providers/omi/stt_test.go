@@ -937,10 +937,22 @@ func TestAnErrorBetweenWritesFromASilentPeerEndsTheNextWrite(t *testing.T) {
 	if err := stream.WriteAudio(context.Background(), make([]byte, 3200)); err != nil {
 		t.Fatal(err)
 	}
+	// Wait for the reader to have processed the error: the bytes-sent
+	// estimate is published just before it. No write is in flight now.
+	deadline := time.After(5 * time.Second)
+	for sawEstimate := false; !sawEstimate; {
+		select {
+		case event, ok := <-stream.Events():
+			if !ok {
+				t.Fatal("events closed before the bytes-sent estimate")
+			}
+			sawEstimate = event.Type == protocol.EventUsageObserved && dataOf(t, event)["billing_evidence"] == "pcm_bytes_sent"
+		case <-deadline:
+			t.Fatal("the error frame was never processed")
+		}
+	}
 	drained := make(chan []runtimepkg.ProviderEvent, 1)
 	go func() { drained <- drainSTT(t, stream) }()
-	// Give the error frame time to arrive while no write is in flight.
-	time.Sleep(200 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	err := stream.WriteAudio(ctx, make([]byte, 3200))
@@ -948,20 +960,13 @@ func TestAnErrorBetweenWritesFromASilentPeerEndsTheNextWrite(t *testing.T) {
 	if !errors.As(err, &providerErr) {
 		t.Fatalf("the next WriteAudio returned %v, want the terminal provider error before its deadline", err)
 	}
-	var events []runtimepkg.ProviderEvent
 	select {
-	case events = <-drained:
+	case events := <-drained:
+		if terminalFailure(t, events) == nil {
+			t.Fatal("no terminal error after the estimate")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("events never closed after the error")
-	}
-	sawEstimate := false
-	for _, event := range events {
-		if event.Type == protocol.EventUsageObserved && dataOf(t, event)["billing_evidence"] == "pcm_bytes_sent" {
-			sawEstimate = true
-		}
-	}
-	if !sawEstimate {
-		t.Fatal("no bytes-sent estimate was published")
 	}
 }
 
