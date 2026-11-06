@@ -254,8 +254,10 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	conn.SetReadLimit(a.maxMessageBytes)
 
 	streamCtx, cancel := context.WithCancel(context.Background())
+	writeCtx, cancelWrites := context.WithCancel(streamCtx)
 	stream := &sttStream{
 		conn: conn, ctx: streamCtx, cancel: cancel,
+		writeCtx: writeCtx, cancelWrites: cancelWrites,
 		events:            make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		setupDone:         make(chan error, 1),
 		done:              make(chan struct{}),
@@ -373,9 +375,14 @@ func handshakeError(response *http.Response, cause error) error {
 
 // sttStream is one open realtime socket.
 type sttStream struct {
-	conn              *websocket.Conn
-	ctx               context.Context
-	cancel            context.CancelFunc
+	conn   *websocket.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+	// writeCtx bounds every socket write. reportEstimate cancels it so a
+	// write blocked on a peer that stopped reading cannot hold writeMu while
+	// the reader waits to publish the terminal evidence.
+	writeCtx          context.Context
+	cancelWrites      context.CancelFunc
 	events            chan runtimepkg.ProviderEvent
 	setupDone         chan error
 	done              chan struct{}
@@ -438,12 +445,45 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	if len(audio) == 0 {
 		return errors.New("omi stt audio is empty")
 	}
+	if s.estimated.Load() {
+		return s.afterTerminal(ctx)
+	}
 	if s.inputClosed.Load() || s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.inputClosed.Load() || s.closed.Load() || s.estimated.Load() {
+	if s.estimated.Load() {
+		s.writeMu.Unlock()
+		return s.afterTerminal(ctx)
+	}
+	err := s.writeAudioLocked(ctx, audio)
+	s.writeMu.Unlock()
+	if err != nil && s.estimated.Load() {
+		// reportEstimate cancelled this write to publish the session's end.
+		return s.afterTerminal(ctx)
+	}
+	return err
+}
+
+// afterTerminal is WriteAudio's answer once the session is ending on a
+// provider error. It waits, without holding writeMu, until the reader has
+// published the bytes-sent evidence and the terminal error, so the runtime
+// does not stop consuming events on an operation error first, then returns
+// that terminal error.
+func (s *sttStream) afterTerminal(ctx context.Context) error {
+	select {
+	case <-s.done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := s.TerminalError(); err != nil {
+		return err
+	}
+	return runtimepkg.ErrSessionClosed
+}
+
+func (s *sttStream) writeAudioLocked(ctx context.Context, audio []byte) error {
+	if s.inputClosed.Load() || s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
 	pcm := append(s.carry, audio...)
@@ -574,6 +614,10 @@ func (s *sttStream) writeLocked(ctx context.Context, messageType websocket.Messa
 	if s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(s.writeCtx, cancel)
+	defer stop()
 	if err := s.conn.Write(ctx, messageType, payload); err != nil {
 		if s.closed.Load() {
 			return runtimepkg.ErrSessionClosed
@@ -1011,10 +1055,13 @@ func (s *sttStream) reportEstimate() {
 		return
 	}
 	s.billed = true
-	// Taking the write lock waits out a frame in flight and closes input,
-	// so the count below covers every byte that reached the socket.
-	s.writeMu.Lock()
+	// Close input first, then cancel any write in flight (a peer that stopped
+	// reading would otherwise hold writeMu forever), then take the lock: the
+	// count below covers every frame that fully reached the socket, and no
+	// later WriteAudio adds to it.
 	s.estimated.Store(true)
+	s.cancelWrites()
+	s.writeMu.Lock()
 	s.writeMu.Unlock()
 	data := s.usageData()
 	data["audio_bytes"] = s.sentBytes.Load()

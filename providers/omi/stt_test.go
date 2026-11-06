@@ -44,6 +44,9 @@ type fakeStream struct {
 	onAudio        []string
 	// closeAfterAudio closes with this status after onAudio.
 	closeAfterAudio websocket.StatusCode
+	// stallAfterAudio stops reading after onAudio, so the client's writes
+	// back up as they would against a peer that has given up.
+	stallAfterAudio bool
 	// onFinalize is written after each finalize; %s is the finalize id.
 	onFinalize []string
 	// onStop precedes record after stop. ignoreStop sends nothing;
@@ -144,6 +147,10 @@ func (f *fakeStream) handle(writer http.ResponseWriter, request *http.Request) {
 			if !heard {
 				heard = true
 				f.write(ctx, conn, f.onAudio)
+				if f.stallAfterAudio {
+					<-ctx.Done()
+					return
+				}
 				if f.closeAfterAudio != 0 {
 					_ = conn.Close(f.closeAfterAudio, f.closeReason)
 					return
@@ -772,8 +779,9 @@ func TestAMidSessionErrorFrameReportsTheBytesSentFirst(t *testing.T) {
 }
 
 // A write racing the error frame must not land after the estimate: the
-// estimate closes input under the write lock, so it covers exactly the audio
-// WriteAudio accepted.
+// estimate closes input and cancels the write in flight before reading the
+// count, so it covers the audio WriteAudio accepted plus the whole frames the
+// cancelled write had already sent.
 func TestTheEstimateCoversEveryWriteThatRacedTheErrorFrame(t *testing.T) {
 	t.Parallel()
 	fake := newFakeStream(t)
@@ -800,8 +808,66 @@ func TestTheEstimateCoversEveryWriteThatRacedTheErrorFrame(t *testing.T) {
 			estimate = event.Billing
 		}
 	}
-	if estimate == nil || estimate.Quantities["duration_seconds"] != accepted.Load() {
-		t.Fatalf("estimate = %+v, WriteAudio accepted %d bytes", estimate, accepted.Load())
+	// Every byte of every accepted write is counted. The write the estimate
+	// cancelled may have put whole frames on the socket before it returned an
+	// error; those count too, and nothing beyond that one write does.
+	if estimate == nil {
+		t.Fatal("no bytes-sent estimate")
+	}
+	got := estimate.Quantities["duration_seconds"]
+	if got < accepted.Load() || got > accepted.Load()+1<<20 {
+		t.Fatalf("estimate = %d bytes, WriteAudio accepted %d", got, accepted.Load())
+	}
+}
+
+// Omi sends an error and stops reading. A write blocked on that peer must not
+// hold the write lock forever: the estimate cancels it, the evidence and the
+// error are published, and the blocked WriteAudio returns the terminal error
+// rather than a bare closed-session error the runtime would stop on first.
+func TestAnErrorFromAPeerThatStoppedReadingIsPublishedPromptly(t *testing.T) {
+	t.Parallel()
+	fake := newFakeStream(t)
+	fake.onAudio = []string{`{"type":"error","code":"INTERNAL_ERROR","message":"vendor detail"}`}
+	fake.stallAfterAudio = true
+	stream := openSTT(t, fake, STTConfig{}, sttRequest(fake.endpoint()))
+	writeErr := make(chan error, 1)
+	go func() {
+		chunk := make([]byte, 1<<20)
+		for {
+			if err := stream.WriteAudio(context.Background(), chunk); err != nil {
+				writeErr <- err
+				return
+			}
+		}
+	}()
+	drained := make(chan []runtimepkg.ProviderEvent, 1)
+	go func() { drained <- drainSTT(t, stream) }()
+	var events []runtimepkg.ProviderEvent
+	select {
+	case events = <-drained:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the terminal error never arrived: a blocked write held the session")
+	}
+	estimate, failure := -1, -1
+	for i, event := range events {
+		if event.Type == protocol.EventUsageObserved && dataOf(t, event)["billing_evidence"] == "pcm_bytes_sent" {
+			estimate = i
+		}
+		if event.Err != nil && failure < 0 {
+			failure = i
+		}
+	}
+	if estimate < 0 || failure < 0 || estimate > failure {
+		t.Fatalf("estimate at %d, terminal error at %d", estimate, failure)
+	}
+	select {
+	case err := <-writeErr:
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) {
+			t.Fatalf("WriteAudio returned %v, want the session's terminal provider error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteAudio stayed blocked after the session ended")
 	}
 }
 

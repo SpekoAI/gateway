@@ -617,6 +617,48 @@ func TestBatchJobReturnsTheTextWhenDecorationOutlastsTheDeadline(t *testing.T) {
 	checkBilling(t, result, 7380, "req_abc123")
 }
 
+// A caller who cancels while the labels are still attaching gets the
+// cancellation, not a successful text-only result: the text fallback belongs
+// to the adapter's own poll deadline.
+func TestBatchJobDecorationWaitHonoursTheCallersCancellation(t *testing.T) {
+	t.Parallel()
+	textFirst := strings.Replace(verboseResponse, `"language_source":"requested"`, `"language_source":"requested","decoration":{"status":"processing"}`, 1)
+	fake := newFakeOmiAPI(t, http.StatusAccepted, `{"id":"job_c","status":"accepted","poll_url":"/v1/jobs/job_c"}`)
+	for range 400 {
+		fake.polls = append(fake.polls, fakeAnswer{200, `{"id":"job_c","status":"succeeded","result":{"inline":true,"content":` + textFirst + `}}`})
+	}
+	on := true
+	request := uploadRequest(fake.endpoint(), "en", wav(3200, 3200))
+	request.Options.STT = &protocol.SttOptions{Diarization: &on}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result, err := newTestBatch(t, BatchConfig{PollDeadline: time.Minute}, fake.host()).Transcribe(ctx, request)
+	if err == nil {
+		t.Fatalf("a cancelled caller got a result: %+v", result)
+	}
+}
+
+// Omi's decoration.stale_after says when to stop waiting for labels even if
+// the status still reads processing; past it, the first result ends the job.
+func TestBatchJobStopsWaitingForDecorationAtStaleAfter(t *testing.T) {
+	t.Parallel()
+	stale := strings.Replace(verboseResponse, `"language_source":"requested"`, `"language_source":"requested","decoration":{"status":"processing","stale_after":"2026-01-01T00:00:00Z"}`, 1)
+	fake := newFakeOmiAPI(t, http.StatusAccepted, `{"id":"job_t","status":"accepted","poll_url":"/v1/jobs/job_t"}`)
+	fake.polls = []fakeAnswer{{200, `{"id":"job_t","status":"succeeded","result":{"inline":true,"content":` + stale + `}}`}}
+	on := true
+	request := uploadRequest(fake.endpoint(), "en", wav(3200, 3200))
+	request.Options.STT = &protocol.SttOptions{WordTimestamps: &on}
+	result, err := transcribe(t, fake, BatchConfig{}, request)
+	if err != nil || result.Text != "Patient reports chest pain." {
+		t.Fatalf("result = %+v, err = %v", result, err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.pollQueries) != 1 {
+		t.Fatalf("polls = %d, want 1: a stale decoration ends the wait", len(fake.pollQueries))
+	}
+}
+
 func TestBatchJobResultCanBeAJSONString(t *testing.T) {
 	t.Parallel()
 	fake := newFakeOmiAPI(t, http.StatusAccepted, `{"id":"job_2","status":"queued"}`)

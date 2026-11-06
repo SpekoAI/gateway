@@ -323,6 +323,9 @@ func (a *BatchAdapter) awaitJob(ctx context.Context, endpoint *url.URL, credenti
 	// were still being attached. If the deadline passes first, the caller
 	// gets the final text without them, as for a language Omi cannot align.
 	var text *runtimepkg.BatchTranscription
+	// Only the adapter's own poll deadline earns the text fallback; a caller
+	// that cancelled, or whose own deadline passed, gets its own error.
+	ownDeadline := func() bool { return text != nil && ctx.Err() == nil && pollCtx.Err() != nil }
 	for {
 		pollRequest, err := http.NewRequestWithContext(pollCtx, http.MethodGet, pollURL.String(), nil)
 		if err != nil {
@@ -332,7 +335,7 @@ func (a *BatchAdapter) awaitJob(ctx context.Context, endpoint *url.URL, credenti
 		pollRequest.Header.Set("Authorization", "Bearer "+credential)
 		polled, err := batchhttp.Do(a.httpClient, pollRequest, a.maxResponseBytes)
 		if err != nil {
-			if text != nil && pollCtx.Err() != nil {
+			if ownDeadline() {
 				return text, nil
 			}
 			return nil, a.pollError(pollCtx, err)
@@ -351,7 +354,7 @@ func (a *BatchAdapter) awaitJob(ctx context.Context, endpoint *url.URL, credenti
 				return nil, err
 			}
 			done, result, err := a.jobState(pollCtx, endpoint, credential, state, requestID, requested)
-			if err != nil && text != nil && pollCtx.Err() != nil {
+			if err != nil && ownDeadline() {
 				return text, nil
 			}
 			if err != nil || done {
@@ -365,7 +368,7 @@ func (a *BatchAdapter) awaitJob(ctx context.Context, endpoint *url.URL, credenti
 		select {
 		case <-pollCtx.Done():
 			timer.Stop()
-			if text != nil {
+			if ownDeadline() {
 				return text, nil
 			}
 			return nil, a.pollError(pollCtx, pollCtx.Err())
@@ -532,6 +535,9 @@ type batchResponse struct {
 	// and word timings are still being attached (docs.omi.health/async).
 	Decoration *struct {
 		Status string `json:"status"`
+		// StaleAfter is when Omi says to stop waiting for the labels even if
+		// Status still reads processing.
+		StaleAfter string `json:"stale_after"`
 	} `json:"decoration"`
 }
 
@@ -545,7 +551,14 @@ func decorating(body []byte, requested batchRequest) bool {
 	if json.Unmarshal(body, &payload) != nil || payload.Decoration == nil {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(payload.Decoration.Status), "processing")
+	if !strings.EqualFold(strings.TrimSpace(payload.Decoration.Status), "processing") {
+		return false
+	}
+	if stale, err := time.Parse(time.RFC3339, strings.TrimSpace(payload.Decoration.StaleAfter)); err == nil && !time.Now().Before(stale) {
+		// Enrichment stalled: Omi says to stop polling and keep the text.
+		return false
+	}
+	return true
 }
 
 type batchSegment struct {
