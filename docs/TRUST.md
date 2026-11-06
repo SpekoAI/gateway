@@ -324,6 +324,31 @@ numeric stream ID. They contain no audio, transcript, synthesis text
 or voice content. A socket that ends before the server's END reply, or a
 synthesis whose audio is cut off, leaves incomplete billing evidence.
 
+### Omi transcription
+
+Omi requests go only to `api.us.omi.health`, which Omi runs in the US (Ohio,
+us-east-2); the adapters accept no other host, so audio is processed in the
+US whichever cell the session starts from. There is no token exchange, so no
+managed provider-direct credential exists. The realtime socket carries the
+delegated key inside its first JSON `start` frame, as Omi's protocol requires,
+rather than in a header or the URL. That frame also carries a random session
+ID, the model, the language, the audio format and any caller `silence_ms`
+endpointing setting, and it is never logged, attached to events or errors, or
+echoed anywhere else. The socket then receives the session's 16 kHz audio.
+Prerecorded uploads send the WAV file, model, language, the response format
+and, when the caller asked for speaker labels or word timings, `diarize`, with
+the key as an `Authorization` bearer and an `Idempotency-Key` derived from
+opaque plan identifiers. When an upload is accepted as a job, the bearer goes
+only to poll URLs on the same Omi host; a result Omi hands back as a signed
+storage `download_url` is fetched without it. Redirects are refused on every
+request. Billing observations carry an opaque operation ID, the Omi session
+or request ID, model, mode and one duration: the `audio_ms` Omi reports in
+the socket's closing `canonical_record`, or the `duration` an upload returns.
+They contain no audio, transcript or language. A socket that ends without
+its `canonical_record` keeps its observation incomplete, carrying the audio
+bytes sent as an estimate rather than settling as complete; an upload
+without `duration` leaves incomplete evidence.
+
 ### Soniox usage attribution
 
 Soniox realtime STT and TTS requests using relay or managed plans include

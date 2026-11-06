@@ -274,6 +274,7 @@ Every catalog provider has a BYOK credential variable:
 | MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
 | Munsit | `SPEKO_MUNSIT_BYOK_API_KEY` | API key, sent as `x-api-key`; BYOK/Relay only because Munsit has no token exchange |
 | Nari Labs | `SPEKO_NARI_BYOK_API_KEY` | API key; one key serves both the synthesis endpoint and the transcription socket |
+| Omi Health | `SPEKO_OMI_BYOK_API_KEY` | API key; sent inside the realtime socket's JSON `start` frame and as a bearer on uploads; BYOK/Relay only because Omi has no token exchange |
 | OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
 | Palabra | `SPEKO_PALABRA_BYOK_API_KEY` | API key; dedicated STT/TTS sockets do not expose a scoped short-lived grant |
 | Paxa Labs | `SPEKO_PAXA_BYOK_API_KEY` | API key |
@@ -365,6 +366,7 @@ restarting the Gateway.
 | TTS | Munsit | `munsit.tts.v1` | `faseeh-v1-preview` |
 | STT | Hopper | `hopper.stt.v1` | `nemotron-asr` |
 | TTS | Hopper | `hopper.tts.v1` | `qwen3-tts` |
+| STT | Omi Health | `omi.stt.v1` | `omi-medical-1` |
 
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.
