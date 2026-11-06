@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import logging
+import uuid
 import weakref
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
@@ -18,6 +20,8 @@ import aiohttp
 from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
+    Agent,
+    AgentSession,
     APIConnectionError,
     APIConnectOptions,
     NotGivenOr,
@@ -25,6 +29,7 @@ from livekit.agents import (
     stt,
     tts,
     utils,
+    vad,
 )
 from livekit.agents.llm.tool_context import get_raw_function_info
 from livekit.agents.utils import is_given
@@ -37,6 +42,21 @@ from ._livekit_bridge import (
     LiveKitTTSEvent,
     LiveKitTTSStream,
 )
+from ._livekit_draining_vad import DrainingVAD
+from ._livekit_local_transcript import bind_local_transcript, restore_local_transcript
+from ._livekit_native_input import (
+    NativeInputBinding,
+    bind_native_input,
+    native_input_timeline,
+)
+from ._livekit_native_speaker import NativeSpeechData, bind_native_speaker_timing
+from ._livekit_native_stt import NativeSpeechStream
+from ._livekit_native_transcript import (
+    bind_native_transcript,
+    restore_native_transcript,
+)
+from ._livekit_native_turns import NativeTurnPolicy
+from ._speech_client import SpeechClient
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
 from .client import GatewayClient, GatewayError
 from .probe import report_leg as _report_probe_leg
@@ -47,6 +67,22 @@ from .relay import (
     RelayLLMClient,
     validate_reasoning_effort,
 )
+from .relay_speech import RelaySpeechClient
+
+__all__ = ["LLM", "STT", "TTS", "DrainingVAD"]
+
+
+def _speech_connect_options(
+    client: SpeechClient, options: APIConnectOptions
+) -> APIConnectOptions:
+    # Some supported LiveKit releases retry STT regardless of error.retryable;
+    # outer chunked synthesis can also replay input. Fence every framework loop.
+    return (
+        dataclasses.replace(options, max_retry=0)
+        if isinstance(client, RelaySpeechClient)
+        else options
+    )
+
 
 _logger = logging.getLogger(__name__)
 
@@ -63,6 +99,20 @@ def _report_stream_leg(kind: str, stream: Any) -> None:
         session_id=str(getattr(stream, "session_id", "") or ""),
         attempt_id=str(getattr(stream, "attempt_id", "") or ""),
     )
+
+
+def _speech_data(event: LiveKitSpeechEvent, language: str) -> NativeSpeechData:
+    data = NativeSpeechData(
+        language=event.language or language,
+        text=event.text,
+        speaker_id=event.speaker_id,
+        start_time=event.start_time or 0.0,
+        end_time=event.end_time or 0.0,
+    )
+    data.speaker_segments = tuple(_speech_data(part, language) for part in event.speaker_segments)
+    data.canonical_text = event.canonical_text
+    data._local_part_text = event.text
+    return data
 
 
 # STTCapabilities fields added after livekit-agents 1.4.5: keyterms and
@@ -113,7 +163,7 @@ class STT(stt.STT):
 
     def __init__(
         self,
-        client: GatewayClient | None = None,
+        client: SpeechClient | None = None,
         *,
         language: str = "en",
         model: str = "auto",
@@ -124,7 +174,14 @@ class STT(stt.STT):
         keywords: Sequence[str] | None = None,
         noise_reduction: bool | None = None,
         provider_options: Mapping[str, Mapping[str, Any]] | None = None,
+        turn_vad: vad.VAD | None = None,
     ) -> None:
+        if isinstance(client, RelaySpeechClient) and turn_vad is None:
+            raise ValueError(
+                "Native relay STT requires a local turn_vad for speech boundaries"
+            )
+        self._turn_vad = turn_vad if isinstance(client, RelaySpeechClient) else None
+        self._native_failed = False
         # Options are declared here and enforced at session create: a provider
         # that cannot honor a canonical ask refuses the session with the option
         # named (`stt_option_unsupported`), so the capabilities declared below
@@ -146,7 +203,8 @@ class STT(stt.STT):
                 offline_recognize=True,
                 keyterms=bool(keywords),
                 chat_context=False,
-                manual_flush=provider.strip().lower() in _FLUSH_ON_TURN_END_PROVIDERS,
+                manual_flush=provider.strip().lower() in _FLUSH_ON_TURN_END_PROVIDERS
+                and not isinstance(client, RelaySpeechClient),
             )
         )
         self._client = client or GatewayClient.from_env()
@@ -156,7 +214,267 @@ class STT(stt.STT):
         self._provider_name = provider
         self._credential_source = credential_source
         self._sample_rate = sample_rate
-        self._streams: weakref.WeakSet[SpeechStream] = weakref.WeakSet()
+        self._streams: weakref.WeakSet[stt.RecognizeStream] = weakref.WeakSet()
+        self._bound_agent: Agent | None = None
+        self._bound_session: AgentSession | None = None
+        self._turn_binding: tuple[Any, Any, Any] | None = None
+        self._native_transcript_binding: tuple[Any, Any, Any] | None = None
+        self._turn_listener: Any = None
+        self._native_wrappers: dict[int, tuple[Any, Any, Any]] = {}
+        self._native_input_binding: NativeInputBinding | None = None
+        self._native_deferred_turn: tuple[Any, bool] | None = None
+        self._native_turn_rearmed = False
+        self._native_reconsider_scheduled = False
+        self._native_turn_policy: NativeTurnPolicy | None = None
+        self._local_transcript_bindings: weakref.WeakSet[Any] = weakref.WeakSet()
+
+    def prewarm(self) -> None:
+        if not isinstance(self._client, RelaySpeechClient):
+            bind_local_transcript(self)
+
+    def bind_agent(self, agent: Agent) -> None:
+        """Locate the owned session through its initial Agent at stream start.
+
+        The binding follows that session across Agent handoffs. Public Agent
+        lifecycle hooks remain untouched, including turns that skip a reply.
+        """
+        if not isinstance(self._client, RelaySpeechClient):
+            return
+        if self._bound_agent is not None or self._bound_session is not None:
+            raise ValueError("Native STT is already bound to an AgentSession")
+        self._bound_agent = agent
+        self._native_input_binding = bind_native_input(self, agent=agent)
+
+    def bind_session(self, session: AgentSession) -> None:
+        """Bind native turn ownership before starting the supplied session."""
+        if not isinstance(self._client, RelaySpeechClient):
+            return
+        if self._bound_agent is not None or self._bound_session is not None:
+            raise ValueError("Native STT is already bound to an AgentSession")
+        self._bound_session = session
+        self._native_input_binding = bind_native_input(self, session=session)
+
+    def _restore_turn_binding(self) -> None:
+        restore_native_transcript(self)
+        if self._native_turn_policy is not None:
+            self._native_turn_policy.close()
+            self._native_turn_policy = None
+        self._native_deferred_turn = None
+        self._native_turn_rearmed = False
+        if self._turn_binding is not None:
+            activity, original, completed = self._turn_binding
+            if activity.on_end_of_turn is completed:
+                activity.on_end_of_turn = original
+            if getattr(activity, "_speko_native_stt_turn_owner", None) is self:
+                del activity._speko_native_stt_turn_owner
+            self._turn_binding = None
+
+    def _owns_native_recognition(self, candidate: Any) -> bool:
+        """Resolve SDK wrappers without granting automatic model failover."""
+        visited: set[int] = set()
+
+        def owns(model: Any) -> bool:
+            if model is self:
+                return True
+            if id(model) in visited:
+                return False
+            visited.add(id(model))
+            if isinstance(model, stt.MultiSpeakerAdapter):
+                # Older supported SDKs expose only _stt; newer ones also
+                # provide wrapped_stt. The adapter forwards this same stream.
+                if not owns(getattr(model, "wrapped_stt", model._stt)):
+                    return False
+                if (
+                    model._suppress_background
+                    or model._primary_format != "{text}"
+                    or model._background_format != "{text}"
+                ):
+                    raise ValueError(
+                        "Native STT turn ownership requires a transcript-preserving MultiSpeakerAdapter"
+                    )
+                self._fence_native_wrapper(model)
+                return True
+            if isinstance(model, stt.FallbackAdapter):
+                models = model._stt_instances
+                if not any(owns(child) for child in models):
+                    return False
+                if len(models) != 1:
+                    raise ValueError(
+                        "Native STT model fallback requires a control-plane recovery decision"
+                    )
+                self._fence_native_wrapper(model)
+                return True
+            return False
+
+        return owns(candidate)
+
+    def _fence_native_wrapper(self, wrapper: Any) -> None:
+        if id(wrapper) in self._native_wrappers:
+            return
+        original = wrapper.stream
+
+        def stream(*args: Any, **kwargs: Any) -> Any:
+            # Some wrappers construct their child asynchronously. Fence the
+            # wrapper's synchronous entry too, so nested fallback recovery
+            # cannot hide an ambiguous native outcome in an SDK retry loop.
+            self._check_native_admission()
+            result = original(*args, **kwargs)
+            if isinstance(wrapper, stt.MultiSpeakerAdapter):
+                bind_native_speaker_timing(result)
+            return result
+
+        wrapper.stream = stream
+        self._native_wrappers[id(wrapper)] = (wrapper, original, stream)
+
+    def _bind_native_activity(self, *, require_owner: bool = False) -> None:
+        if self._bound_session is None:
+            try:
+                assert self._bound_agent is not None
+                self._bound_session = self._bound_agent.session
+                self._bound_agent = None
+            except RuntimeError:
+                raise ValueError(
+                    "Native STT streaming requires a running AgentSession"
+                ) from None
+        # current_agent can announce a handoff target before its activity is
+        # active. The actual session activity owns recognition and its commits.
+        activity = getattr(self._bound_session, "_activity", None)
+        if activity is None:
+            raise ValueError(
+                "Native STT streaming requires a running AgentSession"
+            )
+        if not self._owns_native_recognition(activity.stt):
+            # Another native model may be bound to this same session for a
+            # later Agent. Only the active recognition owner can wrap its
+            # turn callback; passive listeners must never wrap each other.
+            self._restore_turn_binding()
+            if require_owner:
+                raise ValueError(
+                    "Native STT requires the active recognition model or a supported wrapper"
+                )
+            return
+        restore_local_transcript(activity)
+        if self._turn_listener is None:
+            # A retained pipeline can publish while its SDK consumer is
+            # detached and the previous activity is still current. Observe
+            # the session's synchronous handoff and transcript-consumption
+            # events too, before the receiving activity can commit that final.
+            def observe_activity(_event: Any) -> None:
+                if getattr(self._bound_session, "_activity", None) is not None:
+                    self._bind_native_activity()
+                    if self._native_turn_policy is not None:
+                        asyncio.get_running_loop().call_soon(self._native_turn_policy.changed.set)
+                    self._schedule_native_reconsider()
+
+            self._turn_listener = observe_activity
+            self._bound_session.on("conversation_item_added", observe_activity)
+            self._bound_session.on("user_input_transcribed", observe_activity)
+        previous = getattr(activity, "_speko_native_stt_turn_owner", None)
+        if previous is not None and previous is not self:
+            # update_options swaps recognition on this same activity before
+            # the previous model's session listener gets a chance to run.
+            # Restore its callback before capturing our own predecessor.
+            previous._restore_turn_binding()
+        original = getattr(activity, "on_end_of_turn", None)
+        if self._turn_binding is not None:
+            bound, _, completed = self._turn_binding
+            if bound is activity and original is completed:
+                if getattr(activity, "_audio_recognition", None) is not None:
+                    bind_native_transcript(self, activity._audio_recognition)
+                if self._native_turn_policy is not None:
+                    self._native_turn_policy.refresh()
+                return
+        self._restore_turn_binding()
+        original = getattr(activity, "on_end_of_turn", None)
+        if not callable(original) or inspect.iscoroutinefunction(original):
+            raise ValueError("Unsupported native AgentSession turn interface")
+
+        def committed(info: Any) -> bool:
+            if self._native_failed:
+                return False
+            if any(
+                isinstance(stream, NativeSpeechStream)
+                and not stream.permits_framework_commit(info.new_transcript)
+                for stream in list(self._streams)
+            ):
+                previous = self._native_deferred_turn
+                self._native_deferred_turn = (
+                    activity,
+                    info.skip_reply
+                    or (
+                        previous[1]
+                        if previous is not None and previous[0] is activity
+                        else False
+                    ),
+                )
+                self._native_turn_rearmed = False
+                return False
+            previous = self._native_deferred_turn
+            if (
+                previous is not None
+                and previous[0] is activity
+                and previous[1]
+                and not info.skip_reply
+            ):
+                info = dataclasses.replace(info, skip_reply=True)
+            accepted = original(info)
+            if accepted is True:
+                self._native_deferred_turn = None
+                self._native_turn_rearmed = False
+                # AudioRecognition clears its transcript synchronously after
+                # this callback returns. Waking the waiter cannot overtake it.
+                for stream in list(self._streams):
+                    if isinstance(stream, NativeSpeechStream):
+                        stream.acknowledge_turn(info.new_transcript)
+            return accepted
+
+        activity.on_end_of_turn = committed
+        activity._speko_native_stt_turn_owner = self
+        self._turn_binding = (activity, original, committed)
+        if getattr(activity, "_audio_recognition", None) is not None:
+            bind_native_transcript(self, activity._audio_recognition)
+            self._native_turn_policy = NativeTurnPolicy(activity._audio_recognition)
+
+    async def _native_continuation_delay(
+        self, transcript: str, gap: float
+    ) -> float | None:
+        if self._native_turn_policy is None:
+            return None
+        return await self._native_turn_policy.delay_for(transcript, gap)
+
+    def _schedule_native_reconsider(self) -> None:
+        if self._native_failed:
+            return
+        if (
+            self._native_deferred_turn is not None
+            and not self._native_turn_rearmed
+            and not self._native_reconsider_scheduled
+        ):
+            self._native_reconsider_scheduled = True
+            asyncio.get_running_loop().call_soon(self._reconsider_native_turn)
+
+    def _reconsider_native_turn(self) -> None:
+        self._native_reconsider_scheduled = False
+        deferred = self._native_deferred_turn
+        if (
+            deferred is None
+            or self._native_turn_rearmed
+            or getattr(self._bound_session, "_activity", None) is not deferred[0]
+        ):
+            return
+        recognition = deferred[0]._audio_recognition
+        if recognition._closing.is_set():
+            return
+        transcript = recognition._audio_transcript
+        if not transcript or any(
+            isinstance(stream, NativeSpeechStream)
+            and not stream.permits_framework_commit(transcript)
+            for stream in list(self._streams)
+        ):
+            return
+        if self._native_turn_policy is not None:
+            self._native_turn_rearmed = True
+            self._native_turn_policy.reconsider(skip_reply=deferred[1])
 
     @property
     def model(self) -> str:
@@ -166,6 +484,19 @@ class STT(stt.STT):
     def provider(self) -> str:
         return "speko"
 
+    async def recognize(
+        self,
+        buffer: Any,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> stt.SpeechEvent:
+        return await super().recognize(
+            buffer,
+            language=language,
+            conn_options=_speech_connect_options(self._client, conn_options),
+        )
+
     async def _recognize_impl(
         self,
         buffer: Any,
@@ -173,18 +504,44 @@ class STT(stt.STT):
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions,
     ) -> stt.SpeechEvent:
-        stream = self.stream(language=language, conn_options=conn_options)
+        stream = self._stream(
+            language=language, conn_options=conn_options, recognize=True
+        )
         try:
             frames = buffer if isinstance(buffer, list) else [buffer]
             for frame in frames:
                 stream.push_frame(frame)
             stream.end_input()
             final: stt.SpeechEvent | None = None
+            segments: list[stt.SpeechData] = []
+            canonical_parts: list[str] = []
             async for event in stream:
                 if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    segments.extend(event.alternatives)
+                    data = event.alternatives[0]
+                    canonical = getattr(data, "canonical_text", None)
+                    if canonical is None:
+                        canonical = data.text
+                    if canonical:
+                        canonical_parts.append(canonical)
                     final = event
             if final is None:
                 raise APIConnectionError("Speko STT ended without a final transcript")
+            if segments:
+                if len(segments) > 1:
+                    final = stt.SpeechEvent(
+                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                        request_id=final.request_id,
+                        alternatives=[NativeSpeechData(
+                            language=segments[-1].language,
+                            text="",
+                            start_time=segments[0].start_time,
+                            end_time=segments[-1].end_time,
+                        )],
+                    )
+                final.alternatives[0].text = " ".join(canonical_parts)
+                final.alternatives[0].canonical_text = final.alternatives[0].text
+                final.alternatives[0].speaker_segments = tuple(segments) if len(segments) > 1 else ()
             return final
         finally:
             await stream.aclose()
@@ -194,7 +551,35 @@ class STT(stt.STT):
         *,
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> SpeechStream:
+        manual_turns: bool = False,
+    ) -> stt.RecognizeStream:
+        return self._stream(
+            language=language,
+            conn_options=conn_options,
+            recognize=False,
+            manual_turns=manual_turns,
+        )
+
+    def _stream(
+        self,
+        *,
+        language: NotGivenOr[str],
+        conn_options: APIConnectOptions,
+        recognize: bool,
+        manual_turns: bool = False,
+    ) -> stt.RecognizeStream:
+        self._check_native_admission()
+        if (
+            isinstance(self._client, RelaySpeechClient)
+            and not recognize
+            and not manual_turns
+            and self._bound_agent is None
+            and self._bound_session is None
+        ):
+            raise ValueError(
+                "Native STT streaming requires bind_agent() or bind_session() before AgentSession starts; explicit event consumers use manual_turns=True"
+            )
+        conn_options = _speech_connect_options(self._client, conn_options)
         resolved_language = str(language) if is_given(language) else self._language
         bridge = LiveKitSTTBridge(
             self._client,
@@ -204,20 +589,73 @@ class STT(stt.STT):
             credential_source=self._credential_source,
             stt_options=self._stt_options,
         )
-        stream = SpeechStream(
-            stt_instance=self,
-            bridge=bridge,
-            language=resolved_language,
-            conn_options=conn_options,
-            sample_rate=self._sample_rate,
-        )
+        if isinstance(self._client, RelaySpeechClient):
+            def prepare_native_turn() -> None:
+                self._check_native_admission()
+                if not recognize and not manual_turns:
+                    self._bind_native_activity(require_owner=True)
+
+            if not recognize and not manual_turns:
+                self._bind_native_activity(require_owner=True)
+            stream = NativeSpeechStream(
+                stt_instance=self,
+                bridge=bridge,
+                language=resolved_language,
+                conn_options=conn_options,
+                sample_rate=self._sample_rate,
+                turn_vad=None if recognize else self._turn_vad,
+                mark_failed=lambda: setattr(self, "_native_failed", True),
+                report_open=lambda stream: _report_stream_leg("stt", stream),
+                check_admission=prepare_native_turn,
+                wait_for_turn_commit=not recognize and not manual_turns,
+                continuation_delay=self._native_continuation_delay,
+                reconsider_turn=self._schedule_native_reconsider,
+                input_timeline=native_input_timeline(self._native_input_binding) if not recognize and not manual_turns else None,
+            )
+        else:
+            bind_local_transcript(self)
+            stream = SpeechStream(
+                stt_instance=self,
+                bridge=bridge,
+                language=resolved_language,
+                conn_options=conn_options,
+                sample_rate=self._sample_rate,
+            )
         self._streams.add(stream)
         return stream
 
+    def _check_native_admission(self) -> None:
+        if isinstance(self._client, RelaySpeechClient) and self._native_failed:
+            # LiveKit's outer AgentSession pump can ignore retryable=False.
+            # A non-API error stops that recovery loop before another request.
+            raise GatewayError(
+                "Native Speko STT requires a control-plane recovery decision",
+                source="relay",
+                code="recovery_required",
+                retryable=False,
+            )
+
     async def aclose(self) -> None:
+        if self._bound_session is not None and self._turn_listener is not None:
+            self._bound_session.off("conversation_item_added", self._turn_listener)
+            self._bound_session.off("user_input_transcribed", self._turn_listener)
+            self._turn_listener = None
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
+        for binding in list(self._local_transcript_bindings):
+            binding.release(self)
+        self._local_transcript_bindings.clear()
+        self._restore_turn_binding()
+        for wrapper, original, stream in self._native_wrappers.values():
+            if wrapper.stream is stream:
+                wrapper.stream = original
+        self._native_wrappers.clear()
+        if self._native_input_binding is not None:
+            self._native_input_binding.release(self)
+            self._native_input_binding = None
+        self._bound_agent = None
+        self._bound_session = None
         if self._owns_client:
             await self._client.aclose()
 
@@ -240,6 +678,7 @@ class SpeechStream(stt.RecognizeStream):
         self._bridge = bridge
         self._language = language
         self._request_id = utils.shortuuid()
+        self._local_group: str | None = None
         self._gateway_stream: LiveKitSTTStream | None = None
         self._speaking = False
         self._saw_final_for_turn = False
@@ -265,16 +704,15 @@ class SpeechStream(stt.RecognizeStream):
             receive_task = asyncio.create_task(
                 self._receive_events(), name="speko.livekit.stt.receive"
             )
+            tasks = (send_task, receive_task)
             try:
-                done, _ = await asyncio.wait(
-                    (send_task, receive_task), return_when=asyncio.FIRST_COMPLETED
-                )
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     task.result()
                 if receive_task not in done:
-                    await receive_task
+                    await asyncio.gather(*tasks)
             finally:
-                await utils.aio.cancel_and_wait(send_task, receive_task)
+                await utils.aio.cancel_and_wait(*tasks)
         except asyncio.CancelledError:
             raise
         except GatewayError as err:
@@ -316,6 +754,19 @@ class SpeechStream(stt.RecognizeStream):
         if self._speaking:
             self._emit_end()
 
+    def _data(self, event: LiveKitSpeechEvent) -> NativeSpeechData:
+        data = _speech_data(event, self._language)
+        if event.type == "transcript.final":
+            if self._local_group is None:
+                self._local_group = uuid.uuid4().hex
+            data._local_group = self._local_group
+            data._local_after_eos = self._awaiting_final
+            data.canonical_text = event.text if event.canonical_text is None else event.canonical_text
+            data._local_terminal = bool(data.canonical_text)
+            if data.canonical_text:
+                self._local_group = None
+        return data
+
     def _emit(self, event: LiveKitSpeechEvent) -> None:
         if event.provider_request_id:
             self._request_id = event.provider_request_id
@@ -346,19 +797,16 @@ class SpeechStream(stt.RecognizeStream):
         if event.type not in {"transcript.delta", "transcript.final"} or not event.text:
             return
         is_final = event.type == "transcript.final"
+        data = self._data(event)
         if is_final and self._awaiting_final:
-            self._awaiting_final = False
+            self._awaiting_final = not bool(data.canonical_text)
+            self._saw_final_for_turn = True
             self._event_ch.send_nowait(
                 stt.SpeechEvent(
                     type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                     request_id=self._request_id,
                     alternatives=[
-                        stt.SpeechData(
-                            language=event.language or self._language,
-                            text=event.text,
-                            start_time=event.start_time or 0.0,
-                            end_time=event.end_time or 0.0,
-                        )
+                        data
                     ],
                 )
             )
@@ -385,12 +833,7 @@ class SpeechStream(stt.RecognizeStream):
                 ),
                 request_id=self._request_id,
                 alternatives=[
-                    stt.SpeechData(
-                        language=event.language or self._language,
-                        text=event.text,
-                        start_time=event.start_time or 0.0,
-                        end_time=event.end_time or 0.0,
-                    )
+                    data
                 ],
             )
         )
@@ -521,17 +964,19 @@ def _retrieve(task: asyncio.Task[Any]) -> None:
 
 
 class TTS(tts.TTS):
-    """Synthesize speech through a colocated Speko Gateway.
+    """Synthesize speech through a Speko Gateway or native speech relay.
 
     ``prewarm()`` and each reply open up to ``standby_sessions`` Gateway
     sessions in standby, so the next reply's first text does not wait for a
     session to open. A standby that no reply takes within three minutes closes.
     With ``standby_sessions=0``, each reply opens its session at its first text.
+    The default is one standby for GatewayClient and zero for RelaySpeechClient;
+    native speech preopens provider admissions only with explicit opt-in.
     """
 
     def __init__(
         self,
-        client: GatewayClient | None = None,
+        client: SpeechClient | None = None,
         *,
         voice: str = "",
         language: str = "en",
@@ -541,9 +986,9 @@ class TTS(tts.TTS):
         max_input_characters: int = 100_000,
         credential_source: CredentialSource = "auto",
         provider_options: Mapping[str, Mapping[str, Any]] | None = None,
-        standby_sessions: int = 1,
+        standby_sessions: int | None = None,
     ) -> None:
-        if standby_sessions < 0:
+        if standby_sessions is not None and standby_sessions < 0:
             raise ValueError("standby_sessions must not be negative")
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -551,6 +996,8 @@ class TTS(tts.TTS):
             num_channels=1,
         )
         self._client = client or GatewayClient.from_env()
+        if standby_sessions is None:
+            standby_sessions = 0 if isinstance(self._client, RelaySpeechClient) else 1
         self._owns_client = client is None
         self._voice = voice
         self._language = language
@@ -582,7 +1029,9 @@ class TTS(tts.TTS):
         *,
         language: NotGivenOr[str] = NOT_GIVEN,
         voice: NotGivenOr[str] = NOT_GIVEN,
-        provider_options: NotGivenOr[Mapping[str, Mapping[str, Any]] | None] = NOT_GIVEN,
+        provider_options: NotGivenOr[
+            Mapping[str, Mapping[str, Any]] | None
+        ] = NOT_GIVEN,
     ) -> None:
         """Change the language, voice or provider settings of the next stream.
 
@@ -609,13 +1058,16 @@ class TTS(tts.TTS):
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> tts.ChunkedStream:
-        return self._synthesize_with_stream(text, conn_options=conn_options)
+        return self._synthesize_with_stream(
+            text, conn_options=_speech_connect_options(self._client, conn_options)
+        )
 
     def stream(
         self,
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> SynthesisStream:
+        conn_options = _speech_connect_options(self._client, conn_options)
         options = self._session_options()
         stream = SynthesisStream(
             tts_instance=self,
@@ -783,7 +1235,11 @@ class SynthesisStream(tts.SynthesizeStream):
             # try once more. Other refusals surface at once, credit_exhausted
             # included: a closed standby frees its slot when it closes, but its
             # credit only when the Gateway's batched usage report settles it.
-            if not (error.retryable and await self._plugin._release_standbys()):
+            # Native opens admit bounded provider work; even an error marked
+            # retryable cannot prove that the original admission did not commit.
+            if isinstance(self._plugin._client, RelaySpeechClient) or not (
+                error.retryable and await self._plugin._release_standbys()
+            ):
                 raise
             self._session = _TTSSession(self._bridge)
             stream = await self._session.stream()

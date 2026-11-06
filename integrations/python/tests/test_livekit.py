@@ -21,6 +21,7 @@ from speko_gateway._livekit_bridge import (
 from speko_gateway.client import CanonicalEvent, GatewayError, SessionConfig
 from speko_gateway.livekit import LLM, STT, TTS
 from speko_gateway.relay import RelayError
+from speko_gateway.relay_speech import RelaySpeechClient
 
 
 class FakeClient:
@@ -1191,6 +1192,83 @@ async def test_tts_first_reply_after_prewarm_uses_the_standby() -> None:
 
     gateway.opens_allowed.set()
     await plugin.aclose()
+    assert gateway.nothing_left_open()
+
+
+@pytest.mark.parametrize("standbys", [None, 0, 1])
+async def test_native_tts_only_preopens_sessions_when_requested(
+    monkeypatch: pytest.MonkeyPatch, standbys: int | None
+) -> None:
+    gateway = FakeGateway()
+    client = RelaySpeechClient(
+        api_key="sk_speko_owned_fixture",
+        session_id="00000000-0000-4000-8000-000000000001",
+        base_url="http://127.0.0.1:1",
+    )
+    monkeypatch.setattr(client, "open", gateway.open)
+    options = {} if standbys is None else {"standby_sessions": standbys}
+    plugin = TTS(client, credential_source="managed", **options)
+    try:
+        plugin.prewarm()
+        if standbys == 1:
+            await until(lambda: len(gateway.sessions) == 1)
+        _, audio = await speak(plugin, "hello")
+        assert audio
+        if standbys == 1:
+            await until(lambda: len(gateway.sessions) == 2)
+        assert gateway.opens == (2 if standbys == 1 else 1)
+        assert gateway.sessions[0].appended == ["hello"]
+    finally:
+        await plugin.aclose()
+        await client.aclose()
+    assert gateway.nothing_left_open()
+
+
+async def test_native_tts_does_not_retry_an_open_even_with_standbys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = FakeGateway()
+    client = RelaySpeechClient(
+        api_key="sk_speko_owned_fixture",
+        session_id="00000000-0000-4000-8000-000000000001",
+        base_url="http://127.0.0.1:1",
+    )
+    monkeypatch.setattr(client, "open", gateway.open)
+    plugin = TTS(client, credential_source="managed", standby_sessions=1)
+    stream = None
+    refused = 0
+
+    async def refuse_old_language(config: SessionConfig, **_: Any) -> Any:
+        nonlocal refused
+        if config.request["language"] == "en":
+            refused += 1
+            raise GatewayError("ambiguous native open", retryable=True)
+        return await gateway.open(config)
+
+    try:
+        plugin.prewarm()
+        await until(lambda: len(gateway.sessions) == 1)
+        stream = plugin.stream(
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=0)
+        )
+        plugin.update_options(language="hi")
+        await until(lambda: len(gateway.sessions) == 2)
+        monkeypatch.setattr(client, "open", refuse_old_language)
+        stream.push_text("hello")
+        stream.end_input()
+
+        async def audio() -> list[Any]:
+            return [event async for event in stream]
+
+        with pytest.raises(APIConnectionError):
+            await asyncio.wait_for(audio(), timeout=1)
+        assert refused == 1, "an ambiguous native open must never be replayed"
+        assert not gateway.sessions[1].closed, "keep the unrelated standby"
+    finally:
+        if stream is not None:
+            await stream.aclose()
+        await plugin.aclose()
+        await client.aclose()
     assert gateway.nothing_left_open()
 
 

@@ -354,14 +354,14 @@ func TestTTSHandshakeErrorsAreClassified(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(testCase.status) }))
 			defer server.Close()
 			endpoint := strings.Replace(server.URL, "http://", "ws://", 1) + streamPath
-			adapter, err := New(Config{AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+			adapter, err := New(Config{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
 			if err != nil {
 				t.Fatal(err)
 			}
 			_, err = adapter.Open(context.Background(), ttsAdapterRequest(endpoint))
 			var providerErr *runtimepkg.ProviderError
 			if !errors.As(err, &providerErr) || providerErr.Code != testCase.code || providerErr.ProviderStatus != testCase.status {
-				t.Fatalf("error = %#v, want %s status=%d", err, testCase.code, testCase.status)
+				t.Fatalf("error = %#v (%v), want %s status=%d", err, err, testCase.code, testCase.status)
 			}
 		})
 	}
@@ -406,7 +406,15 @@ func TestTTSOpenValidationAndLocalLimits(t *testing.T) {
 		})
 	}
 
-	harness := newTTSHarness(t, func(context.Context, *websocket.Conn, *http.Request) {})
+	harness := newTTSHarness(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		// Local input validation needs a live stream. Keep the owned peer
+		// connected until the test aborts it, rather than racing its EOF.
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+		}
+	})
 	defer harness.Close()
 	stream := openTTSStream(t, harness, nil)
 	defer func() { _ = stream.Abort(context.Background()) }()
@@ -495,6 +503,11 @@ func openTTSStreamWithConfig(t *testing.T, harness *ttsHarness, config Config, m
 	parsed, _ := url.Parse(harness.endpoint)
 	config.AllowedEndpointHosts = []string{parsed.Hostname()}
 	config.AllowInsecureEndpoint = true
+	if config.HTTPClient == nil {
+		// Own the fixture's connection pool; parallel httptest server
+		// teardown must not share http.DefaultTransport with this client.
+		config.HTTPClient = harness.server.Client()
+	}
 	adapter, err := New(config)
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
