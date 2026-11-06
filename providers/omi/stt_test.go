@@ -924,6 +924,47 @@ func TestACommitRacingAnErrorFrameWaitsForTheEvidence(t *testing.T) {
 	}
 }
 
+// An error that arrives between writes, from a peer that then neither closes
+// nor reads: the next audio frame must not wait on a reader that never
+// finishes. The adapter closes the socket on the error frame, so the frame
+// gets the terminal error promptly and the evidence is published.
+func TestAnErrorBetweenWritesFromASilentPeerEndsTheNextWrite(t *testing.T) {
+	t.Parallel()
+	fake := newFakeStream(t)
+	fake.onAudio = []string{`{"type":"error","code":"INTERNAL_ERROR","message":"vendor detail"}`}
+	fake.stallAfterAudio = true
+	stream := openSTT(t, fake, STTConfig{}, sttRequest(fake.endpoint()))
+	if err := stream.WriteAudio(context.Background(), make([]byte, 3200)); err != nil {
+		t.Fatal(err)
+	}
+	drained := make(chan []runtimepkg.ProviderEvent, 1)
+	go func() { drained <- drainSTT(t, stream) }()
+	// Give the error frame time to arrive while no write is in flight.
+	time.Sleep(200 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := stream.WriteAudio(ctx, make([]byte, 3200))
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) {
+		t.Fatalf("the next WriteAudio returned %v, want the terminal provider error before its deadline", err)
+	}
+	var events []runtimepkg.ProviderEvent
+	select {
+	case events = <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("events never closed after the error")
+	}
+	sawEstimate := false
+	for _, event := range events {
+		if event.Type == protocol.EventUsageObserved && dataOf(t, event)["billing_evidence"] == "pcm_bytes_sent" {
+			sawEstimate = true
+		}
+	}
+	if !sawEstimate {
+		t.Fatal("no bytes-sent estimate was published")
+	}
+}
+
 // A close reason is vendor text. If Omi ever echoed the key in one, it must
 // not reach the error's message, cause or extension, before or after ready.
 func TestACloseReasonNeverCarriesTheKey(t *testing.T) {
