@@ -3,7 +3,8 @@ name: Publish Docker image
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # Stable releases only: vMAJOR.MINOR.PATCH. Prerelease tags are not published.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
 
 permissions:
@@ -12,10 +13,39 @@ permissions:
 env:
   IMAGE_NAME: spekoai/gateway
 
+# One build per ref at a time, never cancelled. A shared queue would drop
+# pending tags, so releases are cut one at a time instead (docs/RELEASING.md).
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      - name: Refuse to rebuild a released version
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A released image must never change under a customer who pinned it.
+          # Only "not found" counts as absent; any other API failure stops the build.
+          if out=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName 2>&1); then
+            echo "::error::$TAG is already released; cut a new patch version instead"
+            exit 1
+          elif ! printf '%s' "$out" | grep -qi "release not found"; then
+            echo "::error::could not check for an existing $TAG release: $out"
+            exit 1
+          fi
+          # Never move the minor alias back to an older patch.
+          minor=$(printf '%s' "${TAG%.*}" | sed 's/\./\\./g')
+          released=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName')
+          newest=$(printf '%s\n%s\n' "$released" "$TAG" | grep -E "^${minor}\.[0-9]+$" | sort -V | tail -1)
+          if [ "$newest" != "$TAG" ]; then
+            echo "::error::$newest is newer than $TAG on the same minor; refusing to move the ${TAG%.*} alias back"
+            exit 1
+          fi
       - uses: actions/checkout@v6
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -27,6 +57,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
+          # latest/edge follow main only; release tags never move them.
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=edge,enable={{is_default_branch}}
@@ -48,3 +81,27 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  release:
+    # Every v* tag gets a GitHub release so customers have one changelog to
+    # watch. Runs only after the image is published, so the notes never point
+    # at a tag that does not exist on Docker Hub.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            exit 0
+          fi
+          version="${TAG#v}"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            --title "$TAG" \
+            --notes "Image: \`spekoai/gateway:${version}\` (also \`:${version%.*}\`)"

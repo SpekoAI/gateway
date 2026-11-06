@@ -40,6 +40,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/modulate"
 	"github.com/SpekoAI/gateway/providers/munsit"
 	"github.com/SpekoAI/gateway/providers/nari"
+	"github.com/SpekoAI/gateway/providers/omi"
 	"github.com/SpekoAI/gateway/providers/openai"
 	"github.com/SpekoAI/gateway/providers/openailive"
 	"github.com/SpekoAI/gateway/providers/openairealtime"
@@ -329,6 +330,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	omiSTTAdapter, err := omi.NewSTT(omi.STTConfig{})
+	if err != nil {
+		return err
+	}
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsDialogueAdapter, elevenLabsSTTAdapter,
 		fishAdapter,
@@ -341,7 +346,7 @@ func run() error {
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 		geminiSTTAdapter, geminiTTSAdapter, metaSTTAdapter, nariSTTAdapter, nariTTSAdapter,
 		paxaTTSAdapter, munsitSTTAdapter, munsitTTSAdapter, hamsaTTSAdapter,
-		hopperSTTAdapter, hopperTTSAdapter,
+		hopperSTTAdapter, hopperTTSAdapter, omiSTTAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {
@@ -471,9 +476,11 @@ func run() error {
 			return err
 		}
 	}
-	if reporter != nil {
-		runtimeDescriptor.IncarnationID = reporter.incarnation
-	}
+	// The incarnation travels only on instance reports. Do not copy it into
+	// runtimeDescriptor: that descriptor rides every hosted plan request, and
+	// a control plane built before runtime.incarnation_id existed decodes plan
+	// requests with DisallowUnknownFields, so every session fails with
+	// invalid_request (400) before a plan is issued.
 	engine, err := runtimepkg.New(runtimepkg.Config{
 		Adapters: adapters, Verifier: verifier, LocalCredentials: localCredentials, Telemetry: telemetryExporter,
 	})

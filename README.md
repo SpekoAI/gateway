@@ -8,6 +8,18 @@ routing, observability, and consolidated billing.
 > Early preview: the protocol is versioned, but breaking changes may occur
 > before the first stable release.
 
+## Versions and changelog
+
+Pin a released version in production. Each release has notes on the
+[releases page](https://github.com/SpekoAI/gateway/releases). Watch the repo
+with **Custom → Releases** to get notified.
+
+| Tag | What it points to | Use it for |
+|---|---|---|
+| `0.1.0` | One exact release. The workflow refuses to rebuild a released version. | Production, when you want to choose every upgrade. |
+| `0.1` | The newest `0.1.x` release. Gets fixes only. | Production, when you want fixes automatically. |
+| `latest`, `edge`, `sha-<commit>` | Every merge to `main`. Moves several times a day. | Testing unreleased changes. Not for production. |
+
 ## Add Gateway to a Pipecat agent
 
 Gateway includes native Pipecat `STTService` and `TTSService` processors with
@@ -24,7 +36,7 @@ Dockerfile:
 
 ```diff
  ARG PYTHON_VERSION=3.14
-+FROM spekoai/gateway:latest AS speko-gateway
++FROM spekoai/gateway:0.1 AS speko-gateway
  FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim AS base
 
  FROM base AS build
@@ -262,6 +274,7 @@ Every catalog provider has a BYOK credential variable:
 | MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
 | Munsit | `SPEKO_MUNSIT_BYOK_API_KEY` | API key, sent as `x-api-key`; BYOK/Relay only because Munsit has no token exchange |
 | Nari Labs | `SPEKO_NARI_BYOK_API_KEY` | API key; one key serves both the synthesis endpoint and the transcription socket |
+| Omi Health | `SPEKO_OMI_BYOK_API_KEY` | API key; sent inside the realtime socket's JSON `start` frame and as a bearer on uploads; BYOK/Relay only because Omi has no token exchange |
 | OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
 | Palabra | `SPEKO_PALABRA_BYOK_API_KEY` | API key; dedicated STT/TTS sockets do not expose a scoped short-lived grant |
 | Paxa Labs | `SPEKO_PAXA_BYOK_API_KEY` | API key |
@@ -353,6 +366,7 @@ restarting the Gateway.
 | TTS | Munsit | `munsit.tts.v1` | `faseeh-v1-preview` |
 | STT | Hopper | `hopper.stt.v1` | `nemotron-asr` |
 | TTS | Hopper | `hopper.tts.v1` | `qwen3-tts` |
+| STT | Omi Health | `omi.stt.v1` | `omi-medical-1` |
 
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.
