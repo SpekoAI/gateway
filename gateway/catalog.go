@@ -185,6 +185,11 @@ var providerCatalog = []CatalogEntry{
 	// streams 24 kHz PCM and refuses requests without a voice.
 	{Provider: "hopper", Kind: protocol.SessionKindSTT, Adapter: "hopper.stt.v1", DefaultModel: "nemotron-asr", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.withhopper.com/stt/websocket"},
 	{Provider: "hopper", Kind: protocol.SessionKindTTS, Adapter: "hopper.tts.v1", DefaultModel: "qwen3-tts", DefaultVoice: "elena", Transport: protocol.TransportHTTP, Endpoint: "https://api.withhopper.com/v1/audio/speech"},
+	// Omi Health: omi-medical-1 over the US (Ohio) realtime socket, with the
+	// key inside the JSON start frame. 16 kHz mono PCM16 only. The
+	// prerecorded sibling (POST /v1/audio/transcriptions) is a
+	// BatchTranscriber, which this catalog does not publish.
+	{Provider: "omi", Kind: protocol.SessionKindSTT, Adapter: "omi.stt.v1", DefaultModel: "omi-medical-1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.us.omi.health/v1/stream"},
 	{Provider: "speechmatics", Kind: protocol.SessionKindSTT, Adapter: "speechmatics.stt.v1", DefaultModel: "standard", Models: []string{"standard", "enhanced"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://global.rt.speechmatics.com/v2/"},
 }
 

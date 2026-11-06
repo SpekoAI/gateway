@@ -120,6 +120,14 @@ var sttOptionSupport = map[string]sttSupport{
 	// (turn_detection: balanced, patient or responsive) as a query
 	// parameter. Nothing else on the socket is tunable.
 	"hopper": {providerKeys: []string{"turn_detection"}},
+	// Omi's realtime start frame takes its endpointer's silence window
+	// (endpointing.silence_ms, 200 to 1100 ms) and nothing else a caller
+	// tunes. Realtime has no keyterms and no word timings, and its speaker
+	// labels are provisional, so none is advertised. The upload's diarize
+	// (which also returns word timings) is a batch-only capability this
+	// streaming table cannot express; inline vocabulary is accepted by Omi but
+	// not applied, so keywords are advertised on neither surface.
+	"omi": {providerKeys: []string{"silence_ms"}},
 	// Keywords fold into the transcription prompt alongside a caller's own
 	// prompt text. gpt-4o-transcribe-diarize is batch-only, so no realtime
 	// diarization. The vendor documents `prompt` on the realtime session for
@@ -245,6 +253,13 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 			return err
 		}
 	}
+	// Omi refuses an out-of-range silence window in place of ready; refusing
+	// it at create names the bounds instead of failing over.
+	if name == "omi" {
+		if err := validateNumericOptions("omi", omiEndpointRanges, options); err != nil {
+			return err
+		}
+	}
 	if name == "assemblyai" && options.Provider(name)["voice_focus_threshold"] != nil &&
 		!sttAssemblyAIVoiceFocusOn(options) {
 		return &SttSupportError{
@@ -303,21 +318,37 @@ func validateAssemblyAIVoiceFocus(options *protocol.SttOptions) error {
 	return nil
 }
 
+// numericOptionRange bounds one numeric provider setting; whole marks a
+// setting that takes integers.
+type numericOptionRange struct {
+	min, max float64
+	whole    bool
+}
+
 // sonioxEndpointRanges are the documented bounds of Soniox's endpoint knobs
 // (https://soniox.com/docs/stt/rt/endpoint-detection). whole marks the knobs
 // that take integers.
-var sonioxEndpointRanges = map[string]struct {
-	min, max float64
-	whole    bool
-}{
+var sonioxEndpointRanges = map[string]numericOptionRange{
 	"max_endpoint_delay_ms":             {min: 500, max: 3000, whole: true},
 	"endpoint_sensitivity":              {min: -1, max: 1},
 	"endpoint_latency_adjustment_level": {min: 0, max: 3, whole: true},
 }
 
+// omiEndpointRanges is the documented bound of Omi's realtime
+// endpointing.silence_ms.
+var omiEndpointRanges = map[string]numericOptionRange{
+	"silence_ms": {min: 200, max: 1100, whole: true},
+}
+
 func validateSonioxEndpointOptions(options *protocol.SttOptions) error {
-	for key, raw := range options.Provider("soniox") {
-		bounds, ok := sonioxEndpointRanges[key]
+	return validateNumericOptions("soniox", sonioxEndpointRanges, options)
+}
+
+// validateNumericOptions refuses a provider's numeric settings outside their
+// documented bounds.
+func validateNumericOptions(provider string, ranges map[string]numericOptionRange, options *protocol.SttOptions) error {
+	for key, raw := range options.Provider(provider) {
+		bounds, ok := ranges[key]
 		if !ok {
 			continue
 		}
@@ -330,14 +361,14 @@ func validateSonioxEndpointOptions(options *protocol.SttOptions) error {
 		case int64:
 			value = float64(typed)
 		default:
-			return &SttSupportError{Provider: "soniox", Option: "provider_options.soniox." + key, Detail: "must be a number"}
+			return &SttSupportError{Provider: provider, Option: "provider_options." + provider + "." + key, Detail: "must be a number"}
 		}
 		if value < bounds.min || value > bounds.max || bounds.whole && value != math.Trunc(value) {
 			kind := "a number"
 			if bounds.whole {
 				kind = "an integer"
 			}
-			return &SttSupportError{Provider: "soniox", Option: "provider_options.soniox." + key, Detail: fmt.Sprintf("must be %s from %g to %g", kind, bounds.min, bounds.max)}
+			return &SttSupportError{Provider: provider, Option: "provider_options." + provider + "." + key, Detail: fmt.Sprintf("must be %s from %g to %g", kind, bounds.min, bounds.max)}
 		}
 	}
 	return nil

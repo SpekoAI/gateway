@@ -796,6 +796,9 @@ class _ManualFlushSTTCapabilities:
         # audio.commit is Soniox's mid-stream finalize.
         ("soniox", True),
         (" Soniox ", True),
+        # audio.commit is Omi's finalize, which leaves the session open.
+        ("omi", True),
+        ("OMI", True),
         # The route is unknown until the session plan names it.
         ("auto", False),
         # audio.commit is a no-op on Deepgram Flux and drops a sub-50 ms

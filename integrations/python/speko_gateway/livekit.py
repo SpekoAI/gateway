@@ -83,8 +83,10 @@ _NEWER_STT_CAPABILITIES = frozenset({"keyterms", "chat_context", "manual_flush"}
 # flushes audio that holds no new words, Soniox answers with an empty final,
 # which this plugin does not forward, so LiveKit waits out its
 # transcript_timeout. Without the flush it already waited that long unless a
-# final had arrived in the previous 0.5 s.
-_FLUSH_ON_TURN_END_PROVIDERS = frozenset({"soniox"})
+# final had arrived in the previous 0.5 s. Omi's adapter sends the same
+# commit as Omi's `finalize`, which the live probe (2026-11-06) measured at
+# about 50 ms server-side; the session stays open after it.
+_FLUSH_ON_TURN_END_PROVIDERS = frozenset({"soniox", "omi"})
 
 
 def _stt_capabilities(**declared: Any) -> stt.STTCapabilities:
