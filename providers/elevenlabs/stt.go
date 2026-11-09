@@ -219,7 +219,7 @@ func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string
 		// `language_code`, NOT `language`: the vendor ignores an unknown parameter,
 		// so the wrong name silently leaves Scribe auto-detecting instead of pinned.
 		// Only the primary subtag is accepted — `es`, not `es-MX`.
-		query.Set("language_code", baseLanguageTag(language))
+		query.Set("language_code", sttLanguageCode(language))
 	}
 	// Vocabulary biasing: repeated `keyterms`, one per term, matching how the
 	// platform's own Scribe adapter spells it on this same realtime socket.
@@ -247,6 +247,22 @@ func sttAudioFormat(sampleRateHz int) (string, error) {
 		return "", &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("ElevenLabs transcription cannot accept a %d Hz sample rate", sampleRateHz), Hint: "Resample the mono pcm_s16le input to 8000, 16000, 22050, 24000, 44100, or 48000 Hz and try again."}
 	}
 }
+
+// sttLanguageCode is the Scribe `language_code` (realtime and batch). Scribe
+// accepts ISO 639-1 or 639-3 codes, and lists Norwegian only as `nor`: a
+// platform `nb` is answered with invalid_request and close 1008, which ends
+// the session. The aliases match the platform's elevenLabsSttLanguage
+// (packages/providers lang.ts) for Norwegian only. TTS uses ttsLanguageCode
+// instead, because its 639-1 language_code would reject `nor`.
+func sttLanguageCode(language string) string {
+	base := baseLanguageTag(language)
+	if alias, ok := sttLanguageAliases[base]; ok {
+		return alias
+	}
+	return base
+}
+
+var sttLanguageAliases = map[string]string{"nb": "nor", "nn": "nor"}
 
 // baseLanguageTag reduces a tag to its primary subtag.
 func baseLanguageTag(language string) string {
@@ -486,9 +502,9 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		}
 		s.rememberTimedFinal(message.Text)
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: sttTranscriptData(message.Text, true, message.Words), Extensions: sttExtension(raw)})
-	case "insufficient_audio_activity":
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: sttMarshalData(map[string]any{"message": "ElevenLabs detected no transcribable speech", "provider_type": message.MessageType}), Extensions: sttExtension(raw)})
-	case "error", "scribe_error", "auth_error", "quota_exceeded", "rate_limited", "input_error", "transcriber_error", "commit_throttled", "unaccepted_terms", "queue_overflow", "resource_exhausted", "session_time_limit_exceeded", "chunk_size_exceeded":
+	// Every error type in the vendor's realtime event schema. ElevenLabs sends
+	// the error frame and then closes the socket, so each one is terminal.
+	case "error", "scribe_error", "auth_error", "quota_exceeded", "rate_limited", "input_error", "invalid_request", "insufficient_audio_activity", "transcriber_error", "commit_throttled", "unaccepted_terms", "queue_overflow", "resource_exhausted", "session_time_limit_exceeded", "chunk_size_exceeded":
 		return &runtimepkg.ProviderError{
 			Code:      sttErrorCode(message.MessageType),
 			Message:   sttErrorMessage(message.MessageType, message.Error),
@@ -582,7 +598,10 @@ func sttErrorCode(messageType string) string {
 		return "provider_quota_exceeded"
 	case "rate_limited", "commit_throttled":
 		return "provider_rate_limited"
-	case "input_error", "chunk_size_exceeded":
+	// invalid_request: the connection parameters were rejected.
+	// insufficient_audio_activity: the caller stopped sending audio long enough
+	// for Scribe to drop the connection. Retrying the same request repeats both.
+	case "input_error", "chunk_size_exceeded", "invalid_request", "insufficient_audio_activity":
 		return "invalid_request"
 	default:
 		return "provider_unavailable"
@@ -612,6 +631,8 @@ func sttErrorHint(messageType string) string {
 		return "Retry after a brief delay or use auto routing to select another provider."
 	case "chunk_size_exceeded":
 		return "Retry the request; the relay will split audio into smaller provider frames."
+	case "insufficient_audio_activity":
+		return "Keep streaming audio, including silence, for as long as the transcription session is open."
 	default:
 		return "Check the advertised media and request options, correct them, and retry."
 	}

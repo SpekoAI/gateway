@@ -196,6 +196,8 @@ func TestSTTAdapterKeepsTheVendorsErrorDistinction(t *testing.T) {
 		{frame: "commit_throttled", code: "provider_rate_limited", retryable: true},
 		{frame: "input_error", code: "invalid_request"},
 		{frame: "chunk_size_exceeded", code: "invalid_request"},
+		{frame: "invalid_request", code: "invalid_request"},
+		{frame: "insufficient_audio_activity", code: "invalid_request"},
 		{frame: "queue_overflow", code: "provider_unavailable", retryable: true},
 		{frame: "resource_exhausted", code: "provider_unavailable", retryable: true},
 		{frame: "session_time_limit_exceeded", code: "provider_unavailable", retryable: true},

@@ -99,7 +99,7 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		{Name: "tag_audio_events", Value: "false"},
 	}
 	if language := strings.TrimSpace(request.Options.Language); language != "" {
-		fields = append(fields, batchhttp.MultipartField{Name: "language_code", Value: baseLanguageTag(language)})
+		fields = append(fields, batchhttp.MultipartField{Name: "language_code", Value: sttLanguageCode(language)})
 	}
 	for _, keyword := range request.Options.STT.GetKeywords() {
 		fields = append(fields, batchhttp.MultipartField{Name: "keyterms", Value: keyword})

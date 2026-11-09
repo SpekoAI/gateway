@@ -113,3 +113,32 @@ func TestBatchTranscribeRefusals(t *testing.T) {
 		t.Fatalf("oversized: %v", err)
 	}
 }
+
+func TestBatchTranscribeAliasesNorwegianToScribeCode(t *testing.T) {
+	t.Parallel()
+	seen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("multipart: %v", err)
+		}
+		seen <- r.FormValue("language_code")
+		_, _ = w.Write([]byte(`{"language_code":"nor","text":"Hei.","transcription_id":"tx_1","audio_duration_secs":1}`))
+	}))
+	defer server.Close()
+
+	adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatalf("adapter: %v", err)
+	}
+	if _, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{
+		Plan:       batchPlan(server.URL + "/v1/speech-to-text"),
+		Options:    protocol.RequestOptions{Language: "nb-NO"},
+		Audio:      strings.NewReader("RIFF....WAVE"),
+		AudioBytes: 12,
+	}); err != nil {
+		t.Fatalf("transcribe: %v", err)
+	}
+	if got := <-seen; got != "nor" {
+		t.Fatalf("language_code = %q, want nor", got)
+	}
+}
