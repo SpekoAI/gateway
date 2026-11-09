@@ -56,6 +56,22 @@ func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.Creden
 	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
+// errRedirectRefused stops a handshake that Palabra answered with a redirect.
+var errRedirectRefused = errors.New("palabra: refusing to follow a handshake redirect")
+
+// handshakeClient returns a copy of client that never follows redirects. The
+// endpoint policy vets only the first URL, and a followed redirect would
+// carry a credential sent in the query to an unvetted host, both as the new
+// request and in its Referer. The caller's client is copied, never changed.
+func handshakeClient(client *http.Client) *http.Client {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	clone := *client
+	clone.CheckRedirect = func(*http.Request, []*http.Request) error { return errRedirectRefused }
+	return &clone
+}
+
 func authHeaders(value string) http.Header {
 	headers := make(http.Header)
 	headers.Set("Authorization", "Bearer "+value)

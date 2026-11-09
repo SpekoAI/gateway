@@ -128,8 +128,9 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 	endpoint.RawQuery = query.Encode()
 
+	// The token is in the URL, so the handshake must not follow a redirect.
 	conn, response, err := websocket.Dial(ctx, endpoint.String(), &websocket.DialOptions{
-		HTTPClient: a.httpClient,
+		HTTPClient: handshakeClient(a.httpClient),
 	})
 	if err != nil {
 		// net/http errors can contain the full URL. Never retain the token in

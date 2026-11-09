@@ -252,6 +252,60 @@ func TestSTTDialFailureRedactsToken(t *testing.T) {
 	}
 }
 
+// The STT token rides in the handshake query, and the endpoint policy vets
+// only the first URL. A redirect must fail the dial without contacting its
+// target, with the default client and with a caller-supplied one, and the
+// caller's client must come back unchanged.
+func TestSTTRefusesHandshakeRedirect(t *testing.T) {
+	key := "secret+token/with=characters"
+	for _, tc := range []struct {
+		name   string
+		client *http.Client
+	}{
+		{"default client", nil},
+		{"custom client", &http.Client{Timeout: 5 * time.Second}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			targetHits := make(chan *http.Request, 4)
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetHits <- r
+				w.WriteHeader(http.StatusTeapot)
+			}))
+			defer target.Close()
+			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL+sttPath, http.StatusFound)
+			}))
+			defer endpoint.Close()
+
+			parsed, _ := url.Parse(endpoint.URL)
+			adapter, err := NewSTT(STTConfig{HTTPClient: tc.client, AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := sttRequest(wsURL(endpoint.URL) + sttPath)
+			req.Plan.Route.Credential.Value = key
+			stream, err := adapter.Open(context.Background(), req)
+			if err == nil {
+				_ = stream.Close(context.Background())
+				t.Fatal("dial followed a redirect")
+			}
+			for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+				if strings.Contains(cause.Error(), key) || strings.Contains(cause.Error(), url.QueryEscape(key)) {
+					t.Fatal("dial error retained credential")
+				}
+			}
+			select {
+			case hit := <-targetHits:
+				t.Fatalf("redirect target was contacted: %s referer=%q", hit.URL, hit.Referer())
+			default:
+			}
+			if tc.client != nil && tc.client.CheckRedirect != nil {
+				t.Fatal("caller's HTTP client was modified")
+			}
+		})
+	}
+}
+
 type sttFailingTransport struct{}
 
 func (sttFailingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
