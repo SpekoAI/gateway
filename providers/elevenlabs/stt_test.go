@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -868,7 +869,7 @@ func TestSTTAdapterRefusesAudioAfterAProviderError(t *testing.T) {
 		if _, err := readSTTJSON(ctx, conn); err != nil {
 			return
 		}
-		_ = writeSTTJSON(ctx, conn, map[string]any{"message_type": "transcriber_error", "error": "boom"})
+		_ = writeSTTJSON(ctx, conn, map[string]any{"message_type": "invalid_request", "error": "boom"})
 		for {
 			if _, err := readSTTJSON(ctx, conn); err != nil {
 				return
@@ -887,8 +888,15 @@ func TestSTTAdapterRefusesAudioAfterAProviderError(t *testing.T) {
 	if billed != 3_200 {
 		t.Fatalf("complete observation billed %d bytes, want 3200", billed)
 	}
-	if err := providerStream.WriteAudio(context.Background(), make([]byte, 3_200)); err == nil {
+	err := providerStream.WriteAudio(context.Background(), make([]byte, 3_200))
+	if err == nil {
 		t.Fatal("audio was accepted after the provider ended the stream")
+	}
+	// The refused write carries the vendor's failure, not a bare
+	// ErrSessionClosed the runtime would report as an internal error.
+	providerErr := &runtimepkg.ProviderError{}
+	if errors.Is(err, runtimepkg.ErrSessionClosed) || !asProviderError(err, &providerErr) || providerErr.Code != "invalid_request" {
+		t.Fatalf("write after the provider error returned %v, want the invalid_request provider error", err)
 	}
 }
 

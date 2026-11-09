@@ -323,7 +323,12 @@ type sttStream struct {
 	// cannot follow the complete observation with an incomplete one. It also
 	// guards eventsClosed: Close emits from the caller's goroutine and must
 	// not send after readLoop has closed the channel.
-	billingMu    sync.Mutex
+	billingMu sync.Mutex
+	// endedErr is why the provider side ended input, set before closed when
+	// the read loop exits with input still open. A refused write returns it,
+	// so a concurrent writer reports the vendor's failure (quota, rate limit)
+	// rather than a bare ErrSessionClosed the runtime would treat as internal.
+	endedErr     atomic.Pointer[error]
 	sessionID    string
 	billed       bool
 	eventsClosed bool
@@ -496,12 +501,12 @@ func (s *sttStream) writeFrame(ctx context.Context, value any, audioBytes int64)
 		return err
 	}
 	if s.closed.Load() {
-		return runtimepkg.ErrSessionClosed
+		return s.inputClosedErr()
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.closed.Load() {
-		return runtimepkg.ErrSessionClosed
+		return s.inputClosedErr()
 	}
 	if err := s.conn.Write(ctx, websocket.MessageText, payload); err != nil {
 		return &runtimepkg.ProviderError{
@@ -515,6 +520,15 @@ func (s *sttStream) writeFrame(ctx context.Context, value any, audioBytes int64)
 	return nil
 }
 
+// inputClosedErr is what a write returns once input is closed: the reason the
+// provider side ended the stream, or ErrSessionClosed after the caller's Close.
+func (s *sttStream) inputClosedErr() error {
+	if err := s.endedErr.Load(); err != nil {
+		return *err
+	}
+	return runtimepkg.ErrSessionClosed
+}
+
 func (s *sttStream) readLoop() {
 	// terminal is delivered after the complete observation: consumers stop at
 	// an error event, so billing has to reach them first.
@@ -522,7 +536,20 @@ func (s *sttStream) readLoop() {
 	defer func() {
 		// Close input first: writeFrame checks closed under the write lock,
 		// so once awaitWrites has held that lock no later audio can be sent,
-		// and every write that succeeded is already in sentBytes.
+		// and every write that succeeded is already in sentBytes. If input was
+		// still open, the provider or a teardown ended the stream; record why
+		// before closing, so a refused write carries the same failure.
+		if !s.closed.Load() {
+			ended := error(&runtimepkg.ProviderError{
+				Code:      "provider_unavailable",
+				Message:   "ElevenLabs ended the streaming connection",
+				Retryable: true,
+			})
+			if terminal != nil && terminal.Err != nil {
+				ended = terminal.Err
+			}
+			s.endedErr.Store(&ended)
+		}
 		s.closed.Store(true)
 		s.awaitWrites(sttWriteSettleTimeout)
 		s.emitCompleteBilling(sttFinalBillingTimeout, true)
