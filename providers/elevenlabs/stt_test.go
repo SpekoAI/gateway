@@ -960,3 +960,52 @@ func TestSTTAdapterCloseAfterAServerCloseIsClean(t *testing.T) {
 		t.Fatalf("Close after a normal server close = %v, want nil", err)
 	}
 }
+
+// A provider error queued behind the final billing event in a one-slot buffer
+// survives a Cancel that overlaps it: Cancel reports the failure, and the
+// consumer still receives billing and then the error.
+func TestSTTAdapterProviderErrorSurvivesCancel(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-cancel"}); err != nil {
+			return
+		}
+		if _, err := readSTTJSON(ctx, conn); err != nil {
+			return
+		}
+		_ = writeSTTJSON(ctx, conn, map[string]any{"message_type": "invalid_request", "error": "boom"})
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	config := sttTestConfig(server.URL)
+	config.EventBuffer = 1
+	stream := openSTTWithAudio(t, server, config, 3_200).(*sttStream)
+	// Wait until the read loop has placed the billing event in the one slot,
+	// so the error is blocked behind it.
+	deadline := time.Now().Add(2 * time.Second)
+	for len(stream.events) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("read loop never queued the final billing event")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := stream.Cancel(context.Background()); err == nil {
+		t.Fatal("Cancel after a provider error returned nil")
+	}
+	var order []string
+	for event := range stream.events {
+		switch {
+		case event.Billing != nil && event.Billing.Complete:
+			order = append(order, "billing")
+		case event.Err != nil:
+			order = append(order, "error")
+		}
+	}
+	if fmt.Sprint(order) != "[billing error]" {
+		t.Fatalf("events after Cancel = %v, want [billing error]", order)
+	}
+}

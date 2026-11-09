@@ -389,10 +389,11 @@ func (s *sttStream) CommitText(context.Context) error { return runtimepkg.ErrUns
 // Cancel closes the stream because the realtime protocol has no distinct cancel
 // command. It aborts rather than waiting for a final result.
 func (s *sttStream) Cancel(ctx context.Context) error {
-	if err := s.Close(ctx); err != nil {
+	closeErr := s.Close(ctx)
+	if err := s.abort(); closeErr == nil {
 		return err
 	}
-	return s.abort()
+	return closeErr
 }
 
 // Abort immediately tears down the socket after a runtime terminal failure.
@@ -403,10 +404,11 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 // discards whatever Scribe had buffered.
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
-		// A commit refused because the provider already ended the stream is
-		// not a Close failure: that ending reached the consumer on its own, and
-		// a clean server close must stay a clean shutdown.
-		if err := s.CommitAudio(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) && s.endedErr.Load() == nil {
+		// A commit refused because Scribe closed the stream normally is not a
+		// Close failure: a clean server close stays a clean shutdown. A real
+		// provider error is returned, so Cancel cannot abort past it as if
+		// the stream had ended cleanly.
+		if err := s.CommitAudio(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) && !errors.Is(err, errSTTProviderClosed) {
 			s.closeErr = err
 		}
 		s.closed.Store(true)
@@ -523,6 +525,15 @@ func (s *sttStream) writeFrame(ctx context.Context, value any, audioBytes int64)
 	return nil
 }
 
+// errSTTProviderClosed is the reason recorded when Scribe ended the stream
+// without an error frame. Close treats only this one as clean; a real
+// provider error stays a failure.
+var errSTTProviderClosed error = &runtimepkg.ProviderError{
+	Code:      "provider_unavailable",
+	Message:   "ElevenLabs ended the streaming connection",
+	Retryable: true,
+}
+
 // inputClosedErr is what a write returns once input is closed: the reason the
 // provider side ended the stream, or ErrSessionClosed after the caller's Close.
 func (s *sttStream) inputClosedErr() error {
@@ -543,11 +554,7 @@ func (s *sttStream) readLoop() {
 		// still open, the provider or a teardown ended the stream; record why
 		// before closing, so a refused write carries the same failure.
 		if !s.closed.Load() {
-			ended := error(&runtimepkg.ProviderError{
-				Code:      "provider_unavailable",
-				Message:   "ElevenLabs ended the streaming connection",
-				Retryable: true,
-			})
+			ended := errSTTProviderClosed
 			if terminal != nil && terminal.Err != nil {
 				ended = terminal.Err
 			}
@@ -557,7 +564,9 @@ func (s *sttStream) readLoop() {
 		s.awaitWrites(sttWriteSettleTimeout)
 		s.emitCompleteBilling(sttFinalBillingTimeout, true)
 		if terminal != nil {
-			_ = s.emit(*terminal)
+			// Bounded like the billing send rather than tied to s.ctx, so a
+			// Cancel that aborts meanwhile cannot drop the failure.
+			s.emitBounded(*terminal, sttFinalBillingTimeout)
 		}
 		s.billingMu.Lock()
 		s.eventsClosed = true
@@ -711,6 +720,17 @@ func consumeFinal(finals *[]string, text string) bool {
 		}
 	}
 	return false
+}
+
+// emitBounded delivers a teardown event, waiting at most timeout for a
+// consumer. Only the read loop's exit calls it, before it closes the channel.
+func (s *sttStream) emitBounded(event runtimepkg.ProviderEvent, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case s.events <- event:
+	case <-timer.C:
+	}
 }
 
 func (s *sttStream) emit(event runtimepkg.ProviderEvent) error {
