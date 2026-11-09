@@ -403,7 +403,10 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 // discards whatever Scribe had buffered.
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
-		if err := s.CommitAudio(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		// A commit refused because the provider already ended the stream is
+		// not a Close failure: that ending reached the consumer on its own, and
+		// a clean server close must stay a clean shutdown.
+		if err := s.CommitAudio(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) && s.endedErr.Load() == nil {
 			s.closeErr = err
 		}
 		s.closed.Store(true)

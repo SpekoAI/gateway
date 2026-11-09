@@ -935,3 +935,28 @@ func TestSTTAdapterStartedStreamWithoutAudioBillsZero(t *testing.T) {
 		t.Fatalf("complete observations = %+v, want one zero-duration observation for el-stt-zero", complete)
 	}
 }
+
+// Scribe closing normally after receiving audio, then the caller's Close, is
+// still a clean shutdown: Close does not turn the refused commit into an error.
+func TestSTTAdapterCloseAfterAServerCloseIsClean(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-clean"}); err != nil {
+			return
+		}
+		if _, err := readSTTJSON(ctx, conn); err != nil {
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+	providerStream := openSTTWithAudio(t, server, sttTestConfig(server.URL), 3_200)
+	for event := range providerStream.Events() {
+		if event.Err != nil {
+			t.Fatalf("a normal server close produced an error event: %v", event.Err)
+		}
+	}
+	if err := providerStream.Close(context.Background()); err != nil {
+		t.Fatalf("Close after a normal server close = %v, want nil", err)
+	}
+}
