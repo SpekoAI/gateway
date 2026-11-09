@@ -2,8 +2,10 @@ package elevenlabs
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -85,6 +87,12 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if request.AudioBytes > BatchMaxAudioBytes {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInputTooLarge, Message: "the upload exceeds Scribe's 2 GB file limit"}
 	}
+	// webhook=true makes Scribe accept the job and transcribe later. This
+	// adapter returns the transcript from the response it waits for, so it
+	// would return nothing and could not know what Scribe ends up billing.
+	if batchProviderFlag(request, "webhook") {
+		return nil, &runtimepkg.ProviderError{Code: "invalid_request", Message: "ElevenLabs webhook mode is asynchronous; this batch API returns the transcript in the response, so webhook is not supported"}
+	}
 	credential, err := batchhttp.Credential(request.Plan)
 	if err != nil {
 		return nil, err
@@ -163,10 +171,73 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	}
 	// Scribe's batch and realtime models bill at different rates, so the
 	// observation names the batch model that ran. audio_duration_secs is the
-	// length Scribe processed; when it is missing the observation stays
-	// incomplete rather than falling back to the uploaded bytes.
+	// length Scribe processed, but the API documents it as optional. When it
+	// is missing, the duration comes from the upload itself: the request is
+	// always a WAV container of PCM in request.Media, so its data chunk gives
+	// the exact length, as a fraction of a second like the realtime path. Any
+	// other encoding leaves the observation incomplete.
 	observation := billing.Duration("request", model, "batch", response.Body, 1000, "audio_duration_secs")
+	// Only a final 200 carries a finished transcription to measure.
+	if !observation.Complete && response.Status == http.StatusOK {
+		if pcm, ok := wavPCMBytes(request.Audio, request.AudioBytes); ok && request.Media.Encoding == "pcm_s16le" && request.Media.SampleRateHz > 0 {
+			// Scribe bills each channel independently with
+			// use_multi_channel, so the quantity is channel-seconds: every
+			// channel's PCM counts. Otherwise it is the wall-clock length.
+			denominator := int64(request.Media.SampleRateHz) * 2
+			if !batchProviderFlag(request, "use_multi_channel") {
+				denominator *= int64(max(request.Media.Channels, 1))
+			}
+			observation.Quantities["duration_seconds"] = pcm
+			observation.QuantityDenominators = map[string]int64{"duration_seconds": denominator}
+			observation.Complete = true
+		}
+	}
 	observation.ProviderRequestID = result.ProviderRequestID
 	result.Billing = billing.Report(observation)
 	return result, nil
+}
+
+// wavPCMBytes returns the size of a WAV container's data chunk, walking the
+// RIFF chunks from the start. A data size the writer left open (0 or
+// 0xFFFFFFFF) or one past the end of the upload is bounded by the bytes
+// actually uploaded. The reader is rewound afterwards.
+func wavPCMBytes(audio io.ReadSeeker, total int64) (int64, bool) {
+	if audio == nil {
+		return 0, false
+	}
+	if _, err := audio.Seek(0, io.SeekStart); err != nil {
+		return 0, false
+	}
+	defer func() { _, _ = audio.Seek(0, io.SeekStart) }()
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(audio, header); err != nil || string(header[0:4]) != "RIFF" || string(header[8:12]) != "WAVE" {
+		return 0, false
+	}
+	position := int64(12)
+	chunk := make([]byte, 8)
+	for {
+		if _, err := io.ReadFull(audio, chunk); err != nil {
+			return 0, false
+		}
+		position += 8
+		size := int64(binary.LittleEndian.Uint32(chunk[4:8]))
+		if string(chunk[0:4]) == "data" {
+			if remaining := total - position; total > 0 && (size == 0 || size == 0xFFFFFFFF || size > remaining) {
+				size = remaining
+			}
+			return size, size > 0
+		}
+		skip := size + size%2
+		if _, err := audio.Seek(skip, io.SeekCurrent); err != nil {
+			return 0, false
+		}
+		position += skip
+	}
+}
+
+// batchProviderFlag reports whether the caller set an ElevenLabs provider
+// option to true.
+func batchProviderFlag(request runtimepkg.BatchTranscribeRequest, key string) bool {
+	value, ok := request.Options.STT.Provider("elevenlabs")[key]
+	return ok && strings.EqualFold(strings.TrimSpace(protocol.SttOptionString(value)), "true")
 }

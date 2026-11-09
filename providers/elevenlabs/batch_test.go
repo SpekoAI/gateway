@@ -1,7 +1,9 @@
 package elevenlabs
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net/http"
@@ -178,5 +180,106 @@ func TestBatchTranscribeAliasesNorwegianToScribeCode(t *testing.T) {
 	}
 	if got := <-seen; got != "nor" {
 		t.Fatalf("language_code = %q, want nor", got)
+	}
+}
+
+// testWAV builds a 16-bit PCM WAV container. A LIST chunk precedes data so the
+// chunk walk is exercised, and dataSize overrides the declared data length.
+func testWAV(pcmBytes int, dataSize uint32) []byte {
+	var buf bytes.Buffer
+	put32 := func(v uint32) { _ = binary.Write(&buf, binary.LittleEndian, v) }
+	put16 := func(v uint16) { _ = binary.Write(&buf, binary.LittleEndian, v) }
+	buf.WriteString("RIFF")
+	put32(uint32(4 + 8 + 16 + 8 + 4 + 8 + pcmBytes))
+	buf.WriteString("WAVE")
+	buf.WriteString("fmt ")
+	put32(16)
+	put16(1)
+	put16(1)
+	put32(16_000)
+	put32(32_000)
+	put16(2)
+	put16(16)
+	buf.WriteString("LIST")
+	put32(4)
+	buf.WriteString("INFO")
+	buf.WriteString("data")
+	put32(dataSize)
+	buf.Write(make([]byte, pcmBytes))
+	return buf.Bytes()
+}
+
+// Scribe documents audio_duration_secs as optional. Without it, a finished
+// (200) batch observation takes the length of the uploaded PCM: wall-clock
+// for an ordinary upload, channel-seconds with use_multi_channel, which Scribe
+// bills per channel. A 202 acceptance or an encoding it cannot measure stays
+// incomplete, and webhook mode is refused before anything is sent.
+func TestBatchTranscribeBillsTheUploadWhenScribeOmitsTheDuration(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name            string
+		audio           []byte
+		encoding        string
+		channels        int
+		providerOptions map[string]any
+		status          int
+		wantErr         bool
+		complete        bool
+		want, wantDen   int64
+	}{
+		{name: "declared data chunk", audio: testWAV(48_000, 48_000), encoding: "pcm_s16le", channels: 1, status: 200, complete: true, want: 48_000, wantDen: 32_000},
+		{name: "open-ended data size", audio: testWAV(48_000, 0xFFFFFFFF), encoding: "pcm_s16le", channels: 1, status: 200, complete: true, want: 48_000, wantDen: 32_000},
+		{name: "stereo wall clock", audio: testWAV(64_000, 64_000), encoding: "pcm_s16le", channels: 2, status: 200, complete: true, want: 64_000, wantDen: 64_000},
+		{name: "stereo multichannel bills each channel", audio: testWAV(64_000, 64_000), encoding: "pcm_s16le", channels: 2, providerOptions: map[string]any{"use_multi_channel": true}, status: 200, complete: true, want: 64_000, wantDen: 32_000},
+		{name: "not PCM", audio: testWAV(48_000, 48_000), encoding: "opus", channels: 1, status: 200},
+		{name: "202 acceptance", audio: testWAV(48_000, 48_000), encoding: "pcm_s16le", channels: 1, status: 202},
+		{name: "webhook refused", audio: testWAV(48_000, 48_000), encoding: "pcm_s16le", channels: 1, providerOptions: map[string]any{"webhook": true}, status: 200, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				_ = r.ParseMultipartForm(1 << 20)
+				w.Header().Set("request-id", "rid-nodur")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"language_code":"en","language_probability":0.99,"text":"Hi.","transcription_id":"tx_nodur","words":[]}`))
+			}))
+			defer server.Close()
+			adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+			if err != nil {
+				t.Fatalf("adapter: %v", err)
+			}
+			options := protocol.RequestOptions{}
+			if tc.providerOptions != nil {
+				options.STT = &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"elevenlabs": tc.providerOptions}}
+			}
+			result, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{
+				Plan:       batchPlan(server.URL + "/v1/speech-to-text"),
+				Options:    options,
+				Media:      protocol.MediaFormat{Encoding: tc.encoding, SampleRateHz: 16_000, Channels: tc.channels},
+				Audio:      bytes.NewReader(tc.audio),
+				AudioBytes: int64(len(tc.audio)),
+			})
+			if tc.wantErr {
+				if err == nil || requests != 0 {
+					t.Fatalf("err = %v after %d requests, want a refusal before any request", err, requests)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("transcribe: %v", err)
+			}
+			got := result.Billing.Operations[0]
+			if got.Complete != tc.complete || result.Billing.Complete != tc.complete {
+				t.Fatalf("complete = %v (report %v), want %v", got.Complete, result.Billing.Complete, tc.complete)
+			}
+			if !tc.complete {
+				return
+			}
+			if got.Quantities["duration_seconds"] != tc.want || got.QuantityDenominators["duration_seconds"] != tc.wantDen || got.Model != BatchModel || got.Mode != "batch" {
+				t.Fatalf("observation = %+v, want %d/%d scribe_v2 batch", got, tc.want, tc.wantDen)
+			}
+		})
 	}
 }
