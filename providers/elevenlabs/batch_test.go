@@ -1,7 +1,9 @@
 package elevenlabs
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net/http"
@@ -178,5 +180,82 @@ func TestBatchTranscribeAliasesNorwegianToScribeCode(t *testing.T) {
 	}
 	if got := <-seen; got != "nor" {
 		t.Fatalf("language_code = %q, want nor", got)
+	}
+}
+
+// testWAV builds a 16-bit PCM WAV container. A LIST chunk precedes data so the
+// chunk walk is exercised, and dataSize overrides the declared data length.
+func testWAV(pcmBytes int, dataSize uint32) []byte {
+	var buf bytes.Buffer
+	put32 := func(v uint32) { _ = binary.Write(&buf, binary.LittleEndian, v) }
+	put16 := func(v uint16) { _ = binary.Write(&buf, binary.LittleEndian, v) }
+	buf.WriteString("RIFF")
+	put32(uint32(4 + 8 + 16 + 8 + 4 + 8 + pcmBytes))
+	buf.WriteString("WAVE")
+	buf.WriteString("fmt ")
+	put32(16)
+	put16(1)
+	put16(1)
+	put32(16_000)
+	put32(32_000)
+	put16(2)
+	put16(16)
+	buf.WriteString("LIST")
+	put32(4)
+	buf.WriteString("INFO")
+	buf.WriteString("data")
+	put32(dataSize)
+	buf.Write(make([]byte, pcmBytes))
+	return buf.Bytes()
+}
+
+// Scribe documents audio_duration_secs as optional. Without it, the batch
+// observation takes the exact length of the uploaded PCM instead of staying
+// incomplete; an encoding it cannot measure stays incomplete.
+func TestBatchTranscribeBillsTheUploadWhenScribeOmitsTheDuration(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		audio    []byte
+		encoding string
+		want     int64
+		complete bool
+	}{
+		{name: "declared data chunk", audio: testWAV(48_000, 48_000), encoding: "pcm_s16le", want: 48_000, complete: true},
+		{name: "open-ended data size", audio: testWAV(48_000, 0xFFFFFFFF), encoding: "pcm_s16le", want: 48_000, complete: true},
+		{name: "not PCM", audio: testWAV(48_000, 48_000), encoding: "opus"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = r.ParseMultipartForm(1 << 20)
+				w.Header().Set("request-id", "rid-nodur")
+				_, _ = w.Write([]byte(`{"language_code":"en","language_probability":0.99,"text":"Hi.","transcription_id":"tx_nodur","words":[]}`))
+			}))
+			defer server.Close()
+			adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+			if err != nil {
+				t.Fatalf("adapter: %v", err)
+			}
+			result, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{
+				Plan:       batchPlan(server.URL + "/v1/speech-to-text"),
+				Media:      protocol.MediaFormat{Encoding: tc.encoding, SampleRateHz: 16_000, Channels: 1},
+				Audio:      bytes.NewReader(tc.audio),
+				AudioBytes: int64(len(tc.audio)),
+			})
+			if err != nil {
+				t.Fatalf("transcribe: %v", err)
+			}
+			got := result.Billing.Operations[0]
+			if got.Complete != tc.complete || result.Billing.Complete != tc.complete {
+				t.Fatalf("complete = %v (report %v), want %v", got.Complete, result.Billing.Complete, tc.complete)
+			}
+			if !tc.complete {
+				return
+			}
+			if got.Quantities["duration_seconds"] != tc.want || got.QuantityDenominators["duration_seconds"] != 32_000 || got.Model != BatchModel || got.Mode != "batch" {
+				t.Fatalf("observation = %+v, want %d/32000 scribe_v2 batch", got, tc.want)
+			}
+		})
 	}
 }
