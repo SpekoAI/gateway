@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -84,6 +85,43 @@ func TestBatchTranscribeUsesScribeFileContract(t *testing.T) {
 	}
 	if len(result.Segments) != 2 || result.Segments[0] != (runtimepkg.BatchSegment{Text: "Hello there.", StartMS: 100, EndMS: 800, Speaker: "speaker_0"}) || result.Segments[1].Speaker != "speaker_1" {
 		t.Fatalf("segments = %+v", result.Segments)
+	}
+	// Batch Scribe bills apart from realtime, so the observation names the
+	// batch model and mode, and Scribe's own processed duration.
+	want := protocol.BillingReport{Revision: protocol.BillingRevision, Complete: true, Operations: []protocol.BillingObservation{{
+		OperationID: "request", Model: BatchModel, Mode: "batch", ProviderRequestID: "tx_1",
+		Quantities: map[string]int64{"duration_seconds": 1_823_170}, Complete: true,
+	}}}
+	if result.Billing == nil || !reflect.DeepEqual(*result.Billing, want) {
+		t.Fatalf("billing = %+v, want %+v", result.Billing, want)
+	}
+	if err := result.Billing.Validate(); err != nil {
+		t.Fatalf("billing invalid: %v", err)
+	}
+}
+
+// Without audio_duration_secs there is no vendor quantity, and the uploaded
+// bytes are not substituted for it.
+func TestBatchBillingStaysIncompleteWithoutTheVendorDuration(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("request-id", "rid-2")
+		_, _ = w.Write([]byte(`{"language_code":"en","text":"Hi.","words":[]}`))
+	}))
+	defer server.Close()
+	adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatalf("adapter: %v", err)
+	}
+	result, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{Plan: batchPlan(server.URL + "/v1/speech-to-text"), Audio: strings.NewReader("RIFF....WAVE"), AudioBytes: 12})
+	if err != nil {
+		t.Fatalf("transcribe: %v", err)
+	}
+	want := protocol.BillingReport{Revision: protocol.BillingRevision, Operations: []protocol.BillingObservation{{
+		OperationID: "request", Model: BatchModel, Mode: "batch", ProviderRequestID: "rid-2", Quantities: map[string]int64{},
+	}}}
+	if result.Billing == nil || !reflect.DeepEqual(*result.Billing, want) {
+		t.Fatalf("billing = %+v, want %+v", result.Billing, want)
 	}
 }
 

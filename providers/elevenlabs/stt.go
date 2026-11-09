@@ -154,6 +154,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		cancel: cancel,
 		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		rate:   request.Media.SampleRateHz,
+		model:  request.Plan.Route.Model,
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -293,6 +294,9 @@ type sttStream struct {
 	cancel context.CancelFunc
 	events chan runtimepkg.ProviderEvent
 	rate   int
+	// model is the realtime Scribe model on the socket, named in billing
+	// because batch scribe_v2 bills at a different rate.
+	model string
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -303,6 +307,17 @@ type sttStream struct {
 	stateMu      sync.Mutex
 	baseFinals   []string
 	timedFinals  []string
+	// sentBytes is the PCM written to the socket. Scribe reports no audio
+	// count on the realtime socket, so this is the billed duration.
+	sentBytes atomic.Int64
+	// billingMu orders the two billing emits, so a late session_started
+	// cannot follow the complete observation with an incomplete one. It also
+	// guards eventsClosed: Close emits from the caller's goroutine and must
+	// not send after readLoop has closed the channel.
+	billingMu    sync.Mutex
+	sessionID    string
+	billed       bool
+	eventsClosed bool
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -328,6 +343,7 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 		if err := s.writeJSON(ctx, chunk); err != nil {
 			return err
 		}
+		s.sentBytes.Add(int64(end - offset))
 	}
 	s.inputPending.Store(true)
 	return nil
@@ -380,9 +396,35 @@ func (s *sttStream) Close(ctx context.Context) error {
 		s.closed.Store(true)
 		if s.closeErr != nil {
 			_ = s.abort()
+			return
+		}
+		// Input is closed, so the PCM count is final. Taking the write lock
+		// waits out a frame still in flight before it is read.
+		s.writeMu.Lock()
+		s.writeMu.Unlock()
+		s.billingMu.Lock()
+		defer s.billingMu.Unlock()
+		s.billed = true
+		if !s.eventsClosed {
+			_ = s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billing(true)})
 		}
 	})
 	return s.closeErr
+}
+
+// billing is the session's one duration observation. Before Close it is
+// incomplete and carries no quantity, so a session that ends without a
+// graceful Close settles as unresolved rather than free. The complete
+// observation is the PCM this stream sent, as an exact fraction of a second.
+// The caller holds billingMu.
+func (s *sttStream) billing(complete bool) *protocol.BillingObservation {
+	observation := &protocol.BillingObservation{OperationID: "stream", Model: s.model, Mode: "streaming", ProviderRequestID: s.sessionID, Quantities: map[string]int64{}}
+	if complete {
+		observation.Quantities["duration_seconds"] = s.sentBytes.Load()
+		observation.QuantityDenominators = map[string]int64{"duration_seconds": int64(s.rate) * 2}
+		observation.Complete = true
+	}
+	return observation
 }
 
 func (s *sttStream) abort() error {
@@ -420,7 +462,12 @@ func (s *sttStream) writeJSON(ctx context.Context, value any) error {
 }
 
 func (s *sttStream) readLoop() {
-	defer close(s.events)
+	defer func() {
+		s.billingMu.Lock()
+		s.eventsClosed = true
+		close(s.events)
+		s.billingMu.Unlock()
+	}()
 	for {
 		messageType, payload, err := s.conn.Read(s.ctx)
 		if err != nil {
@@ -461,10 +508,18 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// an ALREADY-OPEN socket, so readiness has to wait for this rather than fire
 		// at dial — otherwise those failures look like mid-stream errors and the
 		// runtime loses its open-failure failover.
+		s.billingMu.Lock()
+		defer s.billingMu.Unlock()
+		var observation *protocol.BillingObservation
+		if !s.billed {
+			s.sessionID = message.SessionID
+			observation = s.billing(false)
+		}
 		return s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventUsageObserved,
 			Data:       sttMarshalData(map[string]any{"provider_request_id": message.SessionID}),
 			Extensions: sttExtension(raw),
+			Billing:    observation,
 		})
 	case "partial_transcript":
 		if strings.TrimSpace(message.Text) == "" {
