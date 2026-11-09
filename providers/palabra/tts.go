@@ -242,16 +242,19 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 // generation_id, issuing the id with the sentence's first fragment. The
 // caller holds stateMu.
 func (s *ttsStream) writeText(ctx context.Context, text string, eos bool) error {
-	if s.sentence == "" {
+	// The sentence is outstanding from its first fragment, not its is_eos:
+	// Palabra may already be synthesizing streamed text, so a normal close
+	// between AppendText and CommitText still loses audio.
+	first := s.sentence == ""
+	if first {
 		s.sentence = s.generations.next()
+		s.generations.commit(s.sentence)
 	}
 	id := s.sentence
-	if eos {
-		s.generations.commit(id)
-	}
 	if err := s.writeJSON(ctx, ttsText{Type: "text", Text: text, GenerationID: id, IsEOS: eos}); err != nil {
-		if eos {
+		if first || eos {
 			s.generations.finish(id)
+			s.sentence = ""
 		}
 		return err
 	}

@@ -812,3 +812,63 @@ func TestTTSCompletionFollowsGenerationIDs(t *testing.T) {
 		})
 	}
 }
+
+// A normal close after a streamed, uncommitted fragment loses audio Palabra
+// may already be synthesizing, so it is an error, not a clean finish.
+func TestTTSNormalCloseAfterUncommittedFragmentIsAnError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		for range 2 { // init, then the streamed fragment
+			_, payload, err := conn.Read(ctx)
+			if err != nil {
+				t.Errorf("read: %v", err)
+				return
+			}
+			var frame struct {
+				Type  string `json:"type"`
+				IsEOS bool   `json:"is_eos"`
+			}
+			_ = json.Unmarshal(payload, &frame)
+			if frame.Type == "text" && frame.IsEOS {
+				t.Errorf("fragment sent with is_eos before CommitText")
+			}
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	}))
+	defer server.Close()
+	parsed, _ := url.Parse(server.URL)
+	adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(ctx, ttsRequest(wsURL(server.URL)+ttsPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.(*ttsStream).Abort(ctx)
+	// The second AppendText sends the first text as a non-final fragment.
+	for _, text := range []string{"first part", "second part"} {
+		if err := stream.AppendText(ctx, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for {
+		select {
+		case event, ok := <-stream.Events():
+			if !ok {
+				t.Fatal("stream ended cleanly after a close mid-sentence")
+			}
+			if event.Err != nil {
+				return
+			}
+		case <-ctx.Done():
+			t.Fatal("no terminal event")
+		}
+	}
+}
