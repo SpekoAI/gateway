@@ -133,18 +133,24 @@
 // audio cap (text that speaks far slower than the budget assumes), the 413 is
 // classified as a non-retryable invalid_request.
 //
+// # Keepalive and idle closes
+//
+// Soniox ends a started STT stream with 408 request_timeout after 20 seconds
+// without audio or a `{"type":"keepalive"}` control, and closes a connection
+// that never sends its start request with WebSocket status 1001 after 40
+// seconds (docs.soniox.com/stt/rt/connection-keepalive). The STT adapter
+// therefore sends `{"type":"keepalive"}` whenever no audio has been written for
+// sttKeepaliveInterval (10 seconds) and stops once Close has sent the
+// end-of-stream frame. Keepalives keep the stream, and so its billed duration,
+// open for as long as the caller holds the session. An unrequested 1001 close
+// is reported as a retryable provider_unavailable error, not as completion.
+//
 // # Known gaps
 //
-// Soniox closes an STT socket that receives neither audio nor a
-// `{"type":"keepalive"}` control for too long, and closes a TTS connection
-// idle for more than 40 seconds; a TTS stream that receives no text for a few
-// seconds ends with request_timeout, which applies equally to a queued stream
-// of a long utterance whose caller stops sending text without committing.
-// Note the two keepalive messages have different shapes: STT takes
-// `{"type":"keepalive"}`, TTS takes `{"keep_alive":true}`. Neither adapter
-// runs a keepalive ticker, because in this runtime writes are serialized by
-// the session and driven by the caller — the same stance the Deepgram adapter
-// takes toward its own idle timeout. A caller that gates audio behind local
-// VAD must therefore keep the socket fed itself, or the socket is
-// closed underneath it.
+// Soniox closes a TTS connection idle for more than 40 seconds, and a TTS
+// stream that receives no text for a few seconds ends with request_timeout,
+// which applies equally to a queued stream of a long utterance whose caller
+// stops sending text without committing. TTS takes `{"keep_alive":true}`, a
+// different shape from STT's keepalive. The TTS adapter runs no keepalive
+// ticker, because its writes are driven by the caller.
 package soniox

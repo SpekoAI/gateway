@@ -50,12 +50,15 @@ import (
 //     reaches between turns routinely, so this adapter keeps it alive itself.
 //     The text-to-speech socket needs nothing equivalent.
 //
-// Two vendor parameters the text-to-speech path sets are deliberately NOT set
-// here, because the dialogue endpoint does not document them and an undocumented
-// query parameter is a 400 risk on a route that has already reserved credit:
-// `sync_alignment` (so alignment arrives only if the vendor volunteers it, and
-// this adapter forwards it when it does) and `language_code` (a request-body
-// field on the dialogue API, not a socket parameter — v3 infers the language).
+// The vendor's AsyncAPI for this socket (api-reference/text-to-dialogue/
+// ttd-websocket, read 2026-11-09) lists `language_code` as a handshake query
+// parameter, so a session language is sent there with the same ISO 639-1
+// normalisation and aliases as the text-to-speech socket (ttsLanguageCode); a
+// session without one leaves the model to infer the language. The same schema
+// lists `sync_alignment` and `apply_text_normalization`, but this adapter
+// still sets neither: no request option carries text normalization, and
+// alignment arrives only if the vendor volunteers it (this adapter forwards it
+// when it does) rather than changing the frame stream the read loop expects.
 const (
 	// DialogueAdapterID identifies the ElevenLabs text-to-dialogue socket.
 	DialogueAdapterID = "elevenlabs.dialogue.v1"
@@ -157,7 +160,7 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 	if request.Plan.Execution.CredentialSource == protocol.CredentialsManaged && request.Plan.Execution.ProviderRoute != protocol.RouteSpekoRelay {
 		singleUseToken = credential.Value
 	}
-	endpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media, singleUseToken)
+	endpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options.Language, *request.Media, singleUseToken)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +198,7 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 			if !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, fresh.Kind) || strings.TrimSpace(fresh.Value) == "" {
 				return nil, errors.New("elevenlabs dialogue reconnect requires a bearer credential")
 			}
-			freshEndpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media, fresh.Value)
+			freshEndpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options.Language, *request.Media, fresh.Value)
 			if err != nil {
 				return nil, err
 			}
@@ -255,7 +258,7 @@ func (a *DialogueAdapter) dialDialogue(ctx context.Context, client *http.Client,
 // dialogueSocket validates the route and builds the socket URL. The path is
 // fixed — unlike the text-to-speech socket there is no voice segment to append,
 // because the voice is registered in the handshake instead.
-func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model string, media protocol.MediaFormat, singleUseToken string) (string, error) {
+func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model, language string, media protocol.MediaFormat, singleUseToken string) (string, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
 		return "", fmt.Errorf("elevenlabs dialogue endpoint: %w", err)
@@ -284,6 +287,9 @@ func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	query := endpoint.Query()
 	query.Set("model_id", model)
 	query.Set("output_format", "pcm_"+strconv.Itoa(media.SampleRateHz))
+	if language := ttsLanguageCode(language); language != "" {
+		query.Set("language_code", language)
+	}
 	if singleUseToken != "" {
 		query.Set("single_use_token", singleUseToken)
 	}

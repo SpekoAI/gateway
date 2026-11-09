@@ -54,8 +54,9 @@ type Config struct {
 	HTTPClient      *http.Client
 	EventBuffer     int
 	MaxMessageBytes int64
-	// GracefulCloseIdleTimeout bounds a Close whose provider reader cannot
-	// make progress, including when downstream has stopped draining Events.
+	// GracefulCloseIdleTimeout bounds a Close or Cancel whose provider reader
+	// cannot make progress, including when downstream has stopped draining
+	// Events.
 	GracefulCloseIdleTimeout time.Duration
 	// MaxResponseBytes is retained as a compatibility alias from v1. New code
 	// should use MaxMessageBytes; if both are set MaxMessageBytes wins.
@@ -323,9 +324,14 @@ func (s *stream) CommitText(ctx context.Context) error {
 	return nil
 }
 
-// Cancel closes the active provider context. A later utterance creates a fresh
-// context on the same authenticated connection, so cancellation does not need
-// another one-time credential.
+// Cancel sends cancel_context for the active provider context. Inworld aborts
+// the synthesis in progress, discards buffered and queued text, and ends the
+// context with contextClosed; close_context would instead synthesize the rest
+// of the utterance before closing. Audio already generated may still arrive
+// after the cancel and is dropped. Cancel returns once contextClosed arrives,
+// bounded by GracefulCloseIdleTimeout without provider progress. A later
+// utterance creates a fresh context on the same authenticated connection, so
+// cancellation does not need another one-time credential.
 func (s *stream) Cancel(ctx context.Context) error {
 	s.stateMu.Lock()
 	hadPending := s.pending.Len() > 0
@@ -344,19 +350,21 @@ func (s *stream) Cancel(ctx context.Context) error {
 	s.stateMu.Unlock()
 
 	if shouldWrite {
-		if err := s.writeJSON(ctx, closeContextRequest{ContextID: contextID, CloseContext: struct{}{}}); err != nil {
+		if err := s.writeJSON(ctx, cancelContextRequest{ContextID: contextID, CancelContext: struct{}{}}); err != nil {
 			s.abort()
 			return err
 		}
 	}
-	select {
-	case <-done:
-		return nil
-	case <-s.ctx.Done():
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := s.waitForCloseProgress(ctx, done, "cancellation"); err != nil {
+		var providerErr *runtimepkg.ProviderError
+		if errors.As(err, &providerErr) {
+			// The context never acknowledged the cancel, so it cannot be
+			// reused and no fresh one may start beside it on this socket.
+			s.abort()
+		}
+		return err
 	}
+	return nil
 }
 
 func (s *stream) Close(ctx context.Context) error {
@@ -863,6 +871,11 @@ type sendTextRequest struct {
 type closeContextRequest struct {
 	ContextID    string   `json:"context_id"`
 	CloseContext struct{} `json:"close_context"`
+}
+
+type cancelContextRequest struct {
+	ContextID     string   `json:"context_id"`
+	CancelContext struct{} `json:"cancel_context"`
 }
 
 type rpcStatus struct {

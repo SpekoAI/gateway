@@ -62,3 +62,25 @@ func sttQuery(t *testing.T, endpoint string) url.Values {
 	}
 	return parsed.Query()
 }
+
+// Scribe lists Norwegian only as `nor`; a platform `nb` is refused with
+// invalid_request and close 1008. Other languages pass as the primary subtag,
+// and the TTS-only `no` alias must not leak onto STT.
+func TestRealtimeEndpointAliasesNorwegianToScribeCode(t *testing.T) {
+	t.Parallel()
+	policy, err := upstream.NewWebSocketPolicy(officialAPIHost, nil, false)
+	if err != nil {
+		t.Fatalf("endpoint policy: %v", err)
+	}
+	media := protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1}
+	raw := "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
+	for language, want := range map[string]string{"nb": "nor", "nb-NO": "nor", "nn": "nor", "NN_no": "nor", "es-MX": "es", "fil": "fil", "uz": "uz"} {
+		endpoint, err := realtimeEndpoint(policy, raw, "scribe_v2_realtime", protocol.RequestOptions{Language: language}, media)
+		if err != nil {
+			t.Fatalf("%s endpoint: %v", language, err)
+		}
+		if got := sttQuery(t, endpoint).Get("language_code"); got != want {
+			t.Errorf("language %q sent language_code=%q, want %q", language, got, want)
+		}
+	}
+}

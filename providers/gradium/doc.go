@@ -71,7 +71,9 @@
 //   - /guides/limits.md — the exact accepted `output_format` / `input_format`
 //     vocabulary and the 300-second session ceiling.
 //   - /guides/transcription-settings.md — the language enumeration
-//     (en, fr, de, es, pt) both adapters validate against.
+//     (en, fr, de, es, pt, and "any" to auto-detect) the STT adapter
+//     validates against, and that `json_config.language` is required
+//     (re-read 2026-11-09).
 //   - /guides/websocket-stream-options.md — that waiting for `ready` before
 //     sending input is optional and off by default.
 //   - /guides/browser-websockets.md — the token mint endpoint described above.
@@ -88,11 +90,14 @@
 // is not sent here. It appears in no published Gradium documentation, and this
 // package only writes headers the vendor documents.
 //
-// Regional hosts. The platform's TypeScript client connects to
-// `us.api.gradium.ai`, and Gradium advertises EU and US capacity, but no
-// published doc page names a regional hostname. The endpoint allowlist here
-// pins only the documented `api.gradium.ai`; a deployment that wants a
-// regional host must add it explicitly through Config.AllowedEndpointHosts.
+// Regional hosts. Gradium documents `eu.api.gradium.ai` and
+// `us.api.gradium.ai` beside the default `api.gradium.ai`
+// (/guides/data-residency.md): the same API, key and routes, with sessions
+// pinned to that region's clusters for organizations enrolled in data
+// residency. The platform's TypeScript client connects to the US host. The
+// endpoint allowlist here still pins only `api.gradium.ai`, which routes to the
+// nearest cluster; a deployment that wants a regional host must add it
+// explicitly through Config.AllowedEndpointHosts.
 //
 // # Known gaps
 //

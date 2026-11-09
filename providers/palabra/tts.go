@@ -2,11 +2,13 @@ package palabra
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,7 +126,7 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
-	stream := &ttsStream{conn: conn, ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer)}
+	stream := &ttsStream{conn: conn, ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), generations: newGenerations()}
 	if err := stream.writeJSON(ctx, ttsInit{
 		Type: "init", Language: language, Model: model,
 		VoiceOptions: ttsVoiceOptions{VoiceID: voice, Speed: 1, DeaccentStrength: 1},
@@ -157,9 +159,10 @@ type ttsOutput struct {
 }
 
 type ttsText struct {
-	Type  string `json:"type"`
-	Text  string `json:"text"`
-	IsEOS bool   `json:"is_eos"`
+	Type         string `json:"type"`
+	Text         string `json:"text"`
+	GenerationID string `json:"generation_id,omitempty"`
+	IsEOS        bool   `json:"is_eos"`
 }
 
 type ttsStream struct {
@@ -175,7 +178,14 @@ type ttsStream struct {
 	closed       atomic.Bool
 	closeErr     error
 	pending      string
-	audioStarted bool // read-loop owned
+	// sentence is the generation_id of the sentence being sent, empty until
+	// its first text frame goes out. Guarded by stateMu.
+	sentence    string
+	generations *generations
+	// audioStarted and audioGeneration are read-loop owned: the generation
+	// whose audio.started has gone out and whose audio.done has not.
+	audioStarted    bool
+	audioGeneration string
 }
 
 func (s *ttsStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -197,13 +207,13 @@ func (s *ttsStream) AppendText(ctx context.Context, text string) error {
 		return runtimepkg.ErrSessionClosed
 	}
 	if s.pending != "" {
-		if err := s.writeJSON(ctx, ttsText{Type: "text", Text: s.pending, IsEOS: false}); err != nil {
+		if err := s.writeText(ctx, s.pending, false); err != nil {
 			return err
 		}
 	}
 	chunks := splitRunes(text, maxTextRunes)
 	for _, chunk := range chunks[:len(chunks)-1] {
-		if err := s.writeJSON(ctx, ttsText{Type: "text", Text: chunk, IsEOS: false}); err != nil {
+		if err := s.writeText(ctx, chunk, false); err != nil {
 			return err
 		}
 	}
@@ -221,10 +231,36 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		return errors.New("palabra tts has no buffered text to synthesize")
 	}
 	text := s.pending
-	if err := s.writeJSON(ctx, ttsText{Type: "text", Text: text, IsEOS: true}); err != nil {
+	if err := s.writeText(ctx, text, true); err != nil {
 		return err
 	}
 	s.pending = ""
+	return nil
+}
+
+// writeText sends one fragment of the current sentence under its
+// generation_id, issuing the id with the sentence's first fragment. The
+// caller holds stateMu.
+func (s *ttsStream) writeText(ctx context.Context, text string, eos bool) error {
+	// The sentence is outstanding from its first fragment, not its is_eos:
+	// Palabra may already be synthesizing streamed text, so a normal close
+	// between AppendText and CommitText still loses audio.
+	first := s.sentence == ""
+	if first {
+		s.sentence = s.generations.next()
+		s.generations.commit(s.sentence)
+	}
+	id := s.sentence
+	if err := s.writeJSON(ctx, ttsText{Type: "text", Text: text, GenerationID: id, IsEOS: eos}); err != nil {
+		if first || eos {
+			s.generations.finish(id)
+			s.sentence = ""
+		}
+		return err
+	}
+	if eos {
+		s.sentence = ""
+	}
 	return nil
 }
 
@@ -244,8 +280,12 @@ func splitRunes(value string, limit int) []string {
 
 func (s *ttsStream) Cancel(ctx context.Context) error {
 	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	s.pending = ""
-	s.stateMu.Unlock()
+	s.sentence = ""
+	// Marked before the cancel goes out, so a frame Palabra sent for these
+	// sentences is dropped however late it arrives.
+	s.generations.cancelAll()
 	return s.writeJSON(ctx, map[string]string{"type": "cancel"})
 }
 
@@ -297,8 +337,8 @@ func (s *ttsStream) readLoop() {
 	for {
 		messageType, payload, err := s.conn.Read(s.ctx)
 		if err != nil {
-			if !s.closed.Load() && !isNormalClose(err) && s.ctx.Err() == nil {
-				s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Palabra TTS streaming read failed", Retryable: true, Cause: err}})
+			if !s.closed.Load() && s.ctx.Err() == nil && (!isNormalClose(err) || s.generations.waiting()) {
+				s.emit(runtimepkg.ProviderEvent{Err: streamFailure("Palabra TTS streaming read failed", "the audio was complete", err)})
 			}
 			return
 		}
@@ -320,13 +360,17 @@ func (s *ttsStream) handleMessage(payload []byte) error {
 	raw := append([]byte(nil), payload...)
 	switch message.MessageType {
 	case "audio_chunk":
+		id := message.Data.GenerationID
+		if s.generations.cancelled(id) {
+			return nil
+		}
 		if message.Data.Audio != "" {
 			audio, err := base64.StdEncoding.DecodeString(message.Data.Audio)
 			if err != nil {
 				return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Palabra TTS sent invalid audio data", Retryable: true, Cause: err}
 			}
-			if !s.audioStarted {
-				s.audioStarted = true
+			if !s.audioStarted || s.audioGeneration != id {
+				s.audioStarted, s.audioGeneration = true, id
 				if err := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: marshalData(map[string]any{"provider_request_id": message.Data.GenerationID}), Extensions: extension(raw)}); err != nil {
 					return err
 				}
@@ -336,12 +380,15 @@ func (s *ttsStream) handleMessage(payload []byte) error {
 			}
 		}
 		if message.Data.LastChunk {
-			s.audioStarted = false
+			if s.audioGeneration == id {
+				s.audioStarted = false
+			}
+			s.generations.finish(id)
 			return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: marshalData(map[string]any{"provider_request_id": message.Data.GenerationID}), Extensions: extension(raw)})
 		}
 		return nil
 	case "error":
-		return providerFrameError(message.Data.Code, message.Data.Description, raw)
+		return message.Data.providerError(raw)
 	default:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"message": "ignored Palabra TTS message type", "provider_type": message.MessageType}), Extensions: extension(raw)})
 	}
@@ -359,10 +406,118 @@ func (s *ttsStream) emit(event runtimepkg.ProviderEvent) error {
 type ttsInbound struct {
 	MessageType string `json:"message_type"`
 	Data        struct {
+		frameError
 		Audio        string `json:"audio"`
 		GenerationID string `json:"generation_id"`
 		LastChunk    bool   `json:"last_chunk"`
-		Code         string `json:"code"`
-		Description  string `json:"desc"`
 	} `json:"data"`
+}
+
+// generations tracks the generation_id of every sentence on one socket. Each
+// sentence gets its own id, sent on every text frame of that sentence;
+// Palabra echoes it on that sentence's audio_chunk frames, including its one
+// last_chunk. Ids are "<prefix><n>" with n counting up from 1, so one number
+// marks every id issued before a cancel.
+type generations struct {
+	prefix string
+
+	mu sync.Mutex
+	// issued is the n of the newest id.
+	issued uint64
+	// cancelledThrough is the highest n that a cancel covered. Frames for
+	// these ids are dropped, so a cancelled sentence's late audio or
+	// last_chunk cannot play as, or complete, a later sentence.
+	cancelledThrough uint64
+	// outstanding holds committed sentences (is_eos sent) whose last_chunk
+	// has not arrived. A socket that closes while one remains closed
+	// mid-synthesis, even with a normal close code.
+	outstanding map[uint64]struct{}
+}
+
+func newGenerations() *generations {
+	// 4-256 characters per Palabra's text message. The random part keeps ids
+	// from different sockets apart in Palabra's logs and in
+	// provider_request_id.
+	return &generations{prefix: "speko-" + strings.ToLower(rand.Text()[:10]) + "-", outstanding: make(map[uint64]struct{})}
+}
+
+// next issues the id for a new sentence.
+func (g *generations) next() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.issued++
+	return g.prefix + strconv.FormatUint(g.issued, 10)
+}
+
+func (g *generations) number(id string) (uint64, bool) {
+	rest, ok := strings.CutPrefix(id, g.prefix)
+	if !ok || g.prefix == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(rest, 10, 64)
+	return n, err == nil && n > 0
+}
+
+// commit marks a sentence as waiting for its last_chunk. It runs before the
+// is_eos frame is sent, so the last_chunk can never be read first.
+func (g *generations) commit(id string) {
+	n, ok := g.number(id)
+	if !ok {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.outstanding[n] = struct{}{}
+}
+
+// finish retires a sentence: the one an id this stream issued names, or a
+// failed send of its is_eos frame. A last_chunk with an empty or unknown id
+// retires the oldest outstanding sentence instead, so a Palabra that omits or
+// rewrites the id still completes sentences in order, as before ids were
+// sent. Cancelled ids never get here; their frames are dropped first.
+func (g *generations) finish(id string) {
+	n, ours := g.number(id)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if ours {
+		delete(g.outstanding, n)
+		return
+	}
+	var oldest uint64
+	for candidate := range g.outstanding {
+		if oldest == 0 || candidate < oldest {
+			oldest = candidate
+		}
+	}
+	delete(g.outstanding, oldest)
+}
+
+// cancelAll covers every id issued so far, committed or not. Palabra's cancel
+// stops the current synthesis and answers with a "cancelled" frame, not a
+// last_chunk, and the caller no longer waits for that audio.
+func (g *generations) cancelAll() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cancelledThrough = g.issued
+	clear(g.outstanding)
+}
+
+// cancelled reports whether id belongs to a cancelled sentence. Ids this
+// stream did not issue, including an empty one, are not cancelled: their
+// audio plays.
+func (g *generations) cancelled(id string) bool {
+	n, ok := g.number(id)
+	if !ok {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return n <= g.cancelledThrough
+}
+
+// waiting reports whether a committed sentence still lacks its last_chunk.
+func (g *generations) waiting() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.outstanding) > 0
 }

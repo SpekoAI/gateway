@@ -33,6 +33,13 @@ const (
 	finToken = "<fin>"
 
 	sttGracefulCloseTimeout = 30 * time.Second
+
+	// sttKeepAliveInterval is how long the stream may go without audio before
+	// the adapter sends {"type":"keepalive"}. Soniox ends a started stream
+	// with 408 request_timeout after 20 seconds without audio or a keepalive
+	// (docs.soniox.com/stt/rt/connection-keepalive), so this keeps a wide
+	// margin under that limit.
+	sttKeepAliveInterval = 10 * time.Second
 )
 
 const (
@@ -44,10 +51,12 @@ const (
 // STTConfig controls local transport limits. Credentials and provider
 // selection always come from the signed session plan, never from here.
 type STTConfig struct {
-	AdapterID             string
-	HTTPClient            *http.Client
-	EventBuffer           int
-	MaxMessageBytes       int64
+	AdapterID       string
+	HTTPClient      *http.Client
+	EventBuffer     int
+	MaxMessageBytes int64
+	// KeepAliveInterval overrides sttKeepAliveInterval; zero uses the default.
+	KeepAliveInterval     time.Duration
 	AllowedEndpointHosts  []string
 	AllowInsecureEndpoint bool
 }
@@ -58,6 +67,7 @@ type STTAdapter struct {
 	httpClient      *http.Client
 	eventBuffer     int
 	maxMessageBytes int64
+	keepalive       time.Duration
 	endpointPolicy  upstream.WebSocketPolicy
 }
 
@@ -78,6 +88,12 @@ func NewSTT(config STTConfig) (*STTAdapter, error) {
 	if config.MaxMessageBytes < 1 {
 		return nil, errors.New("soniox maximum message bytes must be positive")
 	}
+	if config.KeepAliveInterval == 0 {
+		config.KeepAliveInterval = sttKeepAliveInterval
+	}
+	if config.KeepAliveInterval < 0 {
+		return nil, errors.New("soniox keepalive interval must be positive")
+	}
 	endpointPolicy, err := upstream.NewWebSocketPolicy(sttOfficialHost, config.AllowedEndpointHosts, config.AllowInsecureEndpoint)
 	if err != nil {
 		return nil, err
@@ -87,6 +103,7 @@ func NewSTT(config STTConfig) (*STTAdapter, error) {
 		httpClient:      config.HTTPClient,
 		eventBuffer:     config.EventBuffer,
 		maxMessageBytes: config.MaxMessageBytes,
+		keepalive:       config.KeepAliveInterval,
 		endpointPolicy:  endpointPolicy,
 	}, nil
 }
@@ -199,7 +216,9 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		events:       make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		closeTimeout: sttGracefulCloseTimeout,
 	}
+	stream.lastAudio.Store(time.Now().UnixNano())
 	go stream.readLoop()
+	go stream.keepaliveLoop(a.keepalive)
 	return stream, nil
 }
 
@@ -323,6 +342,8 @@ type sttStream struct {
 	// binary frame as end-of-stream, so only uncommitted audio needs a finalize
 	// immediately before it.
 	finalizeSent atomic.Bool
+	// lastAudio is the UnixNano time of the last audio frame or keepalive.
+	lastAudio atomic.Int64
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -337,8 +358,38 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	if err := s.write(ctx, websocket.MessageBinary, audio); err != nil {
 		return err
 	}
+	s.lastAudio.Store(time.Now().UnixNano())
 	s.finalizeSent.Store(false)
 	return nil
+}
+
+// keepaliveLoop sends Soniox's {"type":"keepalive"} control whenever no audio
+// has been written for interval, so a caller that pauses audio (local VAD,
+// push-to-talk, a long agent turn) keeps its stream. It stops once Close has
+// sent the end-of-stream frame, on Abort, or when a write fails because the
+// socket is gone.
+func (s *sttStream) keepaliveLoop(interval time.Duration) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if s.closed.Load() {
+			return
+		}
+		if idle := time.Since(time.Unix(0, s.lastAudio.Load())); idle < interval {
+			timer.Reset(interval - idle)
+			continue
+		}
+		if err := s.writeJSON(s.ctx, map[string]string{"type": "keepalive"}); err != nil {
+			return
+		}
+		s.lastAudio.Store(time.Now().UnixNano())
+		timer.Reset(interval)
+	}
 }
 
 // CommitAudio issues Soniox's manual finalization control. Soniox finalizes
@@ -520,10 +571,19 @@ func (s *sttStream) readLoop() {
 	for {
 		messageType, payload, err := s.conn.Read(s.ctx)
 		if err != nil {
-			if !s.closed.Load() && !sonioxIsNormalClose(err) && s.ctx.Err() == nil {
+			// Only 1000 after a caller-requested close (or after Soniox's own
+			// finished reply) is completion. Soniox uses 1001 for connections
+			// it closes as idle, so an unrequested 1001 lost the stream.
+			if !s.closed.Load() && s.ctx.Err() == nil && websocket.CloseStatus(err) != websocket.StatusNormalClosure {
+				message, hint := "Soniox streaming read failed", ""
+				if websocket.CloseStatus(err) == websocket.StatusGoingAway {
+					message = "Soniox closed the streaming connection as idle"
+					hint = "Soniox closed the stream with WebSocket code 1001; retry the request, and if it recurs, route to another STT provider."
+				}
 				s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{
 					Code:      "provider_unavailable",
-					Message:   "Soniox streaming read failed",
+					Message:   message,
+					Hint:      hint,
 					Retryable: true,
 					Cause:     err,
 				}})
