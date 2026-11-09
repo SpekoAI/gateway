@@ -87,6 +87,12 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if request.AudioBytes > BatchMaxAudioBytes {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInputTooLarge, Message: "the upload exceeds Scribe's 2 GB file limit"}
 	}
+	// webhook=true makes Scribe accept the job and transcribe later. This
+	// adapter returns the transcript from the response it waits for, so it
+	// would return nothing and could not know what Scribe ends up billing.
+	if batchProviderFlag(request, "webhook") {
+		return nil, &runtimepkg.ProviderError{Code: "invalid_request", Message: "ElevenLabs webhook mode is asynchronous; this batch API returns the transcript in the response, so webhook is not supported"}
+	}
 	credential, err := batchhttp.Credential(request.Plan)
 	if err != nil {
 		return nil, err
@@ -171,11 +177,18 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	// the exact length, as a fraction of a second like the realtime path. Any
 	// other encoding leaves the observation incomplete.
 	observation := billing.Duration("request", model, "batch", response.Body, 1000, "audio_duration_secs")
-	if !observation.Complete {
+	// Only a final 200 carries a finished transcription to measure.
+	if !observation.Complete && response.Status == http.StatusOK {
 		if pcm, ok := wavPCMBytes(request.Audio, request.AudioBytes); ok && request.Media.Encoding == "pcm_s16le" && request.Media.SampleRateHz > 0 {
-			channels := int64(max(request.Media.Channels, 1))
+			// Scribe bills each channel independently with
+			// use_multi_channel, so the quantity is channel-seconds: every
+			// channel's PCM counts. Otherwise it is the wall-clock length.
+			denominator := int64(request.Media.SampleRateHz) * 2
+			if !batchProviderFlag(request, "use_multi_channel") {
+				denominator *= int64(max(request.Media.Channels, 1))
+			}
 			observation.Quantities["duration_seconds"] = pcm
-			observation.QuantityDenominators = map[string]int64{"duration_seconds": int64(request.Media.SampleRateHz) * 2 * channels}
+			observation.QuantityDenominators = map[string]int64{"duration_seconds": denominator}
 			observation.Complete = true
 		}
 	}
@@ -220,4 +233,11 @@ func wavPCMBytes(audio io.ReadSeeker, total int64) (int64, bool) {
 		}
 		position += skip
 	}
+}
+
+// batchProviderFlag reports whether the caller set an ElevenLabs provider
+// option to true.
+func batchProviderFlag(request runtimepkg.BatchTranscribeRequest, key string) bool {
+	value, ok := request.Options.STT.Provider("elevenlabs")[key]
+	return ok && strings.EqualFold(strings.TrimSpace(protocol.SttOptionString(value)), "true")
 }
