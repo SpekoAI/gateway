@@ -176,6 +176,12 @@ type ttsStream struct {
 	closeErr     error
 	pending      string
 	audioStarted bool // read-loop owned
+	// generating is set once text reaches Palabra and cleared by its
+	// last_chunk or a caller Cancel. A server close while it is set dropped
+	// the generation, so it is a failure even with close status 1000/1001.
+	// Palabra does not echo which text a generation_id belongs to, so text
+	// sent while an earlier last_chunk is in flight can be cleared early.
+	generating atomic.Bool
 }
 
 func (s *ttsStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -197,13 +203,13 @@ func (s *ttsStream) AppendText(ctx context.Context, text string) error {
 		return runtimepkg.ErrSessionClosed
 	}
 	if s.pending != "" {
-		if err := s.writeJSON(ctx, ttsText{Type: "text", Text: s.pending, IsEOS: false}); err != nil {
+		if err := s.writeText(ctx, s.pending, false); err != nil {
 			return err
 		}
 	}
 	chunks := splitRunes(text, maxTextRunes)
 	for _, chunk := range chunks[:len(chunks)-1] {
-		if err := s.writeJSON(ctx, ttsText{Type: "text", Text: chunk, IsEOS: false}); err != nil {
+		if err := s.writeText(ctx, chunk, false); err != nil {
 			return err
 		}
 	}
@@ -221,11 +227,16 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 		return errors.New("palabra tts has no buffered text to synthesize")
 	}
 	text := s.pending
-	if err := s.writeJSON(ctx, ttsText{Type: "text", Text: text, IsEOS: true}); err != nil {
+	if err := s.writeText(ctx, text, true); err != nil {
 		return err
 	}
 	s.pending = ""
 	return nil
+}
+
+func (s *ttsStream) writeText(ctx context.Context, text string, eos bool) error {
+	s.generating.Store(true)
+	return s.writeJSON(ctx, ttsText{Type: "text", Text: text, IsEOS: eos})
 }
 
 func splitRunes(value string, limit int) []string {
@@ -246,7 +257,11 @@ func (s *ttsStream) Cancel(ctx context.Context) error {
 	s.stateMu.Lock()
 	s.pending = ""
 	s.stateMu.Unlock()
-	return s.writeJSON(ctx, map[string]string{"type": "cancel"})
+	if err := s.writeJSON(ctx, map[string]string{"type": "cancel"}); err != nil {
+		return err
+	}
+	s.generating.Store(false)
+	return nil
 }
 
 func (s *ttsStream) Abort(context.Context) error { return s.abort() }
@@ -297,8 +312,8 @@ func (s *ttsStream) readLoop() {
 	for {
 		messageType, payload, err := s.conn.Read(s.ctx)
 		if err != nil {
-			if !s.closed.Load() && !isNormalClose(err) && s.ctx.Err() == nil {
-				s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Palabra TTS streaming read failed", Retryable: true, Cause: err}})
+			if !s.closed.Load() && s.ctx.Err() == nil && (!isNormalClose(err) || s.generating.Load()) {
+				s.emit(runtimepkg.ProviderEvent{Err: streamFailure("Palabra TTS streaming read failed", "the audio was complete", err)})
 			}
 			return
 		}
@@ -337,11 +352,12 @@ func (s *ttsStream) handleMessage(payload []byte) error {
 		}
 		if message.Data.LastChunk {
 			s.audioStarted = false
+			s.generating.Store(false)
 			return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: marshalData(map[string]any{"provider_request_id": message.Data.GenerationID}), Extensions: extension(raw)})
 		}
 		return nil
 	case "error":
-		return providerFrameError(message.Data.Code, message.Data.Description, raw)
+		return message.Data.providerError(raw)
 	default:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"message": "ignored Palabra TTS message type", "provider_type": message.MessageType}), Extensions: extension(raw)})
 	}
@@ -359,10 +375,9 @@ func (s *ttsStream) emit(event runtimepkg.ProviderEvent) error {
 type ttsInbound struct {
 	MessageType string `json:"message_type"`
 	Data        struct {
+		frameError
 		Audio        string `json:"audio"`
 		GenerationID string `json:"generation_id"`
 		LastChunk    bool   `json:"last_chunk"`
-		Code         string `json:"code"`
-		Description  string `json:"desc"`
 	} `json:"data"`
 }

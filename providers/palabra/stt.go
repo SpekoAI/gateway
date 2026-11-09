@@ -343,7 +343,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		}
 		return err
 	case "error":
-		return providerFrameError(message.Data.Code, message.Data.Description, raw)
+		return message.Data.providerError(raw)
 	default:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"message": "ignored Palabra STT message type", "provider_type": message.MessageType}), Extensions: extension(raw)})
 	}
@@ -370,8 +370,5 @@ type sttInbound struct {
 		StartTime float64 `json:"start_time"`
 		EndTime   float64 `json:"end_time"`
 	} `json:"segment"`
-	Data struct {
-		Code        string `json:"code"`
-		Description string `json:"desc"`
-	} `json:"data"`
+	Data frameError `json:"data"`
 }

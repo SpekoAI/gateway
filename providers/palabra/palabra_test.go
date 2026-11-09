@@ -423,3 +423,110 @@ func TestSTTCloseReportsMissingAcknowledgement(t *testing.T) {
 		})
 	}
 }
+
+// A server close, even with 1000, while a committed generation has not sent
+// last_chunk drops audio and must not look like clean completion.
+func TestTTSServerCloseMidGenerationIsAnError(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		lastChunk bool
+		status    websocket.StatusCode
+	}{
+		{"normal close before last_chunk", false, websocket.StatusNormalClosure},
+		{"going away before last_chunk", false, websocket.StatusGoingAway},
+		{"normal close after last_chunk", true, websocket.StatusNormalClosure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.CloseNow()
+				for range 2 { // init, text
+					if _, _, err := conn.Read(ctx); err != nil {
+						t.Errorf("read: %v", err)
+						return
+					}
+				}
+				audio := base64.StdEncoding.EncodeToString([]byte{0, 1})
+				_ = conn.Write(ctx, websocket.MessageText, []byte(`{"message_type":"audio_chunk","data":{"audio":"`+audio+`","generation_id":"gen-1","last_chunk":false}}`))
+				if tc.lastChunk {
+					_ = conn.Write(ctx, websocket.MessageText, []byte(`{"message_type":"audio_chunk","data":{"audio":"","generation_id":"gen-1","last_chunk":true}}`))
+				}
+				_ = conn.Close(tc.status, "")
+			}))
+			defer server.Close()
+			parsed, _ := url.Parse(server.URL)
+			adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream, err := adapter.Open(ctx, ttsRequest(wsURL(server.URL)+ttsPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.(*ttsStream).Abort(ctx)
+			if err := stream.AppendText(ctx, "hello"); err != nil {
+				t.Fatal(err)
+			}
+			if err := stream.CommitText(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var terminal error
+			for done := false; !done; {
+				select {
+				case event, ok := <-stream.Events():
+					if !ok {
+						done = true
+					} else if event.Err != nil {
+						terminal = event.Err
+					}
+				case <-ctx.Done():
+					t.Fatal("events did not finish")
+				}
+			}
+			if tc.lastChunk {
+				if terminal != nil {
+					t.Fatalf("completed generation reported %v", terminal)
+				}
+				return
+			}
+			var pe *runtimepkg.ProviderError
+			if !errors.As(terminal, &pe) || pe.Code != "provider_unavailable" || !pe.Retryable {
+				t.Fatalf("terminal = %#v", terminal)
+			}
+			if want := fmt.Sprintf("WebSocket code %d", int(tc.status)); !strings.Contains(pe.Hint, want) {
+				t.Fatalf("hint = %q, want %q", pe.Hint, want)
+			}
+		})
+	}
+}
+
+func TestErrorFramesAcceptNumericSessionCodes(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload, code, message string
+		retryable                    bool
+	}{
+		{"numeric session code", `{"message_type":"error","data":{"code":202103,"reason":"session_revoked"}}`, "provider_authentication_failed", "session_revoked", false},
+		{"numeric retryable code", `{"message_type":"error","data":{"code":202107,"reason":"session_verification_unavailable"}}`, "provider_unavailable", "session_verification_unavailable", true},
+		{"numeric session limit", `{"message_type":"error","data":{"code":202106,"reason":"session_limit_reached"}}`, "provider_rate_limited", "session_limit_reached", true},
+		{"string streaming code", `{"message_type":"error","data":{"code":"SERVICE_UNAVAILABLE","desc":"busy"}}`, "provider_unavailable", "busy", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tts := &ttsStream{ctx: context.Background(), events: make(chan runtimepkg.ProviderEvent, 1)}
+			stt := &sttStream{ctx: context.Background(), events: make(chan runtimepkg.ProviderEvent, 1)}
+			for name, err := range map[string]error{"tts": tts.handleMessage([]byte(tc.payload)), "stt": stt.handleMessage([]byte(tc.payload))} {
+				var pe *runtimepkg.ProviderError
+				if !errors.As(err, &pe) || pe.Code != tc.code || pe.Message != tc.message || pe.Retryable != tc.retryable {
+					t.Fatalf("%s error = %#v", name, err)
+				}
+				if len(pe.Extensions[extensionID]) == 0 {
+					t.Fatalf("%s error lost the raw frame", name)
+				}
+			}
+		})
+	}
+}

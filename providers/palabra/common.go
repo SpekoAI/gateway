@@ -97,15 +97,59 @@ func dialError(provider string, response *http.Response, err error) error {
 	}
 }
 
+// frameError is the data object of an inbound {"message_type":"error"} frame.
+// Streaming codes are uppercase strings with a desc (docs.palabra.ai realtime
+// TTS), while session errors carry a numeric code with a reason, such as
+// {"code":202103,"reason":"session_revoked"} (docs.palabra.ai/docs/auth/session).
+type frameError struct {
+	Code        frameErrorCode `json:"code"`
+	Description string         `json:"desc"`
+	Reason      string         `json:"reason"`
+}
+
+// frameErrorCode accepts both spellings and keeps a number as its decimal text.
+type frameErrorCode string
+
+func (c *frameErrorCode) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		*c = frameErrorCode(text)
+		return nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(data, &number); err != nil {
+		return fmt.Errorf("palabra error code must be a string or number: %w", err)
+	}
+	*c = frameErrorCode(number.String())
+	return nil
+}
+
+func (e frameError) providerError(raw []byte) error {
+	description := e.Description
+	if strings.TrimSpace(description) == "" {
+		description = e.Reason
+	}
+	return providerFrameError(string(e.Code), description, raw)
+}
+
 func providerFrameError(code, description string, raw []byte) error {
-	retryable := code == "SERVICE_UNAVAILABLE" || code == "RATE_LIMIT_EXCEEDED"
 	stable := "provider_rejected_request"
+	retryable := false
 	switch code {
-	case "UNAUTHORIZED":
+	case "UNAUTHORIZED",
+		// Session tokens that can no longer authorize this stream:
+		// connect_window_expired, session_revoked, intent_mismatch,
+		// connection_type_mismatch, account_blocked.
+		"202101", "202103", "202104", "202105", "400020":
 		stable = "provider_authentication_failed"
-	case "RATE_LIMIT_EXCEEDED":
-		stable = "provider_rate_limited"
-	case "SERVICE_UNAVAILABLE", "SERVER_ERROR", "UNKNOWN_ERROR":
+	case "RATE_LIMIT_EXCEEDED",
+		"202106": // session_limit_reached
+		stable, retryable = "provider_rate_limited", true
+	case "SERVICE_UNAVAILABLE",
+		// session_verification_unavailable, billing_unavailable: retry advised.
+		"202107", "200030":
+		stable, retryable = "provider_unavailable", true
+	case "SERVER_ERROR", "UNKNOWN_ERROR":
 		stable = "provider_unavailable"
 	}
 	if strings.TrimSpace(description) == "" {
