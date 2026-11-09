@@ -10,6 +10,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	billing "github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -160,5 +161,12 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if result.ProviderRequestID == "" {
 		result.ProviderRequestID = response.Header.Get("request-id")
 	}
+	// Scribe's batch and realtime models bill at different rates, so the
+	// observation names the batch model that ran. audio_duration_secs is the
+	// length Scribe processed; when it is missing the observation stays
+	// incomplete rather than falling back to the uploaded bytes.
+	observation := billing.Duration("request", model, "batch", response.Body, 1000, "audio_duration_secs")
+	observation.ProviderRequestID = result.ProviderRequestID
+	result.Billing = billing.Report(observation)
 	return result, nil
 }

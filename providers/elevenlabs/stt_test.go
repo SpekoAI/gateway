@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -590,5 +593,469 @@ func TestSTTAdapterRefusesAnUndeclarableSampleRate(t *testing.T) {
 	request.Media.SampleRateHz = 32_000
 	if _, err := adapter.Open(context.Background(), request); err == nil || !strings.Contains(err.Error(), "sample rate") {
 		t.Fatalf("32000 Hz = %v, want a sample-rate refusal rather than a silent pcm_16000", err)
+	}
+}
+
+// Realtime and batch Scribe bill at different rates, so the realtime stream
+// names scribe_v2_realtime/streaming: incomplete on session_started, complete
+// at Close with the PCM sent as an exact fraction of a second.
+func TestSTTAdapterReportsTheRealtimeBillingObservation(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-1"}); err != nil {
+			t.Errorf("session_started: %v", err)
+			return
+		}
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	providerStream, err := adapter.Open(context.Background(), sttRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+
+	started := collectSTTEvents(t, providerStream.Events(), 1)[0]
+	if started.Type != protocol.EventUsageObserved || string(started.Data) != `{"provider_request_id":"el-stt-1"}` || started.Extensions[extensionID] == nil {
+		t.Fatalf("session_started event = %+v", started)
+	}
+	wantStarted := protocol.BillingObservation{OperationID: "stream", Model: "scribe_v2_realtime", Mode: "streaming", ProviderRequestID: "el-stt-1", Quantities: map[string]int64{}}
+	if started.Billing == nil || !reflect.DeepEqual(*started.Billing, wantStarted) {
+		t.Fatalf("session_started billing = %+v, want %+v", started.Billing, wantStarted)
+	}
+
+	// 20000 bytes cross the 16000-byte frame cap, so the count spans two frames.
+	if err := providerStream.WriteAudio(context.Background(), make([]byte, 20_000)); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	if err := providerStream.WriteAudio(context.Background(), make([]byte, 4_000)); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	if err := providerStream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	closed := collectSTTEvents(t, providerStream.Events(), 1)[0]
+	if closed.Type != protocol.EventUsageObserved || len(closed.Data) != 0 || len(closed.Extensions) != 0 || len(closed.Audio) != 0 {
+		t.Fatalf("close event = %+v, want billing-only usage.observed", closed)
+	}
+	wantClosed := protocol.BillingObservation{
+		OperationID: "stream", Model: "scribe_v2_realtime", Mode: "streaming", ProviderRequestID: "el-stt-1",
+		Quantities: map[string]int64{"duration_seconds": 24_000}, QuantityDenominators: map[string]int64{"duration_seconds": 32_000}, Complete: true,
+	}
+	if closed.Billing == nil || !reflect.DeepEqual(*closed.Billing, wantClosed) {
+		t.Fatalf("close billing = %+v, want %+v", closed.Billing, wantClosed)
+	}
+	if err := closed.Billing.Validate(); err != nil {
+		t.Fatalf("close billing invalid: %v", err)
+	}
+	merged, err := protocol.MergeBillingObservation(*started.Billing, *closed.Billing)
+	if err != nil || !merged.Complete {
+		t.Fatalf("merge = %+v, %v", merged, err)
+	}
+}
+
+// A session torn down by Abort (spent budget, write failure, watchdog) still
+// bills the PCM ElevenLabs received: exactly one complete observation, even
+// when Close and Abort both run.
+func TestSTTAdapterAbortBillsTheAudioSent(t *testing.T) {
+	for _, closeFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("close_first=%v", closeFirst), func(t *testing.T) {
+			testSTTAdapterAbortBillsTheAudioSent(t, closeFirst)
+		})
+	}
+}
+
+func testSTTAdapterAbortBillsTheAudioSent(t *testing.T, closeFirst bool) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-2"}); err != nil {
+			return
+		}
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	providerStream, err := adapter.Open(context.Background(), sttRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	collectSTTEvents(t, providerStream.Events(), 1)
+	if err := providerStream.WriteAudio(context.Background(), make([]byte, 3_200)); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	if closeFirst {
+		_ = providerStream.Close(context.Background())
+	}
+	_ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+	var complete []*protocol.BillingObservation
+	for event := range providerStream.Events() {
+		if event.Billing != nil && event.Billing.Complete {
+			complete = append(complete, event.Billing)
+		}
+	}
+	if len(complete) != 1 {
+		t.Fatalf("complete observations = %d, want exactly 1", len(complete))
+	}
+	got := complete[0]
+	if got.Quantities["duration_seconds"] != 3_200 || got.QuantityDenominators["duration_seconds"] != 32_000 || got.Mode != "streaming" || got.Model != "scribe_v2_realtime" {
+		t.Fatalf("complete observation = %+v, want 3200/32000 streaming scribe_v2_realtime", got)
+	}
+}
+
+// Close emits from the caller's goroutine, so it must not send on the event
+// channel once the server has ended the socket and readLoop has closed it.
+func TestSTTAdapterCloseAfterTheServerEndedTheSocket(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-3"}); err != nil {
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	providerStream, err := adapter.Open(context.Background(), sttRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+	for range providerStream.Events() {
+	}
+	if err := providerStream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// openSTTWithAudio opens a stream against server, waits for session_started,
+// and writes bytes of PCM.
+func openSTTWithAudio(t *testing.T, server *httptest.Server, config STTConfig, bytes int) runtimepkg.ProviderStream {
+	t.Helper()
+	adapter, err := NewSTT(config)
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	providerStream, err := adapter.Open(context.Background(), sttRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	collectSTTEvents(t, providerStream.Events(), 1)
+	if err := providerStream.WriteAudio(context.Background(), make([]byte, bytes)); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	return providerStream
+}
+
+// Scribe ending the socket, or sending a terminal error, after it received
+// audio still bills that audio, and the observation arrives before the error.
+func TestSTTAdapterBillsAudioWhenScribeEndsTheStream(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		end     func(context.Context, *websocket.Conn)
+		wantErr bool
+	}{
+		{name: "server close", end: func(_ context.Context, conn *websocket.Conn) {
+			_ = conn.Close(websocket.StatusNormalClosure, "")
+		}},
+		{name: "error frame", end: func(ctx context.Context, conn *websocket.Conn) {
+			_ = writeSTTJSON(ctx, conn, map[string]any{"message_type": "transcriber_error", "error": "boom"})
+		}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			received := make(chan struct{})
+			server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+				if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-end"}); err != nil {
+					return
+				}
+				if _, err := readSTTJSON(ctx, conn); err != nil {
+					return
+				}
+				close(received)
+				tc.end(ctx, conn)
+				_, _, _ = conn.Read(ctx)
+			})
+			defer server.Close()
+			providerStream := openSTTWithAudio(t, server, sttTestConfig(server.URL), 3_200)
+			defer func() { _ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+			<-received
+			var order []string
+			for event := range providerStream.Events() {
+				switch {
+				case event.Billing != nil && event.Billing.Complete:
+					if event.Billing.Quantities["duration_seconds"] != 3_200 {
+						t.Fatalf("complete observation = %+v, want 3200 bytes", event.Billing)
+					}
+					order = append(order, "billing")
+				case event.Err != nil:
+					order = append(order, "error")
+				}
+			}
+			want := []string{"billing"}
+			if tc.wantErr {
+				want = append(want, "error")
+			}
+			if fmt.Sprint(order) != fmt.Sprint(want) {
+				t.Fatalf("events = %v, want %v", order, want)
+			}
+		})
+	}
+}
+
+// A consumer stalled past Close's bounded attempt still gets the complete
+// observation from the read loop once it drains again.
+func TestSTTAdapterBillingSurvivesAStalledConsumer(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-stall"}); err != nil {
+			return
+		}
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	stream := openSTTWithAudio(t, server, sttTestConfig(server.URL), 3_200).(*sttStream)
+	// Fill the buffer so Close's attempt cannot land, then let it time out.
+	for len(stream.events) < cap(stream.events) {
+		stream.events <- runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved}
+	}
+	stream.emitCompleteBilling(10*time.Millisecond, false)
+	stream.billingMu.Lock()
+	billed := stream.billed
+	stream.billingMu.Unlock()
+	if billed {
+		t.Fatal("a timed-out send was recorded as billed")
+	}
+	_ = stream.Abort(context.Background())
+	var complete int
+	for event := range stream.events {
+		if event.Billing != nil && event.Billing.Complete {
+			complete++
+		}
+	}
+	if complete != 1 {
+		t.Fatalf("complete observations after draining = %d, want 1", complete)
+	}
+}
+
+// After Scribe ends the stream with an error, input is closed: a later write is
+// refused, so the complete observation already sent stays exact.
+func TestSTTAdapterRefusesAudioAfterAProviderError(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-err"}); err != nil {
+			return
+		}
+		if _, err := readSTTJSON(ctx, conn); err != nil {
+			return
+		}
+		_ = writeSTTJSON(ctx, conn, map[string]any{"message_type": "invalid_request", "error": "boom"})
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	providerStream := openSTTWithAudio(t, server, sttTestConfig(server.URL), 3_200)
+	defer func() { _ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+	var billed int64 = -1
+	for event := range providerStream.Events() {
+		if event.Billing != nil && event.Billing.Complete {
+			billed = event.Billing.Quantities["duration_seconds"]
+		}
+	}
+	if billed != 3_200 {
+		t.Fatalf("complete observation billed %d bytes, want 3200", billed)
+	}
+	err := providerStream.WriteAudio(context.Background(), make([]byte, 3_200))
+	if err == nil {
+		t.Fatal("audio was accepted after the provider ended the stream")
+	}
+	// The refused write carries the vendor's failure, not a bare
+	// ErrSessionClosed the runtime would report as an internal error.
+	providerErr := &runtimepkg.ProviderError{}
+	if errors.Is(err, runtimepkg.ErrSessionClosed) || !asProviderError(err, &providerErr) || providerErr.Code != "invalid_request" {
+		t.Fatalf("write after the provider error returned %v, want the invalid_request provider error", err)
+	}
+}
+
+// A started stream that sent no audio completes its operation at zero rather
+// than leaving it unresolved.
+func TestSTTAdapterStartedStreamWithoutAudioBillsZero(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-zero"}); err != nil {
+			return
+		}
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	providerStream, err := adapter.Open(context.Background(), sttRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	collectSTTEvents(t, providerStream.Events(), 1)
+	_ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+	var complete []*protocol.BillingObservation
+	for event := range providerStream.Events() {
+		if event.Billing != nil && event.Billing.Complete {
+			complete = append(complete, event.Billing)
+		}
+	}
+	if len(complete) != 1 || complete[0].Quantities["duration_seconds"] != 0 || complete[0].ProviderRequestID != "el-stt-zero" {
+		t.Fatalf("complete observations = %+v, want one zero-duration observation for el-stt-zero", complete)
+	}
+}
+
+// Scribe closing normally after receiving audio, then the caller's Close, is
+// still a clean shutdown: Close does not turn the refused commit into an error.
+func TestSTTAdapterCloseAfterAServerCloseIsClean(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-clean"}); err != nil {
+			return
+		}
+		if _, err := readSTTJSON(ctx, conn); err != nil {
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+	providerStream := openSTTWithAudio(t, server, sttTestConfig(server.URL), 3_200)
+	for event := range providerStream.Events() {
+		if event.Err != nil {
+			t.Fatalf("a normal server close produced an error event: %v", event.Err)
+		}
+	}
+	if err := providerStream.Close(context.Background()); err != nil {
+		t.Fatalf("Close after a normal server close = %v, want nil", err)
+	}
+}
+
+// A provider error queued behind the final billing event in a one-slot buffer
+// survives a Cancel that overlaps it: Cancel reports the failure, and the
+// consumer still receives billing and then the error.
+func TestSTTAdapterProviderErrorSurvivesCancel(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-cancel"}); err != nil {
+			return
+		}
+		if _, err := readSTTJSON(ctx, conn); err != nil {
+			return
+		}
+		_ = writeSTTJSON(ctx, conn, map[string]any{"message_type": "invalid_request", "error": "boom"})
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	config := sttTestConfig(server.URL)
+	config.EventBuffer = 1
+	stream := openSTTWithAudio(t, server, config, 3_200).(*sttStream)
+	// Wait until the read loop has placed the billing event in the one slot,
+	// so the error is blocked behind it.
+	deadline := time.Now().Add(2 * time.Second)
+	for len(stream.events) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("read loop never queued the final billing event")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := stream.Cancel(context.Background()); err == nil {
+		t.Fatal("Cancel after a provider error returned nil")
+	}
+	var order []string
+	for event := range stream.events {
+		switch {
+		case event.Billing != nil && event.Billing.Complete:
+			order = append(order, "billing")
+		case event.Err != nil:
+			order = append(order, "error")
+		}
+	}
+	if fmt.Sprint(order) != "[billing error]" {
+		t.Fatalf("events after Cancel = %v, want [billing error]", order)
+	}
+}
+
+// A clean Cancel while the reader is blocked delivering a regular event (one
+// slot, consumer not reading) ends the stream without any error event.
+func TestSTTAdapterCleanCancelWhileAnEventIsBlocked(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-blocked"}); err != nil {
+			return
+		}
+		for i := 0; i < 4; i++ {
+			if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "partial_transcript", "text": fmt.Sprintf("partial %d", i)}); err != nil {
+				return
+			}
+		}
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	config := sttTestConfig(server.URL)
+	config.EventBuffer = 1
+	adapter, err := NewSTT(config)
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	providerStream, err := adapter.Open(context.Background(), sttRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	stream := providerStream.(*sttStream)
+	// Let the slot fill and the reader block on the next send.
+	deadline := time.Now().Add(2 * time.Second)
+	for len(stream.events) < cap(stream.events) {
+		if time.Now().After(deadline) {
+			t.Fatal("event buffer never filled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("clean Cancel returned %v", err)
+	}
+	for event := range stream.events {
+		if event.Err != nil {
+			t.Fatalf("a clean Cancel produced an error event: %v", event.Err)
+		}
 	}
 }

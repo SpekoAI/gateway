@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -31,6 +32,14 @@ const (
 	// s16le mono and is sample-aligned, so a caller handing a whole utterance as
 	// one write does not produce an oversized WebSocket message.
 	sttPCMFrameBytes = 16_000
+	// sttCloseBillingTimeout bounds Close's attempt to hand over the complete
+	// billing observation. If the consumer is stalled, the read loop retries on
+	// exit with sttFinalBillingTimeout, which bounds teardown for a consumer
+	// that stopped for good. sttWriteSettleTimeout bounds the wait for a write
+	// in flight when the stream ends.
+	sttCloseBillingTimeout = 2 * time.Second
+	sttFinalBillingTimeout = 30 * time.Second
+	sttWriteSettleTimeout  = 2 * time.Second
 )
 
 // STTConfig controls local transport limits. Credentials and provider selection
@@ -154,6 +163,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		cancel: cancel,
 		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		rate:   request.Media.SampleRateHz,
+		model:  request.Plan.Route.Model,
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -293,6 +303,9 @@ type sttStream struct {
 	cancel context.CancelFunc
 	events chan runtimepkg.ProviderEvent
 	rate   int
+	// model is the realtime Scribe model on the socket, named in billing
+	// because batch scribe_v2 bills at a different rate.
+	model string
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -303,6 +316,22 @@ type sttStream struct {
 	stateMu      sync.Mutex
 	baseFinals   []string
 	timedFinals  []string
+	// sentBytes is the PCM written to the socket. Scribe reports no audio
+	// count on the realtime socket, so this is the billed duration.
+	sentBytes atomic.Int64
+	// billingMu orders the two billing emits, so a late session_started
+	// cannot follow the complete observation with an incomplete one. It also
+	// guards eventsClosed: Close emits from the caller's goroutine and must
+	// not send after readLoop has closed the channel.
+	billingMu sync.Mutex
+	// endedErr is why the provider side ended input, set before closed when
+	// the read loop exits with input still open. A refused write returns it,
+	// so a concurrent writer reports the vendor's failure (quota, rate limit)
+	// rather than a bare ErrSessionClosed the runtime would treat as internal.
+	endedErr     atomic.Pointer[error]
+	sessionID    string
+	billed       bool
+	eventsClosed bool
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -325,7 +354,7 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 			"commit":        false,
 			"sample_rate":   s.rate,
 		}
-		if err := s.writeJSON(ctx, chunk); err != nil {
+		if err := s.writeFrame(ctx, chunk, int64(end-offset)); err != nil {
 			return err
 		}
 	}
@@ -360,10 +389,11 @@ func (s *sttStream) CommitText(context.Context) error { return runtimepkg.ErrUns
 // Cancel closes the stream because the realtime protocol has no distinct cancel
 // command. It aborts rather than waiting for a final result.
 func (s *sttStream) Cancel(ctx context.Context) error {
-	if err := s.Close(ctx); err != nil {
+	closeErr := s.Close(ctx)
+	if err := s.abort(); closeErr == nil {
 		return err
 	}
-	return s.abort()
+	return closeErr
 }
 
 // Abort immediately tears down the socket after a runtime terminal failure.
@@ -374,19 +404,87 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 // discards whatever Scribe had buffered.
 func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
-		if err := s.CommitAudio(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		// A commit refused because Scribe closed the stream normally is not a
+		// Close failure: a clean server close stays a clean shutdown. A real
+		// provider error is returned, so Cancel cannot abort past it as if
+		// the stream had ended cleanly.
+		if err := s.CommitAudio(ctx); err != nil && !errors.Is(err, runtimepkg.ErrSessionClosed) && !errors.Is(err, errSTTProviderClosed) {
 			s.closeErr = err
 		}
 		s.closed.Store(true)
 		if s.closeErr != nil {
 			_ = s.abort()
+			return
 		}
+		// Input is closed, so the PCM count is final. Taking the write lock
+		// waits out a frame still in flight before it is read.
+		s.writeMu.Lock()
+		s.writeMu.Unlock()
+		s.emitCompleteBilling(sttCloseBillingTimeout, false)
 	})
 	return s.closeErr
 }
 
+// emitCompleteBilling hands the complete observation to the consumer exactly
+// once, while the events channel is open. ElevenLabs bills the audio it
+// received however the stream ended, so Close sends it as soon as input is
+// final and the read loop sends it on exit for every other ending (Abort, a
+// server close, a provider error). It counts as sent only once delivered, so a
+// stalled consumer that resumes still gets it from the read loop's retry. The
+// send is bounded by timeout rather than s.ctx, which Abort has cancelled.
+// With requireAudio, a stream that never started and sent no PCM reports
+// nothing, so a failure before startup stays its consumer's first event. A
+// started stream always completes its operation, at zero if no audio went out.
+func (s *sttStream) emitCompleteBilling(timeout time.Duration, requireAudio bool) {
+	s.billingMu.Lock()
+	defer s.billingMu.Unlock()
+	if s.billed || s.eventsClosed || (requireAudio && s.sentBytes.Load() == 0 && s.sessionID == "") {
+		return
+	}
+	event := runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billing(true)}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case s.events <- event:
+		s.billed = true
+	case <-timer.C:
+	}
+}
+
+// awaitWrites waits, up to timeout, for a write in flight to finish, so the
+// complete observation counts audio that reached Scribe. A write that is
+// still stuck after the timeout did not complete and is not billed.
+func (s *sttStream) awaitWrites(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for !s.writeMu.TryLock() {
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	s.writeMu.Unlock()
+}
+
+// billing is the session's one duration observation. Until the stream ends it
+// is incomplete and carries no quantity; the complete observation is the PCM
+// this stream sent, as an exact fraction of a second. Only a consumer that
+// stops reading for good before the read loop's exit leaves it unresolved.
+// The caller holds billingMu.
+func (s *sttStream) billing(complete bool) *protocol.BillingObservation {
+	observation := &protocol.BillingObservation{OperationID: "stream", Model: s.model, Mode: "streaming", ProviderRequestID: s.sessionID, Quantities: map[string]int64{}}
+	if complete {
+		observation.Quantities["duration_seconds"] = s.sentBytes.Load()
+		observation.QuantityDenominators = map[string]int64{"duration_seconds": int64(s.rate) * 2}
+		observation.Complete = true
+	}
+	return observation
+}
+
 func (s *sttStream) abort() error {
 	s.abortOnce.Do(func() {
+		// Cancelling fails a write in flight, so the read loop's exit counts
+		// only audio that reached Scribe before it sends the complete
+		// observation.
 		s.cancel()
 		if err := s.conn.CloseNow(); err != nil && s.closeErr == nil {
 			s.closeErr = err
@@ -396,17 +494,24 @@ func (s *sttStream) abort() error {
 }
 
 func (s *sttStream) writeJSON(ctx context.Context, value any) error {
+	return s.writeFrame(ctx, value, 0)
+}
+
+// writeFrame writes one JSON frame and, for an audio chunk, counts its PCM
+// bytes under the same lock. Counting inside the lock is what lets the read
+// loop's exit trust sentBytes once it has held the lock after closing input.
+func (s *sttStream) writeFrame(ctx context.Context, value any, audioBytes int64) error {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
 	if s.closed.Load() {
-		return runtimepkg.ErrSessionClosed
+		return s.inputClosedErr()
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.closed.Load() {
-		return runtimepkg.ErrSessionClosed
+		return s.inputClosedErr()
 	}
 	if err := s.conn.Write(ctx, websocket.MessageText, payload); err != nil {
 		return &runtimepkg.ProviderError{
@@ -416,21 +521,68 @@ func (s *sttStream) writeJSON(ctx context.Context, value any) error {
 			Cause:     err,
 		}
 	}
+	s.sentBytes.Add(audioBytes)
 	return nil
 }
 
+// errSTTProviderClosed is the reason recorded when Scribe ended the stream
+// without an error frame. Close treats only this one as clean; a real
+// provider error stays a failure.
+var errSTTProviderClosed error = &runtimepkg.ProviderError{
+	Code:      "provider_unavailable",
+	Message:   "ElevenLabs ended the streaming connection",
+	Retryable: true,
+}
+
+// inputClosedErr is what a write returns once input is closed: the reason the
+// provider side ended the stream, or ErrSessionClosed after the caller's Close.
+func (s *sttStream) inputClosedErr() error {
+	if err := s.endedErr.Load(); err != nil {
+		return *err
+	}
+	return runtimepkg.ErrSessionClosed
+}
+
 func (s *sttStream) readLoop() {
-	defer close(s.events)
+	// terminal is delivered after the complete observation: consumers stop at
+	// an error event, so billing has to reach them first.
+	var terminal *runtimepkg.ProviderEvent
+	defer func() {
+		// Close input first: writeFrame checks closed under the write lock,
+		// so once awaitWrites has held that lock no later audio can be sent,
+		// and every write that succeeded is already in sentBytes. If input was
+		// still open, the provider or a teardown ended the stream; record why
+		// before closing, so a refused write carries the same failure.
+		if !s.closed.Load() {
+			ended := errSTTProviderClosed
+			if terminal != nil && terminal.Err != nil {
+				ended = terminal.Err
+			}
+			s.endedErr.Store(&ended)
+		}
+		s.closed.Store(true)
+		s.awaitWrites(sttWriteSettleTimeout)
+		s.emitCompleteBilling(sttFinalBillingTimeout, true)
+		if terminal != nil {
+			// Bounded like the billing send rather than tied to s.ctx, so a
+			// Cancel that aborts meanwhile cannot drop the failure.
+			s.emitBounded(*terminal, sttFinalBillingTimeout)
+		}
+		s.billingMu.Lock()
+		s.eventsClosed = true
+		close(s.events)
+		s.billingMu.Unlock()
+	}()
 	for {
 		messageType, payload, err := s.conn.Read(s.ctx)
 		if err != nil {
 			if !s.closed.Load() && !sttIsNormalClose(err) && s.ctx.Err() == nil {
-				s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{
+				terminal = &runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{
 					Code:      "provider_unavailable",
 					Message:   "ElevenLabs streaming read failed",
 					Retryable: true,
 					Cause:     err,
-				}})
+				}}
 			}
 			return
 		}
@@ -438,7 +590,12 @@ func (s *sttStream) readLoop() {
 			continue
 		}
 		if err := s.handleMessage(payload); err != nil {
-			s.emit(runtimepkg.ProviderEvent{Err: err})
+			// An event send interrupted by our own Cancel or Abort is teardown,
+			// not a provider failure; only a real error becomes terminal.
+			if ctxErr := s.ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+				return
+			}
+			terminal = &runtimepkg.ProviderEvent{Err: err}
 			return
 		}
 	}
@@ -461,10 +618,18 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// an ALREADY-OPEN socket, so readiness has to wait for this rather than fire
 		// at dial — otherwise those failures look like mid-stream errors and the
 		// runtime loses its open-failure failover.
+		s.billingMu.Lock()
+		defer s.billingMu.Unlock()
+		var observation *protocol.BillingObservation
+		if !s.billed {
+			s.sessionID = message.SessionID
+			observation = s.billing(false)
+		}
 		return s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventUsageObserved,
 			Data:       sttMarshalData(map[string]any{"provider_request_id": message.SessionID}),
 			Extensions: sttExtension(raw),
+			Billing:    observation,
 		})
 	case "partial_transcript":
 		if strings.TrimSpace(message.Text) == "" {
@@ -560,6 +725,17 @@ func consumeFinal(finals *[]string, text string) bool {
 		}
 	}
 	return false
+}
+
+// emitBounded delivers a teardown event, waiting at most timeout for a
+// consumer. Only the read loop's exit calls it, before it closes the channel.
+func (s *sttStream) emitBounded(event runtimepkg.ProviderEvent, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case s.events <- event:
+	case <-timer.C:
+	}
 }
 
 func (s *sttStream) emit(event runtimepkg.ProviderEvent) error {
