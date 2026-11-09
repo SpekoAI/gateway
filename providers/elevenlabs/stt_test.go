@@ -1009,3 +1009,53 @@ func TestSTTAdapterProviderErrorSurvivesCancel(t *testing.T) {
 		t.Fatalf("events after Cancel = %v, want [billing error]", order)
 	}
 }
+
+// A clean Cancel while the reader is blocked delivering a regular event (one
+// slot, consumer not reading) ends the stream without any error event.
+func TestSTTAdapterCleanCancelWhileAnEventIsBlocked(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-blocked"}); err != nil {
+			return
+		}
+		for i := 0; i < 4; i++ {
+			if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "partial_transcript", "text": fmt.Sprintf("partial %d", i)}); err != nil {
+				return
+			}
+		}
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	config := sttTestConfig(server.URL)
+	config.EventBuffer = 1
+	adapter, err := NewSTT(config)
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	providerStream, err := adapter.Open(context.Background(), sttRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	stream := providerStream.(*sttStream)
+	// Let the slot fill and the reader block on the next send.
+	deadline := time.Now().Add(2 * time.Second)
+	for len(stream.events) < cap(stream.events) {
+		if time.Now().After(deadline) {
+			t.Fatal("event buffer never filled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("clean Cancel returned %v", err)
+	}
+	for event := range stream.events {
+		if event.Err != nil {
+			t.Fatalf("a clean Cancel produced an error event: %v", event.Err)
+		}
+	}
+}

@@ -590,6 +590,11 @@ func (s *sttStream) readLoop() {
 			continue
 		}
 		if err := s.handleMessage(payload); err != nil {
+			// An event send interrupted by our own Cancel or Abort is teardown,
+			// not a provider failure; only a real error becomes terminal.
+			if ctxErr := s.ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+				return
+			}
 			terminal = &runtimepkg.ProviderEvent{Err: err}
 			return
 		}
