@@ -40,13 +40,19 @@ const (
 )
 
 // sttLanguages is the exact set Gradium's transcription settings page
-// enumerates for `json_config.language`. Anything else is rejected at Open
-// rather than silently dropped: dropping it would leave the model to guess,
-// and a caller that explicitly asked for a language Gradium cannot transcribe
-// deserves a failed session rather than confident nonsense in another one.
+// enumerates for `json_config.language`, including "any" for auto-detection.
+// Anything else is rejected at Open rather than silently dropped: dropping it
+// would leave the model to guess, and a caller that explicitly asked for a
+// language Gradium cannot transcribe deserves a failed session rather than
+// confident nonsense in another one.
 var sttLanguages = map[string]struct{}{
-	"en": {}, "fr": {}, "de": {}, "es": {}, "pt": {},
+	"en": {}, "fr": {}, "de": {}, "es": {}, "pt": {}, sttAnyLanguage: {},
 }
+
+// sttAnyLanguage asks Gradium to auto-detect. Gradium rejects a setup whose
+// json_config has no language (docs.gradium.ai/guides/transcription-settings),
+// so it is sent whenever the caller names none.
+const sttAnyLanguage = "any"
 
 // STTConfig controls local transport limits and one provider model setting.
 // Credentials and provider selection always come from the signed session plan,
@@ -212,9 +218,9 @@ type sttSetup struct {
 // sttJSONConfig is the nested advanced-settings object. Gradium accepts either
 // an object or a JSON string here; the object form is what its own SDK sends.
 type sttJSONConfig struct {
-	// Language is omitted when the caller named none, which is Gradium's
-	// documented way of asking the model not to ground on a single language.
-	Language      string `json:"language,omitempty"`
+	// Language is required: Gradium rejects requests without it. "any" asks
+	// the model not to ground on a single language.
+	Language      string `json:"language"`
 	DelayInFrames int    `json:"delay_in_frames"`
 }
 
@@ -584,11 +590,11 @@ func pcmFormat(media protocol.MediaFormat) (string, error) {
 }
 
 // transcriptionLanguage narrows a BCP-47 tag to the bare subtag Gradium
-// accepts. An empty language is legal and means "do not ground on one".
+// accepts. An empty language becomes "any", Gradium's auto-detect value.
 func transcriptionLanguage(language string) (string, error) {
 	trimmed := strings.TrimSpace(language)
 	if trimmed == "" {
-		return "", nil
+		return sttAnyLanguage, nil
 	}
 	base := strings.ToLower(trimmed)
 	if index := strings.IndexAny(base, "-_"); index > 0 {
