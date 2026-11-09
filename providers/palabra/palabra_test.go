@@ -107,6 +107,7 @@ func TestTTSInitStreamingAndAudioEvents(t *testing.T) {
 			return
 		}
 		defer func() { _ = conn.CloseNow() }()
+		var id string
 		for range 3 {
 			_, payload, err := conn.Read(r.Context())
 			if err != nil {
@@ -118,11 +119,11 @@ func TestTTSInitStreamingAndAudioEvents(t *testing.T) {
 				t.Errorf("decode frame: %v", err)
 				return
 			}
+			id, _ = decoded["generation_id"].(string)
 			frames <- decoded
 		}
-		audio := base64.StdEncoding.EncodeToString([]byte{0, 1, 2, 3})
-		_ = conn.Write(r.Context(), websocket.MessageText, []byte(`{"message_type":"audio_chunk","data":{"audio":"`+audio+`","generation_id":"gen-1","last_chunk":false}}`))
-		_ = conn.Write(r.Context(), websocket.MessageText, []byte(`{"message_type":"audio_chunk","data":{"audio":"","generation_id":"gen-1","last_chunk":true}}`))
+		_ = conn.Write(r.Context(), websocket.MessageText, []byte(ttsChunk(id, []byte{0, 1, 2, 3}, false)))
+		_ = conn.Write(r.Context(), websocket.MessageText, []byte(ttsChunk(id, nil, true)))
 	}))
 	defer server.Close()
 
@@ -154,6 +155,11 @@ func TestTTSInitStreamingAndAudioEvents(t *testing.T) {
 	first, last := <-frames, <-frames
 	if first["text"] != "hello " || first["is_eos"] != false || last["text"] != "world" || last["is_eos"] != true {
 		t.Fatalf("text frames = %#v %#v", first, last)
+	}
+	// Both fragments of one sentence share one generation_id, 4-256 chars.
+	id, _ := last["generation_id"].(string)
+	if first["generation_id"] != id || len(id) < 4 || len(id) > 256 {
+		t.Fatalf("generation ids = %v %v", first["generation_id"], last["generation_id"])
 	}
 	started, audio, done := eventWithin(t, stream.Events()), eventWithin(t, stream.Events()), eventWithin(t, stream.Events())
 	if started.Type != protocol.EventAudioStarted || audio.Type != protocol.EventAudioFrame || string(audio.Audio) != string([]byte{0, 1, 2, 3}) || done.Type != protocol.EventAudioDone {
@@ -499,16 +505,20 @@ func TestTTSServerCloseMidGenerationIsAnError(t *testing.T) {
 					return
 				}
 				defer conn.CloseNow()
+				var text struct {
+					GenerationID string `json:"generation_id"`
+				}
 				for range 2 { // init, text
-					if _, _, err := conn.Read(ctx); err != nil {
+					_, payload, err := conn.Read(ctx)
+					if err != nil {
 						t.Errorf("read: %v", err)
 						return
 					}
+					_ = json.Unmarshal(payload, &text)
 				}
-				audio := base64.StdEncoding.EncodeToString([]byte{0, 1})
-				_ = conn.Write(ctx, websocket.MessageText, []byte(`{"message_type":"audio_chunk","data":{"audio":"`+audio+`","generation_id":"gen-1","last_chunk":false}}`))
+				_ = conn.Write(ctx, websocket.MessageText, []byte(ttsChunk(text.GenerationID, []byte{0, 1}, false)))
 				if tc.lastChunk {
-					_ = conn.Write(ctx, websocket.MessageText, []byte(`{"message_type":"audio_chunk","data":{"audio":"","generation_id":"gen-1","last_chunk":true}}`))
+					_ = conn.Write(ctx, websocket.MessageText, []byte(ttsChunk(text.GenerationID, nil, true)))
 				}
 				_ = conn.Close(tc.status, "")
 			}))
@@ -580,6 +590,186 @@ func TestErrorFramesAcceptNumericSessionCodes(t *testing.T) {
 				if len(pe.Extensions[extensionID]) == 0 {
 					t.Fatalf("%s error lost the raw frame", name)
 				}
+			}
+		})
+	}
+}
+
+func ttsChunk(id string, audio []byte, last bool) string {
+	return fmt.Sprintf(`{"message_type":"audio_chunk","data":{"audio":%q,"generation_id":%q,"last_chunk":%t}}`, base64.StdEncoding.EncodeToString(audio), id, last)
+}
+
+// Each committed sentence has its own generation_id, and only the last_chunk
+// carrying a sentence's id completes it. A cancelled sentence's frames are
+// dropped, so they can neither play as nor complete a later sentence.
+func TestTTSCompletionFollowsGenerationIDs(t *testing.T) {
+	const cancelled = `{"message_type":"cancelled","data":{}}`
+	for _, tc := range []struct {
+		name string
+		// steps are client calls: "commit:<text>" appends and commits one
+		// sentence, "cancel" cancels.
+		steps []string
+		// reply builds the server frames from the generation_ids of the
+		// committed sentences, in commit order. A normal close follows.
+		reply   func(ids []string) []string
+		wantErr bool
+		// wantAudio is the audio the caller receives, one byte per
+		// sentence, so a clean run also expects one audio.started and one
+		// audio.done per byte.
+		wantAudio []byte
+	}{
+		{
+			name:  "one sentence completes",
+			steps: []string{"commit:one"},
+			reply: func(ids []string) []string {
+				return []string{ttsChunk(ids[0], []byte{1}, false), ttsChunk(ids[0], nil, true)}
+			},
+			wantAudio: []byte{1},
+		},
+		{
+			name:  "second sentence closed before its last_chunk",
+			steps: []string{"commit:one", "commit:two"},
+			reply: func(ids []string) []string {
+				return []string{ttsChunk(ids[0], []byte{1}, false), ttsChunk(ids[0], nil, true), ttsChunk(ids[1], []byte{2}, false)}
+			},
+			wantErr:   true,
+			wantAudio: []byte{1, 2},
+		},
+		{
+			name:  "both sentences complete",
+			steps: []string{"commit:one", "commit:two"},
+			reply: func(ids []string) []string {
+				return []string{ttsChunk(ids[0], []byte{1}, false), ttsChunk(ids[0], nil, true), ttsChunk(ids[1], []byte{2}, false), ttsChunk(ids[1], nil, true)}
+			},
+			wantAudio: []byte{1, 2},
+		},
+		{
+			name:  "cancelled sentence's late last_chunk does not complete the next",
+			steps: []string{"commit:one", "cancel", "commit:two"},
+			reply: func(ids []string) []string {
+				return []string{cancelled, ttsChunk(ids[0], []byte{1}, false), ttsChunk(ids[0], nil, true)}
+			},
+			wantErr: true,
+		},
+		{
+			name:  "next sentence completes after cancelled sentence's late audio",
+			steps: []string{"commit:one", "cancel", "commit:two"},
+			reply: func(ids []string) []string {
+				return []string{cancelled, ttsChunk(ids[0], []byte{1}, false), ttsChunk(ids[0], nil, true), ttsChunk(ids[1], []byte{2}, false), ttsChunk(ids[1], nil, true)}
+			},
+			wantAudio: []byte{2},
+		},
+		{
+			name:  "close after cancel",
+			steps: []string{"commit:one", "cancel"},
+			reply: func([]string) []string { return []string{cancelled} },
+		},
+		{
+			name:  "close after cancel and late last_chunk",
+			steps: []string{"commit:one", "cancel"},
+			reply: func(ids []string) []string {
+				return []string{cancelled, ttsChunk(ids[0], []byte{1}, false), ttsChunk(ids[0], nil, true)}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer func() { _ = conn.CloseNow() }()
+				var ids []string
+				for range 1 + len(tc.steps) { // init, then one frame per step
+					_, payload, err := conn.Read(ctx)
+					if err != nil {
+						t.Errorf("read: %v", err)
+						return
+					}
+					var frame struct {
+						Type         string `json:"type"`
+						GenerationID string `json:"generation_id"`
+						IsEOS        bool   `json:"is_eos"`
+					}
+					_ = json.Unmarshal(payload, &frame)
+					if frame.Type == "text" && frame.IsEOS {
+						ids = append(ids, frame.GenerationID)
+					}
+				}
+				for i, id := range ids {
+					if len(id) < 4 || len(id) > 256 || (i > 0 && id == ids[i-1]) {
+						t.Errorf("generation ids = %q", ids)
+					}
+				}
+				for _, frame := range tc.reply(ids) {
+					if err := conn.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+						return
+					}
+				}
+				_ = conn.Close(websocket.StatusNormalClosure, "")
+			}))
+			defer server.Close()
+			parsed, _ := url.Parse(server.URL)
+			adapter, err := NewTTS(TTSConfig{AllowedEndpointHosts: []string{parsed.Hostname()}, AllowInsecureEndpoint: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream, err := adapter.Open(ctx, ttsRequest(wsURL(server.URL)+ttsPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.(*ttsStream).Abort(ctx)
+			for _, step := range tc.steps {
+				if text, ok := strings.CutPrefix(step, "commit:"); ok {
+					if err := stream.AppendText(ctx, text); err != nil {
+						t.Fatal(err)
+					}
+					if err := stream.CommitText(ctx); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := stream.Cancel(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var terminal error
+			var audio []byte
+			var started, finished int
+			for done := false; !done; {
+				select {
+				case event, ok := <-stream.Events():
+					switch {
+					case !ok:
+						done = true
+					case event.Err != nil:
+						terminal = event.Err
+					case event.Type == protocol.EventAudioStarted:
+						started++
+					case event.Type == protocol.EventAudioFrame:
+						audio = append(audio, event.Audio...)
+					case event.Type == protocol.EventAudioDone:
+						finished++
+					}
+				case <-ctx.Done():
+					t.Fatal("events did not finish")
+				}
+			}
+			if string(audio) != string(tc.wantAudio) {
+				t.Fatalf("audio = %v, want %v", audio, tc.wantAudio)
+			}
+			if tc.wantErr {
+				var pe *runtimepkg.ProviderError
+				if !errors.As(terminal, &pe) || pe.Code != "provider_unavailable" || !pe.Retryable {
+					t.Fatalf("terminal = %#v, want retryable provider_unavailable", terminal)
+				}
+				return
+			}
+			if terminal != nil {
+				t.Fatalf("clean close reported %v", terminal)
+			}
+			if started != len(tc.wantAudio) || finished != len(tc.wantAudio) {
+				t.Fatalf("audio.started=%d audio.done=%d, want %d each", started, finished, len(tc.wantAudio))
 			}
 		})
 	}
