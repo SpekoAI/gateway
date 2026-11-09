@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -660,9 +661,18 @@ func TestSTTAdapterReportsTheRealtimeBillingObservation(t *testing.T) {
 	}
 }
 
-// A session that ends by Abort never confirmed its input, so it carries no
-// complete observation and settles as unresolved.
-func TestSTTAdapterAbortLeavesTheObservationIncomplete(t *testing.T) {
+// A session torn down by Abort (spent budget, write failure, watchdog) still
+// bills the PCM ElevenLabs received: exactly one complete observation, even
+// when Close and Abort both run.
+func TestSTTAdapterAbortBillsTheAudioSent(t *testing.T) {
+	for _, closeFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("close_first=%v", closeFirst), func(t *testing.T) {
+			testSTTAdapterAbortBillsTheAudioSent(t, closeFirst)
+		})
+	}
+}
+
+func testSTTAdapterAbortBillsTheAudioSent(t *testing.T, closeFirst bool) {
 	t.Parallel()
 	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
 		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-2"}); err != nil {
@@ -687,11 +697,22 @@ func TestSTTAdapterAbortLeavesTheObservationIncomplete(t *testing.T) {
 	if err := providerStream.WriteAudio(context.Background(), make([]byte, 3_200)); err != nil {
 		t.Fatalf("write audio: %v", err)
 	}
+	if closeFirst {
+		_ = providerStream.Close(context.Background())
+	}
 	_ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+	var complete []*protocol.BillingObservation
 	for event := range providerStream.Events() {
 		if event.Billing != nil && event.Billing.Complete {
-			t.Fatalf("aborted stream reported complete billing %+v", event.Billing)
+			complete = append(complete, event.Billing)
 		}
+	}
+	if len(complete) != 1 {
+		t.Fatalf("complete observations = %d, want exactly 1", len(complete))
+	}
+	got := complete[0]
+	if got.Quantities["duration_seconds"] != 3_200 || got.QuantityDenominators["duration_seconds"] != 32_000 || got.Mode != "streaming" || got.Model != "scribe_v2_realtime" {
+		t.Fatalf("complete observation = %+v, want 3200/32000 streaming scribe_v2_realtime", got)
 	}
 }
 

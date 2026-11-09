@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -31,6 +32,9 @@ const (
 	// s16le mono and is sample-aligned, so a caller handing a whole utterance as
 	// one write does not produce an oversized WebSocket message.
 	sttPCMFrameBytes = 16_000
+	// sttFinalBillingTimeout bounds the wait to hand the complete billing
+	// observation to a consumer during teardown.
+	sttFinalBillingTimeout = 2 * time.Second
 )
 
 // STTConfig controls local transport limits. Credentials and provider selection
@@ -402,20 +406,40 @@ func (s *sttStream) Close(ctx context.Context) error {
 		// waits out a frame still in flight before it is read.
 		s.writeMu.Lock()
 		s.writeMu.Unlock()
-		s.billingMu.Lock()
-		defer s.billingMu.Unlock()
-		s.billed = true
-		if !s.eventsClosed {
-			_ = s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billing(true)})
-		}
+		s.emitCompleteBilling()
 	})
 	return s.closeErr
 }
 
-// billing is the session's one duration observation. Before Close it is
-// incomplete and carries no quantity, so a session that ends without a
-// graceful Close settles as unresolved rather than free. The complete
-// observation is the PCM this stream sent, as an exact fraction of a second.
+// emitCompleteBilling sends the complete observation exactly once, while the
+// events channel is open. Close and abort both end here: ElevenLabs bills the
+// audio it received whether the stream ended gracefully or was torn down (a
+// spent budget, a write failure, a watchdog), so an aborted stream bills the
+// PCM it sent instead of settling unresolved. If readLoop has already closed
+// the channel nothing can be sent, and the session settles on the incomplete
+// observation from session_started.
+func (s *sttStream) emitCompleteBilling() {
+	s.billingMu.Lock()
+	defer s.billingMu.Unlock()
+	if s.billed || s.eventsClosed {
+		return
+	}
+	s.billed = true
+	event := runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billing(true)}
+	// Bounded, not tied to s.ctx: abort sends before it cancels, and a consumer
+	// that stopped reading must not hold the teardown open.
+	timer := time.NewTimer(sttFinalBillingTimeout)
+	defer timer.Stop()
+	select {
+	case s.events <- event:
+	case <-timer.C:
+	}
+}
+
+// billing is the session's one duration observation. Until Close or Abort it
+// is incomplete and carries no quantity; the complete observation is the PCM
+// this stream sent, as an exact fraction of a second. A session whose read
+// loop ended before either could send it settles as unresolved, not free.
 // The caller holds billingMu.
 func (s *sttStream) billing(complete bool) *protocol.BillingObservation {
 	observation := &protocol.BillingObservation{OperationID: "stream", Model: s.model, Mode: "streaming", ProviderRequestID: s.sessionID, Quantities: map[string]int64{}}
@@ -429,6 +453,10 @@ func (s *sttStream) billing(complete bool) *protocol.BillingObservation {
 
 func (s *sttStream) abort() error {
 	s.abortOnce.Do(func() {
+		// Before cancel, so the observation is sent while the channel is open.
+		// sentBytes counts completed writes only; a write still in flight is
+		// not waited for, since it may be the one that is stuck.
+		s.emitCompleteBilling()
 		s.cancel()
 		if err := s.conn.CloseNow(); err != nil && s.closeErr == nil {
 			s.closeErr = err
