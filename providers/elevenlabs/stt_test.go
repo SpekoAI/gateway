@@ -742,3 +742,117 @@ func TestSTTAdapterCloseAfterTheServerEndedTheSocket(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 }
+
+// openSTTWithAudio opens a stream against server, waits for session_started,
+// and writes bytes of PCM.
+func openSTTWithAudio(t *testing.T, server *httptest.Server, config STTConfig, bytes int) runtimepkg.ProviderStream {
+	t.Helper()
+	adapter, err := NewSTT(config)
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	providerStream, err := adapter.Open(context.Background(), sttRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	collectSTTEvents(t, providerStream.Events(), 1)
+	if err := providerStream.WriteAudio(context.Background(), make([]byte, bytes)); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	return providerStream
+}
+
+// Scribe ending the socket, or sending a terminal error, after it received
+// audio still bills that audio, and the observation arrives before the error.
+func TestSTTAdapterBillsAudioWhenScribeEndsTheStream(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		end     func(context.Context, *websocket.Conn)
+		wantErr bool
+	}{
+		{name: "server close", end: func(_ context.Context, conn *websocket.Conn) {
+			_ = conn.Close(websocket.StatusNormalClosure, "")
+		}},
+		{name: "error frame", end: func(ctx context.Context, conn *websocket.Conn) {
+			_ = writeSTTJSON(ctx, conn, map[string]any{"message_type": "transcriber_error", "error": "boom"})
+		}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			received := make(chan struct{})
+			server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+				if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-end"}); err != nil {
+					return
+				}
+				if _, err := readSTTJSON(ctx, conn); err != nil {
+					return
+				}
+				close(received)
+				tc.end(ctx, conn)
+				_, _, _ = conn.Read(ctx)
+			})
+			defer server.Close()
+			providerStream := openSTTWithAudio(t, server, sttTestConfig(server.URL), 3_200)
+			defer func() { _ = providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+			<-received
+			var order []string
+			for event := range providerStream.Events() {
+				switch {
+				case event.Billing != nil && event.Billing.Complete:
+					if event.Billing.Quantities["duration_seconds"] != 3_200 {
+						t.Fatalf("complete observation = %+v, want 3200 bytes", event.Billing)
+					}
+					order = append(order, "billing")
+				case event.Err != nil:
+					order = append(order, "error")
+				}
+			}
+			want := []string{"billing"}
+			if tc.wantErr {
+				want = append(want, "error")
+			}
+			if fmt.Sprint(order) != fmt.Sprint(want) {
+				t.Fatalf("events = %v, want %v", order, want)
+			}
+		})
+	}
+}
+
+// A consumer stalled past Close's bounded attempt still gets the complete
+// observation from the read loop once it drains again.
+func TestSTTAdapterBillingSurvivesAStalledConsumer(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-stall"}); err != nil {
+			return
+		}
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	stream := openSTTWithAudio(t, server, sttTestConfig(server.URL), 3_200).(*sttStream)
+	// Fill the buffer so Close's attempt cannot land, then let it time out.
+	for len(stream.events) < cap(stream.events) {
+		stream.events <- runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved}
+	}
+	stream.emitCompleteBilling(10*time.Millisecond, false)
+	stream.billingMu.Lock()
+	billed := stream.billed
+	stream.billingMu.Unlock()
+	if billed {
+		t.Fatal("a timed-out send was recorded as billed")
+	}
+	_ = stream.Abort(context.Background())
+	var complete int
+	for event := range stream.events {
+		if event.Billing != nil && event.Billing.Complete {
+			complete++
+		}
+	}
+	if complete != 1 {
+		t.Fatalf("complete observations after draining = %d, want 1", complete)
+	}
+}
