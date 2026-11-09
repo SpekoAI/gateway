@@ -62,6 +62,21 @@ func authHeaders(value string) http.Header {
 	return headers
 }
 
+// retryRemedy ends the caller-safe Hint on transient failures. Hints are fixed
+// sentences plus at most a numeric status or close code, never Palabra's text.
+const retryRemedy = "retry after a brief delay or use auto routing."
+
+// streamFailure is the provider_unavailable error for a stream that broke
+// before its output was complete. The hint distinguishes Palabra closing the
+// socket (with its numeric close code) from the connection dropping.
+func streamFailure(message, unfinished string, err error) error {
+	hint := "The connection to Palabra dropped before " + unfinished + "; " + retryRemedy
+	if code := websocket.CloseStatus(err); code != -1 {
+		hint = fmt.Sprintf("Palabra closed the stream with WebSocket code %d before %s; %s", int(code), unfinished, retryRemedy)
+	}
+	return &runtime.ProviderError{Code: "provider_unavailable", Message: message, Hint: hint, Retryable: true, Cause: err}
+}
+
 func dialError(provider string, response *http.Response, err error) error {
 	status := 0
 	if response != nil {

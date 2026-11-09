@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
@@ -17,9 +19,10 @@ import (
 )
 
 const (
-	STTAdapterID = "palabra.stt.v1"
-	sttPath      = "/asr/v1/speech-to-text/stream"
-	STTModel     = "default"
+	STTAdapterID   = "palabra.stt.v1"
+	sttPath        = "/asr/v1/speech-to-text/stream"
+	STTModel       = "default"
+	finalizeMarker = "<fin>"
 )
 
 var sttLanguages = map[string]struct{}{
@@ -32,6 +35,7 @@ type STTConfig struct {
 	HTTPClient            *http.Client
 	EventBuffer           int
 	MaxMessageBytes       int64
+	GracefulCloseTimeout  time.Duration
 	AllowedEndpointHosts  []string
 	AllowInsecureEndpoint bool
 }
@@ -41,6 +45,7 @@ type STTAdapter struct {
 	httpClient      *http.Client
 	eventBuffer     int
 	maxMessageBytes int64
+	closeTimeout    time.Duration
 	endpointPolicy  endpointPolicy
 }
 
@@ -54,6 +59,12 @@ func NewSTT(config STTConfig) (*STTAdapter, error) {
 	if config.MaxMessageBytes == 0 {
 		config.MaxMessageBytes = 1 << 20
 	}
+	if config.GracefulCloseTimeout == 0 {
+		config.GracefulCloseTimeout = 10 * time.Second
+	}
+	if config.GracefulCloseTimeout < 0 {
+		return nil, errors.New("palabra stt graceful close timeout must be positive")
+	}
 	if config.EventBuffer < 1 {
 		return nil, errors.New("palabra stt event buffer must be positive")
 	}
@@ -64,7 +75,7 @@ func NewSTT(config STTConfig) (*STTAdapter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &STTAdapter{id: config.AdapterID, httpClient: config.HTTPClient, eventBuffer: config.EventBuffer, maxMessageBytes: config.MaxMessageBytes, endpointPolicy: policy}, nil
+	return &STTAdapter{id: config.AdapterID, httpClient: config.HTTPClient, eventBuffer: config.EventBuffer, maxMessageBytes: config.MaxMessageBytes, closeTimeout: config.GracefulCloseTimeout, endpointPolicy: policy}, nil
 }
 
 func (a *STTAdapter) ID() string { return a.id }
@@ -105,6 +116,11 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		return nil, fmt.Errorf("palabra stt endpoint: %w", err)
 	}
 	query := endpoint.Query()
+	// The dedicated ASR service rejected the account key in both bearer and
+	// raw Authorization headers with HTTP 401 during the 2026-09-11 staging
+	// canary, while the same key succeeded in the documented token parameter.
+	// TTS still uses the Authorization header.
+	query.Set("token", credential.Value)
 	query.Set("format", "pcm_s16le")
 	query.Set("sample_rate", fmt.Sprint(request.Media.SampleRateHz))
 	if language != "auto" {
@@ -113,14 +129,17 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	endpoint.RawQuery = query.Encode()
 
 	conn, response, err := websocket.Dial(ctx, endpoint.String(), &websocket.DialOptions{
-		HTTPClient: a.httpClient, HTTPHeader: authHeaders(credential.Value),
+		HTTPClient: a.httpClient,
 	})
 	if err != nil {
-		return nil, dialError("Palabra STT", response, err)
+		// net/http errors can contain the full URL. Never retain the token in
+		// the error chain, including its query-escaped spelling.
+		redacted := strings.NewReplacer(url.QueryEscape(credential.Value), "[redacted]", credential.Value, "[redacted]").Replace(err.Error())
+		return nil, dialError("Palabra STT", response, errors.New(redacted))
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
-	streamCtx, cancel := context.WithCancel(context.Background())
-	stream := &sttStream{conn: conn, ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer)}
+	streamCtx, cancel := context.WithCancelCause(context.Background())
+	stream := &sttStream{conn: conn, ctx: streamCtx, cancel: cancel, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), closeTimeout: a.closeTimeout}
 	go stream.readLoop()
 	return stream, nil
 }
@@ -142,7 +161,7 @@ func sttLanguage(value string) (string, error) {
 type sttStream struct {
 	conn   *websocket.Conn
 	ctx    context.Context
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 	events chan runtimepkg.ProviderEvent
 
 	writeMu      sync.Mutex
@@ -150,6 +169,9 @@ type sttStream struct {
 	abortOnce    sync.Once
 	closed       atomic.Bool
 	closeErr     error
+	closeTimeout time.Duration
+	finalizeSent bool // protected by writeMu; reset by subsequent audio
+	pending      atomic.Int64
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -161,13 +183,27 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	return s.write(ctx, websocket.MessageBinary, audio)
 }
 
-// Palabra's dedicated ASR socket has no flush/finalize command. Its own
-// endpointer emits is_eos boundaries, so a caller commit is intentionally a
-// no-op rather than an invented wire message.
-func (s *sttStream) CommitAudio(context.Context) error {
+// CommitAudio sends Palabra's documented manual end-of-segment command,
+// {"message_type":"finalize"}. Palabra answers every finalize with a final
+// transcript whose text carries a "<fin>" suffix, even when there was no new
+// speech. File uploads need this because they may end without trailing
+// silence for Palabra's own endpointer to mark.
+func (s *sttStream) CommitAudio(ctx context.Context) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
+	return s.finalizeLocked(ctx)
+}
+
+func (s *sttStream) finalizeLocked(ctx context.Context) error {
+	s.pending.Add(1)
+	if err := s.conn.Write(ctx, websocket.MessageText, []byte(`{"message_type":"finalize"}`)); err != nil {
+		s.pending.Add(-1)
+		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Palabra STT finalize failed", Hint: "The connection to Palabra failed while finalizing the transcript; " + retryRemedy, Retryable: true, Cause: err}
+	}
+	s.finalizeSent = true
 	return nil
 }
 
@@ -178,26 +214,54 @@ func (s *sttStream) CommitText(context.Context) error { return runtimepkg.ErrUns
 func (s *sttStream) Cancel(context.Context) error     { return s.abort() }
 func (s *sttStream) Abort(context.Context) error      { return s.abort() }
 
-func (s *sttStream) Close(context.Context) error {
+// Close stops input and drains every outstanding finalize acknowledgement,
+// bounded by GracefulCloseTimeout. Palabra drops audio that has not been
+// finalized when the socket closes, so Close finalizes first unless no audio
+// arrived since the last finalize. It returns immediately so the caller can
+// consume Events while the reader drains; a missing acknowledgement surfaces
+// through TerminalError.
+func (s *sttStream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
-		s.closed.Store(true)
 		s.writeMu.Lock()
-		s.closeErr = s.conn.Close(websocket.StatusNormalClosure, "")
+		if !s.closed.Load() && !s.finalizeSent {
+			s.closeErr = s.finalizeLocked(ctx)
+		}
+		s.closed.Store(true)
 		s.writeMu.Unlock()
-		s.cancel()
+		if s.closeErr != nil {
+			s.cancel(s.closeErr)
+		} else if s.pending.Load() == 0 {
+			s.cancel(nil)
+		} else {
+			go func() {
+				timer := time.NewTimer(s.closeTimeout)
+				defer timer.Stop()
+				select {
+				case <-s.ctx.Done():
+				case <-timer.C:
+					s.cancel(&runtimepkg.ProviderError{Code: "request_timeout", Message: "Palabra STT did not acknowledge finalization before shutdown", Hint: fmt.Sprintf("Palabra did not finish the transcript within %s of the end of audio; %s", s.closeTimeout, retryRemedy), Retryable: true})
+				}
+			}()
+		}
 	})
 	return s.closeErr
+}
+
+// TerminalError retains shutdown failures even when the event buffer is full.
+func (s *sttStream) TerminalError() error {
+	if err := context.Cause(s.ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
 }
 
 func (s *sttStream) abort() error {
 	s.abortOnce.Do(func() {
 		s.closed.Store(true)
-		s.cancel()
-		if err := s.conn.CloseNow(); err != nil && s.closeErr == nil {
-			s.closeErr = err
-		}
+		s.cancel(nil)
+		_ = s.conn.CloseNow()
 	})
-	return s.closeErr
+	return nil
 }
 
 func (s *sttStream) write(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
@@ -210,18 +274,29 @@ func (s *sttStream) write(ctx context.Context, messageType websocket.MessageType
 		return runtimepkg.ErrSessionClosed
 	}
 	if err := s.conn.Write(ctx, messageType, payload); err != nil {
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Palabra STT streaming write failed", Retryable: true, Cause: err}
+		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Palabra STT streaming write failed", Hint: "The connection to Palabra failed while sending audio; " + retryRemedy, Retryable: true, Cause: err}
 	}
+	s.finalizeSent = false
 	return nil
 }
 
 func (s *sttStream) readLoop() {
 	defer close(s.events)
+	defer func() {
+		if err := s.TerminalError(); err != nil {
+			select {
+			case s.events <- runtimepkg.ProviderEvent{Err: err}:
+			default:
+			}
+		}
+	}()
+	defer s.cancel(nil)
+	defer s.conn.CloseNow()
 	for {
 		messageType, payload, err := s.conn.Read(s.ctx)
 		if err != nil {
-			if !s.closed.Load() && !isNormalClose(err) && s.ctx.Err() == nil {
-				s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Palabra STT streaming read failed", Retryable: true, Cause: err}})
+			if s.ctx.Err() == nil && (!isNormalClose(err) || s.pending.Load() > 0) {
+				s.cancel(streamFailure("Palabra STT closed before transcription completed", "the transcript was complete", err))
 			}
 			return
 		}
@@ -229,7 +304,10 @@ func (s *sttStream) readLoop() {
 			continue
 		}
 		if err := s.handleMessage(payload); err != nil {
-			s.emit(runtimepkg.ProviderEvent{Err: err})
+			s.cancel(err)
+			return
+		}
+		if s.closed.Load() && s.pending.Load() == 0 {
 			return
 		}
 	}
@@ -238,24 +316,32 @@ func (s *sttStream) readLoop() {
 func (s *sttStream) handleMessage(payload []byte) error {
 	var message sttInbound
 	if err := json.Unmarshal(payload, &message); err != nil {
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Palabra STT sent malformed streaming JSON", Retryable: true, Cause: err}
+		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Palabra STT sent malformed streaming JSON", Hint: "Palabra sent a malformed streaming message; " + retryRemedy, Retryable: true, Cause: err}
 	}
 	raw := append([]byte(nil), payload...)
 	switch message.MessageType {
 	case "transcription":
+		// A finalize acknowledgement appends this protocol marker, including
+		// when there was no speech. It is never transcript content.
+		finalized := strings.HasSuffix(message.Segment.Text, finalizeMarker)
+		message.Segment.Text = strings.TrimSuffix(message.Segment.Text, finalizeMarker)
 		kind := protocol.EventTranscriptDelta
-		if message.IsEOS {
+		if message.IsEOS || finalized {
 			kind = protocol.EventTranscriptFinal
 		}
-		return s.emit(runtimepkg.ProviderEvent{
+		err := s.emit(runtimepkg.ProviderEvent{
 			Type: kind,
 			Data: marshalData(map[string]any{
-				"text": message.Segment.Text, "is_final": message.IsEOS,
+				"text": message.Segment.Text, "is_final": message.IsEOS || finalized,
 				"language": message.Language, "audio_start_ms": milliseconds(message.Segment.StartTime),
 				"audio_end_ms": milliseconds(message.Segment.EndTime), "provider_request_id": message.TranscriptionID,
 			}),
 			Extensions: extension(raw),
 		})
+		if finalized && s.pending.Load() > 0 {
+			s.pending.Add(-1)
+		}
+		return err
 	case "error":
 		return providerFrameError(message.Data.Code, message.Data.Description, raw)
 	default:
