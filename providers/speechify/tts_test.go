@@ -77,7 +77,7 @@ func TestAdapterAcceptsCompletePublishedSimbaFamily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, model := range []string{"simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"} {
+	for _, model := range []string{"simba-3.5", "simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"} {
 		stream, err := adapter.Open(context.Background(), adapterRequest("https://api.speechify.ai/v1/audio/stream", model))
 		if err != nil {
 			t.Errorf("model %s: %v", model, err)
