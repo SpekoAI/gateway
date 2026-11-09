@@ -660,6 +660,44 @@ func TestTTSCompletionFollowsGenerationIDs(t *testing.T) {
 			wantAudio: []byte{2},
 		},
 		{
+			// Palabra omitting the id falls back to completing sentences in
+			// commit order.
+			name:  "last_chunks without generation_id complete in order",
+			steps: []string{"commit:one", "commit:two"},
+			reply: func([]string) []string {
+				return []string{ttsChunk("", []byte{1}, false), ttsChunk("", nil, true), ttsChunk("", []byte{2}, false), ttsChunk("", nil, true)}
+			},
+			wantAudio: []byte{1, 2},
+		},
+		{
+			name:  "one last_chunk without generation_id leaves the second sentence waiting",
+			steps: []string{"commit:one", "commit:two"},
+			reply: func([]string) []string {
+				return []string{ttsChunk("", []byte{1}, false), ttsChunk("", nil, true), ttsChunk("", []byte{2}, false)}
+			},
+			wantErr:   true,
+			wantAudio: []byte{1, 2},
+		},
+		{
+			name:  "last_chunk with an id this stream never issued",
+			steps: []string{"commit:one"},
+			reply: func([]string) []string {
+				return []string{ttsChunk("palabra-assigned", []byte{1}, false), ttsChunk("palabra-assigned", nil, true)}
+			},
+			wantAudio: []byte{1},
+		},
+		{
+			// A cancelled id stays dropped: it does not take the FIFO
+			// fallback and retire B.
+			name:  "cancelled id's late last_chunk without audio does not retire the next",
+			steps: []string{"commit:one", "cancel", "commit:two"},
+			reply: func(ids []string) []string {
+				return []string{cancelled, ttsChunk(ids[0], nil, true), ttsChunk(ids[1], []byte{2}, false)}
+			},
+			wantErr:   true,
+			wantAudio: []byte{2},
+		},
+		{
 			name:  "close after cancel",
 			steps: []string{"commit:one", "cancel"},
 			reply: func([]string) []string { return []string{cancelled} },

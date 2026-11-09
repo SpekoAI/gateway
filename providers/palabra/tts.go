@@ -467,16 +467,26 @@ func (g *generations) commit(id string) {
 	g.outstanding[n] = struct{}{}
 }
 
-// finish retires a sentence. Only the last_chunk carrying its own id, or a
-// failed send of its is_eos frame, may do so.
+// finish retires a sentence: the one an id this stream issued names, or a
+// failed send of its is_eos frame. A last_chunk with an empty or unknown id
+// retires the oldest outstanding sentence instead, so a Palabra that omits or
+// rewrites the id still completes sentences in order, as before ids were
+// sent. Cancelled ids never get here; their frames are dropped first.
 func (g *generations) finish(id string) {
-	n, ok := g.number(id)
-	if !ok {
-		return
-	}
+	n, ours := g.number(id)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	delete(g.outstanding, n)
+	if ours {
+		delete(g.outstanding, n)
+		return
+	}
+	var oldest uint64
+	for candidate := range g.outstanding {
+		if oldest == 0 || candidate < oldest {
+			oldest = candidate
+		}
+	}
+	delete(g.outstanding, oldest)
 }
 
 // cancelAll covers every id issued so far, committed or not. Palabra's cancel
@@ -490,7 +500,8 @@ func (g *generations) cancelAll() {
 }
 
 // cancelled reports whether id belongs to a cancelled sentence. Ids this
-// stream did not issue are not cancelled.
+// stream did not issue, including an empty one, are not cancelled: their
+// audio plays.
 func (g *generations) cancelled(id string) bool {
 	n, ok := g.number(id)
 	if !ok {
