@@ -349,10 +349,9 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 			"commit":        false,
 			"sample_rate":   s.rate,
 		}
-		if err := s.writeJSON(ctx, chunk); err != nil {
+		if err := s.writeFrame(ctx, chunk, int64(end-offset)); err != nil {
 			return err
 		}
-		s.sentBytes.Add(int64(end - offset))
 	}
 	s.inputPending.Store(true)
 	return nil
@@ -423,12 +422,13 @@ func (s *sttStream) Close(ctx context.Context) error {
 // server close, a provider error). It counts as sent only once delivered, so a
 // stalled consumer that resumes still gets it from the read loop's retry. The
 // send is bounded by timeout rather than s.ctx, which Abort has cancelled.
-// With requireAudio, a stream that sent no PCM reports nothing: there is
-// nothing to bill, and a provider error must stay its consumer's first event.
+// With requireAudio, a stream that never started and sent no PCM reports
+// nothing, so a failure before startup stays its consumer's first event. A
+// started stream always completes its operation, at zero if no audio went out.
 func (s *sttStream) emitCompleteBilling(timeout time.Duration, requireAudio bool) {
 	s.billingMu.Lock()
 	defer s.billingMu.Unlock()
-	if s.billed || s.eventsClosed || (requireAudio && s.sentBytes.Load() == 0) {
+	if s.billed || s.eventsClosed || (requireAudio && s.sentBytes.Load() == 0 && s.sessionID == "") {
 		return
 	}
 	event := runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billing(true)}
@@ -484,6 +484,13 @@ func (s *sttStream) abort() error {
 }
 
 func (s *sttStream) writeJSON(ctx context.Context, value any) error {
+	return s.writeFrame(ctx, value, 0)
+}
+
+// writeFrame writes one JSON frame and, for an audio chunk, counts its PCM
+// bytes under the same lock. Counting inside the lock is what lets the read
+// loop's exit trust sentBytes once it has held the lock after closing input.
+func (s *sttStream) writeFrame(ctx context.Context, value any, audioBytes int64) error {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -504,6 +511,7 @@ func (s *sttStream) writeJSON(ctx context.Context, value any) error {
 			Cause:     err,
 		}
 	}
+	s.sentBytes.Add(audioBytes)
 	return nil
 }
 
@@ -512,6 +520,10 @@ func (s *sttStream) readLoop() {
 	// an error event, so billing has to reach them first.
 	var terminal *runtimepkg.ProviderEvent
 	defer func() {
+		// Close input first: writeFrame checks closed under the write lock,
+		// so once awaitWrites has held that lock no later audio can be sent,
+		// and every write that succeeded is already in sentBytes.
+		s.closed.Store(true)
 		s.awaitWrites(sttWriteSettleTimeout)
 		s.emitCompleteBilling(sttFinalBillingTimeout, true)
 		if terminal != nil {
