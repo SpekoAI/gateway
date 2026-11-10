@@ -67,9 +67,11 @@ type CatalogModelRoute struct {
 var providerCatalog = []CatalogEntry{
 	{Provider: "deepgram", Kind: protocol.SessionKindSTT, Adapter: "deepgram.stt.v1", DefaultModel: "flux-general-en", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.deepgram.com/v2/listen", ModelRoutes: []CatalogModelRoute{{ModelPrefix: "flux-", Endpoint: "wss://api.deepgram.com/v2/listen"}, {ModelPrefix: "", Endpoint: "wss://api.deepgram.com/v1/listen"}}},
 	{Provider: "deepgram", Kind: protocol.SessionKindTTS, Adapter: "deepgram.tts.v1", DefaultModel: "flux-haley-en", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.deepgram.com/v2/speak", ModelRoutes: []CatalogModelRoute{{ModelPrefix: "flux-", Endpoint: "wss://api.deepgram.com/v2/speak"}, {ModelPrefix: "", Endpoint: "wss://api.deepgram.com/v1/speak"}}},
-	// The realtime Scribe family, NOT the batch `scribe_v2`: only this id streams
-	// over /v1/speech-to-text/realtime.
-	{Provider: "elevenlabs", Kind: protocol.SessionKindSTT, Adapter: "elevenlabs.stt.v1", DefaultModel: "scribe_v2_realtime", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/speech-to-text/realtime"},
+	// The realtime Scribe family, NOT the batch `scribe_v2`/`scribe_v3`: only the
+	// realtime ids stream over /v1/speech-to-text/realtime. scribe_v3_live
+	// (2026-11-10) shares the socket and parameters and is listed so discovery
+	// shows it; scribe_v2_realtime stays the default a bare or auto pin gets.
+	{Provider: "elevenlabs", Kind: protocol.SessionKindSTT, Adapter: "elevenlabs.stt.v1", DefaultModel: "scribe_v2_realtime", Models: []string{"scribe_v2_realtime", "scribe_v3_live"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/speech-to-text/realtime"},
 	{Provider: "elevenlabs", Kind: protocol.SessionKindTTS, Adapter: "elevenlabs.tts.v1", DefaultModel: "eleven_flash_v2_5", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/text-to-speech"},
 	// v3/v4 stream only on the text-to-dialogue socket, a separate adapter. The
 	// row sits after the text-to-speech one so a bare or `auto` model keeps

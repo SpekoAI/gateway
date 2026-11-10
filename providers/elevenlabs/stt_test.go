@@ -1059,3 +1059,71 @@ func TestSTTAdapterCleanCancelWhileAnEventIsBlocked(t *testing.T) {
 		}
 	}
 }
+
+// A scribe_v3_live plan dials the same socket with its own id, and both
+// billing observations name the model that streamed, so a v3 Live session
+// is never billed as v2 Realtime.
+func TestSTTAdapterStreamsScribeV3LiveAndBillsItByName(t *testing.T) {
+	t.Parallel()
+	requests := make(chan *http.Request, 1)
+	server := newSTTServer(t, func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+		requests <- request.Clone(request.Context())
+		if err := writeSTTJSON(ctx, conn, map[string]any{"message_type": "session_started", "session_id": "el-stt-v3"}); err != nil {
+			t.Errorf("session_started: %v", err)
+			return
+		}
+		for {
+			if _, err := readSTTJSON(ctx, conn); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	request := sttRequest(server.URL, protocol.CredentialsBYOK)
+	request.Plan.Route.Model = "scribe_v3_live"
+	providerStream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+
+	dial := <-requests
+	if dial.URL.Path != sttEndpointPath {
+		t.Fatalf("dial path = %q, want %q", dial.URL.Path, sttEndpointPath)
+	}
+	query := dial.URL.Query()
+	for field, wanted := range map[string]string{
+		"model_id": "scribe_v3_live", "audio_format": "pcm_16000", "include_timestamps": "true", "commit_strategy": "vad", "language_code": "es",
+	} {
+		if got := query.Get(field); got != wanted {
+			t.Fatalf("query %s = %q, want %q", field, got, wanted)
+		}
+	}
+	if dial.Header.Get("xi-api-key") != "customer-elevenlabs-key" {
+		t.Fatal("a BYOK v3 Live session must authenticate with the header, like v2")
+	}
+
+	started := collectSTTEvents(t, providerStream.Events(), 1)[0]
+	wantStarted := protocol.BillingObservation{OperationID: "stream", Model: "scribe_v3_live", Mode: "streaming", ProviderRequestID: "el-stt-v3", Quantities: map[string]int64{}}
+	if started.Billing == nil || !reflect.DeepEqual(*started.Billing, wantStarted) {
+		t.Fatalf("session_started billing = %+v, want %+v", started.Billing, wantStarted)
+	}
+	if err := providerStream.WriteAudio(context.Background(), make([]byte, 3_200)); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	if err := providerStream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	closed := collectSTTEvents(t, providerStream.Events(), 1)[0]
+	wantClosed := protocol.BillingObservation{
+		OperationID: "stream", Model: "scribe_v3_live", Mode: "streaming", ProviderRequestID: "el-stt-v3",
+		Quantities: map[string]int64{"duration_seconds": 3_200}, QuantityDenominators: map[string]int64{"duration_seconds": 32_000}, Complete: true,
+	}
+	if closed.Billing == nil || !reflect.DeepEqual(*closed.Billing, wantClosed) {
+		t.Fatalf("close billing = %+v, want %+v", closed.Billing, wantClosed)
+	}
+}

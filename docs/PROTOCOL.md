@@ -18,11 +18,10 @@ and `GET /v1/models` require `Authorization: Bearer <SPEKO_LOCAL_AUTH_TOKEN>`.
 
 ### `GET /v1/models`
 
-Every (provider, modality) this build implements, with the adapter behind it, the
-default model used when a caller names none, and whether **this process** has the
-adapter loaded. Unauthenticated on purpose: it names no customer, carries no
-credential, and an integrator has to be able to read it before the first session
-exists.
+Every (provider, modality) this build implements, one row per model id, with the
+adapter behind it and whether **this process** has the adapter loaded.
+Unauthenticated on purpose: it names no customer, carries no credential, and an
+integrator has to be able to read it before the first session exists.
 
 Filter with `?kind=stt|tts` and `?provider=<name>`.
 
@@ -39,10 +38,25 @@ Filter with `?kind=stt|tts` and `?provider=<name>`.
       "adapter": "elevenlabs.stt.v1",
       "transport": "websocket",
       "installed": true
+    },
+    {
+      "id": "elevenlabs:scribe_v3_live",
+      "provider": "elevenlabs",
+      "kind": "stt",
+      "adapter": "elevenlabs.stt.v1",
+      "transport": "websocket",
+      "installed": true
     }
   ]
 }
 ```
+
+A catalog entry that serves several models on one adapter publishes one id per
+model, as the two realtime Scribe generations above do. The response does not
+mark which id is the default; the adapter table in the README lists it. In
+standalone BYOK planning, `auto` or an empty model resolves to the entry's
+default (`scribe_v2_realtime` here) and the other ids are reached by naming
+them; a managed plan carries the model the control plane selected.
 
 `installed: false` means the row is part of the catalog but this deployment did
 not load its adapter, so a session for it cannot open here. The row is reported
