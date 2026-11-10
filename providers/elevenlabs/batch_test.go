@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
@@ -279,6 +280,105 @@ func TestBatchTranscribeBillsTheUploadWhenScribeOmitsTheDuration(t *testing.T) {
 			}
 			if got.Quantities["duration_seconds"] != tc.want || got.QuantityDenominators["duration_seconds"] != tc.wantDen || got.Model != BatchModel || got.Mode != "batch" {
 				t.Fatalf("observation = %+v, want %d/%d scribe_v2 batch", got, tc.want, tc.wantDen)
+			}
+		})
+	}
+}
+
+// Each realtime Scribe generation has its own file twin. A v3 Live session
+// that needs a file transcription runs scribe_v3, v2 Realtime keeps
+// scribe_v2, and an id that is not a realtime Scribe model has no twin, so a
+// caller cannot swap generations by accident.
+func TestBatchModelForPairsByGeneration(t *testing.T) {
+	t.Parallel()
+	if BatchModel != "scribe_v2" || BatchModelV3 != "scribe_v3" {
+		t.Fatalf("BatchModel = %q, BatchModelV3 = %q; want scribe_v2 and scribe_v3", BatchModel, BatchModelV3)
+	}
+	for _, tc := range []struct {
+		realtime string
+		want     string
+		ok       bool
+	}{
+		{realtime: "scribe_v2_realtime", want: "scribe_v2", ok: true},
+		{realtime: "scribe_v3_live", want: "scribe_v3", ok: true},
+		{realtime: " scribe_v3_live ", want: "scribe_v3", ok: true},
+		{realtime: "scribe_v2"},
+		{realtime: "scribe_v3"},
+		{realtime: "scribe_v1"},
+		{realtime: "auto"},
+		{realtime: ""},
+	} {
+		got, ok := BatchModelFor(tc.realtime)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("BatchModelFor(%q) = %q, %v; want %q, %v", tc.realtime, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// Regression: the guard looked only for "realtime", so scribe_v3_live (the
+// v3 realtime id) would have been POSTed to the file endpoint. Every realtime
+// spelling is refused before a request leaves.
+func TestBatchTranscribeRefusesEveryRealtimeScribeModelBeforeSending(t *testing.T) {
+	t.Parallel()
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(`{"language_code":"en","text":"","transcription_id":"tx_1","audio_duration_secs":1}`))
+	}))
+	defer server.Close()
+	adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatalf("adapter: %v", err)
+	}
+	// The last two are not shipped ids; they pin the spelling rule, so a
+	// later realtime generation is refused without another guard change.
+	for _, model := range []string{"scribe_v2_realtime", "scribe_v3_live", " scribe_v3_live ", "", "  ", "scribe_v4_live", "scribe_v3_live_preview"} {
+		request := runtimepkg.BatchTranscribeRequest{Plan: batchPlan(server.URL + "/v1/speech-to-text"), Audio: strings.NewReader("x"), AudioBytes: 1}
+		request.Plan.Route.Model = model
+		if _, err := adapter.Transcribe(context.Background(), request); err == nil || !strings.Contains(err.Error(), "requires a file Scribe model") {
+			t.Errorf("model %q: err = %v, want a file-model refusal", model, err)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("file endpoint received %d requests for realtime models, want 0", n)
+	}
+}
+
+// Both file generations go to Scribe verbatim, and each names its own billing
+// observation. Adding v3 must not move what a v2 upload sends or bills.
+func TestBatchTranscribeSendsEachGenerationsFileModelVerbatim(t *testing.T) {
+	t.Parallel()
+	for _, model := range []string{BatchModel, BatchModelV3} {
+		t.Run(model, func(t *testing.T) {
+			t.Parallel()
+			seen := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseMultipartForm(1 << 20); err != nil {
+					t.Errorf("multipart: %v", err)
+				}
+				seen <- r.FormValue("model_id")
+				_, _ = w.Write([]byte(`{"language_code":"en","text":"Hi.","transcription_id":"tx_1","audio_duration_secs":2}`))
+			}))
+			defer server.Close()
+			adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+			if err != nil {
+				t.Fatalf("adapter: %v", err)
+			}
+			request := runtimepkg.BatchTranscribeRequest{Plan: batchPlan(server.URL + "/v1/speech-to-text"), Audio: strings.NewReader("RIFF....WAVE"), AudioBytes: 12}
+			request.Plan.Route.Model = model
+			result, err := adapter.Transcribe(context.Background(), request)
+			if err != nil {
+				t.Fatalf("transcribe: %v", err)
+			}
+			if got := <-seen; got != model {
+				t.Fatalf("model_id = %q, want %q", got, model)
+			}
+			want := protocol.BillingReport{Revision: protocol.BillingRevision, Complete: true, Operations: []protocol.BillingObservation{{
+				OperationID: "request", Model: model, Mode: "batch", ProviderRequestID: "tx_1",
+				Quantities: map[string]int64{"duration_seconds": 2_000}, Complete: true,
+			}}}
+			if result.Billing == nil || !reflect.DeepEqual(*result.Billing, want) {
+				t.Fatalf("billing = %+v, want %+v", result.Billing, want)
 			}
 		})
 	}

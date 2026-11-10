@@ -25,8 +25,11 @@ const (
 	// STTAdapterID is the identifier returned by an ElevenLabs STT session plan.
 	STTAdapterID = "elevenlabs.stt.v1"
 	// sttEndpointPath is the realtime Scribe socket. The batch /v1/speech-to-text
-	// endpoint is a DIFFERENT model family: it takes `scribe_v1`/`scribe_v2`, and
-	// only `scribe_v2_realtime` streams over this path.
+	// endpoint is a DIFFERENT model family: it takes `scribe_v1`/`scribe_v2`/
+	// `scribe_v3`, and only the realtime ids (`scribe_v2_realtime`,
+	// `scribe_v3_live`) stream over this path. The plan's model goes to the
+	// socket verbatim as `model_id`, so both realtime generations share this
+	// adapter.
 	sttEndpointPath = "/v1/speech-to-text/realtime"
 	// sttPCMFrameBytes caps one input_audio_chunk. 16000 B is 0.5 s of 16 kHz
 	// s16le mono and is sample-aligned, so a caller handing a whole utterance as
@@ -223,7 +226,9 @@ func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string
 	// words array — see handleMessage for why only the timestamped twin is used.
 	query.Set("include_timestamps", "true")
 	// Vendor-default VAD commit strategy. The framework still owns turn detection;
-	// this only decides when Scribe finalizes a segment on its own side.
+	// this only decides when Scribe finalizes a segment on its own side. It is
+	// set for every generation: scribe_v3_live still defaults to manual commits,
+	// and its opt-in turn_prediction strategy is not exposed here.
 	query.Set("commit_strategy", "vad")
 	if language := strings.TrimSpace(options.Language); language != "" {
 		// `language_code`, NOT `language`: the vendor ignores an unknown parameter,
@@ -303,8 +308,9 @@ type sttStream struct {
 	cancel context.CancelFunc
 	events chan runtimepkg.ProviderEvent
 	rate   int
-	// model is the realtime Scribe model on the socket, named in billing
-	// because batch scribe_v2 bills at a different rate.
+	// model is the realtime Scribe model on the socket (scribe_v2_realtime or
+	// scribe_v3_live), named in billing because each Scribe model, realtime or
+	// batch, can bill at its own rate.
 	model string
 
 	writeMu      sync.Mutex

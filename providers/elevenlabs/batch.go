@@ -24,6 +24,8 @@ const (
 	BatchEndpoint = "https://api.elevenlabs.io/v1/speech-to-text"
 	// BatchModel is the batch Scribe generation paired with scribe_v2_realtime.
 	BatchModel = "scribe_v2"
+	// BatchModelV3 is the batch Scribe generation paired with scribe_v3_live.
+	BatchModelV3 = "scribe_v3"
 	// BatchMaxDurationSeconds is the documented per-file ceiling ("up to 10
 	// hours").
 	BatchMaxDurationSeconds int64 = 10 * 60 * 60
@@ -34,6 +36,32 @@ const (
 
 	batchExtensionID = "elevenlabs.io/v1/speech-to-text"
 )
+
+// realtimeBatchModels pairs each realtime Scribe model with the file model of
+// the same generation. Audio pinned to one generation is never transcribed by
+// another: v3 Live falls back to v3, and v2 Realtime keeps v2.
+var realtimeBatchModels = map[string]string{
+	"scribe_v2_realtime": BatchModel,
+	"scribe_v3_live":     BatchModelV3,
+}
+
+// BatchModelFor returns the file Scribe model of the same generation as a
+// realtime Scribe model. ok is false for any id that is not a known realtime
+// Scribe model, so a caller cannot silently swap generations.
+func BatchModelFor(realtimeModel string) (string, bool) {
+	model, ok := realtimeBatchModels[strings.TrimSpace(realtimeModel)]
+	return model, ok
+}
+
+// isRealtimeModel reports whether a model id names a realtime Scribe model,
+// which the file endpoint must never receive. The v2 generation spells it
+// `_realtime` and v3 spells it `_live`; the paired ids are checked too.
+func isRealtimeModel(model string) bool {
+	if _, paired := realtimeBatchModels[model]; paired {
+		return true
+	}
+	return strings.Contains(model, "realtime") || strings.Contains(model, "_live")
+}
 
 // BatchConfig controls local transport limits for the Scribe file adapter.
 type BatchConfig struct {
@@ -81,7 +109,7 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		return nil, fmt.Errorf("elevenlabs batch adapter cannot serve provider %q", request.Plan.Route.Provider)
 	}
 	model := strings.TrimSpace(request.Plan.Route.Model)
-	if model == "" || strings.Contains(model, "realtime") {
+	if model == "" || isRealtimeModel(model) {
 		return nil, fmt.Errorf("elevenlabs batch adapter requires a file Scribe model, got %q", model)
 	}
 	if request.AudioBytes > BatchMaxAudioBytes {
