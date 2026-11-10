@@ -114,6 +114,10 @@ func TestBytesTTSUsesPinnedHTTPShapeAndExactUnicodeInputFactsAcrossUtterances(t 
 		if len(format) != 3 || format["container"] != "raw" || format["encoding"] != "pcm_s16le" || format["sample_rate"] != float64(24000) {
 			t.Fatal("raw PCM configuration changed")
 		}
+		pending := bytesEvent(t, stream)
+		if pending.Type != protocol.EventUsageObserved || pending.Billing == nil || pending.Billing.Complete || len(pending.Billing.Quantities) != 0 {
+			t.Fatal("dispatched operation lacks initial unknown-quantity evidence")
+		}
 		started := bytesEvent(t, stream)
 		if started.Type != protocol.EventAudioStarted || started.Billing == nil || started.Billing.Complete || started.Billing.Quantities["characters"] != 5000 {
 			t.Fatal("accepted input facts missing before audio")
@@ -155,17 +159,20 @@ func TestBytesTTSRejectsUnpinnedOrIncompatibleInputsBeforeIO(t *testing.T) {
 		_ = stream.Close(context.Background())
 	}
 	for name, mutate := range map[string]func(*runtimepkg.AdapterRequest){
-		"model":         func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Model = "sonic-latest" },
-		"provider":      func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Provider = "other" },
-		"path":          func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Endpoint = "https://api.cartesia.ai/tts/sse" },
-		"host":          func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Endpoint = "https://other.invalid/tts/bytes" },
-		"query":         func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Endpoint += "?access_token=private" },
-		"transport":     func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Transport = protocol.TransportWebSocket },
-		"stereo":        func(r *runtimepkg.AdapterRequest) { r.Media.Channels = 2 },
-		"format":        func(r *runtimepkg.AdapterRequest) { r.Media.Encoding = "pcm_f32le" },
-		"rate":          func(r *runtimepkg.AdapterRequest) { r.Media.SampleRateHz = 12345 },
-		"voice":         func(r *runtimepkg.AdapterRequest) { r.Options.Voice = "" },
-		"expired":       func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Credential.ExpiresAt = time.Now().Add(-time.Second) },
+		"model":     func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Model = "sonic-latest" },
+		"provider":  func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Provider = "other" },
+		"path":      func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Endpoint = "https://api.cartesia.ai/tts/sse" },
+		"host":      func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Endpoint = "https://other.invalid/tts/bytes" },
+		"query":     func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Endpoint += "?access_token=private" },
+		"transport": func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Transport = protocol.TransportWebSocket },
+		"stereo":    func(r *runtimepkg.AdapterRequest) { r.Media.Channels = 2 },
+		"format":    func(r *runtimepkg.AdapterRequest) { r.Media.Encoding = "pcm_f32le" },
+		"rate":      func(r *runtimepkg.AdapterRequest) { r.Media.SampleRateHz = 12345 },
+		"voice":     func(r *runtimepkg.AdapterRequest) { r.Options.Voice = "" },
+		"expired": func(r *runtimepkg.AdapterRequest) {
+			r.Plan.Execution.ProviderRoute = protocol.RouteProviderDirect
+			r.Plan.Route.Credential.ExpiresAt = time.Now().Add(-time.Second)
+		},
 		"normalization": func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Model = "sonic-3.5" },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -260,7 +267,11 @@ func TestBytesTTSErrorsAndRedirectsAreBoundedAndContentFree(t *testing.T) {
 				_, _ = io.WriteString(w, strings.Repeat("private provider echo", 10000))
 			}, BytesTTSConfig{MaxErrorBytes: 64}, bytesRequest())
 			_ = stream.AppendText(context.Background(), "private input")
-			err := stream.CommitText(context.Background())
+			if err := stream.CommitText(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			_, terminal := bytesDrain(t, stream)
+			err := terminal.Err
 			var failure *runtimepkg.ProviderError
 			if !errors.As(err, &failure) || failure.ProviderStatus != status || strings.Contains(err.Error(), "private") || failure.Retryable != (status == 429 || status >= 500) {
 				t.Fatal("provider failure exposed content or changed classification")
@@ -278,7 +289,11 @@ func TestBytesTTSErrorsAndRedirectsAreBoundedAndContentFree(t *testing.T) {
 			_, _ = io.WriteString(w, "private provider echo")
 		}, BytesTTSConfig{}, bytesRequest())
 		_ = stream.AppendText(context.Background(), "private input")
-		if err := stream.CommitText(context.Background()); err == nil || strings.Contains(err.Error(), "private") {
+		if err := stream.CommitText(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		_, terminal := bytesDrain(t, stream)
+		if err := terminal.Err; err == nil || strings.Contains(err.Error(), "private") {
 			t.Fatal("unsupported response accepted or echoed")
 		}
 	}
@@ -307,11 +322,13 @@ func TestBytesTTSAbortOwnsHeaderRequestAndCloseCannotRaceAReaderAdd(t *testing.T
 	case <-time.After(2 * time.Second):
 		t.Fatal("abort deadlocked with active header request")
 	}
-	if err := <-committed; err == nil {
-		t.Fatal("aborted header request succeeded")
+	if err := <-committed; err != nil {
+		t.Fatal("commit blocked or failed before scheduling the cancelable request")
 	}
-	if _, ok := <-stream.Events(); ok {
-		t.Fatal("aborted header request published events")
+	for event := range stream.Events() {
+		if event.Type != protocol.EventUsageObserved || event.Billing == nil || event.Billing.Complete || len(event.Billing.Quantities) != 0 {
+			t.Fatal("aborted header request lost its pending operation or claimed completion")
+		}
 	}
 }
 
@@ -323,7 +340,11 @@ func TestBytesTTSHeaderDeadlineAndCancelBoundIO(t *testing.T) {
 			<-r.Context().Done()
 		}, BytesTTSConfig{HeaderTimeout: 20 * time.Millisecond}, bytesRequest())
 		_ = stream.AppendText(context.Background(), "synthetic request")
-		err := stream.CommitText(context.Background())
+		if err := stream.CommitText(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		_, terminal := bytesDrain(t, stream)
+		err := terminal.Err
 		var failure *runtimepkg.ProviderError
 		if !errors.As(err, &failure) || failure.Code != "request_timeout" {
 			t.Fatal("stalled response headers had no bounded failure")
@@ -340,6 +361,9 @@ func TestBytesTTSHeaderDeadlineAndCancelBoundIO(t *testing.T) {
 		_ = stream.AppendText(context.Background(), "synthetic request")
 		if err := stream.CommitText(context.Background()); err != nil {
 			t.Fatal(err)
+		}
+		if pending := bytesEvent(t, stream); pending.Type != protocol.EventUsageObserved {
+			t.Fatal("missing dispatched-operation snapshot")
 		}
 		if first := bytesEvent(t, stream); first.Type != protocol.EventAudioStarted {
 			t.Fatal("audio did not start")

@@ -41,6 +41,7 @@ type BytesTTSConfig struct {
 	MaxErrorBytes            int64
 	GracefulCloseIdleTimeout time.Duration
 	HeaderTimeout            time.Duration
+	ResponseIdleTimeout      time.Duration
 	AllowedEndpointHosts     []string
 	AllowInsecureEndpoint    bool
 }
@@ -48,6 +49,7 @@ type BytesTTSConfig struct {
 type BytesTTSAdapter struct {
 	config         BytesTTSConfig
 	endpointPolicy upstream.HTTPPolicy
+	now            func() time.Time
 }
 
 // NewBytesTTS builds the bounded raw PCM adapter for POST /tts/bytes.
@@ -74,7 +76,10 @@ func NewBytesTTS(config BytesTTSConfig) (*BytesTTSAdapter, error) {
 	if config.HeaderTimeout == 0 {
 		config.HeaderTimeout = 10 * time.Second
 	}
-	if config.EventBuffer < 1 || config.EventBuffer > 256 || config.AudioChunkBytes < 1 || config.AudioChunkBytes > 64<<10 || config.MaxInputBytes < 1 || config.MaxInputBytes > 1<<20 || config.MaxResponseBytes < 1 || config.MaxResponseBytes > 64<<20 || config.MaxErrorBytes < 1 || config.MaxErrorBytes > 1<<20 || config.GracefulCloseIdleTimeout < 0 || config.GracefulCloseIdleTimeout > time.Minute || config.HeaderTimeout < 0 || config.HeaderTimeout > time.Minute {
+	if config.ResponseIdleTimeout == 0 {
+		config.ResponseIdleTimeout = 30 * time.Second
+	}
+	if config.EventBuffer < 1 || config.EventBuffer > 256 || config.AudioChunkBytes < 1 || config.AudioChunkBytes > 64<<10 || config.MaxInputBytes < 1 || config.MaxInputBytes > 1<<20 || config.MaxResponseBytes < 1 || config.MaxResponseBytes > 64<<20 || config.MaxErrorBytes < 1 || config.MaxErrorBytes > 1<<20 || config.GracefulCloseIdleTimeout < 0 || config.GracefulCloseIdleTimeout > time.Minute || config.HeaderTimeout < 0 || config.HeaderTimeout > time.Minute || config.ResponseIdleTimeout < 0 || config.ResponseIdleTimeout > time.Minute {
 		return nil, errors.New("cartesia bytes tts: invalid transport bounds")
 	}
 	policy, err := upstream.NewHTTPPolicy(officialAPIHost, config.AllowedEndpointHosts, config.AllowInsecureEndpoint)
@@ -82,7 +87,7 @@ func NewBytesTTS(config BytesTTSConfig) (*BytesTTSAdapter, error) {
 		return nil, err
 	}
 	config.AllowedEndpointHosts = nil
-	return &BytesTTSAdapter{config: config, endpointPolicy: policy}, nil
+	return &BytesTTSAdapter{config: config, endpointPolicy: policy, now: time.Now}, nil
 }
 
 func (a *BytesTTSAdapter) ID() string { return BytesTTSAdapterID }
@@ -113,7 +118,8 @@ func (a *BytesTTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequ
 		return nil, errors.New("cartesia bytes tts: invalid request options")
 	}
 	credential := request.Plan.Route.Credential
-	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" || !credential.ExpiresAt.IsZero() && !time.Now().Before(credential.ExpiresAt) {
+	permanent := request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK || request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay
+	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" || !permanent && !credential.ExpiresAt.IsZero() && !a.now().Before(credential.ExpiresAt) && request.RefreshCredential == nil {
 		return nil, errors.New("cartesia bytes tts: missing or expired credential")
 	}
 	endpoint, err := a.endpointPolicy.Parse(request.Plan.Route.Endpoint)
@@ -132,46 +138,54 @@ func (a *BytesTTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequ
 		httpClient: &copied, endpoint: endpoint.String(), credential: credential.Value, credentialExpiresAt: credential.ExpiresAt,
 		audioChunkBytes: a.config.AudioChunkBytes, maxResponseBytes: a.config.MaxResponseBytes, maxErrorBytes: a.config.MaxErrorBytes,
 		gracefulCloseIdleTimeout: a.config.GracefulCloseIdleTimeout, headerTimeout: a.config.HeaderTimeout,
+		responseIdleTimeout: a.config.ResponseIdleTimeout, now: a.now, permanentCredential: permanent,
+		refreshCredential: request.RefreshCredential, providerRoute: request.Plan.Execution.ProviderRoute,
 		model: model, voice: request.Options.Voice, language: request.Options.Language, normalization: normalization,
 		sampleRateHz: rate, maximumInputBytes: a.config.MaxInputBytes, maximumCharacters: request.Options.MaxInputCharacters,
 	}, nil
 }
 
+// Each operation retains its cancellation handle until its terminal event is
+// published. Cancel signals it before taking stateMu, so a backpressured final
+// send can keep publication and idle-state changes atomic without blocking cancel.
+type bytesTTSOperation struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+	canceled   atomic.Bool
+	userCancel chan struct{}
+	known      atomic.Bool
+	id         string
+	characters int64
+}
+
 type bytesTTSStream struct {
-	ctx              context.Context
-	cancel           context.CancelFunc
-	events           chan runtimepkg.ProviderEvent
-	responseProgress chan struct{}
-
-	httpClient               *http.Client
-	endpoint                 string
-	credential               string
-	audioChunkBytes          int
-	maxResponseBytes         int64
-	maxErrorBytes            int64
-	gracefulCloseIdleTimeout time.Duration
-	headerTimeout            time.Duration
-	model                    string
-	voice                    string
-	language                 string
-	normalization            string
-	sampleRateHz             int
-	maximumInputBytes        int
-	maximumCharacters        int64
-	credentialExpiresAt      time.Time
-
-	readers           sync.WaitGroup
-	closeOnce         sync.Once
-	closeErr          error
-	stateMu           sync.Mutex
-	closed            bool
-	pending           strings.Builder
-	pendingCharacters int64
-	inFlight          bool
-	requestCancel     context.CancelFunc
-	requestDone       chan struct{}
-	canceled          bool
-	billingSequence   atomic.Uint64
+	ctx                                                          context.Context
+	cancel                                                       context.CancelFunc
+	events                                                       chan runtimepkg.ProviderEvent
+	responseProgress                                             chan struct{}
+	httpClient                                                   *http.Client
+	endpoint, credential, model, voice, language, normalization  string
+	credentialExpiresAt                                          time.Time
+	permanentCredential                                          bool
+	refreshCredential                                            runtimepkg.CredentialRefresher
+	providerRoute                                                protocol.ProviderRoute
+	now                                                          func() time.Time
+	audioChunkBytes, maximumInputBytes, sampleRateHz             int
+	maximumCharacters                                            int64
+	maxResponseBytes, maxErrorBytes                              int64
+	gracefulCloseIdleTimeout, headerTimeout, responseIdleTimeout time.Duration
+	stateMu                                                      sync.Mutex
+	pending                                                      strings.Builder
+	pendingCharacters                                            int64
+	active                                                       atomic.Pointer[bytesTTSOperation]
+	closing                                                      atomic.Bool
+	readers                                                      sync.WaitGroup
+	closeOnce                                                    sync.Once
+	closeErr                                                     error
+	errorMu                                                      sync.Mutex
+	terminalErr                                                  error
+	billingSequence                                              atomic.Uint64
 }
 
 func (s *bytesTTSStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -181,41 +195,46 @@ func (s *bytesTTSStream) WriteAudio(context.Context, []byte) error {
 func (s *bytesTTSStream) CommitAudio(context.Context) error {
 	return runtimepkg.ErrUnsupportedOperation
 }
-
-// AppendText preserves the exact bounded UTF-8 input. One commit is one POST;
-// fragments are never independently synthesized or silently truncated.
-func (s *bytesTTSStream) AppendText(_ context.Context, text string) error {
-	if text == "" {
-		return errors.New("cartesia bytes tts text must be nonempty UTF-8")
+func (s *bytesTTSStream) TerminalError() error {
+	s.errorMu.Lock()
+	defer s.errorMu.Unlock()
+	return s.terminalErr
+}
+func (s *bytesTTSStream) terminal(err error) {
+	s.errorMu.Lock()
+	if s.terminalErr == nil {
+		s.terminalErr = err
 	}
+	s.errorMu.Unlock()
+}
+
+func (s *bytesTTSStream) AppendText(_ context.Context, text string) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if s.closed {
+	if s.closing.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
-	if s.inFlight {
+	if s.active.Load() != nil {
 		return errors.New("cartesia bytes tts previous utterance has not completed")
 	}
 	if len(text) > s.maximumInputBytes-s.pending.Len() {
-		return &runtimepkg.ProviderError{Code: "input_too_large", Message: "Cartesia bytes TTS input exceeds the configured bound", ProviderStatus: http.StatusRequestEntityTooLarge}
+		return bytesInputTooLarge()
 	}
-	if !utf8.ValidString(text) {
+	if text == "" || !utf8.ValidString(text) {
 		return errors.New("cartesia bytes tts text must be nonempty UTF-8")
 	}
 	characters := s.pendingCharacters + int64(utf8.RuneCountInString(text))
 	if s.maximumCharacters > 0 && characters > s.maximumCharacters {
-		return &runtimepkg.ProviderError{
-			Code: "input_too_large", Message: "Cartesia bytes TTS input exceeds the configured bound",
-			Retryable: false, ProviderStatus: http.StatusRequestEntityTooLarge,
-		}
+		return bytesInputTooLarge()
 	}
 	s.pending.WriteString(text)
 	s.pendingCharacters = characters
 	return nil
 }
+func bytesInputTooLarge() error {
+	return &runtimepkg.ProviderError{Code: "input_too_large", Message: "Cartesia bytes TTS input exceeds the configured bound", ProviderStatus: http.StatusRequestEntityTooLarge}
+}
 
-// Only the typed provider request reaches Cartesia. Native work credentials,
-// cell-control tokens and private input-binding markers are not generation fields.
 type bytesSpeechRequest struct {
 	Model         string       `json:"model_id"`
 	Voice         string       `json:"voice"`
@@ -225,212 +244,237 @@ type bytesSpeechRequest struct {
 	OutputFormat  outputFormat `json:"output_format"`
 }
 
-// CommitText performs the synthesis request. It returns once the status line
-// is known, so a rejection surfaces synchronously; audio then streams on
-// Events until audio.done.
+// CommitText only schedules the owned operation. The runtime's serialized input
+// dispatcher must remain free to process response.cancel while HTTP waits.
 func (s *bytesTTSStream) CommitText(ctx context.Context) error {
-	text, requestCtx, requestCancel, done, err := s.beginRequest()
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// Cancel a stalled header request when CommitText's caller cancels. Stop
-	// the hook when this call returns so its scope does not own the audio body.
-	stopCallerCancel := context.AfterFunc(ctx, requestCancel)
-	defer stopCallerCancel()
-	operationID := fmt.Sprintf("synthesis-%d", s.billingSequence.Add(1))
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.closing.Load() {
+		return runtimepkg.ErrSessionClosed
+	}
+	if s.active.Load() != nil {
+		return errors.New("cartesia bytes tts previous utterance has not completed")
+	}
+	text := s.pending.String()
+	if strings.TrimSpace(text) == "" {
+		return errors.New("cartesia bytes tts has no buffered text to synthesize")
+	}
 	payload, err := json.Marshal(bytesSpeechRequest{Model: s.model, Voice: s.voice, Input: text, Language: s.language, Normalization: s.normalization, OutputFormat: outputFormat{Container: "raw", Encoding: "pcm_s16le", SampleRate: s.sampleRateHz}})
 	if err != nil {
-		s.abandonRequest(requestCancel, done)
-		return err
+		return errors.New("cartesia bytes tts could not prepare input")
 	}
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, s.endpoint, bytes.NewReader(payload))
+	work, cancel := context.WithCancel(s.ctx)
+	op := &bytesTTSOperation{ctx: work, cancel: cancel, done: make(chan struct{}), userCancel: make(chan struct{}), id: fmt.Sprintf("synthesis-%d", s.billingSequence.Add(1)), characters: s.pendingCharacters}
+	s.pending.Reset()
+	s.pendingCharacters = 0
+	s.active.Store(op)
+	s.readers.Add(1)
+	go s.perform(op, payload)
+	return nil
+}
+
+func (s *bytesTTSStream) release(op *bytesTTSOperation) {
+	s.stateMu.Lock()
+	s.active.CompareAndSwap(op, nil)
+	s.stateMu.Unlock()
+}
+func (s *bytesTTSStream) progress() {
+	select {
+	case s.responseProgress <- struct{}{}:
+	default:
+	}
+}
+func (s *bytesTTSStream) emit(ctx context.Context, event runtimepkg.ProviderEvent) bool {
+	select {
+	case s.events <- event:
+		s.progress()
+		return true
+	case <-ctx.Done():
+		return false
+	case <-s.ctx.Done():
+		return false
+	}
+}
+func (s *bytesTTSStream) finish(op *bytesTTSOperation, event runtimepkg.ProviderEvent) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.active.Load() != op {
+		return
+	}
+	// The receiver may immediately call AppendText after audio.done. It waits
+	// for stateMu until the send and release have both committed. Cancel can
+	// still interrupt this send through the atomically visible operation.
+	select {
+	case s.events <- event:
+		s.progress()
+	case <-op.ctx.Done():
+	case <-s.ctx.Done():
+	}
+	s.active.CompareAndSwap(op, nil)
+}
+func (s *bytesTTSStream) failed(op *bytesTTSOperation, err error) {
+	if op.canceled.Load() || s.ctx.Err() != nil {
+		return
+	}
+	s.closing.Store(true)
+	s.terminal(err)
+	// An internal timeout canceled op.ctx to interrupt I/O. Its failure still
+	// reaches the event consumer; user cancellation remains silent here.
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.active.Load() != op || op.canceled.Load() {
+		return
+	}
+	select {
+	case s.events <- runtimepkg.ProviderEvent{Billing: s.observation(op, op.known.Load(), false), Err: err}:
+		s.progress()
+	case <-s.ctx.Done():
+	case <-op.userCancel:
+		// TerminalError independently survives a saturated or canceled queue.
+	}
+	s.active.CompareAndSwap(op, nil)
+}
+
+func (s *bytesTTSStream) credentialFor(ctx context.Context) (string, error) {
+	if s.permanentCredential || s.credentialExpiresAt.IsZero() || s.now().Before(s.credentialExpiresAt) {
+		return s.credential, nil
+	}
+	if s.refreshCredential == nil {
+		return "", &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS credential cannot be renewed", Retryable: true}
+	}
+	credential, err := s.refreshCredential(ctx)
+	if err != nil || !acceptableCredentialKind(s.providerRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" || credential.ExpiresAt.IsZero() || !s.now().Before(credential.ExpiresAt) {
+		return "", &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS credential renewal failed", Retryable: true}
+	}
+	s.credential, s.credentialExpiresAt = credential.Value, credential.ExpiresAt
+	return s.credential, nil
+}
+func bytesFailure(message string) *runtimepkg.ProviderError {
+	return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: message, Retryable: true}
+}
+
+// Initial evidence has no measured quantity: preparing an input is not proof
+// that its bytes reached the provider. It nevertheless represents every POST
+// that may have been dispatched, even if headers, audio or cancellation follow.
+func (s *bytesTTSStream) observation(op *bytesTTSOperation, known, complete bool) *protocol.BillingObservation {
+	quantities := map[string]int64{}
+	if known {
+		quantities["characters"] = op.characters * 1000
+	}
+	return &protocol.BillingObservation{OperationID: op.id, Model: s.model, Mode: "streaming", Quantities: quantities, Complete: complete}
+}
+func (s *bytesTTSStream) perform(op *bytesTTSOperation, payload []byte) {
+	defer func() { op.cancel(); s.release(op); close(op.done); s.readers.Done() }()
+	// Credential renewal is bounded and cancelable, but creates no provider
+	// operation when it fails before dispatch.
+	credentialCtx, cancelCredential := context.WithTimeout(op.ctx, s.headerTimeout)
+	credential, err := s.credentialFor(credentialCtx)
+	cancelCredential()
 	if err != nil {
-		s.abandonRequest(requestCancel, done)
-		return err
+		s.failed(op, err)
+		return
 	}
-	request.Header.Set("Authorization", "Bearer "+s.credential)
+	request, err := http.NewRequestWithContext(op.ctx, http.MethodPost, s.endpoint, bytes.NewReader(payload))
+	if err != nil {
+		s.failed(op, bytesFailure("Cartesia bytes TTS request could not be prepared"))
+		return
+	}
+	request.Header.Set("Authorization", "Bearer "+credential)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Cartesia-Version", BytesTTSAPIVersion)
 	request.Header.Set("Accept", "audio/pcm, application/octet-stream")
 	request.Header.Set("Accept-Encoding", "identity")
-	// The runtime holds its provider lock across CommitText, so a vendor that
-	// accepts the connection but never answers would wedge the session.
-	var headerTimedOut atomic.Bool
-	headerTimer := time.AfterFunc(s.headerTimeout, func() {
-		headerTimedOut.Store(true)
-		requestCancel()
-	})
-	response, err := s.httpClient.Do(request)
-	// Stop reporting false means the callback ran or is running, so the
-	// request context is cancelled even if headers arrived: that context also
-	// carries the audio body, so the response cannot be used.
-	if !headerTimer.Stop() {
-		headerTimedOut.Store(true)
-		if err == nil {
-			_ = response.Body.Close()
-			err = context.Canceled
-		}
+	if !s.emit(op.ctx, runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.observation(op, false, false)}) {
+		return
 	}
-	if err != nil {
-		s.abandonRequest(requestCancel, done)
-		if headerTimedOut.Load() {
-			return &runtimepkg.ProviderError{Code: "request_timeout", Message: fmt.Sprintf("Cartesia bytes TTS sent no response headers within %s", s.headerTimeout), Retryable: true, Cause: err}
+	var timedOut atomic.Bool
+	headerTimer := time.AfterFunc(s.headerTimeout, func() { timedOut.Store(true); op.cancel() })
+	response, err := s.httpClient.Do(request)
+	if !headerTimer.Stop() {
+		timedOut.Store(true)
+		op.cancel()
+	}
+	if response != nil {
+		defer response.Body.Close()
+	}
+	if err != nil || timedOut.Load() {
+		failure := bytesFailure("Cartesia bytes TTS request could not be sent")
+		if timedOut.Load() {
+			failure.Code = "request_timeout"
+			failure.Message = "Cartesia bytes TTS response headers timed out"
 		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS request could not be sent", Retryable: true, Cause: err}
+		s.failed(op, failure)
+		return
 	}
 	if response.StatusCode != http.StatusOK {
-		// The header timer has stopped, and the runtime still holds its
-		// provider lock here, so the error body gets its own bound. A body
-		// cut off by it still classifies from the status.
-		bodyTimer := time.AfterFunc(s.headerTimeout, requestCancel)
-		providerErr := s.statusError(response)
-		bodyTimer.Stop()
-		_ = response.Body.Close()
-		s.abandonRequest(requestCancel, done)
-		return providerErr
+		errorTimer := time.AfterFunc(s.headerTimeout, op.cancel)
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, s.maxErrorBytes))
+		errorTimer.Stop()
+		code := "provider_unavailable"
+		if response.StatusCode == 401 || response.StatusCode == 403 {
+			code = "authentication_failed"
+		}
+		if response.StatusCode == 429 {
+			code = "rate_limited"
+		}
+		s.failed(op, &runtimepkg.ProviderError{Code: code, Message: "Cartesia bytes TTS rejected the synthesis request", ProviderStatus: response.StatusCode, Retryable: response.StatusCode == 429 || response.StatusCode >= 500})
+		return
 	}
 	mediaType, _, typeErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	encoding := strings.TrimSpace(response.Header.Get("Content-Encoding"))
 	if len(response.Header.Values("Content-Type")) != 1 || len(response.Header.Values("Content-Encoding")) > 1 || typeErr != nil || mediaType != "audio/pcm" && mediaType != "application/octet-stream" || response.Uncompressed || encoding != "" && !strings.EqualFold(encoding, "identity") {
-		_ = response.Body.Close()
-		s.abandonRequest(requestCancel, done)
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS returned an unexpected success content type", Retryable: true, ProviderStatus: response.StatusCode}
-	}
-	go s.readResponse(requestCtx, response, requestCancel, done, operationID, int64(utf8.RuneCountInString(text)))
-	return nil
-}
-
-func (s *bytesTTSStream) statusError(response *http.Response) error {
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, s.maxErrorBytes))
-	code := "provider_unavailable"
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		code = "authentication_failed"
-	}
-	if response.StatusCode == http.StatusTooManyRequests {
-		code = "rate_limited"
-	}
-	return &runtimepkg.ProviderError{Code: code, Message: "Cartesia bytes TTS rejected the synthesis request", ProviderStatus: response.StatusCode, Retryable: response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500}
-}
-
-func (s *bytesTTSStream) beginRequest() (string, context.Context, context.CancelFunc, chan struct{}, error) {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	if s.closed {
-		return "", nil, nil, nil, runtimepkg.ErrSessionClosed
-	}
-	if !s.credentialExpiresAt.IsZero() && !time.Now().Before(s.credentialExpiresAt) {
-		return "", nil, nil, nil, errors.New("cartesia bytes tts credential expired")
-	}
-	if s.inFlight {
-		return "", nil, nil, nil, errors.New("cartesia bytes tts previous utterance has not completed")
-	}
-	text := s.pending.String()
-	if strings.TrimSpace(text) == "" {
-		return "", nil, nil, nil, errors.New("cartesia bytes tts has no buffered text to synthesize")
-	}
-	requestCtx, requestCancel := context.WithCancel(s.ctx)
-	done := make(chan struct{})
-	s.pending.Reset()
-	s.pendingCharacters = 0
-	s.inFlight = true
-	s.requestCancel = requestCancel
-	s.requestDone = done
-	s.canceled = false
-	// Count the header request as well as its reader. Close may race CommitText;
-	// the state mutex prevents a new Add after shutdown starts waiting.
-	s.readers.Add(1)
-	return text, requestCtx, requestCancel, done, nil
-}
-
-func (s *bytesTTSStream) abandonRequest(cancel context.CancelFunc, done chan struct{}) {
-	cancel()
-	s.releaseRequest(done)
-	close(done)
-	s.readers.Done()
-}
-
-// releaseRequest frees the in-flight slot of the request that owns done. It
-// is idempotent and leaves a newer request alone, so the reader can release
-// its slot before publishing audio.done and still run its deferred cleanup
-// after the caller has started the next utterance.
-func (s *bytesTTSStream) releaseRequest(done chan struct{}) {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	if s.requestDone != done {
+		s.failed(op, bytesFailure("Cartesia bytes TTS returned unsupported audio metadata"))
 		return
 	}
-	s.inFlight = false
-	s.requestCancel = nil
-	s.requestDone = nil
+	s.readResponse(op, response)
 }
-
-func (s *bytesTTSStream) wasCanceled() bool {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	return s.canceled
-}
-
-// This is the exact original input character count, not inferred provider
-// credits: Cartesia's preprocessing can change its credit total. Consumers must
-// use an explicitly reviewed character-priced profile or retain unknown cost.
-// Neither audio bytes nor an SDK-local operation ID is a provider request ID.
-func (s *bytesTTSStream) billing(operationID string, characters int64, complete bool) *protocol.BillingObservation {
-	return &protocol.BillingObservation{
-		OperationID: operationID, Model: s.model, Mode: "streaming", Complete: complete,
-		Quantities: map[string]int64{"characters": characters * 1000},
-	}
-}
-
-// readResponse slices the streamed PCM into audio frames as it arrives. Frames
-// carry whole samples: an odd byte left by a chunk boundary waits for the next
-// read.
-func (s *bytesTTSStream) readResponse(requestCtx context.Context, response *http.Response, requestCancel context.CancelFunc, done chan struct{}, operationID string, inputCharacters int64) {
-	defer func() {
-		requestCancel()
-		_ = response.Body.Close()
-		s.releaseRequest(done)
-		close(done)
-		s.readers.Done()
-	}()
-	// finish publishes the request's last event. The slot is released first:
-	// a caller that reacts to audio.done by starting the next utterance must
-	// not find this one still in flight.
-	finish := func(event runtimepkg.ProviderEvent) {
-		s.releaseRequest(done)
-		s.emit(requestCtx, event)
-	}
+func (s *bytesTTSStream) readResponse(op *bytesTTSOperation, response *http.Response) {
 	data := marshalData(map[string]any{"sample_rate_hz": s.sampleRateHz})
 	reader := &io.LimitedReader{R: response.Body, N: s.maxResponseBytes + 1}
 	buffer := make([]byte, s.audioChunkBytes)
 	var carry []byte
-	started := false
 	var total int64
+	started := false
 	for {
+		var timedOut atomic.Bool
+		timer := time.AfterFunc(s.responseIdleTimeout, func() { timedOut.Store(true); op.cancel() })
 		count, err := reader.Read(buffer)
+		if !timer.Stop() {
+			timedOut.Store(true)
+			op.cancel()
+		}
+		if op.canceled.Load() || s.ctx.Err() != nil {
+			return
+		}
+		if timedOut.Load() {
+			s.failed(op, bytesFailure("Cartesia bytes TTS audio response stalled"))
+			return
+		}
 		if count > 0 {
-			s.reportResponseProgress()
+			s.progress()
 			total += int64(count)
 			if total > s.maxResponseBytes {
-				finish(runtimepkg.ProviderEvent{Billing: s.billing(operationID, inputCharacters, false), Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS response exceeded the configured limit", Retryable: true}})
+				s.failed(op, bytesFailure("Cartesia bytes TTS response exceeded the configured limit"))
 				return
 			}
 			audio := append(carry, buffer[:count]...)
 			carry = nil
-			if len(audio)%2 == 1 {
+			if len(audio)%2 != 0 {
 				carry = []byte{audio[len(audio)-1]}
 				audio = audio[:len(audio)-1]
 			}
 			if len(audio) > 0 {
 				if !started {
 					started = true
-					if !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: data, Billing: s.billing(operationID, inputCharacters, false)}) {
+					op.known.Store(true)
+					if !s.emit(op.ctx, runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: data, Billing: s.observation(op, true, false)}) {
 						return
 					}
 				}
-				if !s.emit(requestCtx, runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: data, Audio: audio}) {
+				if !s.emit(op.ctx, runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: data, Audio: audio}) {
 					return
 				}
 			}
@@ -438,115 +482,90 @@ func (s *bytesTTSStream) readResponse(requestCtx context.Context, response *http
 		if err == nil {
 			continue
 		}
-		if s.wasCanceled() || s.ctx.Err() != nil {
-			return
-		}
 		if !errors.Is(err, io.EOF) {
-			// A failure after the status line cuts the chunked body with no
-			// trailer, so a torn read is a failed synthesis, never a short
-			// utterance.
-			finish(runtimepkg.ProviderEvent{Billing: s.billing(operationID, inputCharacters, false), Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS audio stream ended unexpectedly", Retryable: true}})
+			s.failed(op, bytesFailure("Cartesia bytes TTS audio response ended unexpectedly"))
 			return
 		}
-		if !started {
-			finish(runtimepkg.ProviderEvent{Billing: s.billing(operationID, inputCharacters, false), Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS completed without returning audio", Retryable: true}})
+		if !started || len(carry) > 0 {
+			s.failed(op, bytesFailure("Cartesia bytes TTS returned incomplete PCM audio"))
 			return
 		}
-		// A body that ends on an odd byte has lost half a sample: the audio
-		// is broken, not complete, whatever came before it.
-		if len(carry) > 0 {
-			finish(runtimepkg.ProviderEvent{Billing: s.billing(operationID, inputCharacters, false), Err: &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS audio ended mid-sample", Retryable: true}})
-			return
-		}
-		finish(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: data, Billing: s.billing(operationID, inputCharacters, true)})
+		s.finish(op, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: data, Billing: s.observation(op, true, true)})
 		return
 	}
 }
 
-func (s *bytesTTSStream) reportResponseProgress() {
-	select {
-	case s.responseProgress <- struct{}{}:
-	default:
+func (op *bytesTTSOperation) stop() {
+	if op.canceled.CompareAndSwap(false, true) {
+		close(op.userCancel)
 	}
+	op.cancel()
 }
 
-// emit does not let Close interrupt a blocked send: a runtime still draining
-// events must receive every frame and audio.done. The graceful-close idle
-// timer cancels s.ctx if the consumer is abandoned; Cancel interrupts just
-// this request through requestCtx.
-func (s *bytesTTSStream) emit(requestCtx context.Context, event runtimepkg.ProviderEvent) bool {
-	select {
-	case s.events <- event:
-		s.reportResponseProgress()
-		return true
-	case <-requestCtx.Done():
-		return false
-	case <-s.ctx.Done():
-		return false
-	}
-}
-
-// Cancel discards buffered text and aborts an in-flight synthesis. HTTP has no
-// cancel message; dropping the request is the only way to stop generation.
 func (s *bytesTTSStream) Cancel(ctx context.Context) error {
+	// Signal before taking stateMu: a blocked terminal publication holds it.
+	op := s.active.Load()
+	if op != nil {
+		op.stop()
+	}
 	s.stateMu.Lock()
+	current := s.active.Load()
+	if current != nil && current != op {
+		current.stop()
+		op = current
+	}
 	s.pending.Reset()
 	s.pendingCharacters = 0
-	closed := s.closed
-	cancel, done := s.requestCancel, s.requestDone
-	if cancel != nil {
-		s.canceled = true
-	}
+	closed := s.closing.Load()
 	s.stateMu.Unlock()
-	if cancel == nil {
-		if closed {
-			return runtimepkg.ErrSessionClosed
+	if op != nil {
+		select {
+		case <-op.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.ctx.Done():
+			return nil
 		}
-		return nil
 	}
-	cancel()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
+	if closed {
+		return runtimepkg.ErrSessionClosed
+	}
+	if !s.emit(ctx, runtimepkg.ProviderEvent{Type: protocol.EventResponseCanceled}) {
 		return ctx.Err()
-	case <-s.ctx.Done():
-		return nil
 	}
+	return nil
 }
-
-// Close lets every reader finish so its audio and audio.done are delivered,
-// then releases the stream. It waits on the readers rather than the in-flight
-// slot, which a reader frees just before its last event.
 func (s *bytesTTSStream) Close(ctx context.Context) error { return s.shutdown(ctx, true) }
-
-// Abort tears the stream down immediately after a terminal runtime failure.
-func (s *bytesTTSStream) Abort(context.Context) error { return s.shutdown(context.Background(), false) }
-
+func (s *bytesTTSStream) Abort(context.Context) error     { return s.shutdown(context.Background(), false) }
 func (s *bytesTTSStream) shutdown(ctx context.Context, graceful bool) error {
 	s.closeOnce.Do(func() {
-		s.stateMu.Lock()
-		s.closed = true
-		s.pending.Reset()
-		s.pendingCharacters = 0
-		s.stateMu.Unlock()
-		// beginRequest counts header I/O under stateMu before releasing it.
-		// Once closed is set, no new request can join this wait group.
-		idle := make(chan struct{})
+		s.closing.Store(true)
+		stopped := make(chan struct{})
 		go func() {
+			// This barrier waits for a concurrent CommitText to finish Add.
+			// The close watchdog already runs if terminal publication holds it.
+			s.stateMu.Lock()
+			s.pending.Reset()
+			s.pendingCharacters = 0
+			s.stateMu.Unlock()
 			s.readers.Wait()
-			close(idle)
+			close(stopped)
 		}()
 		if graceful {
-			s.closeErr = s.waitForRequest(ctx, idle)
+			s.closeErr = s.waitForRequest(ctx, stopped)
+			if s.closeErr != nil {
+				s.terminal(s.closeErr)
+			}
 		}
 		s.cancel()
-		<-idle
+		<-stopped
+		if s.closeErr == nil {
+			s.closeErr = s.TerminalError()
+		}
 		close(s.events)
 	})
 	return s.closeErr
 }
-
 func (s *bytesTTSStream) waitForRequest(ctx context.Context, done <-chan struct{}) error {
 	timer := time.NewTimer(s.gracefulCloseIdleTimeout)
 	defer timer.Stop()
@@ -570,7 +589,7 @@ func (s *bytesTTSStream) waitForRequest(ctx context.Context, done <-chan struct{
 				return nil
 			default:
 			}
-			return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS response stalled during graceful close", Retryable: true, Cause: context.DeadlineExceeded}
+			return bytesFailure("Cartesia bytes TTS response stalled during graceful close")
 		}
 	}
 }
