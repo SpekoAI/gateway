@@ -337,6 +337,9 @@ func TestElevenLabsSupportRowMatchesTheAdaptersModelTable(t *testing.T) {
 	if !ok {
 		t.Fatal("no elevenlabs stt catalog row")
 	}
+	if !entry.ServesModel(elevenlabs.ModelScribeV2Realtime) || !entry.ServesModel(elevenlabs.ModelScribeV3Live) {
+		t.Fatalf("elevenlabs stt row serves %v, want both realtime Scribe models", entry.Models)
+	}
 	support := sttOptionSupport["elevenlabs"]
 	for _, model := range entry.Models {
 		gated, diarizes := elevenlabs.ScribeRealtimeCapabilities(model)
