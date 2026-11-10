@@ -42,6 +42,8 @@ with the protocol's thousandths representation and `streaming` output mode.
 Every potentially dispatched POST first emits an incomplete operation with an
 unknown quantity. Header failures and pre-audio cancellation therefore cannot
 hide behind a previous completed utterance or become a measured zero.
+Credential renewal or request preparation failures before that dispatch boundary
+report an error without creating a provider billing operation.
 They do not infer credits, provider cost, audible delivery or a provider request
 ID. Cartesia's [pricing documentation](https://docs.cartesia.ai/pricing) says
 transcript preprocessing can vary its final credit total. A consumer must use

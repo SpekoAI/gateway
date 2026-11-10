@@ -340,6 +340,103 @@ func TestBytesTTSAllPotentiallyDispatchedPostsRemainInBillingAfterHeaderCancella
 	}
 }
 
+func TestBytesTTSFailedRenewalDoesNotInventAnotherProviderOperation(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"failed", "invalid", "missing", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			var calls atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "audio/pcm")
+				_, _ = w.Write([]byte{1, 2})
+			}))
+			defer server.Close()
+			adapter, err := NewBytesTTS(BytesTTSConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true, HeaderTimeout: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := time.Now()
+			var current atomic.Int64
+			current.Store(base.UnixNano())
+			adapter.now = func() time.Time { return time.Unix(0, current.Load()) }
+			request := bytesRequest()
+			request.Plan.Execution.ProviderRoute = protocol.RouteProviderDirect
+			request.Plan.Route.Endpoint = server.URL + bytesTTSPath
+			request.Plan.Route.Credential.ExpiresAt = base.Add(time.Second)
+			request.Plan.Reservation.LeaseExpiresAt = base.Add(time.Minute)
+			if mode != "missing" {
+				request.RefreshCredential = func(ctx context.Context) (protocol.DelegatedCredential, error) {
+					if mode == "failed" {
+						return protocol.DelegatedCredential{}, errors.New("private renewal response")
+					}
+					if mode == "deadline" {
+						<-ctx.Done()
+						return protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "late-token", ExpiresAt: base.Add(time.Minute)}, nil
+					}
+					return protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "", ExpiresAt: base.Add(time.Minute)}, nil
+				}
+			}
+			stream, err := adapter.Open(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+			observations := map[string]protocol.BillingObservation{}
+			for index := range 2 {
+				if index == 1 {
+					current.Store(base.Add(2 * time.Second).UnixNano())
+					if mode == "deadline" {
+						stream.(*bytesTTSStream).headerTimeout = 20 * time.Millisecond
+					}
+				}
+				if err := stream.AppendText(context.Background(), "utterance"); err != nil {
+					t.Fatal(err)
+				}
+				if err := stream.CommitText(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				for {
+					event := bytesEvent(t, stream)
+					if event.Billing != nil {
+						if index == 1 {
+							t.Fatal("failed renewal invented a provider operation")
+						}
+						merged, err := protocol.MergeBillingObservation(observations[event.Billing.OperationID], *event.Billing)
+						if err != nil {
+							t.Fatal(err)
+						}
+						observations[event.Billing.OperationID] = merged
+					}
+					if event.Err != nil {
+						if index != 1 {
+							t.Fatal(event.Err)
+						}
+						var failure *runtimepkg.ProviderError
+						if !errors.As(event.Err, &failure) || !failure.Retryable {
+							t.Fatal("renewal failure was not reported")
+						}
+						break
+					}
+					if event.Type == protocol.EventAudioDone {
+						if index != 0 {
+							t.Fatal("undispatched request completed")
+						}
+						break
+					}
+				}
+			}
+			if calls.Load() != 1 || len(observations) != 1 {
+				t.Fatal("renewal failure changed dispatched operation identity")
+			}
+			for _, observation := range observations {
+				if !observation.Complete {
+					t.Fatal("renewal failure erased complete prior evidence")
+				}
+			}
+		})
+	}
+}
+
 func TestBytesTTSCancelRetainsOwnershipOfBackpressuredTerminalPublication(t *testing.T) {
 	t.Parallel()
 	stream := openBytes(t, func(w http.ResponseWriter, _ *http.Request) {

@@ -155,6 +155,7 @@ type bytesTTSOperation struct {
 	canceled   atomic.Bool
 	userCancel chan struct{}
 	known      atomic.Bool
+	observed   bool // owned by perform; true only after pre-dispatch evidence was published
 	id         string
 	characters int64
 }
@@ -328,8 +329,12 @@ func (s *bytesTTSStream) failed(op *bytesTTSOperation, err error) {
 	if s.active.Load() != op || op.canceled.Load() {
 		return
 	}
+	event := runtimepkg.ProviderEvent{Err: err}
+	if op.observed {
+		event.Billing = s.observation(op, op.known.Load(), false)
+	}
 	select {
-	case s.events <- runtimepkg.ProviderEvent{Billing: s.observation(op, op.known.Load(), false), Err: err}:
+	case s.events <- event:
 		s.progress()
 	case <-s.ctx.Done():
 	case <-op.userCancel:
@@ -346,7 +351,7 @@ func (s *bytesTTSStream) credentialFor(ctx context.Context) (string, error) {
 		return "", &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS credential cannot be renewed", Retryable: true}
 	}
 	credential, err := s.refreshCredential(ctx)
-	if err != nil || !acceptableCredentialKind(s.providerRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" || credential.ExpiresAt.IsZero() || !s.now().Before(credential.ExpiresAt) {
+	if err != nil || ctx.Err() != nil || !acceptableCredentialKind(s.providerRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" || credential.ExpiresAt.IsZero() || !s.now().Before(credential.ExpiresAt) {
 		return "", &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia bytes TTS credential renewal failed", Retryable: true}
 	}
 	s.credential, s.credentialExpiresAt = credential.Value, credential.ExpiresAt
@@ -390,6 +395,7 @@ func (s *bytesTTSStream) perform(op *bytesTTSOperation, payload []byte) {
 	if !s.emit(op.ctx, runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.observation(op, false, false)}) {
 		return
 	}
+	op.observed = true
 	var timedOut atomic.Bool
 	headerTimer := time.AfterFunc(s.headerTimeout, func() { timedOut.Store(true); op.cancel() })
 	response, err := s.httpClient.Do(request)
