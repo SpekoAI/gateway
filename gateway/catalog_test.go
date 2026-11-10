@@ -10,6 +10,7 @@ import (
 
 	"github.com/SpekoAI/gateway/gateway"
 	"github.com/SpekoAI/gateway/protocol"
+	elevenlabsprovider "github.com/SpekoAI/gateway/providers/elevenlabs"
 )
 
 type catalogResponse struct {
@@ -72,20 +73,22 @@ func TestModelsPublishesEveryCatalogEntry(t *testing.T) {
 	// ElevenLabs STT is the row this endpoint exists to make discoverable: it is the
 	// board's strongest transcriber across the most languages and had no adapter at
 	// all until now.
-	var found bool
+	// Both realtime generations are published on the one socket row; the batch
+	// ids (scribe_v2, scribe_v3) never are.
+	var scribeIDs []string
 	for _, model := range catalog.Models {
 		if model.Provider == "elevenlabs" && model.Kind == "stt" {
-			found = true
-			if model.ID != "elevenlabs:scribe_v2_realtime" {
-				t.Fatalf("elevenlabs stt id = %q, want the realtime model, not the batch one", model.ID)
+			scribeIDs = append(scribeIDs, model.ID)
+			if model.ID != "elevenlabs:scribe_v2_realtime" && model.ID != "elevenlabs:scribe_v3_live" {
+				t.Fatalf("elevenlabs stt id = %q, want a realtime model, not a batch one", model.ID)
 			}
 			if model.Adapter != "elevenlabs.stt.v1" || model.Transport != string(protocol.TransportWebSocket) {
 				t.Fatalf("elevenlabs stt row = %+v", model)
 			}
 		}
 	}
-	if !found {
-		t.Fatal("catalog does not publish elevenlabs stt")
+	if !slices.Equal(scribeIDs, []string{"elevenlabs:scribe_v2_realtime", "elevenlabs:scribe_v3_live"}) {
+		t.Fatalf("elevenlabs stt ids = %v, want scribe_v2_realtime then scribe_v3_live", scribeIDs)
 	}
 	wantMultiModel := map[string]bool{
 		"speechify:simba-3.5": false, "speechify:simba-3.2": false, "speechify:simba-3.0": false,
@@ -142,14 +145,16 @@ func TestModelsFiltersByKindAndProvider(t *testing.T) {
 			t.Fatalf("kind=tts returned %s", model.Kind)
 		}
 	}
-	// One STT row, flash on the text-to-speech socket, and the four v3/v4
-	// models on the text-to-dialogue socket, which is the only one serving them.
+	// One STT row publishing both realtime Scribe generations, flash on the
+	// text-to-speech socket, and the four v3/v4 models on the text-to-dialogue
+	// socket, which is the only one serving them.
 	elevenlabs := fetchCatalog(t, "/v1/models?provider=elevenlabs")
 	adapters := make(map[string]string, len(elevenlabs.Models))
 	for _, model := range elevenlabs.Models {
 		adapters[model.ID] = model.Adapter
 	}
-	if len(elevenlabs.Models) != 6 || adapters["elevenlabs:eleven_flash_v2_5"] != "elevenlabs.tts.v1" ||
+	if len(elevenlabs.Models) != 7 || adapters["elevenlabs:scribe_v2_realtime"] != "elevenlabs.stt.v1" || adapters["elevenlabs:scribe_v3_live"] != "elevenlabs.stt.v1" ||
+		adapters["elevenlabs:eleven_flash_v2_5"] != "elevenlabs.tts.v1" ||
 		adapters["elevenlabs:eleven_v4_turbo"] != "elevenlabs.dialogue.v1" || adapters["elevenlabs:eleven_v3_conversational"] != "elevenlabs.dialogue.v1" {
 		t.Fatalf("provider=elevenlabs returned %v", adapters)
 	}
@@ -170,6 +175,36 @@ func TestModelsFiltersByKindAndProvider(t *testing.T) {
 	}
 	if unknown := fetchCatalog(t, "/v1/models?provider=nope"); len(unknown.Models) != 0 {
 		t.Fatalf("an unknown provider returned %d rows, want none", len(unknown.Models))
+	}
+}
+
+// The ElevenLabs STT row keeps scribe_v2_realtime as the default a bare or
+// auto pin gets, and every realtime model it publishes has a file twin of the
+// same generation. A new realtime id listed without a pairing would leave a
+// batch fallback with no model to run, so the catalog and the adapter must
+// agree.
+func TestElevenLabsScribeRowPairsEveryRealtimeModelWithItsBatchTwin(t *testing.T) {
+	t.Parallel()
+	var rows int
+	for _, entry := range gateway.Catalog() {
+		if entry.Provider != "elevenlabs" || entry.Kind != protocol.SessionKindSTT {
+			continue
+		}
+		rows++
+		if entry.DefaultModel != "scribe_v2_realtime" {
+			t.Fatalf("elevenlabs stt default = %q, want scribe_v2_realtime", entry.DefaultModel)
+		}
+		if !entry.ServesModel("scribe_v3_live") || entry.ServesModel(elevenlabsprovider.BatchModel) || entry.ServesModel(elevenlabsprovider.BatchModelV3) {
+			t.Fatalf("elevenlabs stt row models = %v, want the realtime ids only", entry.Models)
+		}
+		for _, model := range entry.Models {
+			if _, ok := elevenlabsprovider.BatchModelFor(model); !ok {
+				t.Errorf("elevenlabs stt publishes %q with no batch twin", model)
+			}
+		}
+	}
+	if rows != 1 {
+		t.Fatalf("elevenlabs publishes %d stt rows, want 1", rows)
 	}
 }
 

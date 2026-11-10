@@ -39,10 +39,24 @@ Filter with `?kind=stt|tts` and `?provider=<name>`.
       "adapter": "elevenlabs.stt.v1",
       "transport": "websocket",
       "installed": true
+    },
+    {
+      "id": "elevenlabs:scribe_v3_live",
+      "provider": "elevenlabs",
+      "kind": "stt",
+      "adapter": "elevenlabs.stt.v1",
+      "transport": "websocket",
+      "installed": true
     }
   ]
 }
 ```
+
+A row that serves several models on one adapter publishes one id per model,
+as the two realtime Scribe generations above do. In standalone BYOK planning,
+`auto` or an empty model resolves to the row's default (`scribe_v2_realtime`
+here) and the other ids are reached by naming them; a managed plan carries the
+model the control plane selected.
 
 `installed: false` means the row is part of the catalog but this deployment did
 not load its adapter, so a session for it cannot open here. The row is reported

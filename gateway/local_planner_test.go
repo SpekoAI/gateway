@@ -238,6 +238,36 @@ func TestLocalPlannerResolvesGeminiLiveModelsByName(t *testing.T) {
 	}
 }
 
+// Scribe v3 Live is a model on the existing ElevenLabs STT row: reachable by
+// name on the same realtime socket and adapter, while "auto" and an empty
+// model keep landing on scribe_v2_realtime.
+func TestLocalPlannerResolvesScribeModelsByName(t *testing.T) {
+	t.Parallel()
+	planner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{Providers: []string{"elevenlabs"}})
+	if err != nil {
+		t.Fatalf("new local planner: %v", err)
+	}
+	const endpoint = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
+	for _, tc := range []struct{ model, wantModel string }{
+		{"auto", "scribe_v2_realtime"},
+		{"", "scribe_v2_realtime"},
+		{"scribe_v2_realtime", "scribe_v2_realtime"},
+		{"scribe_v3_live", "scribe_v3_live"},
+	} {
+		request := localPlanRequest()
+		request.Runtime.Adapters = []string{"elevenlabs.stt.v1"}
+		request.Request.Provider = "elevenlabs"
+		request.Request.Model = tc.model
+		plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
+		if err != nil {
+			t.Fatalf("model %q: create local plan: %v", tc.model, err)
+		}
+		if plan.Route.Adapter != "elevenlabs.stt.v1" || plan.Route.Model != tc.wantModel || plan.Route.Endpoint != endpoint || plan.Route.Transport != protocol.TransportWebSocket {
+			t.Fatalf("model %q: route = %+v", tc.model, plan.Route)
+		}
+	}
+}
+
 // Grok Voice 3.0 is a model on the existing xai realtime row: reachable by
 // name on the same socket, while "auto" stays on the grok-voice-latest alias.
 func TestLocalPlannerResolvesGrokVoiceModelsByName(t *testing.T) {
