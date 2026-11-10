@@ -25,8 +25,8 @@ const (
 	// STTAdapterID is the identifier returned by an ElevenLabs STT session plan.
 	STTAdapterID = "elevenlabs.stt.v1"
 	// sttEndpointPath is the realtime Scribe socket. The batch /v1/speech-to-text
-	// endpoint is a DIFFERENT model family: it takes `scribe_v1`/`scribe_v2`, and
-	// only `scribe_v2_realtime` streams over this path.
+	// endpoint serves DIFFERENT model ids; scribeModels says which id belongs
+	// to which.
 	sttEndpointPath = "/v1/speech-to-text/realtime"
 	// sttPCMFrameBytes caps one input_audio_chunk. 16000 B is 0.5 s of 16 kHz
 	// s16le mono and is sample-aligned, so a caller handing a whole utterance as
@@ -115,10 +115,11 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	if credential == nil || !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, credential.Kind) || strings.TrimSpace(credential.Value) == "" {
 		return nil, errors.New("elevenlabs stt requires a bearer credential")
 	}
-	endpoint, err := realtimeEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media)
+	session, err := planRealtime(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media)
 	if err != nil {
 		return nil, err
 	}
+	endpoint := session.endpoint
 	// Two different credentials, two different channels. A BYOK session carries the
 	// customer's permanent API key, which belongs in `xi-api-key`. A managed session
 	// carries a single-use token minted by the control plane, and the vendor accepts
@@ -164,6 +165,10 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		rate:   request.Media.SampleRateHz,
 		model:  request.Plan.Route.Model,
+
+		keytermLibrary: session.keytermLibrary,
+		diarize:        session.diarize,
+		speakerMerges:  map[string]string{},
 	}
 	go stream.readLoop()
 	return stream, nil
@@ -189,22 +194,36 @@ func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.Creden
 	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
-func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat) (string, error) {
+// realtimeSession is what Open derives from a request before it dials: the
+// socket URL, and the two things the model's capabilities decide beyond it.
+type realtimeSession struct {
+	endpoint string
+	// keytermLibrary rides the first input_audio_chunk.
+	keytermLibrary []string
+	// diarize means finals come from diarized_transcript, not the commit.
+	diarize bool
+}
+
+func planRealtime(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat) (realtimeSession, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
-		return "", fmt.Errorf("elevenlabs stt endpoint: %w", err)
+		return realtimeSession{}, fmt.Errorf("elevenlabs stt endpoint: %w", err)
 	}
 	if endpoint.Path != sttEndpointPath {
-		return "", fmt.Errorf("elevenlabs stt endpoint path must be %s, got %q", sttEndpointPath, endpoint.Path)
+		return realtimeSession{}, fmt.Errorf("elevenlabs stt endpoint path must be %s, got %q", sttEndpointPath, endpoint.Path)
 	}
 	if strings.TrimSpace(model) == "" || model == "auto" {
-		return "", errors.New("elevenlabs stt requires a concrete model in the session plan")
+		return realtimeSession{}, errors.New("elevenlabs stt requires a concrete model in the session plan")
+	}
+	capabilities, err := scribeModelFor(model, scribeRealtime)
+	if err != nil {
+		return realtimeSession{}, err
 	}
 	if media.Encoding != "pcm_s16le" {
-		return "", &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("ElevenLabs transcription cannot accept %s audio", media.Encoding), Hint: "Convert the input to mono pcm_s16le at 8000, 16000, 22050, 24000, 44100, or 48000 Hz and try again."}
+		return realtimeSession{}, &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("ElevenLabs transcription cannot accept %s audio", media.Encoding), Hint: "Convert the input to mono pcm_s16le at 8000, 16000, 22050, 24000, 44100, or 48000 Hz and try again."}
 	}
 	if media.Channels != 1 {
-		return "", &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("ElevenLabs transcription cannot accept %d-channel audio", media.Channels), Hint: "Downmix the input to mono pcm_s16le and try again."}
+		return realtimeSession{}, &runtimepkg.ProviderError{Code: "unsupported_media", Message: fmt.Sprintf("ElevenLabs transcription cannot accept %d-channel audio", media.Channels), Hint: "Downmix the input to mono pcm_s16le and try again."}
 	}
 	query := endpoint.Query()
 	query.Set("model_id", model)
@@ -214,7 +233,7 @@ func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string
 	// looks healthy. An unsupported rate is refused here instead.
 	audioFormat, err := sttAudioFormat(media.SampleRateHz)
 	if err != nil {
-		return "", err
+		return realtimeSession{}, err
 	}
 	query.Set("audio_format", audioFormat)
 	// Word timestamps. Without this, a committed segment arrives as
@@ -222,8 +241,10 @@ func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string
 	// With it, Scribe emits `committed_transcript_with_timestamps` carrying a
 	// words array — see handleMessage for why only the timestamped twin is used.
 	query.Set("include_timestamps", "true")
-	// Vendor-default VAD commit strategy. The framework still owns turn detection;
-	// this only decides when Scribe finalizes a segment on its own side.
+	// The framework still owns turn detection; this only decides when Scribe
+	// finalizes a segment on its own side. Always sent, because the vendor's
+	// default is manual commits. A caller of a model with turn prediction can
+	// replace it below.
 	query.Set("commit_strategy", "vad")
 	if language := strings.TrimSpace(options.Language); language != "" {
 		// `language_code`, NOT `language`: the vendor ignores an unknown parameter,
@@ -233,17 +254,37 @@ func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string
 	}
 	// Vocabulary biasing: repeated `keyterms`, one per term, matching how the
 	// platform's own Scribe adapter spells it on this same realtime socket.
-	for _, keyword := range options.STT.GetKeywords() {
+	keyterms, library, err := capabilities.realtimeKeyterms(options.STT.GetKeywords())
+	if err != nil {
+		return realtimeSession{}, err
+	}
+	for _, keyword := range keyterms {
 		query.Add("keyterms", keyword)
 	}
-	// The caller's own Scribe settings, already allow-listed by the gateway —
-	// today that is vad_silence_threshold_secs, the snappy-vs-patient commit
-	// knob whose right value is genuinely per-caller.
-	for _, key := range options.STT.ProviderKeys("elevenlabs") {
-		query.Set(key, protocol.SttOptionString(options.STT.Provider("elevenlabs")[key]))
+	diarize := options.STT.Diarize()
+	if diarize {
+		if !capabilities.diarization {
+			return realtimeSession{}, scribeUnsupported(model, "diarization", func(candidate scribeModel) bool { return candidate.diarization })
+		}
+		query.Set("diarize", "true")
+	}
+	// The caller's own Scribe settings. The gateway allow-lists them per
+	// model, and the model's capabilities refuse a gated one again here for
+	// callers that drive this adapter without the gateway.
+	params, err := capabilities.params(model, options.STT)
+	if err != nil {
+		return realtimeSession{}, err
+	}
+	replaced := map[string]bool{}
+	for _, param := range params {
+		if !replaced[param.name] {
+			query.Del(param.name)
+			replaced[param.name] = true
+		}
+		query.Add(param.name, param.value)
 	}
 	endpoint.RawQuery = query.Encode()
-	return endpoint.String(), nil
+	return realtimeSession{endpoint: endpoint.String(), keytermLibrary: library, diarize: diarize}, nil
 }
 
 // sttAudioFormat maps a portable sample rate onto one of the vendor's accepted
@@ -304,7 +345,7 @@ type sttStream struct {
 	events chan runtimepkg.ProviderEvent
 	rate   int
 	// model is the realtime Scribe model on the socket, named in billing
-	// because batch scribe_v2 bills at a different rate.
+	// because every Scribe model bills at its own rate.
 	model string
 
 	writeMu      sync.Mutex
@@ -332,6 +373,24 @@ type sttStream struct {
 	sessionID    string
 	billed       bool
 	eventsClosed bool
+
+	// keytermLibrary is sent on the first audio chunk and then cleared: the
+	// vendor closes the socket on a library in any later chunk. Guarded by
+	// writeMu, so two concurrent writers cannot both be first.
+	keytermLibrary []string
+	// The diarization state below is touched only by the read loop.
+	diarize bool
+	// pendingCommits are committed segments whose diarized_transcript has not
+	// arrived, in commit order.
+	pendingCommits []sttCommit
+	// speakerMerges maps a speaker id the vendor merged away to the id it
+	// merged into.
+	speakerMerges map[string]string
+}
+
+type sttCommit struct {
+	segmentIndex int
+	text         string
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -369,11 +428,11 @@ func (s *sttStream) CommitAudio(ctx context.Context) error {
 	if !s.inputPending.CompareAndSwap(true, false) {
 		return nil
 	}
-	if err := s.writeJSON(ctx, map[string]any{
+	if err := s.writeFrame(ctx, map[string]any{
 		"message_type":  "input_audio_chunk",
 		"audio_base_64": "",
 		"commit":        true,
-	}); err != nil {
+	}, 0); err != nil {
 		s.inputPending.Store(true)
 		return err
 	}
@@ -493,18 +552,10 @@ func (s *sttStream) abort() error {
 	return s.closeErr
 }
 
-func (s *sttStream) writeJSON(ctx context.Context, value any) error {
-	return s.writeFrame(ctx, value, 0)
-}
-
 // writeFrame writes one JSON frame and, for an audio chunk, counts its PCM
 // bytes under the same lock. Counting inside the lock is what lets the read
 // loop's exit trust sentBytes once it has held the lock after closing input.
-func (s *sttStream) writeFrame(ctx context.Context, value any, audioBytes int64) error {
-	payload, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
+func (s *sttStream) writeFrame(ctx context.Context, chunk map[string]any, audioBytes int64) error {
 	if s.closed.Load() {
 		return s.inputClosedErr()
 	}
@@ -512,6 +563,14 @@ func (s *sttStream) writeFrame(ctx context.Context, value any, audioBytes int64)
 	defer s.writeMu.Unlock()
 	if s.closed.Load() {
 		return s.inputClosedErr()
+	}
+	if len(s.keytermLibrary) > 0 {
+		chunk["keyterm_library"] = s.keytermLibrary
+		s.keytermLibrary = nil
+	}
+	payload, err := json.Marshal(chunk)
+	if err != nil {
+		return err
 	}
 	if err := s.conn.Write(ctx, websocket.MessageText, payload); err != nil {
 		return &runtimepkg.ProviderError{
@@ -562,6 +621,7 @@ func (s *sttStream) readLoop() {
 		}
 		s.closed.Store(true)
 		s.awaitWrites(sttWriteSettleTimeout)
+		s.flushPendingCommits()
 		s.emitCompleteBilling(sttFinalBillingTimeout, true)
 		if terminal != nil {
 			// Bounded like the billing send rather than tied to s.ctx, so a
@@ -635,13 +695,27 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		if strings.TrimSpace(message.Text) == "" {
 			return nil
 		}
+		data := map[string]any{"text": message.Text, "is_final": false, "speech_final": false}
+		// A model with turn prediction scores every partial with the chance
+		// that the speaker has finished. Carried under the vendor's name, the
+		// way AssemblyAI's end_of_turn_confidence is.
+		if message.TurnProbability != nil {
+			data["turn_probability"] = *message.TurnProbability
+		}
 		return s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventTranscriptDelta,
-			Data:       sttTranscriptData(message.Text, false, nil),
+			Data:       sttMarshalData(data),
 			Extensions: sttExtension(raw),
 		})
 	case "final_transcript", "committed_transcript":
 		if strings.TrimSpace(message.Text) == "" {
+			return nil
+		}
+		if s.diarize {
+			// The speakers arrive on the diarized_transcript that follows
+			// every commit. The final waits for it, so a caller who asked for
+			// speakers never reads a final without them.
+			s.pendingCommits = append(s.pendingCommits, sttCommit{segmentIndex: message.SegmentIndex, text: message.Text})
 			return nil
 		}
 		if s.consumeTimedFinal(message.Text) {
@@ -655,7 +729,9 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			Extensions: sttExtension(raw),
 		})
 	case "final_transcript_with_timestamps", "committed_transcript_with_timestamps":
-		if strings.TrimSpace(message.Text) == "" {
+		// On a diarized session the diarized_transcript carries the same word
+		// timings beside the speakers, so this twin adds nothing.
+		if strings.TrimSpace(message.Text) == "" || s.diarize {
 			return nil
 		}
 		if s.consumeBaseFinal(message.Text) {
@@ -676,13 +752,114 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			Hint:      sttErrorHint(message.MessageType),
 			Retryable: sttErrorRetryable(message.MessageType),
 		}
-	default:
+	case "diarized_transcript":
+		if !s.diarize {
+			return s.emitIgnored(message.MessageType, raw)
+		}
+		s.dropPendingCommit(message.SegmentIndex)
+		if strings.TrimSpace(message.Text) == "" {
+			return nil
+		}
 		return s.emit(runtimepkg.ProviderEvent{
-			Type:       protocol.EventWarning,
-			Data:       sttMarshalData(map[string]any{"message": "ignored ElevenLabs message type", "provider_type": message.MessageType}),
+			Type:       protocol.EventTranscriptFinal,
+			Data:       s.diarizedData(message.Text, message.Words),
 			Extensions: sttExtension(raw),
 		})
+	case "speakers_merged":
+		if !s.diarize {
+			return s.emitIgnored(message.MessageType, raw)
+		}
+		s.speakerMerges[message.FromSpeakerID] = message.ToSpeakerID
+		// Finals already delivered keep the old label: the protocol has no
+		// event that relabels a past transcript. The merge is surfaced so a
+		// consumer that stores speakers can apply it; later finals already
+		// use the surviving id.
+		return s.emit(runtimepkg.ProviderEvent{
+			Type: protocol.EventWarning,
+			Data: sttMarshalData(map[string]any{
+				"message":       "ElevenLabs merged two speaker labels",
+				"provider_type": message.MessageType,
+				"from_speaker":  message.FromSpeakerID,
+				"to_speaker":    s.mergedSpeaker(message.ToSpeakerID),
+			}),
+			Extensions: sttExtension(raw),
+		})
+	default:
+		return s.emitIgnored(message.MessageType, raw)
 	}
+}
+
+func (s *sttStream) emitIgnored(messageType string, raw json.RawMessage) error {
+	return s.emit(runtimepkg.ProviderEvent{
+		Type:       protocol.EventWarning,
+		Data:       sttMarshalData(map[string]any{"message": "ignored ElevenLabs message type", "provider_type": messageType}),
+		Extensions: sttExtension(raw),
+	})
+}
+
+// dropPendingCommit forgets the commit a diarized_transcript answers. The
+// vendor sends them in commit order, so the first match is the right one even
+// if a frame arrives without its index.
+func (s *sttStream) dropPendingCommit(segmentIndex int) {
+	for i, commit := range s.pendingCommits {
+		if commit.segmentIndex == segmentIndex {
+			s.pendingCommits = append(s.pendingCommits[:i], s.pendingCommits[i+1:]...)
+			return
+		}
+	}
+}
+
+// flushPendingCommits delivers, without speakers, the committed text whose
+// diarized_transcript never arrived before the stream ended. Losing the words
+// would be worse than losing their labels. Only the read loop's exit calls it.
+func (s *sttStream) flushPendingCommits() {
+	for _, commit := range s.pendingCommits {
+		event := runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: sttTranscriptData(commit.text, true, nil)}
+		if !s.emitBounded(event, sttFinalBillingTimeout) {
+			return
+		}
+	}
+	s.pendingCommits = nil
+}
+
+// mergedSpeaker follows the vendor's merges to the id a speaker ended up as.
+// Merges can chain; ids are never reused, so the walk ends.
+func (s *sttStream) mergedSpeaker(id string) string {
+	for range len(s.speakerMerges) {
+		next, merged := s.speakerMerges[id]
+		if !merged {
+			break
+		}
+		id = next
+	}
+	return id
+}
+
+// diarizedData is a final with the vendor's speaker label on each word, and on
+// the final itself when one speaker said all of it.
+func (s *sttStream) diarizedData(text string, words []sttWord) json.RawMessage {
+	data := map[string]any{"text": text, "is_final": true, "speech_final": true}
+	timings := sttWordTimings(words)
+	speakers := map[string]struct{}{}
+	for index, word := range sttSpokenWords(words) {
+		if word.SpeakerID == nil || *word.SpeakerID == "" {
+			continue
+		}
+		speaker := s.mergedSpeaker(*word.SpeakerID)
+		timings[index]["speaker"] = speaker
+		speakers[speaker] = struct{}{}
+	}
+	if len(timings) > 0 {
+		data["words"] = timings
+		data["audio_start_ms"] = timings[0]["start_ms"]
+		data["audio_end_ms"] = timings[len(timings)-1]["end_ms"]
+	}
+	if len(speakers) == 1 {
+		for speaker := range speakers {
+			data["speaker"] = speaker
+		}
+	}
+	return sttMarshalData(data)
 }
 
 func (s *sttStream) rememberBaseFinal(text string) {
@@ -728,13 +905,16 @@ func consumeFinal(finals *[]string, text string) bool {
 }
 
 // emitBounded delivers a teardown event, waiting at most timeout for a
-// consumer. Only the read loop's exit calls it, before it closes the channel.
-func (s *sttStream) emitBounded(event runtimepkg.ProviderEvent, timeout time.Duration) {
+// consumer, and reports whether one took it. Only the read loop's exit calls
+// it, before it closes the channel.
+func (s *sttStream) emitBounded(event runtimepkg.ProviderEvent, timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case s.events <- event:
+		return true
 	case <-timer.C:
+		return false
 	}
 }
 
@@ -847,8 +1027,9 @@ func sttAlignmentData(text string, words []sttWord) json.RawMessage {
 	return sttMarshalData(data)
 }
 
-func sttWordTimings(words []sttWord) []map[string]any {
-	var timings []map[string]any
+// sttSpokenWords keeps the tokens that are words with usable timings.
+func sttSpokenWords(words []sttWord) []sttWord {
+	var spoken []sttWord
 	for _, word := range words {
 		if word.Type != "" && word.Type != "word" {
 			continue
@@ -859,6 +1040,14 @@ func sttWordTimings(words []sttWord) []map[string]any {
 		if math.IsNaN(word.Start) || math.IsNaN(word.End) || math.IsInf(word.Start, 0) || math.IsInf(word.End, 0) {
 			continue
 		}
+		spoken = append(spoken, word)
+	}
+	return spoken
+}
+
+func sttWordTimings(words []sttWord) []map[string]any {
+	var timings []map[string]any
+	for _, word := range sttSpokenWords(words) {
 		timings = append(timings, map[string]any{
 			"text":     word.Text,
 			"start_ms": sttMilliseconds(word.Start),
@@ -880,13 +1069,16 @@ func sttMilliseconds(seconds float64) int64 {
 	return int64(math.Round(seconds * 1_000))
 }
 
-// sttWord is one token of a committed_transcript_with_timestamps frame. Start and
-// End are SECONDS, and Type distinguishes `word` from `spacing`.
+// sttWord is one token of a committed_transcript_with_timestamps or
+// diarized_transcript frame. Start and End are SECONDS, and Type distinguishes
+// `word` from `spacing`. SpeakerID is set only on a diarized session, and is
+// null while the vendor has not resolved the speaker.
 type sttWord struct {
-	Text  string  `json:"text"`
-	Start float64 `json:"start"`
-	End   float64 `json:"end"`
-	Type  string  `json:"type"`
+	Text      string  `json:"text"`
+	Start     float64 `json:"start"`
+	End       float64 `json:"end"`
+	Type      string  `json:"type"`
+	SpeakerID *string `json:"speaker_id"`
 }
 
 type sttInboundMessage struct {
@@ -895,4 +1087,10 @@ type sttInboundMessage struct {
 	Text        string    `json:"text"`
 	Error       string    `json:"error"`
 	Words       []sttWord `json:"words"`
+	// The fields below are sent only by a model with turn prediction
+	// (TurnProbability) or on a diarized session (the rest).
+	TurnProbability *float64 `json:"turn_probability"`
+	SegmentIndex    int      `json:"segment_index"`
+	FromSpeakerID   string   `json:"from_speaker_id"`
+	ToSpeakerID     string   `json:"to_speaker_id"`
 }
