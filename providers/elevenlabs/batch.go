@@ -22,7 +22,8 @@ const (
 	BatchAdapterID = "elevenlabs.stt.batch.v1"
 	// BatchEndpoint is Scribe's synchronous file endpoint.
 	BatchEndpoint = "https://api.elevenlabs.io/v1/speech-to-text"
-	// BatchModel is the batch Scribe generation paired with scribe_v2_realtime.
+	// BatchModel is the batch Scribe generation paired with scribe_v2_realtime,
+	// and the default. ModelScribeV3 is the newer batch generation.
 	BatchModel = "scribe_v2"
 	// BatchMaxDurationSeconds is the documented per-file ceiling ("up to 10
 	// hours").
@@ -81,8 +82,18 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		return nil, fmt.Errorf("elevenlabs batch adapter cannot serve provider %q", request.Plan.Route.Provider)
 	}
 	model := strings.TrimSpace(request.Plan.Route.Model)
-	if model == "" || strings.Contains(model, "realtime") {
-		return nil, fmt.Errorf("elevenlabs batch adapter requires a file Scribe model, got %q", model)
+	if model == "" {
+		return nil, errors.New("elevenlabs batch adapter requires a file Scribe model")
+	}
+	capabilities, err := scribeModelFor(model, scribeBatch)
+	if err != nil {
+		return nil, err
+	}
+	// Refused before the upload: the vendor answers a newer model's parameter
+	// on an older model with invalid_parameters after reading the whole file.
+	params, err := capabilities.params(model, request.Options.STT)
+	if err != nil {
+		return nil, err
 	}
 	if request.AudioBytes > BatchMaxAudioBytes {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInputTooLarge, Message: "the upload exceeds Scribe's 2 GB file limit"}
@@ -113,8 +124,8 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	for _, keyword := range request.Options.STT.GetKeywords() {
 		fields = append(fields, batchhttp.MultipartField{Name: "keyterms", Value: keyword})
 	}
-	for _, key := range request.Options.STT.ProviderKeys("elevenlabs") {
-		fields = append(fields, batchhttp.MultipartField{Name: key, Value: protocol.SttOptionString(request.Options.STT.Provider("elevenlabs")[key])})
+	for _, param := range params {
+		fields = append(fields, batchhttp.MultipartField{Name: param.name, Value: param.value})
 	}
 	body, contentType := batchhttp.Multipart(fields, "file", "audio.wav", "audio/wav", request.Audio)
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), body)
