@@ -38,16 +38,18 @@ const (
 )
 
 // realtimeBatchModels pairs each realtime Scribe model with the file model of
-// the same generation. Audio pinned to one generation is never transcribed by
-// another: v3 Live falls back to v3, and v2 Realtime keeps v2.
+// the same generation: v3 Live pairs with v3, and v2 Realtime keeps v2.
 var realtimeBatchModels = map[string]string{
 	"scribe_v2_realtime": BatchModel,
 	"scribe_v3_live":     BatchModelV3,
 }
 
-// BatchModelFor returns the file Scribe model of the same generation as a
-// realtime Scribe model. ok is false for any id that is not a known realtime
-// Scribe model, so a caller cannot silently swap generations.
+// BatchModelFor is a lookup for a caller that builds the batch plan for a
+// realtime Scribe session: it returns the file model of the same generation.
+// ok is false for any id that is not a known realtime Scribe model. It does
+// not enforce the pairing. Transcribe receives only the batch model and never
+// sees which realtime model the audio came from, so the caller that picks the
+// batch model owns keeping the two generations in step.
 func BatchModelFor(realtimeModel string) (string, bool) {
 	model, ok := realtimeBatchModels[strings.TrimSpace(realtimeModel)]
 	return model, ok
@@ -55,11 +57,9 @@ func BatchModelFor(realtimeModel string) (string, bool) {
 
 // isRealtimeModel reports whether a model id names a realtime Scribe model,
 // which the file endpoint must never receive. The v2 generation spells it
-// `_realtime` and v3 spells it `_live`; the paired ids are checked too.
+// `_realtime` and v3 spells it `_live`. A test keeps every realtime id in
+// realtimeBatchModels inside this spelling rule.
 func isRealtimeModel(model string) bool {
-	if _, paired := realtimeBatchModels[model]; paired {
-		return true
-	}
 	return strings.Contains(model, "realtime") || strings.Contains(model, "_live")
 }
 

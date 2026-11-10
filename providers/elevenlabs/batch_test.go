@@ -287,8 +287,8 @@ func TestBatchTranscribeBillsTheUploadWhenScribeOmitsTheDuration(t *testing.T) {
 
 // Each realtime Scribe generation has its own file twin. A v3 Live session
 // that needs a file transcription runs scribe_v3, v2 Realtime keeps
-// scribe_v2, and an id that is not a realtime Scribe model has no twin, so a
-// caller cannot swap generations by accident.
+// scribe_v2, and an id that is not a realtime Scribe model has no twin, so the
+// lookup never guesses a generation for an unknown id.
 func TestBatchModelForPairsByGeneration(t *testing.T) {
 	t.Parallel()
 	if BatchModel != "scribe_v2" || BatchModelV3 != "scribe_v3" {
@@ -315,6 +315,24 @@ func TestBatchModelForPairsByGeneration(t *testing.T) {
 	}
 }
 
+// The pairing table and the batch guard must agree: every realtime id that
+// has a file twin is refused by the guard, and every file twin passes it. A
+// future realtime id with a new spelling fails here until the guard learns it.
+func TestRealtimeBatchModelsAgreeWithTheBatchGuard(t *testing.T) {
+	t.Parallel()
+	if len(realtimeBatchModels) == 0 {
+		t.Fatal("realtimeBatchModels is empty")
+	}
+	for realtime, batch := range realtimeBatchModels {
+		if !isRealtimeModel(realtime) {
+			t.Errorf("isRealtimeModel(%q) = false; the batch guard would send a realtime id to the file endpoint", realtime)
+		}
+		if isRealtimeModel(batch) {
+			t.Errorf("isRealtimeModel(%q) = true; the batch guard would refuse the file twin of %q", batch, realtime)
+		}
+	}
+}
+
 // Regression: the guard looked only for "realtime", so scribe_v3_live (the
 // v3 realtime id) would have been POSTed to the file endpoint. Every realtime
 // spelling is refused before a request leaves.
@@ -330,9 +348,10 @@ func TestBatchTranscribeRefusesEveryRealtimeScribeModelBeforeSending(t *testing.
 	if err != nil {
 		t.Fatalf("adapter: %v", err)
 	}
-	// The last two are not shipped ids; they pin the spelling rule, so a
-	// later realtime generation is refused without another guard change.
-	for _, model := range []string{"scribe_v2_realtime", "scribe_v3_live", " scribe_v3_live ", "", "  ", "scribe_v4_live", "scribe_v3_live_preview"} {
+	// The last three are not shipped ids. They pin both spellings of the rule
+	// apart from the shipped ids, so a later realtime generation is refused
+	// without another guard change.
+	for _, model := range []string{"scribe_v2_realtime", "scribe_v3_live", " scribe_v3_live ", "", "  ", "scribe_v4_realtime", "scribe_v4_live", "scribe_v3_live_preview"} {
 		request := runtimepkg.BatchTranscribeRequest{Plan: batchPlan(server.URL + "/v1/speech-to-text"), Audio: strings.NewReader("x"), AudioBytes: 1}
 		request.Plan.Route.Model = model
 		if _, err := adapter.Transcribe(context.Background(), request); err == nil || !strings.Contains(err.Error(), "requires a file Scribe model") {
