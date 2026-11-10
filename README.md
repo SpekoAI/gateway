@@ -138,7 +138,7 @@ settings:
 stt = STT(
     provider="deepgram",             # pin provider AND model when an option is a requirement:
     model="nova-3",                  # deepgram's default is Flux, which has no diarization
-    diarization=True,                # speaker labels (deepgram nova, assemblyai, soniox)
+    diarization=True,                # speaker labels (deepgram nova, assemblyai, soniox, elevenlabs scribe_v3_live)
     keywords=["Speko", "Casey"],     # vocabulary biasing, every provider's own spelling
     noise_reduction=True,            # gladia enhancer, assemblyai voice focus, openai near-field
     provider_options={               # vendor-native settings, allow-listed per provider AND model
@@ -156,6 +156,33 @@ an option is a requirement. Settings under `provider_options` never narrow
 routing; a provider the session does not reach simply ignores its entry, and a
 setting outside a provider's allow-list is refused by name. Speaker labels
 arrive on the raw vendor frames each event carries in `extensions`.
+
+ElevenLabs serves two realtime Scribe models on one adapter. `scribe_v2_realtime`
+is the default. Pin `model="scribe_v3_live"` for Scribe v3 Live, which adds
+three things the gateway refuses on any other Scribe model:
+
+```python
+stt = STT(
+    provider="elevenlabs",
+    model="scribe_v3_live",
+    diarization=True,                # each final carries the vendor's speaker labels
+    keywords=catalog_terms,          # terms past 50 x 20 characters ride the keyterm library
+    provider_options={
+        "elevenlabs": {
+            "turn_prediction": True, # commit on predicted end of turn; VAD stays active
+            "multilang_mode": True,  # follow speakers who switch languages
+        },
+    },
+)
+```
+
+With `diarization=True` a final is emitted when ElevenLabs sends the
+speaker-labelled transcript for the segment, which follows the commit, so
+finals arrive later than without it. Each word carries `speaker`, and the
+final carries `speaker` when one speaker said all of it. When ElevenLabs later
+decides two labels are one person, the gateway relabels the finals that follow
+and emits a `warning` event with `provider_type: "speakers_merged"`,
+`from_speaker` and `to_speaker`; finals already delivered keep their label.
 
 `LLM()` requires `SPEKO_API_KEY` and speaks HTTPS directly to the relay —
 not the local socket — under the public [`relayapi`](relayapi/doc.go)
@@ -325,7 +352,7 @@ restarting the Gateway.
 | --- | --- | --- | --- |
 | STT | Deepgram | `deepgram.stt.v1` | `flux-general-en` |
 | TTS | Deepgram | `deepgram.tts.v1` | `flux-haley-en` |
-| STT | ElevenLabs | `elevenlabs.stt.v1` | `scribe_v2_realtime` |
+| STT | ElevenLabs | `elevenlabs.stt.v1` | `scribe_v2_realtime` (`scribe_v3_live` by pin) |
 | TTS | ElevenLabs | `elevenlabs.tts.v1` | `eleven_flash_v2_5` |
 | TTS | ElevenLabs (v3/v4) | `elevenlabs.dialogue.v1` | `eleven_v4_turbo` |
 | STT | Cartesia | `cartesia.stt.v1` | `ink-2` |
