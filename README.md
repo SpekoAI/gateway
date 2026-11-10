@@ -368,6 +368,9 @@ restarting the Gateway.
 | TTS | Hopper | `hopper.tts.v1` | `qwen3-tts` |
 | STT | Omi Health | `omi.stt.v1` | `omi-medical-1` |
 
+Whole-input HTTP synthesis is available through the explicitly registered
+[Cartesia bytes adapter](docs/CARTESIA_BYTES_TTS.md), `cartesia.tts.bytes.v1`.
+
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.
 
