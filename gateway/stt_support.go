@@ -3,6 +3,7 @@ package gateway
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/SpekoAI/gateway/protocol"
@@ -48,26 +49,37 @@ type sttSupport struct {
 type sttModelKeys struct {
 	prefix string
 	keys   []string
+	// noDiarization, when set, is why this family cannot diarize although the
+	// provider's other models can. It is the refusal's detail, so it names
+	// the model to pin instead.
+	noDiarization string
+}
+
+// family returns the first modelKeys row matching the model, or a zero row.
+func (s sttSupport) family(model string) sttModelKeys {
+	for _, family := range s.modelKeys {
+		if strings.HasPrefix(model, family.prefix) {
+			return family
+		}
+	}
+	return sttModelKeys{}
 }
 
 // keysFor returns the settings this provider accepts on this model.
 func (s sttSupport) keysFor(model string) []string {
-	for _, family := range s.modelKeys {
-		if strings.HasPrefix(model, family.prefix) {
-			return append(family.keys, s.providerKeys...)
-		}
-	}
-	return s.providerKeys
+	return append(slices.Clone(s.family(model).keys), s.providerKeys...)
 }
 
 var sttOptionSupport = map[string]sttSupport{
 	// diarize / keyterm+keywords on v1 listen; keyterm on v2 (Flux). Flux owns
 	// turn detection, so its three eot_* knobs are caller-tunable there and
 	// meaningless on v1; the v1 formatting and endpointing knobs are ignored
-	// by the Flux endpoint. Diarization is v1-only. The catalog default is
-	// flux-general-en, so the split guards the DEFAULT route, not an edge.
+	// by the Flux endpoint. Diarization is v1-only: Flux has no diarize
+	// parameter at all. The catalog default is flux-general-en, so the split
+	// guards the DEFAULT route, not an edge.
 	"deepgram": {diarization: true, keywords: true, modelKeys: []sttModelKeys{
-		{prefix: "flux-", keys: []string{"eot_threshold", "eager_eot_threshold", "eot_timeout_ms"}},
+		{prefix: "flux-", keys: []string{"eot_threshold", "eager_eot_threshold", "eot_timeout_ms"},
+			noDiarization: "Deepgram Flux models have no diarization; pin a nova model"},
 		{prefix: "", keys: []string{
 			"punctuate", "numerals", "smart_format", "filler_words", "profanity_filter",
 			"dictation", "measurements",
@@ -91,8 +103,15 @@ var sttOptionSupport = map[string]sttSupport{
 	}},
 	// Scribe realtime takes repeated keyterms; vad_silence_threshold_secs is
 	// the one commit-strategy knob worth exposing (default 1.5s, and the
-	// snappy-vs-patient tradeoff is genuinely per-caller).
-	"elevenlabs": {keywords: true, providerKeys: []string{"vad_silence_threshold_secs"}},
+	// snappy-vs-patient tradeoff is genuinely per-caller). Scribe v3 Live
+	// adds speaker labels, multilingual mode and turn prediction, each of
+	// which closes the socket on any other Scribe model. The adapter's own
+	// table (elevenlabs.ScribeRealtimeCapabilities) is the source; a test
+	// holds this row to it.
+	"elevenlabs": {diarization: true, keywords: true, providerKeys: []string{"vad_silence_threshold_secs"}, modelKeys: []sttModelKeys{
+		{prefix: "scribe_v3_live", keys: []string{"multilang_mode", "turn_prediction"}},
+		{prefix: "", noDiarization: "only Scribe v3 Live labels speakers; pin scribe_v3_live"},
+	}},
 	// enable_speaker_diarization, context terms and the one-way translation
 	// block all ride the start frame, and so do the endpoint knobs: Soniox's
 	// defaults wait up to 2s after speech ends before returning an endpoint,
@@ -204,10 +223,8 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 	if options.Diarize() && !support.diarization {
 		return &SttSupportError{Provider: name, Option: "diarization", Detail: "no speaker labels on this provider's streaming transport"}
 	}
-	// Deepgram's split is model-level: Flux owns turns and takes keyterm, but
-	// has no diarize parameter at all.
-	if options.Diarize() && name == "deepgram" && strings.HasPrefix(model, "flux-") {
-		return &SttSupportError{Provider: name, Option: "diarization", Detail: "Deepgram Flux models have no diarization; pin a nova model"}
+	if detail := support.family(model).noDiarization; options.Diarize() && detail != "" {
+		return &SttSupportError{Provider: name, Option: "diarization", Detail: detail}
 	}
 	if len(options.GetKeywords()) > 0 && !support.keywords {
 		return &SttSupportError{Provider: name, Option: "keywords", Detail: "this provider has no vocabulary-biasing parameter on its streaming transport"}

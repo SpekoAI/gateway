@@ -2,9 +2,11 @@ package gateway
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/SpekoAI/gateway/protocol"
+	"github.com/SpekoAI/gateway/providers/elevenlabs"
 )
 
 func boolPointer(value bool) *bool { return &value }
@@ -47,6 +49,23 @@ func TestSttRouteSupportFailsClosedByOptionAndProvider(t *testing.T) {
 			options: &protocol.SttOptions{Diarization: boolPointer(true)}, refused: false},
 		{name: "deepgram flux has no diarization", provider: "deepgram", model: "flux-general-en",
 			options: &protocol.SttOptions{Diarization: boolPointer(true)}, refused: true, option: "diarization"},
+		{name: "scribe v3 live diarizes", provider: "elevenlabs", model: "scribe_v3_live",
+			options: &protocol.SttOptions{Diarization: boolPointer(true)}, refused: false},
+		{name: "scribe v2 realtime has no diarization", provider: "elevenlabs", model: "scribe_v2_realtime",
+			options: &protocol.SttOptions{Diarization: boolPointer(true)}, refused: true, option: "diarization"},
+		{name: "scribe v3 live forwards its own knobs", provider: "elevenlabs", model: "scribe_v3_live",
+			options: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+				"elevenlabs": {"turn_prediction": true, "multilang_mode": true, "vad_silence_threshold_secs": 0.5},
+			}}, refused: false},
+		{name: "turn prediction is refused on scribe v2 realtime", provider: "elevenlabs", model: "scribe_v2_realtime",
+			options: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"elevenlabs": {"turn_prediction": true}}},
+			refused: true, option: "provider_options.elevenlabs.turn_prediction"},
+		{name: "multilingual mode is refused on scribe v2 realtime", provider: "elevenlabs", model: "scribe_v2_realtime",
+			options: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"elevenlabs": {"multilang_mode": true}}},
+			refused: true, option: "provider_options.elevenlabs.multilang_mode"},
+		{name: "scribe v2 realtime keeps its vad threshold", provider: "elevenlabs", model: "scribe_v2_realtime",
+			options: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"elevenlabs": {"vad_silence_threshold_secs": 0.7}}},
+			refused: false},
 		{name: "assemblyai streams speaker labels", provider: "assemblyai", model: "universal-3-5-pro",
 			options: &protocol.SttOptions{Diarization: boolPointer(true)}, refused: false},
 		{name: "assemblyai voice focus serves noise reduction", provider: "assemblyai", model: "universal-3-5-pro",
@@ -304,6 +323,33 @@ func TestOmiTakesOnlyABoundedSilenceWindow(t *testing.T) {
 		var supportError *SttSupportError
 		if err := validateSttRouteSupport("omi", "omi-medical-1", options); !errors.As(err, &supportError) {
 			t.Fatalf("%s: want a support error, got %v", name, err)
+		}
+	}
+}
+
+// The ElevenLabs adapter owns what each Scribe model accepts and refuses the
+// rest itself. This table has to agree with it for every published model, or
+// the gateway would allow a setting the adapter then refuses at open (or
+// refuse one the adapter serves).
+func TestElevenLabsSupportRowMatchesTheAdaptersModelTable(t *testing.T) {
+	t.Parallel()
+	entry, ok := catalogEntryFor(protocol.SessionKindSTT, "elevenlabs", "")
+	if !ok {
+		t.Fatal("no elevenlabs stt catalog row")
+	}
+	support := sttOptionSupport["elevenlabs"]
+	for _, model := range entry.Models {
+		gated, diarizes := elevenlabs.ScribeRealtimeCapabilities(model)
+		want := append(gated, support.providerKeys...)
+		got := support.keysFor(model)
+		slices.Sort(want)
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s: gateway allows %v, the adapter reads %v", model, got, want)
+		}
+		err := validateSttRouteSupport("elevenlabs", model, &protocol.SttOptions{Diarization: boolPointer(true)})
+		if (err == nil) != diarizes {
+			t.Errorf("%s: gateway diarization refusal = %v, adapter diarizes = %v", model, err, diarizes)
 		}
 	}
 }
