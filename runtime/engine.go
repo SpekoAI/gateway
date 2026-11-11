@@ -55,8 +55,14 @@ type planUse struct{ expiresAt time.Time }
 func (e *Engine) claimPlanUse(plan protocol.SessionPlan) (func(bool), error) {
 	e.planUsesMu.Lock()
 	defer e.planUsesMu.Unlock()
+	now := e.now()
+	// Verification may block or yield past expiry. Check again at the fence's
+	// admission point before removing old uses or acquiring a provider stream.
+	if err := plan.Validate(now); err != nil {
+		return nil, fmt.Errorf("invalid session plan after verification: %w", err)
+	}
 	for key, use := range e.planUses {
-		if !use.expiresAt.After(e.now()) {
+		if !use.expiresAt.After(now) {
 			delete(e.planUses, key)
 		}
 	}
@@ -371,6 +377,9 @@ type Session struct {
 	usageMu            sync.Mutex
 	usedUnits          int64
 	acceptedAudioBytes int64
+	audioInFlight      bool
+	audioUncertain     bool
+	usageSealed        bool
 	usageOnce          sync.Once
 }
 
@@ -564,16 +573,30 @@ func (s *Session) dispatch(message inputMessage) error {
 
 	switch message.kind {
 	case inputAudio:
+		s.usageMu.Lock()
+		if s.usageSealed {
+			s.usageMu.Unlock()
+			if message.audio.release != nil {
+				message.audio.release()
+			}
+			return ErrSessionClosed
+		}
+		s.audioInFlight = true
+		s.usageMu.Unlock()
 		err := s.stream.WriteAudio(s.ctx, message.audio.data)
+		s.usageMu.Lock()
+		s.audioInFlight = false
 		if err == nil {
-			s.usageMu.Lock()
 			if frameBytes := int64(len(message.audio.data)); frameBytes > math.MaxInt64-s.acceptedAudioBytes {
 				s.acceptedAudioBytes = math.MaxInt64
 			} else {
 				s.acceptedAudioBytes += frameBytes
 			}
-			s.usageMu.Unlock()
+		} else {
+			// A failed transport write may already have reached the provider.
+			s.audioUncertain = true
 		}
+		s.usageMu.Unlock()
 		if message.audio.release != nil {
 			message.audio.release()
 		}
@@ -818,9 +841,16 @@ func requiredMeteringEvent(name string) bool {
 func (s *Session) recordUsageFinalized() {
 	s.usageOnce.Do(func() {
 		s.usageMu.Lock()
+		s.usageSealed = true
 		usedUnits := s.usedUnits
 		acceptedAudioBytes := s.acceptedAudioBytes
+		unknown := s.audioInFlight || s.audioUncertain
 		s.usageMu.Unlock()
+		// Public termination never waits for a stalled provider. An unresolved
+		// write or compressed duration remains unknown evidence for settlement.
+		if unknown || s.kind == protocol.SessionKindLLM || (acceptedAudioBytes > 0 && s.media.Encoding != "pcm_s16le") {
+			return
+		}
 		s.record("usage.finalized", usageReportedData(s.kind, s.media, usedUnits, acceptedAudioBytes))
 	})
 }

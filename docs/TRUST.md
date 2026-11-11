@@ -192,6 +192,9 @@ The stock verifier consumes the signed nonce on verification, so a retry with
 the same verifier remains refused. Local fences and replay caches do not persist
 across processes. The control plane reserves funds and reconciles final usage;
 missing telemetry remains unknown evidence, never proof of zero consumption.
+Final usage is also omitted when a write remains in flight at termination, a
+write failed with an uncertain outcome, or accepted compressed audio has no
+reliable duration. Session termination does not wait for a stalled write.
 
 Anonymous BYOK events are sent without an authorization header to
 `https://gateway.speko.dev/v1/anonymous-runtime-events`. The receiver rejects

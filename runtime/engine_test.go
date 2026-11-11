@@ -1024,3 +1024,108 @@ func TestConcurrentOpenCannotAcquireASecondStreamForTheSamePlan(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestFinalUsageRemainsUnknownWhenAbortOvertakesAnAudioWrite(t *testing.T) {
+	t.Parallel()
+	entered, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	adapter := mock.NewAdapter("mock.inflight.stt", func(runtimepkg.AdapterRequest) *mock.Stream {
+		stream := mock.NewStream(4)
+		stream.WriteAudioHook = func(context.Context, []byte) error { close(entered); <-release; return nil }
+		return stream
+	})
+	telemetry := &collectingTelemetry{}
+	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), telemetry)
+	session := openSession(t, engine, protocol.SessionKindSTT, adapter.ID())
+	if err := session.SubmitAudio(runtimepkg.AudioInput{Data: make([]byte, 32000), Release: func() { close(returned) }}); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	session.Abort()
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("abort waited for provider write")
+	}
+	collectEvents(t, session)
+	assertNoFinalUsage(t, telemetry.snapshot())
+	close(release)
+	<-returned
+	assertNoFinalUsage(t, telemetry.snapshot())
+}
+
+func TestFailedAudioWriteLeavesConsumptionUnknown(t *testing.T) {
+	t.Parallel()
+	adapter := mock.NewAdapter("mock.uncertain.stt", func(runtimepkg.AdapterRequest) *mock.Stream {
+		stream := mock.NewStream(4)
+		stream.WriteAudioHook = func(context.Context, []byte) error { return errors.New("write may have reached provider") }
+		return stream
+	})
+	telemetry := &collectingTelemetry{}
+	session := openSession(t, newEngine(t, adapter, runtimepkg.DefaultLimits(), telemetry), protocol.SessionKindSTT, adapter.ID())
+	if err := session.SubmitAudio(runtimepkg.AudioInput{Data: make([]byte, 32000)}); err != nil {
+		t.Fatal(err)
+	}
+	collectEvents(t, session)
+	assertNoFinalUsage(t, telemetry.snapshot())
+}
+
+func TestAcceptedOpusAudioHasNoAuthoritativeZeroDuration(t *testing.T) {
+	t.Parallel()
+	adapter := mock.NewAdapter("mock.opus.stt", func(runtimepkg.AdapterRequest) *mock.Stream { return mock.NewStream(4) })
+	telemetry := &collectingTelemetry{}
+	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), telemetry)
+	request := runtimepkg.OpenRequest{Kind: protocol.SessionKindSTT, Plan: validPlan(protocol.SessionKindSTT, adapter.ID(), 60), Media: &protocol.MediaFormat{Encoding: "opus", SampleRateHz: 48000, Channels: 1}}
+	session, err := engine.Open(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SubmitAudio(runtimepkg.AudioInput{Data: []byte("owned compressed audio")}); err != nil {
+		t.Fatal(err)
+	}
+	session.Close()
+	collectEvents(t, session)
+	if len(adapter.LastStream().Calls()) < 1 {
+		t.Fatal("audio was not sent")
+	}
+	assertNoFinalUsage(t, telemetry.snapshot())
+}
+
+func TestVerificationCannotOutliveExpiryAndReplaceAUsedPlanFence(t *testing.T) {
+	t.Parallel()
+	var opens, calls atomic.Int64
+	var current atomic.Int64
+	current.Store(fixedNow.UnixNano())
+	adapter := mock.NewAdapter("mock.expiry.stt", func(runtimepkg.AdapterRequest) *mock.Stream { opens.Add(1); return mock.NewStream(4) })
+	engine, err := runtimepkg.New(runtimepkg.Config{Adapters: []runtimepkg.Adapter{adapter},
+		Verifier: runtimepkg.PlanVerifierFunc(func(context.Context, protocol.SessionPlan) error {
+			if calls.Add(1) == 2 {
+				current.Store(fixedNow.Add(2 * time.Hour).UnixNano())
+			}
+			return nil
+		}), Now: func() time.Time { return time.Unix(0, current.Load()) }, LocalCredentials: map[string]runtimepkg.LocalCredential{"mock": {Kind: protocol.CredentialBearer, Value: "owned-key"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := runtimepkg.OpenRequest{Kind: protocol.SessionKindSTT, Plan: validPlan(protocol.SessionKindSTT, adapter.ID(), 60), Media: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1}}
+	session, err := engine.Open(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Close()
+	collectEvents(t, session)
+	if _, err := engine.Open(context.Background(), request); err == nil {
+		t.Fatal("plan expired during verification admitted")
+	}
+	if opens.Load() != 1 {
+		t.Fatalf("provider opens = %d", opens.Load())
+	}
+}
+
+func assertNoFinalUsage(t *testing.T, events []runtimepkg.TelemetryEvent) {
+	t.Helper()
+	for _, event := range events {
+		if event.Name == "usage.finalized" || event.Name == "usage.reported" {
+			t.Fatalf("unknown usage became final: %s", event.Name)
+		}
+	}
+}
