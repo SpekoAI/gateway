@@ -1129,3 +1129,32 @@ func assertNoFinalUsage(t *testing.T, events []runtimepkg.TelemetryEvent) {
 		}
 	}
 }
+
+func TestEngineRecordsRepeatedEmptyObservationsAsIndependentOccurrences(t *testing.T) {
+	t.Parallel()
+	adapter := mock.NewAdapter("mock.repeated.stt", func(runtimepkg.AdapterRequest) *mock.Stream {
+		stream := mock.NewStream(4)
+		for range 2 {
+			if err := stream.Emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return stream
+	})
+	telemetry := &collectingTelemetry{}
+	session := openSession(t, newEngine(t, adapter, runtimepkg.DefaultLimits(), telemetry), protocol.SessionKindSTT, adapter.ID())
+	session.Close()
+	collectEvents(t, session)
+	var observations []runtimepkg.TelemetryEvent
+	for _, event := range telemetry.snapshot() {
+		if event.Name == "usage.observed" {
+			observations = append(observations, event)
+		}
+	}
+	if len(observations) != 2 || observations[0].EventID == "" || observations[0].EventID == observations[1].EventID {
+		t.Fatal("repeated provider observations lost independent identity")
+	}
+	if len(observations[0].Data) != 0 || len(observations[1].Data) != 0 {
+		t.Fatal("observation payload was fabricated")
+	}
+}

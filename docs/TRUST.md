@@ -203,6 +203,9 @@ API key, plan, reservation, or billing association. Managed plan telemetry is
 sent separately to the authenticated endpoint supplied in the signed plan.
 
 Telemetry delivery is asynchronous, bounded, and never blocks audio or text.
+Each event occurrence has an independent ID, including repeated data-free
+provider observations. That ID and the complete body stay unchanged during
+delivery retries, so receivers can distinguish new facts from duplicate delivery.
 Events can be dropped under pressure or after bounded retries; counters expose
 that condition without recording customer content.
 

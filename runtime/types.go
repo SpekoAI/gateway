@@ -249,8 +249,10 @@ func (f PlanVerifierFunc) Verify(ctx context.Context, plan protocol.SessionPlan)
 // TelemetryEvent captures local experience metadata only. It intentionally
 // contains no media, transcripts, or provider credentials.
 //
-// EventID is deterministic per attempt and payload so an at-least-once
-// exporter can be deduplicated by the receiver. Destination is empty for
+// EventID identifies one event occurrence and stays stable across delivery
+// retries, so an at-least-once exporter can be deduplicated by the receiver.
+// The Engine assigns IDs at creation; the exporter assigns a missing ID once
+// before enqueueing. Destination is empty for
 // anonymous local routing or carries the plan-scoped contract for an
 // authenticated attempt; Destination.Token is a credential and must never be
 // logged or persisted by a sink. Data carries a redacted, provider-neutral

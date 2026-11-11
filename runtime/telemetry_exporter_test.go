@@ -1,8 +1,10 @@
 package runtime_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -312,5 +314,70 @@ func TestTelemetryExporterFlushesOnTheDestinationInterval(t *testing.T) {
 	requests := waitForRequests(t, capture, 1)
 	if !strings.HasPrefix(requests[0].authorization, "Bearer ") {
 		t.Fatalf("authorization = %q", requests[0].authorization)
+	}
+}
+
+func TestTelemetryExporterKeepsOccurrenceIDsAndExactBytesAcrossRetries(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var bodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(500)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		bodies = append(bodies, body)
+		if len(bodies) == 1 {
+			w.WriteHeader(503)
+		} else {
+			w.WriteHeader(204)
+		}
+	}))
+	defer server.Close()
+	exporter, err := runtimepkg.NewTelemetryExporter(runtimepkg.TelemetryExporterConfig{MaxBatchEvents: 3, MaxAttempts: 2, RetryBackoff: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation := telemetryTestEvent("usage.observed", "att-1", server.URL, "owned-token", nil)
+	observation.EventID = ""
+	if !exporter.TryRecord(observation) {
+		t.Fatal("first observation dropped")
+	}
+	observation.At = observation.At.Add(time.Millisecond)
+	if !exporter.TryRecord(observation) {
+		t.Fatal("second observation dropped")
+	}
+	terminal := telemetryTestEvent("usage.finalized", "att-1", server.URL, "owned-token", json.RawMessage(`{"unit":"duration_seconds","quantity_millis":1000}`))
+	if !exporter.TryRecord(terminal) {
+		t.Fatal("terminal usage dropped")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := exporter.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 || !bytes.Equal(bodies[0], bodies[1]) {
+		t.Fatal("retry changed its event bytes")
+	}
+	var batch struct {
+		Events []protocol.Event `json:"events"`
+	}
+	if err := json.Unmarshal(bodies[0], &batch); err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Events) != 3 || batch.Events[0].EventID == "" || batch.Events[1].EventID == "" || batch.Events[0].EventID == batch.Events[1].EventID {
+		t.Fatal("distinct observations shared an identity")
+	}
+	if batch.Events[2].EventID != terminal.EventID {
+		t.Fatal("exporter replaced an explicit event identity")
+	}
+	if stats := exporter.Stats(); stats.Retried != 1 || stats.Exported != 3 || stats.Dropped != 0 {
+		t.Fatalf("stats = %+v", stats)
 	}
 }
