@@ -333,11 +333,11 @@ func TestScribeV3LiveDiarizedSession(t *testing.T) {
 	if first.Words[0].Speaker != "speaker_0" || first.Words[2].Speaker != "speaker_1" || first.Words[2].StartMs != 1000 || first.Words[2].EndMs != 1200 {
 		t.Fatalf("first final words = %+v, want the vendor's speaker and timing per word", first.Words)
 	}
-	// An unresolved (null) speaker leaves the word unlabelled; the one
-	// resolved speaker still names the turn.
+	// An unresolved (null) speaker leaves the word unlabelled, and the final
+	// names no speaker: the unlabelled word may be someone else's.
 	second := decode(3)
-	if second.Text != "fine thanks" || second.Speaker != "speaker_2" || second.Words[1].Speaker != "" {
-		t.Fatalf("second final = %+v, want speaker_2 with an unlabelled second word", second)
+	if second.Text != "fine thanks" || second.Speaker != "" || second.Words[0].Speaker != "speaker_2" || second.Words[1].Speaker != "" {
+		t.Fatalf("second final = %+v, want speaker_2 on the first word only and no single speaker", second)
 	}
 	var merge struct {
 		ProviderType string `json:"provider_type"`

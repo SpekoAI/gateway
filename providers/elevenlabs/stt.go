@@ -853,17 +853,19 @@ func (s *sttStream) mergedSpeaker(id string) string {
 }
 
 // diarizedData is a final with the vendor's speaker label on each word, and on
-// the final itself when one speaker said all of it.
+// the final itself when one speaker said all of it. A word whose speaker the
+// vendor has not resolved could be anyone's, so it keeps the final unlabelled.
 func (s *sttStream) diarizedData(text string, words []sttWord) json.RawMessage {
 	data := map[string]any{"text": text, "is_final": true, "speech_final": true}
 	timings := sttWordTimings(words)
+	// An unresolved word counts as the speaker "".
 	speakers := map[string]struct{}{}
 	for index, word := range sttSpokenWords(words) {
-		if word.SpeakerID == nil || *word.SpeakerID == "" {
-			continue
+		speaker := ""
+		if word.SpeakerID != nil && *word.SpeakerID != "" {
+			speaker = s.mergedSpeaker(*word.SpeakerID)
+			timings[index]["speaker"] = speaker
 		}
-		speaker := s.mergedSpeaker(*word.SpeakerID)
-		timings[index]["speaker"] = speaker
 		speakers[speaker] = struct{}{}
 	}
 	if len(timings) > 0 {
@@ -873,7 +875,9 @@ func (s *sttStream) diarizedData(text string, words []sttWord) json.RawMessage {
 	}
 	if len(speakers) == 1 {
 		for speaker := range speakers {
-			data["speaker"] = speaker
+			if speaker != "" {
+				data["speaker"] = speaker
+			}
 		}
 	}
 	return sttMarshalData(data)
