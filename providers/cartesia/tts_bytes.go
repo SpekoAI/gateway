@@ -93,29 +93,17 @@ func NewBytesTTS(config BytesTTSConfig) (*BytesTTSAdapter, error) {
 func (a *BytesTTSAdapter) ID() string { return BytesTTSAdapterID }
 
 func (a *BytesTTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
-	if request.Kind != protocol.SessionKindTTS || request.Plan.Route.Provider != "cartesia" || request.Plan.Route.Transport != protocol.TransportHTTP {
-		return nil, errors.New("cartesia bytes tts: incompatible route")
-	}
-	model := request.Plan.Route.Model
-	if model != "sonic-3" && model != "sonic-3.5" && model != "sonic-3.6" {
-		return nil, errors.New("cartesia bytes tts: unsupported concrete model")
-	}
-	if request.Media == nil || request.Media.Validate() != nil || request.Media.Channels != 1 || request.Media.Encoding != "pcm_s16le" {
-		return nil, &runtimepkg.ProviderError{Code: "unsupported_media", Message: "Cartesia bytes TTS requires mono pcm_s16le"}
-	}
-	rate := request.Media.SampleRateHz
-	if rate != 8000 && rate != 16000 && rate != 22050 && rate != 24000 && rate != 44100 && rate != 48000 {
-		return nil, &runtimepkg.ProviderError{Code: "unsupported_media", Message: "Cartesia bytes TTS sample rate is unsupported"}
-	}
-	if err := validateGenerationOptions(model, request.Options, *request.Media); err != nil {
-		return nil, err
-	}
-	normalization, err := ttsNormalization(model, request.Options.TTS.Provider("cartesia"))
+	stream, err := a.open(request)
 	if err != nil {
 		return nil, err
 	}
-	if request.Options.MaxInputCharacters < 0 || !utf8.ValidString(request.Options.Voice) || !utf8.ValidString(request.Options.Language) || len(request.Options.Voice) > 512 || len(request.Options.Language) > 1024 {
-		return nil, errors.New("cartesia bytes tts: invalid request options")
+	return stream, nil
+}
+
+func (a *BytesTTSAdapter) open(request runtimepkg.AdapterRequest) (*bytesTTSStream, error) {
+	input, err := bytesTTSInputTemplate(request)
+	if err != nil {
+		return nil, err
 	}
 	credential := request.Plan.Route.Credential
 	permanent := request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK || request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay
@@ -140,8 +128,8 @@ func (a *BytesTTSAdapter) Open(_ context.Context, request runtimepkg.AdapterRequ
 		gracefulCloseIdleTimeout: a.config.GracefulCloseIdleTimeout, headerTimeout: a.config.HeaderTimeout,
 		responseIdleTimeout: a.config.ResponseIdleTimeout, now: a.now, permanentCredential: permanent,
 		refreshCredential: request.RefreshCredential, providerRoute: request.Plan.Execution.ProviderRoute,
-		model: model, voice: request.Options.Voice, language: request.Options.Language, normalization: normalization,
-		sampleRateHz: rate, maximumInputBytes: a.config.MaxInputBytes, maximumCharacters: request.Options.MaxInputCharacters,
+		model: input.Model, voice: input.Voice, language: input.Language, normalization: input.Normalization,
+		sampleRateHz: input.OutputFormat.SampleRate, maximumInputBytes: a.config.MaxInputBytes, maximumCharacters: request.Options.MaxInputCharacters,
 	}, nil
 }
 
@@ -179,6 +167,7 @@ type bytesTTSStream struct {
 	stateMu                                                      sync.Mutex
 	pending                                                      strings.Builder
 	pendingCharacters                                            int64
+	preparedOnly                                                 bool
 	active                                                       atomic.Pointer[bytesTTSOperation]
 	closing                                                      atomic.Bool
 	readers                                                      sync.WaitGroup
@@ -212,6 +201,9 @@ func (s *bytesTTSStream) terminal(err error) {
 func (s *bytesTTSStream) AppendText(_ context.Context, text string) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
+	if s.preparedOnly {
+		return runtimepkg.ErrUnsupportedOperation
+	}
 	if s.closing.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
@@ -253,6 +245,9 @@ func (s *bytesTTSStream) CommitText(ctx context.Context) error {
 	}
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
+	if s.preparedOnly {
+		return runtimepkg.ErrUnsupportedOperation
+	}
 	if s.closing.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
@@ -267,10 +262,20 @@ func (s *bytesTTSStream) CommitText(ctx context.Context) error {
 	if err != nil {
 		return errors.New("cartesia bytes tts could not prepare input")
 	}
-	work, cancel := context.WithCancel(s.ctx)
-	op := &bytesTTSOperation{ctx: work, cancel: cancel, done: make(chan struct{}), userCancel: make(chan struct{}), id: fmt.Sprintf("synthesis-%d", s.billingSequence.Add(1)), characters: s.pendingCharacters}
+	if err := s.startLocked(ctx, payload, s.pendingCharacters); err != nil {
+		return err
+	}
 	s.pending.Reset()
 	s.pendingCharacters = 0
+	return nil
+}
+
+func (s *bytesTTSStream) startLocked(ctx context.Context, payload []byte, characters int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	work, cancel := context.WithCancel(s.ctx)
+	op := &bytesTTSOperation{ctx: work, cancel: cancel, done: make(chan struct{}), userCancel: make(chan struct{}), id: fmt.Sprintf("synthesis-%d", s.billingSequence.Add(1)), characters: characters}
 	s.active.Store(op)
 	s.readers.Add(1)
 	go s.perform(op, payload)
