@@ -158,8 +158,9 @@ The gateway can export:
 | --- | --- |
 | `session.opened` | provider connection latency in milliseconds |
 | `agent.event` | canonical event type and sequence number |
-| `usage.observed` | provider request correlation ID |
-| `usage.reported` | accepted character or complete-PCM duration quantity in thousandths of the declared unit |
+| `usage.observed` | optional provider request correlation ID or processed-audio milliseconds; Google may omit the payload |
+| `usage.finalized` | accepted character or complete-PCM duration quantity in thousandths of the declared unit, after an opened session ends |
+| `usage.reported` | legacy observation; never proof of terminal usage |
 | `session.closed` | no payload |
 | `error` | error class, source, retryability, and provider HTTP status |
 
@@ -179,14 +180,21 @@ The exporter code deliberately excludes:
 
 Setting `SPEKO_TELEMETRY_DISABLED=true` suppresses anonymous and optional
 events. On a managed-credential route, the gateway still exports
-`usage.reported`, `usage.observed`, and the terminal `session.closed` or `error`
+`usage.finalized`, `usage.observed`, and the terminal `session.closed` or `error`
 event because those records are required to meter and consolidate the provider
 charge. BYOK routes have no mandatory billing records.
 
-Managed billing is post-paid: nothing is authorized before a session starts, and
-usage is settled monthly from these records afterwards. A lost
-`usage.reported` results in that usage not being billed rather than in a
-fallback charge.
+A failed provider open emits an error, without terminal zero usage. The engine
+fences concurrent or repeated successful opens of an issued plan even with a
+custom signature-only verifier. A failed open that acquired no stream releases
+that local fence; the configured verifier's own replay policy still applies.
+The stock verifier consumes the signed nonce on verification, so a retry with
+the same verifier remains refused. Local fences and replay caches do not persist
+across processes. The control plane reserves funds and reconciles final usage;
+missing telemetry remains unknown evidence, never proof of zero consumption.
+Final usage is also omitted when a write remains in flight at termination, a
+write failed with an uncertain outcome, or accepted compressed audio has no
+reliable duration. Session termination does not wait for a stalled write.
 
 Anonymous BYOK events are sent without an authorization header to
 `https://gateway.speko.dev/v1/anonymous-runtime-events`. The receiver rejects

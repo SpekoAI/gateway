@@ -32,8 +32,11 @@ const (
 	// EventUsageReported is authenticated, content-free metering telemetry from
 	// the Gateway. It reports only a normalized quantity, never media or text.
 	EventUsageReported EventType = "usage.reported"
-	EventWarning       EventType = "warning"
-	EventError         EventType = "error"
+	// EventUsageFinalized closes the one successful use of an issued plan.
+	// Failed opens and legacy usage.reported observations are not final usage.
+	EventUsageFinalized EventType = "usage.finalized"
+	EventWarning        EventType = "warning"
+	EventError          EventType = "error"
 	// EventProviderEvent surfaces one native provider event verbatim on a
 	// speech-to-speech session (Data is a ProviderEvent envelope). It carries
 	// delegation notices, nested Responses events, command acknowledgments,
