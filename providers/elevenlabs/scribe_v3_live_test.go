@@ -635,6 +635,99 @@ func TestScribeV3LiveCloseDeliversAHeldCommitBeforeBilling(t *testing.T) {
 	}
 }
 
+// Close gives a commit still waiting for its speakers a bounded time for its
+// diarized_transcript, which the vendor sends tens of milliseconds after the
+// commit, before it sends the commit without them and bills.
+func TestScribeV3LiveCloseWaitsForSpeakersInFlight(t *testing.T) {
+	t.Parallel()
+	diarize := true
+	cases := []struct {
+		name string
+		// held is how many events the stream holds before Close.
+		held       int
+		afterClose []map[string]any
+		want       []string
+		// waits says whether Close must wait out the whole bound.
+		waits bool
+		// cancel closes with Cancel, which ends the stream without waiting.
+		cancel bool
+	}{
+		{name: "the speakers arrive within the bound", held: 1, afterClose: []map[string]any{diarizedFrame(0, "hello", "speaker_0")},
+			want: []string{"final hello@speaker_0", "billing"}},
+		{name: "the speakers never arrive", held: 1, want: []string{"final hello", "billing"}, waits: true},
+		{name: "nothing is held", want: []string{"billing"}},
+		{name: "cancel does not wait", held: 1, afterClose: []map[string]any{diarizedFrame(0, "hello", "speaker_0")},
+			want: []string{"final hello", "billing"}, cancel: true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+				script := []map[string]any{{"message_type": "session_started", "session_id": "el-live-close"}}
+				if test.held > 0 {
+					script = append(script, map[string]any{"message_type": "committed_transcript", "segment_index": 0, "text": "hello"})
+				}
+				for _, message := range script {
+					if err := writeSTTJSON(ctx, conn, message); err != nil {
+						t.Errorf("write: %v", err)
+						return
+					}
+				}
+				for {
+					frame, err := readSTTJSON(ctx, conn)
+					if err != nil {
+						return
+					}
+					if frame["commit"] == true {
+						break
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
+				for _, message := range test.afterClose {
+					if err := writeSTTJSON(ctx, conn, message); err != nil {
+						t.Errorf("write: %v", err)
+						return
+					}
+				}
+				_, _, _ = conn.Read(ctx)
+			})
+			defer server.Close()
+			adapter, err := NewSTT(sttTestConfig(server.URL))
+			if err != nil {
+				t.Fatalf("new STT adapter: %v", err)
+			}
+			stream, err := adapter.Open(context.Background(), scribeLiveRequest(server.URL, ModelScribeV3Live, &protocol.SttOptions{Diarization: &diarize}))
+			if err != nil {
+				t.Fatalf("open stream: %v", err)
+			}
+			defer stream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+			collectSTTEvents(t, stream.Events(), 1)
+			awaitHeld(t, stream, test.held)
+			if err := stream.WriteAudio(context.Background(), make([]byte, 320)); err != nil {
+				t.Fatalf("write audio: %v", err)
+			}
+			end := stream.Close
+			if test.cancel {
+				end = stream.Cancel
+			}
+			began := time.Now()
+			if err := end(context.Background()); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			took := time.Since(began)
+			if got := eventOrder(t, collectSTTEvents(t, stream.Events(), len(test.want))); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("after close = %q, want %q", got, test.want)
+			}
+			if test.waits && took < sttCloseSpeakersTimeout {
+				t.Fatalf("Close returned after %v, before the %v bound", took, sttCloseSpeakersTimeout)
+			}
+			if !test.waits && took >= sttCloseSpeakersTimeout/2 {
+				t.Fatalf("Close took %v with nothing left to wait for", took)
+			}
+		})
+	}
+}
+
 // awaitHeld waits until a diarized stream holds count events, which the
 // consumer cannot see while a commit ahead of them waits for its speakers.
 func awaitHeld(t *testing.T, stream runtimepkg.ProviderStream, count int) {

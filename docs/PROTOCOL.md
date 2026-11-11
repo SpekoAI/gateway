@@ -169,10 +169,11 @@ diarized ElevenLabs Scribe v3 Live session, `transcript.final` data has the
 vendor's label as `speaker` on each entry of `words`, and as a top-level
 `speaker` when one speaker said the whole segment. A word the vendor left
 unattributed (a null speaker) has no `speaker`, and its final then has no
-top-level `speaker`. A diarized final can also arrive with no speakers at all,
-when the stream ended before the vendor labelled the segment or the vendor
-sent no labels for it: the committed text is delivered without them rather
-than dropped. Events that follow a segment's commit wait for that segment's
+top-level `speaker`. Closing the session waits up to 0.8 s for the labels of
+segments the vendor already committed. A diarized final can still arrive with
+no speakers at all, when the vendor had not labelled the segment by then, the
+stream ended first, or the vendor sent no labels for it: the committed text is
+delivered without them rather than dropped. Events that follow a segment's commit wait for that segment's
 final, so a later `transcript.delta` never precedes an earlier segment's
 `transcript.final`. A later `warning` event with `provider_type: "speakers_merged"`,
 `from_speaker` and `to_speaker` means

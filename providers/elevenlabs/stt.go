@@ -41,6 +41,11 @@ const (
 	sttCloseBillingTimeout = 2 * time.Second
 	sttFinalBillingTimeout = 30 * time.Second
 	sttWriteSettleTimeout  = 2 * time.Second
+	// sttCloseSpeakersTimeout bounds Close's wait for the diarized_transcript
+	// of a commit still waiting for its speakers. Scribe sends it within tens
+	// of milliseconds of the commit, and the platform's Scribe worker holds a
+	// commit for its speakers just as long.
+	sttCloseSpeakersTimeout = 800 * time.Millisecond
 )
 
 // STTConfig controls local transport limits. Credentials and provider selection
@@ -451,9 +456,10 @@ func (s *sttStream) AppendText(context.Context, string) error {
 func (s *sttStream) CommitText(context.Context) error { return runtimepkg.ErrUnsupportedOperation }
 
 // Cancel closes the stream because the realtime protocol has no distinct cancel
-// command. It aborts rather than waiting for a final result.
+// command. It aborts rather than waiting for a final result, or for the
+// speakers of a commit already received.
 func (s *sttStream) Cancel(ctx context.Context) error {
-	closeErr := s.Close(ctx)
+	closeErr := s.closeInput(ctx, 0)
 	if err := s.abort(); closeErr == nil {
 		return err
 	}
@@ -467,6 +473,12 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 // first is what makes the last segment arrive: dropping the socket without it
 // discards whatever Scribe had buffered.
 func (s *sttStream) Close(ctx context.Context) error {
+	return s.closeInput(ctx, sttCloseSpeakersTimeout)
+}
+
+// closeInput closes input once. A commit still held for its speakers gets up
+// to speakersTimeout for them before the complete billing observation.
+func (s *sttStream) closeInput(ctx context.Context, speakersTimeout time.Duration) error {
 	s.gracefulOnce.Do(func() {
 		// A commit refused because Scribe closed the stream normally is not a
 		// Close failure: a clean server close stays a clean shutdown. A real
@@ -484,15 +496,34 @@ func (s *sttStream) Close(ctx context.Context) error {
 		// waits out a frame still in flight before it is read.
 		s.writeMu.Lock()
 		s.writeMu.Unlock()
+		s.awaitSpeakers(speakersTimeout)
 		s.emitCompleteBilling(sttCloseBillingTimeout, false)
 	})
 	return s.closeErr
 }
 
+// awaitSpeakers waits, up to timeout, until no commit is held for its
+// speakers, so a diarized_transcript the read loop is still receiving labels
+// its final before emitCompleteBilling sends the commit without them. It
+// returns at once when nothing is held. It polls rather than holding
+// billingMu, which the read loop needs to deliver the final.
+func (s *sttStream) awaitSpeakers(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for s.holding() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (s *sttStream) holding() bool {
+	s.billingMu.Lock()
+	defer s.billingMu.Unlock()
+	return len(s.held) > 0 && !s.eventsClosed
+}
+
 // emitCompleteBilling hands the complete observation to the consumer exactly
 // once, while the events channel is open. ElevenLabs bills the audio it
-// received however the stream ended, so Close sends it as soon as input is
-// final and the read loop sends it on exit for every other ending (Abort, a
+// received however the stream ended, so Close sends it once input is final
+// and the read loop sends it on exit for every other ending (Abort, a
 // server close, a provider error). It counts as sent only once delivered, so a
 // stalled consumer that resumes still gets it from the read loop's retry. The
 // send is bounded by timeout rather than s.ctx, which Abort has cancelled.
