@@ -298,6 +298,10 @@ func (c *Client) postJSON(ctx context.Context, endpoint *url.URL, value any, ide
 }
 
 func (c *Client) post(ctx context.Context, endpoint *url.URL, value any, idempotencyKey string) ([]byte, string, error) {
+	return c.postAuthenticated(ctx, endpoint, value, idempotencyKey, c.bearer, c.httpClient)
+}
+
+func (c *Client) postAuthenticated(ctx context.Context, endpoint *url.URL, value any, idempotencyKey, bearer string, client *http.Client) ([]byte, string, error) {
 	body, err := json.Marshal(value)
 	if err != nil {
 		return nil, "", fmt.Errorf("controlplane: encode request: %w", err)
@@ -306,7 +310,7 @@ func (c *Client) post(ctx context.Context, endpoint *url.URL, value any, idempot
 	if err != nil {
 		return nil, "", fmt.Errorf("controlplane: create request: %w", err)
 	}
-	request.Header.Set("Authorization", "Bearer "+c.bearer)
+	request.Header.Set("Authorization", "Bearer "+bearer)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Idempotency-Key", idempotencyKey)
@@ -314,7 +318,7 @@ func (c *Client) post(ctx context.Context, endpoint *url.URL, value any, idempot
 	if c.userAgent != "" {
 		request.Header.Set("User-Agent", c.userAgent)
 	}
-	response, err := c.httpClient.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, "", fmt.Errorf("controlplane: send request: %w", err)
 	}
@@ -376,5 +380,14 @@ func (c *Client) escapedBasePath() string {
 }
 
 func sameOrigin(left, right *url.URL) bool {
-	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host)
+	port := func(endpoint *url.URL) string {
+		if explicit := endpoint.Port(); explicit != "" {
+			return explicit
+		}
+		if strings.EqualFold(endpoint.Scheme, "https") {
+			return "443"
+		}
+		return "80"
+	}
+	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Hostname(), right.Hostname()) && port(left) == port(right)
 }

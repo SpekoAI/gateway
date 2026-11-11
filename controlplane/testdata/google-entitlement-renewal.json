@@ -1,0 +1,17 @@
+{
+  "entitlement_id": "entitlement:owned-test",
+  "session_id": "session-test",
+  "attempt_id": "attempt-test",
+  "reservation_id": "reservation-test",
+  "sequence": 1,
+  "previous_expires_at": "2026-08-01T12:01:00Z",
+  "lease_expires_at": "2026-08-01T12:06:00Z",
+  "authorized_units": 300,
+  "maximum_amount_micros": 300000,
+  "currency": "USD",
+  "credential": {
+    "kind": "bearer",
+    "value": "owned-fixture-token",
+    "expires_at": "2026-08-01T12:06:00Z"
+  }
+}
