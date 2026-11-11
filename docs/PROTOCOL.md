@@ -167,8 +167,13 @@ and do not substitute `speech.ended`, which can precede the last transcript.
 Transcript data may also carry fields only some providers produce. On a
 diarized ElevenLabs Scribe v3 Live session, `transcript.final` data has the
 vendor's label as `speaker` on each entry of `words`, and as a top-level
-`speaker` when one speaker said the whole segment. A later `warning` event
-with `provider_type: "speakers_merged"`, `from_speaker` and `to_speaker` means
+`speaker` when one speaker said the whole segment. A word the vendor left
+unattributed (a null speaker) has no `speaker`, and its final then has no
+top-level `speaker`. A diarized final can also arrive with no speakers at all,
+when the stream ended before the vendor labelled the segment or the vendor
+sent no labels for it: the committed text is delivered without them rather
+than dropped. A later `warning` event with `provider_type: "speakers_merged"`,
+`from_speaker` and `to_speaker` means
 the provider decided two labels are one person. There is no event that
 rewrites a delivered transcript, so a client that stores speakers applies the
 merge itself. Scribe v3 Live `transcript.delta` data carries the vendor's
