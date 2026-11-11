@@ -20,6 +20,7 @@ from livekit.agents import (
     NOT_GIVEN,
     APIConnectionError,
     APIConnectOptions,
+    APIError,
     NotGivenOr,
     llm,
     stt,
@@ -42,6 +43,8 @@ from .client import GatewayClient, GatewayError
 from .probe import report_leg as _report_probe_leg
 from .probe import report_marker as _report_probe_marker
 from .relay import (
+    AdmissionPreparer,
+    PreparedPresentation,
     ReasoningEffort,
     RelayError,
     RelayLLMClient,
@@ -863,6 +866,13 @@ class LLM(llm.LLM):
     zai-org/GLM-5.3-Flash. Every other value, `"minimal"` included, needs a
     model that can reason: the Router refuses it for a pinned model that cannot,
     and auto routing considers only models that can.
+
+    `prepare_admissions=True` takes the Router's per-request admission round
+    trip off the reply's critical path: when the caller starts speaking, the
+    LLM admits the next request ahead of time, and that request presents the
+    ticket. Call `attach(session)` once to prepare on the session's user speech
+    starts, or call `prepare(chat_ctx)` yourself. `prepared_admission_outcome`
+    reports what the Router did with the last request's ticket.
     """
 
     def __init__(
@@ -875,6 +885,7 @@ class LLM(llm.LLM):
         max_output_tokens: int = 8_192,
         temperature: float | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        prepare_admissions: bool = False,
     ) -> None:
         super().__init__()
         if (provider == "auto") != (model == "auto"):
@@ -888,10 +899,115 @@ class LLM(llm.LLM):
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
         self._reasoning_effort = reasoning_effort
+        self._preparer = (
+            AdmissionPreparer(self._client) if prepare_admissions else None
+        )
+        self._last_tools: list[llm.Tool] | None = None
+        self._prepared_admission_outcome: str | None = None
+        self._attachments: list[tuple[Any, list[tuple[str, Any]]]] = []
 
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def prepared_admission_outcome(self) -> str | None:
+        """What the Router did with the ticket of the most recent request.
+
+        `"used"` when the request skipped its admission round trip; otherwise
+        the Router's reason for admitting it the ordinary way (`"invalid"`,
+        `"expired"`, `"stale"`, `"route"`, `"budget"`), or `""`
+        when no outcome arrived. None when that request presented no ticket.
+        Each `RelayLLMStream` carries its own request's value too.
+        """
+
+        return self._prepared_admission_outcome
+
+    def prepare(
+        self,
+        chat_ctx: llm.ChatContext,
+        tools: Sequence[llm.Tool] | None = None,
+    ) -> None:
+        """Admit the next request ahead of time, from the conversation so far.
+
+        Call it when the caller starts speaking (`attach` does this for an
+        `AgentSession`). `tools` defaults to those of the last request. A no-op
+        unless the LLM was built with `prepare_admissions=True`. Never raises
+        and never blocks: the prepare runs in the background, and a live ticket
+        with over a minute left is kept rather than replaced.
+        """
+
+        preparer = self._preparer
+        if preparer is None:
+            return
+        chosen = list(tools) if tools is not None else list(self._last_tools or [])
+        preparer.prepare(lambda: self._request_body(chat_ctx, chosen))
+
+    def attach(self, session: Any) -> None:
+        """Prepare admissions on `session`'s user speech starts.
+
+        Pass the `AgentSession` this LLM serves, once, before or after
+        `session.start()`. When the user starts speaking it prepares from the
+        current agent's chat context; when the session closes it releases an
+        unused ticket. Inside a LiveKit job it also releases at job shutdown.
+        A no-op unless the LLM was built with `prepare_admissions=True`.
+        """
+
+        if self._preparer is None or any(
+            attached is session for attached, _ in self._attachments
+        ):
+            return
+
+        def on_user_state_changed(event: Any) -> None:
+            if getattr(event, "new_state", None) != "speaking":
+                return
+            try:
+                agent = session.current_agent
+                if self._last_tools is not None:
+                    tools = self._last_tools
+                else:
+                    tools = [
+                        tool
+                        for tool in agent.tools
+                        if llm.is_function_tool(tool) or llm.is_raw_function_tool(tool)
+                    ]
+                self.prepare(agent.chat_ctx, tools)
+            except Exception:
+                _logger.debug("speko router admission prepare skipped", exc_info=True)
+
+        def on_close(event: Any) -> None:
+            self._detach(session)
+            if self._preparer is not None:
+                self._preparer.release_unused()
+
+        handlers: list[tuple[str, Any]] = [
+            ("user_state_changed", on_user_state_changed),
+            ("close", on_close),
+        ]
+        for name, handler in handlers:
+            session.on(name, handler)
+        self._attachments.append((session, handlers))
+        try:
+            from livekit.agents import get_job_context
+
+            get_job_context().add_shutdown_callback(self._release_prepared)
+        except Exception:  # noqa: BLE001, S110 - no job (console, tests)
+            pass
+
+    def _detach(self, session: Any) -> None:
+        for attached, handlers in list(self._attachments):
+            if attached is not session:
+                continue
+            self._attachments.remove((attached, handlers))
+            for name, handler in handlers:
+                try:
+                    session.off(name, handler)
+                except Exception:  # noqa: BLE001, S110 - detach must not raise
+                    pass
+
+    async def _release_prepared(self) -> None:
+        if self._preparer is not None:
+            await self._preparer.aclose()
 
     @property
     def provider(self) -> str:
@@ -907,6 +1023,8 @@ class LLM(llm.LLM):
         tool_choice: NotGivenOr[Any] = NOT_GIVEN,
         extra_kwargs: NotGivenOr[dict[str, Any]] = NOT_GIVEN,
     ) -> RelayLLMStream:
+        if self._preparer is not None:
+            self._last_tools = list(tools or [])
         return RelayLLMStream(
             llm_instance=self,
             client=self._client,
@@ -943,7 +1061,12 @@ class LLM(llm.LLM):
         return body
 
     async def aclose(self) -> None:
-        if self._owns_client:
+        for session, _ in list(self._attachments):
+            self._detach(session)
+        await self._release_prepared()
+        if self._owns_client and not (
+            self._preparer is not None and self._preparer.close_client_when_done()
+        ):
             await self._client.aclose()
         await super().aclose()
 
@@ -966,6 +1089,10 @@ class RelayLLMStream(llm.LLMStream):
         )
         self._relay_llm = llm_instance
         self._client = client
+        self.prepared_admission_outcome: str | None = None
+        """This request's `Speko-Prepared-Admission-Outcome`, as on the LLM."""
+        self._presentation: PreparedPresentation | None = None
+        self._attempts = 0
 
     async def _run(self) -> None:
         request = self._relay_llm._request_body(self._chat_ctx, self._tools)
@@ -975,10 +1102,67 @@ class RelayLLMStream(llm.LLMStream):
                 " chat context",
                 retryable=False,
             )
-        response_id = utils.shortuuid()
         _report_probe_marker("llm.requested")
+        # Waiting on a prepare in flight is part of this request's latency,
+        # so it comes after the marker.
+        self._attempts += 1
+        preparer = self._relay_llm._preparer
+        presentation = self._presentation
+        if presentation is not None and not presentation.reusable:
+            presentation = None
+        if presentation is None and preparer is not None:
+            # A fresh attempt, or a retry after the ticket was retired: take()
+            # hands each ticket out once, so a spent ticket never comes back.
+            admission = await preparer.take()
+            if admission is not None:
+                presentation = preparer.present(admission)
+            else:
+                await preparer.wait_releases()
+        # Otherwise this retries a ticketed request that failed unconfirmed:
+        # the only safe retry is the same ticket under the same key.
+        self._presentation = presentation
+        self._relay_llm._prepared_admission_outcome = None
+        try:
+            await self._stream_relay(request, presentation)
+        except BaseException as error:
+            if presentation is not None:
+                retryable = isinstance(error, APIError) and error.retryable
+                presentation.finish(
+                    error,
+                    retry_follows=retryable
+                    and self._attempts <= self._conn_options.max_retry,
+                )
+            raise
+        if presentation is not None:
+            presentation.finish()
+
+    def _on_prepared_outcome(self, outcome: str) -> None:
+        self.prepared_admission_outcome = outcome
+        self._relay_llm._prepared_admission_outcome = outcome
+        if outcome:
+            _logger.debug("speko router prepared admission outcome=%s", outcome)
+
+    async def _stream_relay(
+        self, request: dict[str, Any], presentation: PreparedPresentation | None
+    ) -> None:
+        response_id = utils.shortuuid()
         first_token_reported = False
-        events = self._client.stream_response(request)
+        if presentation is None:
+            events = self._client.stream_response(request)
+        else:
+            self._on_prepared_outcome("")
+
+            def on_outcome(outcome: str) -> None:
+                presentation.observe(outcome)
+                self._on_prepared_outcome(outcome)
+
+            events = self._client.stream_response(
+                request,
+                prepared_admission=presentation.admission.ticket,
+                idempotency_key=presentation.admission.idempotency_key,
+                on_prepared_outcome=on_outcome,
+                before_resend=presentation.retired,
+            )
         try:
             async for event, payload in events:
                 if event == "response.created":

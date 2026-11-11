@@ -90,6 +90,26 @@ and tool updates, cancellation, usage metrics, and out-of-band
 request and provider attempt with the Platform conversation while preserving
 their separate request identifiers.
 
+`SpekoLLMService(prepare_admissions=True)` takes the Router's per-request
+admission round trip (about 270 ms from Singapore) off the reply's critical
+path. On `UserStartedSpeakingFrame`, the service prepares an admission from the
+last context it received. The next reply request presents the ticket, with
+the prepare call's `Idempotency-Key` (the Router binds the ticket to it). It
+waits up to 3 s for a prepare still in flight. Requests without a ticket keep
+fresh keys. When the Router retires a ticket that does not fit and answers
+409 `idempotency_conflict`, the service sends the request again at once
+without it. It does not resend a conflict whose outcome is `invalid`. Any other
+failure of a ticketed request is raised; `request_already_started` means the
+request may have run. Pipecat does not retry, so
+the request's ticket is released when it ends, unless the Router reported an
+outcome on a success or retired or spent it. A ticket left unused at `EndFrame`,
+`CancelFrame` or cleanup is released too, including one whose prepare lands
+after the pipeline ends. `llm.prepared_admission_outcome` reports `"used"` or the Router's
+reason for admitting the last reply the ordinary way. Before the first context
+frame arrives, call `llm.prepare_admission(context)` to cover the first turn.
+The option is off by default. See the
+[Python integration README](../integrations/python/README.md#prepared-admissions).
+
 ## 2. Add the sidecar to the Pipecat image
 
 The public Gateway image contains both the binary and this Python package.
