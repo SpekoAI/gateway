@@ -178,7 +178,9 @@ stt = STT(
 
 With `diarization=True` a final is emitted when ElevenLabs sends the
 speaker-labelled transcript for the segment, which follows the commit, so
-finals arrive later than without it. Each word carries `speaker`, and the
+finals arrive later than without it. Partials and other events that follow
+the commit wait behind that final, so the next segment's partial never
+arrives before the previous segment's final. Each word carries `speaker`, and the
 final carries `speaker` when one speaker said all of it. A word ElevenLabs has
 not attributed to a speaker carries no `speaker`, and then neither does its
 final. A final can also arrive with no speakers at all: when the stream ends

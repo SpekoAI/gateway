@@ -364,9 +364,9 @@ type sttStream struct {
 	// billingMu orders the two billing emits, so a late session_started
 	// cannot follow the complete observation with an incomplete one. It also
 	// guards eventsClosed: Close emits from the caller's goroutine and must
-	// not send after readLoop has closed the channel. And it guards
-	// pendingCommits, so a commit received before the complete observation
-	// is delivered before it.
+	// not send after readLoop has closed the channel. And it guards held, so
+	// a commit received before the complete observation is delivered before
+	// it.
 	billingMu sync.Mutex
 	// endedErr is why the provider side ended input, set before closed when
 	// the read loop exits with input still open. A refused write returns it,
@@ -382,17 +382,20 @@ type sttStream struct {
 	// writeMu, so two concurrent writers cannot both be first.
 	keytermLibrary []string
 	diarize        bool
-	// pendingCommits are committed segments whose diarized_transcript has not
-	// arrived, in commit order. Guarded by billingMu.
-	pendingCommits []sttCommit
+	// held is what a diarized session has not yet given the consumer, in the
+	// vendor's order: a commit waiting for its diarized_transcript first, then
+	// everything received after it. Guarded by billingMu.
+	held []sttHeld
 	// speakerMerges maps a speaker id the vendor merged away to the id it
 	// merged into. Touched only by the read loop.
 	speakerMerges map[string]string
 }
 
-type sttCommit struct {
-	segmentIndex int
-	text         string
+type sttHeld struct {
+	event   runtimepkg.ProviderEvent
+	segment int
+	// waiting marks a commit whose diarized_transcript has not arrived.
+	waiting bool
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -497,22 +500,23 @@ func (s *sttStream) Close(ctx context.Context) error {
 // nothing, so a failure before startup stays its consumer's first event. A
 // started stream always completes its operation, at zero if no audio went out.
 //
-// Commits still waiting for their speakers go first, without them: their
-// words were received before the observation, and losing the words would be
-// worse than losing their labels. A late diarized_transcript for one of them
-// then answers nothing. If the consumer stalls before taking them all, the
-// observation waits for the read loop's retry rather than overtake them.
+// Held events go first, with commits still waiting for their speakers sent
+// without them: their words were received before the observation, and losing
+// the words would be worse than losing their labels. A late
+// diarized_transcript for one of them then answers nothing. If the consumer
+// stalls before taking them all, the observation waits for the read loop's
+// retry rather than overtake them.
 func (s *sttStream) emitCompleteBilling(timeout time.Duration, requireAudio bool) {
 	s.billingMu.Lock()
 	defer s.billingMu.Unlock()
 	if s.eventsClosed {
 		return
 	}
-	for len(s.pendingCommits) > 0 {
-		if !s.emitBounded(heldFinal(s.pendingCommits[0].text), timeout) {
+	for len(s.held) > 0 {
+		if !s.emitBounded(s.held[0].event, timeout) {
 			return
 		}
-		s.pendingCommits = s.pendingCommits[1:]
+		s.held = s.held[1:]
 	}
 	if s.billed || (requireAudio && s.sentBytes.Load() == 0 && s.sessionID == "") {
 		return
@@ -711,7 +715,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		if message.TurnProbability != nil {
 			data["turn_probability"] = *message.TurnProbability
 		}
-		return s.emit(runtimepkg.ProviderEvent{
+		return s.deliver(runtimepkg.ProviderEvent{
 			Type:       protocol.EventTranscriptDelta,
 			Data:       sttMarshalData(data),
 			Extensions: sttExtension(raw),
@@ -726,7 +730,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			// emitCompleteBilling say when a commit goes out without them.
 			s.billingMu.Lock()
 			defer s.billingMu.Unlock()
-			s.pendingCommits = append(s.pendingCommits, sttCommit{segmentIndex: message.SegmentIndex, text: message.Text})
+			s.held = append(s.held, sttHeld{event: heldFinal(message.Text), segment: message.SegmentIndex, waiting: true})
 			return nil
 		}
 		if s.consumeTimedFinal(message.Text) {
@@ -734,7 +738,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			return nil
 		}
 		s.rememberBaseFinal(message.Text)
-		return s.emit(runtimepkg.ProviderEvent{
+		return s.deliver(runtimepkg.ProviderEvent{
 			Type:       protocol.EventTranscriptFinal,
 			Data:       sttTranscriptData(message.Text, true, nil),
 			Extensions: sttExtension(raw),
@@ -746,14 +750,14 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			return nil
 		}
 		if s.consumeBaseFinal(message.Text) {
-			return s.emit(runtimepkg.ProviderEvent{
+			return s.deliver(runtimepkg.ProviderEvent{
 				Type:       protocol.EventAlignment,
 				Data:       sttAlignmentData(message.Text, message.Words),
 				Extensions: sttExtension(raw),
 			})
 		}
 		s.rememberTimedFinal(message.Text)
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: sttTranscriptData(message.Text, true, message.Words), Extensions: sttExtension(raw)})
+		return s.deliver(runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: sttTranscriptData(message.Text, true, message.Words), Extensions: sttExtension(raw)})
 	// Every error type in the vendor's realtime event schema. ElevenLabs sends
 	// the error frame and then closes the socket, so each one is terminal.
 	case "error", "scribe_error", "auth_error", "quota_exceeded", "rate_limited", "input_error", "invalid_request", "insufficient_audio_activity", "transcriber_error", "commit_throttled", "unaccepted_terms", "queue_overflow", "resource_exhausted", "session_time_limit_exceeded", "chunk_size_exceeded":
@@ -777,7 +781,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// event that relabels a past transcript. The merge is surfaced so a
 		// consumer that stores speakers can apply it; later finals already
 		// use the surviving id.
-		return s.emit(runtimepkg.ProviderEvent{
+		return s.deliver(runtimepkg.ProviderEvent{
 			Type: protocol.EventWarning,
 			Data: sttMarshalData(map[string]any{
 				"message":       "ElevenLabs merged two speaker labels",
@@ -793,44 +797,66 @@ func (s *sttStream) handleMessage(payload []byte) error {
 }
 
 func (s *sttStream) emitIgnored(messageType string, raw json.RawMessage) error {
-	return s.emit(runtimepkg.ProviderEvent{
+	return s.deliver(runtimepkg.ProviderEvent{
 		Type:       protocol.EventWarning,
 		Data:       sttMarshalData(map[string]any{"message": "ignored ElevenLabs message type", "provider_type": messageType}),
 		Extensions: sttExtension(raw),
 	})
 }
 
-// resolveCommit delivers the final for the pending commit a diarized_transcript
-// answers. The vendor sends them in commit order, so earlier commits still
-// pending will not get theirs in order; they go first, without speakers, and
-// a late frame for one of them answers nothing. A frame that answers no
-// pending commit, such as a duplicate, yields no final, and one without text
-// delivers the commit's text without speakers.
+// deliver gives the consumer an event the read loop produced. On a diarized
+// session an event behind a commit still waiting for its speakers is held
+// until that commit's final goes out, so a later segment's partial cannot
+// overtake an earlier segment's final.
+func (s *sttStream) deliver(event runtimepkg.ProviderEvent) error {
+	if s.diarize && s.holdBehindCommit(event) {
+		return nil
+	}
+	return s.emit(event)
+}
+
+func (s *sttStream) holdBehindCommit(event runtimepkg.ProviderEvent) bool {
+	s.billingMu.Lock()
+	defer s.billingMu.Unlock()
+	if len(s.held) == 0 {
+		return false
+	}
+	s.held = append(s.held, sttHeld{event: event})
+	return true
+}
+
+// resolveCommit gives the commit a diarized_transcript answers its speakers
+// and releases what is held up to the next commit still waiting. The vendor
+// sends them in commit order, so earlier commits still waiting will not get
+// theirs in order; they go out without speakers, and a late frame for one of
+// them answers nothing. A frame that answers no waiting commit, such as a
+// duplicate, yields no final, and one without text delivers the commit's
+// text without speakers.
 //
 // The lock is held across the sends so Close cannot deliver the complete
-// observation between taking a commit and delivering its final.
+// observation between releasing a commit and delivering its final.
 func (s *sttStream) resolveCommit(message sttInboundMessage, raw json.RawMessage) error {
 	s.billingMu.Lock()
 	defer s.billingMu.Unlock()
-	match := slices.IndexFunc(s.pendingCommits, func(commit sttCommit) bool { return commit.segmentIndex == message.SegmentIndex })
+	match := slices.IndexFunc(s.held, func(held sttHeld) bool { return held.waiting && held.segment == message.SegmentIndex })
 	if match < 0 {
 		return nil
 	}
-	for range match {
-		if err := s.emit(heldFinal(s.pendingCommits[0].text)); err != nil {
+	for index := range s.held[:match] {
+		s.held[index].waiting = false
+	}
+	resolved := &s.held[match]
+	if strings.TrimSpace(message.Text) != "" {
+		resolved.event.Data = s.diarizedData(message.Text, message.Words)
+	}
+	resolved.event.Extensions = sttExtension(raw)
+	resolved.waiting = false
+	for len(s.held) > 0 && !s.held[0].waiting {
+		if err := s.emit(s.held[0].event); err != nil {
 			return err
 		}
-		s.pendingCommits = s.pendingCommits[1:]
+		s.held = s.held[1:]
 	}
-	event := heldFinal(s.pendingCommits[0].text)
-	if strings.TrimSpace(message.Text) != "" {
-		event.Data = s.diarizedData(message.Text, message.Words)
-	}
-	event.Extensions = sttExtension(raw)
-	if err := s.emit(event); err != nil {
-		return err
-	}
-	s.pendingCommits = s.pendingCommits[1:]
 	return nil
 }
 

@@ -468,6 +468,74 @@ func finalTexts(t *testing.T, events []runtimepkg.ProviderEvent) []string {
 	return texts
 }
 
+// eventOrder renders the transcript events and the complete billing
+// observation in delivery order: "final text@speaker", "delta text", "billing".
+func eventOrder(t *testing.T, events []runtimepkg.ProviderEvent) []string {
+	t.Helper()
+	var order []string
+	for _, event := range events {
+		switch {
+		case event.Type == protocol.EventTranscriptFinal:
+			order = append(order, "final "+finalTexts(t, []runtimepkg.ProviderEvent{event})[0])
+		case event.Type == protocol.EventTranscriptDelta:
+			var delta struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(event.Data, &delta); err != nil {
+				t.Fatalf("decode delta %s: %v", event.Data, err)
+			}
+			order = append(order, "delta "+delta.Text)
+		case event.Billing != nil && event.Billing.Complete:
+			order = append(order, "billing")
+		}
+	}
+	return order
+}
+
+// A segment's final waits for its speakers, and everything the vendor sent
+// after the commit waits behind that final: a client that clears its interim
+// text on a final must not lose the next segment's partial.
+func TestScribeV3LiveLaterEventsWaitBehindAHeldFinal(t *testing.T) {
+	t.Parallel()
+	started := map[string]any{"message_type": "session_started", "session_id": "el-live-order"}
+	partial := func(text string) map[string]any {
+		return map[string]any{"message_type": "partial_transcript", "text": text}
+	}
+	commit := func(segment int, text string) map[string]any {
+		return map[string]any{"message_type": "committed_transcript", "segment_index": segment, "text": text}
+	}
+	cases := []struct {
+		name   string
+		script []map[string]any
+		want   []string
+	}{
+		{
+			name:   "the speakers arrive",
+			script: []map[string]any{started, commit(0, "A"), partial("B so"), diarizedFrame(0, "A", "speaker_0"), commit(1, "B"), diarizedFrame(1, "B", "speaker_1")},
+			want:   []string{"final A@speaker_0", "delta B so", "final B@speaker_1", "billing"},
+		},
+		{
+			name:   "a later segment's speakers release an earlier commit without them",
+			script: []map[string]any{started, commit(0, "A"), partial("B so"), commit(1, "B"), partial("C so"), diarizedFrame(1, "B", "speaker_1")},
+			want:   []string{"final A", "delta B so", "final B@speaker_1", "delta C so", "billing"},
+		},
+		{
+			name:   "the speakers never arrive",
+			script: []map[string]any{started, commit(0, "A"), partial("B so")},
+			want:   []string{"final A", "delta B so", "billing"},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			stream := openDiarizedScript(t, test.script)
+			if got := eventOrder(t, drainSTTEvents(t, stream.Events())); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("events = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func diarizedFrame(segment int, text string, speaker string) map[string]any {
 	var words []map[string]any
 	if text != "" {
@@ -512,8 +580,9 @@ func TestScribeV3LiveEmptyDiarizedFrameKeepsTheCommittedText(t *testing.T) {
 }
 
 // A commit still waiting for its speakers when the caller closes was received
-// before the stream's audio was final, so it reaches the consumer ahead of
-// the complete billing observation even if its speakers never arrive.
+// before the stream's audio was final, so it and the partial held behind it
+// reach the consumer ahead of the complete billing observation even if its
+// speakers never arrive.
 func TestScribeV3LiveCloseDeliversAHeldCommitBeforeBilling(t *testing.T) {
 	t.Parallel()
 	diarize := true
@@ -549,27 +618,40 @@ func TestScribeV3LiveCloseDeliversAHeldCommitBeforeBilling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
-	// The partial follows the commit, so once it is read the commit is held.
-	if started := collectSTTEvents(t, stream.Events(), 2); started[1].Type != protocol.EventTranscriptDelta {
-		t.Fatalf("second event = %q, want the partial", started[1].Type)
-	}
+	collectSTTEvents(t, stream.Events(), 1)
+	awaitHeld(t, stream, 2)
 	if err := stream.WriteAudio(context.Background(), make([]byte, 320)); err != nil {
 		t.Fatalf("write audio: %v", err)
 	}
 	if err := stream.Close(context.Background()); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	var order []string
-	for _, event := range drainSTTEvents(t, stream.Events()) {
-		switch {
-		case event.Type == protocol.EventTranscriptFinal:
-			order = append(order, string(event.Data))
-		case event.Billing != nil && event.Billing.Complete:
-			order = append(order, "complete billing")
-		}
+	events := drainSTTEvents(t, stream.Events())
+	if got, want := eventOrder(t, events), []string{"final hello", "delta next", "billing"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after close = %q, want %q", got, want)
 	}
-	if want := []string{`{"is_final":true,"speech_final":true,"text":"hello"}`, "complete billing"}; !reflect.DeepEqual(order, want) {
-		t.Fatalf("after close = %q, want %q", order, want)
+	if string(events[0].Data) != `{"is_final":true,"speech_final":true,"text":"hello"}` {
+		t.Fatalf("held final = %s, want the committed text without speakers", events[0].Data)
+	}
+}
+
+// awaitHeld waits until a diarized stream holds count events, which the
+// consumer cannot see while a commit ahead of them waits for its speakers.
+func awaitHeld(t *testing.T, stream runtimepkg.ProviderStream, count int) {
+	t.Helper()
+	s := stream.(*sttStream)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.billingMu.Lock()
+		held := len(s.held)
+		s.billingMu.Unlock()
+		if held >= count {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the stream holds %d events, want %d", held, count)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

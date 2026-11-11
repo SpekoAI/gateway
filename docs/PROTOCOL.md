@@ -172,7 +172,9 @@ unattributed (a null speaker) has no `speaker`, and its final then has no
 top-level `speaker`. A diarized final can also arrive with no speakers at all,
 when the stream ended before the vendor labelled the segment or the vendor
 sent no labels for it: the committed text is delivered without them rather
-than dropped. A later `warning` event with `provider_type: "speakers_merged"`,
+than dropped. Events that follow a segment's commit wait for that segment's
+final, so a later `transcript.delta` never precedes an earlier segment's
+`transcript.final`. A later `warning` event with `provider_type: "speakers_merged"`,
 `from_speaker` and `to_speaker` means
 the provider decided two labels are one person. There is no event that
 rewrites a delivered transcript, so a client that stores speakers applies the
