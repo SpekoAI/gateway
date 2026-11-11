@@ -16,6 +16,14 @@ new horizon is at most 300 seconds later and never beyond the signed original
 `renewable_until`. The bearer credential expires at that new horizon. Numeric
 int64 fields retain exact values; the Gateway does not calculate money.
 
+The cell response retains `entitlement_id` and `maximum_amount_micros` from
+the TypeScript browser SDK's renewal contract. The maximum is the new slice's
+funded cap. The current cell also returns session, attempt, reservation and
+previous-expiry bindings, which this client validates. The representative wire
+fixture is `testdata/google-entitlement-renewal.json`; paired acceptance in
+`SpekoAI/platform-next` calls this client against the actual Effect HTTP and
+PostgreSQL preparation/mint lifecycle rather than a fabricated HTTP success.
+
 This API does not adopt the credential into an adapter or extend an Engine
 session. Runtime lease adoption and Google reconnect/resumption are separate
 work. An application must not advance a running lease merely because this

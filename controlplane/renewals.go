@@ -20,20 +20,21 @@ type EntitlementRenewalRequest struct {
 }
 
 // EntitlementRenewal is one newly funded slice, using the original price.
-// ReservedAmountMicros describes this slice, not a cumulative charge. Only the
+// MaximumAmountMicros describes this slice, not a cumulative charge. Only the
 // cell computes money. Obtaining it alone does not extend a running session:
 // its credential must be adopted before advancing the runtime's lease.
 type EntitlementRenewal struct {
-	SessionID            string                       `json:"session_id"`
-	AttemptID            string                       `json:"attempt_id"`
-	ReservationID        string                       `json:"reservation_id"`
-	Sequence             int64                        `json:"sequence"`
-	PreviousExpiresAt    time.Time                    `json:"previous_expires_at"`
-	LeaseExpiresAt       time.Time                    `json:"lease_expires_at"`
-	AuthorizedUnits      int64                        `json:"authorized_units"`
-	ReservedAmountMicros int64                        `json:"reserved_amount_micros"`
-	Currency             string                       `json:"currency"`
-	Credential           protocol.DelegatedCredential `json:"credential"`
+	EntitlementID       string                       `json:"entitlement_id"`
+	SessionID           string                       `json:"session_id"`
+	AttemptID           string                       `json:"attempt_id"`
+	ReservationID       string                       `json:"reservation_id"`
+	Sequence            int64                        `json:"sequence"`
+	PreviousExpiresAt   time.Time                    `json:"previous_expires_at"`
+	LeaseExpiresAt      time.Time                    `json:"lease_expires_at"`
+	AuthorizedUnits     int64                        `json:"authorized_units"`
+	MaximumAmountMicros int64                        `json:"maximum_amount_micros"`
+	Currency            string                       `json:"currency"`
+	Credential          protocol.DelegatedCredential `json:"credential"`
 }
 
 var gatewayPlanToken = regexp.MustCompile(`^gwt1\.[A-Za-z0-9_-]{43}$`)
@@ -81,12 +82,12 @@ func (c *Client) RenewEntitlement(ctx context.Context, plan protocol.SessionPlan
 
 func validEntitlementRenewal(plan protocol.SessionPlan, request EntitlementRenewalRequest, renewal EntitlementRenewal) bool {
 	duration := renewal.LeaseExpiresAt.Sub(request.PreviousExpiresAt)
-	return renewal.SessionID == plan.SessionID && renewal.AttemptID == plan.AttemptID &&
+	return strings.TrimSpace(renewal.EntitlementID) != "" && renewal.SessionID == plan.SessionID && renewal.AttemptID == plan.AttemptID &&
 		renewal.ReservationID == plan.Reservation.ID && renewal.Sequence > 0 &&
 		renewal.PreviousExpiresAt.Equal(request.PreviousExpiresAt) &&
 		duration > 0 && duration <= 300*time.Second && duration%time.Second == 0 &&
 		!renewal.LeaseExpiresAt.After(plan.Reservation.Billing.RenewableUntil) &&
-		renewal.AuthorizedUnits == int64(duration/time.Second) && renewal.ReservedAmountMicros > 0 && renewal.Currency == "USD" &&
+		renewal.AuthorizedUnits == int64(duration/time.Second) && renewal.MaximumAmountMicros > 0 && renewal.Currency == "USD" &&
 		renewal.Credential.Kind == protocol.CredentialBearer && strings.TrimSpace(renewal.Credential.Value) != "" &&
 		renewal.Credential.ExpiresAt.Equal(renewal.LeaseExpiresAt)
 }

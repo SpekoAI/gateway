@@ -380,5 +380,14 @@ func (c *Client) escapedBasePath() string {
 }
 
 func sameOrigin(left, right *url.URL) bool {
-	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host)
+	port := func(endpoint *url.URL) string {
+		if explicit := endpoint.Port(); explicit != "" {
+			return explicit
+		}
+		if strings.EqualFold(endpoint.Scheme, "https") {
+			return "443"
+		}
+		return "80"
+	}
+	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Hostname(), right.Hostname()) && port(left) == port(right)
 }

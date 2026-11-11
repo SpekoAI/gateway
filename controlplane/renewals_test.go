@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -31,9 +32,9 @@ func renewalPlan(origin string) protocol.SessionPlan {
 func renewedSlice(plan protocol.SessionPlan) controlplane.EntitlementRenewal {
 	end := plan.Reservation.LeaseExpiresAt.Add(300 * time.Second)
 	return controlplane.EntitlementRenewal{
-		SessionID: plan.SessionID, AttemptID: plan.AttemptID, ReservationID: plan.Reservation.ID,
+		EntitlementID: "entitlement:owned-test", SessionID: plan.SessionID, AttemptID: plan.AttemptID, ReservationID: plan.Reservation.ID,
 		Sequence: 1, PreviousExpiresAt: plan.Reservation.LeaseExpiresAt, LeaseExpiresAt: end,
-		AuthorizedUnits: 300, ReservedAmountMicros: 9007199254740993, Currency: "USD",
+		AuthorizedUnits: 300, MaximumAmountMicros: 9007199254740993, Currency: "USD",
 		Credential: protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "owned-renewal-token", ExpiresAt: end},
 	}
 }
@@ -72,8 +73,8 @@ func TestRenewEntitlementRetriesWithTheSamePlanTokenBodyAndNumericInt64(t *testi
 		t.Fatalf("first result: %v", err)
 	}
 	got, requestID, err := client.RenewEntitlement(context.Background(), plan, request, "renew-once")
-	if err != nil || got.ReservedAmountMicros != 9007199254740993 || requestID != "cp_renew" || calls != 2 {
-		t.Fatalf("retry: amount=%d request=%s calls=%d error=%v", got.ReservedAmountMicros, requestID, calls, err)
+	if err != nil || got.MaximumAmountMicros != 9007199254740993 || requestID != "cp_renew" || calls != 2 {
+		t.Fatalf("retry: amount=%d request=%s calls=%d error=%v", got.MaximumAmountMicros, requestID, calls, err)
 	}
 	var fields map[string]json.RawMessage
 	if json.Unmarshal([]byte(first), &fields) != nil || len(fields) != 1 || fields["previous_expires_at"] == nil {
@@ -96,7 +97,7 @@ func TestRenewEntitlementRefusesInvalidResponseBindingsAndBounds(t *testing.T) {
 			r.Credential.ExpiresAt = r.Credential.ExpiresAt.Add(time.Second)
 		}},
 		{"currency", func(r *controlplane.EntitlementRenewal) { r.Currency = "EUR" }},
-		{"negative", func(r *controlplane.EntitlementRenewal) { r.ReservedAmountMicros = -1 }},
+		{"negative", func(r *controlplane.EntitlementRenewal) { r.MaximumAmountMicros = -1 }},
 	} {
 		t.Run(change.name, func(t *testing.T) {
 			var plan protocol.SessionPlan
@@ -150,5 +151,39 @@ func TestRenewEntitlementDoesNotForwardItsPlanTokenThroughRedirects(t *testing.T
 	_, _, err := newClient(t, server, "sk_speko_test").RenewEntitlement(context.Background(), plan, controlplane.EntitlementRenewalRequest{PreviousExpiresAt: plan.Reservation.LeaseExpiresAt}, "renew")
 	if err == nil || calls != 0 {
 		t.Fatalf("redirect followed: calls=%d error=%v", calls, err)
+	}
+}
+
+type renewalTransport func(*http.Request) (*http.Response, error)
+
+func (f renewalTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestRenewEntitlementNormalizesHTTPSDefaultPortsAndReadsTheCellContract(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/google-entitlement-renewal.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, origins := range [][2]string{
+		{"https://cell.example.test:443", "https://cell.example.test"},
+		{"https://CELL.example.test", "https://cell.example.test:443"},
+		{"https://cell.example.test", "https://cell.example.test:444"},
+	} {
+		plan := renewalPlan(origins[1])
+		calls := 0
+		client, err := controlplane.New(controlplane.Config{BaseURL: origins[0], APIKey: "sk_speko_setup", HTTPClient: &http.Client{Transport: renewalTransport(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{StatusCode: 201, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(fixture))), Request: r}, nil
+		})}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, _, err := client.RenewEntitlement(context.Background(), plan, controlplane.EntitlementRenewalRequest{PreviousExpiresAt: plan.Reservation.LeaseExpiresAt}, "renew")
+		if strings.HasSuffix(origins[1], ":444") {
+			if err == nil || calls != 0 {
+				t.Fatal("different effective port accepted")
+			}
+		} else if err != nil || calls != 1 || response.EntitlementID != "entitlement:owned-test" || response.MaximumAmountMicros != 300000 {
+			t.Fatalf("default port or representative cell response refused: %v", err)
+		}
 	}
 }
