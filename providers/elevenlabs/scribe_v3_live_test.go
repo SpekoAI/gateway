@@ -498,12 +498,7 @@ func eventOrder(t *testing.T, events []runtimepkg.ProviderEvent) []string {
 func TestScribeV3LiveLaterEventsWaitBehindAHeldFinal(t *testing.T) {
 	t.Parallel()
 	started := map[string]any{"message_type": "session_started", "session_id": "el-live-order"}
-	partial := func(text string) map[string]any {
-		return map[string]any{"message_type": "partial_transcript", "text": text}
-	}
-	commit := func(segment int, text string) map[string]any {
-		return map[string]any{"message_type": "committed_transcript", "segment_index": segment, "text": text}
-	}
+	partial, commit := partialFrame, commitFrame
 	cases := []struct {
 		name   string
 		script []map[string]any
@@ -542,6 +537,100 @@ func diarizedFrame(segment int, text string, speaker string) map[string]any {
 		words = []map[string]any{{"text": text, "start": 0.1, "end": 0.4, "type": "word", "speaker_id": speaker}}
 	}
 	return map[string]any{"message_type": "diarized_transcript", "segment_index": segment, "text": text, "words": words}
+}
+
+func commitFrame(segment int, text string) map[string]any {
+	return map[string]any{"message_type": "committed_transcript", "segment_index": segment, "text": text}
+}
+
+func partialFrame(text string) map[string]any {
+	return map[string]any{"message_type": "partial_transcript", "text": text}
+}
+
+// openDiarizedSession opens a diarized scribe_v3_live session against a server
+// that runs serve on the socket and then closes it normally. send writes
+// frames and reports whether they all went out.
+func openDiarizedSession(t *testing.T, serve func(send func(...map[string]any) bool)) runtimepkg.ProviderStream {
+	t.Helper()
+	diarize := true
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		serve(func(messages ...map[string]any) bool {
+			for _, message := range messages {
+				if err := writeSTTJSON(ctx, conn, message); err != nil {
+					t.Errorf("write %v: %v", message["message_type"], err)
+					return false
+				}
+			}
+			return true
+		})
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	t.Cleanup(server.Close)
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), scribeLiveRequest(server.URL, ModelScribeV3Live, &protocol.SttOptions{Diarization: &diarize}))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	t.Cleanup(func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) })
+	return stream
+}
+
+// A commit whose diarized_transcript never comes waits sttSpeakersTimeout
+// while the stream runs, then goes out without speakers, followed by what was
+// held behind it up to the next commit still waiting. That commit keeps its
+// own wait, and a frame for the released commit that arrives later yields
+// nothing.
+func TestScribeV3LiveReleasesACommitWhoseSpeakersAreLate(t *testing.T) {
+	t.Parallel()
+	released := make(chan struct{})
+	opened := time.Now()
+	stream := openDiarizedSession(t, func(send func(...map[string]any) bool) {
+		if !send(map[string]any{"message_type": "session_started", "session_id": "el-live-late"}, commitFrame(0, "A"), partialFrame("B so")) {
+			return
+		}
+		time.Sleep(sttSpeakersTimeout / 2)
+		if !send(commitFrame(1, "B"), partialFrame("C so")) {
+			return
+		}
+		select {
+		case <-released:
+		case <-time.After(5 * time.Second):
+			return
+		}
+		send(diarizedFrame(0, "A", "speaker_0"), diarizedFrame(1, "B", "speaker_1"))
+	})
+	first := collectSTTEvents(t, stream.Events(), 3)
+	if took := time.Since(opened); took < sttSpeakersTimeout {
+		t.Fatalf("A went out %v after the stream opened, inside the %v bound", took, sttSpeakersTimeout)
+	}
+	if got, want := eventOrder(t, first), []string{"final A", "delta B so"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("released = %q, want %q", got, want)
+	}
+	if string(first[1].Data) != `{"is_final":true,"speech_final":true,"text":"A"}` {
+		t.Fatalf("released final = %s, want the committed text without speakers", first[1].Data)
+	}
+	close(released)
+	if got, want := eventOrder(t, drainSTTEvents(t, stream.Events())), []string{"final B@speaker_1", "delta C so", "billing"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after the release = %q, want %q", got, want)
+	}
+}
+
+// A diarized_transcript that arrives inside the bound still labels its commit.
+func TestScribeV3LiveSpeakersInsideTheBoundLabelTheirCommit(t *testing.T) {
+	t.Parallel()
+	stream := openDiarizedSession(t, func(send func(...map[string]any) bool) {
+		if !send(map[string]any{"message_type": "session_started", "session_id": "el-live-inside"}, commitFrame(0, "A"), partialFrame("B so")) {
+			return
+		}
+		time.Sleep(sttSpeakersTimeout / 2)
+		send(diarizedFrame(0, "A", "speaker_0"))
+	})
+	if got, want := eventOrder(t, drainSTTEvents(t, stream.Events())), []string{"final A@speaker_0", "delta B so", "billing"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("events = %q, want %q", got, want)
+	}
 }
 
 // A diarized_transcript yields a final only for a commit still waiting for
@@ -681,7 +770,8 @@ func TestScribeV3LiveCloseWaitsForSpeakersInFlight(t *testing.T) {
 		held       int
 		afterClose []map[string]any
 		want       []string
-		// waits says whether Close must wait out the whole bound.
+		// waits says whether Close must wait until the held commit has
+		// waited the whole bound.
 		waits bool
 		// cancel closes with Cancel, which ends the stream without waiting.
 		cancel bool
@@ -730,6 +820,7 @@ func TestScribeV3LiveCloseWaitsForSpeakersInFlight(t *testing.T) {
 			if err != nil {
 				t.Fatalf("new STT adapter: %v", err)
 			}
+			opened := time.Now()
 			stream, err := adapter.Open(context.Background(), scribeLiveRequest(server.URL, ModelScribeV3Live, &protocol.SttOptions{Diarization: &diarize}))
 			if err != nil {
 				t.Fatalf("open stream: %v", err)
@@ -748,14 +839,14 @@ func TestScribeV3LiveCloseWaitsForSpeakersInFlight(t *testing.T) {
 			if err := end(context.Background()); err != nil {
 				t.Fatalf("close: %v", err)
 			}
-			took := time.Since(began)
+			returned := time.Now()
 			if got := eventOrder(t, collectSTTEvents(t, stream.Events(), len(test.want))); !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("after close = %q, want %q", got, test.want)
 			}
-			if test.waits && took < sttCloseSpeakersTimeout {
-				t.Fatalf("Close returned after %v, before the %v bound", took, sttCloseSpeakersTimeout)
+			if held := returned.Sub(opened); test.waits && held < sttSpeakersTimeout {
+				t.Fatalf("Close returned %v after the stream opened, before the commit had waited the %v bound", held, sttSpeakersTimeout)
 			}
-			if !test.waits && took >= sttCloseSpeakersTimeout/2 {
+			if took := returned.Sub(began); !test.waits && took >= sttSpeakersTimeout/2 {
 				t.Fatalf("Close took %v with nothing left to wait for", took)
 			}
 		})

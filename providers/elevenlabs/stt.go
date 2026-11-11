@@ -41,11 +41,12 @@ const (
 	sttCloseBillingTimeout = 2 * time.Second
 	sttFinalBillingTimeout = 30 * time.Second
 	sttWriteSettleTimeout  = 2 * time.Second
-	// sttCloseSpeakersTimeout bounds Close's wait for the diarized_transcript
-	// of a commit still waiting for its speakers. Scribe sends it within tens
-	// of milliseconds of the commit, and the platform's Scribe worker holds a
-	// commit for its speakers just as long.
-	sttCloseSpeakersTimeout = 800 * time.Millisecond
+	// sttSpeakersTimeout bounds how long a commit on a diarized session waits
+	// for its diarized_transcript, from its arrival while the stream runs and
+	// from Close at the end, before it goes out without speakers. Scribe sends
+	// the frame within tens of milliseconds of the commit, and the platform's
+	// Scribe worker holds a commit for its speakers just as long.
+	sttSpeakersTimeout = 800 * time.Millisecond
 )
 
 // STTConfig controls local transport limits. Credentials and provider selection
@@ -391,6 +392,9 @@ type sttStream struct {
 	// vendor's order: a commit waiting for its diarized_transcript first, then
 	// everything received after it. Guarded by billingMu.
 	held []sttHeld
+	// speakersTimer releases the commit at the head of held once it is due.
+	// Guarded by billingMu.
+	speakersTimer *time.Timer
 	// speakerMerges maps a speaker id the vendor merged away to the id it
 	// merged into. Touched only by the read loop.
 	speakerMerges map[string]string
@@ -399,9 +403,12 @@ type sttStream struct {
 type sttHeld struct {
 	event   runtimepkg.ProviderEvent
 	segment int
-	// waiting marks a commit whose diarized_transcript has not arrived.
-	waiting bool
+	// due is when a commit whose diarized_transcript has not arrived goes out
+	// without it. Zero for every other event.
+	due time.Time
 }
+
+func (h sttHeld) waiting() bool { return !h.due.IsZero() }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
 
@@ -473,7 +480,7 @@ func (s *sttStream) Abort(context.Context) error { return s.abort() }
 // first is what makes the last segment arrive: dropping the socket without it
 // discards whatever Scribe had buffered.
 func (s *sttStream) Close(ctx context.Context) error {
-	return s.closeInput(ctx, sttCloseSpeakersTimeout)
+	return s.closeInput(ctx, sttSpeakersTimeout)
 }
 
 // closeInput closes input once. A commit still held for its speakers gets up
@@ -757,11 +764,13 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		}
 		if s.diarize {
 			// The speakers arrive on the diarized_transcript that follows
-			// every commit, and the final waits for it. resolveCommit and
-			// emitCompleteBilling say when a commit goes out without them.
+			// every commit, and the final waits for it. resolveCommit,
+			// releaseDueCommit and emitCompleteBilling say when a commit goes
+			// out without them.
 			s.billingMu.Lock()
 			defer s.billingMu.Unlock()
-			s.held = append(s.held, sttHeld{event: heldFinal(message.Text), segment: message.SegmentIndex, waiting: true})
+			s.held = append(s.held, sttHeld{event: heldFinal(message.Text), segment: message.SegmentIndex, due: time.Now().Add(sttSpeakersTimeout)})
+			s.resetSpeakersTimer()
 			return nil
 		}
 		if s.consumeTimedFinal(message.Text) {
@@ -859,36 +868,77 @@ func (s *sttStream) holdBehindCommit(event runtimepkg.ProviderEvent) bool {
 // resolveCommit gives the commit a diarized_transcript answers its speakers
 // and releases what is held up to the next commit still waiting. The vendor
 // sends them in commit order, so earlier commits still waiting will not get
-// theirs in order; they go out without speakers, and a late frame for one of
-// them answers nothing. A frame that answers no waiting commit, such as a
-// duplicate, yields no final, and one without text delivers the commit's
-// text without speakers.
-//
-// The lock is held across the sends so Close cannot deliver the complete
-// observation between releasing a commit and delivering its final.
+// theirs in order; they go out without speakers. A frame that answers no
+// waiting commit, such as a duplicate or one for a commit already sent
+// without speakers, yields no final, and one without text delivers the
+// commit's text without speakers.
 func (s *sttStream) resolveCommit(message sttInboundMessage, raw json.RawMessage) error {
 	s.billingMu.Lock()
 	defer s.billingMu.Unlock()
-	match := slices.IndexFunc(s.held, func(held sttHeld) bool { return held.waiting && held.segment == message.SegmentIndex })
+	match := slices.IndexFunc(s.held, func(held sttHeld) bool { return held.waiting() && held.segment == message.SegmentIndex })
 	if match < 0 {
 		return nil
 	}
 	for index := range s.held[:match] {
-		s.held[index].waiting = false
+		s.held[index].due = time.Time{}
 	}
 	resolved := &s.held[match]
 	if strings.TrimSpace(message.Text) != "" {
 		resolved.event.Data = s.diarizedData(message.Text, message.Words)
 	}
 	resolved.event.Extensions = sttExtension(raw)
-	resolved.waiting = false
-	for len(s.held) > 0 && !s.held[0].waiting {
+	resolved.due = time.Time{}
+	return s.releaseHeld()
+}
+
+// releaseDueCommit runs on the speakers timer. It sends the commit at the head
+// of held without speakers once it is due, and what is held behind it up to
+// the next commit still waiting. A timer that fired for a head released
+// meanwhile finds the new head not yet due and only re-arms.
+func (s *sttStream) releaseDueCommit() {
+	s.billingMu.Lock()
+	defer s.billingMu.Unlock()
+	if s.eventsClosed {
+		return
+	}
+	if len(s.held) > 0 && s.held[0].waiting() && !time.Now().Before(s.held[0].due) {
+		s.held[0].due = time.Time{}
+	}
+	// A send fails only once Abort has cancelled the stream, and the read
+	// loop's exit then delivers what is still held.
+	_ = s.releaseHeld()
+}
+
+// releaseHeld delivers held events up to the next commit still waiting and
+// points the speakers timer at that commit. The caller holds billingMu across
+// the sends, so the read loop, the timer and Close's complete observation
+// cannot interleave their deliveries.
+func (s *sttStream) releaseHeld() error {
+	for len(s.held) > 0 && !s.held[0].waiting() {
 		if err := s.emit(s.held[0].event); err != nil {
 			return err
 		}
 		s.held = s.held[1:]
 	}
+	s.resetSpeakersTimer()
 	return nil
+}
+
+// resetSpeakersTimer points the speakers timer at the commit at the head of
+// held, or stops it when no commit waits there. The caller holds billingMu.
+func (s *sttStream) resetSpeakersTimer() {
+	if len(s.held) == 0 || !s.held[0].waiting() {
+		if s.speakersTimer != nil {
+			s.speakersTimer.Stop()
+		}
+		return
+	}
+	wait := time.Until(s.held[0].due)
+	if s.speakersTimer == nil {
+		s.speakersTimer = time.AfterFunc(wait, s.releaseDueCommit)
+		return
+	}
+	s.speakersTimer.Reset(wait)
 }
 
 // heldFinal is a committed segment delivered without its speakers.

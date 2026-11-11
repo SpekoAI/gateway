@@ -183,11 +183,12 @@ the commit wait behind that final, so the next segment's partial never
 arrives before the previous segment's final. Each word carries `speaker`, and the
 final carries `speaker` when one speaker said all of it. A word ElevenLabs has
 not attributed to a speaker carries no `speaker`, and then neither does its
-final. On close the gateway waits up to 0.8 s for the labels of a segment
-ElevenLabs has already committed. A final can still arrive with no speakers at
-all: when ElevenLabs has not labelled a segment by then, the stream ends first,
-or ElevenLabs sends no labels for it, the committed text is delivered without
-them rather than dropped. When ElevenLabs
+final. The gateway waits at most 0.8 s after a commit for its labels, also
+while the session closes, so no event is delayed longer than that. A final can
+still arrive with no speakers at all: when ElevenLabs has not labelled a
+segment within 0.8 s, the stream ends first, or ElevenLabs sends no labels for
+it, the committed text is delivered without them rather than dropped, and
+labels that arrive later are ignored. When ElevenLabs
 later decides two labels are one person, the gateway relabels the finals that follow
 and emits a `warning` event with `provider_type: "speakers_merged"`,
 `from_speaker` and `to_speaker`; finals already delivered keep their label.
