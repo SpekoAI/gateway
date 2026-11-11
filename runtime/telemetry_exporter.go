@@ -53,7 +53,7 @@ type TelemetryExporterStats struct {
 
 // TelemetryExporter is the production TelemetrySink: TryRecord never performs
 // I/O, events batch per plan-carried or anonymous default destination, and
-// delivery retries within bounded attempts and memory. Deterministic event IDs
+// delivery retries within bounded attempts and memory. Stable event IDs
 // make at-least-once delivery safe against idempotent ingest; a full queue or
 // exhausted retry drops events and counts them rather than blocking a session.
 type TelemetryExporter struct {
@@ -137,6 +137,9 @@ func (e *TelemetryExporter) TryRecord(event TelemetryEvent) bool {
 	}
 	if e.closed.Load() {
 		return false
+	}
+	if event.EventID == "" {
+		event.EventID = newTelemetryEventID()
 	}
 	select {
 	case e.queue <- event:
@@ -331,13 +334,9 @@ func wireTelemetryEvents(events []TelemetryEvent) []protocol.Event {
 		if name == "session.failed" {
 			name = string(protocol.EventError)
 		}
-		eventID := event.EventID
-		if eventID == "" {
-			eventID = telemetryEventID(event.AttemptID, event.Name, event.Data)
-		}
 		wire = append(wire, protocol.Event{
 			Type:        protocol.EventType(name),
-			EventID:     eventID,
+			EventID:     event.EventID,
 			SessionID:   event.SessionID,
 			AttemptID:   event.AttemptID,
 			CreatedAtMS: event.At.UnixMilli(),

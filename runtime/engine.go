@@ -2,14 +2,14 @@ package runtime
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -804,7 +804,7 @@ func (s *Session) record(name string, data json.RawMessage) {
 		SessionID:   s.plan.SessionID,
 		AttemptID:   s.plan.AttemptID,
 		At:          s.now(),
-		EventID:     telemetryEventID(s.plan.AttemptID, name, data),
+		EventID:     newTelemetryEventID(),
 		Destination: s.plan.Telemetry,
 		Data:        data,
 		Required:    s.plan.Execution.CredentialSource == protocol.CredentialsManaged && requiredMeteringEvent(name),
@@ -859,7 +859,7 @@ func (e *Engine) recordOpenFailure(request OpenRequest, openErr error) {
 	for _, event := range []TelemetryEvent{
 		{
 			Name: "session.failed", SessionID: request.Plan.SessionID, AttemptID: request.Plan.AttemptID,
-			At: e.now(), EventID: telemetryEventID(request.Plan.AttemptID, "session.failed", telemetryErrorData(openErr)),
+			At: e.now(), EventID: newTelemetryEventID(),
 			Destination: request.Plan.Telemetry, Data: telemetryErrorData(openErr),
 			Required: request.Plan.Execution.CredentialSource == protocol.CredentialsManaged,
 		},
@@ -897,15 +897,14 @@ func usageReportedData(kind protocol.SessionKind, media protocol.MediaFormat, us
 	return payload
 }
 
-// telemetryEventID is deterministic so a resent event deduplicates in the
-// control plane's idempotent ingest. Lifecycle events occur at most once per
-// attempt; payload-bearing events additionally key on their content.
-func telemetryEventID(attemptID, name string, data json.RawMessage) string {
-	if len(data) == 0 {
-		return "tel_" + attemptID + "_" + name
-	}
-	sum := sha256.Sum256(data)
-	return "tel_" + attemptID + "_" + name + "_" + hex.EncodeToString(sum[:8])
+// A process nonce plus a monotonic occurrence counter also distinguishes
+// repeated data-free provider observations and retries of a failed open. IDs
+// are allocated at creation and retained by the exporter across delivery retries.
+var telemetryProcessID = rand.Text()
+var telemetryEventSequence atomic.Uint64
+
+func newTelemetryEventID() string {
+	return "tel_" + telemetryProcessID + "_" + strconv.FormatUint(telemetryEventSequence.Add(1), 10)
 }
 
 func openLatencyData(latency time.Duration) json.RawMessage {
