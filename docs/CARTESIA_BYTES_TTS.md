@@ -22,6 +22,26 @@ applied to the submitted speech text, and no private native binding fields enter
 the provider JSON. Redirects, compressed/ambiguous responses and unsupported
 success content types are refused.
 
+Native owners that must bind final input before admission can call
+`adapter.PrepareInput(request, text)`. This validates the concrete generation
+settings and creates an immutable complete provider body without credentials,
+endpoint resolution or I/O. `prepared.Text()` supplies its exact final transcript
+for the owner's input-binding check. The body and text remain private in memory;
+never store or log them as control or financial evidence.
+The opaque snapshot holds its private implementation by value, so another
+consumer sharing it cannot replace an aliased pointee after the binding check.
+External wrappers and other implementations are refused by `OpenPrepared`.
+
+After admission, `adapter.OpenPrepared(workContext, fundedRequest, prepared)`
+checks the actual endpoint and credential and requires the funded generation
+settings to produce the same provider bytes within the current input bounds.
+It then sends the original prepared bytes once. No text append or commit can
+replace them or start another utterance, even after completion. This prepared
+stream follows the work context through actual HTTP cancellation and retains
+the ordinary output and billing lifecycle. Preparation supplies no execution
+authority, idempotency guarantee, no-I/O proof or heard-audio evidence; the
+native owner must still establish those separately.
+
 Audio frames contain whole PCM samples. Only a nonempty, aligned response that
 ends cleanly publishes audio.done and a complete observation. Empty, truncated,
 oversized, failed or interrupted output cannot become complete. Header waits,
