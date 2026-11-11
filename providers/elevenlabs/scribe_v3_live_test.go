@@ -563,6 +563,40 @@ func TestScribeV3LiveDiarizedFinalsFollowTheirCommits(t *testing.T) {
 	}
 }
 
+// A diarized word sent without timing (null or absent, as the vendor's word
+// schema allows) keeps its text and speaker but carries no time, and the
+// segment's start or end is left out when its first or last word has none. A
+// genuine zero start is still a time.
+func TestScribeV3LiveDiarizedWordsKeepMissingTimingsMissing(t *testing.T) {
+	t.Parallel()
+	stream := openDiarizedScript(t, []map[string]any{
+		{"message_type": "committed_transcript", "segment_index": 0, "text": "zero null absent"},
+		{"message_type": "diarized_transcript", "segment_index": 0, "text": "zero null absent", "words": []map[string]any{
+			{"text": "zero", "start": 0, "end": 0.2, "type": "word", "speaker_id": "speaker_0"},
+			{"text": "null", "start": nil, "end": nil, "type": "word", "speaker_id": "speaker_0"},
+			{"text": "absent", "type": "word", "speaker_id": "speaker_0"},
+		}},
+		{"message_type": "committed_transcript", "segment_index": 1, "text": "late word"},
+		{"message_type": "diarized_transcript", "segment_index": 1, "text": "late word", "words": []map[string]any{
+			{"text": "late", "start": nil, "end": nil, "type": "word", "speaker_id": "speaker_1"},
+			{"text": "word", "start": 1.0, "end": 1.4, "type": "word", "speaker_id": "speaker_1"},
+		}},
+	})
+	var finals []string
+	for _, event := range drainSTTEvents(t, stream.Events()) {
+		if event.Type == protocol.EventTranscriptFinal {
+			finals = append(finals, string(event.Data))
+		}
+	}
+	want := []string{
+		`{"audio_start_ms":0,"is_final":true,"speaker":"speaker_0","speech_final":true,"text":"zero null absent","words":[{"end_ms":200,"speaker":"speaker_0","start_ms":0,"text":"zero"},{"speaker":"speaker_0","text":"null"},{"speaker":"speaker_0","text":"absent"}]}`,
+		`{"audio_end_ms":1400,"is_final":true,"speaker":"speaker_1","speech_final":true,"text":"late word","words":[{"speaker":"speaker_1","text":"late"},{"end_ms":1400,"speaker":"speaker_1","start_ms":1000,"text":"word"}]}`,
+	}
+	if !reflect.DeepEqual(finals, want) {
+		t.Fatalf("finals\n got %q\nwant %q", finals, want)
+	}
+}
+
 // A diarized_transcript without text does not erase the committed words: the
 // commit's text is the final, without speakers. Both empty is no final.
 func TestScribeV3LiveEmptyDiarizedFrameKeepsTheCommittedText(t *testing.T) {

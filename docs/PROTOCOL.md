@@ -169,7 +169,9 @@ diarized ElevenLabs Scribe v3 Live session, `transcript.final` data has the
 vendor's label as `speaker` on each entry of `words`, and as a top-level
 `speaker` when one speaker said the whole segment. A word the vendor left
 unattributed (a null speaker) has no `speaker`, and its final then has no
-top-level `speaker`. Closing the session waits up to 0.8 s for the labels of
+top-level `speaker`. A word the vendor sent without timing has no `start_ms`
+or `end_ms`, and a final whose first or last word has none has no
+`audio_start_ms` or `audio_end_ms`. Closing the session waits up to 0.8 s for the labels of
 segments the vendor already committed. A diarized final can still arrive with
 no speakers at all, when the vendor had not labelled the segment by then, the
 stream ended first, or the vendor sent no labels for it: the committed text is

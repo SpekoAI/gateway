@@ -925,11 +925,7 @@ func (s *sttStream) diarizedData(text string, words []sttWord) json.RawMessage {
 		}
 		speakers[speaker] = struct{}{}
 	}
-	if len(timings) > 0 {
-		data["words"] = timings
-		data["audio_start_ms"] = timings[0]["start_ms"]
-		data["audio_end_ms"] = timings[len(timings)-1]["end_ms"]
-	}
+	sttSetWords(data, timings)
 	if len(speakers) == 1 {
 		for speaker := range speakers {
 			if speaker != "" {
@@ -1088,25 +1084,32 @@ func sttTranscriptData(text string, final bool, words []sttWord) json.RawMessage
 	data := map[string]any{"text": text, "is_final": final, "speech_final": final}
 	// Scribe tags each token with a type and only `word` entries carry meaningful
 	// timings; `spacing` tokens would otherwise contribute zero-width ranges.
-	if timings := sttWordTimings(words); len(timings) > 0 {
-		data["words"] = timings
-		data["audio_start_ms"] = timings[0]["start_ms"]
-		data["audio_end_ms"] = timings[len(timings)-1]["end_ms"]
-	}
+	sttSetWords(data, sttWordTimings(words))
 	return sttMarshalData(data)
 }
 
 func sttAlignmentData(text string, words []sttWord) json.RawMessage {
 	data := map[string]any{"text": text}
-	if timings := sttWordTimings(words); len(timings) > 0 {
-		data["words"] = timings
-		data["audio_start_ms"] = timings[0]["start_ms"]
-		data["audio_end_ms"] = timings[len(timings)-1]["end_ms"]
-	}
+	sttSetWords(data, sttWordTimings(words))
 	return sttMarshalData(data)
 }
 
-// sttSpokenWords keeps the tokens that are words with usable timings.
+// sttSetWords adds the word timings and the span they cover: the first word's
+// start and the last word's end, each left out when that word has no time.
+func sttSetWords(data map[string]any, timings []map[string]any) {
+	if len(timings) == 0 {
+		return
+	}
+	data["words"] = timings
+	if start, timed := timings[0]["start_ms"]; timed {
+		data["audio_start_ms"] = start
+	}
+	if end, timed := timings[len(timings)-1]["end_ms"]; timed {
+		data["audio_end_ms"] = end
+	}
+}
+
+// sttSpokenWords keeps the tokens that are words.
 func sttSpokenWords(words []sttWord) []sttWord {
 	var spoken []sttWord
 	for _, word := range words {
@@ -1116,22 +1119,24 @@ func sttSpokenWords(words []sttWord) []sttWord {
 		if strings.TrimSpace(word.Text) == "" {
 			continue
 		}
-		if math.IsNaN(word.Start) || math.IsNaN(word.End) || math.IsInf(word.Start, 0) || math.IsInf(word.End, 0) {
-			continue
-		}
 		spoken = append(spoken, word)
 	}
 	return spoken
 }
 
+// sttWordTimings is each word with its time in milliseconds. A word the vendor
+// has not aligned has no time, which is not the same as time zero.
 func sttWordTimings(words []sttWord) []map[string]any {
 	var timings []map[string]any
 	for _, word := range sttSpokenWords(words) {
-		timings = append(timings, map[string]any{
-			"text":     word.Text,
-			"start_ms": sttMilliseconds(word.Start),
-			"end_ms":   sttMilliseconds(word.End),
-		})
+		timing := map[string]any{"text": word.Text}
+		if word.Start != nil {
+			timing["start_ms"] = sttMilliseconds(*word.Start)
+		}
+		if word.End != nil {
+			timing["end_ms"] = sttMilliseconds(*word.End)
+		}
+		timings = append(timings, timing)
 	}
 	return timings
 }
@@ -1150,14 +1155,15 @@ func sttMilliseconds(seconds float64) int64 {
 
 // sttWord is one token of a committed_transcript_with_timestamps or
 // diarized_transcript frame. Start and End are SECONDS, and Type distinguishes
-// `word` from `spacing`. SpeakerID is set only on a diarized session, and is
+// `word` from `spacing`. The vendor's word schema makes Start and End
+// optional and nullable. SpeakerID is set only on a diarized session, and is
 // null while the vendor has not resolved the speaker.
 type sttWord struct {
-	Text      string  `json:"text"`
-	Start     float64 `json:"start"`
-	End       float64 `json:"end"`
-	Type      string  `json:"type"`
-	SpeakerID *string `json:"speaker_id"`
+	Text      string   `json:"text"`
+	Start     *float64 `json:"start"`
+	End       *float64 `json:"end"`
+	Type      string   `json:"type"`
+	SpeakerID *string  `json:"speaker_id"`
 }
 
 type sttInboundMessage struct {
