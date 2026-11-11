@@ -92,18 +92,18 @@ var scribeGatedOptions = map[string]func(value any) ([]scribeParam, error){
 		return []scribeParam{{"numbers_format", format}}, nil
 	},
 	// The vendor wants one form field per language and rejects a JSON array,
-	// while provider options are scalars, so the caller sends "es,fr". Codes
-	// are checked for shape here because the vendor skips one it does not
-	// recognize without an error.
+	// while provider options are scalars, so the caller sends "es,fr". The
+	// vendor skips a code it does not recognize without an error, so each one
+	// must be a language scribeLanguages lists.
 	"secondary_language_codes": func(value any) ([]scribeParam, error) {
 		list, _ := value.(string)
 		var params []scribeParam
 		for _, code := range strings.Split(list, ",") {
-			code = sttLanguageCode(code)
-			if len(code) < 2 || len(code) > 3 || strings.ContainsFunc(code, func(r rune) bool { return r < 'a' || r > 'z' }) {
-				return nil, errors.New("takes comma-separated ISO 639-1 or 639-3 codes, such as \"es,fr\"")
+			language, supported := scribeLanguage(code)
+			if !supported {
+				return nil, fmt.Errorf("has %q, which is not a language Scribe supports; use comma-separated ISO 639-1 or 639-3 codes such as \"es,fr\"", strings.TrimSpace(code))
 			}
-			params = append(params, scribeParam{"secondary_language_codes", code})
+			params = append(params, scribeParam{"secondary_language_codes", language})
 		}
 		return params, nil
 	},

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -44,12 +46,85 @@ func TestScribeV3BatchFormCarriesItsOptions(t *testing.T) {
 	}
 	// One secondary_language_codes field per language: the vendor rejects a
 	// JSON array sent as a single string.
-	const want = "model_id=scribe_v3|diarize=false|timestamps_granularity=word|tag_audio_events=false|language_code=en|no_verbatim=true|numbers_format=digits|secondary_language_codes=es|secondary_language_codes=fr|secondary_language_codes=nor|file=RIFF....WAVE"
+	const want = "model_id=scribe_v3|diarize=false|timestamps_granularity=word|tag_audio_events=false|language_code=en|no_verbatim=true|numbers_format=digits|secondary_language_codes=spa|secondary_language_codes=fra|secondary_language_codes=nor|file=RIFF....WAVE"
 	if got := <-forms; got != want {
 		t.Fatalf("scribe_v3 form\n got %s\nwant %s", got, want)
 	}
 	if len(result.Billing.Operations) != 1 || result.Billing.Operations[0].Model != ModelScribeV3 || result.Billing.Operations[0].Mode != "batch" {
 		t.Fatalf("billing = %+v, want the pinned scribe_v3 in batch mode", result.Billing)
+	}
+}
+
+// Scribe skips a secondary language it does not recognize without an error,
+// so a code outside its documented languages is refused by name before the
+// upload, and an accepted one reaches the vendor as the documented ISO 639-3
+// code.
+func TestScribeV3SecondaryLanguageCodes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		codes string
+		// want is the secondary_language_codes fields the vendor receives.
+		want []string
+		// refused is the code a refusal names.
+		refused string
+	}{
+		{name: "two ISO 639-1 codes", codes: "es,fr", want: []string{"spa", "fra"}},
+		{name: "an ISO 639-3 code", codes: "nor", want: []string{"nor"}},
+		{name: "regional tags and a Norwegian alias", codes: " ES-mx ,nb-NO", want: []string{"spa", "nor"}},
+		{name: "an unknown two-letter code", codes: "zz", refused: "zz"},
+		{name: "an unknown code beside a known one", codes: "es,zz", refused: "zz"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			fields := make(chan []string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseMultipartForm(1 << 20); err != nil {
+					t.Errorf("multipart: %v", err)
+				}
+				fields <- r.MultipartForm.Value["secondary_language_codes"]
+				_, _ = w.Write([]byte(`{"language_code":"en","text":"Hola.","audio_duration_secs":1,"words":[]}`))
+			}))
+			defer server.Close()
+			adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+			if err != nil {
+				t.Fatalf("adapter: %v", err)
+			}
+			plan := batchPlan(server.URL + "/v1/speech-to-text")
+			plan.Route.Model = ModelScribeV3
+			_, err = adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{
+				Plan: plan, Options: protocol.RequestOptions{STT: elevenlabsOptions(map[string]any{"secondary_language_codes": test.codes})},
+				Audio: strings.NewReader("RIFF....WAVE"), AudioBytes: 12,
+			})
+			if test.refused != "" {
+				var providerErr *runtimepkg.ProviderError
+				if !errors.As(err, &providerErr) || providerErr.Code != "invalid_request" || !strings.Contains(providerErr.Message, `"`+test.refused+`"`) {
+					t.Fatalf("transcribe = %v, want an invalid_request naming %q", err, test.refused)
+				}
+				if len(fields) != 0 {
+					t.Fatal("the adapter uploaded a secondary language Scribe would skip")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("transcribe: %v", err)
+			}
+			if got := <-fields; !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("secondary_language_codes = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// An accepted ISO 639-1 code reaches the vendor as a language Scribe
+// documents, never as a code it would skip.
+func TestScribeISO6391CodesNameDocumentedLanguages(t *testing.T) {
+	t.Parallel()
+	for short, long := range scribeISO6391 {
+		if len(short) != 2 || !slices.Contains(scribeLanguages, long) {
+			t.Errorf("%q maps to %q, which is not on Scribe's documented 639-3 list", short, long)
+		}
 	}
 }
 
