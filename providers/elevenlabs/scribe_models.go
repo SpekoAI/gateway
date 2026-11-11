@@ -140,6 +140,12 @@ func (m scribeModel) params(id string, options *protocol.SttOptions) ([]scribePa
 		value := options.Provider("elevenlabs")[key]
 		translate, gated := scribeGatedOptions[key]
 		if !gated {
+			// The gateway refuses these names before routing. A caller that
+			// drives the adapter directly would otherwise override or repeat a
+			// parameter the adapter writes itself, past every gate above.
+			if protocol.SttOptionKeyReserved(key) || strings.EqualFold(strings.TrimSpace(key), "keyterm_library") {
+				return nil, &runtimepkg.ProviderError{Code: "invalid_request", Message: "ElevenLabs " + key + " is set by the gateway, not by provider options", Hint: "Use the diarization or keywords option, or turn_prediction, instead."}
+			}
 			params = append(params, scribeParam{key, protocol.SttOptionString(value)})
 			continue
 		}

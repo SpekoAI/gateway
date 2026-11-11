@@ -69,6 +69,8 @@ func TestScribeBatchRefusesUnsupportedOptionsBeforeUploading(t *testing.T) {
 		{name: "an unknown numbers_format", model: ModelScribeV3, settings: map[string]any{"numbers_format": "roman"}},
 		{name: "a language name instead of a code", model: ModelScribeV3, settings: map[string]any{"secondary_language_codes": "es,spanish"}},
 		{name: "an empty language list", model: ModelScribeV3, settings: map[string]any{"secondary_language_codes": ""}},
+		{name: "native diarize on v2", model: BatchModel, settings: map[string]any{"diarize": true}},
+		{name: "a second model id", model: BatchModel, settings: map[string]any{"model_id": ModelScribeV3}},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {

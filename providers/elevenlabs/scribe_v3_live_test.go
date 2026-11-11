@@ -88,6 +88,14 @@ func TestScribeRealtimeRefusesUnsupportedOptionsBeforeDialing(t *testing.T) {
 		{name: "a batch option on v3 live", model: ModelScribeV3Live, options: elevenlabsOptions(map[string]any{"numbers_format": "digits"})},
 		{name: "a flag that is not a boolean", model: ModelScribeV3Live, options: elevenlabsOptions(map[string]any{"multilang_mode": "yes"})},
 		{name: "a keyword past the library's term length", model: ModelScribeV3Live, options: &protocol.SttOptions{Keywords: []string{strings.Repeat("k", 51)}}},
+		// The settings below are the adapter's own. The gateway refuses them
+		// before routing; a caller driving the adapter directly is refused here.
+		{name: "native diarize on v2", model: ModelScribeV2Realtime, options: elevenlabsOptions(map[string]any{"diarize": true})},
+		{name: "native diarize on v3 live", model: ModelScribeV3Live, options: elevenlabsOptions(map[string]any{"diarize": true})},
+		{name: "native commit_strategy on v2", model: ModelScribeV2Realtime, options: elevenlabsOptions(map[string]any{"commit_strategy": "turn_prediction"})},
+		{name: "native commit_strategy in another case", model: ModelScribeV3Live, options: elevenlabsOptions(map[string]any{"Commit_Strategy": "manual"})},
+		{name: "native keyterm_library", model: ModelScribeV3Live, options: elevenlabsOptions(map[string]any{"keyterm_library": "Speko"})},
+		{name: "a second model id", model: ModelScribeV2Realtime, options: elevenlabsOptions(map[string]any{"model_id": ModelScribeV3Live})},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
