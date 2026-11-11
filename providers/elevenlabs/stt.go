@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -756,15 +757,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		if !s.diarize {
 			return s.emitIgnored(message.MessageType, raw)
 		}
-		s.dropPendingCommit(message.SegmentIndex)
-		if strings.TrimSpace(message.Text) == "" {
-			return nil
-		}
-		return s.emit(runtimepkg.ProviderEvent{
-			Type:       protocol.EventTranscriptFinal,
-			Data:       s.diarizedData(message.Text, message.Words),
-			Extensions: sttExtension(raw),
-		})
+		return s.resolveCommit(message, raw)
 	case "speakers_merged":
 		if !s.diarize {
 			return s.emitIgnored(message.MessageType, raw)
@@ -797,16 +790,36 @@ func (s *sttStream) emitIgnored(messageType string, raw json.RawMessage) error {
 	})
 }
 
-// dropPendingCommit forgets the commit a diarized_transcript answers. The
-// vendor sends them in commit order, so the first match is the right one even
-// if a frame arrives without its index.
-func (s *sttStream) dropPendingCommit(segmentIndex int) {
-	for i, commit := range s.pendingCommits {
-		if commit.segmentIndex == segmentIndex {
-			s.pendingCommits = append(s.pendingCommits[:i], s.pendingCommits[i+1:]...)
-			return
-		}
+// resolveCommit delivers the final for the pending commit a diarized_transcript
+// answers. The vendor sends them in commit order, so earlier commits still
+// pending will not get theirs in order; they go first, without speakers, and
+// a late frame for one of them answers nothing. A frame that answers no
+// pending commit, such as a duplicate, yields no final.
+func (s *sttStream) resolveCommit(message sttInboundMessage, raw json.RawMessage) error {
+	match := slices.IndexFunc(s.pendingCommits, func(commit sttCommit) bool { return commit.segmentIndex == message.SegmentIndex })
+	if match < 0 {
+		return nil
 	}
+	for range match {
+		if err := s.emit(heldFinal(s.pendingCommits[0].text)); err != nil {
+			return err
+		}
+		s.pendingCommits = s.pendingCommits[1:]
+	}
+	s.pendingCommits = s.pendingCommits[1:]
+	if strings.TrimSpace(message.Text) == "" {
+		return nil
+	}
+	return s.emit(runtimepkg.ProviderEvent{
+		Type:       protocol.EventTranscriptFinal,
+		Data:       s.diarizedData(message.Text, message.Words),
+		Extensions: sttExtension(raw),
+	})
+}
+
+// heldFinal is a committed segment delivered without its speakers.
+func heldFinal(text string) runtimepkg.ProviderEvent {
+	return runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: sttTranscriptData(text, true, nil)}
 }
 
 // flushPendingCommits delivers, without speakers, the committed text whose
@@ -814,8 +827,7 @@ func (s *sttStream) dropPendingCommit(segmentIndex int) {
 // would be worse than losing their labels. Only the read loop's exit calls it.
 func (s *sttStream) flushPendingCommits() {
 	for _, commit := range s.pendingCommits {
-		event := runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: sttTranscriptData(commit.text, true, nil)}
-		if !s.emitBounded(event, sttFinalBillingTimeout) {
+		if !s.emitBounded(heldFinal(commit.text), sttFinalBillingTimeout) {
 			return
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
@@ -384,6 +385,105 @@ func TestScribeV3LiveDeliversACommitWhoseSpeakersNeverArrived(t *testing.T) {
 	}
 	if events[2].Type != protocol.EventUsageObserved || events[2].Billing == nil || !events[2].Billing.Complete {
 		t.Fatalf("last event = %+v, want the complete billing observation", events[2])
+	}
+}
+
+// openDiarizedScript opens a diarized scribe_v3_live session against a server
+// that sends script and then closes the socket normally.
+func openDiarizedScript(t *testing.T, script []map[string]any) runtimepkg.ProviderStream {
+	t.Helper()
+	diarize := true
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		for _, message := range script {
+			if err := writeSTTJSON(ctx, conn, message); err != nil {
+				t.Errorf("write %v: %v", message["message_type"], err)
+				return
+			}
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	t.Cleanup(server.Close)
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), scribeLiveRequest(server.URL, ModelScribeV3Live, &protocol.SttOptions{Diarization: &diarize}))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	return stream
+}
+
+// drainSTTEvents reads events until the stream closes its channel.
+func drainSTTEvents(t *testing.T, events <-chan runtimepkg.ProviderEvent) []runtimepkg.ProviderEvent {
+	t.Helper()
+	var result []runtimepkg.ProviderEvent
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return result
+			}
+			if event.Err != nil {
+				t.Fatalf("provider event error: %v", event.Err)
+			}
+			result = append(result, event)
+		case <-timer.C:
+			t.Fatalf("events still open after %d events", len(result))
+		}
+	}
+}
+
+// finalTexts renders each transcript final as text, with "@speaker" when it
+// names one, in delivery order.
+func finalTexts(t *testing.T, events []runtimepkg.ProviderEvent) []string {
+	t.Helper()
+	var texts []string
+	for _, event := range events {
+		if event.Type != protocol.EventTranscriptFinal {
+			continue
+		}
+		var final struct {
+			Text    string `json:"text"`
+			Speaker string `json:"speaker"`
+		}
+		if err := json.Unmarshal(event.Data, &final); err != nil {
+			t.Fatalf("decode final %s: %v", event.Data, err)
+		}
+		if final.Speaker != "" {
+			final.Text += "@" + final.Speaker
+		}
+		texts = append(texts, final.Text)
+	}
+	return texts
+}
+
+func diarizedFrame(segment int, text string, speaker string) map[string]any {
+	var words []map[string]any
+	if text != "" {
+		words = []map[string]any{{"text": text, "start": 0.1, "end": 0.4, "type": "word", "speaker_id": speaker}}
+	}
+	return map[string]any{"message_type": "diarized_transcript", "segment_index": segment, "text": text, "words": words}
+}
+
+// A diarized_transcript yields a final only for a commit still waiting for
+// it, and finals keep commit order: a frame for a later commit releases the
+// earlier ones without speakers, since theirs are not coming in order.
+func TestScribeV3LiveDiarizedFinalsFollowTheirCommits(t *testing.T) {
+	t.Parallel()
+	stream := openDiarizedScript(t, []map[string]any{
+		{"message_type": "committed_transcript", "segment_index": 0, "text": "A"},
+		{"message_type": "committed_transcript", "segment_index": 1, "text": "B"},
+		diarizedFrame(1, "B", "speaker_1"),
+		diarizedFrame(1, "B", "speaker_1"),
+		diarizedFrame(0, "A", "speaker_0"),
+		diarizedFrame(7, "Z", "speaker_0"),
+	})
+	got := finalTexts(t, drainSTTEvents(t, stream.Events()))
+	if want := []string{"A", "B@speaker_1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("finals = %q, want %q", got, want)
 	}
 }
 
