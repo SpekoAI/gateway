@@ -28,6 +28,9 @@ settings and creates an immutable complete provider body without credentials,
 endpoint resolution or I/O. `prepared.Text()` supplies its exact final transcript
 for the owner's input-binding check. The body and text remain private in memory;
 never store or log them as control or financial evidence.
+The opaque snapshot holds its private implementation by value, so another
+consumer sharing it cannot replace an aliased pointee after the binding check.
+External wrappers and other implementations are refused by `OpenPrepared`.
 
 After admission, `adapter.OpenPrepared(workContext, fundedRequest, prepared)`
 checks the actual endpoint and credential and requires the funded generation

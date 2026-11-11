@@ -70,7 +70,7 @@ func TestPreparedBytesTTSFreezesFinalProviderBodyBeforeCredentialsOrIO(t *testin
 		t.Fatal("prepared operation lost its actual output/billing lifecycle")
 	}
 	actual := <-bodies
-	if <-rawBodies != input.payload || actual.Input != input.Text() || actual.Model != "sonic-3.6" || actual.Voice != "voice-id" || actual.Language != "en" || actual.Normalization != "off" || actual.OutputFormat.SampleRate != 24000 {
+	if <-rawBodies != input.(preparedBytesTTSInput).payload || actual.Input != input.Text() || actual.Model != "sonic-3.6" || actual.Voice != "voice-id" || actual.Language != "en" || actual.Normalization != "off" || actual.OutputFormat.SampleRate != 24000 {
 		t.Fatal("the actual provider body differs from the immutable prepared input")
 	}
 	for _, err := range []error{stream.AppendText(context.Background(), "another"), stream.CommitText(context.Background())} {
@@ -187,7 +187,7 @@ func TestPreparedBytesTTSRejectsInvalidInputAndUnavailablePreparation(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, unavailable := range []*PreparedBytesTTSInput{nil, {}} {
+	for _, unavailable := range []PreparedBytesTTSInput{nil, preparedBytesTTSInput{}} {
 		if stream, err := adapter.OpenPrepared(context.Background(), request, unavailable); err == nil || stream != nil {
 			t.Fatal("missing preparation fell back to ordinary input")
 		}

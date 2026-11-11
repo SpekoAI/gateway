@@ -13,26 +13,32 @@ import (
 
 // PreparedBytesTTSInput holds the complete final provider body in private memory.
 // It supplies no execution permission or credential and must never be logged.
-// Only PrepareInput can produce a valid instance; fields remain immutable.
-type PreparedBytesTTSInput struct {
+// Only PrepareInput can produce a valid instance. The private implementation is
+// held by value: even a shared consumer cannot overwrite an aliased pointee.
+type PreparedBytesTTSInput interface {
+	// Text is the exact final transcript encoded in the provider body.
+	Text() string
+	preparedBytesTTSInput()
+}
+
+type preparedBytesTTSInput struct {
 	payload    string
 	text       string
 	characters int64
 }
 
+func (preparedBytesTTSInput) preparedBytesTTSInput() {}
+
 // Text returns the exact final transcript encoded in the provider body. A native
 // execution owner can bind it before funding, then forward the prepared body.
-func (p *PreparedBytesTTSInput) Text() string {
-	if p == nil {
-		return ""
-	}
+func (p preparedBytesTTSInput) Text() string {
 	return p.text
 }
 
 // PrepareInput applies every input rewrite and validates the concrete model,
 // media, generation options and bounds without credentials or any provider I/O.
 // OpenPrepared verifies the later funded settings and sends these same bytes.
-func (a *BytesTTSAdapter) PrepareInput(request runtimepkg.AdapterRequest, text string) (*PreparedBytesTTSInput, error) {
+func (a *BytesTTSAdapter) PrepareInput(request runtimepkg.AdapterRequest, text string) (PreparedBytesTTSInput, error) {
 	if a == nil {
 		return nil, errors.New("cartesia bytes tts: missing adapter")
 	}
@@ -40,15 +46,22 @@ func (a *BytesTTSAdapter) PrepareInput(request runtimepkg.AdapterRequest, text s
 	if err != nil {
 		return nil, err
 	}
-	return prepareBytesTTSInput(input, text, a.config.MaxInputBytes, request.Options.MaxInputCharacters)
+	prepared, err := prepareBytesTTSInput(input, text, a.config.MaxInputBytes, request.Options.MaxInputCharacters)
+	if err != nil {
+		return nil, err
+	}
+	return prepared, nil
 }
 
 // OpenPrepared starts exactly one prepared operation after ordinary credential
 // and endpoint checks. Changed funded settings refuse before provider I/O. The
 // returned stream rejects AppendText and CommitText, including after completion;
 // its cancellation, output and billing lifecycle are the ordinary bytes stream.
-func (a *BytesTTSAdapter) OpenPrepared(ctx context.Context, request runtimepkg.AdapterRequest, input *PreparedBytesTTSInput) (runtimepkg.ProviderStream, error) {
-	if a == nil || input == nil || input.payload == "" {
+func (a *BytesTTSAdapter) OpenPrepared(ctx context.Context, request runtimepkg.AdapterRequest, prepared PreparedBytesTTSInput) (runtimepkg.ProviderStream, error) {
+	// A consumer may embed the interface and override Text. Only the exact
+	// private value returned by PrepareInput may reach validation or dispatch.
+	input, ok := prepared.(preparedBytesTTSInput)
+	if a == nil || !ok || input.payload == "" {
 		return nil, errors.New("cartesia bytes tts: missing prepared input")
 	}
 	if err := ctx.Err(); err != nil {
@@ -108,21 +121,21 @@ func bytesTTSInputTemplate(request runtimepkg.AdapterRequest) (bytesSpeechReques
 		OutputFormat: outputFormat{Container: "raw", Encoding: "pcm_s16le", SampleRate: rate}}, nil
 }
 
-func prepareBytesTTSInput(input bytesSpeechRequest, text string, maximumBytes int, maximumCharacters int64) (*PreparedBytesTTSInput, error) {
+func prepareBytesTTSInput(input bytesSpeechRequest, text string, maximumBytes int, maximumCharacters int64) (preparedBytesTTSInput, error) {
 	if len(text) > maximumBytes {
-		return nil, bytesInputTooLarge()
+		return preparedBytesTTSInput{}, bytesInputTooLarge()
 	}
 	if !utf8.ValidString(text) || strings.TrimSpace(text) == "" {
-		return nil, errors.New("cartesia bytes tts text must be nonempty UTF-8")
+		return preparedBytesTTSInput{}, errors.New("cartesia bytes tts text must be nonempty UTF-8")
 	}
 	characters := int64(utf8.RuneCountInString(text))
 	if maximumCharacters > 0 && characters > maximumCharacters {
-		return nil, bytesInputTooLarge()
+		return preparedBytesTTSInput{}, bytesInputTooLarge()
 	}
 	input.Input = text
 	payload, err := json.Marshal(input)
 	if err != nil {
-		return nil, errors.New("cartesia bytes tts could not prepare input")
+		return preparedBytesTTSInput{}, errors.New("cartesia bytes tts could not prepare input")
 	}
-	return &PreparedBytesTTSInput{payload: string(payload), text: input.Input, characters: characters}, nil
+	return preparedBytesTTSInput{payload: string(payload), text: input.Input, characters: characters}, nil
 }
