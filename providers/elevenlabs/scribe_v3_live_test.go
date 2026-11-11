@@ -853,6 +853,96 @@ func TestScribeV3LiveCloseWaitsForSpeakersInFlight(t *testing.T) {
 	}
 }
 
+// A consumer that stops reading while a diarized final is going out, with the
+// event buffer full, holds Close no longer than its bound: the speakers wait
+// and then the attempt to hand over the billing observation. Once the consumer
+// reads again it gets the finals in order and then the billing observation.
+func TestScribeV3LiveCloseIsBoundedWhileTheConsumerStalls(t *testing.T) {
+	t.Parallel()
+	diarize := true
+	cases := []struct {
+		name   string
+		script []map[string]any
+		want   []string
+	}{
+		{
+			name:   "the speakers timer is releasing a final",
+			script: []map[string]any{commitFrame(0, "A"), partialFrame("B so"), commitFrame(1, "B"), partialFrame("C so")},
+			want:   []string{"final A", "delta B so", "final B", "delta C so", "billing"},
+		},
+		{
+			name:   "the read loop is releasing a final",
+			script: []map[string]any{commitFrame(0, "A"), partialFrame("B so"), diarizedFrame(0, "A", "speaker_0")},
+			want:   []string{"final A@speaker_0", "delta B so", "billing"},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+				script := append([]map[string]any{{"message_type": "session_started", "session_id": "el-live-stall"}}, test.script...)
+				for _, message := range script {
+					if err := writeSTTJSON(ctx, conn, message); err != nil {
+						t.Errorf("write: %v", err)
+						return
+					}
+				}
+				for {
+					frame, err := readSTTJSON(ctx, conn)
+					if err != nil {
+						return
+					}
+					if frame["commit"] == true {
+						break
+					}
+				}
+				_ = conn.Close(websocket.StatusNormalClosure, "")
+			})
+			defer server.Close()
+			config := sttTestConfig(server.URL)
+			config.EventBuffer = 1
+			adapter, err := NewSTT(config)
+			if err != nil {
+				t.Fatalf("new STT adapter: %v", err)
+			}
+			providerStream, err := adapter.Open(context.Background(), scribeLiveRequest(server.URL, ModelScribeV3Live, &protocol.SttOptions{Diarization: &diarize}))
+			if err != nil {
+				t.Fatalf("open stream: %v", err)
+			}
+			defer providerStream.(runtimepkg.AbortingProviderStream).Abort(context.Background())
+			stream := providerStream.(*sttStream)
+			collectSTTEvents(t, stream.Events(), 1)
+			if err := stream.WriteAudio(context.Background(), make([]byte, 320)); err != nil {
+				t.Fatalf("write audio: %v", err)
+			}
+			// The first final fills the one slot, so whoever sends it blocks on
+			// the partial behind it.
+			deadline := time.Now().Add(2 * sttSpeakersTimeout)
+			for len(stream.events) < cap(stream.events) {
+				if time.Now().After(deadline) {
+					t.Fatal("no final filled the event buffer")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			closed := make(chan error, 1)
+			began := time.Now()
+			go func() { closed <- stream.Close(context.Background()) }()
+			bound := sttSpeakersTimeout + sttCloseBillingTimeout
+			select {
+			case err := <-closed:
+				if err != nil {
+					t.Fatalf("close: %v", err)
+				}
+			case <-time.After(bound + time.Second):
+				t.Fatalf("Close still running %v after it began, past its %v bound, while the consumer stalled", time.Since(began), bound)
+			}
+			if got := eventOrder(t, drainSTTEvents(t, stream.Events())); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("after the consumer resumed = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 // awaitHeld waits until a diarized stream holds count events, which the
 // consumer cannot see while a commit ahead of them waits for its speakers.
 func awaitHeld(t *testing.T, stream runtimepkg.ProviderStream, count int) {

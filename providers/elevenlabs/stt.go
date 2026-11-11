@@ -166,12 +166,13 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &sttStream{
-		conn:   conn,
-		ctx:    streamCtx,
-		cancel: cancel,
-		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer),
-		rate:   request.Media.SampleRateHz,
-		model:  request.Plan.Route.Model,
+		conn:     conn,
+		ctx:      streamCtx,
+		cancel:   cancel,
+		events:   make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		sendTurn: make(chan struct{}, 1),
+		rate:     request.Media.SampleRateHz,
+		model:    request.Plan.Route.Model,
 
 		keytermLibrary: session.keytermLibrary,
 		diarize:        session.diarize,
@@ -367,12 +368,17 @@ type sttStream struct {
 	// sentBytes is the PCM written to the socket. Scribe reports no audio
 	// count on the realtime socket, so this is the billed duration.
 	sentBytes atomic.Int64
-	// billingMu orders the two billing emits, so a late session_started
-	// cannot follow the complete observation with an incomplete one. It also
-	// guards eventsClosed: Close emits from the caller's goroutine and must
-	// not send after readLoop has closed the channel. And it guards held, so
-	// a commit received before the complete observation is delivered before
-	// it.
+	// sendTurn admits one sender at a time for the billing observations,
+	// held events and, on a diarized session, everything the read loop
+	// delivers, so they reach the consumer in order: a late session_started
+	// cannot follow the complete observation with an incomplete one, and a
+	// commit received before the complete observation goes out before it.
+	// readLoop closes the channel while holding it, so no holder sends after
+	// that. It is a channel rather than a mutex so Close can stop waiting for
+	// a holder that a stalled consumer blocks.
+	sendTurn chan struct{}
+	// billingMu guards sessionID, billed, eventsClosed, held and
+	// speakersTimer. It is never held across a send.
 	billingMu sync.Mutex
 	// endedErr is why the provider side ended input, set before closed when
 	// the read loop exits with input still open. A refused write returns it,
@@ -390,10 +396,9 @@ type sttStream struct {
 	diarize        bool
 	// held is what a diarized session has not yet given the consumer, in the
 	// vendor's order: a commit waiting for its diarized_transcript first, then
-	// everything received after it. Guarded by billingMu.
+	// everything received after it. Only the send turn's holder changes it.
 	held []sttHeld
 	// speakersTimer releases the commit at the head of held once it is due.
-	// Guarded by billingMu.
 	speakersTimer *time.Timer
 	// speakerMerges maps a speaker id the vendor merged away to the id it
 	// merged into. Touched only by the read loop.
@@ -512,19 +517,19 @@ func (s *sttStream) closeInput(ctx context.Context, speakersTimeout time.Duratio
 // awaitSpeakers waits, up to timeout, until no commit is held for its
 // speakers, so a diarized_transcript the read loop is still receiving labels
 // its final before emitCompleteBilling sends the commit without them. It
-// returns at once when nothing is held. It polls rather than holding
+// returns at once when no commit waits. It polls rather than holding
 // billingMu, which the read loop needs to deliver the final.
 func (s *sttStream) awaitSpeakers(timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
-	for s.holding() && time.Now().Before(deadline) {
+	for s.awaitingSpeakers() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-func (s *sttStream) holding() bool {
+func (s *sttStream) awaitingSpeakers() bool {
 	s.billingMu.Lock()
 	defer s.billingMu.Unlock()
-	return len(s.held) > 0 && !s.eventsClosed
+	return !s.eventsClosed && slices.ContainsFunc(s.held, sttHeld.waiting)
 }
 
 // emitCompleteBilling hands the complete observation to the consumer exactly
@@ -544,22 +549,38 @@ func (s *sttStream) holding() bool {
 // diarized_transcript for one of them then answers nothing. If the consumer
 // stalls before taking them all, the observation waits for the read loop's
 // retry rather than overtake them.
+//
+// timeout bounds the whole attempt, including the wait for a sender the
+// stalled consumer is blocking, so a consumer that never reads again holds
+// Close for timeout at most.
 func (s *sttStream) emitCompleteBilling(timeout time.Duration, requireAudio bool) {
+	attempt, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if !s.takeTurn(attempt.Done()) {
+		return
+	}
+	defer s.releaseTurn()
+	s.completeBilling(attempt.Done(), requireAudio)
+}
+
+// completeBilling is emitCompleteBilling for a caller that holds the send
+// turn, giving up once stop closes.
+func (s *sttStream) completeBilling(stop <-chan struct{}, requireAudio bool) {
+	if !s.sendHeld(true, stop) {
+		return
+	}
 	s.billingMu.Lock()
-	defer s.billingMu.Unlock()
-	if s.eventsClosed {
-		return
-	}
-	for len(s.held) > 0 {
-		if !s.emitBounded(s.held[0].event, timeout) {
-			return
-		}
-		s.held = s.held[1:]
-	}
 	if s.billed || (requireAudio && s.sentBytes.Load() == 0 && s.sessionID == "") {
+		s.billingMu.Unlock()
 		return
 	}
-	s.billed = s.emitBounded(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billing(true)}, timeout)
+	observation := s.billing(true)
+	s.billingMu.Unlock()
+	if s.sendUntil(stop, runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: observation}) {
+		s.billingMu.Lock()
+		s.billed = true
+		s.billingMu.Unlock()
+	}
 }
 
 // awaitWrites waits, up to timeout, for a write in flight to finish, so the
@@ -673,7 +694,13 @@ func (s *sttStream) readLoop() {
 		}
 		s.closed.Store(true)
 		s.awaitWrites(sttWriteSettleTimeout)
-		s.emitCompleteBilling(sttFinalBillingTimeout, true)
+		// Another holder lets the turn go once its event is taken, Abort
+		// cancels s.ctx, or Close's bound passes.
+		s.sendTurn <- struct{}{}
+		defer s.releaseTurn()
+		final, cancel := context.WithTimeout(context.Background(), sttFinalBillingTimeout)
+		s.completeBilling(final.Done(), true)
+		cancel()
 		if terminal != nil {
 			// Bounded like the billing send rather than tied to s.ctx, so a
 			// Cancel that aborts meanwhile cannot drop the failure.
@@ -729,13 +756,17 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// an ALREADY-OPEN socket, so readiness has to wait for this rather than fire
 		// at dial — otherwise those failures look like mid-stream errors and the
 		// runtime loses its open-failure failover.
+		if !s.takeTurn(s.ctx.Done()) {
+			return s.ctx.Err()
+		}
+		defer s.releaseTurn()
 		s.billingMu.Lock()
-		defer s.billingMu.Unlock()
 		var observation *protocol.BillingObservation
 		if !s.billed {
 			s.sessionID = message.SessionID
 			observation = s.billing(false)
 		}
+		s.billingMu.Unlock()
 		return s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventUsageObserved,
 			Data:       sttMarshalData(map[string]any{"provider_request_id": message.SessionID}),
@@ -767,11 +798,9 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			// every commit, and the final waits for it. resolveCommit,
 			// releaseDueCommit and emitCompleteBilling say when a commit goes
 			// out without them.
-			s.billingMu.Lock()
-			defer s.billingMu.Unlock()
-			s.held = append(s.held, sttHeld{event: heldFinal(message.Text), segment: message.SegmentIndex, due: time.Now().Add(sttSpeakersTimeout)})
-			s.resetSpeakersTimer()
-			return nil
+			return s.updateHeld(func() {
+				s.held = append(s.held, sttHeld{event: heldFinal(message.Text), segment: message.SegmentIndex, due: time.Now().Add(sttSpeakersTimeout)})
+			})
 		}
 		if s.consumeTimedFinal(message.Text) {
 			// The timestamped twin already carried both text and alignment.
@@ -849,20 +878,10 @@ func (s *sttStream) emitIgnored(messageType string, raw json.RawMessage) error {
 // until that commit's final goes out, so a later segment's partial cannot
 // overtake an earlier segment's final.
 func (s *sttStream) deliver(event runtimepkg.ProviderEvent) error {
-	if s.diarize && s.holdBehindCommit(event) {
-		return nil
+	if !s.diarize {
+		return s.emit(event)
 	}
-	return s.emit(event)
-}
-
-func (s *sttStream) holdBehindCommit(event runtimepkg.ProviderEvent) bool {
-	s.billingMu.Lock()
-	defer s.billingMu.Unlock()
-	if len(s.held) == 0 {
-		return false
-	}
-	s.held = append(s.held, sttHeld{event: event})
-	return true
+	return s.updateHeld(func() { s.held = append(s.held, sttHeld{event: event}) })
 }
 
 // resolveCommit gives the commit a diarized_transcript answers its speakers
@@ -873,22 +892,21 @@ func (s *sttStream) holdBehindCommit(event runtimepkg.ProviderEvent) bool {
 // without speakers, yields no final, and one without text delivers the
 // commit's text without speakers.
 func (s *sttStream) resolveCommit(message sttInboundMessage, raw json.RawMessage) error {
-	s.billingMu.Lock()
-	defer s.billingMu.Unlock()
-	match := slices.IndexFunc(s.held, func(held sttHeld) bool { return held.waiting() && held.segment == message.SegmentIndex })
-	if match < 0 {
-		return nil
-	}
-	for index := range s.held[:match] {
-		s.held[index].due = time.Time{}
-	}
-	resolved := &s.held[match]
-	if strings.TrimSpace(message.Text) != "" {
-		resolved.event.Data = s.diarizedData(message.Text, message.Words)
-	}
-	resolved.event.Extensions = sttExtension(raw)
-	resolved.due = time.Time{}
-	return s.releaseHeld()
+	return s.updateHeld(func() {
+		match := slices.IndexFunc(s.held, func(held sttHeld) bool { return held.waiting() && held.segment == message.SegmentIndex })
+		if match < 0 {
+			return
+		}
+		for index := range s.held[:match] {
+			s.held[index].due = time.Time{}
+		}
+		resolved := &s.held[match]
+		if strings.TrimSpace(message.Text) != "" {
+			resolved.event.Data = s.diarizedData(message.Text, message.Words)
+		}
+		resolved.event.Extensions = sttExtension(raw)
+		resolved.due = time.Time{}
+	})
 }
 
 // releaseDueCommit runs on the speakers timer. It sends the commit at the head
@@ -896,33 +914,73 @@ func (s *sttStream) resolveCommit(message sttInboundMessage, raw json.RawMessage
 // the next commit still waiting. A timer that fired for a head released
 // meanwhile finds the new head not yet due and only re-arms.
 func (s *sttStream) releaseDueCommit() {
-	s.billingMu.Lock()
-	defer s.billingMu.Unlock()
-	if s.eventsClosed {
-		return
-	}
-	if len(s.held) > 0 && s.held[0].waiting() && !time.Now().Before(s.held[0].due) {
-		s.held[0].due = time.Time{}
-	}
 	// A send fails only once Abort has cancelled the stream, and the read
 	// loop's exit then delivers what is still held.
-	_ = s.releaseHeld()
+	_ = s.updateHeld(func() {
+		if len(s.held) > 0 && s.held[0].waiting() && !time.Now().Before(s.held[0].due) {
+			s.held[0].due = time.Time{}
+		}
+	})
 }
 
-// releaseHeld delivers held events up to the next commit still waiting and
-// points the speakers timer at that commit. The caller holds billingMu across
-// the sends, so the read loop, the timer and Close's complete observation
-// cannot interleave their deliveries.
-func (s *sttStream) releaseHeld() error {
-	for len(s.held) > 0 && !s.held[0].waiting() {
-		if err := s.emit(s.held[0].event); err != nil {
-			return err
+// updateHeld applies change to held and then sends held events up to the
+// next commit still waiting, holding the send turn throughout so the read
+// loop, the timer and Close's complete observation cannot interleave their
+// sends. A consumer that stops reading blocks it until it reads again or
+// Abort cancels the stream.
+func (s *sttStream) updateHeld(change func()) error {
+	if !s.takeTurn(s.ctx.Done()) {
+		return s.ctx.Err()
+	}
+	defer s.releaseTurn()
+	s.billingMu.Lock()
+	change()
+	s.billingMu.Unlock()
+	if !s.sendHeld(false, s.ctx.Done()) {
+		return s.ctx.Err()
+	}
+	return nil
+}
+
+// sendHeld sends held events in order up to the next commit still waiting
+// for its speakers, or every one with all, and then points the speakers timer
+// at what is left. It reports false once stop closes, leaving the event it
+// was sending held. The caller holds the send turn.
+func (s *sttStream) sendHeld(all bool, stop <-chan struct{}) bool {
+	s.billingMu.Lock()
+	defer s.billingMu.Unlock()
+	for len(s.held) > 0 && (all || !s.held[0].waiting()) {
+		event := s.held[0].event
+		s.billingMu.Unlock()
+		sent := s.sendUntil(stop, event)
+		s.billingMu.Lock()
+		if !sent {
+			return false
 		}
 		s.held = s.held[1:]
 	}
 	s.resetSpeakersTimer()
-	return nil
+	return true
 }
+
+// takeTurn waits for the send turn until stop closes, and reports whether it
+// holds the turn with the event channel still open.
+func (s *sttStream) takeTurn(stop <-chan struct{}) bool {
+	select {
+	case s.sendTurn <- struct{}{}:
+	case <-stop:
+		return false
+	}
+	s.billingMu.Lock()
+	open := !s.eventsClosed
+	s.billingMu.Unlock()
+	if !open {
+		s.releaseTurn()
+	}
+	return open
+}
+
+func (s *sttStream) releaseTurn() { <-s.sendTurn }
 
 // resetSpeakersTimer points the speakers timer at the commit at the head of
 // held, or stops it when no commit waits there. The caller holds billingMu.
@@ -1028,10 +1086,20 @@ func consumeFinal(finals *[]string, text string) bool {
 	return false
 }
 
+// sendUntil hands event to the consumer unless stop closes first, and reports
+// whether the consumer took it. The caller holds the send turn.
+func (s *sttStream) sendUntil(stop <-chan struct{}, event runtimepkg.ProviderEvent) bool {
+	select {
+	case s.events <- event:
+		return true
+	case <-stop:
+		return false
+	}
+}
+
 // emitBounded delivers a teardown event, waiting at most timeout for a
 // consumer, and reports whether one took it. The caller is the read loop's
-// exit, before it closes the channel, or holds billingMu with eventsClosed
-// unset.
+// exit, before it closes the channel.
 func (s *sttStream) emitBounded(event runtimepkg.ProviderEvent, timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
