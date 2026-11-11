@@ -487,6 +487,22 @@ func TestScribeV3LiveDiarizedFinalsFollowTheirCommits(t *testing.T) {
 	}
 }
 
+// A diarized_transcript without text does not erase the committed words: the
+// commit's text is the final, without speakers. Both empty is no final.
+func TestScribeV3LiveEmptyDiarizedFrameKeepsTheCommittedText(t *testing.T) {
+	t.Parallel()
+	stream := openDiarizedScript(t, []map[string]any{
+		{"message_type": "committed_transcript", "segment_index": 0, "text": "hello"},
+		diarizedFrame(0, "", ""),
+		{"message_type": "committed_transcript", "segment_index": 1, "text": ""},
+		diarizedFrame(1, "", ""),
+	})
+	got := finalTexts(t, drainSTTEvents(t, stream.Events()))
+	if want := []string{"hello"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("finals = %q, want %q", got, want)
+	}
+}
+
 // The diarization frames mean nothing on a session that did not ask for
 // speakers, so they stay visible as ignored frames and a commit is a final.
 func TestScribeV3LiveWithoutDiarizationFinalizesOnTheCommit(t *testing.T) {

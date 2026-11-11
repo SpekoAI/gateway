@@ -794,7 +794,8 @@ func (s *sttStream) emitIgnored(messageType string, raw json.RawMessage) error {
 // answers. The vendor sends them in commit order, so earlier commits still
 // pending will not get theirs in order; they go first, without speakers, and
 // a late frame for one of them answers nothing. A frame that answers no
-// pending commit, such as a duplicate, yields no final.
+// pending commit, such as a duplicate, yields no final, and one without text
+// delivers the commit's text without speakers.
 func (s *sttStream) resolveCommit(message sttInboundMessage, raw json.RawMessage) error {
 	match := slices.IndexFunc(s.pendingCommits, func(commit sttCommit) bool { return commit.segmentIndex == message.SegmentIndex })
 	if match < 0 {
@@ -806,15 +807,16 @@ func (s *sttStream) resolveCommit(message sttInboundMessage, raw json.RawMessage
 		}
 		s.pendingCommits = s.pendingCommits[1:]
 	}
-	s.pendingCommits = s.pendingCommits[1:]
-	if strings.TrimSpace(message.Text) == "" {
-		return nil
+	event := heldFinal(s.pendingCommits[0].text)
+	if strings.TrimSpace(message.Text) != "" {
+		event.Data = s.diarizedData(message.Text, message.Words)
 	}
-	return s.emit(runtimepkg.ProviderEvent{
-		Type:       protocol.EventTranscriptFinal,
-		Data:       s.diarizedData(message.Text, message.Words),
-		Extensions: sttExtension(raw),
-	})
+	event.Extensions = sttExtension(raw)
+	if err := s.emit(event); err != nil {
+		return err
+	}
+	s.pendingCommits = s.pendingCommits[1:]
+	return nil
 }
 
 // heldFinal is a committed segment delivered without its speakers.
