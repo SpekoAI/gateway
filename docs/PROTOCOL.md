@@ -164,6 +164,28 @@ an unfinished utterance (for example, Deepgram Nova's `is_final: true,
 speech_final: false`). Do not infer utterance completion from `is_final` alone,
 and do not substitute `speech.ended`, which can precede the last transcript.
 
+Transcript data may also carry fields only some providers produce. On a
+diarized ElevenLabs Scribe v3 Live session, `transcript.final` data has the
+vendor's label as `speaker` on each entry of `words`, and as a top-level
+`speaker` when one speaker said the whole segment. A word the vendor left
+unattributed (a null speaker) has no `speaker`, and its final then has no
+top-level `speaker`. A word the vendor sent without timing has no `start_ms`
+or `end_ms`, and a final whose first or last word has none has no
+`audio_start_ms` or `audio_end_ms`. A segment's final waits at most 0.8 s
+after its commit for the labels, also while the session closes. A diarized
+final can still arrive with no speakers at all, when the vendor had not
+labelled the segment within 0.8 s, the stream ended first, or the vendor sent
+no labels for it: the committed text is delivered without them rather than
+dropped, and labels the vendor sends later are ignored. Events that follow a
+segment's commit wait for that segment's final, so a later `transcript.delta`
+never precedes an earlier segment's `transcript.final`, and none waits longer
+than 0.8 s. A later `warning` event with `provider_type: "speakers_merged"`,
+`from_speaker` and `to_speaker` means
+the provider decided two labels are one person. There is no event that
+rewrites a delivered transcript, so a client that stores speakers applies the
+merge itself. Scribe v3 Live `transcript.delta` data carries the vendor's
+`turn_probability`, the estimated chance that the speaker has finished.
+
 ### Realtime sessions: OpenAI Realtime and GPT-Live
 
 `kind: "realtime"` opens a speech-to-speech session. The setup body carries

@@ -84,3 +84,8 @@ func TestRealtimeEndpointAliasesNorwegianToScribeCode(t *testing.T) {
 		}
 	}
 }
+
+func realtimeEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat) (string, error) {
+	session, err := planRealtime(policy, rawEndpoint, model, options, media)
+	return session.endpoint, err
+}

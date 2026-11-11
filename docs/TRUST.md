@@ -349,6 +349,24 @@ its `canonical_record` keeps its observation incomplete, carrying the audio
 bytes sent as an estimate rather than settling as complete; an upload
 without `duration` leaves incomplete evidence.
 
+### ElevenLabs Scribe transcription
+
+Realtime Scribe sessions send the session's audio to the validated ElevenLabs
+host with the model, audio format, language and commit strategy in the
+connection URL. Caller keywords travel as `keyterms` in that URL. On
+`scribe_v3_live`, keywords past the URL's limit of 50 terms of 20 characters
+travel instead as `keyterm_library` inside the first audio message, and the
+URL also carries `diarize`, `multilang_mode` or the turn-prediction commit
+strategy when the caller asked for them. Prerecorded uploads send the WAV
+file, model, language, keywords and the caller's ElevenLabs settings as form
+fields; on `scribe_v3` those can include `numbers_format` and
+`secondary_language_codes`, the other languages the caller expects in the
+audio. A BYOK or relay key travels in the `xi-api-key` header; a managed
+single-use token travels in the URL, which is never logged. Billing
+observations carry an opaque operation ID, the ElevenLabs session or
+transcription ID, the model, the mode and the audio duration. They contain no
+audio, transcript, keywords or speaker labels.
+
 ### Soniox usage attribution
 
 Soniox realtime STT and TTS requests using relay or managed plans include
