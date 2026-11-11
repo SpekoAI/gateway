@@ -364,7 +364,9 @@ type sttStream struct {
 	// billingMu orders the two billing emits, so a late session_started
 	// cannot follow the complete observation with an incomplete one. It also
 	// guards eventsClosed: Close emits from the caller's goroutine and must
-	// not send after readLoop has closed the channel.
+	// not send after readLoop has closed the channel. And it guards
+	// pendingCommits, so a commit received before the complete observation
+	// is delivered before it.
 	billingMu sync.Mutex
 	// endedErr is why the provider side ended input, set before closed when
 	// the read loop exits with input still open. A refused write returns it,
@@ -379,13 +381,12 @@ type sttStream struct {
 	// vendor closes the socket on a library in any later chunk. Guarded by
 	// writeMu, so two concurrent writers cannot both be first.
 	keytermLibrary []string
-	// The diarization state below is touched only by the read loop.
-	diarize bool
+	diarize        bool
 	// pendingCommits are committed segments whose diarized_transcript has not
-	// arrived, in commit order.
+	// arrived, in commit order. Guarded by billingMu.
 	pendingCommits []sttCommit
 	// speakerMerges maps a speaker id the vendor merged away to the id it
-	// merged into.
+	// merged into. Touched only by the read loop.
 	speakerMerges map[string]string
 }
 
@@ -495,20 +496,28 @@ func (s *sttStream) Close(ctx context.Context) error {
 // With requireAudio, a stream that never started and sent no PCM reports
 // nothing, so a failure before startup stays its consumer's first event. A
 // started stream always completes its operation, at zero if no audio went out.
+//
+// Commits still waiting for their speakers go first, without them: their
+// words were received before the observation, and losing the words would be
+// worse than losing their labels. A late diarized_transcript for one of them
+// then answers nothing. If the consumer stalls before taking them all, the
+// observation waits for the read loop's retry rather than overtake them.
 func (s *sttStream) emitCompleteBilling(timeout time.Duration, requireAudio bool) {
 	s.billingMu.Lock()
 	defer s.billingMu.Unlock()
-	if s.billed || s.eventsClosed || (requireAudio && s.sentBytes.Load() == 0 && s.sessionID == "") {
+	if s.eventsClosed {
 		return
 	}
-	event := runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billing(true)}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case s.events <- event:
-		s.billed = true
-	case <-timer.C:
+	for len(s.pendingCommits) > 0 {
+		if !s.emitBounded(heldFinal(s.pendingCommits[0].text), timeout) {
+			return
+		}
+		s.pendingCommits = s.pendingCommits[1:]
 	}
+	if s.billed || (requireAudio && s.sentBytes.Load() == 0 && s.sessionID == "") {
+		return
+	}
+	s.billed = s.emitBounded(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: s.billing(true)}, timeout)
 }
 
 // awaitWrites waits, up to timeout, for a write in flight to finish, so the
@@ -622,7 +631,6 @@ func (s *sttStream) readLoop() {
 		}
 		s.closed.Store(true)
 		s.awaitWrites(sttWriteSettleTimeout)
-		s.flushPendingCommits()
 		s.emitCompleteBilling(sttFinalBillingTimeout, true)
 		if terminal != nil {
 			// Bounded like the billing send rather than tied to s.ctx, so a
@@ -714,8 +722,10 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		}
 		if s.diarize {
 			// The speakers arrive on the diarized_transcript that follows
-			// every commit. The final waits for it, so a caller who asked for
-			// speakers never reads a final without them.
+			// every commit, and the final waits for it. resolveCommit and
+			// emitCompleteBilling say when a commit goes out without them.
+			s.billingMu.Lock()
+			defer s.billingMu.Unlock()
 			s.pendingCommits = append(s.pendingCommits, sttCommit{segmentIndex: message.SegmentIndex, text: message.Text})
 			return nil
 		}
@@ -796,7 +806,12 @@ func (s *sttStream) emitIgnored(messageType string, raw json.RawMessage) error {
 // a late frame for one of them answers nothing. A frame that answers no
 // pending commit, such as a duplicate, yields no final, and one without text
 // delivers the commit's text without speakers.
+//
+// The lock is held across the sends so Close cannot deliver the complete
+// observation between taking a commit and delivering its final.
 func (s *sttStream) resolveCommit(message sttInboundMessage, raw json.RawMessage) error {
+	s.billingMu.Lock()
+	defer s.billingMu.Unlock()
 	match := slices.IndexFunc(s.pendingCommits, func(commit sttCommit) bool { return commit.segmentIndex == message.SegmentIndex })
 	if match < 0 {
 		return nil
@@ -822,18 +837,6 @@ func (s *sttStream) resolveCommit(message sttInboundMessage, raw json.RawMessage
 // heldFinal is a committed segment delivered without its speakers.
 func heldFinal(text string) runtimepkg.ProviderEvent {
 	return runtimepkg.ProviderEvent{Type: protocol.EventTranscriptFinal, Data: sttTranscriptData(text, true, nil)}
-}
-
-// flushPendingCommits delivers, without speakers, the committed text whose
-// diarized_transcript never arrived before the stream ended. Losing the words
-// would be worse than losing their labels. Only the read loop's exit calls it.
-func (s *sttStream) flushPendingCommits() {
-	for _, commit := range s.pendingCommits {
-		if !s.emitBounded(heldFinal(commit.text), sttFinalBillingTimeout) {
-			return
-		}
-	}
-	s.pendingCommits = nil
 }
 
 // mergedSpeaker follows the vendor's merges to the id a speaker ended up as.
@@ -919,8 +922,9 @@ func consumeFinal(finals *[]string, text string) bool {
 }
 
 // emitBounded delivers a teardown event, waiting at most timeout for a
-// consumer, and reports whether one took it. Only the read loop's exit calls
-// it, before it closes the channel.
+// consumer, and reports whether one took it. The caller is the read loop's
+// exit, before it closes the channel, or holds billingMu with eventsClosed
+// unset.
 func (s *sttStream) emitBounded(event runtimepkg.ProviderEvent, timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()

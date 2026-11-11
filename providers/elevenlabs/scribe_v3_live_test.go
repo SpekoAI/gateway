@@ -503,6 +503,68 @@ func TestScribeV3LiveEmptyDiarizedFrameKeepsTheCommittedText(t *testing.T) {
 	}
 }
 
+// A commit still waiting for its speakers when the caller closes was received
+// before the stream's audio was final, so it reaches the consumer ahead of
+// the complete billing observation even if its speakers never arrive.
+func TestScribeV3LiveCloseDeliversAHeldCommitBeforeBilling(t *testing.T) {
+	t.Parallel()
+	diarize := true
+	server := newSTTServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		for _, message := range []map[string]any{
+			{"message_type": "session_started", "session_id": "el-live-3"},
+			{"message_type": "committed_transcript", "segment_index": 0, "text": "hello"},
+			{"message_type": "partial_transcript", "text": "next"},
+		} {
+			if err := writeSTTJSON(ctx, conn, message); err != nil {
+				t.Errorf("write: %v", err)
+				return
+			}
+		}
+		for {
+			frame, err := readSTTJSON(ctx, conn)
+			if err != nil {
+				t.Errorf("read: %v", err)
+				return
+			}
+			if frame["commit"] == true {
+				break
+			}
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new STT adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), scribeLiveRequest(server.URL, ModelScribeV3Live, &protocol.SttOptions{Diarization: &diarize}))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	// The partial follows the commit, so once it is read the commit is held.
+	if started := collectSTTEvents(t, stream.Events(), 2); started[1].Type != protocol.EventTranscriptDelta {
+		t.Fatalf("second event = %q, want the partial", started[1].Type)
+	}
+	if err := stream.WriteAudio(context.Background(), make([]byte, 320)); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	var order []string
+	for _, event := range drainSTTEvents(t, stream.Events()) {
+		switch {
+		case event.Type == protocol.EventTranscriptFinal:
+			order = append(order, string(event.Data))
+		case event.Billing != nil && event.Billing.Complete:
+			order = append(order, "complete billing")
+		}
+	}
+	if want := []string{`{"is_final":true,"speech_final":true,"text":"hello"}`, "complete billing"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("after close = %q, want %q", order, want)
+	}
+}
+
 // The diarization frames mean nothing on a session that did not ask for
 // speakers, so they stay visible as ignored frames and a commit is a final.
 func TestScribeV3LiveWithoutDiarizationFinalizesOnTheCommit(t *testing.T) {
