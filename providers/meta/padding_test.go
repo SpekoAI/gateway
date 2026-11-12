@@ -583,6 +583,30 @@ func TestCallerAudioDuringACatchUpFollowsTheWholeGap(t *testing.T) {
 	}
 }
 
+// A catch-up whose writes take time catches up to the clock as it moves,
+// so the caller audio queued behind it lands on a stream that is current
+// and no silence is due after it.
+func TestSlowCatchUpEndsCurrentWithTheClock(t *testing.T) {
+	t.Parallel()
+	var h *padHarness
+	h = openPadded(t, newFakeRealtime(t), func(a *STTAdapter) {
+		a.padWriter = func(ctx context.Context, frame []byte) error {
+			h.clock.set(h.clock.Now().Add(60 * time.Millisecond)) // each write takes 60 ms
+			return h.stream.conn.Write(ctx, websocket.MessageBinary, frame)
+		}
+	})
+	h.caller(0, padFrameBytes24k)
+	frames := h.tick(ms(500))
+	end := h.clock.Now().Sub(h.start)
+	if lag := h.lag(end); lag > 0 {
+		t.Fatalf("after a %d-frame catch-up ending at %v the stream trails the clock by %v, want none", frames, end, lag)
+	}
+	h.caller(end, padFrameBytes24k)
+	if got := h.tick(end + paddingFrame); got != 0 {
+		t.Fatalf("%d frames of silence followed the caller audio queued behind the catch-up", got)
+	}
+}
+
 // One deadline bounds a whole catch-up, so writes that each succeed just in
 // time cannot add up to holding writeMu for longer than padWriteTimeout.
 func TestSlowPaddingWritesShareOneDeadline(t *testing.T) {
