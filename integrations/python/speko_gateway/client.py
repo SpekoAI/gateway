@@ -149,7 +149,8 @@ class GatewayClient:
         Router TTS attachments use separate requests: an older Gateway rejects
         their identity shape and must not discard unrelated markers with them.
         Preserve sequence order, never retry, and return the number of markers
-        rejected at HTTP ingress. Successful ingress still proves no export.
+        rejected or not acknowledged at HTTP ingress. A transport failure drops
+        only the failed and unattempted groups. Successful ingress proves no export.
         """
 
         def router_tts(event: dict[str, Any]) -> bool:
@@ -161,15 +162,28 @@ class GatewayClient:
                 and "request_id" in data
             )
 
-        dropped = 0
+        dropped, remaining = 0, len(events)
         for _, group in groupby(events, key=router_tts):
             batch = list(group)
-            async with self._session.post(
-                f"{_BASE_URL}/v1/turn-events", json={"events": batch}
-            ) as response:
-                if not 200 <= response.status < 300:
-                    dropped += len(batch)
-                await response.read()
+            try:
+                async with self._session.post(
+                    f"{_BASE_URL}/v1/turn-events", json={"events": batch}
+                ) as response:
+                    remaining -= len(batch)
+                    if not 200 <= response.status < 300:
+                        dropped += len(batch)
+                    # HTTP status acknowledges ingress. The ignored body must
+                    # not stall flushing or undo an already accepted group.
+            except (
+                aiohttp.ClientError,
+                OSError,
+                asyncio.TimeoutError,
+                ValueError,
+                TypeError,
+            ):
+                # Keep prior acknowledgements even if a later local post fails.
+                # Cancellation still propagates; never retry uncertain markers.
+                return dropped + remaining
         return dropped
 
     async def open(

@@ -466,6 +466,66 @@ async def test_native_speech_mixed_gateway_versions_preserve_unrelated_markers(
     assert probe.dropped_events == int(not accept_router_tts)
 
 
+@pytest.mark.parametrize("failed_group", [2, 3])
+async def test_partial_telemetry_failure_preserves_prior_acknowledgements(failed_group):
+    batches, accepted = [], []
+
+    async def ingress(request):
+        batch = (await request.json())["events"]
+        batches.append(batch)
+        if len(batches) == failed_group:
+            request.transport.abort()
+            return web.Response(status=503)
+        accepted.extend(batch)
+        return web.json_response({"accepted": len(batch), "dropped": 0}, status=202)
+
+    app = web.Application()
+    app.router.add_post("/v1/turn-events", ingress)
+    async with gateway_server(app, unix=True) as socket:
+        client = GatewayClient(socket_path=socket, local_auth_token="owned-local")
+        session = FakeAgentSession()
+        probe = ConversationProbe(session, client=client)
+        probe.start()
+        user_state(session, "listening", "speaking")
+        user_state(session, "speaking", "listening")
+        report_leg("tts", request_id="req-tts-1")
+        report_marker("tts.first_audio")
+        probe._complete_turn()
+        try:
+            await asyncio.wait_for(probe.aclose(), 1)
+        finally:
+            await client.aclose()
+    assert len(batches) == failed_group  # No retry or send after socket failure.
+    expected_accepted = 4 if failed_group == 2 else 5
+    assert len(accepted) == expected_accepted
+    assert [event["seq"] for event in accepted] == list(range(1, expected_accepted + 1))
+    assert probe.dropped_events == 8 - expected_accepted
+
+
+async def test_turn_ingress_acknowledgement_does_not_wait_for_ignored_response_body():
+    release = asyncio.Event()
+
+    async def ingress(request):
+        await request.read()
+        response = web.StreamResponse(status=202, headers={"Content-Length": "4096"})
+        await response.prepare(request)
+        await release.wait()
+        return response
+
+    app = web.Application()
+    app.router.add_post("/v1/turn-events", ingress)
+    async with gateway_server(app, unix=True) as socket:
+        client = GatewayClient(socket_path=socket, local_auth_token="owned-local")
+        try:
+            dropped = await asyncio.wait_for(
+                client.post_turn_events([{"type": "turn.completed", "data": {}}]), 1
+            )
+            assert dropped == 0
+        finally:
+            release.set()
+            await client.aclose()
+
+
 @pytest.mark.parametrize("start_with_turn", [False, True])
 async def test_native_speech_late_headers_do_not_attach_to_a_later_turn(
     start_with_turn,
