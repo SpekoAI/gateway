@@ -44,7 +44,9 @@ type padHarness struct {
 	iterations chan bool
 }
 
-func openPadded(t *testing.T, fake *fakeRealtime) *padHarness {
+// openPadded opens a stream on a fake clock and ticker; tune adjusts the
+// adapter before Open.
+func openPadded(t *testing.T, fake *fakeRealtime, tune ...func(*STTAdapter)) *padHarness {
 	t.Helper()
 	adapter, err := NewSTT(STTConfig{AllowedEndpointHosts: []string{fake.host()}, AllowInsecureEndpoint: true, SetupTimeout: 5 * time.Second, CloseDrainTimeout: 5 * time.Second})
 	if err != nil {
@@ -65,6 +67,9 @@ func openPadded(t *testing.T, fake *fakeRealtime) *padHarness {
 		return h.ticks, func() {}
 	}
 	adapter.afterPad = func(wrote bool) { h.iterations <- wrote }
+	for _, apply := range tune {
+		apply(adapter)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
 	stream, err := adapter.Open(ctx, realtimeRequest(fake.endpoint()))
@@ -331,6 +336,43 @@ func TestPaddingIsNeverBilled(t *testing.T) {
 	final := mergeLikeConnector(t, observations)
 	if final.Quantities["duration_seconds"] != 1000 || !final.Complete {
 		t.Fatalf("final = %+v, want a complete 1000 ms: the caller's audio only", final)
+	}
+}
+
+// A padding write the service never takes is bounded: it fails after
+// padWriteTimeout, padding stops, and writeMu is free again for caller
+// audio and teardown.
+func TestStalledPaddingWriteEndsPadding(t *testing.T) {
+	t.Parallel()
+	const timeout = 50 * time.Millisecond
+	deadlines := make(chan time.Duration, 1)
+	h := openPadded(t, newFakeRealtime(t), func(a *STTAdapter) {
+		a.padWriteTimeout = timeout
+		a.padWriter = func(ctx context.Context, _ []byte) error {
+			deadline, _ := ctx.Deadline()
+			deadlines <- time.Until(deadline)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	})
+	h.caller(0, padFrameBytes24k)
+	if h.tick(ms(400)) {
+		t.Fatal("a stalled write reported padding")
+	}
+	if left := <-deadlines; left <= 0 || left > timeout {
+		t.Fatalf("padding write deadline %v away, want within %v", left, timeout)
+	}
+	select {
+	case h.ticks <- h.start.Add(ms(600)):
+		t.Fatal("padding loop still running after a failed write")
+	case <-time.After(100 * time.Millisecond):
+	}
+	written := make(chan error, 1)
+	go func() { written <- h.stream.WriteAudio(h.ctx, []byte{1, 1}) }()
+	select {
+	case <-written:
+	case <-time.After(time.Second):
+		t.Fatal("caller audio still waits behind the failed padding write")
 	}
 }
 

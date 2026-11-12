@@ -90,6 +90,12 @@ const (
 	// policy closes the session. Caller audio starts a new stretch; a commit
 	// does not.
 	paddingStretchCap = 30 * time.Second
+	// padWriteTimeout bounds one padding write. A write still blocked after
+	// it means the service stopped reading: the websocket closes on the
+	// deadline, padding ends, and the read loop reports the socket's end, so
+	// padding never holds writeMu, and with it caller audio and teardown,
+	// for longer.
+	padWriteTimeout = 2 * time.Second
 )
 
 // sampleRateEncodings are the only rates the realtime socket listens at,
@@ -130,8 +136,11 @@ type STTAdapter struct {
 	now       func() time.Time
 	newTicker func(time.Duration) (<-chan time.Time, func())
 	// afterPad, when set, is told after every padding iteration whether it
-	// wrote silence. Tests only.
-	afterPad func(wrote bool)
+	// wrote silence, and padWriter, when set, replaces the socket write for
+	// padding. Tests only.
+	afterPad        func(wrote bool)
+	padWriter       func(ctx context.Context, frame []byte) error
+	padWriteTimeout time.Duration
 }
 
 // NewSTT validates the configuration and builds the adapter.
@@ -164,6 +173,7 @@ func NewSTT(config STTConfig) (*STTAdapter, error) {
 		closeDrainTimeout: config.CloseDrainTimeout,
 		endpointPolicy:    policy,
 		now:               time.Now,
+		padWriteTimeout:   padWriteTimeout,
 		newTicker: func(period time.Duration) (<-chan time.Time, func()) {
 			ticker := time.NewTicker(period)
 			return ticker.C, ticker.Stop
@@ -224,13 +234,15 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &sttStream{
 		conn: conn, ctx: streamCtx, cancel: cancel,
-		events:       make(chan runtimepkg.ProviderEvent, a.eventBuffer),
-		setupDone:    make(chan error, 1),
-		done:         make(chan struct{}),
-		drainTimeout: a.closeDrainTimeout,
-		now:          a.now,
-		afterPad:     a.afterPad,
-		padKick:      make(chan struct{}, 1),
+		events:          make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		setupDone:       make(chan error, 1),
+		done:            make(chan struct{}),
+		drainTimeout:    a.closeDrainTimeout,
+		now:             a.now,
+		afterPad:        a.afterPad,
+		padWriter:       a.padWriter,
+		padWriteTimeout: a.padWriteTimeout,
+		padKick:         make(chan struct{}, 1),
 		// mono pcm_s16le, validated above
 		bytesPerSecond: int64(request.Media.SampleRateHz) * 2,
 		billing:        protocol.BillingObservation{OperationID: "session", Model: model, Mode: "streaming", Quantities: map[string]int64{}},
@@ -252,6 +264,11 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	case <-setupCtx.Done():
 		stream.abort()
 		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Meta transcribe did not acknowledge the session", Retryable: true, Cause: setupCtx.Err()}
+	}
+	if stream.padWriter == nil {
+		stream.padWriter = func(ctx context.Context, frame []byte) error {
+			return stream.conn.Write(ctx, websocket.MessageBinary, frame)
+		}
 	}
 	stream.writeMu.Lock()
 	stream.padFrom = a.now().Add(paddingGap)
@@ -377,9 +394,11 @@ type sttStream struct {
 	// padFrom and audioUntil are guarded by writeMu, the lock every socket
 	// write takes, so a padding decision and its write never interleave with
 	// caller audio.
-	now      func() time.Time
-	afterPad func(wrote bool)
-	padFrame []byte
+	now             func() time.Time
+	afterPad        func(wrote bool)
+	padWriter       func(ctx context.Context, frame []byte) error
+	padWriteTimeout time.Duration
+	padFrame        []byte
 	// padKick asks the loop to pad at once (CommitAudio).
 	padKick chan struct{}
 	// padFrom is the earliest instant padding may be written.
@@ -482,7 +501,10 @@ func (s *sttStream) padOnce() (wrote, open bool) {
 	if now.Before(s.padFrom) || s.audioUntil.Sub(now) >= paddingFrame/2 || s.stretchPadded >= paddingStretchCap {
 		return false, true
 	}
-	if err := s.conn.Write(s.ctx, websocket.MessageBinary, s.padFrame); err != nil {
+	ctx, cancel := context.WithTimeout(s.ctx, s.padWriteTimeout)
+	err := s.padWriter(ctx, s.padFrame)
+	cancel()
+	if err != nil {
 		return false, false
 	}
 	s.paddedBytes.Add(int64(len(s.padFrame)))
