@@ -570,6 +570,66 @@ func TestCallerAudioGetsInBetweenCatchUpFrames(t *testing.T) {
 	}
 }
 
+// Caller audio that interrupts a catch-up with more than paddingGap still to
+// fill drops the rest of the gap: no silence follows the resumed speech
+// until a new gap opens behind it.
+func TestCallerAudioInterruptingACatchUpDropsTheRestOfTheGap(t *testing.T) {
+	t.Parallel()
+	started := make(chan struct{}, 16)
+	proceed := make(chan struct{})
+	h := openPadded(t, newFakeRealtime(t), func(a *STTAdapter) {
+		a.padWriter = func(ctx context.Context, _ []byte) error {
+			started <- struct{}{}
+			select {
+			case <-proceed:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+	h.caller(0, padFrameBytes24k) // written until 100 ms
+	h.at(ms(1100))                // a 1 s gap: an eleven-frame catch-up is due
+	padded := make(chan int, 1)
+	go func() {
+		h.ticks <- h.clock.Now()
+		padded <- <-h.iterations
+	}()
+	<-started
+	callerDone := make(chan error, 1)
+	go func() { callerDone <- h.stream.WriteAudio(h.ctx, bytes.Repeat([]byte{1}, padFrameBytes24k)) }()
+	for written := 1; ; written++ {
+		time.Sleep(20 * time.Millisecond)
+		proceed <- struct{}{}
+		select {
+		case err := <-callerDone:
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := <-padded; got != written || lagAfter(h, written) < paddingGap {
+				t.Fatalf("iteration wrote %d frames with the caller in after %d; want the caller in with at least %v still unfilled", got, written, paddingGap)
+			}
+			h.callerBytes += padFrameBytes24k
+			close(proceed) // later padding writes go straight through
+			h.expectTicks(
+				tickWant{ms(1100), 0}, // resumed speech is not followed by the old gap
+				tickWant{ms(1599), 0},
+				tickWant{ms(1600), 5}, // a new 400 ms gap behind the caller's frame
+			)
+			return
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("caller audio never got in")
+		}
+	}
+}
+
+// lagAfter is how far the stream trailed the clock at 1100 ms once the first
+// caller frame and written padding frames were out.
+func lagAfter(h *padHarness, written int) time.Duration {
+	return ms(1100) - ms(100) - time.Duration(written)*paddingFrame
+}
+
 // The production clock and ticker pad a stalled caller on their own.
 func TestPaddingRunsOnTheRealClock(t *testing.T) {
 	t.Parallel()

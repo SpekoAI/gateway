@@ -441,9 +441,12 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	// partial, and the service cannot report audio it never got.
 	s.forwardedBytes.Add(int64(len(audio)))
 	s.timeline.caller(int64(len(audio)))
-	if s.stretchPadded >= paddingStretchCap {
-		// Padding gave up on this gap, so the stream is behind the clock by
-		// the rest of it; no burst of silence should make that up now.
+	if s.padding {
+		// Caller audio resumed while padding ran. Any gap padding has not
+		// filled yet, a catch-up this audio interrupted or the rest of a
+		// stretch past the cap, is dropped rather than spliced in after the
+		// caller's speech. Padding that kept up with the clock leaves no gap,
+		// so this only ever drops what a single gap left behind.
 		s.audioUntil = laterOf(s.audioUntil, s.now())
 	}
 	s.padding = false
@@ -522,7 +525,8 @@ func (s *sttStream) padOnce() (frames int, open bool) {
 // writeMu for that one frame only, so caller audio, and the engine's
 // teardown waiting behind a caller write, never wait out a whole catch-up:
 // at most one padding write, itself bounded by padWriteTimeout. Caller
-// audio that gets in between frames ends the catch-up.
+// audio that gets in between frames ends the catch-up and drops the rest of
+// the gap (WriteAudio).
 func (s *sttStream) padFrameIfDue() (wrote, open bool) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
