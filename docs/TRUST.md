@@ -227,7 +227,7 @@ containing an unknown marker type or an unknown data field:
 | `tool.started` / `tool.completed` | 1-based tool index and success flag — never tool names, arguments, or results |
 | `tts.requested` / `tts.first_audio` / `playback.started` / `playback.stopped` | interruption flag and playback position — never synthesized text or audio |
 | `interrupt.detected` / `interrupt.cancel_sent` | timing only |
-| `leg.attached` | the session/attempt IDs (STT/TTS) or relay request ID (LLM) already known to Speko, plus optional provider/model names |
+| `leg.attached` | the Gateway session/attempt IDs (STT/TTS) or Router request ID (TTS/LLM/evaluation) already known to Speko, plus optional provider/model names; identity namespaces are never mixed |
 
 Every marker carries a monotonic millisecond stamp and a sequence number and
 nothing else. Turn markers are always optional telemetry: with a Speko API key

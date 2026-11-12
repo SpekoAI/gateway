@@ -61,16 +61,9 @@ async def collect(client, request=None, **options):
     )
 
 
-async def test_exact_unicode_bound_request_audio_and_probe_metadata_are_transported_once(
-    monkeypatch,
-):
+async def test_exact_unicode_bound_request_and_audio_are_transported_once():
     data = json.loads(json.dumps(REQUEST))
     data["options"] = {"number": 9007199254740993}
-    legs = []
-    monkeypatch.setattr(
-        "speko_gateway.speech.report_leg",
-        lambda *args, **kwargs: legs.append((args, kwargs)),
-    )
 
     async def handle(request, _):
         assert request.method == "POST" and request.path == "/v1/tts/speech"
@@ -98,7 +91,44 @@ async def test_exact_unicode_bound_request_audio_and_probe_metadata_are_transpor
             == b"\x00\x01\x00\xff"
         )
     assert calls == ["/v1/tts/speech"]
-    assert legs == [(("tts",), {"request_id": "req:owned"})]
+
+
+@pytest.mark.parametrize(
+    "key", ["k" * 256, "é" * 128, "opaque retry 漢🙂", "inner\tkey"]
+)
+async def test_router_idempotency_keys_preserve_all_256_utf8_bytes(key):
+    async def handle(request, _):
+        assert request.headers["Idempotency-Key"] == key
+        return web.Response(body=b"audio", content_type="audio/pcm")
+
+    async with server(handle) as (client, calls):
+        assert await collect(client, idempotency_key=key) == b"audio"
+    assert calls == ["/v1/tts/speech"]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "k" * 257,
+        "é" * 129,
+        "\u2003",
+        " key",
+        "key\t",
+        "key\nvalue",
+        "key\rvalue",
+        "key\x00value",
+        "key\x7fvalue",
+        "key\ud800",
+    ],
+)
+async def test_invalid_router_retry_identity_is_refused_before_http(key):
+    async def unexpected(*_):
+        pytest.fail("invalid retry key crossed HTTP")
+
+    async with server(unexpected) as (client, calls):
+        with pytest.raises(ValueError, match="invalid Router speech request"):
+            await collect(client, idempotency_key=key)
+    assert calls == []
 
 
 async def test_unbound_speech_sends_no_private_work_markers():

@@ -234,6 +234,8 @@ is in the [Pipecat integration guide](../../docs/PIPECAT.md).
 `RelayTTSClient` sends one `POST /v1/tts/speech` and yields the original audio
 bytes. It uses a Speko key and an explicit idempotency key; it never retries,
 follows redirects or falls back to a provider or local Gateway transport.
+Retry keys preserve up to 256 UTF-8 bytes, including interior spaces and Unicode.
+Blank keys, HTTP controls and surrounding HTTP whitespace are refused.
 
 ```python
 from speko_gateway import RelayTTSClient
@@ -266,3 +268,8 @@ chunk. No SDK timeout scope remains active in consumer code. Closure/cancellatio
 releases owned responses. HTTP errors expose fixed status diagnostics rather
 than server response content. Audio, EOF, timeouts and failures supply no proof
 of provider non-execution, settlement or actual audible delivery.
+
+With an active `ConversationProbe`, the response's `Speko-Request-ID` attaches
+the Router TTS leg to the turn that started the request, provided that turn is
+still open. This request identity is separate from Gateway TTS session/attempt
+identities. The receiving Gateway must support Router TTS leg attachments.

@@ -4,6 +4,8 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+from aiohttp import web
 from livekit import (
     agents as _agents,  # noqa: F401  (venv sanity: probe never imports it)
 )
@@ -19,6 +21,7 @@ from test_livekit import (
     _relay_events,
     frame,
 )
+from test_native_speech import collect, server
 
 import speko_gateway.probe as probe_module
 from speko_gateway.livekit import LLM, STT, TTS
@@ -333,6 +336,117 @@ async def test_registry_hooks_attach_legs_and_markers_to_open_turn() -> None:
     completed = next(event for event in events if event["type"] == "llm.completed")
     assert set(completed["data"]) == {"mono_ms", "ok"}
     assert "session.opened" not in markers
+
+
+@pytest.mark.parametrize("request_id", ["req-tts-1", "r" * 256])
+async def test_native_speech_attaches_router_identity_through_active_probe(
+    request_id,
+) -> None:
+    probe, session, client = new_probe()
+    probe.start()
+    user_state(session, "listening", "speaking")
+
+    async def audio(request, _):
+        await request.read()
+        return web.Response(
+            body=b"audio",
+            headers={"Content-Type": "audio/pcm", "Speko-Request-ID": request_id},
+        )
+
+    try:
+        async with server(audio) as (speech, calls):
+            assert await collect(speech) == b"audio"
+    finally:
+        await probe.aclose()
+
+    legs = [event for event in posted(client) if event["type"] == "leg.attached"]
+    assert len(legs) == 1 and probe.dropped_events == 0
+    assert legs[0]["turn_id"] == "turn_000001"
+    assert legs[0]["data"] == {
+        "mono_ms": legs[0]["data"]["mono_ms"],
+        "kind": "tts",
+        "request_id": request_id,
+    }
+    assert calls == ["/v1/tts/speech"]
+
+
+@pytest.mark.parametrize(
+    "request_ids", [["req/invalid"], ["r" * 257], ["req-one", "req-two"]]
+)
+async def test_native_speech_invalid_identity_never_poisons_probe_batch(
+    request_ids,
+) -> None:
+    probe, session, client = new_probe()
+    probe.start()
+    user_state(session, "listening", "speaking")
+
+    async def audio(request, _):
+        await request.read()
+        return web.Response(
+            body=b"audio",
+            headers=[("Content-Type", "audio/pcm")]
+            + [("Speko-Request-ID", value) for value in request_ids],
+        )
+
+    try:
+        async with server(audio) as (speech, _):
+            assert await collect(speech) == b"audio"
+    finally:
+        await probe.aclose()
+    assert not [event for event in posted(client) if event["type"] == "leg.attached"]
+    assert probe.dropped_events == 0
+
+
+@pytest.mark.parametrize("start_with_turn", [False, True])
+async def test_native_speech_late_headers_do_not_attach_to_a_later_turn(
+    start_with_turn,
+) -> None:
+    probe, session, client = new_probe()
+    probe.start()
+    if start_with_turn:
+        user_state(session, "listening", "speaking")
+
+    async def audio(request, _):
+        await request.read()
+        if start_with_turn:
+            # Finish the first turn, then open another before headers arrive.
+            probe._complete_turn()
+        user_state(session, "listening", "speaking")
+        return web.Response(
+            body=b"audio",
+            headers={"Content-Type": "audio/pcm", "Speko-Request-ID": "req-late"},
+        )
+
+    try:
+        async with server(audio) as (speech, _):
+            assert await collect(speech) == b"audio"
+    finally:
+        await probe.aclose()
+    assert not [event for event in posted(client) if event["type"] == "leg.attached"]
+
+
+@pytest.mark.parametrize(
+    "kind,identity",
+    [
+        ("tts", {"request_id": "req", "session_id": "sess", "attempt_id": "att"}),
+        ("tts", {"request_id": "req", "session_id": "sess"}),
+        ("tts", {"request_id": "req", "attempt_id": "att"}),
+        ("tts", {"session_id": "sess"}),
+        ("tts", {"attempt_id": "att"}),
+        ("tts", {}),
+        ("stt", {"request_id": "req"}),
+        ("stt", {"request_id": "req", "session_id": "sess", "attempt_id": "att"}),
+        ("llm", {"request_id": "req", "session_id": "sess"}),
+        ("evaluation", {"request_id": "req", "attempt_id": "att"}),
+    ],
+)
+async def test_probe_refuses_mixed_or_partial_leg_identity(kind, identity) -> None:
+    probe, session, client = new_probe()
+    probe.start()
+    user_state(session, "listening", "speaking")
+    report_leg(kind, **identity)
+    await probe.aclose()
+    assert not [event for event in posted(client) if event["type"] == "leg.attached"]
 
 
 async def test_probe_batches_at_64_and_drops_beyond_bounded_queue() -> None:

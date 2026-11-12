@@ -193,6 +193,67 @@ func TestTurnEventsValidationRejectsWholeBatch(t *testing.T) {
 	})
 }
 
+func TestTurnEventsLegIdentityNamespaces(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		kind     string
+		identity map[string]any
+		accepted bool
+	}{
+		{"gateway stt", "stt", map[string]any{"session_id": "sess-1", "attempt_id": "att-1"}, true},
+		{"gateway tts", "tts", map[string]any{"session_id": "sess-2", "attempt_id": "att-2"}, true},
+		{"router tts", "tts", map[string]any{"request_id": "req-tts-1"}, true},
+		{"router llm", "llm", map[string]any{"request_id": "req-llm-1"}, true},
+		{"router evaluation", "evaluation", map[string]any{"request_id": "req-eval-1"}, true},
+		{"mixed tts", "tts", map[string]any{"session_id": "sess", "attempt_id": "att", "request_id": "req"}, false},
+		{"tts request and session", "tts", map[string]any{"session_id": "sess", "request_id": "req"}, false},
+		{"tts request and attempt", "tts", map[string]any{"attempt_id": "att", "request_id": "req"}, false},
+		{"tts session only", "tts", map[string]any{"session_id": "sess"}, false},
+		{"tts attempt only", "tts", map[string]any{"attempt_id": "att"}, false},
+		{"tts no identity", "tts", map[string]any{}, false},
+		{"stt request", "stt", map[string]any{"request_id": "req"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &fakeTelemetrySink{}
+			server := newTurnEventServer(t, sink, gateway.TurnEventDestinations{AnonymousEndpoint: "https://telemetry.speko.test/v1/anonymous-turn-events"}, nil)
+			fields := map[string]any{"mono_ms": 1, "kind": tc.kind}
+			for key, value := range tc.identity {
+				fields[key] = value
+			}
+			response := postTurnEvents(t, server.URL, "local-token", []map[string]any{turnEventPayload("leg.attached", "turn_000001", 1, fields)})
+			defer response.Body.Close()
+			if !tc.accepted {
+				if response.StatusCode != http.StatusBadRequest || len(sink.recorded()) != 0 {
+					t.Fatalf("invalid identity status=%d recorded=%d", response.StatusCode, len(sink.recorded()))
+				}
+				return
+			}
+			if response.StatusCode != http.StatusAccepted {
+				body, _ := io.ReadAll(response.Body)
+				t.Fatalf("valid identity status=%d body=%s", response.StatusCode, body)
+			}
+			events := sink.recorded()
+			if len(events) != 1 {
+				t.Fatalf("recorded=%d", len(events))
+			}
+			var data map[string]any
+			if err := json.Unmarshal(events[0].Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			if len(data) != len(fields)+1 || data["kind"] != tc.kind {
+				t.Fatalf("forwarded fields=%v", data)
+			}
+			for key, value := range tc.identity {
+				if data[key] != value {
+					t.Fatalf("forwarded %s=%v", key, data[key])
+				}
+			}
+		})
+	}
+}
+
 func TestTurnEventsMapToTelemetryEvents(t *testing.T) {
 	t.Parallel()
 	sink := &fakeTelemetrySink{}

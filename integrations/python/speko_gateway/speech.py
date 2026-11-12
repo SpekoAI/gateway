@@ -13,8 +13,8 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from ._user_agent import USER_AGENT
-from .probe import report_leg
-from .relay import RelayError
+from .probe import active_probe
+from .relay import RelayError, _registered_idempotency_key
 
 _MAX_REQUEST_BYTES = 1024 * 1024
 _MAX_AUDIO_BYTES = 64 * 1024 * 1024
@@ -40,7 +40,7 @@ def _request(
     try:
         if (
             type(request) is not dict
-            or not _header(idempotency_key)
+            or not _registered_idempotency_key(idempotency_key)
             or not all(
                 type(key) is str and not key.startswith("speko_") for key in request
             )
@@ -148,6 +148,8 @@ class RelayTTSClient:
         Neither interruption nor a failed response permits an automatic retry.
         """
         body = _request(request, idempotency_key, work_nonce, input_blinder)
+        probe = active_probe()
+        turn_id = probe.current_turn_id if probe is not None else None
         headers = {
             "Content-Type": "application/json",
             "Accept-Encoding": "identity",
@@ -212,9 +214,14 @@ class RelayTTSClient:
                 raise RelayError(
                     "Router returned invalid speech audio", code="invalid_response"
                 )
-            request_id = response.headers.get("Speko-Request-ID", "")
-            if _header(request_id):
-                report_leg("tts", request_id=request_id)
+            request_ids = response.headers.getall("Speko-Request-ID", [])
+            request_id = request_ids[0] if len(request_ids) == 1 else ""
+            if (
+                re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", request_id)
+                and probe is not None
+                and turn_id
+            ):
+                probe.report_leg("tts", request_id=request_id, expected_turn_id=turn_id)
             total = 0
             while True:
                 if self._closed:
