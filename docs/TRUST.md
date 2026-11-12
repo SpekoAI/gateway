@@ -400,14 +400,19 @@ refuses that combination with HTTP 400.
 
 The Meta realtime socket receives the caller's audio and, in the gaps between
 it, zero-valued PCM silence that the adapter writes itself. The service closes
-a stream whose audio stops, and its endpointing only ends a turn while audio
-keeps arriving. So once the caller has sent no audio for 400 ms, or at once
-after a commit, the adapter fills the gap with 100 ms frames of silence at real
-time, never ahead of the audio already written. Each continuous stretch of
-padding stops after 30 seconds, so a client that stays connected and silent
+a stream whose audio falls behind real time, and its endpointing only ends a
+turn while audio keeps arriving. So once the audio written trails the clock by
+400 ms, or at once after a commit, the adapter fills the gap up to the present
+with 100 ms frames of silence, never more than one frame ahead, and keeps the
+stream at real time until caller audio resumes. Each continuous stretch of
+padding stops after 120 seconds, so a client that stays connected and silent
 cannot keep the session running; the service's own idle policy then closes it.
 Caller audio starts a new stretch. Nothing is padded after the end of the
-stream. Padding carries no caller content. The service processes and charges
-for the padding, but the caller is never billed for it: billing observations
-cap the processed duration Meta reports at the caller's own forwarded audio,
+stream, and a padding write the service does not accept within 2 seconds
+closes the socket. Padding carries no caller content. The service processes
+and charges for the padding, but the caller is never billed for it: the
+adapter records where padding sits in the stream and maps every position the
+service reports back onto the caller's own audio, so billing observations
+count only caller audio the service has processed (never more than was
+forwarded), the published `audio_end_ms` is a position in the caller's audio,
 and the relay's `stt_duration` budget counts caller audio only.
