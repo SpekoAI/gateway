@@ -491,6 +491,11 @@ async def _sse_events(
                 size += len(raw_line)
                 if size > _REGISTERED_RESPONSE_LIMIT:
                     raise ValueError()
+                # aiohttp splits on LF. A bare CR could otherwise hide another
+                # event inside a comment. Registered streams accept LF/CRLF
+                # only; reject any other CR before interpreting the line.
+                if b"\r" in raw_line.removesuffix(b"\r\n"):
+                    raise ValueError()
             line = raw_line.decode("utf-8").rstrip("\r\n")
             if line == "":
                 if strict and (event_seen or data_lines):

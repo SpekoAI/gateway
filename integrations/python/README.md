@@ -154,7 +154,9 @@ that string. HTTP bodies and cumulative SSE bytes each have a 1 MiB bound.
 The registered stream rejects malformed/unsupported frames and duplicate event
 headers. It withholds its success terminal until clean HTTP EOF and refuses
 any event after that terminal, including an error or a second completion.
-Comments, multiline data and LF/CRLF framing remain supported. The caller still
+Comments, multiline data and LF/CRLF framing remain supported. Bare CR framing
+is refused so a line ending cannot hide an additional event inside a comment.
+The caller still
 owns cancellation and the original work deadline; waiting for EOF grants no
 extra time or execution authority. A non-JSON or ambiguous HTTP error keeps only
 fixed status diagnostics. Ordinary unregistered methods retain their existing

@@ -204,6 +204,21 @@ def malformed_streams():
     )
     yield "trailing-delta", wire + delta
     yield (
+        "bare-cr-hidden-error",
+        wire
+        + ': heartbeat\revent: error\rdata: {"error":{"code":"owned-private-wire-marker"}}\r\r\n',
+    )
+    yield (
+        "bare-cr-hidden-terminal",
+        wire
+        + ": heartbeat\r"
+        + frame("response.completed", {"stop_reason": "stop"}).replace("\n", "\r")
+        + "\n",
+    )
+    yield "bare-cr-only", wire.replace("\n", "\r")
+    yield "extra-cr-delimiter", wire + "\r\r\n"
+    yield "bare-cr-final-comment", wire + ": heartbeat\r"
+    yield (
         "unterminated-tail",
         wire + 'event: error\ndata: {"error":{"code":"owned-private-wire-marker"}}',
     )
