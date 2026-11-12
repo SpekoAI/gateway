@@ -43,6 +43,7 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_llm
 
+from ._speech_client import SpeechSession
 from ._voice import (
     CredentialSource,
     execution_from_env,
@@ -53,7 +54,6 @@ from .client import (
     CanonicalEvent,
     GatewayClient,
     GatewayError,
-    GatewaySession,
     SessionConfig,
 )
 from .relay import (
@@ -62,6 +62,7 @@ from .relay import (
     RelayLLMClient,
     validate_reasoning_effort,
 )
+from .relay_speech import RelaySpeechClient
 
 _INTEGRATION_VERSION = "0.1.0"
 _logger = logging.getLogger(__name__)
@@ -72,7 +73,7 @@ class SpekoSTTService(PipecatSTTService):
 
     def __init__(
         self,
-        client: GatewayClient | None = None,
+        client: GatewayClient | RelaySpeechClient | None = None,
         *,
         language: str = "en",
         model: str = "auto",
@@ -126,7 +127,7 @@ class SpekoSTTService(PipecatSTTService):
             noise_reduction=noise_reduction,
             provider_options=provider_options,
         )
-        self._session: GatewaySession | None = None
+        self._session: SpeechSession | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._audio_since_commit = False
 
@@ -184,7 +185,9 @@ class SpekoSTTService(PipecatSTTService):
     async def _connect(self) -> None:
         if self._session is not None:
             return
-        await self._client.wait_until_ready(timeout=self._ready_timeout)
+        # Native relay readiness is its actual session.ready admission.
+        if not isinstance(self._client, RelaySpeechClient):
+            await self._client.wait_until_ready(timeout=self._ready_timeout)
         try:
             self._session = await self._open_session(
                 provider=self._provider, model=self._model
@@ -203,7 +206,7 @@ class SpekoSTTService(PipecatSTTService):
             self._receive_events(), name="speko.pipecat.stt.receive"
         )
 
-    async def _open_session(self, *, provider: str, model: str) -> GatewaySession:
+    async def _open_session(self, *, provider: str, model: str) -> SpeechSession:
         request: dict[str, Any] = {
             "provider": provider,
             "language": self._language,
@@ -234,6 +237,7 @@ class SpekoSTTService(PipecatSTTService):
     def _can_fallback_to_auto(self, error: GatewayError) -> bool:
         return (
             self._fallback_to_auto_on_no_eligible_route
+            and not isinstance(self._client, RelaySpeechClient)
             and execution_from_env(self._credential_source)["credential_source"]
             == "managed"
             and error.code == "no_eligible_route"
@@ -302,7 +306,7 @@ class SpekoSTTService(PipecatSTTService):
 
 @dataclass
 class _TTSContextState:
-    session: GatewaySession
+    session: SpeechSession
     task: asyncio.Task[None] | None = None
     finishing: bool = False
     interrupted: bool = False
@@ -315,7 +319,7 @@ class SpekoTTSService(PipecatTTSService):
 
     def __init__(
         self,
-        client: GatewayClient | None = None,
+        client: GatewayClient | RelaySpeechClient | None = None,
         *,
         voice: str = "",
         language: str = "en",
@@ -448,7 +452,9 @@ class SpekoTTSService(PipecatTTSService):
 
     async def _ensure_ready(self) -> None:
         if not self._ready:
-            await self._client.wait_until_ready(timeout=self._ready_timeout)
+            # Native relay readiness is checked by the first real admission.
+            if not isinstance(self._client, RelaySpeechClient):
+                await self._client.wait_until_ready(timeout=self._ready_timeout)
             self._ready = True
 
     async def _context(self, context_id: str) -> _TTSContextState:
@@ -489,7 +495,7 @@ class SpekoTTSService(PipecatTTSService):
 
     async def _open_session(
         self, *, provider: str, model: str, voice: str
-    ) -> GatewaySession:
+    ) -> SpeechSession:
         request: dict[str, Any] = {
             "provider": provider,
             "language": self._language,
@@ -525,6 +531,7 @@ class SpekoTTSService(PipecatTTSService):
     def _can_fallback_to_auto(self, error: GatewayError) -> bool:
         return (
             self._fallback_to_auto_on_no_eligible_route
+            and not isinstance(self._client, RelaySpeechClient)
             and execution_from_env(self._credential_source)["credential_source"]
             == "managed"
             and error.code == "no_eligible_route"

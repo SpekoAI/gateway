@@ -532,6 +532,58 @@ func TestSTTCloseAfterCommitWaitsForFinishedUsage(t *testing.T) {
 	}
 }
 
+func TestSTTFinishedRemainsTerminalWhenThePeerImmediatelyDisconnects(t *testing.T) {
+	t.Parallel()
+	server := newSTTServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		if _, err := readJSONObject(ctx, conn); err != nil {
+			t.Errorf("read start: %v", err)
+			return
+		}
+		if control, err := readJSONObject(ctx, conn); err != nil || control["type"] != "finalize" {
+			t.Errorf("read finalize: %v, frame=%v", err, control)
+			return
+		}
+		if err := writeJSONFrame(ctx, conn, map[string]any{
+			"tokens": []any{map[string]any{"text": "yes", "is_final": true}, map[string]any{"text": "<fin>", "is_final": true}},
+		}); err != nil {
+			t.Errorf("write final: %v", err)
+			return
+		}
+		if err := writeJSONFrame(ctx, conn, map[string]any{
+			"tokens": []any{}, "finished": true, "total_audio_proc_ms": 1680,
+		}); err != nil {
+			t.Errorf("write finished: %v", err)
+		}
+		// The owned peer closes without waiting for the application's Close.
+		// Complete terminal evidence must not become a later transport error.
+	})
+	defer server.Close()
+	adapter, err := NewSTT(sttTestConfig(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), sttAdapterRequest(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer abortStream(stream)
+	if err := stream.CommitAudio(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(t, stream.Events(), 2)
+	if got := strings.Join(eventTypeNames(events), ","); got != "transcript.final,usage.observed" {
+		t.Fatalf("event types = %s", got)
+	}
+	select {
+	case event, ok := <-stream.Events():
+		if ok {
+			t.Fatalf("event after complete terminal evidence: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("finished did not close the event stream")
+	}
+}
+
 func TestSTTCloseHandlesFinishedBeforeTheEndFrame(t *testing.T) {
 	t.Parallel()
 
