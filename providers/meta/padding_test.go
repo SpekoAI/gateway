@@ -3,6 +3,8 @@ package meta
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -41,7 +43,9 @@ type padHarness struct {
 	clock      *padClock
 	start      time.Time
 	ticks      chan time.Time
-	iterations chan bool
+	iterations chan int
+	// callerBytes is the caller audio written so far.
+	callerBytes int
 }
 
 // openPadded opens a stream on a fake clock and ticker; tune adjusts the
@@ -56,7 +60,7 @@ func openPadded(t *testing.T, fake *fakeRealtime, tune ...func(*STTAdapter)) *pa
 		t: t, fake: fake,
 		start:      time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC),
 		ticks:      make(chan time.Time),
-		iterations: make(chan bool, 64),
+		iterations: make(chan int, 64),
 	}
 	h.clock = &padClock{now: h.start}
 	adapter.now = h.clock.Now
@@ -66,7 +70,7 @@ func openPadded(t *testing.T, fake *fakeRealtime, tune ...func(*STTAdapter)) *pa
 		}
 		return h.ticks, func() {}
 	}
-	adapter.afterPad = func(wrote bool) { h.iterations <- wrote }
+	adapter.afterPad = func(frames int) { h.iterations <- frames }
 	for _, apply := range tune {
 		apply(adapter)
 	}
@@ -84,9 +88,9 @@ func openPadded(t *testing.T, fake *fakeRealtime, tune ...func(*STTAdapter)) *pa
 // at moves the clock to start+offset.
 func (h *padHarness) at(offset time.Duration) { h.clock.set(h.start.Add(offset)) }
 
-// tick fires the padding ticker at start+offset and reports whether that
-// iteration wrote silence.
-func (h *padHarness) tick(offset time.Duration) bool {
+// tick fires the padding ticker at start+offset and reports how many frames
+// of silence that iteration wrote.
+func (h *padHarness) tick(offset time.Duration) int {
 	h.t.Helper()
 	h.at(offset)
 	select {
@@ -97,15 +101,26 @@ func (h *padHarness) tick(offset time.Duration) bool {
 	return h.iteration()
 }
 
-func (h *padHarness) iteration() bool {
+func (h *padHarness) iteration() int {
 	h.t.Helper()
 	select {
-	case wrote := <-h.iterations:
-		return wrote
+	case frames := <-h.iterations:
+		return frames
 	case <-time.After(5 * time.Second):
 		h.t.Fatal("padding loop did not finish an iteration")
-		return false
+		return 0
 	}
+}
+
+// commit calls CommitAudio at start+offset and reports how many frames the
+// iteration it starts wrote.
+func (h *padHarness) commit(offset time.Duration) int {
+	h.t.Helper()
+	h.at(offset)
+	if err := h.stream.CommitAudio(h.ctx); err != nil {
+		h.t.Fatal(err)
+	}
+	return h.iteration()
 }
 
 // caller writes n bytes of non-silent caller audio at start+offset.
@@ -115,20 +130,28 @@ func (h *padHarness) caller(offset time.Duration, n int) {
 	if err := h.stream.WriteAudio(h.ctx, bytes.Repeat([]byte{1}, n)); err != nil {
 		h.t.Fatal(err)
 	}
+	h.callerBytes += n
+}
+
+// lag is how far everything written, caller audio and padding, trails
+// start+offset.
+func (h *padHarness) lag(offset time.Duration) time.Duration {
+	written := int64(h.callerBytes) + h.stream.paddedBytes.Load()
+	return offset - time.Duration(written*int64(time.Second)/bytesPerSecond24k)
 }
 
 func (h *padHarness) expectTicks(want ...tickWant) {
 	h.t.Helper()
 	for _, step := range want {
-		if got := h.tick(step.at); got != step.pads {
-			h.t.Fatalf("tick at %v padded = %v, want %v", step.at, got, step.pads)
+		if got := h.tick(step.at); got != step.frames {
+			h.t.Fatalf("tick at %v padded %d frames, want %d", step.at, got, step.frames)
 		}
 	}
 }
 
 type tickWant struct {
-	at   time.Duration
-	pads bool
+	at     time.Duration
+	frames int
 }
 
 func ms(n int) time.Duration { return time.Duration(n) * time.Millisecond }
@@ -166,26 +189,26 @@ func firstFrame(frames [][]byte) string {
 	return string(frames[0])
 }
 
-// A gap in the caller's audio is filled with silence once it passes
-// paddingGap, one 100 ms frame per 100 ms: exactly real time, never a frame
-// ahead of the clock.
+// Once the audio written trails the clock by paddingGap, padding fills the
+// whole gap up to the clock, at most one frame ahead, and then keeps the
+// stream at real time, one 100 ms frame per 100 ms.
 func TestPaddingFillsACallerGapAtRealTime(t *testing.T) {
 	t.Parallel()
 	h := openPadded(t, newFakeRealtime(t))
 	h.caller(0, padFrameBytes24k) // plays out until 100 ms
 	h.expectTicks(
-		tickWant{ms(300), false},
-		tickWant{ms(399), false},
-		tickWant{ms(400), true},
-		tickWant{ms(450), false}, // the frame written at 400 ms still plays
-		tickWant{ms(500), true},
-		tickWant{ms(600), true},
-		tickWant{ms(600), false}, // a second tick at the same instant never runs ahead
+		tickWant{ms(300), 0},
+		tickWant{ms(499), 0},
+		tickWant{ms(500), 5}, // 100..600 ms: the 400 ms gap and one frame ahead
+		tickWant{ms(550), 0}, // the frame ahead still plays
+		tickWant{ms(600), 1},
+		tickWant{ms(600), 0}, // a second tick at the same instant never runs ahead
+		tickWant{ms(700), 1},
 	)
-	if got := h.stream.paddedBytes.Load(); got != 3*padFrameBytes24k {
-		t.Fatalf("padded bytes = %d, want three 100 ms frames", got)
+	if got := h.stream.paddedBytes.Load(); got != 7*padFrameBytes24k {
+		t.Fatalf("padded bytes = %d, want seven 100 ms frames", got)
 	}
-	frames := h.framesReceived(4)
+	frames := h.framesReceived(8)
 	if frames[0][0] != 1 {
 		t.Fatal("the caller's frame was not first")
 	}
@@ -196,92 +219,110 @@ func TestPaddingFillsACallerGapAtRealTime(t *testing.T) {
 	}
 }
 
-// Caller audio stops padding at once, and a new gap must pass paddingGap
-// again before padding resumes.
+// Caller audio that arrives in short bursts with gaps between them (100 ms
+// every 500 ms) never leaves the stream more than paddingGap behind the
+// clock: each gap is filled in full, not just from when padding started.
+func TestPaddingKeepsIntermittentCallerAudioAtRealTime(t *testing.T) {
+	t.Parallel()
+	h := openPadded(t, newFakeRealtime(t))
+	for burst := range 10 {
+		at := time.Duration(burst) * 500 * time.Millisecond
+		h.caller(at, padFrameBytes24k)
+		for step := 1; step < 5; step++ {
+			offset := at + time.Duration(step)*paddingFrame
+			h.tick(offset)
+			if lag := h.lag(offset); lag > paddingGap {
+				t.Fatalf("at %v the stream trails the clock by %v, want at most %v", offset, lag, paddingGap)
+			}
+		}
+	}
+	h.commit(ms(4950))
+	if lag := h.lag(ms(4950)); lag > 0 {
+		t.Fatalf("after the commit the stream trails the clock by %v, want none", lag)
+	}
+}
+
+// Caller audio stops padding at once, and the stream must trail the clock by
+// paddingGap again before padding resumes.
 func TestPaddingStopsWhenCallerAudioResumes(t *testing.T) {
 	t.Parallel()
 	h := openPadded(t, newFakeRealtime(t))
 	h.caller(0, padFrameBytes24k)
-	h.expectTicks(tickWant{ms(400), true})
-	h.caller(ms(450), padFrameBytes24k)
+	h.expectTicks(tickWant{ms(500), 5}) // written until 600 ms
+	h.caller(ms(550), padFrameBytes24k) // written until 700 ms
 	h.expectTicks(
-		tickWant{ms(450), false},
-		tickWant{ms(500), false},
-		tickWant{ms(849), false},
-		tickWant{ms(850), true},
+		tickWant{ms(600), 0},
+		tickWant{ms(700), 0},
+		tickWant{ms(1099), 0},
+		tickWant{ms(1100), 5},
 	)
-	frames := h.framesReceived(4)
-	for index, wantCaller := range []bool{true, false, true, false} {
-		if isCaller := frames[index][0] == 1; isCaller != wantCaller {
-			t.Fatalf("frame %d caller = %v, want %v (caller, pad, caller, pad)", index, isCaller, wantCaller)
+	frames := h.framesReceived(12)
+	for index, frame := range frames {
+		wantCaller := index == 0 || index == 6
+		if isCaller := frame[0] == 1; isCaller != wantCaller {
+			t.Fatalf("frame %d caller = %v, want %v (caller, 5 pad, caller, 5 pad)", index, isCaller, wantCaller)
 		}
 	}
 }
 
-// A commit pads at once, without waiting out paddingGap, so the service's
-// endpointing sees the turn end; it still never pads over caller audio that
-// has not played out yet.
+// A commit pads at once, without waiting for paddingGap, so the service's
+// endpointing sees the turn end; it fills whatever gap there is, and still
+// never pads over caller audio that has not played out yet.
 func TestCommitStartsPaddingImmediately(t *testing.T) {
 	t.Parallel()
 	t.Run("after the caller's audio played out", func(t *testing.T) {
 		t.Parallel()
 		h := openPadded(t, newFakeRealtime(t))
 		h.caller(0, padFrameBytes24k)
-		h.at(ms(100))
-		if err := h.stream.CommitAudio(h.ctx); err != nil {
-			t.Fatal(err)
+		if got := h.commit(ms(100)); got != 1 {
+			t.Fatalf("commit padded %d frames, want 1", got)
 		}
-		if !h.iteration() {
-			t.Fatal("commit did not pad at once")
+		h.expectTicks(tickWant{ms(150), 0}, tickWant{ms(200), 1})
+	})
+	t.Run("after a gap shorter than paddingGap", func(t *testing.T) {
+		t.Parallel()
+		h := openPadded(t, newFakeRealtime(t))
+		h.caller(0, padFrameBytes24k)
+		if got := h.commit(ms(300)); got != 3 {
+			t.Fatalf("commit padded %d frames, want 3 (100..400 ms)", got)
 		}
-		h.expectTicks(tickWant{ms(150), false}, tickWant{ms(200), true})
 	})
 	t.Run("while the caller's audio still plays", func(t *testing.T) {
 		t.Parallel()
 		h := openPadded(t, newFakeRealtime(t))
 		h.caller(0, 5*padFrameBytes24k) // plays out until 500 ms
-		h.at(ms(100))
-		if err := h.stream.CommitAudio(h.ctx); err != nil {
-			t.Fatal(err)
+		if got := h.commit(ms(100)); got != 0 {
+			t.Fatalf("commit padded %d frames ahead of the caller's audio", got)
 		}
-		if h.iteration() {
-			t.Fatal("commit padded ahead of the caller's audio")
-		}
-		h.expectTicks(tickWant{ms(400), false}, tickWant{ms(500), true})
+		h.expectTicks(tickWant{ms(400), 0}, tickWant{ms(500), 1})
 	})
 }
 
 // One stretch of padding stops at paddingStretchCap, so an idle client
 // cannot keep the service running; a commit does not restart it, and only
-// caller audio starts a new stretch.
+// caller audio starts a new stretch, without making up the time padding
+// gave up on.
 func TestPaddingStopsAtTheStretchCap(t *testing.T) {
 	t.Parallel()
 	h := openPadded(t, newFakeRealtime(t))
-	h.caller(0, padFrameBytes24k)
 	frames := int(paddingStretchCap / paddingFrame)
-	offset := ms(400)
-	for range frames {
-		h.expectTicks(tickWant{offset, true})
-		offset += paddingFrame
-	}
-	h.expectTicks(tickWant{offset, false}, tickWant{offset + time.Minute, false})
-	if got := h.stream.paddedBytes.Load(); got != int64(frames*padFrameBytes24k) {
-		t.Fatalf("padded bytes = %d, want %v of silence", got, paddingStretchCap)
-	}
-
-	offset += time.Minute
-	h.at(offset)
-	if err := h.stream.CommitAudio(h.ctx); err != nil {
-		t.Fatal(err)
-	}
-	if h.iteration() {
-		t.Fatal("a commit restarted padding past the cap")
+	h.caller(0, padFrameBytes24k)
+	h.expectTicks(
+		tickWant{ms(500), 5},
+		tickWant{paddingStretchCap + 10*time.Second, frames - 5},
+		tickWant{200 * time.Second, 0},
+	)
+	if got := h.commit(200 * time.Second); got != 0 {
+		t.Fatalf("a commit restarted padding past the cap: %d frames", got)
 	}
 
-	h.caller(offset, padFrameBytes24k)
-	h.expectTicks(tickWant{offset + paddingGap, true}, tickWant{offset + paddingGap + paddingFrame, true})
-	if got := h.stream.paddedBytes.Load(); got != int64((frames+2)*padFrameBytes24k) {
-		t.Fatalf("padded bytes = %d, want caller audio to start a new stretch", got)
+	h.caller(200*time.Second, padFrameBytes24k)
+	h.expectTicks(
+		tickWant{200*time.Second + ms(400), 0},
+		tickWant{200*time.Second + ms(500), 5},
+	)
+	if got := h.stream.paddedBytes.Load(); got != int64((frames+5)*padFrameBytes24k) {
+		t.Fatalf("padded bytes = %d, want the capped stretch and a new 500 ms one", got)
 	}
 }
 
@@ -292,18 +333,18 @@ func TestNoPaddingAfterEndStream(t *testing.T) {
 	fake.holdOpenAfterEndStream = true
 	h := openPadded(t, fake)
 	h.caller(0, padFrameBytes24k)
-	h.expectTicks(tickWant{ms(400), true})
+	h.expectTicks(tickWant{ms(500), 5})
 	if err := h.stream.Close(h.ctx); err != nil {
 		t.Fatal(err)
 	}
-	h.expectTicks(tickWant{ms(500), false})
+	h.expectTicks(tickWant{ms(600), 0})
 	select {
-	case h.ticks <- h.start.Add(ms(600)):
+	case h.ticks <- h.start.Add(ms(700)):
 		t.Fatal("padding loop still running after endStream")
 	case <-time.After(100 * time.Millisecond):
 	}
-	if got := h.stream.paddedBytes.Load(); got != padFrameBytes24k {
-		t.Fatalf("padded bytes = %d after Close, want only the frame before it", got)
+	if got := h.stream.paddedBytes.Load(); got != 5*padFrameBytes24k {
+		t.Fatalf("padded bytes = %d after Close, want only the frames before it", got)
 	}
 	h.fake.mu.Lock()
 	defer h.fake.mu.Unlock()
@@ -321,10 +362,11 @@ func TestPaddingIsNeverBilled(t *testing.T) {
 	fake.closingReplies = []string{`{"type":"audioProgress","audioProcessedMs":3000}`}
 	h := openPadded(t, fake)
 	for range 10 {
-		h.caller(0, padFrameBytes24k) // a 1 s burst, playing out until 1000 ms
+		h.caller(0, padFrameBytes24k) // a 1 s burst, written until 1000 ms
 	}
-	for offset := 1000; offset < 3000; offset += 100 {
-		h.expectTicks(tickWant{ms(offset), true})
+	h.expectTicks(tickWant{ms(1400), 5})
+	for offset := 1500; offset < 3000; offset += 100 {
+		h.expectTicks(tickWant{ms(offset), 1})
 	}
 	if got := h.stream.paddedBytes.Load(); got != 2*bytesPerSecond24k {
 		t.Fatalf("padded bytes = %d, want 2 s", got)
@@ -336,6 +378,108 @@ func TestPaddingIsNeverBilled(t *testing.T) {
 	final := mergeLikeConnector(t, observations)
 	if final.Quantities["duration_seconds"] != 1000 || !final.Complete {
 		t.Fatalf("final = %+v, want a complete 1000 ms: the caller's audio only", final)
+	}
+}
+
+// The service's processed position counts padding wherever it sits, so the
+// billed caller audio is that position less the padding inside it, and the
+// evidence is complete only once the caller's own audio is covered. A
+// position that has reached only padding ahead of later caller audio bills
+// what precedes it and stays incomplete through a drain timeout.
+func TestBilledCallerAudioExcludesPaddingWhereverItSits(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		layout   func(h *padHarness) // ends with the stream at 4 s (padding first) or 7 s
+		reported int
+		hangUp   bool
+		billed   int64
+		complete bool
+	}{
+		{
+			name: "padding between turns, progress stalled inside it", layout: callerPadCaller, reported: 4000,
+			billed: 1000,
+		},
+		{
+			name: "padding between turns, everything processed", layout: callerPadCaller, reported: 7000, hangUp: true,
+			billed: 4000, complete: true,
+		},
+		{
+			name: "padding before the caller's audio, progress stalled inside it", layout: padThenCaller, reported: 1000,
+			billed: 0,
+		},
+		{
+			name: "padding before the caller's audio, everything processed", layout: padThenCaller, reported: 2000, hangUp: true,
+			billed: 1000, complete: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			fake := newFakeRealtime(t)
+			fake.closingReplies = []string{fmt.Sprintf(`{"type":"audioProgress","audioProcessedMs":%d}`, test.reported)}
+			fake.holdOpenAfterEndStream = !test.hangUp
+			h := openPadded(t, fake, func(a *STTAdapter) { a.closeDrainTimeout = 200 * time.Millisecond })
+			test.layout(h)
+			if err := h.stream.Close(h.ctx); err != nil {
+				t.Fatal(err)
+			}
+			final := mergeLikeConnector(t, drainBilling(t, h.stream, false))
+			if final.Quantities["duration_seconds"] != test.billed || final.Complete != test.complete {
+				t.Fatalf("final = %+v, want %d ms, complete %v", final, test.billed, test.complete)
+			}
+		})
+	}
+}
+
+// callerPadCaller writes 1 s of caller audio, 3 s of padding and 3 s more
+// caller audio.
+func callerPadCaller(h *padHarness) {
+	for range 10 {
+		h.caller(0, padFrameBytes24k)
+	}
+	h.expectTicks(tickWant{ms(1400), 5})
+	for offset := 1500; offset < 4000; offset += 100 {
+		h.expectTicks(tickWant{ms(offset), 1})
+	}
+	for range 30 {
+		h.caller(ms(4000), padFrameBytes24k)
+	}
+}
+
+// padThenCaller writes 1 s of padding before any caller audio, then 1 s of
+// caller audio.
+func padThenCaller(h *padHarness) {
+	h.expectTicks(tickWant{ms(400), 5})
+	for offset := 500; offset < 1000; offset += 100 {
+		h.expectTicks(tickWant{ms(offset), 1})
+	}
+	for range 10 {
+		h.caller(ms(1000), padFrameBytes24k)
+	}
+}
+
+// A position the service reports counts padding too; published as
+// audio_end_ms it is mapped onto the caller's audio, so 1 s of padding
+// before a 100 ms caller frame does not make the frame end at 1100 ms.
+func TestReportedPositionsMapOntoCallerAudio(t *testing.T) {
+	t.Parallel()
+	h := openPadded(t, newFakeRealtime(t))
+	h.expectTicks(tickWant{ms(400), 5})
+	for offset := 500; offset < 1000; offset += 100 {
+		h.expectTicks(tickWant{ms(offset), 1})
+	}
+	h.caller(ms(1000), padFrameBytes24k) // written 1000..1100 ms
+	h.expectTicks(tickWant{ms(1500), 5}) // padding 1100..1600 ms
+	for _, step := range []struct{ processed, caller int64 }{
+		{500, 0}, {1000, 0}, {1050, 50}, {1100, 100}, {1300, 100}, {1600, 100},
+	} {
+		if got := h.stream.callerMs(step.processed); got != step.caller {
+			t.Fatalf("processed %d ms maps to %d ms of caller audio, want %d", step.processed, got, step.caller)
+		}
+	}
+	var data map[string]any
+	if err := json.Unmarshal(h.stream.turnData(serverMessage{AudioProcessedMs: 1100}, nil), &data); err != nil || data["audio_end_ms"] != float64(100) {
+		t.Fatalf("turn data = %v (%v), want audio_end_ms 100", data, err)
 	}
 }
 
@@ -356,8 +500,8 @@ func TestStalledPaddingWriteEndsPadding(t *testing.T) {
 		}
 	})
 	h.caller(0, padFrameBytes24k)
-	if h.tick(ms(400)) {
-		t.Fatal("a stalled write reported padding")
+	if got := h.tick(ms(500)); got != 0 {
+		t.Fatalf("a stalled write reported %d frames", got)
 	}
 	if left := <-deadlines; left <= 0 || left > timeout {
 		t.Fatalf("padding write deadline %v away, want within %v", left, timeout)
