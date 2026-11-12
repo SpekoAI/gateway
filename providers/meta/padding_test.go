@@ -520,6 +520,56 @@ func TestStalledPaddingWriteEndsPadding(t *testing.T) {
 	}
 }
 
+// A catch-up of several frames releases writeMu between them, so caller
+// audio waiting behind slow padding writes gets in after one or two of them
+// (sync.Mutex hands over once a waiter has starved) rather than after the
+// whole catch-up, and ends it.
+func TestCallerAudioGetsInBetweenCatchUpFrames(t *testing.T) {
+	t.Parallel()
+	const catchUp = 5 // a 400 ms gap and one frame ahead
+	started := make(chan struct{}, catchUp)
+	proceed := make(chan struct{})
+	h := openPadded(t, newFakeRealtime(t), func(a *STTAdapter) {
+		a.padWriter = func(ctx context.Context, _ []byte) error {
+			started <- struct{}{}
+			select {
+			case <-proceed:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+	h.caller(0, padFrameBytes24k)
+	h.at(ms(500))
+	padded := make(chan int, 1)
+	go func() {
+		h.ticks <- h.clock.Now()
+		padded <- <-h.iterations
+	}()
+	<-started // the first frame is being written, under writeMu
+
+	callerDone := make(chan error, 1)
+	go func() { callerDone <- h.stream.WriteAudio(h.ctx, bytes.Repeat([]byte{1}, padFrameBytes24k)) }()
+	for written := 1; ; written++ {
+		time.Sleep(20 * time.Millisecond) // the caller waits on writeMu
+		proceed <- struct{}{}
+		select {
+		case err := <-callerDone:
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := <-padded; got != written || written >= catchUp {
+				t.Fatalf("caller audio got in after %d of %d catch-up frames (iteration wrote %d), want before the catch-up finished", written, catchUp, got)
+			}
+			return
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("caller audio never got in")
+		}
+	}
+}
+
 // The production clock and ticker pad a stalled caller on their own.
 func TestPaddingRunsOnTheRealClock(t *testing.T) {
 	t.Parallel()

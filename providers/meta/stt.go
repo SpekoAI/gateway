@@ -506,32 +506,50 @@ func (s *sttStream) padLoop(ticks <-chan time.Time, stop func()) {
 // fails; a failed write is left to the read loop, which reports the
 // socket's end.
 func (s *sttStream) padOnce() (frames int, open bool) {
+	for {
+		wrote, open := s.padFrameIfDue()
+		if !open {
+			return frames, false
+		}
+		if !wrote {
+			return frames, true
+		}
+		frames++
+	}
+}
+
+// padFrameIfDue writes one frame of silence when one is due. It holds
+// writeMu for that one frame only, so caller audio, and the engine's
+// teardown waiting behind a caller write, never wait out a whole catch-up:
+// at most one padding write, itself bounded by padWriteTimeout. Caller
+// audio that gets in between frames ends the catch-up.
+func (s *sttStream) padFrameIfDue() (wrote, open bool) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.inputClosed.Load() || s.closed.Load() {
-		return 0, false
+		return false, false
 	}
 	now := s.now()
 	if !s.padding && now.Sub(s.audioUntil) < paddingGap {
-		return 0, true
+		return false, true
 	}
 	s.padding = true
-	for s.audioUntil.Sub(now) < paddingFrame/2 && s.stretchPadded < paddingStretchCap {
-		// Recorded before the write, like caller audio, so no position the
-		// service reports can name padding the timeline does not hold.
-		s.timeline.pad(int64(len(s.padFrame)))
-		ctx, cancel := context.WithTimeout(s.ctx, s.padWriteTimeout)
-		err := s.padWriter(ctx, s.padFrame)
-		cancel()
-		if err != nil {
-			return frames, false
-		}
-		s.paddedBytes.Add(int64(len(s.padFrame)))
-		s.stretchPadded += paddingFrame
-		s.audioUntil = s.audioUntil.Add(paddingFrame)
-		frames++
+	if s.audioUntil.Sub(now) >= paddingFrame/2 || s.stretchPadded >= paddingStretchCap {
+		return false, true
 	}
-	return frames, true
+	// Recorded before the write, like caller audio, so no position the
+	// service reports can name padding the timeline does not hold.
+	s.timeline.pad(int64(len(s.padFrame)))
+	ctx, cancel := context.WithTimeout(s.ctx, s.padWriteTimeout)
+	err := s.padWriter(ctx, s.padFrame)
+	cancel()
+	if err != nil {
+		return false, false
+	}
+	s.paddedBytes.Add(int64(len(s.padFrame)))
+	s.stretchPadded += paddingFrame
+	s.audioUntil = s.audioUntil.Add(paddingFrame)
+	return true, true
 }
 
 func laterOf(a, b time.Time) time.Time {
