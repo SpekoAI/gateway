@@ -395,3 +395,24 @@ those asks require; the hint is never dropped to satisfy them, because the
 provider loses speech without it. Keywords combined with diarization or word
 timestamps are rejected locally before audio is read or sent: the provider
 refuses that combination with HTTP 400.
+
+### Meta transcription silence padding
+
+The Meta realtime socket receives the caller's audio and, in the gaps between
+it, zero-valued PCM silence that the adapter writes itself. The service closes
+a stream whose audio falls behind real time, and its endpointing only ends a
+turn while audio keeps arriving. So once the audio written trails the clock by
+400 ms, or at once after a commit, the adapter fills the gap up to the present
+with 100 ms frames of silence, never more than one frame ahead, and keeps the
+stream at real time until caller audio resumes. Each continuous stretch of
+padding stops after 120 seconds, so a client that stays connected and silent
+cannot keep the session running; the service's own idle policy then closes it.
+Caller audio starts a new stretch. Nothing is padded after the end of the
+stream, and a catch-up of padding the service does not accept within 2
+seconds closes the socket. Padding carries no caller content. The service processes
+and charges for the padding, but the caller is never billed for it: the
+adapter records where padding sits in the stream and maps every position the
+service reports back onto the caller's own audio, so billing observations
+count only caller audio the service has processed (never more than was
+forwarded), the published `audio_end_ms` is a position in the caller's audio,
+and the relay's `stt_duration` budget counts caller audio only.

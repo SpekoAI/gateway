@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -73,6 +74,29 @@ const (
 	// only ever lowers the bill, because the billed figure is the reported
 	// position, never the forwarded total.
 	processedCoverageSlackMs = 100
+
+	// paddingFrame is the silence one padding write carries and the padding
+	// loop's tick, so padding runs at exactly real time.
+	paddingFrame = 100 * time.Millisecond
+	// paddingGap is how far the audio written may fall behind the clock
+	// before padding fills the gap: above ordinary network jitter, so silence
+	// is not spliced into speech that is merely late, and well under the ~2 s
+	// without audio after which the service was seen closing a session.
+	paddingGap = 400 * time.Millisecond
+	// paddingStretchCap bounds one continuous stretch of padding. Two minutes
+	// keeps the service listening through ordinary pauses and long agent
+	// turns, but a client that stays connected and silent must not keep the
+	// session, and the service's billed minutes, running indefinitely: past
+	// the cap padding stops and the service's own idle policy closes the
+	// session. Caller audio starts a new stretch; a commit does not.
+	paddingStretchCap = 120 * time.Second
+	// padWriteTimeout bounds one padding catch-up, every frame of it. A
+	// normal catch-up is half a second of audio, a few tens of kilobytes; a
+	// socket that cannot take that in two seconds cannot carry real-time
+	// audio either. On the deadline the websocket closes, padding ends, and
+	// the read loop reports the socket's end, so padding never holds
+	// writeMu, and with it caller audio and teardown, for longer.
+	padWriteTimeout = 2 * time.Second
 )
 
 // sampleRateEncodings are the only rates the realtime socket listens at,
@@ -109,6 +133,15 @@ type STTAdapter struct {
 	setupTimeout      time.Duration
 	closeDrainTimeout time.Duration
 	endpointPolicy    upstream.WebSocketPolicy
+	// now and newTicker drive silence padding; tests replace them.
+	now       func() time.Time
+	newTicker func(time.Duration) (<-chan time.Time, func())
+	// afterPad, when set, is told after every padding iteration how many
+	// frames of silence it wrote, and padWriter, when set, replaces the
+	// socket write for padding. Tests only.
+	afterPad        func(frames int)
+	padWriter       func(ctx context.Context, frame []byte) error
+	padWriteTimeout time.Duration
 }
 
 // NewSTT validates the configuration and builds the adapter.
@@ -140,6 +173,12 @@ func NewSTT(config STTConfig) (*STTAdapter, error) {
 		maxMessageBytes: config.MaxMessageBytes, setupTimeout: config.SetupTimeout,
 		closeDrainTimeout: config.CloseDrainTimeout,
 		endpointPolicy:    policy,
+		now:               time.Now,
+		padWriteTimeout:   padWriteTimeout,
+		newTicker: func(period time.Duration) (<-chan time.Time, func()) {
+			ticker := time.NewTicker(period)
+			return ticker.C, ticker.Stop
+		},
 	}, nil
 }
 
@@ -196,10 +235,15 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &sttStream{
 		conn: conn, ctx: streamCtx, cancel: cancel,
-		events:       make(chan runtimepkg.ProviderEvent, a.eventBuffer),
-		setupDone:    make(chan error, 1),
-		done:         make(chan struct{}),
-		drainTimeout: a.closeDrainTimeout,
+		events:          make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		setupDone:       make(chan error, 1),
+		done:            make(chan struct{}),
+		drainTimeout:    a.closeDrainTimeout,
+		now:             a.now,
+		afterPad:        a.afterPad,
+		padWriter:       a.padWriter,
+		padWriteTimeout: a.padWriteTimeout,
+		padKick:         make(chan struct{}, 1),
 		// mono pcm_s16le, validated above
 		bytesPerSecond: int64(request.Media.SampleRateHz) * 2,
 		billing:        protocol.BillingObservation{OperationID: "session", Model: model, Mode: "streaming", Quantities: map[string]int64{}},
@@ -222,6 +266,16 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		stream.abort()
 		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Meta transcribe did not acknowledge the session", Retryable: true, Cause: setupCtx.Err()}
 	}
+	if stream.padWriter == nil {
+		stream.padWriter = func(ctx context.Context, frame []byte) error {
+			return stream.conn.Write(ctx, websocket.MessageBinary, frame)
+		}
+	}
+	stream.writeMu.Lock()
+	stream.audioUntil = a.now()
+	stream.writeMu.Unlock()
+	stream.padFrame = make([]byte, stream.bytesPerSecond*int64(paddingFrame)/int64(time.Second))
+	go stream.padLoop(a.newTicker(paddingFrame))
 	sessionID := stream.session()
 	stream.emit(runtimepkg.ProviderEvent{Type: protocol.EventSessionReady, Data: marshalData(map[string]string{"provider_request_id": sessionID})})
 	stream.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(map[string]string{"provider_request_id": sessionID})})
@@ -334,6 +388,37 @@ type sttStream struct {
 
 	terminalMu  sync.Mutex
 	terminalErr error
+
+	// Silence padding. The service closes a stream whose audio falls behind
+	// real time, and its endpointing only ends a turn while audio keeps
+	// arriving, so padLoop fills every gap in the caller's audio with PCM
+	// silence and keeps the stream at real time. padding, audioUntil and
+	// stretchPadded are guarded by writeMu, the lock every socket write
+	// takes, so a padding decision and its write never interleave with
+	// caller audio.
+	now             func() time.Time
+	afterPad        func(frames int)
+	padWriter       func(ctx context.Context, frame []byte) error
+	padWriteTimeout time.Duration
+	padFrame        []byte
+	// padKick asks the loop to pad at once (CommitAudio).
+	padKick chan struct{}
+	// padding is set once the audio written falls paddingGap behind the
+	// clock, or by a commit, and cleared by caller audio.
+	padding bool
+	// audioUntil is the wall-clock instant by which everything written so
+	// far, caller audio and padding, has played out at real time, counted
+	// from the session's start: a gap nobody filled leaves it behind.
+	audioUntil time.Time
+	// stretchPadded is the silence written since the caller's last audio,
+	// held to paddingStretchCap.
+	stretchPadded time.Duration
+	// paddedBytes is the silence written. It is never billed: see
+	// billedObservation.
+	paddedBytes atomic.Int64
+	// timeline places the padding among everything written, so positions
+	// the service reports map back onto the caller's audio.
+	timeline audioTimeline
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -356,6 +441,15 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	// A frame whose write fails ends the session, whose evidence then stays
 	// partial, and the service cannot report audio it never got.
 	s.forwardedBytes.Add(int64(len(audio)))
+	s.timeline.caller(int64(len(audio)))
+	if s.stretchPadded >= paddingStretchCap {
+		// Padding gave up on this gap, so the stream is behind the clock by
+		// the rest of it; no burst of silence should make that up now.
+		s.audioUntil = laterOf(s.audioUntil, s.now())
+	}
+	s.padding = false
+	s.stretchPadded = 0
+	s.audioUntil = s.audioUntil.Add(time.Duration(int64(len(audio)) * int64(time.Second) / s.bytesPerSecond))
 	if err := s.conn.Write(ctx, websocket.MessageBinary, audio); err != nil {
 		return s.writeError(err)
 	}
@@ -364,12 +458,94 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 
 // CommitAudio has no wire message on this socket short of endStream, which
 // ends the session rather than the turn. The service's own endpointing
-// decides the turn, so the call is accepted and does nothing.
+// decides the turn, and it only does so while audio keeps arriving, so a
+// commit starts silence padding at once instead of after paddingGap.
 func (s *sttStream) CommitAudio(context.Context) error {
 	if s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
+	s.writeMu.Lock()
+	s.padding = true
+	s.writeMu.Unlock()
+	select {
+	case s.padKick <- struct{}{}:
+	default:
+	}
 	return nil
+}
+
+// padLoop writes silence while the caller sends none, one frame per tick,
+// until the input is closed or the session ends.
+func (s *sttStream) padLoop(ticks <-chan time.Time, stop func()) {
+	defer stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.done:
+			return
+		case <-ticks:
+		case <-s.padKick:
+		}
+		frames, open := s.padOnce()
+		if s.afterPad != nil {
+			s.afterPad(frames)
+		}
+		if !open {
+			return
+		}
+	}
+}
+
+// padOnce fills the stream with silence up to the clock, one frame ahead at
+// most, once the audio written has fallen paddingGap behind it or a commit
+// asked; it then keeps the stream at real time until caller audio resumes
+// or the stretch reaches paddingStretchCap. Filling the whole gap, not just
+// the time since padding started, keeps intermittent caller audio from
+// leaving the stream ever further behind real time.
+//
+// The whole catch-up runs under writeMu and one padWriteTimeout deadline,
+// and it catches up to the clock as it reads while writing, not as it read
+// when it began, so slow writes do not leave a new gap behind it. Caller
+// audio that arrives meanwhile waits for it, at most that long, and then
+// follows the silence: the gap is filled before the resumed speech, never
+// spliced into it, and none of it is dropped. Writes slower than real time
+// never catch up, and the deadline then closes the socket. It reports how many
+// frames it wrote, and false for open once the input is closed or a write
+// fails; a failed write is left to the read loop, which reports the
+// socket's end.
+func (s *sttStream) padOnce() (frames int, open bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.inputClosed.Load() || s.closed.Load() {
+		return 0, false
+	}
+	if !s.padding && s.now().Sub(s.audioUntil) < paddingGap {
+		return 0, true
+	}
+	s.padding = true
+	ctx, cancel := context.WithTimeout(s.ctx, s.padWriteTimeout)
+	defer cancel()
+	for s.audioUntil.Sub(s.now()) < paddingFrame/2 && s.stretchPadded < paddingStretchCap {
+		// Recorded before the write, like caller audio, so no position the
+		// service reports can name padding the timeline does not hold.
+		s.timeline.pad(int64(len(s.padFrame)))
+		if err := s.padWriter(ctx, s.padFrame); err != nil {
+			return frames, false
+		}
+		s.paddedBytes.Add(int64(len(s.padFrame)))
+		s.stretchPadded += paddingFrame
+		s.audioUntil = s.audioUntil.Add(paddingFrame)
+		frames++
+	}
+	return frames, true
+}
+
+func laterOf(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 func (s *sttStream) AppendText(context.Context, string) error {
@@ -646,7 +822,7 @@ func (s *sttStream) turnData(message serverMessage, fields map[string]any) json.
 	}
 	s.turnMu.Unlock()
 	if message.AudioProcessedMs != 0 {
-		data["audio_end_ms"] = message.AudioProcessedMs
+		data["audio_end_ms"] = s.callerMs(message.AudioProcessedMs)
 	}
 	for key, value := range fields {
 		data[key] = value
@@ -659,7 +835,7 @@ func (s *sttStream) turnData(message serverMessage, fields map[string]any) json.
 //
 // The field rides more than audioProgress: speechStart, transcript, speechEnd
 // and speechComplete carry it too, as the position of the turn they describe
-// (it is published as audio_end_ms). A turn event therefore routinely names a
+// (it is published, mapped onto the caller's audio, as audio_end_ms). A turn event therefore routinely names a
 // position BEHIND the latest audioProgress — speechComplete arrives after the
 // turn's cleanup pass, by which time progress has moved on. That is not
 // contradictory evidence: every value is a point the service has processed,
@@ -702,33 +878,57 @@ func (s *sttStream) forwardedDuration() *big.Rat {
 	return new(big.Rat).SetFrac(big.NewInt(s.forwardedBytes.Load()), big.NewInt(s.bytesPerSecond))
 }
 
-// billedObservation is the evidence as published: the service's processed
-// position, capped at the audio actually forwarded. The service cannot have
-// processed audio it was never sent, so the cap only matters if its counter
-// ever ran ahead of the input — and then the customer pays for what was sent.
+// processedCallerDuration is the caller's audio inside the service's
+// processed position, in seconds. The service processes, and charges for,
+// the silence padLoop writes too, so its position counts the padding before
+// it; that padding is taken out wherever it sits, before, between or after
+// the caller's frames, and the result never exceeds the audio the caller
+// sent.
+func (s *sttStream) processedCallerDuration() *big.Rat {
+	processed := durationOf(s.billing)
+	position := new(big.Int).Quo(new(big.Int).Mul(processed.Num(), big.NewInt(s.bytesPerSecond)), processed.Denom())
+	caller := new(big.Rat).SetFrac(big.NewInt(s.timeline.callerBytes(position.Int64())), big.NewInt(s.bytesPerSecond))
+	if forwarded := s.forwardedDuration(); caller.Cmp(forwarded) > 0 {
+		return forwarded
+	}
+	return caller
+}
+
+// callerMs maps a position the service reported, in milliseconds of
+// everything written, onto the caller's audio. A position inside padding
+// maps to the end of the caller audio before it.
+func (s *sttStream) callerMs(processedMs int64) int64 {
+	return s.timeline.callerBytes(processedMs*s.bytesPerSecond/1000) * 1000 / s.bytesPerSecond
+}
+
+// billedObservation is the evidence as published: the caller's audio the
+// service has processed (processedCallerDuration). The customer pays only for
+// what they sent, and the relay absorbs the padding; the relay's
+// stt_duration budget is debited by the connector on caller audio before
+// WriteAudio and never sees padding either.
 func (s *sttStream) billedObservation() protocol.BillingObservation {
 	o := s.billing.Clone()
 	if _, ok := o.Quantities["duration_seconds"]; !ok {
 		return o
 	}
-	if forwarded := s.forwardedDuration(); durationOf(o).Cmp(forwarded) > 0 {
-		denominator := o.QuantityDenominator("duration_seconds")
-		capped := new(big.Int).Quo(new(big.Int).Mul(forwarded.Num(), big.NewInt(denominator)), forwarded.Denom())
-		o.Quantities["duration_seconds"] = capped.Int64()
-	}
+	caller := s.processedCallerDuration()
+	denominator := o.QuantityDenominator("duration_seconds")
+	o.Quantities["duration_seconds"] = new(big.Int).Quo(new(big.Int).Mul(caller.Num(), big.NewInt(denominator)), caller.Denom()).Int64()
 	return o
 }
 
-// processedCoversForwarded reports whether the service's processed position
-// has reached the forwarded audio, within one progress step. Once endStream
-// is out no further audio can be forwarded, so this is the point at which the
-// reported figure is final for everything that was served.
+// processedCoversForwarded reports whether the caller audio the service has
+// processed has reached the audio forwarded, within one progress step. Once
+// endStream is out no further audio can be forwarded, so this is the point
+// at which the reported figure is final for everything that was served.
+// Padding earlier in the stream never counts toward it: a position that
+// covers only padding leaves the caller's later frames unprocessed.
 func (s *sttStream) processedCoversForwarded() bool {
 	if !s.billingDurationSeen {
 		return false
 	}
 	slack := new(big.Rat).SetFrac64(processedCoverageSlackMs, 1000)
-	return new(big.Rat).Add(durationOf(s.billing), slack).Cmp(s.forwardedDuration()) >= 0
+	return new(big.Rat).Add(s.processedCallerDuration(), slack).Cmp(s.forwardedDuration()) >= 0
 }
 
 func (s *sttStream) billingEvent(complete bool) runtimepkg.ProviderEvent {
@@ -819,4 +1019,50 @@ func marshalData(value any) json.RawMessage {
 func isNormalClose(err error) bool {
 	status := websocket.CloseStatus(err)
 	return status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway
+}
+
+// audioTimeline records where padding sits among everything written to the
+// service, so a position the service reports, which counts the padding,
+// maps back onto the caller's own audio.
+type audioTimeline struct {
+	mu      sync.Mutex
+	written int64
+	pads    []padSpan
+}
+
+// padSpan is one run of padding, in bytes of everything written; before is
+// the padding written ahead of it.
+type padSpan struct{ start, end, before int64 }
+
+func (t *audioTimeline) caller(n int64) {
+	t.mu.Lock()
+	t.written += n
+	t.mu.Unlock()
+}
+
+func (t *audioTimeline) pad(n int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	last := len(t.pads) - 1
+	switch {
+	case last >= 0 && t.pads[last].end == t.written:
+		t.pads[last].end += n
+	case last >= 0:
+		t.pads = append(t.pads, padSpan{start: t.written, end: t.written + n, before: t.pads[last].before + t.pads[last].end - t.pads[last].start})
+	default:
+		t.pads = append(t.pads, padSpan{start: t.written, end: t.written + n})
+	}
+	t.written += n
+}
+
+// callerBytes is the caller audio among the first position bytes written.
+func (t *audioTimeline) callerBytes(position int64) int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	next := sort.Search(len(t.pads), func(i int) bool { return t.pads[i].start >= position })
+	if next == 0 {
+		return position
+	}
+	span := t.pads[next-1]
+	return position - span.before - (min(span.end, position) - span.start)
 }
