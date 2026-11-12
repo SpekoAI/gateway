@@ -408,8 +408,8 @@ stream at real time until caller audio resumes. Each continuous stretch of
 padding stops after 120 seconds, so a client that stays connected and silent
 cannot keep the session running; the service's own idle policy then closes it.
 Caller audio starts a new stretch. Nothing is padded after the end of the
-stream, and a padding write the service does not accept within 2 seconds
-closes the socket. Padding carries no caller content. The service processes
+stream, and a catch-up of padding the service does not accept within 2
+seconds closes the socket. Padding carries no caller content. The service processes
 and charges for the padding, but the caller is never billed for it: the
 adapter records where padding sits in the stream and maps every position the
 service reports back onto the caller's own audio, so billing observations
