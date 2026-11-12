@@ -474,10 +474,10 @@ async def _sse_events(
                 event = value
             elif field == "data":
                 data_lines.append(value)
-        if event and data_lines:
-            payload = json.loads("\n".join(data_lines))
-            if isinstance(payload, dict):
-                yield event, payload
+        if event or data_lines:
+            # EOF does not dispatch an SSE event. Even valid terminal JSON is
+            # incomplete until the frame's empty-line delimiter was received.
+            raise RelayError("relay stream ended with an unterminated event", retryable=True)
     except ValueError as err:
         raise RelayError("relay stream sent a malformed event", retryable=True) from err
 

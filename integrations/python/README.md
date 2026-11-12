@@ -144,6 +144,9 @@ result. Responses are router transport payloads: the worker must validate and
 commit its model observation separately. No method grants model authority,
 settles a charge, dispatches tools, claims heard audio or enables graph startup.
 Keep the envelope, bearer and blinder in memory only; do not log or spool them.
+The shared SSE decoder dispatches an event only after its blank-line frame
+terminator. EOF after terminal JSON is a truncated stream, including for the
+ordinary `stream_response` method.
 
 Jev evaluations use the separate pooled async client and require an explicit
 idempotency key:

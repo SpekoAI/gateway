@@ -313,3 +313,55 @@ async def test_cancellation_closes_the_actual_request_without_retry(stream):
             released.set()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("suffix", ["", "\n", "\r\n"])
+async def test_valid_terminal_json_without_frame_terminator_is_not_completion(
+    bound, suffix
+):
+    async def handler(request):
+        await request.read()
+        return web.Response(
+            text='event: response.completed\ndata: {"response_id":"resp_owned"}'
+            + suffix,
+            content_type="text/event-stream",
+        )
+
+    seen = []
+    async with server(handler) as client:
+        events = (
+            client.stream_registered_response(**registered(True))
+            if bound
+            else client.stream_response({"input": []})
+        )
+        with pytest.raises(RelayError):
+            async for event in events:
+                seen.append(event[0])
+    assert seen == [], "EOF cannot dispatch an incomplete completion frame"
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+async def test_a_fully_terminated_terminal_frame_remains_valid(bound, newline):
+    async def handler(request):
+        await request.read()
+        return web.Response(
+            text=newline.join(
+                [
+                    "event: response.completed",
+                    'data: {"response_id":"resp_owned"}',
+                    "",
+                    "",
+                ]
+            ),
+            content_type="text/event-stream",
+        )
+
+    async with server(handler) as client:
+        events = (
+            client.stream_registered_response(**registered(True))
+            if bound
+            else client.stream_response({"input": []})
+        )
+        assert [item[0] async for item in events] == ["response.completed"]
