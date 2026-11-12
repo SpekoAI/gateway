@@ -228,3 +228,41 @@ pipeline = Pipeline(
 Use a Pipecat VAD in the pipeline so `VADUserStoppedSpeakingFrame` commits the
 current Gateway STT utterance. The complete container and Pipecat Cloud setup
 is in the [Pipecat integration guide](../../docs/PIPECAT.md).
+
+### Router-native speech audio
+
+`RelayTTSClient` sends one `POST /v1/tts/speech` and yields the original audio
+bytes. It uses a Speko key and an explicit idempotency key; it never retries,
+follows redirects or falls back to a provider or local Gateway transport.
+
+```python
+from speko_gateway import RelayTTSClient
+
+speech = RelayTTSClient(api_key=key, base_url=router_origin, session_id=session_id)
+try:
+    async for chunk in speech.synthesize(
+        {
+            "routing": {"mode": "explicit", "provider": provider, "model": model},
+            "input": text,
+            "language": language,
+            "audio": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
+        },
+        idempotency_key=original_request_id,
+    ):
+        await consume_audio(chunk)
+finally:
+    await speech.aclose()
+```
+
+For caller-bound work, pass its original `work_nonce` and `input_blinder`
+together as keyword arguments. The SDK preserves them and the complete input
+string; it does not mint credentials, choose routes, or authorize another
+attempt. Do not place private work markers inside the request dictionary.
+
+Requests are bounded to 1 MiB; audio defaults to a 64 MiB maximum, configurable
+downward with `max_audio_bytes`. `io_timeout` (default 30 seconds) bounds cumulative
+pending HTTP header/audio waits and excludes time spent consuming a yielded
+chunk. No SDK timeout scope remains active in consumer code. Closure/cancellation
+releases owned responses. HTTP errors expose fixed status diagnostics rather
+than server response content. Audio, EOF, timeouts and failures supply no proof
+of provider non-execution, settlement or actual audible delivery.

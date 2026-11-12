@@ -9,6 +9,7 @@ from .relay import (
     RelayEvaluationClient,
     RelayLLMClient,
 )
+from .speech import RelayTTSClient
 
 __all__ = [
     "CanonicalEvent",
@@ -21,4 +22,5 @@ __all__ = [
     "ReasoningEffort",
     "RelayEvaluationClient",
     "RelayLLMClient",
+    "RelayTTSClient",
 ]
