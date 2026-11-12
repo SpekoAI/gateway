@@ -10,6 +10,8 @@ from aiohttp import web
 
 from speko_gateway.relay import RelayError, RelayLLMClient
 
+ATTEMPT = "00000000-0000-4000-8000-00000000000a"
+
 
 def arguments(stream=False):
     return {
@@ -19,6 +21,118 @@ def arguments(stream=False):
         "input_blinder": "b" * 64,
         "idempotency_key": "owned-work",
     }
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "rendering",
+    ["agent-graph/openai-responses/v2", "agent-graph/anthropic-messages/v2"],
+)
+async def test_registered_attempt_metadata_keeps_original_body_work_identity_and_one_post(
+    stream, rendering
+):
+    seen = []
+    body = (
+        ' { "stream":'
+        + ("true" if stream else "false")
+        + ',"n":9007199254740993,"text":"漢\\u0000🙂" } '
+    )
+
+    async def handler(request):
+        seen.append((await request.json(), dict(request.headers)))
+        return web.Response(
+            text=stream_text() if stream else response_text(),
+            content_type="text/event-stream" if stream else "application/json",
+        )
+
+    values = {
+        **arguments(stream),
+        "rendering": rendering,
+        "request_body": body,
+        "attempt_id": ATTEMPT,
+    }
+    async with peer(handler) as client:
+        if stream:
+            frames = [
+                record async for record in client.stream_registered_response(**values)
+            ]
+            assert frames[-1][0] == "response.completed"
+        else:
+            assert (await client.complete_registered_response(**values))[
+                "id"
+            ] == "resp_owned"
+    assert len(seen) == 1
+    payload, headers = seen[0]
+    assert payload == {
+        "speko_work_nonce": values["work_nonce"],
+        "speko_input_blinder": values["input_blinder"],
+        "speko_model_rendering": rendering,
+        "speko_model_request": body,
+        "speko_model_attempt_id": ATTEMPT,
+    }
+    assert headers["Idempotency-Key"] == values["idempotency_key"]
+    assert headers["Speko-Client-Session-ID"] == "owned-session"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "attempt",
+    [
+        None,
+        "",
+        "invalid",
+        ATTEMPT.upper(),
+        1,
+        True,
+        " " + ATTEMPT,
+        ATTEMPT + "," + ATTEMPT,
+    ],
+)
+async def test_registered_v2_refuses_missing_or_malformed_attempt_before_http(
+    stream, attempt
+):
+    seen = []
+
+    async def handler(request):
+        seen.append(await request.read())
+        return web.json_response({})
+
+    values = {
+        **arguments(stream),
+        "rendering": "agent-graph/openai-responses/v2",
+        "attempt_id": attempt,
+    }
+    async with peer(handler) as client:
+        with pytest.raises(ValueError, match="^registered model input is invalid$"):
+            if stream:
+                _ = [item async for item in client.stream_registered_response(**values)]
+            else:
+                await client.complete_registered_response(**values)
+    assert not seen
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_registered_v1_refuses_mixed_attempt_metadata_before_http(stream):
+    seen = []
+
+    async def handler(request):
+        seen.append(await request.read())
+        return web.json_response({})
+
+    async with peer(handler) as client:
+        with pytest.raises(ValueError, match="^registered model input is invalid$"):
+            if stream:
+                _ = [
+                    item
+                    async for item in client.stream_registered_response(
+                        **arguments(True), attempt_id=ATTEMPT
+                    )
+                ]
+            else:
+                await client.complete_registered_response(
+                    **arguments(), attempt_id=ATTEMPT
+                )
+    assert not seen
 
 
 def response_text():

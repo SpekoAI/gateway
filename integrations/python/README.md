@@ -130,15 +130,28 @@ original `stream:true` body. Create that client with the work's current bearer,
 the configured router URL and its session ID. Supply the cell's exact
 `rendering`, `request_body`, `work_nonce` and private `input_blinder`, plus the
 original explicit `idempotency_key`. The transport embeds the untouched request
-string in the four-field protected envelope; it never adds a stream setting or
+string in the v1 four-field protected envelope; it never adds a stream setting or
 reconstructs provider JSON. The 262144-byte UTF-8 input bound and exact metadata
 shape are checked before sending. Unknown provider grammar and authority are
 still verified independently by the native router and cell.
 
+The `agent-graph/openai-responses/v2` and `agent-graph/anthropic-messages/v2`
+renderings additionally require `attempt_id`, the lowercase UUID belonging to
+this invocation's acquired attempt. Supply its matching private `input_blinder`.
+These methods send exactly five fields by adding `speko_model_attempt_id`, while
+preserving the original request string and work idempotency key. Missing/invalid
+IDs and v1 requests mixed with attempt metadata refuse before HTTP. The SDK only
+transports the supplied proof; the cell and native owner verify the winning
+binding and authority. Keep the attempt ID and blinder in memory only. Do not
+reuse an invocation ID after cancellation, restart or an uncertain send, and do
+not replace the work idempotency key with that ID. No retry or fallback is added.
+
 These methods make one POST to `/v1/llm/responses`, carry
 `Speko-Client-Session-ID`, refuse redirects and do not retry or fall back. An
-explicit retry must reuse the original work/input/key and remains subject to
-current cell authority. Neither a transport error nor `retryable` proves no
+explicit v1 retry must reuse the original work/input/key and remains subject to
+current cell authority. For v2, an uncertain send requires canonical recovery;
+replacement work needs separate cell authorization and a newly acquired attempt.
+Neither a transport error nor `retryable` proves no
 provider I/O. Cancellation or a truncated/error stream is not a completed
 result. Responses are router transport payloads: the worker must validate and
 commit its model observation separately. No method grants model authority,

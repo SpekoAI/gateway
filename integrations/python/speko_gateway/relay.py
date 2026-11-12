@@ -25,6 +25,10 @@ from .probe import report_leg as _report_probe_leg
 _DEFAULT_RELAY_URL = "https://router.speko.dev"
 _TERMINAL_EVENTS = {"response.completed", "error"}
 _REGISTERED_RESPONSE_LIMIT = 1024 * 1024
+_ATTEMPT_RENDERINGS = {
+    "agent-graph/openai-responses/v2",
+    "agent-graph/anthropic-messages/v2",
+}
 _REGISTERED_EVENTS = {
     "response.created",
     "response.item.added",
@@ -262,6 +266,7 @@ class RelayLLMClient:
         input_blinder: str,
         idempotency_key: str,
         stream: bool,
+        attempt_id: str | None = None,
     ) -> tuple[bytes, dict[str, str]]:
         """Transport only: the cell and native router verify execution authority."""
         if not isinstance(self._platform_session_id, str) or not re.fullmatch(
@@ -284,6 +289,14 @@ class RelayLLMClient:
                 or not 0 < len(request_body.encode("utf-8")) <= 262144
             ):
                 raise ValueError()
+            if rendering in _ATTEMPT_RENDERINGS:
+                if not isinstance(attempt_id, str) or not re.fullmatch(
+                    r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
+                    attempt_id,
+                ):
+                    raise ValueError()
+            elif attempt_id is not None:
+                raise ValueError()
             # Inspect mode without rewriting a byte of the registered request.
             # Reject ambiguous JSON rather than accepting a last-property wins
             # interpretation of the stream setting.
@@ -302,6 +315,8 @@ class RelayLLMClient:
             "speko_model_rendering": rendering,
             "speko_model_request": request_body,
         }
+        if attempt_id is not None:
+            envelope["speko_model_attempt_id"] = attempt_id
         return json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         ), {
@@ -319,11 +334,13 @@ class RelayLLMClient:
         work_nonce: str,
         input_blinder: str,
         idempotency_key: str,
+        attempt_id: str | None = None,
     ) -> dict[str, Any]:
         """Send one cell-rendered stream:false request under this work's bearer.
 
         The original request string, nonce, private blinder and retry key must
         come from the caller's registered work. No retry or fallback is made.
+        V2 also carries this invocation's acquired attempt ID, never a new key.
         A response is not a cell result commit, settlement or no-I/O proof.
         """
         body, headers = self._registered_request(
@@ -333,6 +350,7 @@ class RelayLLMClient:
             input_blinder=input_blinder,
             idempotency_key=idempotency_key,
             stream=False,
+            attempt_id=attempt_id,
         )
         async with self._session.post(
             f"{self._base_url}/v1/llm/responses",
@@ -359,10 +377,11 @@ class RelayLLMClient:
         work_nonce: str,
         input_blinder: str,
         idempotency_key: str,
+        attempt_id: str | None = None,
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         """Stream one exact registered stream:true request, without a new key.
 
-        Never reconstruct the provider body from parsed JSON, append fields to
+        Never reconstruct the provider body from parsed JSON, add unknown fields to
         the protected envelope, follow redirects or retry an uncertain send.
         Success is delivered only after clean HTTP EOF: malformed payloads or
         additional events after the terminal cannot be hidden by early return.
@@ -374,6 +393,7 @@ class RelayLLMClient:
             input_blinder=input_blinder,
             idempotency_key=idempotency_key,
             stream=True,
+            attempt_id=attempt_id,
         )
         async with self._session.post(
             f"{self._base_url}/v1/llm/responses",
