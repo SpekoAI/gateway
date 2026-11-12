@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any, Literal, TypedDict
@@ -242,6 +243,142 @@ class RelayLLMClient:
     async def aclose(self) -> None:
         await self._session.close()
 
+    def _registered_request(
+        self,
+        *,
+        rendering: str,
+        request_body: str,
+        work_nonce: str,
+        input_blinder: str,
+        idempotency_key: str,
+        stream: bool,
+    ) -> tuple[bytes, dict[str, str]]:
+        """Transport only: the cell and native router verify execution authority."""
+        if not isinstance(self._platform_session_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}", self._platform_session_id
+        ):
+            raise ValueError("a valid session_id is required for registered model input")
+        if not _registered_idempotency_key(idempotency_key):
+            raise ValueError("a bounded explicit idempotency_key is required")
+        try:
+            if (
+                not isinstance(rendering, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", rendering)
+                or not isinstance(work_nonce, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", work_nonce)
+                or not isinstance(input_blinder, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", input_blinder)
+                or not isinstance(request_body, str)
+                or not 0 < len(request_body.encode("utf-8")) <= 262144
+            ):
+                raise ValueError()
+            # Inspect mode without rewriting a byte of the registered request.
+            # Reject ambiguous JSON rather than accepting a last-property wins
+            # interpretation of the stream setting.
+            value = json.loads(
+                request_body,
+                object_pairs_hook=_registered_object,
+                parse_constant=_invalid_registered_constant,
+            )
+            if not isinstance(value, dict) or value.get("stream") is not stream:
+                raise ValueError()
+        except (ValueError, TypeError, RecursionError):
+            raise ValueError("registered model input is invalid") from None
+        envelope = {
+            "speko_work_nonce": work_nonce,
+            "speko_input_blinder": input_blinder,
+            "speko_model_rendering": rendering,
+            "speko_model_request": request_body,
+        }
+        return json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        ), {
+            "Idempotency-Key": idempotency_key,
+            "Speko-Client-Session-ID": self._platform_session_id,
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if stream else "application/json",
+        }
+
+    async def complete_registered_response(
+        self,
+        *,
+        rendering: str,
+        request_body: str,
+        work_nonce: str,
+        input_blinder: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Send one cell-rendered stream:false request under this work's bearer.
+
+        The original request string, nonce, private blinder and retry key must
+        come from the caller's registered work. No retry or fallback is made.
+        A response is not a cell result commit, settlement or no-I/O proof.
+        """
+        body, headers = self._registered_request(
+            rendering=rendering,
+            request_body=request_body,
+            work_nonce=work_nonce,
+            input_blinder=input_blinder,
+            idempotency_key=idempotency_key,
+            stream=False,
+        )
+        async with self._session.post(
+            f"{self._base_url}/v1/llm/responses",
+            data=body,
+            headers=headers,
+            allow_redirects=False,
+        ) as response:
+            decoded = await _decode_json(response)
+            if response.status != 200:
+                raise _envelope_error(response.status, decoded)
+            if "error" in decoded:
+                raise _event_error(decoded)
+            if not decoded:
+                raise RelayError("Router returned a malformed response", retryable=True)
+            _report_llm_leg(response)
+            return decoded
+
+    async def stream_registered_response(
+        self,
+        *,
+        rendering: str,
+        request_body: str,
+        work_nonce: str,
+        input_blinder: str,
+        idempotency_key: str,
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        """Stream one exact registered stream:true request, without a new key.
+
+        Never reconstruct the provider body from parsed JSON, append fields to
+        the protected envelope, follow redirects or retry an uncertain send.
+        """
+        body, headers = self._registered_request(
+            rendering=rendering,
+            request_body=request_body,
+            work_nonce=work_nonce,
+            input_blinder=input_blinder,
+            idempotency_key=idempotency_key,
+            stream=True,
+        )
+        async with self._session.post(
+            f"{self._base_url}/v1/llm/responses",
+            data=body,
+            headers=headers,
+            allow_redirects=False,
+        ) as response:
+            if response.status != 200:
+                raise _envelope_error(response.status, await _decode_json(response))
+            _report_llm_leg(response)
+            async for event, payload in _sse_events(response):
+                if event == "error":
+                    raise _event_error(payload)
+                yield event, payload
+                if event == "response.completed":
+                    return
+            raise RelayError(
+                "relay stream ended without a terminal event", retryable=True
+            )
+
     async def stream_response(
         self, request: dict[str, Any]
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
@@ -343,6 +480,33 @@ async def _sse_events(
                 yield event, payload
     except ValueError as err:
         raise RelayError("relay stream sent a malformed event", retryable=True) from err
+
+
+def _registered_idempotency_key(value: str) -> bool:
+    # Relay keys are opaque and bounded to 256 UTF-8 bytes. Refuse HTTP field
+    # controls or surrounding OWS, which a receiver would trim and thus change
+    # the original retry identity. Interior spaces/tabs and Unicode stay exact.
+    if not isinstance(value, str) or not value.strip() or value.strip(" \t") != value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 256 and all(
+            (ord(char) >= 32 and ord(char) != 127) or char == "\t" for char in value
+        )
+    except UnicodeError:
+        return False
+
+
+def _registered_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError()
+        result[key] = value
+    return result
+
+
+def _invalid_registered_constant(_value: str) -> Any:
+    raise ValueError()
 
 
 async def _decode_json(response: aiohttp.ClientResponse) -> dict[str, Any]:
