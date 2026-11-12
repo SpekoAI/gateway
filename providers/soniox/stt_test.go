@@ -776,6 +776,9 @@ func TestSTTClassifiesDocumentedErrorTypes(t *testing.T) {
 			if providerError.ProviderStatus != testCase.errorCode {
 				t.Errorf("provider status = %d", providerError.ProviderStatus)
 			}
+			if got := providerError.SafeProviderCode(); got != testCase.errorType {
+				t.Errorf("SafeProviderCode = %q, want %q", got, testCase.errorType)
+			}
 			// A half-finished segment is dropped rather than committed: the
 			// route fails over and a truncated user turn would be worse.
 			if _, open := <-stream.Events(); open {

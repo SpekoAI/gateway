@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -845,6 +846,10 @@ func baseRespError(status int, message string, raw json.RawMessage) *runtimepkg.
 		Message:    fmt.Sprintf("MiniMax reported a TTS error %d: %s", status, message),
 		Retryable:  retryable,
 		Extensions: extension(raw),
+		// The documented status code is MiniMax's only machine-readable name
+		// for the failure, and it is a number under base_resp, which
+		// SafeProviderCode's reading of the frame skips.
+		ProviderCode: strconv.Itoa(status),
 	}
 }
 

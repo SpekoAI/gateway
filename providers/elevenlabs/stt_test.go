@@ -243,6 +243,13 @@ func TestSTTAdapterKeepsTheVendorsErrorDistinction(t *testing.T) {
 				if !strings.Contains(providerErr.Message, "detail here") {
 					t.Fatalf("%s message dropped the vendor detail: %q", tc.frame, providerErr.Message)
 				}
+				wantCode := tc.frame
+				if tc.frame == "error" {
+					wantCode = ""
+				}
+				if got := providerErr.SafeProviderCode(); got != wantCode {
+					t.Fatalf("%s SafeProviderCode = %q, want %q", tc.frame, got, wantCode)
+				}
 			case <-timer.C:
 				t.Fatalf("%s timed out", tc.frame)
 			}

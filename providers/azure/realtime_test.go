@@ -408,10 +408,10 @@ func TestRealtimeTranscriptionFailureIsTerminal(t *testing.T) {
 	stream := &realtimeStream{ctx: context.Background(), events: make(chan runtimepkg.ProviderEvent, 4)}
 	err := stream.handleMessage([]byte(`{"type":"conversation.item.input_audio_transcription.failed","error":{"type":"server_error","message":"decoder crashed"}}`))
 	var providerErr *runtimepkg.ProviderError
-	if !errors.As(err, &providerErr) || !providerErr.Retryable || !strings.Contains(providerErr.Message, "decoder crashed") {
+	if !errors.As(err, &providerErr) || !providerErr.Retryable || !strings.Contains(providerErr.Message, "decoder crashed") || providerErr.SafeProviderCode() != "server_error" {
 		t.Fatalf("err = %#v", err)
 	}
-	if err := stream.handleMessage([]byte(`{"type":"error","error":{"code":"invalid_api_key","message":"bad key"}}`)); !errors.As(err, &providerErr) || providerErr.Code != "authentication_failed" || providerErr.Retryable {
+	if err := stream.handleMessage([]byte(`{"type":"error","error":{"code":"invalid_api_key","message":"bad key"}}`)); !errors.As(err, &providerErr) || providerErr.Code != "authentication_failed" || providerErr.Retryable || providerErr.SafeProviderCode() != "invalid_api_key" {
 		t.Fatalf("auth err = %#v", err)
 	}
 }

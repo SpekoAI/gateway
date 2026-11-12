@@ -967,7 +967,7 @@ func (s *dialogueStream) handleMessage(payload []byte) ([]runtimepkg.ProviderEve
 		// from an exhausted quota. The error field is the vendor's own
 		// message, never the credential, which rides the handshake and the
 		// request header.
-		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: fmt.Sprintf("ElevenLabs dialogue reported a streaming error: %s", strings.TrimSpace(string(message.Error))), Retryable: false}
+		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: fmt.Sprintf("ElevenLabs dialogue reported a streaming error: %s", strings.TrimSpace(string(message.Error))), Retryable: false, Extensions: extension(raw)}
 	}
 	var events []runtimepkg.ProviderEvent
 	if message.Audio != "" {

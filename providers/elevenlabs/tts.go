@@ -410,11 +410,16 @@ func (s *stream) handleMessage(payload []byte) error {
 	}
 	raw := json.RawMessage(append([]byte(nil), payload...))
 	if len(message.Error) > 0 && string(message.Error) != "null" {
+		// The frame is kept so SafeProviderCode can name the vendor's code
+		// ({"error":"quota_exceeded",...}); without it a failure log reads
+		// only provider_unavailable.
 		var code string
 		if json.Unmarshal(message.Error, &code) == nil && isUnsupportedLanguage(code) {
-			return s.unsupportedLanguageError(nil)
+			failure := s.unsupportedLanguageError(nil)
+			failure.Extensions = extension(raw)
+			return failure
 		}
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs reported a streaming error", Retryable: false}
+		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "ElevenLabs reported a streaming error", Retryable: false, Extensions: extension(raw)}
 	}
 	if message.Audio != "" {
 		audio, err := base64.StdEncoding.DecodeString(message.Audio)

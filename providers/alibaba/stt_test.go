@@ -352,6 +352,9 @@ func TestSTTSurfacesAnErrorFrameAsATerminalProviderError(t *testing.T) {
 	if providerErr.Extensions[extensionID] == nil {
 		t.Fatal("terminal error dropped the raw DashScope frame")
 	}
+	if got := providerErr.SafeProviderCode(); got != "InvalidApiKey" {
+		t.Fatalf("SafeProviderCode = %q, want InvalidApiKey", got)
+	}
 	if !strings.Contains(providerErr.Message, "Invalid API-key provided.") {
 		t.Fatalf("message = %q, want the vendor detail preserved", providerErr.Message)
 	}

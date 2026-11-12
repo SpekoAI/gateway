@@ -422,7 +422,7 @@ func (s *bytesTTSStream) perform(op *bytesTTSOperation, payload []byte) {
 	}
 	if response.StatusCode != http.StatusOK {
 		errorTimer := time.AfterFunc(s.headerTimeout, op.cancel)
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, s.maxErrorBytes))
+		body, _ := io.ReadAll(io.LimitReader(response.Body, s.maxErrorBytes))
 		errorTimer.Stop()
 		code := "provider_unavailable"
 		if response.StatusCode == 401 || response.StatusCode == 403 {
@@ -431,7 +431,13 @@ func (s *bytesTTSStream) perform(op *bytesTTSOperation, payload []byte) {
 		if response.StatusCode == 429 {
 			code = "rate_limited"
 		}
-		s.failed(op, &runtimepkg.ProviderError{Code: code, Message: "Cartesia bytes TTS rejected the synthesis request", ProviderStatus: response.StatusCode, Retryable: response.StatusCode == 429 || response.StatusCode >= 500})
+		failure := &runtimepkg.ProviderError{Code: code, Message: "Cartesia bytes TTS rejected the synthesis request", ProviderStatus: response.StatusCode, Retryable: response.StatusCode == 429 || response.StatusCode >= 500}
+		// A JSON body ({"error_code":"voice_not_found","title":...}) is kept
+		// for SafeProviderCode; a truncated or plain-text one is not.
+		if raw := bytes.TrimSpace(body); json.Valid(raw) {
+			failure.Extensions = extension(json.RawMessage(raw))
+		}
+		s.failed(op, failure)
 		return
 	}
 	mediaType, _, typeErr := mime.ParseMediaType(response.Header.Get("Content-Type"))

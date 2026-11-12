@@ -71,10 +71,21 @@ func TestStatusErrorMapping(t *testing.T) {
 		if string(got.Extensions["x"]) != `{"error":"boom"}` {
 			t.Fatalf("%d: extension = %s", status, got.Extensions["x"])
 		}
+		if code := got.SafeProviderCode(); code != "boom" {
+			t.Fatalf("%d: SafeProviderCode = %q, want boom", status, code)
+		}
 	}
 	plain := StatusError("x", 500, []byte("not json"))
 	if string(plain.Extensions["x"]) != `"not json"` {
 		t.Fatalf("non-JSON body should be quoted, got %s", plain.Extensions["x"])
+	}
+	if code := plain.SafeProviderCode(); code != "" {
+		t.Fatalf("a quoted plain-text body named code %q", code)
+	}
+	// The kept body is what lets a failure log name the vendor's code.
+	voice := StatusError("x", 404, []byte(`{"detail":{"type":"not_found","code":"voice_not_found","status":"voice_not_found","message":"no such voice"}}`))
+	if code := voice.SafeProviderCode(); code != "voice_not_found" {
+		t.Fatalf("SafeProviderCode = %q, want voice_not_found", code)
 	}
 }
 

@@ -405,7 +405,11 @@ func (a *BatchAdapter) jobState(ctx context.Context, endpoint *url.URL, credenti
 			if canonical, _ := classify(state.Error, 0); canonical != batchhttp.CodeInvalidRequest {
 				return true, nil, providerError("the Omi job failed", state.Error, 0, marshalData(map[string]string{"code": state.Error.Code}))
 			}
-			return true, nil, batchhttp.Failed(batchExtensionID, state.Error.Code)
+			failure := batchhttp.Failed(batchExtensionID, state.Error.Code)
+			// Failed keeps the code as a bare string, which SafeProviderCode
+			// does not read.
+			failure.ProviderCode = state.Error.Code
+			return true, nil, failure
 		}
 		return true, nil, batchhttp.Failed(batchExtensionID, "")
 	case "expired", "canceled", "cancelled":

@@ -398,6 +398,9 @@ func TestTTSClassifiesDocumentedErrorTypes(t *testing.T) {
 			if providerError.ProviderStatus != testCase.errorCode {
 				t.Errorf("provider status = %d", providerError.ProviderStatus)
 			}
+			if got := providerError.SafeProviderCode(); got != testCase.errorType {
+				t.Errorf("SafeProviderCode = %q, want %q", got, testCase.errorType)
+			}
 			if !strings.Contains(providerError.Message, testCase.wantMessage) {
 				t.Errorf("message = %q, want it to mention %q", providerError.Message, testCase.wantMessage)
 			}

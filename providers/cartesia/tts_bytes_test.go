@@ -281,6 +281,20 @@ func TestBytesTTSErrorsAndRedirectsAreBoundedAndContentFree(t *testing.T) {
 	if leaked.Load() {
 		t.Fatal("credential followed a redirect")
 	}
+	// A structured JSON error is kept for its error_code, never for Message.
+	stream := openBytes(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = io.WriteString(w, `{"error_code":"quota_exceeded","title":"Quota exceeded","message":"private provider echo","request_id":"r1"}`)
+	}, BytesTTSConfig{}, bytesRequest())
+	_ = stream.AppendText(context.Background(), "private input")
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, terminal := bytesDrain(t, stream)
+	var failure *runtimepkg.ProviderError
+	if !errors.As(terminal.Err, &failure) || strings.Contains(terminal.Err.Error(), "private") || failure.SafeProviderCode() != "quota_exceeded" {
+		t.Fatalf("structured error = %+v, want the vendor code kept out of the message", terminal.Err)
+	}
 	for _, headers := range []map[string]string{{"Content-Type": "application/json"}, {"Content-Type": "audio/pcm", "Content-Encoding": "gzip"}} {
 		stream := openBytes(t, func(w http.ResponseWriter, _ *http.Request) {
 			for k, v := range headers {

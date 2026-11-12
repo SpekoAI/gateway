@@ -789,6 +789,16 @@ func TestBatchFailedJobsAreClassified(t *testing.T) {
 		var providerErr *runtimepkg.ProviderError
 		if !errors.As(err, &providerErr) || providerErr.Code != code || strings.Contains(providerErr.Message, "vendor words") {
 			t.Errorf("%s: error = %#v, want %s", body, err, code)
+			continue
+		}
+		wantProviderCode := ""
+		for _, vendor := range []string{"queue_full", "audio_too_long", "decoder_crashed"} {
+			if strings.Contains(body, `"code":"`+vendor+`"`) {
+				wantProviderCode = vendor
+			}
+		}
+		if got := providerErr.SafeProviderCode(); got != wantProviderCode {
+			t.Errorf("%s: SafeProviderCode = %q, want %q", body, got, wantProviderCode)
 		}
 	}
 }

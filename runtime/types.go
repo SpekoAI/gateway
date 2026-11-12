@@ -202,8 +202,14 @@ type ProviderError struct {
 	ProviderStatus int
 	Cause          error
 	// Extensions may retain a provider's raw error payload for the local
-	// canonical error event. Telemetry never copies this field.
+	// canonical error event. Telemetry never copies this field; it reads the
+	// provider's error code out of it through SafeProviderCode only.
 	Extensions map[string]json.RawMessage
+	// ProviderCode is optional: the provider's own machine-readable error
+	// code, set by an adapter whose vendor names it where SafeProviderCode's
+	// generic reading of Extensions would not look (a frame's type, a header
+	// object, a mapped numeric code). Leave it empty otherwise.
+	ProviderCode string
 }
 
 func (e *ProviderError) Error() string {

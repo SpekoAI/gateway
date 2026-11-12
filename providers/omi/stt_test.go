@@ -1054,6 +1054,9 @@ func TestErrorFramesInPlaceOfReadyFailOpenByCode(t *testing.T) {
 		if strings.Contains(providerErr.Message, "vendor detail") || !strings.Contains(providerErr.Message, vendorCode) {
 			t.Errorf("%s: message = %q", vendorCode, providerErr.Message)
 		}
+		if got := providerErr.SafeProviderCode(); got != vendorCode {
+			t.Errorf("%s: SafeProviderCode = %q", vendorCode, got)
+		}
 	}
 }
 
@@ -1068,6 +1071,10 @@ func TestA1013CloseBeforeReadyIsRateLimited(t *testing.T) {
 		var providerErr *runtimepkg.ProviderError
 		if !errors.As(err, &providerErr) || providerErr.Code != "provider_rate_limited" || !providerErr.Retryable {
 			t.Errorf("1013 %q: Open error = %#v", reason, err)
+			continue
+		}
+		if got := providerErr.SafeProviderCode(); got != reason {
+			t.Errorf("1013 %q: SafeProviderCode = %q", reason, got)
 		}
 	}
 }

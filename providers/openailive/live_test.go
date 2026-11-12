@@ -703,6 +703,9 @@ func TestStartupFailuresAreClassified(t *testing.T) {
 	if !errors.As(err, &providerErr) || providerErr.Code != "provider_rejected_request" {
 		t.Fatalf("startup error = %v, want provider_rejected_request", err)
 	}
+	if got := providerErr.SafeProviderCode(); got != "invalid_model" {
+		t.Fatalf("startup error SafeProviderCode = %q, want invalid_model", got)
+	}
 
 	silent := newFakeLive(t, sessionsPath)
 	silent.onStart = func(conn *websocket.Conn, ctx context.Context) bool { <-ctx.Done(); return false }

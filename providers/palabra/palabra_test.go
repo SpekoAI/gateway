@@ -571,13 +571,14 @@ func TestTTSServerCloseMidGenerationIsAnError(t *testing.T) {
 
 func TestErrorFramesAcceptNumericSessionCodes(t *testing.T) {
 	for _, tc := range []struct {
-		name, payload, code, message string
-		retryable                    bool
+		name, payload, code, message, providerCode string
+		retryable                                  bool
 	}{
-		{"numeric session code", `{"message_type":"error","data":{"code":202103,"reason":"session_revoked"}}`, "provider_authentication_failed", "session_revoked", false},
-		{"numeric retryable code", `{"message_type":"error","data":{"code":202107,"reason":"session_verification_unavailable"}}`, "provider_unavailable", "session_verification_unavailable", true},
-		{"numeric session limit", `{"message_type":"error","data":{"code":202106,"reason":"session_limit_reached"}}`, "provider_rate_limited", "session_limit_reached", true},
-		{"string streaming code", `{"message_type":"error","data":{"code":"SERVICE_UNAVAILABLE","desc":"busy"}}`, "provider_unavailable", "busy", true},
+		{"numeric session code", `{"message_type":"error","data":{"code":202103,"reason":"session_revoked"}}`, "provider_authentication_failed", "session_revoked", "session_revoked", false},
+		{"numeric retryable code", `{"message_type":"error","data":{"code":202107,"reason":"session_verification_unavailable"}}`, "provider_unavailable", "session_verification_unavailable", "session_verification_unavailable", true},
+		{"numeric session limit", `{"message_type":"error","data":{"code":202106,"reason":"session_limit_reached"}}`, "provider_rate_limited", "session_limit_reached", "session_limit_reached", true},
+		{"numeric code with a sentence reason", `{"message_type":"error","data":{"code":202103,"reason":"Session was revoked"}}`, "provider_authentication_failed", "Session was revoked", "202103", false},
+		{"string streaming code", `{"message_type":"error","data":{"code":"SERVICE_UNAVAILABLE","desc":"busy"}}`, "provider_unavailable", "busy", "SERVICE_UNAVAILABLE", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tts := &ttsStream{ctx: context.Background(), events: make(chan runtimepkg.ProviderEvent, 1)}
@@ -589,6 +590,9 @@ func TestErrorFramesAcceptNumericSessionCodes(t *testing.T) {
 				}
 				if len(pe.Extensions[extensionID]) == 0 {
 					t.Fatalf("%s error lost the raw frame", name)
+				}
+				if got := pe.SafeProviderCode(); got != tc.providerCode {
+					t.Fatalf("%s SafeProviderCode = %q, want %q", name, got, tc.providerCode)
 				}
 			}
 		})

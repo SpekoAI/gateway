@@ -649,6 +649,9 @@ func (s *stream) handleMessage(payload []byte) error {
 			Retryable:      retryableStatus(status),
 			ProviderStatus: status,
 			Extensions:     extension(raw),
+			// The error object names no code; its exception name is the one
+			// machine-readable token beside the numeric status.
+			ProviderCode: message.Error.Exception,
 		}
 	}
 	switch message.Type {
