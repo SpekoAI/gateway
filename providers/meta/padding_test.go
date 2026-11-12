@@ -10,6 +10,7 @@ import (
 	"time"
 
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
+	"github.com/coder/websocket"
 )
 
 // padFrameBytes24k is one paddingFrame of 24 kHz mono pcm_s16le.
@@ -520,76 +521,29 @@ func TestStalledPaddingWriteEndsPadding(t *testing.T) {
 	}
 }
 
-// A catch-up of several frames releases writeMu between them, so caller
-// audio waiting behind slow padding writes gets in after one or two of them
-// (sync.Mutex hands over once a waiter has starved) rather than after the
-// whole catch-up, and ends it.
-func TestCallerAudioGetsInBetweenCatchUpFrames(t *testing.T) {
+// Caller audio that arrives during a catch-up waits for it and follows the
+// silence: the whole gap is filled before the resumed speech, nothing is
+// spliced after it, and nothing is dropped, so the bytes written keep up
+// with the clock.
+func TestCallerAudioDuringACatchUpFollowsTheWholeGap(t *testing.T) {
 	t.Parallel()
-	const catchUp = 5 // a 400 ms gap and one frame ahead
+	const catchUp = 11 // a 1 s gap and one frame ahead
 	started := make(chan struct{}, catchUp)
 	proceed := make(chan struct{})
-	h := openPadded(t, newFakeRealtime(t), func(a *STTAdapter) {
-		a.padWriter = func(ctx context.Context, _ []byte) error {
+	var h *padHarness
+	h = openPadded(t, newFakeRealtime(t), func(a *STTAdapter) {
+		a.padWriter = func(ctx context.Context, frame []byte) error {
 			started <- struct{}{}
 			select {
 			case <-proceed:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	})
-	h.caller(0, padFrameBytes24k)
-	h.at(ms(500))
-	padded := make(chan int, 1)
-	go func() {
-		h.ticks <- h.clock.Now()
-		padded <- <-h.iterations
-	}()
-	<-started // the first frame is being written, under writeMu
-
-	callerDone := make(chan error, 1)
-	go func() { callerDone <- h.stream.WriteAudio(h.ctx, bytes.Repeat([]byte{1}, padFrameBytes24k)) }()
-	for written := 1; ; written++ {
-		time.Sleep(20 * time.Millisecond) // the caller waits on writeMu
-		proceed <- struct{}{}
-		select {
-		case err := <-callerDone:
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := <-padded; got != written || written >= catchUp {
-				t.Fatalf("caller audio got in after %d of %d catch-up frames (iteration wrote %d), want before the catch-up finished", written, catchUp, got)
-			}
-			return
-		case <-started:
-		case <-time.After(5 * time.Second):
-			t.Fatal("caller audio never got in")
-		}
-	}
-}
-
-// Caller audio that interrupts a catch-up with more than paddingGap still to
-// fill drops the rest of the gap: no silence follows the resumed speech
-// until a new gap opens behind it.
-func TestCallerAudioInterruptingACatchUpDropsTheRestOfTheGap(t *testing.T) {
-	t.Parallel()
-	started := make(chan struct{}, 16)
-	proceed := make(chan struct{})
-	h := openPadded(t, newFakeRealtime(t), func(a *STTAdapter) {
-		a.padWriter = func(ctx context.Context, _ []byte) error {
-			started <- struct{}{}
-			select {
-			case <-proceed:
-				return nil
+				return h.stream.conn.Write(ctx, websocket.MessageBinary, frame)
 			case <-ctx.Done():
 				return ctx.Err()
 			}
 		}
 	})
 	h.caller(0, padFrameBytes24k) // written until 100 ms
-	h.at(ms(1100))                // a 1 s gap: an eleven-frame catch-up is due
+	h.at(ms(1100))
 	padded := make(chan int, 1)
 	go func() {
 		h.ticks <- h.clock.Now()
@@ -598,36 +552,61 @@ func TestCallerAudioInterruptingACatchUpDropsTheRestOfTheGap(t *testing.T) {
 	<-started
 	callerDone := make(chan error, 1)
 	go func() { callerDone <- h.stream.WriteAudio(h.ctx, bytes.Repeat([]byte{1}, padFrameBytes24k)) }()
-	for written := 1; ; written++ {
-		time.Sleep(20 * time.Millisecond)
-		proceed <- struct{}{}
+	for written := 1; written <= catchUp; written++ {
+		time.Sleep(5 * time.Millisecond) // the caller waits on writeMu
 		select {
-		case err := <-callerDone:
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := <-padded; got != written || lagAfter(h, written) < paddingGap {
-				t.Fatalf("iteration wrote %d frames with the caller in after %d; want the caller in with at least %v still unfilled", got, written, paddingGap)
-			}
-			h.callerBytes += padFrameBytes24k
-			close(proceed) // later padding writes go straight through
-			h.expectTicks(
-				tickWant{ms(1100), 0}, // resumed speech is not followed by the old gap
-				tickWant{ms(1599), 0},
-				tickWant{ms(1600), 5}, // a new 400 ms gap behind the caller's frame
-			)
-			return
-		case <-started:
-		case <-time.After(5 * time.Second):
-			t.Fatal("caller audio never got in")
+		case <-callerDone:
+			t.Fatalf("caller audio got in after %d of %d catch-up frames", written-1, catchUp)
+		default:
+		}
+		proceed <- struct{}{}
+		if written < catchUp {
+			<-started
+		}
+	}
+	if err := <-callerDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := <-padded; got != catchUp {
+		t.Fatalf("catch-up wrote %d frames, want %d", got, catchUp)
+	}
+	h.callerBytes += padFrameBytes24k
+	if lag := h.lag(ms(1100)); lag > 0 {
+		t.Fatalf("after the catch-up and the caller's frame the stream trails the clock by %v", lag)
+	}
+	frames := h.framesReceived(catchUp + 2)
+	for index, frame := range frames {
+		wantCaller := index == 0 || index == catchUp+1
+		if isCaller := frame[0] == 1; isCaller != wantCaller {
+			t.Fatalf("frame %d caller = %v, want %v (caller, %d pad, caller)", index, isCaller, wantCaller, catchUp)
 		}
 	}
 }
 
-// lagAfter is how far the stream trailed the clock at 1100 ms once the first
-// caller frame and written padding frames were out.
-func lagAfter(h *padHarness, written int) time.Duration {
-	return ms(1100) - ms(100) - time.Duration(written)*paddingFrame
+// One deadline bounds a whole catch-up, so writes that each succeed just in
+// time cannot add up to holding writeMu for longer than padWriteTimeout.
+func TestSlowPaddingWritesShareOneDeadline(t *testing.T) {
+	t.Parallel()
+	const timeout = 100 * time.Millisecond
+	h := openPadded(t, newFakeRealtime(t), func(a *STTAdapter) {
+		a.padWriteTimeout = timeout
+		a.padWriter = func(ctx context.Context, _ []byte) error {
+			select {
+			case <-time.After(timeout * 2 / 3):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+	h.caller(0, padFrameBytes24k)
+	began := time.Now()
+	if got := h.tick(ms(500)); got != 1 {
+		t.Fatalf("catch-up wrote %d frames, want 1 before its deadline", got)
+	}
+	if held := time.Since(began); held > 3*timeout {
+		t.Fatalf("catch-up held writeMu for %v, want about %v", held, timeout)
+	}
 }
 
 // The production clock and ticker pad a stalled caller on their own.

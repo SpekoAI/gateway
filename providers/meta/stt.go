@@ -90,11 +90,12 @@ const (
 	// the cap padding stops and the service's own idle policy closes the
 	// session. Caller audio starts a new stretch; a commit does not.
 	paddingStretchCap = 120 * time.Second
-	// padWriteTimeout bounds one padding write. A write still blocked after
-	// it means the service stopped reading: the websocket closes on the
-	// deadline, padding ends, and the read loop reports the socket's end, so
-	// padding never holds writeMu, and with it caller audio and teardown,
-	// for longer.
+	// padWriteTimeout bounds one padding catch-up, every frame of it. A
+	// normal catch-up is half a second of audio, a few tens of kilobytes; a
+	// socket that cannot take that in two seconds cannot carry real-time
+	// audio either. On the deadline the websocket closes, padding ends, and
+	// the read loop reports the socket's end, so padding never holds
+	// writeMu, and with it caller audio and teardown, for longer.
 	padWriteTimeout = 2 * time.Second
 )
 
@@ -441,12 +442,9 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	// partial, and the service cannot report audio it never got.
 	s.forwardedBytes.Add(int64(len(audio)))
 	s.timeline.caller(int64(len(audio)))
-	if s.padding {
-		// Caller audio resumed while padding ran. Any gap padding has not
-		// filled yet, a catch-up this audio interrupted or the rest of a
-		// stretch past the cap, is dropped rather than spliced in after the
-		// caller's speech. Padding that kept up with the clock leaves no gap,
-		// so this only ever drops what a single gap left behind.
+	if s.stretchPadded >= paddingStretchCap {
+		// Padding gave up on this gap, so the stream is behind the clock by
+		// the rest of it; no burst of silence should make that up now.
 		s.audioUntil = laterOf(s.audioUntil, s.now())
 	}
 	s.padding = false
@@ -504,56 +502,41 @@ func (s *sttStream) padLoop(ticks <-chan time.Time, stop func()) {
 // asked; it then keeps the stream at real time until caller audio resumes
 // or the stretch reaches paddingStretchCap. Filling the whole gap, not just
 // the time since padding started, keeps intermittent caller audio from
-// leaving the stream ever further behind real time. It reports how many
+// leaving the stream ever further behind real time.
+//
+// The whole catch-up runs under writeMu and one padWriteTimeout deadline.
+// Caller audio that arrives meanwhile waits for it, at most that long, and
+// then follows the silence: the gap is filled before the resumed speech,
+// never spliced into it, and none of it is dropped. It reports how many
 // frames it wrote, and false for open once the input is closed or a write
 // fails; a failed write is left to the read loop, which reports the
 // socket's end.
 func (s *sttStream) padOnce() (frames int, open bool) {
-	for {
-		wrote, open := s.padFrameIfDue()
-		if !open {
-			return frames, false
-		}
-		if !wrote {
-			return frames, true
-		}
-		frames++
-	}
-}
-
-// padFrameIfDue writes one frame of silence when one is due. It holds
-// writeMu for that one frame only, so caller audio, and the engine's
-// teardown waiting behind a caller write, never wait out a whole catch-up:
-// at most one padding write, itself bounded by padWriteTimeout. Caller
-// audio that gets in between frames ends the catch-up and drops the rest of
-// the gap (WriteAudio).
-func (s *sttStream) padFrameIfDue() (wrote, open bool) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.inputClosed.Load() || s.closed.Load() {
-		return false, false
+		return 0, false
 	}
 	now := s.now()
 	if !s.padding && now.Sub(s.audioUntil) < paddingGap {
-		return false, true
+		return 0, true
 	}
 	s.padding = true
-	if s.audioUntil.Sub(now) >= paddingFrame/2 || s.stretchPadded >= paddingStretchCap {
-		return false, true
-	}
-	// Recorded before the write, like caller audio, so no position the
-	// service reports can name padding the timeline does not hold.
-	s.timeline.pad(int64(len(s.padFrame)))
 	ctx, cancel := context.WithTimeout(s.ctx, s.padWriteTimeout)
-	err := s.padWriter(ctx, s.padFrame)
-	cancel()
-	if err != nil {
-		return false, false
+	defer cancel()
+	for s.audioUntil.Sub(now) < paddingFrame/2 && s.stretchPadded < paddingStretchCap {
+		// Recorded before the write, like caller audio, so no position the
+		// service reports can name padding the timeline does not hold.
+		s.timeline.pad(int64(len(s.padFrame)))
+		if err := s.padWriter(ctx, s.padFrame); err != nil {
+			return frames, false
+		}
+		s.paddedBytes.Add(int64(len(s.padFrame)))
+		s.stretchPadded += paddingFrame
+		s.audioUntil = s.audioUntil.Add(paddingFrame)
+		frames++
 	}
-	s.paddedBytes.Add(int64(len(s.padFrame)))
-	s.stretchPadded += paddingFrame
-	s.audioUntil = s.audioUntil.Add(paddingFrame)
-	return true, true
+	return frames, true
 }
 
 func laterOf(a, b time.Time) time.Time {
