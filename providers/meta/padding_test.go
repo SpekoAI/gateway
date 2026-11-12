@@ -246,6 +246,40 @@ func TestCommitStartsPaddingImmediately(t *testing.T) {
 	})
 }
 
+// One stretch of padding stops at paddingStretchCap, so an idle client
+// cannot keep the service running; a commit does not restart it, and only
+// caller audio starts a new stretch.
+func TestPaddingStopsAtTheStretchCap(t *testing.T) {
+	t.Parallel()
+	h := openPadded(t, newFakeRealtime(t))
+	h.caller(0, padFrameBytes24k)
+	frames := int(paddingStretchCap / paddingFrame)
+	offset := ms(400)
+	for range frames {
+		h.expectTicks(tickWant{offset, true})
+		offset += paddingFrame
+	}
+	h.expectTicks(tickWant{offset, false}, tickWant{offset + time.Minute, false})
+	if got := h.stream.paddedBytes.Load(); got != int64(frames*padFrameBytes24k) {
+		t.Fatalf("padded bytes = %d, want %v of silence", got, paddingStretchCap)
+	}
+
+	offset += time.Minute
+	h.at(offset)
+	if err := h.stream.CommitAudio(h.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if h.iteration() {
+		t.Fatal("a commit restarted padding past the cap")
+	}
+
+	h.caller(offset, padFrameBytes24k)
+	h.expectTicks(tickWant{offset + paddingGap, true}, tickWant{offset + paddingGap + paddingFrame, true})
+	if got := h.stream.paddedBytes.Load(); got != int64((frames+2)*padFrameBytes24k) {
+		t.Fatalf("padded bytes = %d, want caller audio to start a new stretch", got)
+	}
+}
+
 // Once Close has sent endStream no silence follows it, and the loop ends.
 func TestNoPaddingAfterEndStream(t *testing.T) {
 	t.Parallel()

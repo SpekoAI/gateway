@@ -82,6 +82,14 @@ const (
 	// speech that is merely late, and well under the ~2 s without audio after
 	// which the service was seen closing a session.
 	paddingGap = 400 * time.Millisecond
+	// paddingStretchCap bounds one continuous stretch of padding. Thirty
+	// seconds keeps the service listening through ordinary pauses and the
+	// agent's own speech, but a client that stays connected and silent must
+	// not keep the session, and the service's billed minutes, running
+	// indefinitely: past the cap padding stops and the service's own idle
+	// policy closes the session. Caller audio starts a new stretch; a commit
+	// does not.
+	paddingStretchCap = 30 * time.Second
 )
 
 // sampleRateEncodings are the only rates the realtime socket listens at,
@@ -379,6 +387,9 @@ type sttStream struct {
 	// audioUntil is the wall-clock instant by which everything written so
 	// far, caller audio and padding, has played out at real time.
 	audioUntil time.Time
+	// stretchPadded is the silence written since the caller's last audio,
+	// held to paddingStretchCap.
+	stretchPadded time.Duration
 	// paddedBytes is the silence written. It is never billed: see
 	// billedObservation.
 	paddedBytes atomic.Int64
@@ -406,6 +417,7 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	s.forwardedBytes.Add(int64(len(audio)))
 	now := s.now()
 	s.padFrom = now.Add(paddingGap)
+	s.stretchPadded = 0
 	s.audioUntil = laterOf(s.audioUntil, now).Add(time.Duration(int64(len(audio)) * int64(time.Second) / s.bytesPerSecond))
 	if err := s.conn.Write(ctx, websocket.MessageBinary, audio); err != nil {
 		return s.writeError(err)
@@ -454,9 +466,10 @@ func (s *sttStream) padLoop(ticks <-chan time.Time, stop func()) {
 	}
 }
 
-// padOnce writes one frame of silence when the caller's audio has a gap and
+// padOnce writes one frame of silence when the caller's audio has a gap,
 // everything already written has played out, so padding never runs ahead of
-// the clock by more than the frame it writes. It reports whether it wrote,
+// the clock by more than the frame it writes, and the gap has not yet been
+// padded for paddingStretchCap. It reports whether it wrote,
 // and false for open once the input is closed or a write fails; a failed
 // write is left to the read loop, which reports the socket's end.
 func (s *sttStream) padOnce() (wrote, open bool) {
@@ -466,13 +479,14 @@ func (s *sttStream) padOnce() (wrote, open bool) {
 		return false, false
 	}
 	now := s.now()
-	if now.Before(s.padFrom) || s.audioUntil.Sub(now) >= paddingFrame/2 {
+	if now.Before(s.padFrom) || s.audioUntil.Sub(now) >= paddingFrame/2 || s.stretchPadded >= paddingStretchCap {
 		return false, true
 	}
 	if err := s.conn.Write(s.ctx, websocket.MessageBinary, s.padFrame); err != nil {
 		return false, false
 	}
 	s.paddedBytes.Add(int64(len(s.padFrame)))
+	s.stretchPadded += paddingFrame
 	s.audioUntil = laterOf(s.audioUntil, now).Add(paddingFrame)
 	return true, true
 }
