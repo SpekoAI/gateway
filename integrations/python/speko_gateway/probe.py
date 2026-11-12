@@ -565,7 +565,9 @@ class ConversationProbe:
                 batch_size = min(_MAX_BATCH_EVENTS, len(self._pending))
                 batch = [self._pending.popleft() for _ in range(batch_size)]
                 try:
-                    await self._client.post_turn_events(batch)
+                    dropped = await self._client.post_turn_events(batch)
+                    if type(dropped) is int:
+                        self.dropped_events += dropped
                 except asyncio.CancelledError:
                     raise
                 except Exception:

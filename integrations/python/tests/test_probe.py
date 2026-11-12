@@ -10,6 +10,7 @@ from livekit import (
     agents as _agents,  # noqa: F401  (venv sanity: probe never imports it)
 )
 from livekit.agents import llm as agents_llm
+from test_client_transports import server as gateway_server
 from test_livekit import (
     FailingRelayClient,
     FakeBridge,
@@ -24,6 +25,7 @@ from test_livekit import (
 from test_native_speech import collect, server
 
 import speko_gateway.probe as probe_module
+from speko_gateway.client import GatewayClient
 from speko_gateway.livekit import LLM, STT, TTS
 from speko_gateway.probe import (
     ConversationProbe,
@@ -395,6 +397,73 @@ async def test_native_speech_invalid_identity_never_poisons_probe_batch(
         await probe.aclose()
     assert not [event for event in posted(client) if event["type"] == "leg.attached"]
     assert probe.dropped_events == 0
+
+
+@pytest.mark.parametrize("accept_router_tts", [False, True])
+async def test_native_speech_mixed_gateway_versions_preserve_unrelated_markers(
+    accept_router_tts,
+) -> None:
+    batches, accepted = [], []
+
+    async def ingress(request):
+        batch = (await request.json())["events"]
+        batches.append(batch)
+        # The old Go vocabulary rejects the whole batch for a TTS request ID.
+        if not accept_router_tts and any(
+            event["type"] == "leg.attached"
+            and event["data"]["kind"] == "tts"
+            and "request_id" in event["data"]
+            for event in batch
+        ):
+            return web.json_response({"error": "old vocabulary"}, status=400)
+        accepted.extend(batch)
+        return web.json_response({"accepted": len(batch), "dropped": 0}, status=202)
+
+    async def audio(request, _):
+        await request.read()
+        return web.Response(
+            body=b"audio",
+            headers={"Content-Type": "audio/pcm", "Speko-Request-ID": "req-tts-1"},
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/turn-events", ingress)
+    async with gateway_server(app, unix=True) as socket:
+        client = GatewayClient(socket_path=socket, local_auth_token="owned-local")
+        session = FakeAgentSession()
+        probe = ConversationProbe(session, client=client)
+        probe.start()
+        user_state(session, "listening", "speaking")
+        user_state(session, "speaking", "listening")
+        report_leg("tts", session_id="sess-gateway", attempt_id="att-gateway")
+        try:
+            async with server(audio) as (speech, _):
+                assert await collect(speech) == b"audio"
+            report_marker("tts.first_audio")
+            probe._complete_turn()
+        finally:
+            await probe.aclose()
+            await client.aclose()
+
+    assert len(batches) == 3  # Original markers, isolated Router TTS, trailing markers.
+    assert [event["seq"] for batch in batches for event in batch] == list(
+        range(1, sum(map(len, batches)) + 1)
+    )
+    assert len(batches[1]) == 1
+    assert batches[1][0]["data"]["request_id"] == "req-tts-1"
+    assert [event["type"] for event in accepted if event["type"] != "leg.attached"] == [
+        "conversation.started",
+        "turn.started",
+        "user.speech.started",
+        "user.speech.ended",
+        "tts.first_audio",
+        "turn.completed",
+        "conversation.ended",
+    ]
+    assert any(event["data"].get("session_id") == "sess-gateway" for event in accepted)
+    router_legs = [event for event in accepted if event["data"].get("request_id")]
+    assert len(router_legs) == int(accept_router_tts)
+    assert probe.dropped_events == int(not accept_router_tts)
 
 
 @pytest.mark.parametrize("start_with_turn", [False, True])

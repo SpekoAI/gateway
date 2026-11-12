@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from itertools import groupby
 from pathlib import Path
 from typing import Any
 
@@ -142,18 +143,34 @@ class GatewayClient:
                 )
             await asyncio.sleep(min(interval, remaining))
 
-    async def post_turn_events(self, events: list[dict[str, Any]]) -> None:
+    async def post_turn_events(self, events: list[dict[str, Any]]) -> int:
         """POST one content-free turn-marker batch to ``/v1/turn-events``.
 
-        The response is deliberately ignored: retry and deduplication belong
-        to the Gateway's telemetry exporter, so the probe never resends a
-        batch and a failed post costs the caller nothing but the markers.
+        Router TTS attachments use separate requests: an older Gateway rejects
+        their identity shape and must not discard unrelated markers with them.
+        Preserve sequence order, never retry, and return the number of markers
+        rejected at HTTP ingress. Successful ingress still proves no export.
         """
 
-        async with self._session.post(
-            f"{_BASE_URL}/v1/turn-events", json={"events": events}
-        ) as response:
-            await response.read()
+        def router_tts(event: dict[str, Any]) -> bool:
+            data = event.get("data")
+            return (
+                event.get("type") == "leg.attached"
+                and isinstance(data, dict)
+                and data.get("kind") == "tts"
+                and "request_id" in data
+            )
+
+        dropped = 0
+        for _, group in groupby(events, key=router_tts):
+            batch = list(group)
+            async with self._session.post(
+                f"{_BASE_URL}/v1/turn-events", json={"events": batch}
+            ) as response:
+                if not 200 <= response.status < 300:
+                    dropped += len(batch)
+                await response.read()
+        return dropped
 
     async def open(
         self, config: SessionConfig, *, idempotency_key: str | None = None
@@ -172,8 +189,12 @@ class GatewayClient:
                 retryable = error["retryable"]
             raise GatewayError(
                 _error_message(response.status, body),
-                code=error.get("code", "") if isinstance(error.get("code"), str) else "",
-                source=error.get("source", "") if isinstance(error.get("source"), str) else "",
+                code=error.get("code", "")
+                if isinstance(error.get("code"), str)
+                else "",
+                source=error.get("source", "")
+                if isinstance(error.get("source"), str)
+                else "",
                 retryable=retryable,
             )
         stream_url = body.get("stream_url")

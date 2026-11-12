@@ -273,3 +273,6 @@ With an active `ConversationProbe`, the response's `Speko-Request-ID` attaches
 the Router TTS leg to the turn that started the request, provided that turn is
 still open. This request identity is separate from Gateway TTS session/attempt
 identities. The receiving Gateway must support Router TTS leg attachments.
+Those attachments are posted separately: older Gateways may reject them while
+unrelated turn markers remain deliverable. The probe counts rejected markers
+without retrying them.
