@@ -124,6 +124,30 @@ provider-direct voice legs, the conversation history travels through the
 Speko Router. Function tools are supported; image and audio content is
 silently skipped — only text is forwarded.
 
+Cell-registered model work uses `RelayLLMClient.complete_registered_response`
+for an original `stream:false` body, or `stream_registered_response` for an
+original `stream:true` body. Create that client with the work's current bearer,
+the configured router URL and its session ID. Supply the cell's exact
+`rendering`, `request_body`, `work_nonce` and private `input_blinder`, plus the
+original explicit `idempotency_key`. The transport embeds the untouched request
+string in the four-field protected envelope; it never adds a stream setting or
+reconstructs provider JSON. The 262144-byte UTF-8 input bound and exact metadata
+shape are checked before sending. Unknown provider grammar and authority are
+still verified independently by the native router and cell.
+
+These methods make one POST to `/v1/llm/responses`, carry
+`Speko-Client-Session-ID`, refuse redirects and do not retry or fall back. An
+explicit retry must reuse the original work/input/key and remains subject to
+current cell authority. Neither a transport error nor `retryable` proves no
+provider I/O. Cancellation or a truncated/error stream is not a completed
+result. Responses are router transport payloads: the worker must validate and
+commit its model observation separately. No method grants model authority,
+settles a charge, dispatches tools, claims heard audio or enables graph startup.
+Keep the envelope, bearer and blinder in memory only; do not log or spool them.
+The shared SSE decoder dispatches an event only after its blank-line frame
+terminator. EOF after terminal JSON is a truncated stream, including for the
+ordinary `stream_response` method.
+
 Jev evaluations use the separate pooled async client and require an explicit
 idempotency key:
 
