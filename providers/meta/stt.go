@@ -73,6 +73,15 @@ const (
 	// only ever lowers the bill, because the billed figure is the reported
 	// position, never the forwarded total.
 	processedCoverageSlackMs = 100
+
+	// paddingFrame is the silence one padding write carries and the padding
+	// loop's tick, so padding runs at exactly real time.
+	paddingFrame = 100 * time.Millisecond
+	// paddingGap is how long the caller may send no audio before padding
+	// starts: above ordinary network jitter, so silence is not spliced into
+	// speech that is merely late, and well under the ~2 s without audio after
+	// which the service was seen closing a session.
+	paddingGap = 400 * time.Millisecond
 )
 
 // sampleRateEncodings are the only rates the realtime socket listens at,
@@ -109,6 +118,12 @@ type STTAdapter struct {
 	setupTimeout      time.Duration
 	closeDrainTimeout time.Duration
 	endpointPolicy    upstream.WebSocketPolicy
+	// now and newTicker drive silence padding; tests replace them.
+	now       func() time.Time
+	newTicker func(time.Duration) (<-chan time.Time, func())
+	// afterPad, when set, is told after every padding iteration whether it
+	// wrote silence. Tests only.
+	afterPad func(wrote bool)
 }
 
 // NewSTT validates the configuration and builds the adapter.
@@ -140,6 +155,11 @@ func NewSTT(config STTConfig) (*STTAdapter, error) {
 		maxMessageBytes: config.MaxMessageBytes, setupTimeout: config.SetupTimeout,
 		closeDrainTimeout: config.CloseDrainTimeout,
 		endpointPolicy:    policy,
+		now:               time.Now,
+		newTicker: func(period time.Duration) (<-chan time.Time, func()) {
+			ticker := time.NewTicker(period)
+			return ticker.C, ticker.Stop
+		},
 	}, nil
 }
 
@@ -200,6 +220,9 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		setupDone:    make(chan error, 1),
 		done:         make(chan struct{}),
 		drainTimeout: a.closeDrainTimeout,
+		now:          a.now,
+		afterPad:     a.afterPad,
+		padKick:      make(chan struct{}, 1),
 		// mono pcm_s16le, validated above
 		bytesPerSecond: int64(request.Media.SampleRateHz) * 2,
 		billing:        protocol.BillingObservation{OperationID: "session", Model: model, Mode: "streaming", Quantities: map[string]int64{}},
@@ -222,6 +245,11 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		stream.abort()
 		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Meta transcribe did not acknowledge the session", Retryable: true, Cause: setupCtx.Err()}
 	}
+	stream.writeMu.Lock()
+	stream.padFrom = a.now().Add(paddingGap)
+	stream.writeMu.Unlock()
+	stream.padFrame = make([]byte, stream.bytesPerSecond*int64(paddingFrame)/int64(time.Second))
+	go stream.padLoop(a.newTicker(paddingFrame))
 	sessionID := stream.session()
 	stream.emit(runtimepkg.ProviderEvent{Type: protocol.EventSessionReady, Data: marshalData(map[string]string{"provider_request_id": sessionID})})
 	stream.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Data: marshalData(map[string]string{"provider_request_id": sessionID})})
@@ -334,6 +362,26 @@ type sttStream struct {
 
 	terminalMu  sync.Mutex
 	terminalErr error
+
+	// Silence padding. The service closes a stream whose audio stops, and its
+	// endpointing only ends a turn while audio keeps arriving, so padLoop
+	// fills every gap in the caller's audio with PCM silence at real time.
+	// padFrom and audioUntil are guarded by writeMu, the lock every socket
+	// write takes, so a padding decision and its write never interleave with
+	// caller audio.
+	now      func() time.Time
+	afterPad func(wrote bool)
+	padFrame []byte
+	// padKick asks the loop to pad at once (CommitAudio).
+	padKick chan struct{}
+	// padFrom is the earliest instant padding may be written.
+	padFrom time.Time
+	// audioUntil is the wall-clock instant by which everything written so
+	// far, caller audio and padding, has played out at real time.
+	audioUntil time.Time
+	// paddedBytes is the silence written. It is never billed: see
+	// billedObservation.
+	paddedBytes atomic.Int64
 }
 
 func (s *sttStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -356,6 +404,9 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 	// A frame whose write fails ends the session, whose evidence then stays
 	// partial, and the service cannot report audio it never got.
 	s.forwardedBytes.Add(int64(len(audio)))
+	now := s.now()
+	s.padFrom = now.Add(paddingGap)
+	s.audioUntil = laterOf(s.audioUntil, now).Add(time.Duration(int64(len(audio)) * int64(time.Second) / s.bytesPerSecond))
 	if err := s.conn.Write(ctx, websocket.MessageBinary, audio); err != nil {
 		return s.writeError(err)
 	}
@@ -364,12 +415,73 @@ func (s *sttStream) WriteAudio(ctx context.Context, audio []byte) error {
 
 // CommitAudio has no wire message on this socket short of endStream, which
 // ends the session rather than the turn. The service's own endpointing
-// decides the turn, so the call is accepted and does nothing.
+// decides the turn, and it only does so while audio keeps arriving, so a
+// commit starts silence padding at once instead of after paddingGap.
 func (s *sttStream) CommitAudio(context.Context) error {
 	if s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
+	s.writeMu.Lock()
+	s.padFrom = s.now()
+	s.writeMu.Unlock()
+	select {
+	case s.padKick <- struct{}{}:
+	default:
+	}
 	return nil
+}
+
+// padLoop writes silence while the caller sends none, one frame per tick,
+// until the input is closed or the session ends.
+func (s *sttStream) padLoop(ticks <-chan time.Time, stop func()) {
+	defer stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.done:
+			return
+		case <-ticks:
+		case <-s.padKick:
+		}
+		wrote, open := s.padOnce()
+		if s.afterPad != nil {
+			s.afterPad(wrote)
+		}
+		if !open {
+			return
+		}
+	}
+}
+
+// padOnce writes one frame of silence when the caller's audio has a gap and
+// everything already written has played out, so padding never runs ahead of
+// the clock by more than the frame it writes. It reports whether it wrote,
+// and false for open once the input is closed or a write fails; a failed
+// write is left to the read loop, which reports the socket's end.
+func (s *sttStream) padOnce() (wrote, open bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.inputClosed.Load() || s.closed.Load() {
+		return false, false
+	}
+	now := s.now()
+	if now.Before(s.padFrom) || s.audioUntil.Sub(now) >= paddingFrame/2 {
+		return false, true
+	}
+	if err := s.conn.Write(s.ctx, websocket.MessageBinary, s.padFrame); err != nil {
+		return false, false
+	}
+	s.paddedBytes.Add(int64(len(s.padFrame)))
+	s.audioUntil = laterOf(s.audioUntil, now).Add(paddingFrame)
+	return true, true
+}
+
+func laterOf(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 func (s *sttStream) AppendText(context.Context, string) error {
@@ -706,6 +818,13 @@ func (s *sttStream) forwardedDuration() *big.Rat {
 // position, capped at the audio actually forwarded. The service cannot have
 // processed audio it was never sent, so the cap only matters if its counter
 // ever ran ahead of the input — and then the customer pays for what was sent.
+//
+// forwardedBytes is the caller's audio only. The service processes, and
+// charges for, the silence padLoop writes too, so its position runs past the
+// caller's audio by the padding; the cap holds the bill to what the caller
+// sent and the relay absorbs the padding. The relay's stt_duration budget is
+// debited by the connector on caller audio before WriteAudio and never sees
+// padding either.
 func (s *sttStream) billedObservation() protocol.BillingObservation {
 	o := s.billing.Clone()
 	if _, ok := o.Quantities["duration_seconds"]; !ok {
@@ -722,7 +841,10 @@ func (s *sttStream) billedObservation() protocol.BillingObservation {
 // processedCoversForwarded reports whether the service's processed position
 // has reached the forwarded audio, within one progress step. Once endStream
 // is out no further audio can be forwarded, so this is the point at which the
-// reported figure is final for everything that was served.
+// reported figure is final for everything that was served. The position
+// includes padding, so it can reach the caller's total before the service has
+// processed the caller's last frames; the billed figure is capped at that
+// total, so from then on it cannot change, which is what final means here.
 func (s *sttStream) processedCoversForwarded() bool {
 	if !s.billingDurationSeen {
 		return false

@@ -39,6 +39,9 @@ type fakeRealtime struct {
 	handshake map[string]any
 	audio     [][]byte
 	endStream bool
+	// audioAfterEndStream counts binary frames that arrived after endStream
+	// (holdOpenAfterEndStream only).
+	audioAfterEndStream int
 }
 
 func newFakeRealtime(t *testing.T, replies ...string) *fakeRealtime {
@@ -126,8 +129,14 @@ func (f *fakeRealtime) handle(writer http.ResponseWriter, request *http.Request)
 		}
 		if f.holdOpenAfterEndStream {
 			for {
-				if _, _, err := conn.Read(ctx); err != nil {
+				kind, _, err := conn.Read(ctx)
+				if err != nil {
 					return
+				}
+				if kind == websocket.MessageBinary {
+					f.mu.Lock()
+					f.audioAfterEndStream++
+					f.mu.Unlock()
 				}
 			}
 		}
@@ -285,8 +294,15 @@ func TestTranscribeStreamsPartialsThenTurnFinal(t *testing.T) {
 	if keywords, _ := fake.handshake["keywords"].([]any); len(keywords) != 2 || keywords[0] != "Speko" || keywords[1] != "relay" {
 		t.Fatalf("keywords = %v, want blank keywords dropped", fake.handshake["keywords"])
 	}
-	if len(fake.audio) != 1 || string(fake.audio[0]) != "caller-pcm" {
-		t.Fatalf("audio frames = %q, want the PCM forwarded as one binary frame", fake.audio)
+	// The commit starts silence padding, so frames after the caller's are
+	// padding.
+	if len(fake.audio) == 0 || string(fake.audio[0]) != "caller-pcm" {
+		t.Fatalf("first audio frame = %q, want the PCM forwarded as one binary frame", firstFrame(fake.audio))
+	}
+	for index, frame := range fake.audio[1:] {
+		if !isPadFrame(frame, bytesPerSecond24k) {
+			t.Fatalf("audio frame %d after the caller's is %d bytes, want a 100 ms frame of silence", index+1, len(frame))
+		}
 	}
 	if fake.endStream {
 		t.Fatal("endStream was sent before Close")
