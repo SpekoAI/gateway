@@ -174,13 +174,17 @@ func TestProviderErrorClassification(t *testing.T) {
 	}
 }
 
-// The vendor's error frame and close reason survive for the failure logs.
-func TestProviderFailuresKeepTheVendorPayload(t *testing.T) {
+// Modulate's error frame is free text, so it names no provider code even
+// when the text is one word; a close reason names one only when it is a bare
+// code.
+func TestProviderFailuresNameOnlyAVendorCode(t *testing.T) {
 	t.Parallel()
-	_, err := (&stream{}).handleMessage(json.RawMessage(`{"type":"error","error":"Insufficient credits."}`))
-	var providerErr *runtimepkg.ProviderError
-	if !errors.As(err, &providerErr) || providerErr.Code != "provider_quota_exceeded" || len(providerErr.Extensions[extensionID]) == 0 {
-		t.Fatalf("error frame = %#v, want provider_quota_exceeded with the raw frame", err)
+	for _, frame := range []string{`{"type":"error","error":"Insufficient credits."}`, `{"type":"error","error":"unavailable"}`} {
+		_, err := (&stream{}).handleMessage(json.RawMessage(frame))
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) || providerErr.SafeProviderCode() != "" {
+			t.Fatalf("error frame %s = %#v, want no provider code", frame, err)
+		}
 	}
 	for reason, want := range map[string]string{"quota_exceeded": "quota_exceeded", "Monthly usage limit reached.": ""} {
 		closed := fmt.Errorf("read: %w", websocket.CloseError{Code: 4029, Reason: reason})

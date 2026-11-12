@@ -392,9 +392,9 @@ func (s *stream) handleMessage(raw json.RawMessage) (bool, error) {
 	case "done":
 		return false, s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: billing.Duration("stream", s.billingModel, "streaming", raw, 1, "duration_ms"), Data: marshalData(map[string]any{"duration_ms": message.DurationMS}), Extensions: extension(raw)})
 	case "error":
-		failure := providerMessageError(message.Error)
-		failure.Extensions = extension(raw)
-		return false, failure
+		// The frame is not kept: its error is free text, which
+		// SafeProviderCode would read as a code when it is one word.
+		return false, providerMessageError(message.Error)
 	default:
 		return true, s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"message": "ignored Modulate message type", "provider_type": message.Type}), Extensions: extension(raw)})
 	}
