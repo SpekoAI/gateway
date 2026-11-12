@@ -82,14 +82,13 @@ const (
 	// speech that is merely late, and well under the ~2 s without audio after
 	// which the service was seen closing a session.
 	paddingGap = 400 * time.Millisecond
-	// paddingStretchCap bounds one continuous stretch of padding. Thirty
-	// seconds keeps the service listening through ordinary pauses and the
-	// agent's own speech, but a client that stays connected and silent must
-	// not keep the session, and the service's billed minutes, running
-	// indefinitely: past the cap padding stops and the service's own idle
-	// policy closes the session. Caller audio starts a new stretch; a commit
-	// does not.
-	paddingStretchCap = 30 * time.Second
+	// paddingStretchCap bounds one continuous stretch of padding. Two minutes
+	// keeps the service listening through ordinary pauses and long agent
+	// turns, but a client that stays connected and silent must not keep the
+	// session, and the service's billed minutes, running indefinitely: past
+	// the cap padding stops and the service's own idle policy closes the
+	// session. Caller audio starts a new stretch; a commit does not.
+	paddingStretchCap = 120 * time.Second
 	// padWriteTimeout bounds one padding write. A write still blocked after
 	// it means the service stopped reading: the websocket closes on the
 	// deadline, padding ends, and the read loop reports the socket's end, so
