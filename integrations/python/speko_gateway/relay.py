@@ -24,6 +24,16 @@ from .probe import report_leg as _report_probe_leg
 
 _DEFAULT_RELAY_URL = "https://router.speko.dev"
 _TERMINAL_EVENTS = {"response.completed", "error"}
+_REGISTERED_RESPONSE_LIMIT = 1024 * 1024
+_REGISTERED_EVENTS = {
+    "response.created",
+    "response.item.added",
+    "response.text.delta",
+    "response.function_call_arguments.delta",
+    "response.item.completed",
+    "response.completed",
+    "error",
+}
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 """The Router's provider-neutral reasoning control, sent as `reasoning_effort`.
@@ -257,7 +267,9 @@ class RelayLLMClient:
         if not isinstance(self._platform_session_id, str) or not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}", self._platform_session_id
         ):
-            raise ValueError("a valid session_id is required for registered model input")
+            raise ValueError(
+                "a valid session_id is required for registered model input"
+            )
         if not _registered_idempotency_key(idempotency_key):
             raise ValueError("a bounded explicit idempotency_key is required")
         try:
@@ -328,9 +340,10 @@ class RelayLLMClient:
             headers=headers,
             allow_redirects=False,
         ) as response:
-            decoded = await _decode_json(response)
             if response.status != 200:
-                raise _envelope_error(response.status, decoded)
+                error = await _registered_rejection(response)
+                raise error
+            decoded = await _decode_json(response, strict=True)
             if "error" in decoded:
                 raise _event_error(decoded)
             if not decoded:
@@ -351,6 +364,8 @@ class RelayLLMClient:
 
         Never reconstruct the provider body from parsed JSON, append fields to
         the protected envelope, follow redirects or retry an uncertain send.
+        Success is delivered only after clean HTTP EOF: malformed payloads or
+        additional events after the terminal cannot be hidden by early return.
         """
         body, headers = self._registered_request(
             rendering=rendering,
@@ -367,17 +382,30 @@ class RelayLLMClient:
             allow_redirects=False,
         ) as response:
             if response.status != 200:
-                raise _envelope_error(response.status, await _decode_json(response))
+                error = await _registered_rejection(response)
+                raise error
             _report_llm_leg(response)
-            async for event, payload in _sse_events(response):
+            terminal = None
+            async for event, payload in _sse_events(response, strict=True):
+                if terminal is not None:
+                    raise RelayError(
+                        "relay stream sent events after its terminal", retryable=False
+                    )
+                if event not in _REGISTERED_EVENTS:
+                    raise RelayError(
+                        "relay stream sent an unsupported event", retryable=False
+                    )
                 if event == "error":
                     raise _event_error(payload)
-                yield event, payload
                 if event == "response.completed":
-                    return
-            raise RelayError(
-                "relay stream ended without a terminal event", retryable=True
-            )
+                    terminal = payload
+                else:
+                    yield event, payload
+            if terminal is None:
+                raise RelayError(
+                    "relay stream ended without a terminal event", retryable=True
+                )
+            yield "response.completed", terminal
 
     async def stream_response(
         self, request: dict[str, Any]
@@ -441,29 +469,43 @@ def _report_evaluation_leg(
 ) -> None:
     request_id = str(response.headers.get("Speko-Request-ID", ""))
     if request_id and probe is not None and turn_id:
-        probe.report_leg(
-            "evaluation", request_id=request_id, expected_turn_id=turn_id
-        )
+        probe.report_leg("evaluation", request_id=request_id, expected_turn_id=turn_id)
 
 
 async def _sse_events(
     response: aiohttp.ClientResponse,
+    *,
+    strict: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     # JSONDecodeError, UnicodeDecodeError, and aiohttp's line-limit overrun
     # are all ValueError: a stream that cannot be parsed is normalized to a
     # retryable RelayError so it stays inside the adapter's connection-error
     # classification instead of escaping as a raw decoding exception.
     event = ""
+    event_seen = False
     data_lines: list[str] = []
+    size, malformed = 0, False
     try:
         async for raw_line in response.content:
+            if strict:
+                size += len(raw_line)
+                if size > _REGISTERED_RESPONSE_LIMIT:
+                    raise ValueError()
             line = raw_line.decode("utf-8").rstrip("\r\n")
             if line == "":
-                if event and data_lines:
+                if strict and (event_seen or data_lines):
+                    if not data_lines:
+                        raise ValueError()
+                    yield (
+                        event or "message",
+                        _strict_response_json("\n".join(data_lines)),
+                    )
+                elif event and data_lines:
                     payload = json.loads("\n".join(data_lines))
                     if isinstance(payload, dict):
                         yield event, payload
                 event = ""
+                event_seen = False
                 data_lines = []
                 continue
             if line.startswith(":"):
@@ -471,15 +513,29 @@ async def _sse_events(
             field, _, value = line.partition(":")
             value = value.removeprefix(" ")
             if field == "event":
+                if strict and event_seen:
+                    raise ValueError()
                 event = value
+                event_seen = True
             elif field == "data":
                 data_lines.append(value)
-        if event or data_lines:
+        if event or data_lines or strict and event_seen:
             # EOF does not dispatch an SSE event. Even valid terminal JSON is
             # incomplete until the frame's empty-line delimiter was received.
-            raise RelayError("relay stream ended with an unterminated event", retryable=True)
-    except ValueError as err:
-        raise RelayError("relay stream sent a malformed event", retryable=True) from err
+            raise RelayError(
+                "relay stream ended with an unterminated event", retryable=True
+            )
+    except (ValueError, TypeError, RecursionError, OverflowError) as err:
+        if not strict:
+            if not isinstance(err, ValueError):
+                raise
+            raise RelayError(
+                "relay stream sent a malformed event", retryable=True
+            ) from err
+        malformed = True
+    if malformed:
+        # No original payload/parser error, even in __context__.
+        raise RelayError("relay stream sent a malformed event", retryable=False)
 
 
 def _registered_idempotency_key(value: str) -> bool:
@@ -509,7 +565,54 @@ def _invalid_registered_constant(_value: str) -> Any:
     raise ValueError()
 
 
-async def _decode_json(response: aiohttp.ClientResponse) -> dict[str, Any]:
+def _strict_response_json(data: str | bytes) -> dict[str, Any]:
+    value = json.loads(
+        data.decode("utf-8") if isinstance(data, bytes) else data,
+        object_pairs_hook=_registered_object,
+        parse_constant=_invalid_registered_constant,
+    )
+    if not isinstance(value, dict):
+        raise TypeError()
+    # Check escaped invalid Unicode and overflowing JSON fractions too. Keep
+    # the original values: raw tool arguments remain unparsed string content.
+    json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return value
+
+
+async def _registered_rejection(response: aiohttp.ClientResponse) -> RelayError:
+    decoded = None
+    try:
+        decoded = await _decode_json(response, strict=True)
+    except RelayError:
+        pass
+    if decoded is None:
+        # A non-JSON or ambiguous error body cannot become success or override
+        # the original HTTP status. Preserve fixed status-only diagnostics.
+        return RelayError(
+            f"Router rejected request (HTTP {response.status})",
+            retryable=response.status >= 500,
+        )
+    return _envelope_error(response.status, decoded)
+
+
+async def _decode_json(
+    response: aiohttp.ClientResponse, *, strict: bool = False
+) -> dict[str, Any]:
+    if strict:
+        result = None
+        try:
+            chunks, size = [], 0
+            async for chunk in response.content.iter_chunked(65536):
+                size += len(chunk)
+                if size > _REGISTERED_RESPONSE_LIMIT:
+                    raise ValueError()
+                chunks.append(chunk)
+            result = _strict_response_json(b"".join(chunks))
+        except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+            pass
+        if result is None:
+            raise RelayError("Router returned a malformed response", retryable=False)
+        return result
     try:
         value = await response.json(content_type=None)
     except (aiohttp.ContentTypeError, json.JSONDecodeError):

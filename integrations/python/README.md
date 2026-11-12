@@ -144,6 +144,21 @@ result. Responses are router transport payloads: the worker must validate and
 commit its model observation separately. No method grants model authority,
 settles a charge, dispatches tools, claims heard audio or enables graph startup.
 Keep the envelope, bearer and blinder in memory only; do not log or spool them.
+
+Registered responses use bounded original UTF-8 JSON before any field is
+discarded: duplicate keys at any object level, non-finite numbers, invalid
+Unicode and non-object payloads are refused. Raw tool argument strings stay
+untouched, including intentional duplicate keys and exact numeric tokens inside
+that string. HTTP bodies and cumulative SSE bytes each have a 1 MiB bound.
+
+The registered stream rejects malformed/unsupported frames and duplicate event
+headers. It withholds its success terminal until clean HTTP EOF and refuses
+any event after that terminal, including an error or a second completion.
+Comments, multiline data and LF/CRLF framing remain supported. The caller still
+owns cancellation and the original work deadline; waiting for EOF grants no
+extra time or execution authority. A non-JSON or ambiguous HTTP error keeps only
+fixed status diagnostics. Ordinary unregistered methods retain their existing
+response handling.
 The shared SSE decoder dispatches an event only after its blank-line frame
 terminator. EOF after terminal JSON is a truncated stream, including for the
 ordinary `stream_response` method.
