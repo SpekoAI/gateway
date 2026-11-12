@@ -145,10 +145,18 @@ func (e frameError) providerError(raw []byte) error {
 	if strings.TrimSpace(description) == "" {
 		description = e.Reason
 	}
-	return providerFrameError(string(e.Code), description, raw)
+	failure := providerFrameError(string(e.Code), description, raw)
+	// The code sits under "data", where SafeProviderCode does not look. A
+	// session error's reason (session_revoked) names its numeric code; a
+	// reason that is a sentence fails the sanitizer and the number stands.
+	failure.ProviderCode = string(e.Code)
+	if reason := runtime.SanitizeProviderCode(e.Reason); reason != "" {
+		failure.ProviderCode = reason
+	}
+	return failure
 }
 
-func providerFrameError(code, description string, raw []byte) error {
+func providerFrameError(code, description string, raw []byte) *runtime.ProviderError {
 	stable := "provider_rejected_request"
 	retryable := false
 	switch code {

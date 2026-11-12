@@ -484,7 +484,7 @@ func (s *ttsStream) handleTTSMessage(payload []byte) error {
 	case "Warning":
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"code": message.Code, "message": message.Description}), Extensions: s.ttsExtension(raw)})
 	case "Error":
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: deepgramTTSErrorMessage(message.Description), Retryable: false}
+		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: deepgramTTSErrorMessage(message.Description), Retryable: false, Extensions: s.ttsExtension(raw)}
 	default:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: warningData(message.Type), Extensions: s.ttsExtension(raw)})
 	}

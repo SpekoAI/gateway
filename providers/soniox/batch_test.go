@@ -134,7 +134,7 @@ func TestBatchTranscribeRefusesRealtimeModelAndMapsJobError(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"id":"tx_2","status":"queued"}`))
 		case "GET /v1/transcriptions/tx_2":
-			_, _ = w.Write([]byte(`{"id":"tx_2","status":"error","error_message":"unsupported audio"}`))
+			_, _ = w.Write([]byte(`{"id":"tx_2","status":"error","error_type":"invalid_audio_file","error_message":"unsupported audio"}`))
 		default:
 			w.WriteHeader(http.StatusNoContent)
 		}
@@ -152,6 +152,28 @@ func TestBatchTranscribeRefusesRealtimeModelAndMapsJobError(t *testing.T) {
 	var providerErr *runtimepkg.ProviderError
 	if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeProviderError || providerErr.Retryable {
 		t.Fatalf("job error: %v", err)
+	}
+	if got := providerErr.SafeProviderCode(); got != "invalid_audio_file" {
+		t.Fatalf("job error SafeProviderCode = %q, want invalid_audio_file", got)
+	}
+}
+
+// A REST error names its stable error_type, which the failure logs read.
+func TestBatchTranscribeKeepsTheRESTErrorType(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"status_code":402,"error_type":"organization_balance_exhausted","message":"Organization balance exhausted.","request_id":"req_1"}`))
+	}))
+	defer server.Close()
+	adapter, _ := NewBatch(BatchConfig{HTTPClient: server.Client(), PollInterval: 1, AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+	_, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{Plan: batchPlan(server.URL + "/v1/transcriptions"), Audio: strings.NewReader("x"), AudioBytes: 1})
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.ProviderStatus != http.StatusPaymentRequired {
+		t.Fatalf("error = %v, want the 402", err)
+	}
+	if got := providerErr.SafeProviderCode(); got != "organization_balance_exhausted" {
+		t.Fatalf("SafeProviderCode = %q, want organization_balance_exhausted", got)
 	}
 }
 

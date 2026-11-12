@@ -476,7 +476,7 @@ func (s *ttsStream) readSSE(requestCtx context.Context, body io.Reader) {
 					}
 					s.observeTTSBilling(requestCtx, []byte(frame))
 					if payload.Error != nil {
-						s.emit(requestCtx, runtimepkg.ProviderEvent{Err: payloadError(payload)})
+						s.emit(requestCtx, runtimepkg.ProviderEvent{Err: payloadError(payload, []byte(frame))})
 						return
 					}
 					audio, finish, decodeErr := payloadAudio(payload)
@@ -543,7 +543,7 @@ func (s *ttsStream) readBlob(requestCtx context.Context, body io.Reader) {
 	}
 	s.observeTTSBilling(requestCtx, raw)
 	if payload.Error != nil {
-		s.emit(requestCtx, runtimepkg.ProviderEvent{Err: payloadError(payload)})
+		s.emit(requestCtx, runtimepkg.ProviderEvent{Err: payloadError(payload, raw)})
 		return
 	}
 	audio, finishReason, decodeErr := payloadAudio(payload)
@@ -649,7 +649,9 @@ func doneData(finishReason string) json.RawMessage {
 	return data
 }
 
-func payloadError(payload ttsPayload) *runtimepkg.ProviderError {
+// payloadError keeps the in-band error payload so SafeProviderCode can name
+// Google's status (RESOURCE_EXHAUSTED, ...).
+func payloadError(payload ttsPayload, raw []byte) *runtimepkg.ProviderError {
 	message := "Gemini TTS reported an error"
 	status := 0
 	if payload.Error != nil {
@@ -668,7 +670,10 @@ func payloadError(payload ttsPayload) *runtimepkg.ProviderError {
 	case status >= 500:
 		code, retryable = "provider_unavailable", true
 	}
-	return &runtimepkg.ProviderError{Code: code, Message: message, Retryable: retryable, ProviderStatus: status}
+	return &runtimepkg.ProviderError{
+		Code: code, Message: message, Retryable: retryable, ProviderStatus: status,
+		Extensions: map[string]json.RawMessage{ttsExtensionID: append(json.RawMessage(nil), raw...)},
+	}
 }
 
 func (s *ttsStream) reportResponseProgress() {

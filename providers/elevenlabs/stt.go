@@ -830,11 +830,19 @@ func (s *sttStream) handleMessage(payload []byte) error {
 	// Every error type in the vendor's realtime event schema. ElevenLabs sends
 	// the error frame and then closes the socket, so each one is terminal.
 	case "error", "scribe_error", "auth_error", "quota_exceeded", "rate_limited", "input_error", "invalid_request", "insufficient_audio_activity", "transcriber_error", "commit_throttled", "unaccepted_terms", "queue_overflow", "resource_exhausted", "session_time_limit_exceeded", "chunk_size_exceeded":
+		// The message type is the vendor's code; the generic "error" names
+		// nothing more, so it is left to SafeProviderCode's reading of the frame.
+		providerCode := message.MessageType
+		if providerCode == "error" {
+			providerCode = ""
+		}
 		return &runtimepkg.ProviderError{
-			Code:      sttErrorCode(message.MessageType),
-			Message:   sttErrorMessage(message.MessageType, message.Error),
-			Hint:      sttErrorHint(message.MessageType),
-			Retryable: sttErrorRetryable(message.MessageType),
+			Code:         sttErrorCode(message.MessageType),
+			Message:      sttErrorMessage(message.MessageType, message.Error),
+			Hint:         sttErrorHint(message.MessageType),
+			Retryable:    sttErrorRetryable(message.MessageType),
+			Extensions:   sttExtension(raw),
+			ProviderCode: providerCode,
 		}
 	case "diarized_transcript":
 		if !s.diarize {

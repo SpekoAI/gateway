@@ -487,9 +487,10 @@ func (s *stream) handleMessage(payload []byte) error {
 		return s.emitResults(message, raw)
 	case "Error":
 		return &runtimepkg.ProviderError{
-			Code:      "provider_unavailable",
-			Message:   deepgramErrorMessage(message.Description),
-			Retryable: false,
+			Code:       "provider_unavailable",
+			Message:    deepgramErrorMessage(message.Description),
+			Retryable:  false,
+			Extensions: extension(raw),
 		}
 	default:
 		return s.emit(runtimepkg.ProviderEvent{

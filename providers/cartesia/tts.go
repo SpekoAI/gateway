@@ -523,9 +523,12 @@ func (s *stream) handleMessage(payload []byte) error {
 				Hint:           "Choose a Cartesia model that supports this language, or use another TTS provider for it.",
 				Retryable:      false,
 				ProviderStatus: message.StatusCode,
+				Extensions:     extension(raw),
 			}
 		}
-		return &runtimepkg.ProviderError{Code: cartesiaErrorCode(message.StatusCode), Message: cartesiaErrorMessage(message.Message), Retryable: message.StatusCode >= 500, ProviderStatus: message.StatusCode}
+		// The frame is kept for its error_code (Cartesia-Version 2026-03-01 and
+		// later), which SafeProviderCode reads.
+		return &runtimepkg.ProviderError{Code: cartesiaErrorCode(message.StatusCode), Message: cartesiaErrorMessage(message.Message), Retryable: message.StatusCode >= 500, ProviderStatus: message.StatusCode, Extensions: extension(raw)}
 	default:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, message.Type), Extensions: extension(raw)})
 	}

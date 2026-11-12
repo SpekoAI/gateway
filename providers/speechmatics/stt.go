@@ -573,6 +573,10 @@ func providerError(message inboundMessage, raw json.RawMessage) *runtimepkg.Prov
 		Retryable:      retryable,
 		ProviderStatus: message.Code,
 		Extensions:     extension(raw),
+		// Speechmatics names the error in the frame's top-level type
+		// (not_authorised, quota_exceeded, ...), which SafeProviderCode's
+		// reading of the frame does not look at.
+		ProviderCode: message.Type,
 	}
 }
 

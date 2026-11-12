@@ -186,7 +186,10 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 			if detail == "" {
 				detail = current.Output.Code
 			}
-			return false, batchhttp.Failed(batchExtensionID, detail)
+			failure := batchhttp.Failed(batchExtensionID, detail)
+			// Failed keeps the message, not the task's code.
+			failure.ProviderCode = current.Output.Code
+			return false, failure
 		case "PENDING", "RUNNING", "":
 			return false, nil
 		default:

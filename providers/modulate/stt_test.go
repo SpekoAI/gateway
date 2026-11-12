@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -169,6 +170,22 @@ func TestProviderErrorClassification(t *testing.T) {
 		err := providerMessageError(testCase.message)
 		if err.Code != testCase.code || err.Retryable != testCase.retry {
 			t.Errorf("%q => %s retry=%t, want %s retry=%t", testCase.message, err.Code, err.Retryable, testCase.code, testCase.retry)
+		}
+	}
+}
+
+// The vendor's error frame and close reason survive for the failure logs.
+func TestProviderFailuresKeepTheVendorPayload(t *testing.T) {
+	t.Parallel()
+	_, err := (&stream{}).handleMessage(json.RawMessage(`{"type":"error","error":"Insufficient credits."}`))
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != "provider_quota_exceeded" || len(providerErr.Extensions[extensionID]) == 0 {
+		t.Fatalf("error frame = %#v, want provider_quota_exceeded with the raw frame", err)
+	}
+	for reason, want := range map[string]string{"quota_exceeded": "quota_exceeded", "Monthly usage limit reached.": ""} {
+		closed := fmt.Errorf("read: %w", websocket.CloseError{Code: 4029, Reason: reason})
+		if got := readError(closed).SafeProviderCode(); got != want {
+			t.Fatalf("close reason %q: SafeProviderCode = %q, want %q", reason, got, want)
 		}
 	}
 }

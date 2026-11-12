@@ -592,6 +592,51 @@ func TestMultiContextEndpointSendsPrimaryLanguageCode(t *testing.T) {
 	}
 }
 
+// An in-band error frame keeps the vendor's code for the failure logs: the
+// relay used to see only provider_unavailable and could not tell an exhausted
+// quota from a missing voice.
+func TestAdapterKeepsTheVendorCodeOfAnErrorFrame(t *testing.T) {
+	t.Parallel()
+	for frame, want := range map[string]string{
+		`{"message":"This request exceeds your quota.","error":"quota_exceeded","code":1008}`: "quota_exceeded",
+		`{"message":"A voice with that id does not exist.","error":"voice_not_found"}`:        "voice_not_found",
+		`{"error":"Something went wrong on our side"}`:                                        "",
+	} {
+		server := newMultiContextServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+			if _, err := readClientMessage(ctx, conn); err != nil {
+				return
+			}
+			_ = conn.Write(ctx, websocket.MessageText, []byte(frame))
+			_ = conn.Close(websocket.StatusPolicyViolation, "error")
+		})
+		adapter, _ := New(testConfig(server.URL))
+		stream, err := adapter.Open(context.Background(), elevenLabsRequest(server.URL, protocol.CredentialsBYOK))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		if err := stream.AppendText(context.Background(), "Hello"); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		var providerErr *runtimepkg.ProviderError
+		for event := range stream.Events() {
+			if event.Err != nil {
+				if !errors.As(event.Err, &providerErr) {
+					t.Fatalf("%s: error = %v, want a provider error", frame, event.Err)
+				}
+				break
+			}
+		}
+		_ = stream.Close(context.Background())
+		server.Close()
+		if providerErr == nil || providerErr.Code != "provider_unavailable" {
+			t.Fatalf("%s: error = %+v, want provider_unavailable", frame, providerErr)
+		}
+		if got := providerErr.SafeProviderCode(); got != want {
+			t.Fatalf("%s: SafeProviderCode = %q, want %q", frame, got, want)
+		}
+	}
+}
+
 // A language the model does not support is a caller error: retrying the same
 // pair is refused identically, so it must not surface as a retryable outage.
 // ElevenLabs sends an unsupported_language error frame and then closes 1008;

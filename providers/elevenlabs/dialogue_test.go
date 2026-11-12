@@ -414,6 +414,10 @@ func TestDialogueAdapterCarriesTheVendorErrorText(t *testing.T) {
 		if !strings.Contains(event.Err.Error(), "voice_not_found") {
 			t.Fatalf("error lost the vendor text: %v", event.Err)
 		}
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(event.Err, &providerErr) || providerErr.SafeProviderCode() != "voice_not_found" {
+			t.Fatalf("error lost the vendor code: %+v", event.Err)
+		}
 		if strings.Contains(event.Err.Error(), "customer-elevenlabs-key") {
 			t.Fatalf("error leaked the credential: %v", event.Err)
 		}

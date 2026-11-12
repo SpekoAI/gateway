@@ -624,6 +624,8 @@ func (s *sttStream) handleMessage(payload []byte) error {
 			Retryable:      retryable,
 			ProviderStatus: message.ErrorCode,
 			Extensions:     sttExtension(raw),
+			// error_type is Soniox's stable code; error_code is the status.
+			ProviderCode: message.ErrorType,
 		}
 	}
 	if message.RequestID != "" && s.requestID != message.RequestID {

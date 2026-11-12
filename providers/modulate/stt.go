@@ -392,7 +392,9 @@ func (s *stream) handleMessage(raw json.RawMessage) (bool, error) {
 	case "done":
 		return false, s.emit(runtimepkg.ProviderEvent{Type: protocol.EventUsageObserved, Billing: billing.Duration("stream", s.billingModel, "streaming", raw, 1, "duration_ms"), Data: marshalData(map[string]any{"duration_ms": message.DurationMS}), Extensions: extension(raw)})
 	case "error":
-		return false, providerMessageError(message.Error)
+		failure := providerMessageError(message.Error)
+		failure.Extensions = extension(raw)
+		return false, failure
 	default:
 		return true, s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"message": "ignored Modulate message type", "provider_type": message.Type}), Extensions: extension(raw)})
 	}
@@ -490,6 +492,12 @@ func providerMessageError(message string) *runtimepkg.ProviderError {
 func readError(err error) *runtimepkg.ProviderError {
 	status := int(websocket.CloseStatus(err))
 	result := &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Modulate streaming connection ended unexpectedly", ProviderStatus: status}
+	// The read error is not kept as Cause, so the close reason is carried
+	// here; SafeProviderCode keeps it only when it is a bare code.
+	var closeErr websocket.CloseError
+	if errors.As(err, &closeErr) {
+		result.ProviderCode = closeErr.Reason
+	}
 	switch status {
 	case 4001, 4003, 4004:
 		result.Code = "authentication_failed"
