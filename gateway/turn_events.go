@@ -248,8 +248,8 @@ var turnEventVocabulary = map[string]turnEventSchema{
 }
 
 // verifyLegAttachment enforces that leg identifiers match the leg's identity
-// namespace: STT/TTS legs are gateway sessions, hosted Router legs are relay
-// requests.
+// namespace: Gateway legs have a session/attempt pair, hosted Router legs have
+// a request ID. TTS can use either transport, with exactly one identity shape.
 // Mixing them would let one namespace masquerade as another in the assembler.
 func verifyLegAttachment(fields map[string]json.RawMessage) error {
 	var kind string
@@ -258,9 +258,13 @@ func verifyLegAttachment(fields map[string]json.RawMessage) error {
 	_, hasAttemptID := fields["attempt_id"]
 	_, hasRequestID := fields["request_id"]
 	switch kind {
-	case "stt", "tts":
+	case "stt":
 		if !hasSessionID || !hasAttemptID || hasRequestID {
-			return errors.New("stt and tts legs require session_id and attempt_id and no request_id")
+			return errors.New("stt legs require session_id and attempt_id and no request_id")
+		}
+	case "tts":
+		if !((hasSessionID && hasAttemptID && !hasRequestID) || (hasRequestID && !hasSessionID && !hasAttemptID)) {
+			return errors.New("tts legs require either session_id and attempt_id or request_id, without mixing")
 		}
 	case "llm", "evaluation":
 		if !hasRequestID || hasSessionID || hasAttemptID {
