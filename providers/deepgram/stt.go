@@ -130,8 +130,9 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		authorizationScheme = "Token"
 	}
 	headers.Set("Authorization", authorizationScheme+" "+credential.Value)
+	handshake := newSTTHandshakeObserver(configHTTPClient(a.httpClient))
 	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
-		HTTPClient: configHTTPClient(a.httpClient),
+		HTTPClient: handshake.client,
 		HTTPHeader: headers,
 	})
 	if err != nil {
@@ -139,13 +140,17 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		if response != nil {
 			status = response.StatusCode
 		}
-		return nil, &runtimepkg.ProviderError{
+		failure := &runtimepkg.ProviderError{
 			Code:           dialErrorCode(status),
 			Message:        "Deepgram streaming connection could not be established",
 			Retryable:      status == 0 || status == http.StatusTooManyRequests || status >= 500,
 			ProviderStatus: status,
 			Cause:          err,
 		}
+		if refusedAt, ok := handshake.capacityRefusedAt(response); ok {
+			return nil, &sttCapacityRefusal{failure: failure, refusedAt: refusedAt}
+		}
+		return nil, failure
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
