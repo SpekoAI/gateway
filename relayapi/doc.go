@@ -31,8 +31,9 @@
 //     output_tokens, so the splits always sum to the totals. Providers that
 //     report no split report all-uncached / all-visible.
 //
-//   - Idempotency-Key is required on every POST and on every WebSocket
-//     upgrade request. The content hash for single-part HTTP bodies covers
+//   - Idempotency-Key is required on every POST (except
+//     POST /v1/llm/admissions/release, which replays nothing) and on every
+//     WebSocket upgrade request. The content hash for single-part HTTP bodies covers
 //     the raw body bytes as sent; for multipart bodies it covers the decoded
 //     part payload bytes only — no part headers, no boundary bytes —
 //     concatenated in part order; for WebSocket sessions it covers the exact
