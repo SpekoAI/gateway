@@ -260,7 +260,8 @@ type STTSessionReady struct {
 	Route     Route        `json:"route"`
 	// CommitIDs is true when the server echoes each input.commit's commit_id
 	// on the transcript.final that answers it, so a client can choose
-	// correlated commits up front instead of guessing.
+	// correlated commits up front instead of guessing. False and absent both
+	// mean no echo.
 	CommitIDs bool `json:"commit_ids,omitempty"`
 }
 

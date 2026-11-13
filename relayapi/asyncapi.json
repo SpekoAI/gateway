@@ -1133,7 +1133,7 @@
           },
           "commit_ids": {
             "type": "boolean",
-            "description": "True when the server echoes each input.commit's commit_id on the transcript.final that answers it. A client that sees it can rely on commit_id correlation; absent means the server does not echo commit ids."
+            "description": "True when the server echoes each input.commit's commit_id on the transcript.final that answers it; only true lets a client rely on commit_id correlation. Absent or false means the server does not echo commit ids. The Router sends it only as true."
           }
         },
         "required": [

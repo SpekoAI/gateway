@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:8369ba1fab0a9c7836aae97b2719d77b560bea288cfac4b1b33f36b2bbadab2e
-# yaml-body: sha256:fcc416e21039efcf1c4e4406dbf2dffde88a5029e0d3ac358bc5e20d6b34611f
+# json-mirror: asyncapi.json sha256:0f9d5130ba66a01d1d7eff24c9351772c7dac2a0131ee9cbb43b75864cc61737
+# yaml-body: sha256:c0c168026bacd8132591b8634ee52d8f32e1cac7539e120fba92a3e8d07f8e4b
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -1164,9 +1164,9 @@ components:
           type: boolean
           description: >-
             True when the server echoes each input.commit's commit_id on the
-            transcript.final that answers it. A client that sees it can rely
-            on commit_id correlation; absent means the server does not echo
-            commit ids.
+            transcript.final that answers it; only true lets a client rely on
+            commit_id correlation. Absent or false means the server does not
+            echo commit ids. The Router sends it only as true.
       required:
         - type
         - request_id
