@@ -25,6 +25,10 @@
     "type": "input.commit"
   },
   {
+    "type": "input.commit",
+    "commit_id": "turn-7:a_b.c"
+  },
+  {
     "type": "session.close"
   },
   {
@@ -35,7 +39,8 @@
       "model": "nova-3",
       "region": "eu-west-1",
       "attempt_id": "att_1"
-    }
+    },
+    "commit_ids": true
   },
   {
     "type": "transcript.delta",
@@ -55,6 +60,11 @@
     ],
     "speaker": "A",
     "translation": "hola mundo"
+  },
+  {
+    "type": "transcript.final",
+    "text": "",
+    "commit_id": "turn-7:a_b.c"
   },
   {
     "type": "usage.updated",

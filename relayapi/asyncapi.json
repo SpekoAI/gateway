@@ -1078,13 +1078,20 @@
       },
       "STTInputCommit": {
         "type": "object",
-        "description": "Marks the end of the audio the client wants finalized.",
+        "description": "Marks the end of the audio the client wants finalized. Every input.commit is answered by exactly one transcript.final, in commit order; the answer may be empty when the provider had nothing left to finalize.",
         "properties": {
           "type": {
             "type": "string",
             "enum": [
               "input.commit"
             ]
+          },
+          "commit_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "description": "Optional id for this commit. The transcript.final that answers it carries the same commit_id, so a client can tell its answer from a final the provider sent on its own. 1 to 64 characters of ASCII letters, digits, and . _ : -; anything else is refused as an invalid request."
           }
         },
         "required": [
@@ -1123,6 +1130,10 @@
           },
           "route": {
             "$ref": "#/components/schemas/Route"
+          },
+          "commit_ids": {
+            "type": "boolean",
+            "description": "True when the server echoes each input.commit's commit_id on the transcript.final that answers it; only true lets a client rely on commit_id correlation. Absent or false means the server does not echo commit ids. The Router sends it only as true."
           }
         },
         "required": [
@@ -1182,6 +1193,13 @@
           "translation": {
             "type": "string",
             "description": "The finalized translation delivered with this span, present only on a session that asked for one; text stays the original words. The vendor translates after it transcribes, so the translation of a span's last words can arrive on the NEXT transcript.final, and a final may carry a translation with empty text. Concatenate finals in order rather than pairing them one to one."
+          },
+          "commit_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "description": "The commit_id of the input.commit this final answers, present only when that commit carried one. A final the provider sent with no commit pending carries none. When one provider final answers several pending commits, the older ones are answered first by empty finals carrying their own ids, and the provider's final carries the newest commit's id."
           }
         },
         "required": [
