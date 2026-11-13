@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:51b0e7820010ed7efc9c8ae174da7d833ecb6257f9ab5446c42fa33cd15a2f90
-# yaml-body: sha256:8b30bdf1b0b552069d3fcc8b1f3a4794f02f8bfd909a8ef2743e39e7e6b5aaad
+# json-mirror: asyncapi.json sha256:8369ba1fab0a9c7836aae97b2719d77b560bea288cfac4b1b33f36b2bbadab2e
+# yaml-body: sha256:fcc416e21039efcf1c4e4406dbf2dffde88a5029e0d3ac358bc5e20d6b34611f
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -1160,6 +1160,13 @@ components:
           type: string
         route:
           $ref: "#/components/schemas/Route"
+        commit_ids:
+          type: boolean
+          description: >-
+            True when the server echoes each input.commit's commit_id on the
+            transcript.final that answers it. A client that sees it can rely
+            on commit_id correlation; absent means the server does not echo
+            commit ids.
       required:
         - type
         - request_id

@@ -39,7 +39,8 @@
       "model": "nova-3",
       "region": "eu-west-1",
       "attempt_id": "att_1"
-    }
+    },
+    "commit_ids": true
   },
   {
     "type": "transcript.delta",

@@ -258,6 +258,10 @@ type STTSessionReady struct {
 	Type      STTEventType `json:"type"`
 	RequestID string       `json:"request_id"`
 	Route     Route        `json:"route"`
+	// CommitIDs is true when the server echoes each input.commit's commit_id
+	// on the transcript.final that answers it, so a client can choose
+	// correlated commits up front instead of guessing.
+	CommitIDs bool `json:"commit_ids,omitempty"`
 }
 
 // Validate checks the frame tag, request id, and route.
