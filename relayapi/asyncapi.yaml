@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:7abf36012d688709b237de6635025cfaaa509dc85ed637d6c778881c0ce81b62
-# yaml-body: sha256:e1b2fc908a1a17edd5b04f9cc2ae9b441a8ff9cfc84887bdd19810d153573e84
+# json-mirror: asyncapi.json sha256:51b0e7820010ed7efc9c8ae174da7d833ecb6257f9ab5446c42fa33cd15a2f90
+# yaml-body: sha256:8b30bdf1b0b552069d3fcc8b1f3a4794f02f8bfd909a8ef2743e39e7e6b5aaad
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -1109,12 +1109,27 @@ components:
       additionalProperties: false
     STTInputCommit:
       type: object
-      description: Marks the end of the audio the client wants finalized.
+      description: >-
+        Marks the end of the audio the client wants finalized. Every
+        input.commit is answered by exactly one transcript.final, in commit
+        order; the answer may be empty when the provider had nothing left to
+        finalize.
       properties:
         type:
           type: string
           enum:
             - input.commit
+        commit_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[A-Za-z0-9._:-]+$"
+          description: >-
+            Optional id for this commit. The transcript.final that answers it
+            carries the same commit_id, so a client can tell its answer from a
+            final the provider sent on its own. 1 to 64 characters of ASCII
+            letters, digits, and . _ : -; anything else is refused as an
+            invalid request.
       required:
         - type
       additionalProperties: false
@@ -1208,6 +1223,18 @@ components:
             a span's last words can arrive on the NEXT transcript.final, and a
             final may carry a translation with empty text. Concatenate finals
             in order rather than pairing them one to one.
+        commit_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[A-Za-z0-9._:-]+$"
+          description: >-
+            The commit_id of the input.commit this final answers, present only
+            when that commit carried one. A final the provider sent with no
+            commit pending carries none. When one provider final answers
+            several pending commits, the older ones are answered first by
+            empty finals carrying their own ids, and the provider's final
+            carries the newest commit's id.
       required:
         - type
         - text
