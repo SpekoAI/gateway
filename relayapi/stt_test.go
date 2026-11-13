@@ -190,3 +190,38 @@ func TestSTTCommitIDForm(t *testing.T) {
 		t.Fatalf("a commit without an id must stay valid: %v", err)
 	}
 }
+
+// On the wire, a commit_id that is sent must be well formed: an empty one is
+// refused rather than read as no id. Omitted and null both mean no id.
+func TestSTTInputCommitFrameCommitID(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		frame, wantID string
+		valid         bool
+	}{
+		{`{"type":"input.commit"}`, "", true},
+		{`{"type":"input.commit","commit_id":null}`, "", true},
+		{`{"type":"input.commit","commit_id":"turn-7"}`, "turn-7", true},
+		{`{"type":"input.commit","commit_id":""}`, "", false},
+		{`{"type":"input.commit","commit_id":"turn 7"}`, "turn 7", false},
+	} {
+		var commit relayapi.STTInputCommit
+		if err := json.Unmarshal([]byte(test.frame), &commit); err != nil {
+			t.Fatalf("%s: decode: %v", test.frame, err)
+		}
+		if commit.CommitID != test.wantID {
+			t.Errorf("%s: commit_id = %q, want %q", test.frame, commit.CommitID, test.wantID)
+		}
+		err := commit.Validate()
+		if test.valid && err != nil {
+			t.Errorf("%s: %v, want valid", test.frame, err)
+		}
+		if !test.valid && (err == nil || !strings.Contains(err.Error(), "commit_id")) {
+			t.Errorf("%s: Validate() = %v, want a commit_id error", test.frame, err)
+		}
+	}
+	var commit relayapi.STTInputCommit
+	if err := json.Unmarshal([]byte(`{"type":"input.commit","commit_id":7}`), &commit); err == nil {
+		t.Fatal("a numeric commit_id must not decode")
+	}
+}

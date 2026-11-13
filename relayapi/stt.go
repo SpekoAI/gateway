@@ -1,6 +1,7 @@
 package relayapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -183,6 +184,27 @@ type STTInputCommit struct {
 	// answers it carries the same id, so a client can tell its answer from
 	// a final the provider sent on its own. See ValidCommitID for the form.
 	CommitID string `json:"commit_id,omitempty"`
+	// commitIDSent records a commit_id member on the wire, so Validate can
+	// refuse "commit_id":"" instead of reading it as no id.
+	commitIDSent bool
+}
+
+// UnmarshalJSON notes whether the frame carried commit_id. A null
+// commit_id counts as absent, as a null member does everywhere in relayapi.
+func (c *STTInputCommit) UnmarshalJSON(data []byte) error {
+	type wire STTInputCommit
+	var decoded struct {
+		wire
+		CommitID *string `json:"commit_id"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = STTInputCommit(decoded.wire)
+	if decoded.CommitID != nil {
+		c.CommitID, c.commitIDSent = *decoded.CommitID, true
+	}
+	return nil
 }
 
 // Validate checks the frame tag and, when present, the commit id.
@@ -190,7 +212,7 @@ func (c STTInputCommit) Validate() error {
 	if c.Type != STTControlInputCommit {
 		return fmt.Errorf("type: got %q, want %q", c.Type, STTControlInputCommit)
 	}
-	if c.CommitID != "" && !ValidCommitID(c.CommitID) {
+	if (c.CommitID != "" || c.commitIDSent) && !ValidCommitID(c.CommitID) {
 		return fmt.Errorf("commit_id: want 1-64 characters of A-Z a-z 0-9 . _ : -")
 	}
 	return nil
