@@ -1,6 +1,7 @@
 package elevenlabs
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -683,5 +684,57 @@ func TestAdapterMapsUnsupportedLanguageToInvalidRequest(t *testing.T) {
 			!strings.Contains(providerErr.Message, "eleven_flash_v2_5") || !strings.Contains(providerErr.Message, `"sw"`) {
 			t.Fatalf("%s: error = %+v, want non-retryable invalid_request naming model and language", name, providerErr)
 		}
+	}
+}
+
+// eleven_multilingual_v2 sends one long generated chunk as a single audio
+// frame larger than 1 MiB (prod, 2026-11-13: "message too big: read limited at
+// 1048577 bytes"). The default limit must take such a frame.
+func TestAdapterReadsAudioFrameLargerThanOneMiB(t *testing.T) {
+	t.Parallel()
+	audio := bytes.Repeat([]byte{1, 2, 3, 4}, 3<<18) // 3 MiB of PCM, 4 MiB as base64
+	server := newMultiContextServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		appendMessage, err := readClientMessage(ctx, conn)
+		if err != nil {
+			t.Errorf("append: %v", err)
+			return
+		}
+		for range 2 { // flush, close context
+			if _, err := readClientMessage(ctx, conn); err != nil {
+				t.Errorf("read: %v", err)
+				return
+			}
+		}
+		if err := writeServerJSON(ctx, conn, map[string]any{
+			"contextId": appendMessage.ContextID,
+			"audio":     base64.StdEncoding.EncodeToString(audio),
+			"isFinal":   true,
+		}); err != nil {
+			t.Errorf("write: %v", err)
+		}
+		_, _ = readClientMessage(ctx, conn)
+	})
+	defer server.Close()
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), elevenLabsRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer stream.Close(context.Background())
+	if err := stream.AppendText(context.Background(), "Hello"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	events := collectEvents(t, stream.Events(), 3)
+	if got := strings.Join(eventTypes(events), ","); got != "audio.started,audio.frame,audio.done" {
+		t.Fatalf("events = %s", got)
+	}
+	if !bytes.Equal(events[1].Audio, audio) {
+		t.Fatalf("audio = %d bytes, want %d", len(events[1].Audio), len(audio))
 	}
 }

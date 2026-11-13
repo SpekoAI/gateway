@@ -26,6 +26,13 @@ const (
 	AdapterID       = "elevenlabs.tts.v1"
 	extensionID     = "elevenlabs.ai/v1"
 	officialAPIHost = "api.elevenlabs.io"
+	// defaultTTSMaxMessageBytes bounds one inbound TTS frame. ElevenLabs sends
+	// each generated chunk as one base64 audio frame, and
+	// eleven_multilingual_v2 makes long chunks: one PCM 44.1 kHz chunk of about
+	// 9 s already exceeds 1 MiB, and the websocket read limit then fails the
+	// request with "message too big". 16 MiB holds about 2 minutes of that
+	// audio in one frame.
+	defaultTTSMaxMessageBytes = 16 << 20
 )
 
 type Config struct {
@@ -53,7 +60,7 @@ func New(config Config) (*Adapter, error) {
 		config.EventBuffer = 32
 	}
 	if config.MaxMessageBytes == 0 {
-		config.MaxMessageBytes = 1 << 20
+		config.MaxMessageBytes = defaultTTSMaxMessageBytes
 	}
 	if config.EventBuffer < 1 || config.MaxMessageBytes < 1 {
 		return nil, errors.New("elevenlabs tts buffers must be positive")
