@@ -244,8 +244,11 @@ func (s *ttsStream) CommitText(ctx context.Context) error {
 }
 
 func (s *ttsStream) Cancel(ctx context.Context) error {
-	if !s.hasUtterance() {
+	if s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
+	}
+	if !s.hasUtterance() {
+		return nil
 	}
 	if s.protocolVersion == 2 {
 		// Flux TTS Early Access documents Speak, Flush, and Close. Interrupt is
