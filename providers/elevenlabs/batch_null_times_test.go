@@ -53,6 +53,11 @@ func TestBatchTranscribePlacesWordsScribeSentWithoutTimes(t *testing.T) {
 			words: `{"text":"One","type":"word","start":2.0,"end":2.2},{"text":"two","type":"word","start":null,"end":2.6},{"text":"three.","type":"word","start":2.7,"end":3.0}`,
 			want:  []runtimepkg.BatchSegment{{Text: "One two three.", StartMS: 2000, EndMS: 3000}},
 		},
+		{
+			name:  "trailing word with only an end keeps it",
+			words: `{"text":"Okay","type":"word","start":1.0,"end":1.2},{"text":"bye.","type":"word","end":1.6}`,
+			want:  []runtimepkg.BatchSegment{{Text: "Okay bye.", StartMS: 1000, EndMS: 1600}},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -86,8 +91,8 @@ func TestTimeScribeWordsPlacesEachUntimedWord(t *testing.T) {
 		want  []span
 	}{
 		{"all untimed", []scribeWord{{text: "a"}, {text: "b"}}, []span{{0, 0}, {0, 0}}},
-		{"start only", []scribeWord{{text: "a", start: at(1)}, {text: "b", start: at(2), end: at(2.5)}}, []span{{2000, 2000}, {2000, 2500}}},
-		{"end only, trailing", []scribeWord{{text: "a", start: at(1), end: at(1.4)}, {text: "b", end: at(2)}}, []span{{1000, 1400}, {1400, 1400}}},
+		{"start only keeps its start", []scribeWord{{text: "a", start: at(1)}, {text: "b", start: at(5), end: at(5.5)}}, []span{{1000, 1000}, {5000, 5500}}},
+		{"end only keeps its end", []scribeWord{{text: "a", start: at(1), end: at(1.4)}, {text: "b", end: at(2)}}, []span{{1000, 1400}, {2000, 2000}}},
 		{"end before start", []scribeWord{{text: "a", start: at(2), end: at(1)}}, []span{{2000, 2000}}},
 		{"consecutive untimed lead in", []scribeWord{{text: "a"}, {text: "b"}, {text: "c", start: at(3), end: at(3.2)}}, []span{{3000, 3000}, {3000, 3000}, {3000, 3200}}},
 		{"same speaker after a gap", []scribeWord{{text: "a", start: at(1), end: at(1.2)}, {text: "b"}, {text: "c", start: at(5), end: at(5.2)}}, []span{{1000, 1200}, {5000, 5000}, {5000, 5200}}},
@@ -148,7 +153,14 @@ func TestTimeScribeWordsKeepsTimeOrder(t *testing.T) {
 			if random.IntN(2) == 0 {
 				clock += 0.1 + random.Float64()*3
 				start, end := clock, clock+0.2
-				words[i].start, words[i].end = &start, &end
+				switch random.IntN(4) {
+				case 0:
+					words[i].start = &start
+				case 1:
+					words[i].end = &end
+				default:
+					words[i].start, words[i].end = &start, &end
+				}
 				clock = end
 			}
 		}

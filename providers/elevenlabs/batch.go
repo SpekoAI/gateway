@@ -215,8 +215,8 @@ type scribeWord struct {
 	start, end    *float64
 }
 
-// timeScribeWords places words Scribe sent without a start or end between
-// the timed words around them, keeping the transcript in time order. In each
+// timeScribeWords places words Scribe sent with neither a start nor an end
+// between the timed words around them, keeping the transcript in time order. In each
 // run of untimed words, the leading ones spoken by the previous timed word's
 // speaker close that turn and sit at its end, when the next timed word is
 // someone else's; the rest lead into the next timed word and sit at its
@@ -229,9 +229,18 @@ func timeScribeWords(words []scribeWord) []batchhttp.Word {
 	timed := make([]bool, len(words))
 	for i, word := range words {
 		out[i] = batchhttp.Word{Text: word.text, Speaker: word.speaker}
-		if word.start != nil && word.end != nil {
-			out[i].StartMS = batchhttp.SecondsToMS(*word.start)
-			out[i].EndMS = max(batchhttp.SecondsToMS(*word.end), out[i].StartMS)
+		start, end := word.start, word.end
+		// A word with one bound sits at that instant: the time Scribe did
+		// send stays in the transcript.
+		if start == nil {
+			start = end
+		}
+		if end == nil {
+			end = start
+		}
+		if start != nil {
+			out[i].StartMS = batchhttp.SecondsToMS(*start)
+			out[i].EndMS = max(batchhttp.SecondsToMS(*end), out[i].StartMS)
 			timed[i] = true
 		}
 	}
