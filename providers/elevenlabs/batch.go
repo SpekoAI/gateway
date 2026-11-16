@@ -150,28 +150,28 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		TranscriptionID   string  `json:"transcription_id"`
 		AudioDurationSecs float64 `json:"audio_duration_secs"`
 		Words             []struct {
-			Text      string  `json:"text"`
-			Type      string  `json:"type"`
-			Start     float64 `json:"start"`
-			End       float64 `json:"end"`
-			SpeakerID string  `json:"speaker_id"`
+			Text      string   `json:"text"`
+			Type      string   `json:"type"`
+			Start     *float64 `json:"start"`
+			End       *float64 `json:"end"`
+			SpeakerID string   `json:"speaker_id"`
 		} `json:"words"`
 	}
 	if err := batchhttp.DecodeJSON(response.Body, &payload); err != nil {
 		return nil, err
 	}
-	words := make([]batchhttp.Word, 0, len(payload.Words))
+	words := make([]scribeWord, 0, len(payload.Words))
 	for _, word := range payload.Words {
 		// Scribe interleaves `spacing` and `audio_event` entries with words;
 		// only words carry transcript text.
 		if word.Type != "" && word.Type != "word" {
 			continue
 		}
-		words = append(words, batchhttp.Word{Text: word.Text, StartMS: batchhttp.SecondsToMS(word.Start), EndMS: batchhttp.SecondsToMS(word.End), Speaker: word.SpeakerID})
+		words = append(words, scribeWord{text: word.Text, start: word.Start, end: word.End, speaker: word.SpeakerID})
 	}
 	result := &runtimepkg.BatchTranscription{
 		Text:              strings.TrimSpace(payload.Text),
-		Segments:          batchhttp.GroupWords(words, 0),
+		Segments:          batchhttp.GroupWords(timeScribeWords(words), 0),
 		Language:          payload.LanguageCode,
 		DurationMS:        batchhttp.SecondsToMS(payload.AudioDurationSecs),
 		ProviderRequestID: payload.TranscriptionID,
@@ -206,6 +206,64 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	observation.ProviderRequestID = result.ProviderRequestID
 	result.Billing = billing.Report(observation)
 	return result, nil
+}
+
+// scribeWord is one Scribe word as the API sent it. Scribe documents start
+// and end as nullable.
+type scribeWord struct {
+	text, speaker string
+	start, end    *float64
+}
+
+// timeScribeWords places words Scribe sent without a start or end between
+// the timed words around them, keeping the transcript in time order. In each
+// run of untimed words, the leading ones spoken by the previous timed word's
+// speaker close that turn and sit at its end, when the next timed word is
+// someone else's; the rest lead into the next timed word and sit at its
+// start. With no timed word after the run, all of it sits at the last one's
+// end. Read as zero, such a word would open a segment at 0 ms or split a
+// turn on a gap that is not in the audio. Its text stays in the transcript
+// either way.
+func timeScribeWords(words []scribeWord) []batchhttp.Word {
+	out := make([]batchhttp.Word, len(words))
+	timed := make([]bool, len(words))
+	for i, word := range words {
+		out[i] = batchhttp.Word{Text: word.text, Speaker: word.speaker}
+		if word.start != nil && word.end != nil {
+			out[i].StartMS = batchhttp.SecondsToMS(*word.start)
+			out[i].EndMS = max(batchhttp.SecondsToMS(*word.end), out[i].StartMS)
+			timed[i] = true
+		}
+	}
+	for i := 0; i < len(out); {
+		if timed[i] {
+			i++
+			continue
+		}
+		end := i
+		for end < len(out) && !timed[end] {
+			end++
+		}
+		previous, next := i-1, end
+		hasPrevious, hasNext := previous >= 0, next < len(out)
+		// Words before split close the previous turn; the rest lead into the next.
+		split := i
+		if hasPrevious && (!hasNext || out[previous].Speaker != out[next].Speaker) {
+			for split < end && (!hasNext || out[split].Speaker == out[previous].Speaker) {
+				split++
+			}
+		}
+		for k := i; k < end; k++ {
+			switch {
+			case k < split:
+				out[k].StartMS, out[k].EndMS = out[previous].EndMS, out[previous].EndMS
+			case hasNext:
+				out[k].StartMS, out[k].EndMS = out[next].StartMS, out[next].StartMS
+			}
+		}
+		i = end
+	}
+	return out
 }
 
 // wavPCMBytes returns the size of a WAV container's data chunk, walking the
