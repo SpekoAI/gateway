@@ -215,8 +215,10 @@ type scribeWord struct {
 	start, end    *float64
 }
 
-// timeScribeWords places words Scribe sent with neither a start nor an end
-// between the timed words around them, keeping the transcript in time order. In each
+// timeScribeWords fills in the times Scribe left out of words, keeping the
+// transcript in time order. A word with one bound keeps it and reaches its
+// neighbour for the other. Words with neither sit between the timed words
+// around them. In each
 // run of untimed words, the leading ones spoken by the previous timed word's
 // speaker close that turn and sit at its end, when the next timed word is
 // someone else's; the rest lead into the next timed word and sit at its
@@ -227,21 +229,42 @@ type scribeWord struct {
 func timeScribeWords(words []scribeWord) []batchhttp.Word {
 	out := make([]batchhttp.Word, len(words))
 	timed := make([]bool, len(words))
+	hasStart, hasEnd := make([]bool, len(words)), make([]bool, len(words))
 	for i, word := range words {
 		out[i] = batchhttp.Word{Text: word.text, Speaker: word.speaker}
-		start, end := word.start, word.end
-		// A word with one bound sits at that instant: the time Scribe did
-		// send stays in the transcript.
-		if start == nil {
-			start = end
+		if word.start != nil {
+			out[i].StartMS, hasStart[i] = batchhttp.SecondsToMS(*word.start), true
 		}
-		if end == nil {
-			end = start
+		if word.end != nil {
+			out[i].EndMS, hasEnd[i] = batchhttp.SecondsToMS(*word.end), true
 		}
-		if start != nil {
-			out[i].StartMS = batchhttp.SecondsToMS(*start)
-			out[i].EndMS = max(batchhttp.SecondsToMS(*end), out[i].StartMS)
-			timed[i] = true
+		timed[i] = hasStart[i] || hasEnd[i]
+	}
+	// A word with one bound keeps it and reaches the word before it (no start)
+	// or after it (no end), so it opens no gap Scribe did not report.
+	last, seen := int64(0), false
+	for i := range out {
+		if hasEnd[i] && !hasStart[i] {
+			out[i].StartMS = out[i].EndMS
+			if seen {
+				out[i].StartMS = min(last, out[i].EndMS)
+			}
+		}
+		if timed[i] {
+			last, seen = max(out[i].StartMS, out[i].EndMS), true
+		}
+	}
+	next, seen := int64(0), false
+	for i := len(out) - 1; i >= 0; i-- {
+		if hasStart[i] && !hasEnd[i] {
+			out[i].EndMS = out[i].StartMS
+			if seen {
+				out[i].EndMS = max(next, out[i].StartMS)
+			}
+		}
+		if timed[i] {
+			out[i].EndMS = max(out[i].EndMS, out[i].StartMS)
+			next, seen = out[i].StartMS, true
 		}
 	}
 	for i := 0; i < len(out); {

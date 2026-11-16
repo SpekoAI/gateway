@@ -54,9 +54,14 @@ func TestBatchTranscribePlacesWordsScribeSentWithoutTimes(t *testing.T) {
 			want:  []runtimepkg.BatchSegment{{Text: "One two three.", StartMS: 2000, EndMS: 3000}},
 		},
 		{
-			name:  "trailing word with only an end keeps it",
-			words: `{"text":"Okay","type":"word","start":1.0,"end":1.2},{"text":"bye.","type":"word","end":1.6}`,
-			want:  []runtimepkg.BatchSegment{{Text: "Okay bye.", StartMS: 1000, EndMS: 1600}},
+			name:  "trailing word with only an end keeps it, without a gap",
+			words: `{"text":"Okay","type":"word","start":1.0,"end":1.2},{"text":"goodbye.","type":"word","end":2.6}`,
+			want:  []runtimepkg.BatchSegment{{Text: "Okay goodbye.", StartMS: 1000, EndMS: 2600}},
+		},
+		{
+			name:  "leading word with only a start keeps it, without a gap",
+			words: `{"text":"Well","type":"word","start":2.0},{"text":"yes.","type":"word","start":5.0,"end":5.3}`,
+			want:  []runtimepkg.BatchSegment{{Text: "Well yes.", StartMS: 2000, EndMS: 5300}},
 		},
 	}
 	for _, tc := range cases {
@@ -91,8 +96,11 @@ func TestTimeScribeWordsPlacesEachUntimedWord(t *testing.T) {
 		want  []span
 	}{
 		{"all untimed", []scribeWord{{text: "a"}, {text: "b"}}, []span{{0, 0}, {0, 0}}},
-		{"start only keeps its start", []scribeWord{{text: "a", start: at(1)}, {text: "b", start: at(5), end: at(5.5)}}, []span{{1000, 1000}, {5000, 5500}}},
-		{"end only keeps its end", []scribeWord{{text: "a", start: at(1), end: at(1.4)}, {text: "b", end: at(2)}}, []span{{1000, 1400}, {2000, 2000}}},
+		{"start only reaches the next word", []scribeWord{{text: "a", start: at(1)}, {text: "b", start: at(5), end: at(5.5)}}, []span{{1000, 5000}, {5000, 5500}}},
+		{"end only reaches back to the previous word", []scribeWord{{text: "a", start: at(1), end: at(1.4)}, {text: "b", end: at(2)}}, []span{{1000, 1400}, {1400, 2000}}},
+		{"lone start only", []scribeWord{{text: "a", start: at(1)}}, []span{{1000, 1000}}},
+		{"lone end only", []scribeWord{{text: "a", end: at(2)}}, []span{{2000, 2000}}},
+		{"one-bound words side by side", []scribeWord{{text: "a", end: at(1)}, {text: "b", start: at(3)}, {text: "c", start: at(4), end: at(4.2)}}, []span{{1000, 1000}, {3000, 4000}, {4000, 4200}}},
 		{"end before start", []scribeWord{{text: "a", start: at(2), end: at(1)}}, []span{{2000, 2000}}},
 		{"consecutive untimed lead in", []scribeWord{{text: "a"}, {text: "b"}, {text: "c", start: at(3), end: at(3.2)}}, []span{{3000, 3000}, {3000, 3000}, {3000, 3200}}},
 		{"same speaker after a gap", []scribeWord{{text: "a", start: at(1), end: at(1.2)}, {text: "b"}, {text: "c", start: at(5), end: at(5.2)}}, []span{{1000, 1200}, {5000, 5000}, {5000, 5200}}},
@@ -165,6 +173,11 @@ func TestTimeScribeWordsKeepsTimeOrder(t *testing.T) {
 			}
 		}
 		placed := timeScribeWords(words)
+		for i, word := range placed {
+			if word.EndMS < word.StartMS {
+				t.Fatalf("word %d ends at %d before it starts at %d: %+v", i, word.EndMS, word.StartMS, placed)
+			}
+		}
 		for i := 1; i < len(placed); i++ {
 			if placed[i].StartMS < placed[i-1].StartMS {
 				t.Fatalf("word %d starts at %d before word %d at %d: %+v", i, placed[i].StartMS, i-1, placed[i-1].StartMS, placed)
