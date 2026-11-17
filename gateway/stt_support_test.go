@@ -212,9 +212,8 @@ func TestAssemblyAIVoiceFocusThresholdRequiresVoiceFocus(t *testing.T) {
 }
 
 // AssemblyAI answers an unknown mode with validation error 3006 after the
-// handshake. The gateway refuses it at create, and keeps manual to the one
-// model that has it.
-func TestAssemblyAIModeIsAKnownPresetForTheModel(t *testing.T) {
+// handshake. The gateway refuses it at create. manual is not offered.
+func TestAssemblyAIModeIsAKnownPreset(t *testing.T) {
 	t.Parallel()
 	mode := func(value any) *protocol.SttOptions {
 		return &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"assemblyai": {"mode": value}}}
@@ -225,24 +224,12 @@ func TestAssemblyAIModeIsAKnownPresetForTheModel(t *testing.T) {
 				t.Fatalf("%s must take mode=%s: %v", model, preset, err)
 			}
 		}
-	}
-	if err := validateSttRouteSupport("assemblyai", assemblyai.RealtimeAgent37Model, mode("manual")); err != nil {
-		t.Fatalf("the 3.7 agent model must take mode=manual: %v", err)
-	}
-	refused := []struct {
-		model string
-		value any
-	}{
-		{"universal-3-6-pro", "manual"},
-		{assemblyai.RealtimeAgent37Model, "fastest"},
-		{assemblyai.RealtimeAgent37Model, "MIN_LATENCY"},
-		{assemblyai.RealtimeAgent37Model, 1},
-	}
-	for _, c := range refused {
-		err := validateSttRouteSupport("assemblyai", c.model, mode(c.value))
-		var supportError *SttSupportError
-		if !errors.As(err, &supportError) || supportError.Option != "provider_options.assemblyai.mode" {
-			t.Fatalf("%s mode=%v must be refused by name, got %v", c.model, c.value, err)
+		for _, value := range []any{"manual", "fastest", "MIN_LATENCY", 1} {
+			err := validateSttRouteSupport("assemblyai", model, mode(value))
+			var supportError *SttSupportError
+			if !errors.As(err, &supportError) || supportError.Option != "provider_options.assemblyai.mode" {
+				t.Fatalf("%s mode=%v must be refused by name, got %v", model, value, err)
+			}
 		}
 	}
 }

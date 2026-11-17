@@ -139,7 +139,7 @@ func TestStreamEndpointCarriesRealtimeAgentModelAndMode(t *testing.T) {
 	}
 	// The adapter holds the same rule as the gateway server, so an in-process
 	// caller (the relay) cannot dial a preset the model refuses mid-call.
-	for model, value := range map[string]any{"universal-3-6-pro": "manual", RealtimeAgent37Model: "fastest"} {
+	for model, value := range map[string]any{RealtimeAgent37Model: "manual", "universal-3-6-pro": "fastest"} {
 		bad := protocol.RequestOptions{STT: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"assemblyai": {"mode": value}}}}
 		if _, err := streamEndpoint(policy, "wss://streaming.assemblyai.com/v3/ws", model, bad, media); err == nil {
 			t.Fatalf("%s mode=%v must be refused before the dial", model, value)
