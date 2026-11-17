@@ -215,11 +215,14 @@ async def test_gemini_tools_refuse_before_socket_and_cannot_start_side_effects(
             await client.aclose()
 
 
+@pytest.mark.parametrize("stop", ["abort", "close"])
 async def test_native_socket_abort_closes_paused_reader_and_prevents_redial(
     native_binary,
+    stop,
 ):
     closed = asyncio.Event()
     opened = []
+    close_codes = []
 
     async def peer(request):
         opened.append(request.path)
@@ -228,6 +231,7 @@ async def test_native_socket_abort_closes_paused_reader_and_prevents_redial(
         await ws.send_json({"setupComplete": {}})
         async for _ in ws:
             pass
+        close_codes.append(ws.close_code)
         closed.set()
         return ws
 
@@ -239,9 +243,12 @@ async def test_native_socket_abort_closes_paused_reader_and_prevents_redial(
             await anext(events)
             # Leave the async generator paused at its yield. Physical close is
             # independent of both that consumer and any SDK output playback.
-            session.abort()
-            await asyncio.wait_for(session.aclose(), 1)
+            if stop == "abort":
+                session.abort()
+            await asyncio.wait_for(session.aclose(), 2)
             await asyncio.wait_for(closed.wait(), 5)
+            if stop == "close":
+                assert close_codes == [1000]
             with pytest.raises(GatewayError, match="exhausted"):
                 await client.open(protocol="google.live.v1", model="gemini-3.8-live")
             with pytest.raises(GatewayError, match="closed"):

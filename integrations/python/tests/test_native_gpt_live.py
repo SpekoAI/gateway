@@ -352,7 +352,10 @@ async def test_gpt_live_refuses_protocol_and_backend_failures_without_paid_repla
 
     async with native_stack(native_binary, handle) as (socket, _):
         voice, backend_client, backend, model = models(socket)
-        voice._setup_timeout = 0.05
+        # Exercise the requested protocol/backend fault after a real handshake.
+        # A 50ms dial budget can fail before the peer on a loaded CI host and
+        # never reaches the ready/error cancellation race this test covers.
+        voice._setup_timeout = 1 if failure == "missing-ready" else 5
         session = model.session()
         session.on("error", failures.put_nowait)
         try:

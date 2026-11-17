@@ -181,8 +181,15 @@ class RelayRealtimeSession:
             await self.aclose()
 
     async def aclose(self) -> None:
-        self.abort()
-        await self._websocket.close()
+        self._closed = True
+        # Preserve a normal close when the peer cooperates, with an independent
+        # physical bound even if its reader/handshake ignores cancellation.
+        deadline = asyncio.get_running_loop().call_later(1, self.abort)
+        try:
+            await self._websocket.close()
+        finally:
+            deadline.cancel()
+            self.abort()
 
     def abort(self) -> None:
         """Stop physical I/O even when a reader or close handshake is paused.
