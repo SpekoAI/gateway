@@ -458,12 +458,7 @@ func run() error {
 			if err != nil {
 				return err
 			}
-			verifier = runtimepkg.PlanVerifierFunc(func(ctx context.Context, plan protocol.SessionPlan) error {
-				if plan.Execution.CredentialSource == protocol.CredentialsBYOK {
-					return localPlanner.Verify(ctx, plan)
-				}
-				return hostedVerifier.Verify(ctx, plan)
-			})
+			verifier = gateway.CredentialSourceVerifier{BYOK: localPlanner, Managed: hostedVerifier}
 		}
 		log.Printf("routing=speko local_byok_providers=%d optional_telemetry=%t", len(localCredentials), !telemetryDisabled)
 	}

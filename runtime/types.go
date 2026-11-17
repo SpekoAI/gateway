@@ -270,6 +270,15 @@ type PlanVerifier interface {
 	Verify(context.Context, protocol.SessionPlan) error
 }
 
+// ClockedPlanVerifier authenticates the exact JWS, issuer and audience before
+// invoking clock and fences the nonce with monotonic retention. It then
+// validates all time bounds against SQL time. Renewable funded roots require
+// this capability.
+type ClockedPlanVerifier interface {
+	PlanVerifier
+	VerifyWithClock(context.Context, protocol.SessionPlan, func(context.Context) (time.Time, error)) error
+}
+
 // PlanVerifierFunc adapts a function into a PlanVerifier.
 type PlanVerifierFunc func(context.Context, protocol.SessionPlan) error
 

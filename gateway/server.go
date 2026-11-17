@@ -635,7 +635,7 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 	// exchange in reserve for when the pool cannot help.
 	// Funded roots require the platform's predecessor lifecycle; a different
 	// warm session cannot substitute for that authorization.
-	if s.warmPlans != nil && !strings.HasPrefix(plan.Telemetry.Token, "gwt1.") {
+	if s.warmPlans != nil && !plan.UsesFundedContinuation() {
 		if retryPlan, warm := s.warmPlans.Take(planRequestFor(body, s.runtime, s.workload)); warm {
 			retrySession, retryErr := s.openSession(ctx, body, retryPlan, inflight)
 			if retryErr == nil {
@@ -649,7 +649,7 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 	// The exchange needs its own idempotency key: the create key already
 	// identifies the plan-issuance request in a different ledger.
 	fallbackKey := idempotencyKey + ":fallback:" + plan.AttemptID
-	if strings.HasPrefix(plan.Telemetry.Token, "gwt1.") {
+	if plan.UsesFundedContinuation() {
 		fallbackKey = fmt.Sprintf("fallback:%x", sha256.Sum256([]byte(fallbackKey)))
 	}
 	fallbackPlan, fallbackRequestID, exchangeErr := s.plans.ExchangeFallbackPlan(ctx, plan, controlplane.FallbackRequest{

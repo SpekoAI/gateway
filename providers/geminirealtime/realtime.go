@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -90,7 +91,10 @@ func (a *Adapter) ID() string { return a.id }
 func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
 	stream, err := a.openSocket(ctx, request, "", nil)
 	if err != nil {
-		return nil, err
+		if stream == nil {
+			return nil, err
+		}
+		return stream, err
 	}
 	if request.Continuation {
 		return newResumableStream(a, request, stream), nil
@@ -139,7 +143,35 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 	query.Set("access_token", credential.Value)
 	endpoint.RawQuery = query.Encode()
 
-	conn, response, err := websocket.Dial(ctx, endpoint.String(), &websocket.DialOptions{HTTPClient: a.httpClient})
+	// Retain the upgraded transport's closer. CloseNow waits for an already
+	// running Close handshake, so the physical transport must remain directly
+	// abortable when the funded lease expires during a graceful close.
+	client := a.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	copyClient := *client
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	var physical io.Closer
+	var stopDialAbort func() bool
+	copyClient.Transport = socketTransport(func(r *http.Request) (*http.Response, error) {
+		response, err := transport.RoundTrip(r)
+		if err == nil && response.StatusCode == http.StatusSwitchingProtocols {
+			physical = response.Body
+			body := response.Body
+			// Dial may be reading an invalid upgrade response while reporting
+			// its handshake error. That diagnostic read has its own timeout.
+			stopDialAbort = context.AfterFunc(ctx, func() { _ = body.Close() })
+		}
+		return response, err
+	})
+	conn, response, err := websocket.Dial(ctx, endpoint.String(), &websocket.DialOptions{HTTPClient: &copyClient})
+	if stopDialAbort != nil {
+		stopDialAbort()
+	}
 	if err != nil {
 		return nil, dialError(response, err)
 	}
@@ -150,7 +182,8 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 	}
 	stream := &liveStream{
 		conn: conn, ctx: streamCtx, cancel: cancel,
-		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), setupDone: make(chan error, 1),
+		physical: physical,
+		events:   make(chan runtimepkg.ProviderEvent, a.eventBuffer), setupDone: make(chan error, 1),
 		inputMIME:  fmt.Sprintf("audio/pcm;rate=%d", request.Media.SampleRateHz),
 		responding: responding,
 	}
@@ -160,7 +193,8 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 	}
 	if err := stream.writeJSON(ctx, setup); err != nil {
 		_ = stream.abort()
-		return nil, err
+		close(stream.events) // The reader has not started; physical close completed.
+		return stream, err
 	}
 	go stream.readLoop()
 	setupCtx, cancelSetup := context.WithTimeout(ctx, a.setupTimeout)
@@ -169,14 +203,18 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 	case err := <-stream.setupDone:
 		if err != nil {
 			_ = stream.abort()
-			return nil, err
+			return stream, err
 		}
 	case <-setupCtx.Done():
 		_ = stream.abort()
-		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini Live did not acknowledge setup", Retryable: true, Cause: setupCtx.Err()}
+		return stream, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini Live did not acknowledge setup", Retryable: true, Cause: setupCtx.Err()}
 	}
 	return stream, nil
 }
+
+type socketTransport func(*http.Request) (*http.Response, error)
+
+func (t socketTransport) RoundTrip(r *http.Request) (*http.Response, error) { return t(r) }
 
 func validatePCM(direction string, media protocol.MediaFormat, sampleRate int) error {
 	if err := media.Validate(); err != nil {
@@ -272,6 +310,7 @@ func thinkingLevelFor(model string, requested string) string {
 
 type liveStream struct {
 	conn      *websocket.Conn
+	physical  io.Closer
 	ctx       context.Context
 	cancel    context.CancelFunc
 	events    chan runtimepkg.ProviderEvent
@@ -289,6 +328,7 @@ type liveStream struct {
 	terminalErr      error
 	resumptionMu     sync.Mutex
 	resumptionHandle string
+	closeMu          sync.Mutex
 }
 
 func (s *liveStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -326,21 +366,35 @@ func (s *liveStream) Close(context.Context) error {
 	s.gracefulOnce.Do(func() {
 		s.closed.Store(true)
 		s.writeMu.Lock()
-		s.closeErr = s.conn.Close(websocket.StatusNormalClosure, "")
+		err := s.conn.Close(websocket.StatusNormalClosure, "")
 		s.writeMu.Unlock()
+		s.rememberCloseError(err)
 		s.cancel()
 	})
-	return s.closeErr
+	return s.closeError()
 }
 func (s *liveStream) Abort(context.Context) error { return s.abort() }
 func (s *liveStream) abort() error {
 	s.abortOnce.Do(func() {
 		s.closed.Store(true)
 		s.cancel()
-		if err := s.conn.CloseNow(); err != nil && s.closeErr == nil {
-			s.closeErr = err
+		if s.physical != nil {
+			_ = s.physical.Close()
 		}
+		s.rememberCloseError(s.conn.CloseNow())
 	})
+	return s.closeError()
+}
+func (s *liveStream) rememberCloseError(err error) {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closeErr == nil {
+		s.closeErr = err
+	}
+}
+func (s *liveStream) closeError() error {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
 	return s.closeErr
 }
 func (s *liveStream) TerminalError() error {

@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SpekoAI/gateway/controlplane"
@@ -39,6 +40,9 @@ func (c *fundedClock) now() time.Time {
 func (c *fundedClock) timestamp() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.server.IsZero() {
+		return time.Time{}
+	}
 	return c.server.Add(max(time.Since(c.monotonic), 0))
 }
 
@@ -91,6 +95,7 @@ func renewableGoogle(plan protocol.SessionPlan) bool {
 }
 
 type continuation struct {
+	terminalLeaseExpired               atomic.Bool
 	ctx                                context.Context
 	cancel                             context.CancelFunc
 	session                            *Session
@@ -185,6 +190,9 @@ func (c *continuation) expire(expected time.Time) {
 	}
 	c.paused = true
 	recoverable := c.pending && c.stream.CanResume()
+	if !recoverable {
+		c.terminalLeaseExpired.Store(true)
+	}
 	c.stream.Detach()
 	c.notifyLocked()
 	c.mu.Unlock()

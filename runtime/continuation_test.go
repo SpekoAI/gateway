@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -25,25 +26,34 @@ import (
 const ownedGooglePath = "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained"
 
 type continuityPeer struct {
-	t                          *testing.T
-	server                     *httptest.Server
-	plan                       protocol.SessionPlan
-	mu                         sync.Mutex
-	calls, mints, sockets      int
-	key, body                  string
-	setups                     chan map[string]any
-	connected                  chan *websocket.Conn
-	closed                     chan string
-	inputs                     chan string
-	renewalStarted             chan struct{}
-	renewalRelease             chan struct{}
-	clockStarted               chan struct{}
-	clockRelease               chan struct{}
-	loseResponse, refuse       bool
-	setupRefusal, clockRefusal bool
-	clockCalls                 atomic.Int32
-	wallOffset                 atomic.Int64
-	telemetry                  collectingTelemetry
+	verifier                                      *runtimepkg.JWKSPlanVerifier
+	adapter                                       *geminirealtime.Adapter
+	private                                       ed25519.PrivateKey
+	envelope                                      protocol.SessionPlanEnvelope
+	t                                             *testing.T
+	server                                        *httptest.Server
+	plan                                          protocol.SessionPlan
+	mu                                            sync.Mutex
+	calls, mints, sockets                         int
+	key, body                                     string
+	setups                                        chan map[string]any
+	connected                                     chan *websocket.Conn
+	closed                                        chan string
+	closeStatuses                                 chan websocket.StatusCode
+	inputs                                        chan string
+	renewalStarted                                chan struct{}
+	renewalRelease                                chan struct{}
+	clockStarted                                  chan struct{}
+	clockRelease                                  chan struct{}
+	loseResponse, refuse                          bool
+	setupRefusal, clockRefusal                    bool
+	initialClockRefusal, holdSetup, holdHandshake bool
+	badHandshake                                  bool
+	holdClose                                     <-chan struct{}
+	handshakeStarted, handshakeClosed             chan struct{}
+	clockCalls                                    atomic.Int32
+	wallOffset                                    atomic.Int64
+	telemetry                                     collectingTelemetry
 }
 
 // ownedContinuationAdapter uses Google's actual socket parser with a
@@ -59,7 +69,7 @@ func (a ownedContinuationAdapter) Open(ctx context.Context, request runtimepkg.A
 
 func newContinuityPeer(t *testing.T, lease time.Duration, skew time.Duration, actual ...bool) (*continuityPeer, *runtimepkg.Engine, *controlplane.Client) {
 	t.Helper()
-	p := &continuityPeer{t: t, setups: make(chan map[string]any, 4), connected: make(chan *websocket.Conn, 4), closed: make(chan string, 4), inputs: make(chan string, 8), renewalStarted: make(chan struct{}, 4)}
+	p := &continuityPeer{t: t, setups: make(chan map[string]any, 4), connected: make(chan *websocket.Conn, 4), closed: make(chan string, 4), closeStatuses: make(chan websocket.StatusCode, 4), inputs: make(chan string, 8), renewalStarted: make(chan struct{}, 4), handshakeStarted: make(chan struct{}, 1), handshakeClosed: make(chan struct{}, 1)}
 	p.wallOffset.Store(int64(skew))
 	public, private, _ := ed25519.GenerateKey(rand.Reader)
 	jwks := newJWKSFixture(t, "continuity", public)
@@ -81,10 +91,12 @@ func newContinuityPeer(t *testing.T, lease time.Duration, skew time.Duration, ac
 	if err != nil {
 		t.Fatal(err)
 	}
+	p.verifier, p.private, p.envelope = verifier, private, envelope
 	adapter, err := geminirealtime.New(geminirealtime.Config{HTTPClient: p.server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
 	if err != nil {
 		t.Fatal(err)
 	}
+	p.adapter = adapter
 	var selected runtimepkg.Adapter = ownedContinuationAdapter{adapter}
 	if len(actual) > 0 && actual[0] {
 		selected = adapter
@@ -101,6 +113,14 @@ func newContinuityPeer(t *testing.T, lease time.Duration, skew time.Duration, ac
 }
 
 func (p *continuityPeer) handle(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/session-plans" {
+		if r.Header.Get("Authorization") != "Bearer sk_speko_setup-never-continuation" {
+			w.WriteHeader(401)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(p.plan)
+		return
+	}
 	if r.URL.Path == ownedGooglePath {
 		p.provider(w, r)
 		return
@@ -112,7 +132,7 @@ func (p *continuityPeer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(r.URL.Path, "/clock") {
 		calls := p.clockCalls.Add(1)
-		if calls > 1 && p.clockRefusal {
+		if p.initialClockRefusal || (calls > 1 && p.clockRefusal) {
 			w.WriteHeader(503)
 			return
 		}
@@ -176,6 +196,25 @@ func (p *continuityPeer) handle(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(reply)
 }
 func (p *continuityPeer) provider(w http.ResponseWriter, r *http.Request) {
+	if p.badHandshake {
+		conn, buffer, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = buffer.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: invalid\r\n\r\n")
+		_ = buffer.Flush()
+		p.handshakeStarted <- struct{}{}
+		_, _ = io.Copy(io.Discard, conn)
+		p.handshakeClosed <- struct{}{}
+		return
+	}
+	if p.holdHandshake {
+		p.handshakeStarted <- struct{}{}
+		<-r.Context().Done()
+		p.handshakeClosed <- struct{}{}
+		return
+	}
 	token := r.URL.Query().Get("access_token")
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
@@ -198,12 +237,19 @@ func (p *continuityPeer) provider(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Write(r.Context(), websocket.MessageText, []byte(`{"error":{"code":403}}`))
 		return
 	}
-	if err = conn.Write(r.Context(), websocket.MessageText, []byte(`{"setupComplete":{},"sessionResumptionUpdate":{"resumable":true,"newHandle":"owned-handle"}}`)); err != nil {
+	if !p.holdSetup {
+		err = conn.Write(r.Context(), websocket.MessageText, []byte(`{"setupComplete":{},"sessionResumptionUpdate":{"resumable":true,"newHandle":"owned-handle"}}`))
+	}
+	if err != nil {
 		return
+	}
+	if p.holdClose != nil {
+		<-p.holdClose
 	}
 	for {
 		_, payload, err = conn.Read(r.Context())
 		if err != nil {
+			p.closeStatuses <- websocket.CloseStatus(err)
 			p.closed <- token
 			return
 		}
@@ -212,7 +258,7 @@ func (p *continuityPeer) provider(w http.ResponseWriter, r *http.Request) {
 }
 func openContinuity(t *testing.T, p *continuityPeer, e *runtimepkg.Engine, c *controlplane.Client) *runtimepkg.Session {
 	t.Helper()
-	session, err := e.Open(context.Background(), runtimepkg.OpenRequest{Kind: protocol.SessionKindRealtime, Plan: p.plan, Media: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1}, Options: protocol.RequestOptions{S2S: &protocol.S2SOptions{OutputMedia: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24000, Channels: 1}}}, Entitlements: c})
+	session, err := e.Open(context.Background(), continuityRequest(p, c))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,6 +267,9 @@ func openContinuity(t *testing.T, p *continuityPeer, e *runtimepkg.Engine, c *co
 		t.Fatalf("first event %s", event.Type)
 	}
 	return session
+}
+func continuityRequest(p *continuityPeer, c *controlplane.Client) runtimepkg.OpenRequest {
+	return runtimepkg.OpenRequest{Kind: protocol.SessionKindRealtime, Plan: p.plan, Media: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1}, Options: protocol.RequestOptions{S2S: &protocol.S2SOptions{OutputMedia: &protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24000, Channels: 1}}}, Entitlements: c}
 }
 func awaitContinuity[T any](t *testing.T, ch <-chan T) T {
 	t.Helper()

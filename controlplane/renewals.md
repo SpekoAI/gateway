@@ -22,9 +22,29 @@ input and provider-event forwarding pause until it succeeds. Existing bounded
 queues retain events; overflow terminates explicitly. The last accepted lease
 has an independent hard timer throughout clock requests.
 
-`runtime.OpenRequest.Entitlements` wires this client into the Engine. The
-Gateway and mixed credential-source planner pass it through automatically for
-renewable Google roots. The Engine retains its original verified plan,
+`runtime.OpenRequest.Entitlements` is required for renewable funded Google
+roots, including embedded callers and custom planners. Missing authority fails
+before provider I/O. The Gateway and mixed credential-source planner pass the
+client through automatically. Such roots also require `ClockedPlanVerifier`:
+the stock verifier authenticates the exact JWS, issuer and audience and fences
+its nonce before sampling SQL time. Plan, credential and envelope time checks
+then use the same trusted sample, so a short three-second slice works at a
+constant host offset of plus or minus ten seconds. Invalid signatures and
+replays cannot cause clock requests. Custom replay stores must implement
+`ClockedReplayCache.TryUseFor` with atomic monotonic-TTL retention; the default
+memory cache provides it. Retaining the nonce for its full signed issuance
+lifetime cannot extend the lease or allow the original plan to be reopened.
+The mixed BYOK/managed CLI verifier preserves this capability.
+
+The accepted lease deadline bounds the provider's handshake and setup context,
+as well as the running session timer. Partial Google opens return their stream
+for teardown, and physical capacity remains held until abort/close returns and
+the event source ends. Every failure after the verified nonce fence records one
+`session.failed`, using trusted SQL-aligned timestamps when available, with no
+fabricated usage finality. Normal close uses the WebSocket close handshake and
+drains the provider event bridge; an independent lease expiration or explicit
+abort can still close the upgraded physical transport while that handshake is
+pending. The Engine retains its original verified plan,
 attempt, reservation, capacity attribution and receipt destination. Its
 continuation coordinator can adopt a slice only after a resumable stream has
 acknowledged the new setup. It enforces increasing sequence/expiry, the signed

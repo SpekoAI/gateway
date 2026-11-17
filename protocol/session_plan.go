@@ -425,6 +425,13 @@ type Fallback struct {
 	ExchangeURL string `json:"exchange_url"`
 }
 
+// UsesFundedContinuation selects the issued-plan family even when its token
+// is malformed. This classification is not authentication or execution authority.
+func (p SessionPlan) UsesFundedContinuation() bool {
+	return strings.HasPrefix(p.Telemetry.Token, "gwt1.") ||
+		(p.Reservation.Billing != nil && p.Reservation.Billing.Mode == "direct_entitlement")
+}
+
 // Requirements binds a plan to an exact implementation contract.
 type Requirements struct {
 	Protocol         string `json:"protocol"`

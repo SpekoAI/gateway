@@ -18,6 +18,7 @@ type resumableStream struct {
 	current, detached *liveStream
 	bridgeDone        chan struct{}
 	closed            bool
+	closing           bool
 	eventsMu          sync.Mutex
 	events            chan runtimepkg.ProviderEvent
 	eventsClosed      bool
@@ -96,7 +97,7 @@ func (s *resumableStream) CanResume() bool {
 	defer s.mu.Unlock()
 	// Google's current managed token pins sessionResumption to {}. Removing
 	// that mask permits resumptions outside uses:1, without an accepted bound.
-	return s.request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK && !s.closed && s.handle() != ""
+	return s.request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK && !s.closed && !s.closing && s.handle() != ""
 }
 func (s *resumableStream) Detach() {
 	s.mu.Lock()
@@ -114,7 +115,7 @@ func (s *resumableStream) Resume(ctx context.Context, credential protocol.Delega
 		return &runtimepkg.ProviderError{Code: "unsupported_operation", Message: "Managed Google resumption has no accepted provider-enforced bound"}
 	}
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.closing {
 		s.mu.Unlock()
 		return runtimepkg.ErrSessionClosed
 	}
@@ -138,12 +139,19 @@ func (s *resumableStream) Resume(ctx context.Context, credential protocol.Delega
 	request.Plan.Route.Credential = &credential
 	stream, err := s.adapter.openSocket(ctx, request, handle, previous.responding)
 	if err != nil {
+		if stream != nil {
+			_ = stream.abort()
+			for range stream.Events() {
+			}
+		}
 		return err
 	}
 	s.mu.Lock()
-	if s.closed || ctx.Err() != nil {
+	if s.closed || s.closing || ctx.Err() != nil {
 		s.mu.Unlock()
 		_ = stream.abort()
+		for range stream.Events() {
+		}
 		return runtimepkg.ErrSessionClosed
 	}
 	s.current, s.detached, s.bridgeDone = stream, nil, make(chan struct{})
@@ -154,7 +162,7 @@ func (s *resumableStream) Resume(ctx context.Context, credential protocol.Delega
 func (s *resumableStream) socket() (*liveStream, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.current == nil {
+	if s.closed || s.closing || s.current == nil {
 		return nil, runtimepkg.ErrSessionClosed
 	}
 	return s.current, nil
@@ -186,7 +194,25 @@ func (s *resumableStream) Cancel(ctx context.Context) error {
 	}
 	return stream.Cancel(ctx)
 }
-func (s *resumableStream) Close(ctx context.Context) error { return s.Abort(ctx) }
+func (s *resumableStream) Close(ctx context.Context) error {
+	s.mu.Lock()
+	s.closing = true
+	stream, done := s.current, s.bridgeDone
+	s.mu.Unlock()
+	var err error
+	if stream != nil {
+		err = stream.Close(ctx)
+	}
+	// The bridge forwards final output/usage through the normal close
+	// handshake. Only abort/lease detachment may force the socket closed.
+	<-done
+	s.mu.Lock()
+	s.closed = true
+	s.current = nil
+	s.mu.Unlock()
+	s.end(nil)
+	return err
+}
 func (s *resumableStream) Abort(context.Context) error {
 	s.mu.Lock()
 	s.closed = true

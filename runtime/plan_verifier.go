@@ -56,35 +56,67 @@ type ReplayCache interface {
 type MemoryReplayCache struct {
 	mu   sync.Mutex
 	now  func() time.Time
-	used map[string]time.Time
+	used map[string]replayUse
 }
+
+// ClockedReplayCache retains authenticated nonces for a monotonic TTL,
+// independently of host wall-clock changes. Shared caches must provide the
+// equivalent atomic SET-if-absent with TTL.
+type ClockedReplayCache interface {
+	ReplayCache
+	TryUseFor(context.Context, string, time.Duration) (bool, error)
+}
+
+type replayUse struct{ expiresAt, monotonicDeadline time.Time }
 
 // NewMemoryReplayCache constructs an in-memory replay cache.
 func NewMemoryReplayCache(now func() time.Time) *MemoryReplayCache {
 	if now == nil {
 		now = time.Now
 	}
-	return &MemoryReplayCache{now: now, used: make(map[string]time.Time)}
+	return &MemoryReplayCache{now: now, used: make(map[string]replayUse)}
 }
 
 // TryUse atomically consumes ID until its expiry. It returns false when the ID
 // was previously consumed and has not yet expired.
 func (c *MemoryReplayCache) TryUse(_ context.Context, id string, expiresAt time.Time) (bool, error) {
-	if strings.TrimSpace(id) == "" || expiresAt.IsZero() {
-		return false, errors.New("runtime: replay cache requires an id and expiry")
+	return c.tryUse(id, expiresAt, c.now(), false)
+}
+
+// TryUseFor retains a nonce for its full authenticated issuance lifetime.
+// Both legacy and clocked lookups respect the monotonic retention deadline.
+func (c *MemoryReplayCache) TryUseFor(_ context.Context, id string, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return false, errors.New("runtime: replay retention must be positive")
 	}
 	now := c.now()
+	return c.tryUse(id, now.Add(ttl), now, true)
+}
+
+func (c *MemoryReplayCache) tryUse(id string, expiresAt, now time.Time, clocked bool) (bool, error) {
+	if strings.TrimSpace(id) == "" || expiresAt.IsZero() || now.IsZero() {
+		return false, errors.New("runtime: replay cache requires an id and expiry")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for usedID, expiry := range c.used {
-		if !expiry.After(now) {
-			delete(c.used, usedID)
+	monotonic := time.Now()
+	for key, use := range c.used {
+		expired := !use.expiresAt.After(now)
+		if !use.monotonicDeadline.IsZero() {
+			expired = !use.monotonicDeadline.After(monotonic)
+		}
+		if expired {
+			delete(c.used, key)
 		}
 	}
-	if expiry, exists := c.used[id]; exists && expiry.After(now) {
+	if _, exists := c.used[id]; exists {
 		return false, nil
 	}
-	c.used[id] = expiresAt
+	use := replayUse{expiresAt: expiresAt}
+	if clocked {
+		use.monotonicDeadline = monotonic.Add(max(expiresAt.Sub(now), 0))
+	}
+	c.used[id] = use
 	return true, nil
 }
 
@@ -174,31 +206,50 @@ func (v *JWKSPlanVerifier) Verify(ctx context.Context, plan protocol.SessionPlan
 	if err := plan.Validate(now); err != nil {
 		return fmt.Errorf("%w: plan validation: %v", ErrPlanSignature, err)
 	}
-	header, payload, signingInput, err := parseCompactJWS(plan.Signature)
+	envelope, err := v.authenticate(ctx, plan)
 	if err != nil {
 		return err
-	}
-	key, err := v.keyFor(ctx, header.KeyID)
-	if err != nil {
-		return err
-	}
-	if key.Algorithm != "" && key.Algorithm != header.Algorithm {
-		return fmt.Errorf("%w: jwks key algorithm does not match jws header", ErrPlanSignature)
-	}
-	if err := verifyJWS(key.PublicKey, header.Algorithm, signingInput, header.Signature); err != nil {
-		return err
-	}
-	var envelope protocol.SessionPlanEnvelope
-	if err := json.Unmarshal(payload, &envelope); err != nil {
-		return fmt.Errorf("%w: envelope payload is not valid JSON", ErrPlanSignature)
 	}
 	if err := envelope.Validate(now, v.config.Issuer, v.config.Audience, v.config.ClockSkew); err != nil {
 		return fmt.Errorf("%w: envelope validation: %v", ErrPlanSignature, err)
 	}
-	if err := planMatchesEnvelope(plan, envelope.Plan, header.Type); err != nil {
+	accepted, err := v.config.ReplayCache.TryUse(ctx, envelope.ID, envelope.ExpiresAt.Add(v.config.ClockSkew))
+	return replayResult(accepted, err)
+}
+
+// VerifyWithClock never sends a plan token to a clock endpoint before its
+// signature, exact payload, issuer and audience have been authenticated.
+func (v *JWKSPlanVerifier) VerifyWithClock(ctx context.Context, plan protocol.SessionPlan, clock func(context.Context) (time.Time, error)) error {
+	envelope, err := v.authenticate(ctx, plan)
+	if err != nil {
 		return err
 	}
-	accepted, err := v.config.ReplayCache.TryUse(ctx, envelope.ID, envelope.ExpiresAt.Add(v.config.ClockSkew))
+
+	cache, ok := v.config.ReplayCache.(ClockedReplayCache)
+	if !ok {
+		return errors.New("runtime: funded plans require a monotonic replay cache")
+	}
+	// Fence the nonce before clock I/O. Retaining the full signed issuance
+	// lifetime can outlast redemption; it cannot extend execution authority.
+	accepted, err := cache.TryUseFor(ctx, envelope.ID, envelope.ExpiresAt.Add(v.config.ClockSkew).Sub(envelope.IssuedAt))
+	if err := replayResult(accepted, err); err != nil {
+		return err
+	}
+	now, err := clock(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := plan.Validate(now); err != nil {
+		return fmt.Errorf("%w: plan validation: %v", ErrPlanSignature, err)
+	}
+	if err := envelope.Validate(now, v.config.Issuer, v.config.Audience, v.config.ClockSkew); err != nil {
+		return fmt.Errorf("%w: envelope validation: %v", ErrPlanSignature, err)
+	}
+	return nil
+}
+
+func replayResult(accepted bool, err error) error {
 	if err != nil {
 		return fmt.Errorf("runtime: record session plan replay guard: %w", err)
 	}
@@ -206,6 +257,37 @@ func (v *JWKSPlanVerifier) Verify(ctx context.Context, plan protocol.SessionPlan
 		return ErrPlanReplay
 	}
 	return nil
+}
+
+func (v *JWKSPlanVerifier) authenticate(ctx context.Context, plan protocol.SessionPlan) (protocol.SessionPlanEnvelope, error) {
+	var envelope protocol.SessionPlanEnvelope
+	header, payload, signingInput, err := parseCompactJWS(plan.Signature)
+	if err != nil {
+		return envelope, err
+	}
+	key, err := v.keyFor(ctx, header.KeyID)
+	if err != nil {
+		return envelope, err
+	}
+	if key.Algorithm != "" && key.Algorithm != header.Algorithm {
+		return envelope, fmt.Errorf("%w: jwks key algorithm does not match jws header", ErrPlanSignature)
+	}
+	if err := verifyJWS(key.PublicKey, header.Algorithm, signingInput, header.Signature); err != nil {
+		return envelope, err
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return envelope, fmt.Errorf("%w: envelope payload is not valid JSON", ErrPlanSignature)
+	}
+	// IssuedAt is authenticated, not a host wall-clock substitute. This first
+	// check establishes the identity/shape and time ordering before clock I/O;
+	// admission below repeats all temporal checks against the trusted sample.
+	if err := envelope.Validate(envelope.IssuedAt, v.config.Issuer, v.config.Audience, v.config.ClockSkew); err != nil {
+		return envelope, fmt.Errorf("%w: envelope validation: %v", ErrPlanSignature, err)
+	}
+	if err := planMatchesEnvelope(plan, envelope.Plan, header.Type); err != nil {
+		return envelope, err
+	}
+	return envelope, nil
 }
 
 type compactJWSHeader struct {

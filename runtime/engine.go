@@ -52,17 +52,18 @@ type planUse struct{ expiresAt time.Time }
 // An Engine still admits only one successful stream for each issued attempt.
 // A failed open with no stream can retry; an acquired stream remains spent even
 // if its setup fails. This is local lifecycle tracking, not provider authority.
-func (e *Engine) claimPlanUse(plan protocol.SessionPlan) (func(bool), error) {
+func (e *Engine) claimPlanUse(plan protocol.SessionPlan, current func() time.Time) (func(bool), error) {
 	e.planUsesMu.Lock()
 	defer e.planUsesMu.Unlock()
-	now := e.now()
+	now := current()
 	// Verification may block or yield past expiry. Check again at the fence's
 	// admission point before removing old uses or acquiring a provider stream.
 	if err := plan.Validate(now); err != nil {
 		return nil, fmt.Errorf("invalid session plan after verification: %w", err)
 	}
+	retentionNow := time.Now()
 	for key, use := range e.planUses {
-		if !use.expiresAt.After(now) {
+		if !use.expiresAt.After(retentionNow) {
 			delete(e.planUses, key)
 		}
 	}
@@ -70,7 +71,7 @@ func (e *Engine) claimPlanUse(plan protocol.SessionPlan) (func(bool), error) {
 	if e.planUses[key] != nil {
 		return nil, ErrPlanReplay
 	}
-	use := &planUse{expiresAt: plan.ExpiresAt}
+	use := &planUse{expiresAt: retentionNow.Add(plan.ExpiresAt.Sub(now))}
 	e.planUses[key] = use
 	return func(spent bool) {
 		if spent {
@@ -138,33 +139,65 @@ func New(config Config) (*Engine, error) {
 
 // Open verifies a concrete session plan, opens its selected adapter, and emits
 // session.ready only after the upstream stream is ready to accept work.
-func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error) {
-	if err := validateOpenRequest(request, e.now()); err != nil {
-		return nil, err
+func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Session, err error) {
+	authenticated := false
+	var clock *fundedClock
+	current := e.now
+	defer func() {
+		if err != nil && authenticated && !errors.Is(err, ErrPlanReplay) {
+			at := e.now()
+			if clock != nil {
+				if trusted := clock.timestamp(); !trusted.IsZero() {
+					at = trusted
+				}
+			}
+			e.recordOpenFailure(request, err, at)
+		}
+	}()
+	if renewableGoogle(request.Plan) {
+		// The capability is required by the verified plan family, not selected by
+		// the caller's optional callback. No local-clock/uncapped fallback exists.
+		verifier, ok := e.verifier.(ClockedPlanVerifier)
+		if !ok {
+			return nil, errors.New("runtime: renewable funded plans require a SQL-clock verifier")
+		}
+		clock = &fundedClock{client: request.Entitlements, plan: request.Plan, wall: e.now}
+		err = verifier.VerifyWithClock(ctx, request.Plan, func(ctx context.Context) (time.Time, error) {
+			authenticated = true
+			if request.Entitlements == nil {
+				return time.Time{}, errors.New("runtime: renewable funded plans require SQL-clock authority")
+			}
+			if _, err := clock.synchronize(ctx); err != nil {
+				return time.Time{}, err
+			}
+			return clock.now(), nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("verify funded session plan: %w", err)
+		}
+		current = clock.timestamp
+	} else {
+		if err := validateOpenRequest(request, e.now()); err != nil {
+			return nil, err
+		}
+		if err := e.verifier.Verify(ctx, request.Plan); err != nil {
+			return nil, fmt.Errorf("verify session plan: %w", err)
+		}
+		authenticated = true
 	}
-	if err := e.verifier.Verify(ctx, request.Plan); err != nil {
-		return nil, fmt.Errorf("verify session plan: %w", err)
+	if err := validateOpenRequest(request, current()); err != nil {
+		return nil, err
 	}
 	adapter, ok := e.adapters[request.Plan.Route.Adapter]
 	if !ok {
 		return nil, fmt.Errorf("runtime adapter %q is not installed", request.Plan.Route.Adapter)
 	}
-	finishUse, err := e.claimPlanUse(request.Plan)
+	finishUse, err := e.claimPlanUse(request.Plan, current)
 	if err != nil {
 		return nil, err
 	}
 	spent := false
 	defer func() { finishUse(spent) }()
-	var clock *fundedClock
-	if request.Entitlements != nil && renewableGoogle(request.Plan) {
-		clock = &fundedClock{client: request.Entitlements, plan: request.Plan, wall: e.now}
-		if _, err := clock.synchronize(ctx); err != nil {
-			return nil, err
-		}
-		if !clock.now().Before(request.Plan.Reservation.LeaseExpiresAt) {
-			return nil, ErrSessionLeaseExpired
-		}
-	}
 
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	openStarted := e.now()
@@ -219,7 +252,24 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if request.OnVerifiedCapacity != nil {
 		request.OnVerifiedCapacity(capacity, request.Plan.Execution.CredentialSource)
 	}
-	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential, Continuation: clock != nil})
+	providerCtx := ctx
+	cancelOpen := func() {}
+	if clock != nil {
+		providerCtx, cancelOpen = context.WithTimeoutCause(ctx, request.Plan.Reservation.LeaseExpiresAt.Sub(clock.now()), ErrSessionLeaseExpired)
+	}
+	defer cancelOpen()
+	if providerCtx.Err() != nil {
+		cancel()
+		release()
+		return nil, context.Cause(providerCtx)
+	}
+	stream, err := adapter.Open(providerCtx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential, Continuation: clock != nil})
+	if errors.Is(context.Cause(providerCtx), ErrSessionLeaseExpired) {
+		err = ErrSessionLeaseExpired
+	}
+	if err == nil && clock != nil && !clock.now().Before(request.Plan.Reservation.LeaseExpiresAt) {
+		err = ErrSessionLeaseExpired
+	}
 	if err != nil {
 		cancel()
 		if stream == nil {
@@ -228,14 +278,12 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 			spent = true
 			go stopOpenedProvider(stream, release)
 		}
-		e.recordOpenFailure(request, err)
 		return nil, fmt.Errorf("open provider stream: %w", err)
 	}
 	openLatency := e.now().Sub(openStarted)
 	if stream == nil {
 		cancel()
 		release()
-		e.recordOpenFailure(request, errors.New("provider stream is required"))
 		return nil, errors.New("provider stream is required")
 	}
 	providerEvents := stream.Events()
@@ -243,12 +291,11 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 		spent = true
 		cancel()
 		go stopOpenedProvider(stream, release)
-		e.recordOpenFailure(request, errors.New("provider stream must expose an events channel"))
 		return nil, errors.New("provider stream must expose an events channel")
 	}
 
 	spent = true
-	session := &Session{
+	session = &Session{
 		kind:            request.Kind,
 		plan:            request.Plan,
 		stream:          stream,
@@ -269,10 +316,16 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	}
 	if clock != nil {
 		resumable, ok := stream.(ResumableProviderStream)
-		if !ok || !clock.now().Before(request.Plan.Reservation.LeaseExpiresAt) {
+		if !ok {
+			err = errors.New("runtime: funded stream cannot continue")
+		}
+		if !clock.now().Before(request.Plan.Reservation.LeaseExpiresAt) {
+			err = ErrSessionLeaseExpired
+		}
+		if err != nil {
 			cancel()
 			go stopOpenedProvider(stream, release)
-			return nil, errors.New("runtime: funded stream cannot continue")
+			return nil, err
 		}
 		session.now = clock.timestamp
 		continuationCtx, continuationCancel := context.WithCancel(sessionCtx)
@@ -787,6 +840,9 @@ func (s *Session) fail(err error) {
 	if err == nil {
 		return
 	}
+	if s.continuation != nil && s.continuation.terminalLeaseExpired.Load() {
+		err = ErrSessionLeaseExpired
+	}
 	s.finishOnce.Do(func() {
 		s.stopLeaseTimer()
 		s.errMu.Lock()
@@ -802,6 +858,9 @@ func (s *Session) fail(err error) {
 }
 
 func (s *Session) finish(err error) {
+	if err == nil && s.continuation != nil && s.continuation.terminalLeaseExpired.Load() {
+		err = ErrSessionLeaseExpired
+	}
 	if err != nil {
 		s.fail(err)
 		return
@@ -919,11 +978,11 @@ func (s *Session) recordUsageFinalized() {
 	})
 }
 
-func (e *Engine) recordOpenFailure(request OpenRequest, openErr error) {
+func (e *Engine) recordOpenFailure(request OpenRequest, openErr error, at time.Time) {
 	for _, event := range []TelemetryEvent{
 		{
 			Name: "session.failed", SessionID: request.Plan.SessionID, AttemptID: request.Plan.AttemptID,
-			At: e.now(), EventID: newTelemetryEventID(),
+			At: at, EventID: newTelemetryEventID(),
 			Destination: request.Plan.Telemetry, Data: telemetryErrorData(openErr),
 			Required: request.Plan.Execution.CredentialSource == protocol.CredentialsManaged,
 		},

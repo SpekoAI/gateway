@@ -210,7 +210,7 @@ func (c *Client) ExchangeFallbackPlan(ctx context.Context, current protocol.Sess
 }
 
 func (c *Client) continuationAuthority(plan protocol.SessionPlan) (string, bool, error) {
-	if strings.HasPrefix(plan.Telemetry.Token, "gwt1.") || (plan.Reservation.Billing != nil && plan.Reservation.Billing.Mode == "direct_entitlement") {
+	if plan.UsesFundedContinuation() {
 		if !gatewayPlanToken.MatchString(plan.Telemetry.Token) || plan.Signature == "" {
 			return "", true, errors.New("controlplane: invalid issued plan continuation token")
 		}
