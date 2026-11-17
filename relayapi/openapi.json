@@ -4,11 +4,11 @@
     "title": "Speko Router API",
     "version": "1.0.0",
     "description": "The Speko Router is streaming-first: live speech-to-text and text-to-speech sessions, and the three native speech-to-speech routes, all run over WebSocket and are specified in asyncapi.yaml, which this Router serves at /asyncapi.json. This document is the HTTP contract, the request/response surface beside those sockets: model discovery, batch speech transcription, one-shot speech synthesis, LLM responses over JSON or server-sent events, and Jev evaluations. The Go types in package relayapi are the source of truth for every shape in this document, and speccheck_test.go machine-checks the two against each other. The /v1 prefix is the stable major version: compatible fields and capabilities may be added, while breaking changes require a new major path. Before a v1 operation or field is retired, Speko documents a migration, sends the Deprecation header and a Link with rel=\"deprecation\", and provides at least 90 days of notice before the Sunset date. See the public versioning policy for the complete compatibility contract.",
-    "x-speko-versioning-policy": "https://speko.ai/developers/versioning"
+    "x-speko-versioning-policy": "https://speko.com/developers/versioning"
   },
   "externalDocs": {
     "description": "Router API lifecycle and deprecation policy",
-    "url": "https://speko.ai/developers/versioning"
+    "url": "https://speko.com/developers/versioning"
   },
   "servers": [
     {
