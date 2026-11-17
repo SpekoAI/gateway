@@ -95,10 +95,12 @@ var sttOptionSupport = map[string]sttSupport{
 	// is the second provider behind the canonical noise_reduction ask.
 	// min_turn_silence is the current parameter table's spelling;
 	// min_end_of_turn_silence_when_confident stays for callers holding the
-	// earlier documented name.
+	// earlier documented name. mode is the vendor's turn-detection preset
+	// (validateAssemblyAIMode holds its values); explicit silence settings
+	// still override the preset's defaults.
 	"assemblyai": {diarization: true, keywords: true, noiseReduction: true, providerKeys: []string{
 		"end_of_turn_confidence_threshold", "min_end_of_turn_silence_when_confident",
-		"min_turn_silence", "max_turn_silence",
+		"min_turn_silence", "max_turn_silence", "mode",
 		"max_speakers", "voice_focus", "voice_focus_threshold", "filter_profanity",
 	}},
 	// Scribe realtime takes repeated keyterms; vad_silence_threshold_secs is
@@ -262,6 +264,9 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 		if err := validateAssemblyAIVoiceFocus(options); err != nil {
 			return err
 		}
+		if err := validateAssemblyAIMode(model, options); err != nil {
+			return err
+		}
 	}
 	// Soniox answers an out-of-range endpoint knob with an error frame after
 	// the handshake, so the session would open and then die mid-call.
@@ -333,6 +338,43 @@ func validateAssemblyAIVoiceFocus(options *protocol.SttOptions) error {
 		}
 	}
 	return nil
+}
+
+// assemblyAIRealtimeAgentModel is the one model that takes mode=manual. It is
+// spelled here because this package imports no provider adapter; a test holds
+// it to assemblyai.RealtimeAgent37Model.
+const assemblyAIRealtimeAgentModel = "assemblyai-stt-3-7-realtime-agent"
+
+// validateAssemblyAIMode refuses a turn-detection preset the vendor does not
+// have. AssemblyAI answers an unknown mode with validation error 3006 after
+// the handshake, so the session would open and then die mid-call. The values
+// are the ones AssemblyAI documents (streaming "Optimizing Accuracy and
+// Latency", read 2026-11-17). manual hands every turn end to the caller's
+// ForceEndpoint and exists only on AssemblyAI-STT-3.7-Realtime-Agent.
+func validateAssemblyAIMode(model string, options *protocol.SttOptions) error {
+	raw, exists := options.Provider("assemblyai")["mode"]
+	if !exists {
+		return nil
+	}
+	text, _ := raw.(string)
+	switch text {
+	case "min_latency", "balanced", "max_accuracy":
+		return nil
+	case "manual":
+		if model == assemblyAIRealtimeAgentModel {
+			return nil
+		}
+		return &SttSupportError{
+			Provider: "assemblyai",
+			Option:   "provider_options.assemblyai.mode",
+			Detail:   "manual mode exists only on " + assemblyAIRealtimeAgentModel + "; pin it or pick min_latency, balanced or max_accuracy",
+		}
+	}
+	return &SttSupportError{
+		Provider: "assemblyai",
+		Option:   "provider_options.assemblyai.mode",
+		Detail:   "mode takes min_latency, balanced or max_accuracy (manual on " + assemblyAIRealtimeAgentModel + ")",
+	}
 }
 
 // numericOptionRange bounds one numeric provider setting; whole marks a

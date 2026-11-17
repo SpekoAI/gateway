@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/SpekoAI/gateway/protocol"
+	"github.com/SpekoAI/gateway/providers/assemblyai"
 	"github.com/SpekoAI/gateway/providers/elevenlabs"
 )
 
@@ -207,6 +208,45 @@ func TestAssemblyAIVoiceFocusThresholdRequiresVoiceFocus(t *testing.T) {
 	}}
 	if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", withProviderOption); err != nil {
 		t.Fatalf("an explicit voice_focus satisfies the dependency: %v", err)
+	}
+}
+
+// AssemblyAI answers an unknown mode with validation error 3006 after the
+// handshake. The gateway refuses it at create, and keeps manual to the one
+// model that has it.
+func TestAssemblyAIModeIsAKnownPresetForTheModel(t *testing.T) {
+	t.Parallel()
+	if assemblyAIRealtimeAgentModel != assemblyai.RealtimeAgent37Model {
+		t.Fatalf("gateway spells the 3.7 agent model %q, the adapter %q", assemblyAIRealtimeAgentModel, assemblyai.RealtimeAgent37Model)
+	}
+	mode := func(value any) *protocol.SttOptions {
+		return &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"assemblyai": {"mode": value}}}
+	}
+	for _, model := range []string{"universal-3-5-pro", "universal-3-6-pro", assemblyai.RealtimeAgent37Model} {
+		for _, preset := range []string{"min_latency", "balanced", "max_accuracy"} {
+			if err := validateSttRouteSupport("assemblyai", model, mode(preset)); err != nil {
+				t.Fatalf("%s must take mode=%s: %v", model, preset, err)
+			}
+		}
+	}
+	if err := validateSttRouteSupport("assemblyai", assemblyai.RealtimeAgent37Model, mode("manual")); err != nil {
+		t.Fatalf("the 3.7 agent model must take mode=manual: %v", err)
+	}
+	refused := []struct {
+		model string
+		value any
+	}{
+		{"universal-3-6-pro", "manual"},
+		{assemblyai.RealtimeAgent37Model, "fastest"},
+		{assemblyai.RealtimeAgent37Model, "MIN_LATENCY"},
+		{assemblyai.RealtimeAgent37Model, 1},
+	}
+	for _, c := range refused {
+		err := validateSttRouteSupport("assemblyai", c.model, mode(c.value))
+		var supportError *SttSupportError
+		if !errors.As(err, &supportError) || supportError.Option != "provider_options.assemblyai.mode" {
+			t.Fatalf("%s mode=%v must be refused by name, got %v", c.model, c.value, err)
+		}
 	}
 }
 

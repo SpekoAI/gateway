@@ -79,9 +79,10 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "elevenlabs", Kind: protocol.SessionKindTTS, Adapter: "elevenlabs.dialogue.v1", DefaultModel: "eleven_v4_turbo", Models: []string{"eleven_v4_turbo", "eleven_v4", "eleven_v3_conversational", "eleven_v3"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/text-to-dialogue/stream-input"},
 	{Provider: "cartesia", Kind: protocol.SessionKindSTT, Adapter: "cartesia.stt.v1", DefaultModel: "ink-2", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/stt/websocket"},
 	{Provider: "cartesia", Kind: protocol.SessionKindTTS, Adapter: "cartesia.tts.v1", DefaultModel: "sonic-3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket"},
-	// universal-3-6-pro (2026-09-29) shares the socket and parameters and is
-	// listed so discovery shows it; 3.5 Pro stays the default a bare pin gets.
-	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "universal-3-5-pro", Models: []string{"universal-3-5-pro", "universal-3-6-pro"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
+	// universal-3-6-pro (2026-09-29) and assemblyai-stt-3-7-realtime-agent
+	// (2026-11-17) share the socket and parameters and are listed so discovery
+	// shows them; 3.5 Pro stays the default a bare pin gets.
+	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "universal-3-5-pro", Models: []string{"universal-3-5-pro", "universal-3-6-pro", "assemblyai-stt-3-7-realtime-agent"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
 	// Modulate selects its two streaming transcription models by endpoint path,
 	// not a model query field. English Fast is the conversational default;
 	// multilingual remains explicitly selectable through the same adapter.

@@ -108,13 +108,20 @@ var streamingLanguages = map[string]struct{}{
 	"hi": {}, "vi": {}, "ar": {}, "he": {}, "ja": {}, "zh": {},
 }
 
-// universal36Model serves a wider vocabulary than every other model on this
-// socket, so its languages are keyed by model rather than folded into the
-// shared set. The vendor does not refuse a code the model cannot serve: on
-// 2026-09-30 universal-3-5-pro accepted language_codes=["ru"] and returned
-// Russian audio as mixed Cyrillic and Latin gibberish, while universal-3-6-pro
-// returned it exactly.
-const universal36Model = "universal-3-6-pro"
+// The Universal-3.6 Pro generation serves a wider vocabulary than every other
+// model on this socket, so its languages are keyed by model rather than folded
+// into the shared set. The vendor does not refuse a code the model cannot
+// serve: on 2026-09-30 universal-3-5-pro accepted language_codes=["ru"] and
+// returned Russian audio as mixed Cyrillic and Latin gibberish, while
+// universal-3-6-pro returned it exactly.
+const (
+	universal36Model = "universal-3-6-pro"
+	// RealtimeAgent37Model is AssemblyAI-STT-3.7-Realtime-Agent (2026-11-17).
+	// The vendor's model page lists the same 32 languages as Universal-3.6 Pro
+	// and the same parameters, and it is the only model that takes
+	// mode=manual.
+	RealtimeAgent37Model = "assemblyai-stt-3-7-realtime-agent"
+)
 
 // universal36Languages adds the fourteen codes the Universal-3.6 Pro launch
 // post names as new (af, ca, et, fa, gl, ko, mr, nn, ro, ru, ur, xh, yue, zu),
@@ -138,7 +145,7 @@ func withLanguages(base map[string]struct{}, extra ...string) map[string]struct{
 
 // languagesFor returns the language_codes vocabulary of one streaming model.
 func languagesFor(model string) map[string]struct{} {
-	if model == universal36Model {
+	if model == universal36Model || model == RealtimeAgent37Model {
 		return universal36Languages
 	}
 	return streamingLanguages
