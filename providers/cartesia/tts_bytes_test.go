@@ -174,6 +174,9 @@ func TestBytesTTSRejectsUnpinnedOrIncompatibleInputsBeforeIO(t *testing.T) {
 			r.Plan.Route.Credential.ExpiresAt = time.Now().Add(-time.Second)
 		},
 		"normalization": func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Model = "sonic-3.5" },
+		"speed": func(r *runtimepkg.AdapterRequest) {
+			r.Options.TTS = &protocol.TtsOptions{ProviderOptions: map[string]map[string]any{"cartesia": {"speed": 1.6}}}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			request := bytesRequest()
@@ -418,5 +421,54 @@ func TestBytesTTSGracefulCloseCannotHangOnAnAbandonedEventConsumer(t *testing.T)
 		if event.Type == protocol.EventAudioDone || event.Billing != nil && event.Billing.Complete {
 			t.Fatal("abandoned output became complete")
 		}
+	}
+}
+
+func TestBytesTTSSendsSpeedAsGenerationConfig(t *testing.T) {
+	t.Parallel()
+	bodies := make(chan map[string]any, 1)
+	request := bytesRequest()
+	request.Options.TTS = &protocol.TtsOptions{ProviderOptions: map[string]map[string]any{"cartesia": {"speed": 1.25}}}
+	stream := openBytes(t, func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if json.NewDecoder(r.Body).Decode(&body) != nil {
+			t.Error("invalid provider JSON")
+		}
+		bodies <- body
+		w.Header().Set("Content-Type", "audio/pcm")
+		_, _ = w.Write([]byte{1, 2})
+	}, BytesTTSConfig{}, request)
+	if err := stream.AppendText(context.Background(), "Hello."); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	body := <-bodies
+	config, ok := body["generation_config"].(map[string]any)
+	if !ok || len(config) != 1 || config["speed"] != 1.25 {
+		t.Fatalf("body = %v, want generation_config {speed: 1.25}", body)
+	}
+	if _, present := body["max_buffer_delay_ms"]; present {
+		t.Fatalf("body = %v, carries a WebSocket-only field", body)
+	}
+}
+
+// The bytes endpoint has no buffering field, so the setting is refused by
+// name rather than dropped.
+func TestBytesTTSRefusesMaxBufferDelay(t *testing.T) {
+	t.Parallel()
+	adapter, err := NewBytesTTS(BytesTTSConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := bytesRequest()
+	request.Options.TTS = &protocol.TtsOptions{ProviderOptions: map[string]map[string]any{"cartesia": {"max_buffer_delay_ms": 300.0}}}
+	var refusal *protocol.TtsOptionError
+	if _, err := adapter.Open(context.Background(), request); !errors.As(err, &refusal) || refusal.Key != "max_buffer_delay_ms" {
+		t.Fatalf("open = %v, want a max_buffer_delay_ms refusal", err)
+	}
+	if _, err := adapter.PrepareInput(request, "Hello."); !errors.As(err, &refusal) || refusal.Key != "max_buffer_delay_ms" {
+		t.Fatalf("prepare = %v, want a max_buffer_delay_ms refusal", err)
 	}
 }

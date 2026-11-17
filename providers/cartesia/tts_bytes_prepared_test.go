@@ -100,6 +100,9 @@ func TestPreparedBytesTTSRejectsChangedFundedSettingsBeforeIO(t *testing.T) {
 		"normalization": func(r *runtimepkg.AdapterRequest) {
 			r.Options.TTS = &protocol.TtsOptions{ProviderOptions: map[string]map[string]any{"cartesia": {"normalization": "auto"}}}
 		},
+		"speed": func(r *runtimepkg.AdapterRequest) {
+			r.Options.TTS = &protocol.TtsOptions{ProviderOptions: map[string]map[string]any{"cartesia": {"speed": 1.2}}}
+		},
 		"lower bound": func(r *runtimepkg.AdapterRequest) { r.Options.MaxInputCharacters = 2 },
 		"credential":  func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Credential = nil },
 		"endpoint":    func(r *runtimepkg.AdapterRequest) { r.Plan.Route.Endpoint = "https://untrusted.invalid/tts/bytes" },

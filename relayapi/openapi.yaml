@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:21ae052d559ca4358c0a3c5b92fdd654573cb17439b95dfd33bffe8262854204
-# yaml-body: sha256:4e899b8eabf5c0bc8bb6307cd831021116b55cf631ac08dfe8e3a3d9a08950d0
+# json-mirror: openapi.json sha256:6b71de3c4171924aa816f42003971dee0e49af89e0d54f07ed19adbe03cd14f5
+# yaml-body: sha256:b459bd115a0bf4b1776c3a805638e2cff3b7e726d28823128ff544cef9b1bf18
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -1307,7 +1307,13 @@ components:
             cartesia.normalization ("auto", "off", or a language or locale
             such as "en-IN", which reads numbers, dates and currency by that
             language's conventions while the speech stays in the session
-            language; sonic-3.6 only); elevenlabs.stability,
+            language; sonic-3.6 only); cartesia.max_buffer_delay_ms (an
+            integer from 0 to 5000, how long Cartesia buffers streamed text
+            before it starts speaking; 0 disables buffering; streaming routes
+            only, refused on whole-input synthesis); cartesia.speed (0.6 to
+            1.5, sent as generation_config.speed; instant voice clones honor
+            it, professional clones ignore it); both on sonic-3, sonic-3.5
+            and sonic-3.6; elevenlabs.stability,
             elevenlabs.similarity_boost and elevenlabs.style (0 to 1),
             elevenlabs.speed (0.7 to 1.2) and elevenlabs.use_speaker_boost
             (boolean). ElevenLabs v3 and v4 models stream on the
