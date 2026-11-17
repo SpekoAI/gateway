@@ -476,8 +476,9 @@ class _RealtimeSession(llm.RealtimeSession):
                 self._enqueue(
                     {"type": "response.cancel", "response_id": self._generation.id}
                 )
-        if self._google and self._manual_turns:
-            self.start_user_activity()
+        # Gemini manual activity starts only with actual input activity/audio.
+        # A framework interruption can be feedback from a provider interruption
+        # after activityEnd; playback cleanup must not open another user turn.
 
     def truncate(
         self,
@@ -1030,6 +1031,15 @@ class _RealtimeSession(llm.RealtimeSession):
                     )
         if content.get("turnComplete"):
             if self._input_item:
+                # The provider has already consumed this audio. LiveKit echoes
+                # the emitted item back in context updates; mark its exact ID
+                # before callbacks so it cannot be resent as new typed input.
+                self._known_items.add(self._input_item)
+                self._chat_ctx.items.append(
+                    llm.ChatMessage(
+                        id=self._input_item, role="user", content=[self._input_text]
+                    )
+                )
                 self.emit(
                     "input_audio_transcription_completed",
                     _transcription(

@@ -52,6 +52,148 @@ def models(socket):
     return voice, backend_client, backend, model
 
 
+@pytest.mark.parametrize("first_delegates", [True, False])
+async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
+    native_binary,
+    first_delegates,
+):
+    requests, opened, errors = [], [], []
+    finished = asyncio.Queue()
+    unrelated_done = asyncio.Event()
+    tasks = ["ONE_OFF_TASK_FIRST", "ONE_OFF_TASK_SECOND"]
+
+    def delegation(identity):
+        return {
+            "type": "session.delegation.created",
+            "offset_ms": 0,
+            "delegation": {"id": identity, "target": "client"},
+        }
+
+    async def peer(request):
+        if request.path == "/v1/llm/responses":
+            body = await request.json()
+            requests.append((body, request.headers.copy()))
+            index = len(requests) - 1
+            if index in ((0, 2) if first_delegates else (0,)):
+                return response(
+                    [
+                        (
+                            "response.item.completed",
+                            {
+                                "item": {
+                                    "type": "function_call",
+                                    "name": "owned_lookup",
+                                    "call_id": f"call_reply_{index}",
+                                    "arguments": '{"value":"one"}',
+                                }
+                            },
+                        ),
+                        ("response.completed", {}),
+                    ]
+                )
+            return response(
+                [
+                    ("response.text.delta", {"delta": f"answer-{index}"}),
+                    ("response.completed", {}),
+                ]
+            )
+        opened.append(request.path)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"type": "session.started"})
+        for index, task in enumerate(tasks):
+            ask = await ws.receive_json()
+            assert task in ask["content"] and ask["delegation_id"] is None
+            if index == 0 and not first_delegates:
+                await ws.send_json(
+                    {
+                        "type": "session.output_audio.delta",
+                        "delta": base64.b64encode(b"\x01\x10" * 2400).decode(),
+                    }
+                )
+                finished.put_nowait(index)
+                continue
+            if index and first_delegates:
+                # A redelivered old delegation cannot consume the new ask.
+                await ws.send_json(delegation("del_reply_0"))
+            identity = f"del_reply_{index}"
+            await ws.send_json(delegation(identity))
+            answer = await ws.receive_json()
+            assert answer["delegation_id"] == identity
+            finished.put_nowait(index)
+        await ws.send_json(delegation("del_unrelated"))
+        answer = await ws.receive_json()
+        assert answer["delegation_id"] == "del_unrelated"
+        unrelated_done.set()
+        async for message in ws:
+            command = json.loads(message.data)
+            if command["type"] == "session.close":
+                await ws.send_json({"type": "session.closed"})
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        voice, backend_client, backend, model = models(socket)
+        session = model.session()
+        session.on("error", errors.append)
+        try:
+            await session._update_session(
+                instructions="Permanent synthetic prompt", tools=[owned_lookup]
+            )
+            await session.start()
+            for index, task in enumerate(tasks):
+                reply = session.generate_reply(instructions=task)
+                rejected = session.generate_reply(
+                    instructions="REJECTED_OVERLAPPING_TASK"
+                )
+                with pytest.raises(llm.RealtimeError, match="already pending"):
+                    await rejected
+                generation = await asyncio.wait_for(reply, 5)
+                messages, calls = await asyncio.wait_for(
+                    collect_generation(generation), 5
+                )
+                if index == 0 and not first_delegates:
+                    assert len(messages) == 1 and calls == []
+                else:
+                    assert messages == [] and len(calls) == 1
+                    context = session.chat_ctx
+                    context.items.append(
+                        llm.FunctionCallOutput(
+                            call_id=calls[0].call_id,
+                            name=calls[0].name,
+                            output="owned-result",
+                            is_error=False,
+                        )
+                    )
+                    await session.update_chat_ctx(context)
+                assert await asyncio.wait_for(finished.get(), 5) == index
+            await asyncio.wait_for(unrelated_done.wait(), 5)
+            inputs = [json.dumps(body["input"]) for body, _ in requests]
+            count = 5 if first_delegates else 3
+            assert len(inputs) == count and len(opened) == 1 and errors == []
+            if first_delegates:
+                assert all(
+                    tasks[0] in value and tasks[1] not in value for value in inputs[:2]
+                )
+            else:
+                assert all(tasks[0] not in value for value in inputs)
+            assert all(
+                tasks[1] in value and tasks[0] not in value for value in inputs[-3:-1]
+            )
+            assert all(task not in inputs[-1] for task in tasks)
+            assert all("REJECTED_OVERLAPPING_TASK" not in value for value in inputs)
+            assert all("Permanent synthetic prompt" in value for value in inputs)
+            assert "owned-result" in inputs[-2]
+            assert all(body["max_output_tokens"] == 123 for body, _ in requests)
+            assert len({headers["Idempotency-Key"] for _, headers in requests}) == count
+        finally:
+            await session.aclose()
+            await model.aclose()
+            await backend.aclose()
+            await backend_client.aclose()
+            await voice.aclose()
+
+
 async def test_gpt_live_gates_audio_and_funds_client_backend_tools_without_native_turn_inference(
     native_binary,
 ):

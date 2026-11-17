@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import json
 
 import pytest
 from aiohttp import web
@@ -36,9 +37,72 @@ async def start_agent(session, tools=()):
         if "record" in inspect.signature(session.start).parameters
         else {}
     )
-    await session.start(
-        agent=Agent(instructions="Synthetic task", tools=list(tools)), **options
-    )
+    agent = Agent(instructions="Synthetic task", tools=list(tools))
+    await session.start(agent=agent, **options)
+    return agent
+
+
+async def test_gemini_spoken_context_update_does_not_resend_audio_as_typed_input(
+    native_binary,
+):
+    spoken, received_typed = asyncio.Event(), asyncio.Event()
+    received, errors = [], []
+    speech_text, typed_text = "Already consumed spoken input", "A genuine typed turn"
+
+    async def peer(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"setupComplete": {}})
+        await ws.send_json(
+            {"serverContent": {"inputTranscription": {"text": speech_text}}}
+        )
+        await ws.send_json({"serverContent": {"turnComplete": True}})
+        async for message in ws:
+            command = json.loads(message.data)
+            received.append(command)
+            if typed_text in str(command):
+                received_typed.set()
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        client, model = client_model(socket)
+        session = AgentSession(
+            llm=model, turn_detection="manual", vad=None, stt=None, tts=None
+        )
+        session.on("error", errors.append)
+        session.on(
+            "conversation_item_added",
+            lambda event: (
+                spoken.set()
+                if isinstance(event.item, llm.ChatMessage)
+                and event.item.role == "user"
+                and event.item.text_content == speech_text
+                else None
+            ),
+        )
+        try:
+            agent = await start_agent(session)
+            await asyncio.wait_for(spoken.wait(), 5)
+            await agent.update_chat_ctx(agent.chat_ctx)
+            await agent.update_chat_ctx(agent.chat_ctx)
+            context = agent.chat_ctx.copy()
+            context.add_message(role="user", content=typed_text)
+            await agent.update_chat_ctx(context)
+            await asyncio.wait_for(received_typed.wait(), 5)
+            assert received == [
+                {
+                    "clientContent": {
+                        "turns": [{"role": "user", "parts": [{"text": typed_text}]}],
+                        "turnComplete": False,
+                    }
+                }
+            ]
+            assert errors == []
+        finally:
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
 
 
 @pytest.mark.parametrize(
@@ -95,10 +159,20 @@ async def test_gemini_finishes_initial_history_before_live_audio(
             await client.aclose()
 
 
+@pytest.mark.parametrize("manual", [False, True])
 async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
     native_binary,
+    manual,
 ):
+    if (
+        manual
+        and "can_disable_turn_detection"
+        not in llm.RealtimeCapabilities.__dataclass_fields__
+    ):
+        pytest.skip("framework cannot negotiate manual realtime turns")
     audible, cleared, release = (asyncio.Event() for _ in range(3))
+    barrier_received, second_turn_received = asyncio.Event(), asyncio.Event()
+    before_barrier, second_turn = [], []
     captured, errors = [], []
 
     class Output(io.AudioOutput):
@@ -124,8 +198,19 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
     async def peer(request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        await ws.receive_json()
+        setup = await ws.receive_json()
+        assert (
+            setup["setup"]["realtimeInputConfig"]["automaticActivityDetection"][
+                "disabled"
+            ]
+            == manual
+        )
         await ws.send_json({"setupComplete": {}})
+        if manual:
+            assert (await ws.receive_json()) == {"realtimeInput": {"activityStart": {}}}
+        assert "audio" in (await ws.receive_json())["realtimeInput"]
+        if manual:
+            assert (await ws.receive_json()) == {"realtimeInput": {"activityEnd": {}}}
         await ws.receive_json()
         await ws.send_json(
             {
@@ -149,6 +234,20 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
         await audible.wait()
         # The native generation has already ended; playback still owns audio.
         await ws.send_json({"serverContent": {"interrupted": True}})
+        async for message in ws:
+            command = json.loads(message.data)
+            if "clientContent" in command:
+                barrier_received.set()
+                break
+            before_barrier.append(command)
+        async for message in ws:
+            command = json.loads(message.data)
+            second_turn.append(command)
+            if ("activityEnd" if manual else "audio") in command.get(
+                "realtimeInput", {}
+            ):
+                second_turn_received.set()
+                break
         async for _ in ws:
             pass
         return ws
@@ -156,17 +255,44 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
     async with native_stack(native_binary, peer) as (socket, _):
         client, model = client_model(socket)
         agent = AgentSession(
-            llm=model, turn_detection="manual", vad=None, stt=None, tts=None
+            llm=model,
+            turn_detection="manual" if manual else "realtime_llm",
+            vad=None,
+            stt=None,
+            tts=None,
         )
         agent.output.audio = Output()
         agent.on("error", errors.append)
         try:
-            await start_agent(agent)
+            current_agent = await start_agent(agent)
+            native = next(iter(model._sessions))
+            native.push_audio(rtc.AudioFrame(b"\x01\x10" * 480, 16000, 1, 480))
+            native.commit_audio()
             speech = agent.generate_reply(instructions="Speak the synthetic response")
             await asyncio.wait_for(audible.wait(), 5)
             await asyncio.wait_for(cleared.wait(), 5)
             assert captured and len(captured) < 100
             assert speech.interrupted
+            await agent.interrupt()
+            context = current_agent.chat_ctx.copy()
+            context.add_message(role="user", content="Typed synchronization barrier")
+            await current_agent.update_chat_ctx(context)
+            await asyncio.wait_for(barrier_received.wait(), 5)
+            native.push_audio(rtc.AudioFrame(b"\x02\x10" * 480, 16000, 1, 480))
+            native.commit_audio()
+            await asyncio.wait_for(second_turn_received.wait(), 5)
+            assert before_barrier == [], (
+                "playback interruption emitted a phantom activity"
+            )
+            if manual:
+                assert len(second_turn) == 3
+                assert second_turn[0] == {"realtimeInput": {"activityStart": {}}}
+                assert "audio" in second_turn[1]["realtimeInput"]
+                assert second_turn[2] == {"realtimeInput": {"activityEnd": {}}}
+            else:
+                assert (
+                    len(second_turn) == 1 and "audio" in second_turn[0]["realtimeInput"]
+                )
             assert errors == []
         finally:
             release.set()

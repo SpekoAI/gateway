@@ -10,10 +10,13 @@ Gemini function tools are refused before a provider socket is opened because the
 supported framework has no owned per-call cancellation interface. Unsolicited
 provider tool requests fail closed. History and typed text stay on the explicitly
 configured native transport; interruptions clear framework playback. GPT-Live
-explicit reply instructions are included in each delegated backend context and
-its subsequent tool rounds. No provider credential, endpoint, funding or receipt
-authority is added by these changes. Physical abort interrupts the owned socket
-without relying on consumer progress; an aborted connection says nothing about
+explicit reply instructions are scoped to the next new delegation and its backend
+tool rounds; unrelated later delegations do not inherit those one-off tasks.
+Gemini marks completed audio transcripts as already consumed, and playback
+interruption never opens a new manual input activity. No provider credential,
+endpoint, funding or receipt authority is added by these changes. Physical abort
+interrupts the owned socket without relying on consumer progress; an aborted
+connection says nothing about
 provider usage, durable finalization, NoIO or settlement.
 
 This document describes what Speko Gateway can access, where it sends data,

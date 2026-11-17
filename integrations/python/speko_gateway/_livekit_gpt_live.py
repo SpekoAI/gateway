@@ -171,6 +171,7 @@ class _GPTLiveSession(_Session):
         self._completed_results: dict[str, bytes] = {}
         self._fragments: list[dict[str, Any]] = []
         self._fragment_bytes = 0
+        self._pending_reply_instructions: str | None = None
         self._socket: RelayRealtimeSession | None = None
         self._resampler: rtc.AudioResampler | None = None
         self._input_format: tuple[int, int] | None = None
@@ -293,13 +294,16 @@ class _GPTLiveSession(_Session):
         self._update_options(tool_choice=tool_choice)
         if is_given(tools) and tools != self._tools.flatten():
             raise llm.RealtimeError("GPT-Live does not support per-response tools")
+        if self._pending_reply_instructions is not None:
+            raise llm.RealtimeError("GPT-Live reply is awaiting its delegation")
         ask = "Reply to the caller now. Do not wait for the caller to speak first. After that, pause and listen."
         if is_given(instructions):
             ask += "\n" + _text(instructions)
-        # The voice socket may delegate before any caller transcript exists.
-        # Keep the exact task in the corresponding paid backend context too.
-        self._remember([llm.ChatMessage(role="system", content=[_text(ask)])])
+        # The next new delegation captures this task in its own context. Its
+        # tool rounds share that snapshot; later delegations get no old ask.
+        ask = _text(ask)
         self._append("session.commentary.append", ask)
+        self._pending_reply_instructions = ask
 
     def _startup(self) -> dict[str, Any]:
         history = []
@@ -414,6 +418,11 @@ class _GPTLiveSession(_Session):
                 context.items.insert(
                     0, llm.ChatMessage(role="system", content=[self._instructions])
                 )
+            if self._pending_reply_instructions is not None:
+                context.add_message(
+                    role="system", content=self._pending_reply_instructions
+                )
+                self._pending_reply_instructions = None
             fragments = [f for f in self._fragments if f["end_ms"] <= offset]
             if fragments:
                 context.add_message(
@@ -649,12 +658,17 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
 
     def _generation(self, generation):
         if self._reply is not None and not self._reply.done():
+            # A voice-only reply also fulfils the request. If it never needed
+            # a backend delegation, its one-off task must not leak into one
+            # created later. Delegated tool rounds already own their snapshot.
+            self.duplex_session._pending_reply_instructions = None
             generation.user_initiated = True
             self._reply.set_result(generation)
             self._reply = None
         self.emit("generation_created", generation)
 
     def _fail_reply(self):
+        self.duplex_session._pending_reply_instructions = None
         if self._reply is not None and not self._reply.done():
             self._reply.set_exception(
                 llm.RealtimeError("GPT-Live ended before its reply")
@@ -668,8 +682,11 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
     def generate_reply(
         self, *, instructions=NOT_GIVEN, tool_choice=NOT_GIVEN, tools=NOT_GIVEN
     ):
-        self._fail_reply()
-        future = self._reply = asyncio.get_running_loop().create_future()
+        future = asyncio.get_running_loop().create_future()
+        if self._reply is not None and not self._reply.done():
+            future.set_exception(llm.RealtimeError("GPT-Live reply is already pending"))
+            return future
+        self._reply = future
         try:
             self.duplex_session._generate_reply(
                 instructions=instructions, tool_choice=tool_choice, tools=tools

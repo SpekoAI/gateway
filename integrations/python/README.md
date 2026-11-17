@@ -27,6 +27,9 @@ release with realtime `supports_say`; older releases can use `generate_reply`.
 Gemini completes initial history before queued audio and forwards typed user
 turns before generating replies. Provider interruptions clear framework playback,
 including audio already buffered after the native generation ended. Gemini
+marks audio transcripts as already consumed so no-op context updates cannot
+replay speech as typed input. Playback interruption does not create new manual
+input activity; real input starts the next activity boundary. Gemini
 function tools are refused before socket creation: supported framework versions
 execute the Agent's original tools and expose no per-call cancellation hook for
 `toolCallCancellation`. This also refuses extended-thinking tool sessions. Native
@@ -41,6 +44,9 @@ Responses backend. Each delegated backend request passes through the native
 Speko LLM transport, and function tools run through `AgentSession`. Repeated
 delegation IDs do not repeat paid backend work. Tool results remain available
 to later delegations; results that request no reply are sent as silent context.
+Explicit reply instructions belong only to the next new delegation and its tool
+rounds. A voice-only reply or failed request clears its pending task; later
+unrelated delegations do not inherit one-off instructions.
 Long Unicode results are split losslessly into bounded native appends.
 
 GPT-Live transcript deltas remain timed fragments, not completed caller turns.
