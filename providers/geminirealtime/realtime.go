@@ -184,8 +184,9 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 		conn: conn, ctx: streamCtx, cancel: cancel,
 		physical: physical,
 		events:   make(chan runtimepkg.ProviderEvent, a.eventBuffer), setupDone: make(chan error, 1),
-		inputMIME:  fmt.Sprintf("audio/pcm;rate=%d", request.Media.SampleRateHz),
-		responding: responding,
+		inputMIME:    fmt.Sprintf("audio/pcm;rate=%d", request.Media.SampleRateHz),
+		responding:   responding,
+		gracefulDone: make(chan struct{}),
 	}
 	setup := buildSetup("models/"+model, request.Options)
 	if handle != "" {
@@ -319,6 +320,8 @@ type liveStream struct {
 
 	writeMu          sync.Mutex
 	gracefulOnce     sync.Once
+	gracefulStarted  atomic.Bool
+	gracefulDone     chan struct{}
 	abortOnce        sync.Once
 	interruptOnce    sync.Once
 	setupOnce        sync.Once
@@ -365,12 +368,14 @@ func (s *liveStream) Cancel(context.Context) error {
 
 func (s *liveStream) Close(context.Context) error {
 	s.gracefulOnce.Do(func() {
+		s.gracefulStarted.Store(true)
 		s.closed.Store(true)
 		s.writeMu.Lock()
 		err := s.conn.Close(websocket.StatusNormalClosure, "")
 		s.writeMu.Unlock()
 		s.rememberCloseError(err)
 		s.cancel()
+		close(s.gracefulDone)
 	})
 	return s.closeError()
 }
@@ -558,6 +563,16 @@ func (s *liveStream) handle(message serverMessage, raw []byte) {
 }
 
 func (s *liveStream) finish(err error) {
+	if s.gracefulStarted.Load() && websocket.CloseStatus(err) == -1 {
+		// The SDK may consume the close acknowledgment itself and wake the
+		// reader with a generic closed-I/O error before Close has returned.
+		// Its actual close result owns that outcome. Explicit provider close
+		// statuses still propagate; abort/deadline cancellation never waits.
+		select {
+		case <-s.gracefulDone:
+		case <-s.ctx.Done():
+		}
+	}
 	if s.closed.Load() && (isNormalClose(err) || s.ctx.Err() != nil) || isNormalClose(err) {
 		return
 	}

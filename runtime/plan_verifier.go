@@ -135,14 +135,15 @@ func (c *MemoryReplayCache) tryUse(id string, expiresAt, now time.Time, clocked 
 // AllowInsecureJWKS option exists only for hermetic HTTP test fixtures.
 type PlanVerifierConfig struct {
 	// MaxReplayEntries bounds the default cache; custom ReplayCache owns its bound.
-	MaxReplayEntries  int
-	JWKSURL           string
-	Issuer            string
-	Audience          string
-	HTTPClient        *http.Client
-	CacheTTL          time.Duration
-	MaxCacheTTL       time.Duration
-	ClockSkew         time.Duration
+	MaxReplayEntries int
+	JWKSURL          string
+	Issuer           string
+	Audience         string
+	HTTPClient       *http.Client
+	CacheTTL         time.Duration
+	MaxCacheTTL      time.Duration
+	ClockSkew        time.Duration
+	// Now supplies plan admission time, not elapsed JWKS cache time.
 	Now               func() time.Time
 	ReplayCache       ReplayCache
 	AllowInsecureJWKS bool
@@ -152,13 +153,16 @@ type PlanVerifierConfig struct {
 // control-plane public keys. An unknown key ID forces one synchronous refresh
 // so normal signing-key rotation does not wait for the cache TTL to expire.
 type JWKSPlanVerifier struct {
-	config PlanVerifierConfig
+	config       PlanVerifierConfig
+	admissionNow func() time.Time
 
 	mu        sync.Mutex
 	refreshMu sync.Mutex
 	keys      map[string]jwkKey
-	expiresAt time.Time
-	etag      string
+	// cacheExpiresAt always retains time.Now's monotonic component. Admission
+	// watermarks and configurable wall clocks must not extend key authority.
+	cacheExpiresAt time.Time
+	etag           string
 }
 
 type jwksDocument struct {
@@ -208,22 +212,22 @@ func NewPlanVerifier(config PlanVerifierConfig) (*JWKSPlanVerifier, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	config.Now = newAdmissionClock(config.Now).now
+	admissionNow := newAdmissionClock(config.Now).now
 	if config.ReplayCache == nil {
-		cache := NewMemoryReplayCache(config.Now)
+		cache := NewMemoryReplayCache(admissionNow)
 		cache.limit = config.MaxReplayEntries
 		config.ReplayCache = cache
 	}
 	if config.HTTPClient == nil {
 		config.HTTPClient = http.DefaultClient
 	}
-	return &JWKSPlanVerifier{config: config, keys: make(map[string]jwkKey)}, nil
+	return &JWKSPlanVerifier{config: config, admissionNow: admissionNow, keys: make(map[string]jwkKey)}, nil
 }
 
 // Verify validates the outer plan, verifies its JWS, binds the envelope to
 // that exact plan, validates issuer/audience/times, and consumes its jti.
 func (v *JWKSPlanVerifier) Verify(ctx context.Context, plan protocol.SessionPlan) error {
-	now := v.config.Now().UTC()
+	now := v.admissionNow()
 	if err := plan.Validate(now); err != nil {
 		return fmt.Errorf("%w: plan validation: %v", ErrPlanSignature, err)
 	}
@@ -422,10 +426,9 @@ func planMatchesEnvelope(plan, enclosed protocol.SessionPlan, envelopeType strin
 }
 
 func (v *JWKSPlanVerifier) keyFor(ctx context.Context, keyID string) (jwkKey, error) {
-	now := v.config.Now()
 	v.mu.Lock()
 	key, found := v.keys[keyID]
-	fresh := now.Before(v.expiresAt)
+	fresh := time.Now().Before(v.cacheExpiresAt)
 	v.mu.Unlock()
 	if found && fresh {
 		return key, nil
@@ -435,9 +438,13 @@ func (v *JWKSPlanVerifier) keyFor(ctx context.Context, keyID string) (jwkKey, er
 	}
 	v.mu.Lock()
 	key, found = v.keys[keyID]
+	fresh = time.Now().Before(v.cacheExpiresAt)
 	v.mu.Unlock()
 	if !found {
 		return jwkKey{}, fmt.Errorf("%w: signing key is not present in jwks", ErrPlanSignature)
+	}
+	if !fresh {
+		return jwkKey{}, fmt.Errorf("%w: jwks expired during refresh", ErrPlanSignature)
 	}
 	return key, nil
 }
@@ -449,7 +456,7 @@ func (v *JWKSPlanVerifier) refresh(ctx context.Context, force bool) error {
 	// Another caller could have completed a forced key-rotation refresh while
 	// this caller waited. A fresh cache always has a complete key set.
 	v.mu.Lock()
-	if !force && v.config.Now().Before(v.expiresAt) && len(v.keys) != 0 {
+	if !force && time.Now().Before(v.cacheExpiresAt) && len(v.keys) != 0 {
 		v.mu.Unlock()
 		return nil
 	}
@@ -464,6 +471,10 @@ func (v *JWKSPlanVerifier) refresh(ctx context.Context, force bool) error {
 	if etag != "" {
 		request.Header.Set("If-None-Match", etag)
 	}
+	// Include retrieval/decoding latency in the bounded lifetime. Only a
+	// successful authoritative response can establish a new deadline; cache
+	// hits, failed refreshes and wall-clock changes cannot move it.
+	fetchedAt := time.Now()
 	response, err := v.config.HTTPClient.Do(request)
 	if err != nil {
 		return fmt.Errorf("runtime: retrieve jwks: %w", err)
@@ -478,7 +489,7 @@ func (v *JWKSPlanVerifier) refresh(ctx context.Context, force bool) error {
 			v.mu.Unlock()
 			return errors.New("runtime: control plane returned an empty cached jwks")
 		}
-		v.expiresAt = v.config.Now().Add(v.cacheTTL(response))
+		v.cacheExpiresAt = fetchedAt.Add(v.cacheTTL(response))
 		v.mu.Unlock()
 		return nil
 	}
@@ -510,7 +521,7 @@ func (v *JWKSPlanVerifier) refresh(ctx context.Context, force bool) error {
 	v.mu.Lock()
 	v.keys = keys
 	v.etag = response.Header.Get("ETag")
-	v.expiresAt = v.config.Now().Add(v.cacheTTL(response))
+	v.cacheExpiresAt = fetchedAt.Add(v.cacheTTL(response))
 	v.mu.Unlock()
 	return nil
 }

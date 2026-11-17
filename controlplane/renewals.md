@@ -47,6 +47,13 @@ entries free space; the admission watermark remains. Clock rollback can
 conservatively refuse new plans until their timestamps catch up. SQL-clock
 funded admission retains its separate trusted-time and nonce contract.
 
+Signing-key freshness has a separate elapsed-time deadline for both session
+and relay verifiers. JWKS `max-age` and `MaxCacheTTL` are measured from request
+start using the process monotonic clock, including retrieval/decoding time.
+Only a successful HTTP 200 or authoritative 304 revalidation starts a new
+bounded lifetime. Cache hits, failed refreshes and admission clock rollback
+cannot extend it; an expired key is never used after a failed/slow refresh.
+
 The accepted lease deadline bounds the provider's handshake and setup context,
 as well as the running session timer. Partial Google opens return their stream
 for teardown, and physical capacity remains held until abort/close returns and
