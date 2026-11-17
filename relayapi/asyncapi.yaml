@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:2a13d6d962a09537a0c61c46c87b721bb2175a98cc8af3be36cdac979f58d2c4
-# yaml-body: sha256:b13a451408b4fe698679b1c217d70babb0bd6739e9b591d439b53273973359bc
+# json-mirror: asyncapi.json sha256:81729891029810b4914e84ebe3936224d66bd96c98f607d28d125c9a73e8189c
+# yaml-body: sha256:5589b28527563a193ec0e78a3a2d51e30c9540ca003abbcaed3512e1d3d92d2f
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -1301,8 +1301,9 @@ components:
             language's conventions while the speech stays in the session
             language; sonic-3.6 only); cartesia.max_buffer_delay_ms (an
             integer from 0 to 5000, how long Cartesia buffers streamed text
-            before it starts speaking; 0 disables buffering; streaming routes
-            only, refused on whole-input synthesis); cartesia.speed (0.6 to
+            before it starts speaking; 0 disables buffering; it matters only
+            when text is streamed in parts, and a request that sends its
+            whole text at once is not affected); cartesia.speed (0.6 to
             1.5, sent as generation_config.speed; instant voice clones honor
             it, professional clones ignore it); both on sonic-3, sonic-3.5
             and sonic-3.6; elevenlabs.stability,
