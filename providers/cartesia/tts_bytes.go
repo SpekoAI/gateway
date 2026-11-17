@@ -128,7 +128,7 @@ func (a *BytesTTSAdapter) open(request runtimepkg.AdapterRequest) (*bytesTTSStre
 		gracefulCloseIdleTimeout: a.config.GracefulCloseIdleTimeout, headerTimeout: a.config.HeaderTimeout,
 		responseIdleTimeout: a.config.ResponseIdleTimeout, now: a.now, permanentCredential: permanent,
 		refreshCredential: request.RefreshCredential, providerRoute: request.Plan.Execution.ProviderRoute,
-		model: input.Model, voice: input.Voice, language: input.Language, normalization: input.Normalization,
+		model: input.Model, voice: input.Voice, language: input.Language, normalization: input.Normalization, generationConfig: input.GenerationConfig,
 		sampleRateHz: input.OutputFormat.SampleRate, maximumInputBytes: a.config.MaxInputBytes, maximumCharacters: request.Options.MaxInputCharacters,
 	}, nil
 }
@@ -155,6 +155,7 @@ type bytesTTSStream struct {
 	responseProgress                                             chan struct{}
 	httpClient                                                   *http.Client
 	endpoint, credential, model, voice, language, normalization  string
+	generationConfig                                             *generationConfig
 	credentialExpiresAt                                          time.Time
 	permanentCredential                                          bool
 	refreshCredential                                            runtimepkg.CredentialRefresher
@@ -229,12 +230,13 @@ func bytesInputTooLarge() error {
 }
 
 type bytesSpeechRequest struct {
-	Model         string       `json:"model_id"`
-	Voice         string       `json:"voice"`
-	Input         string       `json:"transcript"`
-	Language      string       `json:"language"`
-	Normalization string       `json:"normalization,omitempty"`
-	OutputFormat  outputFormat `json:"output_format"`
+	Model            string            `json:"model_id"`
+	Voice            string            `json:"voice"`
+	Input            string            `json:"transcript"`
+	Language         string            `json:"language"`
+	Normalization    string            `json:"normalization,omitempty"`
+	GenerationConfig *generationConfig `json:"generation_config,omitempty"`
+	OutputFormat     outputFormat      `json:"output_format"`
 }
 
 // CommitText only schedules the owned operation. The runtime's serialized input
@@ -258,7 +260,7 @@ func (s *bytesTTSStream) CommitText(ctx context.Context) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("cartesia bytes tts has no buffered text to synthesize")
 	}
-	payload, err := json.Marshal(bytesSpeechRequest{Model: s.model, Voice: s.voice, Input: text, Language: s.language, Normalization: s.normalization, OutputFormat: outputFormat{Container: "raw", Encoding: "pcm_s16le", SampleRate: s.sampleRateHz}})
+	payload, err := json.Marshal(bytesSpeechRequest{Model: s.model, Voice: s.voice, Input: text, Language: s.language, Normalization: s.normalization, GenerationConfig: s.generationConfig, OutputFormat: outputFormat{Container: "raw", Encoding: "pcm_s16le", SampleRate: s.sampleRateHz}})
 	if err != nil {
 		return errors.New("cartesia bytes tts could not prepare input")
 	}

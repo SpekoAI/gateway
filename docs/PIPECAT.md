@@ -218,8 +218,10 @@ tts = SpekoTTSService(
 )
 ```
 
-Today that is Cartesia `normalization` (`sonic-3.6`) and ElevenLabs
-`stability`, `similarity_boost`, `style`, `speed` and `use_speaker_boost`.
+Today that is Cartesia `normalization` (`sonic-3.6`), `max_buffer_delay_ms`
+(0 to 5000, streaming only) and `speed` (0.6 to 1.5), the last two on
+`sonic-3`, `sonic-3.5` and `sonic-3.6`, and ElevenLabs `stability`,
+`similarity_boost`, `style`, `speed` and `use_speaker_boost`.
 
 The LLM takes the Router's reasoning control, and it updates at runtime like
 temperature:

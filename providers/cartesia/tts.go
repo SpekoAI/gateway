@@ -111,7 +111,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	if err := validateGenerationOptions(request.Plan.Route.Model, request.Options, *request.Media); err != nil {
 		return nil, err
 	}
-	normalization, err := ttsNormalization(request.Plan.Route.Model, request.Options.TTS.Provider("cartesia"))
+	settings, err := ttsOptions(request.Plan.Route.Model, request.Options.TTS.Provider("cartesia"))
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +166,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		language: request.Options.Language,
 		media:    *request.Media,
 
-		normalization: normalization,
+		settings: settings,
 	}
 	if response != nil {
 		stream.setProviderRequestID(response.Header.Get("X-Request-ID"))
@@ -249,9 +249,9 @@ type stream struct {
 	voiceID  string
 	language string
 	media    protocol.MediaFormat
-	// normalization is the caller's provider_options.cartesia.normalization,
-	// sent on every generation; "" leaves the vendor default.
-	normalization string
+	// settings are the caller's provider_options.cartesia, sent on every
+	// generation of every context; the zero value leaves vendor defaults.
+	settings ttsSettings
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -429,12 +429,14 @@ func (s *stream) markAudioStarted(contextID string) bool {
 
 func (s *stream) generationRequest(contextID, transcript string, continuation bool) generation {
 	return generation{
-		ModelID:       s.modelID,
-		Transcript:    transcript,
-		Voice:         voice{Mode: "id", ID: s.voiceID},
-		Language:      s.language,
-		Normalization: s.normalization,
-		ContextID:     contextID,
+		ModelID:          s.modelID,
+		Transcript:       transcript,
+		Voice:            voice{Mode: "id", ID: s.voiceID},
+		Language:         s.language,
+		Normalization:    s.settings.normalization,
+		MaxBufferDelayMs: s.settings.maxBufferDelay,
+		GenerationConfig: s.settings.generationConfig(),
+		ContextID:        contextID,
 		OutputFormat: outputFormat{
 			Container:  "raw",
 			Encoding:   "pcm_s16le",
@@ -680,15 +682,22 @@ type outputFormat struct {
 }
 
 type generation struct {
-	ModelID       string       `json:"model_id"`
-	Transcript    string       `json:"transcript"`
-	Voice         voice        `json:"voice"`
-	Language      string       `json:"language"`
-	Normalization string       `json:"normalization,omitempty"`
-	ContextID     string       `json:"context_id"`
-	OutputFormat  outputFormat `json:"output_format"`
-	AddTimestamps bool         `json:"add_timestamps"`
-	Continue      bool         `json:"continue"`
+	ModelID          string            `json:"model_id"`
+	Transcript       string            `json:"transcript"`
+	Voice            voice             `json:"voice"`
+	Language         string            `json:"language"`
+	Normalization    string            `json:"normalization,omitempty"`
+	MaxBufferDelayMs *int              `json:"max_buffer_delay_ms,omitempty"`
+	GenerationConfig *generationConfig `json:"generation_config,omitempty"`
+	ContextID        string            `json:"context_id"`
+	OutputFormat     outputFormat      `json:"output_format"`
+	AddTimestamps    bool              `json:"add_timestamps"`
+	Continue         bool              `json:"continue"`
+}
+
+// generationConfig is the request's generation_config object.
+type generationConfig struct {
+	Speed float64 `json:"speed"`
 }
 
 type inbound struct {

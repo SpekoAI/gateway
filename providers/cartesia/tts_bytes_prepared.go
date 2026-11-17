@@ -71,7 +71,7 @@ func (a *BytesTTSAdapter) OpenPrepared(ctx context.Context, request runtimepkg.A
 	if err != nil {
 		return nil, err
 	}
-	actual, err := prepareBytesTTSInput(bytesSpeechRequest{Model: stream.model, Voice: stream.voice, Language: stream.language, Normalization: stream.normalization,
+	actual, err := prepareBytesTTSInput(bytesSpeechRequest{Model: stream.model, Voice: stream.voice, Language: stream.language, Normalization: stream.normalization, GenerationConfig: stream.generationConfig,
 		OutputFormat: outputFormat{Container: "raw", Encoding: "pcm_s16le", SampleRate: stream.sampleRateHz}}, input.text, stream.maximumInputBytes, stream.maximumCharacters)
 	if err != nil || actual.payload != input.payload || actual.characters != input.characters {
 		stream.cancel()
@@ -110,14 +110,19 @@ func bytesTTSInputTemplate(request runtimepkg.AdapterRequest) (bytesSpeechReques
 	if err := validateGenerationOptions(model, request.Options, *request.Media); err != nil {
 		return bytesSpeechRequest{}, err
 	}
-	normalization, err := ttsNormalization(model, request.Options.TTS.Provider("cartesia"))
+	settings, err := ttsOptions(model, request.Options.TTS.Provider("cartesia"))
 	if err != nil {
 		return bytesSpeechRequest{}, err
+	}
+	// The bytes request has no buffering field: it takes the whole transcript
+	// at once, so there is nothing to buffer and nowhere to send the setting.
+	if settings.maxBufferDelay != nil {
+		return bytesSpeechRequest{}, refuse(maxBufferDelayKey, "applies to streamed text on the WebSocket route only; the bytes endpoint takes the whole transcript at once")
 	}
 	if request.Options.MaxInputCharacters < 0 || !utf8.ValidString(request.Options.Voice) || !utf8.ValidString(request.Options.Language) || len(request.Options.Voice) > 512 || len(request.Options.Language) > 1024 {
 		return bytesSpeechRequest{}, errors.New("cartesia bytes tts: invalid request options")
 	}
-	return bytesSpeechRequest{Model: model, Voice: request.Options.Voice, Language: request.Options.Language, Normalization: normalization,
+	return bytesSpeechRequest{Model: model, Voice: request.Options.Voice, Language: request.Options.Language, Normalization: settings.normalization, GenerationConfig: settings.generationConfig(),
 		OutputFormat: outputFormat{Container: "raw", Encoding: "pcm_s16le", SampleRate: rate}}, nil
 }
 

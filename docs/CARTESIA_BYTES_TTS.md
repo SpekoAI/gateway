@@ -16,8 +16,10 @@ The existing WebSocket adapter and its wire version remain separately selected.
 Append preserves exact UTF-8 fragments within a local byte limit and the
 request's optional character ceiling. Commit schedules one typed JSON request
 without blocking the runtime's serialized control dispatcher. Header/status
-failures arrive on Events. Another utterance gets another POST and operation ID. Normalization uses the
-existing per-model provider-option validation. No normalization or trimming is
+failures arrive on Events. Another utterance gets another POST and operation ID. Normalization and
+speed (sent as `generation_config.speed`) use the existing per-model
+provider-option validation. `max_buffer_delay_ms` is refused by name: the bytes
+request has no buffering field because it takes the whole transcript at once. No normalization or trimming is
 applied to the submitted speech text, and no private native binding fields enter
 the provider JSON. Redirects, compressed/ambiguous responses and unsupported
 success content types are refused.
