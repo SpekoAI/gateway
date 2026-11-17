@@ -419,6 +419,7 @@ async def test_real_agent_session_runs_gpt_live_backend_tool_and_streams_both_au
         if request.path == "/v1/llm/responses":
             body = await request.json()
             requests.append(body)
+            assert "Say the verified tool result" in json.dumps(body["input"])
             if len(requests) == 1:
                 return response(
                     [
@@ -455,14 +456,6 @@ async def test_real_agent_session_runs_gpt_live_backend_tool_and_streams_both_au
         ask = await ws.receive_json()
         assert (
             ask["type"] == "session.commentary.append" and ask["delegation_id"] is None
-        )
-        await ws.send_json(
-            {
-                "type": "session.input_transcript.delta",
-                "delta": "synthetic caller fragment",
-                "start_ms": 0,
-                "end_ms": 100,
-            }
         )
         await ws.send_json(
             {

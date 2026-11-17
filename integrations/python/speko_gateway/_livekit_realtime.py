@@ -251,6 +251,16 @@ class _RealtimeSession(llm.RealtimeSession):
     async def update_tools(self, tools: list[llm.Tool]) -> None:
         context = llm.ToolContext(tools)
         _relay_tools(context.flatten())
+        if self._google and context.flatten():
+            # Supported LiveKit versions execute the Agent's original tools,
+            # not wrappers returned by this session. No public per-call cancel
+            # hook lets us honor Gemini toolCallCancellation for that work.
+            # Refuse before opening a socket rather than dispatch side effects
+            # we cannot stop. Extended-thinking async tools need this too.
+            self._fatal(
+                GatewayError("Gemini tool cancellation is unavailable", retryable=False)
+            )
+            raise llm.RealtimeError("Gemini tool cancellation is unavailable")
         if self._configured.is_set():
             if self._google:
                 raise llm.RealtimeError("Gemini tools are immutable after setup")
@@ -277,33 +287,27 @@ class _RealtimeSession(llm.RealtimeSession):
             if item.type in {"message", "function_call", "function_call_output"}
         ]
         if self._google:
-            results = [
-                item
-                for item in items
-                if isinstance(item, llm.FunctionCallOutput)
-                and item.id not in self._known_items
+            additions = [item for item in items if item.id not in self._known_items]
+            # Gemini appends text context. Tool execution stays refused until
+            # the framework has an owned per-call cancellation interface.
+            if any(
+                not isinstance(item, llm.ChatMessage)
+                or item.role != "user"
+                or not item.text_content
+                or not all(isinstance(part, str) for part in item.content)
+                for item in additions
+            ):
+                raise llm.RealtimeError("Gemini context updates require user text")
+            turns = [
+                {"role": "user", "parts": [{"text": item.text_content}]}
+                for item in additions
+                if isinstance(item, llm.ChatMessage)
             ]
-            if results:
+            if turns:
                 self._enqueue(
-                    {
-                        "toolResponse": {
-                            "functionResponses": [
-                                {
-                                    "id": item.call_id,
-                                    "name": item.name,
-                                    "response": {"result": item.output},
-                                }
-                                for item in results
-                            ]
-                        }
-                    }
+                    {"clientContent": {"turns": turns, "turnComplete": False}}
                 )
-                self._known_items.update(item.id for item in results)
-            unexpected = [item for item in items if item.id not in self._known_items]
-            if unexpected:
-                raise llm.RealtimeError(
-                    "Gemini context updates require native tool results"
-                )
+            self._known_items.update(item.id for item in additions)
         else:
             wanted = {item.id for item in items}
             for removed in self._known_items - wanted:
@@ -509,24 +513,9 @@ class _RealtimeSession(llm.RealtimeSession):
     def _wire_tools(self, context: llm.ToolContext) -> list[dict[str, Any]]:
         declarations = _relay_tools(context.flatten())
         if self._google:
-            return (
-                [
-                    {
-                        "functionDeclarations": [
-                            {
-                                "name": item["name"],
-                                "description": item.get("description", ""),
-                                "parametersJsonSchema": item.get(
-                                    "parameters", {"type": "object"}
-                                ),
-                            }
-                            for item in declarations
-                        ]
-                    }
-                ]
-                if declarations
-                else []
-            )
+            if declarations:
+                raise llm.RealtimeError("Gemini tool cancellation is unavailable")
+            return []
         return [{"type": "function", **item} for item in declarations]
 
     @staticmethod
@@ -671,10 +660,10 @@ class _RealtimeSession(llm.RealtimeSession):
                 return
             if self._failure is not None:
                 raise self._failure
+            configuration = self._configuration()
             self._socket = await self._model._client.open(
                 protocol=self._model._protocol, model=self._model.model
             )
-            configuration = self._configuration()
             await self._socket.send_json(configuration)
             events = self._socket.events()
 
@@ -719,7 +708,7 @@ class _RealtimeSession(llm.RealtimeSession):
                         }
                     )
                 await self._socket.send_json(
-                    {"clientContent": {"turns": turns, "turnComplete": False}}
+                    {"clientContent": {"turns": turns, "turnComplete": True}}
                 )
             self._ready.set_result(None)
 
@@ -758,12 +747,14 @@ class _RealtimeSession(llm.RealtimeSession):
                 else GatewayError("Realtime session failed", retryable=False)
             )
         finally:
+            self._commands.close()
+            if self._socket is not None:
+                self._socket.abort()
             if writer is not None:
                 writer.cancel()
                 await asyncio.gather(writer, return_exceptions=True)
             if self._socket is not None:
                 await self._socket.aclose()
-            self._commands.close()
             if self._generation:
                 self._generation.close()
             failure = self._failure or GatewayError(
@@ -987,9 +978,19 @@ class _RealtimeSession(llm.RealtimeSession):
         if "goAway" in event:
             raise GatewayError("Realtime provider session is ending", retryable=False)
         content = event.get("serverContent", {})
-        if content.get("interrupted") and self._generation:
-            self._generation.interrupted = True
-            self._generation.close()
+        if "toolCall" in event or "toolCallCancellation" in event:
+            raise GatewayError("Gemini tool execution is unavailable", retryable=False)
+        if content.get("interrupted"):
+            if self._generation:
+                self._generation.interrupted = True
+                self._generation.close()
+            # LiveKit owns frames that already left our channels. Its speech
+            # event interrupts the active handle and clears that playback too.
+            self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+            self.emit(
+                "input_speech_stopped",
+                llm.InputSpeechStoppedEvent(user_transcription_enabled=True),
+            )
         transcript = content.get("inputTranscription")
         if isinstance(transcript, dict) and transcript.get("text"):
             self._input_item = self._input_item or "google_user_" + uuid.uuid4().hex
@@ -1008,8 +1009,7 @@ class _RealtimeSession(llm.RealtimeSession):
             )
         output = content.get("modelTurn")
         spoken = content.get("outputTranscription")
-        calls = event.get("toolCall", {}).get("functionCalls", [])
-        if (output or spoken or calls) and self._generation is None:
+        if (output or spoken) and self._generation is None:
             self._begin("google_response_" + uuid.uuid4().hex)
         generation = self._generation
         if generation is not None and not generation.interrupted:
@@ -1028,15 +1028,6 @@ class _RealtimeSession(llm.RealtimeSession):
                     await self._audio(
                         generation.message(generation.id + "_message"), inline["data"]
                     )
-            for call in calls:
-                await self._function(
-                    generation,
-                    {
-                        "id": call["id"],
-                        "name": call["name"],
-                        "arguments": json.dumps(call.get("args", {}), allow_nan=False),
-                    },
-                )
         if content.get("turnComplete"):
             if self._input_item:
                 self.emit(
@@ -1049,10 +1040,6 @@ class _RealtimeSession(llm.RealtimeSession):
                     ),
                 )
                 self._input_item, self._input_text = "", ""
-            self._end()
-        elif calls:
-            # A complete native tool-call batch delegates control to LiveKit.
-            # Waiting for turnComplete here would deadlock before toolResponse.
             self._end()
 
     async def aclose(self) -> None:

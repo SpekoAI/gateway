@@ -51,16 +51,14 @@ async def collect_generation(generation):
     [
         ("openai.realtime.v1", "gpt-realtime-2.1", "marin"),
         ("xai.realtime.v1", "grok-voice-3.0", "eve"),
-        ("google.live.v1", "gemini-3.8-live", "Kore"),
     ],
 )
 async def test_native_realtime_waits_for_own_settings_then_executes_tool_and_audio(
     native_binary, protocol, model, voice
 ):
-    google = protocol == "google.live.v1"
-    configuration_seen, allow_ready = asyncio.Event(), asyncio.Event()
+    configuration_seen, allow_ready = (asyncio.Event(), asyncio.Event())
     generations = asyncio.Queue()
-    calls, sent_audio, failures, inputs = [], bytearray(), [], []
+    calls, sent_audio, failures, inputs = ([], bytearray(), [], [])
     first = b"\x01\x01" * 2400
     second = b"\x02\x02" * 2400
 
@@ -69,12 +67,7 @@ async def test_native_realtime_waits_for_own_settings_then_executes_tool_and_aud
             assert message.type is aiohttp.WSMsgType.TEXT
             event = json.loads(message.data)
             inputs.append(event)
-            if google:
-                audio = event.get("realtimeInput", {}).get("audio")
-                if audio:
-                    assert audio["mimeType"] == "audio/pcm;rate=16000"
-                    sent_audio.extend(base64.b64decode(audio["data"]))
-            elif event.get("type") == "input_audio_buffer.append":
+            if event.get("type") == "input_audio_buffer.append":
                 sent_audio.extend(base64.b64decode(event["audio"]))
             if check(event):
                 return event
@@ -85,32 +78,17 @@ async def test_native_realtime_waits_for_own_settings_then_executes_tool_and_aud
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         configuration = await ws.receive_json()
-        if google:
-            setup = configuration["setup"]
-            assert setup["model"] == model
-            assert setup["realtimeInputConfig"]["automaticActivityDetection"][
-                "disabled"
-            ]
-            assert setup["systemInstruction"] == {
-                "parts": [{"text": "owned-private-prompt"}]
-            }
-            assert (
-                setup["tools"][0]["functionDeclarations"][0]["name"] == "owned_lookup"
-            )
-        else:
-            wanted = configuration["session"]
-            assert wanted["instructions"] == "owned-private-prompt"
-            assert wanted["tools"][0]["name"] == "owned_lookup"
-            if protocol == "openai.realtime.v1":
-                assert wanted["audio"]["input"]["transcription"] is None
-                assert wanted["audio"]["input"]["turn_detection"] is None
-            # Native adapters send an earlier default update. Its acknowledgment
-            # must not open our audio gate, even though the socket is already 101.
-            initial = copy.deepcopy(wanted)
-            initial["instructions"] = ""
-            if protocol == "openai.realtime.v1":
-                initial["audio"]["input"]["transcription"] = {"model": "whisper-1"}
-            await ws.send_json({"type": "session.updated", "session": initial})
+        wanted = configuration["session"]
+        assert wanted["instructions"] == "owned-private-prompt"
+        assert wanted["tools"][0]["name"] == "owned_lookup"
+        if protocol == "openai.realtime.v1":
+            assert wanted["audio"]["input"]["transcription"] is None
+            assert wanted["audio"]["input"]["turn_detection"] is None
+        initial = copy.deepcopy(wanted)
+        initial["instructions"] = ""
+        if protocol == "openai.realtime.v1":
+            initial["audio"]["input"]["transcription"] = {"model": "whisper-1"}
+        await ws.send_json({"type": "session.updated", "session": initial})
         unexpected = asyncio.create_task(ws.receive())
         configuration_seen.set()
         try:
@@ -118,152 +96,99 @@ async def test_native_realtime_waits_for_own_settings_then_executes_tool_and_aud
             assert not unexpected.done(), (
                 "audio or model work left before our own ready acknowledgment"
             )
-            if google:
-                await ws.send_json({"setupComplete": {}})
-            else:
-                effective = copy.deepcopy(wanted)
-                # Providers return their effective tool settings, including
-                # default metadata beyond the caller's requested schema.
-                for tool in effective["tools"]:
-                    tool["strict"] = False
-                await ws.send_json({"type": "session.updated", "session": effective})
+            effective = copy.deepcopy(wanted)
+            for tool in effective["tools"]:
+                tool["strict"] = False
+            await ws.send_json({"type": "session.updated", "session": effective})
         finally:
             unexpected.cancel()
             await asyncio.gather(unexpected, return_exceptions=True)
-        if google:
-            await receive_until(
-                ws, lambda e: "activityEnd" in e.get("realtimeInput", {})
-            )
-            await ws.send_json(
-                {"serverContent": {"inputTranscription": {"text": "synthetic caller"}}}
-            )
-            await ws.send_json(
-                {
-                    "toolCall": {
-                        "functionCalls": [
-                            {
-                                "id": "call-owned",
-                                "name": "owned_lookup",
-                                "args": {"value": "one"},
-                            }
-                        ]
-                    }
-                }
-            )
-            result = await receive_until(ws, lambda e: "toolResponse" in e)
-            assert result["toolResponse"]["functionResponses"] == [
-                {
-                    "id": "call-owned",
-                    "name": "owned_lookup",
-                    "response": {"result": "owned-result"},
-                }
-            ]
-            for pcm, text in [(first, "First. "), (second, "Second.")]:
-                await ws.send_json(
-                    {
-                        "serverContent": {
-                            "modelTurn": {
-                                "parts": [
-                                    {
-                                        "inlineData": {
-                                            "mimeType": "audio/pcm;rate=24000",
-                                            "data": base64.b64encode(pcm).decode(),
-                                        }
-                                    }
-                                ]
-                            },
-                            "outputTranscription": {"text": text},
-                        }
-                    }
-                )
-            await ws.send_json({"serverContent": {"turnComplete": True}})
-        else:
-            await receive_until(ws, lambda e: e.get("type") == "response.create")
-            await ws.send_json(
-                {"type": "response.created", "response": {"id": "response-tool"}}
-            )
-            await ws.send_json(
-                {
-                    "type": "response.function_call_arguments.done",
-                    "response_id": "response-tool",
-                    "item_id": "item-tool",
+        await receive_until(ws, lambda e: e.get("type") == "response.create")
+        await ws.send_json(
+            {"type": "response.created", "response": {"id": "response-tool"}}
+        )
+        await ws.send_json(
+            {
+                "type": "response.function_call_arguments.done",
+                "response_id": "response-tool",
+                "item_id": "item-tool",
+                "call_id": "call-owned",
+                "name": "owned_lookup",
+                "arguments": '{"value":"one"}',
+            }
+        )
+        await ws.send_json(
+            {
+                "type": "response.output_item.done",
+                "response_id": "response-tool",
+                "item": {
+                    "type": "function_call",
+                    "id": "item-tool",
                     "call_id": "call-owned",
                     "name": "owned_lookup",
                     "arguments": '{"value":"one"}',
-                }
-            )
+                },
+            }
+        )
+        await ws.send_json(
+            {
+                "type": "response.done",
+                "response": {"id": "response-tool", "status": "completed"},
+            }
+        )
+        result = await receive_until(
+            ws, lambda e: e.get("type") == "conversation.item.create"
+        )
+        assert result["item"]["type"] == "function_call_output"
+        assert result["item"]["output"] == "owned-result"
+        await receive_until(ws, lambda e: e.get("type") == "response.create")
+        await ws.send_json(
+            {"type": "response.created", "response": {"id": "response-audio"}}
+        )
+        await ws.send_json(
+            {
+                "type": "response.output_item.added",
+                "response_id": "response-audio",
+                "item": {"type": "message", "id": "message-audio"},
+            }
+        )
+        for pcm, text in [(first, "First. "), (second, "Second.")]:
             await ws.send_json(
                 {
-                    "type": "response.output_item.done",
-                    "response_id": "response-tool",
-                    "item": {
-                        "type": "function_call",
-                        "id": "item-tool",
-                        "call_id": "call-owned",
-                        "name": "owned_lookup",
-                        "arguments": '{"value":"one"}',
-                    },
-                }
-            )
-            await ws.send_json(
-                {
-                    "type": "response.done",
-                    "response": {"id": "response-tool", "status": "completed"},
-                }
-            )
-            result = await receive_until(
-                ws, lambda e: e.get("type") == "conversation.item.create"
-            )
-            assert result["item"]["type"] == "function_call_output"
-            assert result["item"]["output"] == "owned-result"
-            await receive_until(ws, lambda e: e.get("type") == "response.create")
-            await ws.send_json(
-                {"type": "response.created", "response": {"id": "response-audio"}}
-            )
-            await ws.send_json(
-                {
-                    "type": "response.output_item.added",
-                    "response_id": "response-audio",
-                    "item": {"type": "message", "id": "message-audio"},
-                }
-            )
-            for pcm, text in [(first, "First. "), (second, "Second.")]:
-                await ws.send_json(
-                    {
-                        "type": "response.output_audio.delta",
-                        "response_id": "response-audio",
-                        "item_id": "message-audio",
-                        "delta": base64.b64encode(pcm).decode(),
-                    }
-                )
-                await ws.send_json(
-                    {
-                        "type": "response.output_audio_transcript.delta",
-                        "response_id": "response-audio",
-                        "item_id": "message-audio",
-                        "delta": text,
-                    }
-                )
-            await ws.send_json(
-                {
-                    "type": "response.output_audio.done",
+                    "type": "response.output_audio.delta",
                     "response_id": "response-audio",
                     "item_id": "message-audio",
+                    "delta": base64.b64encode(pcm).decode(),
                 }
             )
             await ws.send_json(
                 {
-                    "type": "response.output_item.done",
+                    "type": "response.output_audio_transcript.delta",
                     "response_id": "response-audio",
-                    "item": {"type": "message", "id": "message-audio"},
+                    "item_id": "message-audio",
+                    "delta": text,
                 }
             )
-            await ws.send_json(
-                {
-                    "type": "response.done",
-                    "response": {"id": "response-audio", "status": "completed"},
-                }
-            )
+        await ws.send_json(
+            {
+                "type": "response.output_audio.done",
+                "response_id": "response-audio",
+                "item_id": "message-audio",
+            }
+        )
+        await ws.send_json(
+            {
+                "type": "response.output_item.done",
+                "response_id": "response-audio",
+                "item": {"type": "message", "id": "message-audio"},
+            }
+        )
+        await ws.send_json(
+            {
+                "type": "response.done",
+                "response": {"id": "response-audio", "status": "completed"},
+            }
+        )
         async for _ in ws:
             pass
         return ws
@@ -307,7 +232,7 @@ async def test_native_realtime_waits_for_own_settings_then_executes_tool_and_aud
                 collect_generation(generation), 5
             )
             assert messages == []
-            assert len(functions) == 1  # arguments.done plus item.done is one call
+            assert len(functions) == 1
             function = functions[0]
             assert (
                 function.call_id,
@@ -324,12 +249,9 @@ async def test_native_realtime_waits_for_own_settings_then_executes_tool_and_aud
                 )
             )
             await session.update_chat_ctx(context)
-            if not google:
-                second_reply = session.generate_reply()
-                generation = await asyncio.wait_for(second_reply, 5)
-                assert generation is await asyncio.wait_for(generations.get(), 5)
-            else:
-                generation = await asyncio.wait_for(generations.get(), 5)
+            second_reply = session.generate_reply()
+            generation = await asyncio.wait_for(second_reply, 5)
+            assert generation is await asyncio.wait_for(generations.get(), 5)
             messages, functions = await asyncio.wait_for(
                 collect_generation(generation), 5
             )
@@ -345,11 +267,11 @@ async def test_native_realtime_waits_for_own_settings_then_executes_tool_and_aud
     assert calls[0][1]["Authorization"] == "Bearer " + MODEL_KEY
     assert calls[0][1]["Speko-Client-Session-Id"] == "ses_realtime_worker"
     assert LOCAL_TOKEN not in json.dumps(dict(calls[0][1]))
-    expected_samples = 1600 if google else 2400
+    expected_samples = 2400
     assert abs(len(sent_audio) // 2 - expected_samples) <= 2
 
 
-@pytest.mark.parametrize("method", ["reply", "say"])
+@pytest.mark.parametrize("method", ["reply", "say", "typed"])
 @pytest.mark.parametrize(
     "protocol,model,voice",
     [
@@ -412,6 +334,25 @@ async def test_real_agent_session_plays_both_native_realtime_chunks_in_one_turn(
                 {"type": "session.updated", "session": configuration["session"]}
             )
         command = await ws.receive_json()
+        if method == "typed":
+            if google:
+                assert command == {
+                    "clientContent": {
+                        "turns": [
+                            {
+                                "role": "user",
+                                "parts": [{"text": "Synthetic typed request."}],
+                            }
+                        ],
+                        "turnComplete": False,
+                    }
+                }
+            else:
+                assert command["type"] == "conversation.item.create"
+                assert (
+                    command["item"]["content"][0]["text"] == "Synthetic typed request."
+                )
+            command = await ws.receive_json()
         assert (
             ("clientContent" in command)
             if google
@@ -520,6 +461,8 @@ async def test_real_agent_session_plays_both_native_realtime_chunks_in_one_turn(
             speech = (
                 session.say("First. Second.")
                 if method == "say"
+                else session.generate_reply(user_input="Synthetic typed request.")
+                if method == "typed"
                 else session.generate_reply(
                     instructions="Say the synthetic test response"
                 )

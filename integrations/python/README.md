@@ -24,6 +24,14 @@ streamed output use the real LiveKit realtime interface. A separately paid ASR
 model is never enabled implicitly. Native `AgentSession.say` needs a framework
 release with realtime `supports_say`; older releases can use `generate_reply`.
 
+Gemini completes initial history before queued audio and forwards typed user
+turns before generating replies. Provider interruptions clear framework playback,
+including audio already buffered after the native generation ended. Gemini
+function tools are refused before socket creation: supported framework versions
+execute the Agent's original tools and expose no per-call cancellation hook for
+`toolCallCancellation`. This also refuses extended-thinking tool sessions. Native
+OpenAI/xAI and delegated GPT-Live tool rounds keep their separate interfaces.
+
 `GPTLiveModel` uses LiveKit's duplex audio adapter (tested with 1.8.10) and an
 explicitly supplied `LLM` backend. Configure that backend with a native
 `RelayLLMClient`, concrete provider/model and positive `max_output_tokens` from
@@ -46,6 +54,10 @@ Older frameworks can still import the speech integrations; constructing
 The caller owns the supplied clients and backend. Close the `AgentSession` and
 models, then their clients. These SDK interfaces do not select paid model legs
 or authorize execution: the cell must freeze, register and admit every leg.
+`RelayRealtimeSession.abort()` closes its owned physical transport independently
+of a paused reader. Close/EOF establishes no no-I/O, usage, settlement or durable
+cleanup proof. These relay interfaces are not funded provider-direct factories;
+see [the worker factory prerequisites](../../docs/WORKER-PROVIDER-DIRECT.md).
 
 ## Native relay speech
 

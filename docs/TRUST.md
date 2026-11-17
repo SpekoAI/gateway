@@ -1,5 +1,21 @@
 # Trust and data flow
 
+The Python realtime conversation repairs do not authorize worker-funded direct
+execution. Ordinary worker STT/TTS must remain refused until the independently
+reviewed native authority, producer, configured connector directory and consumer
+pins exist; relay media is not a substitute. See the
+[factory prerequisites](WORKER-PROVIDER-DIRECT.md).
+
+Gemini function tools are refused before a provider socket is opened because the
+supported framework has no owned per-call cancellation interface. Unsolicited
+provider tool requests fail closed. History and typed text stay on the explicitly
+configured native transport; interruptions clear framework playback. GPT-Live
+explicit reply instructions are included in each delegated backend context and
+its subsequent tool rounds. No provider credential, endpoint, funding or receipt
+authority is added by these changes. Physical abort interrupts the owned socket
+without relying on consumer progress; an aborted connection says nothing about
+provider usage, durable finalization, NoIO or settlement.
+
 This document describes what Speko Gateway can access, where it sends data,
 and what changes when `SPEKO_API_KEY` is configured.
 

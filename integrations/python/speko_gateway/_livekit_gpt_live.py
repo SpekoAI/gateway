@@ -296,6 +296,9 @@ class _GPTLiveSession(_Session):
         ask = "Reply to the caller now. Do not wait for the caller to speak first. After that, pause and listen."
         if is_given(instructions):
             ask += "\n" + _text(instructions)
+        # The voice socket may delegate before any caller transcript exists.
+        # Keep the exact task in the corresponding paid backend context too.
+        self._remember([llm.ChatMessage(role="system", content=[_text(ask)])])
         self._append("session.commentary.append", ask)
 
     def _startup(self) -> dict[str, Any]:
@@ -535,12 +538,17 @@ class _GPTLiveSession(_Session):
         except Exception:  # noqa: BLE001 -- vendor content never enters logs/errors
             self._failure = self._failure or _failure()
         finally:
+            # Python 3.10 wait_for can lose cancellation when its awaited
+            # future completes concurrently. Fence physical I/O and wake idle
+            # producers before joining, including that ready/error race.
+            self._commands.close()
+            self._delegations.close()
+            if self._socket is not None:
+                self._socket.abort()
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._audio.close()
-            self._commands.close()
-            self._delegations.close()
             for future in self._tool_results.values():
                 if not future.done():
                     future.cancel()

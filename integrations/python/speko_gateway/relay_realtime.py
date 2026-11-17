@@ -181,5 +181,15 @@ class RelayRealtimeSession:
             await self.aclose()
 
     async def aclose(self) -> None:
-        self._closed = True
+        self.abort()
         await self._websocket.close()
+
+    def abort(self) -> None:
+        """Stop physical I/O even when a reader or close handshake is paused.
+
+        aiohttp's WebSocket close waits for its reader/peer. Closing the owned
+        upgrade response first interrupts that wait on supported Python versions,
+        including 3.10. This proves no provider outcome or financial finality.
+        """
+        self._closed = True
+        self._websocket._response.close()
