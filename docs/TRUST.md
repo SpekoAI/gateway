@@ -12,8 +12,14 @@ provider tool requests fail closed. History and typed text stay on the explicitl
 configured native transport; interruptions clear framework playback. GPT-Live
 explicit reply instructions are scoped to the next new delegation and its backend
 tool rounds; unrelated later delegations do not inherit those one-off tasks.
+Audible preambles do not end task lifetime: new caller/app input, supersession,
+cancellation or the original application deadline retires an unclaimed task.
+This state and timeout grant no provider-execution or monetary authority.
 Gemini marks completed audio transcripts as already consumed, and playback
-interruption never opens a new manual input activity. No provider credential,
+cleanup from provider feedback sends no new manual activity. Explicit local
+interruption of an active manual generation requests provider cancellation with
+balanced activity controls; it does not leave an open synthetic turn or record
+caller speech. No provider credential,
 endpoint, funding or receipt authority is added by these changes. Physical abort
 interrupts the owned socket without relying on consumer progress; an aborted
 connection says nothing about

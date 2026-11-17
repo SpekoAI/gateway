@@ -476,9 +476,25 @@ class _RealtimeSession(llm.RealtimeSession):
                 self._enqueue(
                     {"type": "response.cancel", "response_id": self._generation.id}
                 )
-        # Gemini manual activity starts only with actual input activity/audio.
-        # A framework interruption can be feedback from a provider interruption
-        # after activityEnd; playback cleanup must not open another user turn.
+            elif self._manual_turns:
+                if not self._model._allow_interruptions or self._audio_active:
+                    # An already-open real input activity cannot be pulsed
+                    # again without altering that caller turn. Close the owned
+                    # transport when an unambiguous cancellation is unavailable.
+                    self._fatal(
+                        GatewayError(
+                            "Realtime provider cancellation is unavailable",
+                            retryable=False,
+                        )
+                    )
+                    return
+                # A local interrupt of an ACTIVE generation must reach Gemini.
+                # Balance the cancellation pulse without claiming caller audio
+                # or leaving a synthetic activity open. Provider feedback marks
+                # the generation interrupted BEFORE entering this method, so it
+                # never sends another pulse (including asynchronous cleanup).
+                self._enqueue({"realtimeInput": {"activityStart": {}}})
+                self._enqueue({"realtimeInput": {"activityEnd": {}}})
 
     def truncate(
         self,
@@ -785,6 +801,11 @@ class _RealtimeSession(llm.RealtimeSession):
         if self._failure is None:
             self._failure = failure
             self._configured.set()
+            # Stop physical I/O before cancellation/join. Python 3.10 can lose
+            # task cancellation when an awaited producer completes concurrently.
+            self._commands.close()
+            if self._socket is not None:
+                self._socket.abort()
             if self._running:
                 self._task.cancel()
 

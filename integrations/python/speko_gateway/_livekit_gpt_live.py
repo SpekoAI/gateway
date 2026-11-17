@@ -172,6 +172,8 @@ class _GPTLiveSession(_Session):
         self._fragments: list[dict[str, Any]] = []
         self._fragment_bytes = 0
         self._pending_reply_instructions: str | None = None
+        self._pending_reply_future: asyncio.Future | None = None
+        self._pending_reply_timer: asyncio.TimerHandle | None = None
         self._socket: RelayRealtimeSession | None = None
         self._resampler: rtc.AudioResampler | None = None
         self._input_format: tuple[int, int] | None = None
@@ -268,6 +270,8 @@ class _GPTLiveSession(_Session):
                     "GPT-Live received an unknown or conflicting tool result"
                 )
             self._remember([item])
+            if isinstance(item, llm.ChatMessage) and item.role == "user":
+                self._retire_pending_reply()
             if self._started and isinstance(item, llm.ChatMessage):
                 text = item.text_content
                 if text:
@@ -294,16 +298,27 @@ class _GPTLiveSession(_Session):
         self._update_options(tool_choice=tool_choice)
         if is_given(tools) and tools != self._tools.flatten():
             raise llm.RealtimeError("GPT-Live does not support per-response tools")
-        if self._pending_reply_instructions is not None:
-            raise llm.RealtimeError("GPT-Live reply is awaiting its delegation")
         ask = "Reply to the caller now. Do not wait for the caller to speak first. After that, pause and listen."
         if is_given(instructions):
             ask += "\n" + _text(instructions)
         # The next new delegation captures this task in its own context. Its
         # tool rounds share that snapshot; later delegations get no old ask.
         ask = _text(ask)
+        self._retire_pending_reply()
         self._append("session.commentary.append", ask)
         self._pending_reply_instructions = ask
+
+    def _retire_pending_reply(self, future: asyncio.Future | None = None) -> None:
+        if future is not None and self._pending_reply_future is not future:
+            return
+        pending = self._pending_reply_future
+        if self._pending_reply_timer is not None and (
+            pending is None or pending.done()
+        ):
+            self._pending_reply_timer.cancel()
+        self._pending_reply_instructions = None
+        self._pending_reply_future = None
+        self._pending_reply_timer = None
 
     def _startup(self) -> dict[str, Any]:
         history = []
@@ -367,6 +382,10 @@ class _GPTLiveSession(_Session):
             "session.output_transcript.delta",
         }:
             text = _text(event.get("delta"))
+            if kind == "session.input_transcript.delta" and text:
+                # New caller words supersede an unclaimed one-off task. They
+                # remain transcript fragments, never a fabricated complete turn.
+                self._retire_pending_reply()
             start, end = event.get("start_ms"), event.get("end_ms")
             if (
                 any(
@@ -418,11 +437,14 @@ class _GPTLiveSession(_Session):
                 context.items.insert(
                     0, llm.ChatMessage(role="system", content=[self._instructions])
                 )
+            pending = self._pending_reply_future
+            if pending is not None and pending.cancelled():
+                self._retire_pending_reply(pending)
             if self._pending_reply_instructions is not None:
                 context.add_message(
                     role="system", content=self._pending_reply_instructions
                 )
-                self._pending_reply_instructions = None
+                self._retire_pending_reply()
             fragments = [f for f in self._fragments if f["end_ms"] <= offset]
             if fragments:
                 context.add_message(
@@ -547,6 +569,7 @@ class _GPTLiveSession(_Session):
         except Exception:  # noqa: BLE001 -- vendor content never enters logs/errors
             self._failure = self._failure or _failure()
         finally:
+            self._retire_pending_reply()
             # Python 3.10 wait_for can lose cancellation when its awaited
             # future completes concurrently. Fence physical I/O and wake idle
             # producers before joining, including that ready/error race.
@@ -632,6 +655,7 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
         super().__init__(model)
         self._inner = inner
         self._reply: asyncio.Future | None = None
+        self._reply_timeout = 15.0
         inner.on("generation_created", self._generation)
         inner.on("error", self._error)
         for event in (
@@ -658,17 +682,15 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
 
     def _generation(self, generation):
         if self._reply is not None and not self._reply.done():
-            # A voice-only reply also fulfils the request. If it never needed
-            # a backend delegation, its one-off task must not leak into one
-            # created later. Delegated tool rounds already own their snapshot.
-            self.duplex_session._pending_reply_instructions = None
+            # A spoken preamble can fulfil this delivery future before the
+            # corresponding delegation arrives. Task lifetime is independent.
             generation.user_initiated = True
             self._reply.set_result(generation)
             self._reply = None
         self.emit("generation_created", generation)
 
     def _fail_reply(self):
-        self.duplex_session._pending_reply_instructions = None
+        self.duplex_session._retire_pending_reply()
         if self._reply is not None and not self._reply.done():
             self._reply.set_exception(
                 llm.RealtimeError("GPT-Live ended before its reply")
@@ -695,12 +717,32 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
             self._fail_reply()
             return future
 
-        def expire():
-            if self._reply is future:
-                self._fail_reply()
+        self.duplex_session._pending_reply_future = future
 
-        timer = asyncio.get_running_loop().call_later(15, expire)
-        future.add_done_callback(lambda _: timer.cancel())
+        def expire():
+            self.duplex_session._retire_pending_reply(future)
+            if self._reply is future:
+                if not future.done():
+                    future.set_exception(llm.RealtimeError("GPT-Live reply timed out"))
+                self._reply = None
+
+        timer = asyncio.get_running_loop().call_later(self._reply_timeout, expire)
+        self.duplex_session._pending_reply_timer = timer
+
+        def delivered(done):
+            if done.cancelled():
+                self.duplex_session._retire_pending_reply(done)
+                if self._reply is done:
+                    self._reply = None
+            # A preamble keeps the task's original expiration alive. Claimed,
+            # cancelled or superseded tasks cannot leave a timer behind.
+            if (
+                done.cancelled()
+                or self.duplex_session._pending_reply_future is not done
+            ):
+                timer.cancel()
+
+        future.add_done_callback(delivered)
         return future
 
     async def start(self):
@@ -724,6 +766,10 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
     def push_audio(self, frame):
         self._inner.push_audio(frame)
 
+    def start_user_activity(self):
+        self.duplex_session._retire_pending_reply()
+        self._inner.start_user_activity()
+
     def push_video(self, frame):
         self._inner.push_video(frame)
 
@@ -734,6 +780,7 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
         self._inner.clear_audio()
 
     def interrupt(self):
+        self.duplex_session._retire_pending_reply()
         self._inner.interrupt()
 
     def truncate(self, **options):

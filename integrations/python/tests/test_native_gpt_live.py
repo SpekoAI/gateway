@@ -194,6 +194,328 @@ async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
             await voice.aclose()
 
 
+@pytest.mark.parametrize("delegates", [True, False])
+async def test_gpt_live_preamble_keeps_task_until_delegation_then_new_input_retires_it(
+    native_binary,
+    delegates,
+):
+    requests, failures = [], []
+    allow_delegation, done = asyncio.Event(), asyncio.Event()
+    generations = asyncio.Queue()
+    task = "ONE_OFF_LOOKUP_AFTER_PREAMBLE"
+
+    async def peer(request):
+        if request.path == "/v1/llm/responses":
+            requests.append(await request.json())
+            if delegates and len(requests) == 1:
+                return response(
+                    [
+                        (
+                            "response.item.completed",
+                            {
+                                "item": {
+                                    "type": "function_call",
+                                    "name": "owned_lookup",
+                                    "call_id": "call_after_preamble",
+                                    "arguments": '{"value":"one"}',
+                                }
+                            },
+                        ),
+                        ("response.completed", {}),
+                    ]
+                )
+            return response(
+                [
+                    ("response.text.delta", {"delta": "Synthetic backend result"}),
+                    ("response.completed", {}),
+                ]
+            )
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"type": "session.started"})
+        await ws.receive_json()
+        await ws.send_json(
+            {
+                "type": "session.output_audio.delta",
+                "delta": base64.b64encode(b"\x01\x10" * 2400).decode(),
+            }
+        )
+        await allow_delegation.wait()
+        if delegates:
+            await ws.send_json(
+                {
+                    "type": "session.delegation.created",
+                    "offset_ms": 0,
+                    "delegation": {"id": "del_after_preamble", "target": "client"},
+                }
+            )
+            await ws.receive_json()
+        # Fresh caller words separate unrelated work from this one-off ask.
+        await ws.send_json(
+            {
+                "type": "session.input_transcript.delta",
+                "delta": "A different caller request",
+                "start_ms": 1000,
+                "end_ms": 1100,
+            }
+        )
+        await ws.send_json(
+            {
+                "type": "session.delegation.created",
+                "offset_ms": 1100,
+                "delegation": {"id": "del_new_input", "target": "client"},
+            }
+        )
+        await ws.receive_json()
+        done.set()
+        async for message in ws:
+            if json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "session.closed"})
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        voice, backend_client, backend, model = models(socket)
+        session = model.session()
+        session.on("generation_created", generations.put_nowait)
+        session.on("error", failures.append)
+        try:
+            await session._update_session(
+                instructions="Permanent prompt", tools=[owned_lookup]
+            )
+            await session.start()
+            reply = session.generate_reply(instructions=task)
+            timer = session.duplex_session._pending_reply_timer
+            generation = await asyncio.wait_for(reply, 5)
+            assert generation is await generations.get()
+            messages, calls = await asyncio.wait_for(collect_generation(generation), 5)
+            assert len(messages) == 1 and calls == []
+            assert session.duplex_session._pending_reply_instructions == (
+                "Reply to the caller now. Do not wait for the caller to speak first. After that, pause and listen.\n"
+                + task
+            )
+            assert not timer.cancelled(), (
+                "a preamble cannot cancel the original task expiration"
+            )
+            allow_delegation.set()
+            if delegates:
+                generation = await asyncio.wait_for(generations.get(), 5)
+                _, calls = await asyncio.wait_for(collect_generation(generation), 5)
+                assert len(calls) == 1
+                context = session.chat_ctx
+                context.items.append(
+                    llm.FunctionCallOutput(
+                        call_id=calls[0].call_id,
+                        name=calls[0].name,
+                        output="owned-result",
+                        is_error=False,
+                    )
+                )
+                await session.update_chat_ctx(context)
+            await asyncio.wait_for(done.wait(), 5)
+            assert len(requests) == (3 if delegates else 1) and failures == []
+            if delegates:
+                assert all(task in json.dumps(body["input"]) for body in requests[:2])
+            assert task not in json.dumps(requests[-1]["input"])
+            assert task not in str(session.duplex_session._history)
+            assert (
+                session.duplex_session._pending_reply_instructions is None
+                and timer.cancelled()
+            )
+        finally:
+            allow_delegation.set()
+            await session.aclose()
+            await model.aclose()
+            await backend.aclose()
+            await backend_client.aclose()
+            await voice.aclose()
+
+
+@pytest.mark.parametrize("late_before_next", [True, False])
+async def test_gpt_live_agent_interrupt_retires_cancelled_future_before_next_ask(
+    native_binary,
+    late_before_next,
+):
+    from livekit.agents import Agent, AgentSession
+
+    first_seen, cancelled, late_done, done = (asyncio.Event() for _ in range(4))
+    requests, opened = [], []
+    cancelled_task, next_task = "CANCELLED_ONE_OFF_TASK", "NEW_ONE_OFF_TASK"
+
+    async def peer(request):
+        if request.path == "/v1/llm/responses":
+            requests.append(await request.json())
+            return response(
+                [
+                    ("response.text.delta", {"delta": "Synthetic answer"}),
+                    ("response.completed", {}),
+                ]
+            )
+        opened.append(request.path)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"type": "session.started"})
+        assert cancelled_task in (await ws.receive_json())["content"]
+        first_seen.set()
+        await cancelled.wait()
+        if late_before_next:
+            await ws.send_json(
+                {
+                    "type": "session.delegation.created",
+                    "offset_ms": 0,
+                    "delegation": {"id": "del_cancelled_late", "target": "client"},
+                }
+            )
+            await ws.receive_json()
+            late_done.set()
+        assert next_task in (await ws.receive_json())["content"]
+        await ws.send_json(
+            {
+                "type": "session.delegation.created",
+                "offset_ms": 0,
+                "delegation": {"id": "del_new_request", "target": "client"},
+            }
+        )
+        await ws.receive_json()
+        await ws.send_json(
+            {
+                "type": "session.delegation.created",
+                "offset_ms": 0,
+                "delegation": {"id": "del_late_after_new_request", "target": "client"},
+            }
+        )
+        await ws.receive_json()
+        done.set()
+        async for message in ws:
+            if json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "session.closed"})
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        voice, backend_client, backend, model = models(socket)
+        agent = Agent(instructions="Permanent prompt")
+        session = AgentSession(
+            llm=model, turn_detection="manual", vad=None, stt=None, tts=None
+        )
+        try:
+            await session.start(agent=agent, record=False)
+            session.generate_reply(instructions=cancelled_task)
+            await asyncio.wait_for(first_seen.wait(), 5)
+            adapter = agent._activity._rt_session
+            reply = adapter._reply
+            timer = adapter.duplex_session._pending_reply_timer
+            await asyncio.wait_for(session.interrupt(), 5)
+            assert reply.cancelled(), (
+                "test must exercise LiveKit's actual cancelled reply future"
+            )
+            retained_after_cancel = adapter.duplex_session._pending_reply_instructions
+            cancelled.set()
+            if late_before_next:
+                await asyncio.wait_for(late_done.wait(), 5)
+            session.generate_reply(instructions=next_task)
+            await asyncio.wait_for(done.wait(), 5)
+            assert retained_after_cancel is None
+            assert timer.cancelled()
+            assert len(requests) == (3 if late_before_next else 2) and len(opened) == 1
+            inputs = [json.dumps(body["input"]) for body in requests]
+            assert all(cancelled_task not in value for value in inputs)
+            assert next_task in inputs[-2] and next_task not in inputs[-1]
+            assert adapter.duplex_session._pending_reply_instructions is None
+            assert cancelled_task not in str(adapter.duplex_session._history)
+        finally:
+            cancelled.set()
+            await session.aclose()
+            await model.aclose()
+            await backend.aclose()
+            await backend_client.aclose()
+            await voice.aclose()
+
+
+async def test_gpt_live_expiration_retires_task_and_late_delegation_before_next_ask(
+    native_binary,
+):
+    requests = []
+    release_late, late_done, done = (asyncio.Event() for _ in range(3))
+    expired_task, next_task = "EXPIRED_REPLY_TASK", "NEXT_REPLY_AFTER_EXPIRATION"
+
+    async def peer(request):
+        if request.path == "/v1/llm/responses":
+            requests.append(await request.json())
+            return response(
+                [
+                    ("response.text.delta", {"delta": "Synthetic answer"}),
+                    ("response.completed", {}),
+                ]
+            )
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"type": "session.started"})
+        await ws.receive_json()
+        await release_late.wait()
+        await ws.send_json(
+            {
+                "type": "session.delegation.created",
+                "offset_ms": 0,
+                "delegation": {"id": "del_expired_late", "target": "client"},
+            }
+        )
+        await ws.receive_json()
+        late_done.set()
+        assert next_task in (await ws.receive_json())["content"]
+        await ws.send_json(
+            {
+                "type": "session.delegation.created",
+                "offset_ms": 0,
+                "delegation": {"id": "del_after_expiration", "target": "client"},
+            }
+        )
+        await ws.receive_json()
+        done.set()
+        async for message in ws:
+            if json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "session.closed"})
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        voice, backend_client, backend, model = models(socket)
+        session = model.session()
+        try:
+            await session._update_session(instructions="Permanent prompt", tools=[])
+            await session.start()
+            session._reply_timeout = 0.1  # Actual local expiration, after native setup.
+            reply = session.generate_reply(instructions=expired_task)
+            timer = session.duplex_session._pending_reply_timer
+            with pytest.raises(llm.RealtimeError, match="timed out"):
+                await asyncio.wait_for(reply, 5)
+            release_late.set()
+            await asyncio.wait_for(late_done.wait(), 5)
+            assert (
+                timer.cancelled()
+                and session.duplex_session._pending_reply_instructions is None
+            )
+            session._reply_timeout = 15
+            following = session.generate_reply(instructions=next_task)
+            following_timer = session.duplex_session._pending_reply_timer
+            await asyncio.wait_for(done.wait(), 5)
+            following.cancel()
+            await asyncio.sleep(0)  # Run the real future's cancellation callback.
+            assert following_timer.cancelled()
+            assert len(requests) == 2
+            assert expired_task not in json.dumps(requests)
+            assert next_task not in json.dumps(requests[0]["input"])
+            assert next_task in json.dumps(requests[1]["input"])
+            assert expired_task not in str(session.duplex_session._history)
+        finally:
+            release_late.set()
+            await session.aclose()
+            await model.aclose()
+            await backend.aclose()
+            await backend_client.aclose()
+            await voice.aclose()
+
+
 async def test_gpt_live_gates_audio_and_funds_client_backend_tools_without_native_turn_inference(
     native_binary,
 ):

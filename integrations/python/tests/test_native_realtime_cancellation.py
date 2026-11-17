@@ -19,7 +19,7 @@ from speko_gateway import GatewayError, RelayRealtimeClient
 from speko_gateway.livekit import RealtimeModel
 
 
-def client_model(socket):
+def client_model(socket, *, allow_interruptions=True):
     client = RelayRealtimeClient(
         api_key=MODEL_KEY,
         session_id="ses_cancel_owned",
@@ -27,7 +27,11 @@ def client_model(socket):
         local_auth_token=LOCAL_TOKEN,
     )
     return client, RealtimeModel(
-        client, protocol="google.live.v1", model="gemini-3.8-live", voice="Kore"
+        client,
+        protocol="google.live.v1",
+        model="gemini-3.8-live",
+        voice="Kore",
+        allow_interruptions=allow_interruptions,
     )
 
 
@@ -160,10 +164,14 @@ async def test_gemini_finishes_initial_history_before_live_audio(
 
 
 @pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("cause", ["provider", "explicit"])
 async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
     native_binary,
     manual,
+    cause,
 ):
+    if cause == "explicit" and not manual:
+        pytest.skip("this regression targets explicit manual-turn cancellation")
     if (
         manual
         and "can_disable_turn_detection"
@@ -230,16 +238,26 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
                 }
             }
         )
-        await ws.send_json({"serverContent": {"turnComplete": True}})
+        if cause == "provider":
+            await ws.send_json({"serverContent": {"turnComplete": True}})
         await audible.wait()
-        # The native generation has already ended; playback still owns audio.
-        await ws.send_json({"serverContent": {"interrupted": True}})
+        if cause == "provider":
+            # The native generation has already ended; playback still owns audio.
+            await ws.send_json({"serverContent": {"interrupted": True}})
         async for message in ws:
             command = json.loads(message.data)
             if "clientContent" in command:
                 barrier_received.set()
                 break
             before_barrier.append(command)
+            if cause == "explicit" and "activityStart" in command.get(
+                "realtimeInput", {}
+            ):
+                # The owned provider stops its ACTIVE generation on the control,
+                # then reports interruption. Feedback must not send another one.
+                await ws.send_json(
+                    {"serverContent": {"interrupted": True, "turnComplete": True}}
+                )
         async for message in ws:
             command = json.loads(message.data)
             second_turn.append(command)
@@ -270,6 +288,8 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
             native.commit_audio()
             speech = agent.generate_reply(instructions="Speak the synthetic response")
             await asyncio.wait_for(audible.wait(), 5)
+            if cause == "explicit":
+                await asyncio.wait_for(agent.interrupt(), 5)
             await asyncio.wait_for(cleared.wait(), 5)
             assert captured and len(captured) < 100
             assert speech.interrupted
@@ -281,8 +301,15 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
             native.push_audio(rtc.AudioFrame(b"\x02\x10" * 480, 16000, 1, 480))
             native.commit_audio()
             await asyncio.wait_for(second_turn_received.wait(), 5)
-            assert before_barrier == [], (
-                "playback interruption emitted a phantom activity"
+            assert before_barrier == (
+                [
+                    {"realtimeInput": {"activityStart": {}}},
+                    {"realtimeInput": {"activityEnd": {}}},
+                ]
+                if cause == "explicit"
+                else []
+            ), (
+                "explicit cancellation must reach the provider; feedback must not reopen activity"
             )
             if manual:
                 assert len(second_turn) == 3
@@ -297,6 +324,60 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
         finally:
             release.set()
             await agent.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("reason", ["disabled", "input_active"])
+async def test_gemini_manual_interrupt_closes_transport_when_control_is_unavailable(
+    native_binary, reason
+):
+    if (
+        "can_disable_turn_detection"
+        not in llm.RealtimeCapabilities.__dataclass_fields__
+    ):
+        pytest.skip("framework cannot negotiate manual realtime turns")
+    closed = asyncio.Event()
+    received, errors = [], []
+
+    async def peer(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"setupComplete": {}})
+        if reason == "input_active":
+            received.append(await ws.receive_json())
+        await ws.receive_json()  # The explicit reply request.
+        await ws.send_json(
+            {"serverContent": {"outputTranscription": {"text": "Active reply"}}}
+        )
+        async for message in ws:
+            received.append(json.loads(message.data))
+        closed.set()
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        client, model = client_model(socket, allow_interruptions=reason != "disabled")
+        session = model.session(turn_detection_disabled=True)
+        session.on("error", errors.append)
+        try:
+            await session._update_session(instructions="Synthetic task", tools=[])
+            await session.start()
+            if reason == "input_active":
+                session.start_user_activity()
+            await asyncio.wait_for(session.generate_reply(instructions="Reply"), 5)
+            session.interrupt()
+            await asyncio.wait_for(closed.wait(), 5)
+            await asyncio.wait_for(asyncio.shield(session._task), 5)
+            assert len(errors) == 1 and not errors[0].recoverable
+            assert received == (
+                [{"realtimeInput": {"activityStart": {}}}]
+                if reason == "input_active"
+                else []
+            ), "unavailable cancellation must close I/O without faking a caller turn"
+            assert session._generation.interrupted
+        finally:
+            await session.aclose()
             await model.aclose()
             await client.aclose()
 
