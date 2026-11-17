@@ -231,6 +231,7 @@ func TestBatchRefusesMalformedSuccess(t *testing.T) {
 		"chunk no timing": `{"text":"hello","audio_duration_s":1.0,"transcript_chunks":[{"text":"hello"}]}`,
 		"negative start":  `{"text":"hello","audio_duration_s":1.0,"transcript_chunks":[{"text":"hello","start_s":-1,"end_s":1}]}`,
 		"no transcript":   `{"audio_duration_s":2.0}`,
+		"chunk no text":   `{"audio_duration_s":2.0,"transcript_chunks":[{}]}`,
 		"not json":        `<html>`,
 	} {
 		adapter, endpoint, _ := batchServer(t, http.StatusOK, body, nil)

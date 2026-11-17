@@ -151,7 +151,7 @@ type batchResponse struct {
 	Language       string   `json:"language"`
 	AudioDurationS *float64 `json:"audio_duration_s"`
 	Chunks         []struct {
-		Text   string   `json:"text"`
+		Text   *string  `json:"text"`
 		StartS *float64 `json:"start_s"`
 		EndS   *float64 `json:"end_s"`
 	} `json:"transcript_chunks"`
@@ -179,7 +179,12 @@ func parseBatchResponse(body []byte, model, requested string) (*runtimepkg.Batch
 	}
 	segments := make([]runtimepkg.BatchSegment, 0, len(payload.Chunks))
 	for _, chunk := range payload.Chunks {
-		chunkText := strings.Join(strings.Fields(chunk.Text), " ")
+		// Every documented chunk carries text, empty for a silent chunk. A
+		// chunk without the field is not transcript data.
+		if chunk.Text == nil {
+			return nil, batchhttp.Malformed(errors.New("fonada transcript chunk carries no text"))
+		}
+		chunkText := strings.Join(strings.Fields(*chunk.Text), " ")
 		if chunkText == "" {
 			continue
 		}
