@@ -216,9 +216,6 @@ func TestAssemblyAIVoiceFocusThresholdRequiresVoiceFocus(t *testing.T) {
 // model that has it.
 func TestAssemblyAIModeIsAKnownPresetForTheModel(t *testing.T) {
 	t.Parallel()
-	if assemblyAIRealtimeAgentModel != assemblyai.RealtimeAgent37Model {
-		t.Fatalf("gateway spells the 3.7 agent model %q, the adapter %q", assemblyAIRealtimeAgentModel, assemblyai.RealtimeAgent37Model)
-	}
 	mode := func(value any) *protocol.SttOptions {
 		return &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"assemblyai": {"mode": value}}}
 	}

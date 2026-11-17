@@ -143,6 +143,35 @@ func withLanguages(base map[string]struct{}, extra ...string) map[string]struct{
 	return languages
 }
 
+// ModeOption is the provider_options key of the turn-detection preset. It is a
+// realtime connection parameter: the async Transcripts API has no such field.
+const ModeOption = "mode"
+
+// ValidateMode checks a caller's provider_options.assemblyai.mode against the
+// presets AssemblyAI documents (streaming "Optimizing Accuracy and Latency",
+// read 2026-11-17). manual hands every turn end to the caller's
+// ForceEndpoint and exists only on RealtimeAgent37Model. AssemblyAI answers
+// any other value with validation error 3006 after the handshake, so the
+// session would open and then die mid-call. An absent mode is valid: the
+// vendor then uses balanced.
+func ValidateMode(model string, options *protocol.SttOptions) error {
+	raw, exists := options.Provider("assemblyai")[ModeOption]
+	if !exists {
+		return nil
+	}
+	text, _ := raw.(string)
+	switch text {
+	case "min_latency", "balanced", "max_accuracy":
+		return nil
+	case "manual":
+		if model == RealtimeAgent37Model {
+			return nil
+		}
+		return fmt.Errorf("assemblyai mode manual exists only on %s; pin it or use min_latency, balanced or max_accuracy", RealtimeAgent37Model)
+	}
+	return fmt.Errorf("assemblyai mode takes min_latency, balanced or max_accuracy (manual on %s)", RealtimeAgent37Model)
+}
+
 // languagesFor returns the language_codes vocabulary of one streaming model.
 func languagesFor(model string) map[string]struct{} {
 	if model == universal36Model || model == RealtimeAgent37Model {
@@ -327,6 +356,9 @@ func streamEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 		return "", errors.New("assemblyai requires a concrete model in the session plan")
 	}
 	if err := validateMedia(media); err != nil {
+		return "", err
+	}
+	if err := ValidateMode(model, options.STT); err != nil {
 		return "", err
 	}
 	query := endpoint.Query()

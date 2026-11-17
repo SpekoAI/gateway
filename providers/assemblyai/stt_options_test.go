@@ -137,6 +137,14 @@ func TestStreamEndpointCarriesRealtimeAgentModelAndMode(t *testing.T) {
 	if query.Get("speech_model") != RealtimeAgent37Model || query.Get("mode") != "min_latency" || query.Get("format_turns") != "true" {
 		t.Fatalf("connect URL = %s", endpoint)
 	}
+	// The adapter holds the same rule as the gateway server, so an in-process
+	// caller (the relay) cannot dial a preset the model refuses mid-call.
+	for model, value := range map[string]any{"universal-3-6-pro": "manual", RealtimeAgent37Model: "fastest"} {
+		bad := protocol.RequestOptions{STT: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"assemblyai": {"mode": value}}}}
+		if _, err := streamEndpoint(policy, "wss://streaming.assemblyai.com/v3/ws", model, bad, media); err == nil {
+			t.Fatalf("%s mode=%v must be refused before the dial", model, value)
+		}
+	}
 }
 
 func mustQuery(t *testing.T, endpoint string) url.Values {
