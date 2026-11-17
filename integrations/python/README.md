@@ -96,6 +96,9 @@ session = AgentSession(
         objective="balanced",     # default: or "quality", "latency", "cost"
         max_output_tokens=8_192,  # default
         reasoning_effort=None,    # default: provider default; or "none" ... "xhigh"
+        frequency_penalty=None,   # default: unset; -2 to 2
+        presence_penalty=None,    # default: unset; -2 to 2
+        repetition_penalty=None,  # default: unset; greater than 0, at most 2
     ),
     tts=TTS(),
 )
@@ -116,6 +119,17 @@ always reason and refuse `"none"`; `"minimal"` is their floor: Inception
 `zai-org/GLM-5.3-Flash`. Every other value, `"minimal"` included, needs a model
 that can reason: a pinned model that cannot is refused
 (`capability_unsupported`), and auto routing considers only models that can.
+
+`frequency_penalty`, `presence_penalty` and `repetition_penalty` guard against
+a model looping on one phrase until `max_output_tokens`. `frequency_penalty`
+lowers a token's odds in proportion to how often it has already appeared and
+`presence_penalty` once it has appeared at all (both -2 to 2, neutral 0);
+`repetition_penalty` divides the odds of every token already in the context
+(greater than 0 and at most 2, neutral 1). Unset, no field is sent; a value
+out of range raises `ValueError` when the LLM is constructed. The Router
+applies a non-neutral penalty only on Together and Baseten: auto routing keeps
+the request to those models, and a model pinned elsewhere is refused
+(`capability_unsupported`). Older Routers ignore all three.
 
 `LLM()` requires `SPEKO_API_KEY` (plus optional `SPEKO_ROUTER_URL`; the old
 `SPEKO_RELAY_URL` remains a fallback) and speaks HTTPS directly to
