@@ -4,7 +4,7 @@
 // BatchTranscriber only.
 //
 // The request is multipart: the audio as `file` and a required `language_id`
-// from eleven codes (en, bn, gu, hi, kn, ml, mr, or, pa, ta, te). FonadaLabs
+// from ten codes (en, bn, gu, hi, kn, ml, mr, pa, ta, te). FonadaLabs
 // refuses any other code with 400 unsupported_language before it charges, and
 // the adapter refuses it before upload. The response carries the whole
 // transcript, chunk-level timings and the processed duration. It has no word

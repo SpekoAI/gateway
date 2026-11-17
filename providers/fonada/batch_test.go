@@ -150,6 +150,16 @@ func TestBatchTextFallsBackToChunks(t *testing.T) {
 	}
 }
 
+func TestBatchAcceptsStereo(t *testing.T) {
+	t.Parallel()
+	adapter, endpoint, calls := batchServer(t, http.StatusOK, documentedResponse, nil)
+	req := request(endpoint, protocol.RequestOptions{Language: "hi"})
+	req.Media.Channels = 2
+	if _, err := adapter.Transcribe(context.Background(), req); err != nil || calls.Load() != 1 {
+		t.Fatalf("stereo: err = %v, calls = %d", err, calls.Load())
+	}
+}
+
 func TestBatchRefusesBeforeUpload(t *testing.T) {
 	t.Parallel()
 	cases := map[string]struct {
@@ -162,6 +172,8 @@ func TestBatchRefusesBeforeUpload(t *testing.T) {
 		"too large":             {func(r *runtimepkg.BatchTranscribeRequest) { r.AudioBytes = BatchMaxAudioBytes + 1 }, batchhttp.CodeInputTooLarge},
 		"float samples":         {func(r *runtimepkg.BatchTranscribeRequest) { r.Media.Encoding = "pcm_f32le" }, batchhttp.CodeUnsupportedMedia},
 		"low sample rate":       {func(r *runtimepkg.BatchTranscribeRequest) { r.Media.SampleRateHz = 6000 }, batchhttp.CodeUnsupportedMedia},
+		"three channels":        {func(r *runtimepkg.BatchTranscribeRequest) { r.Media.Channels = 3 }, batchhttp.CodeUnsupportedMedia},
+		"odia":                  {func(r *runtimepkg.BatchTranscribeRequest) { r.Options.Language = "or" }, "unsupported_language"},
 		"diarization": {func(r *runtimepkg.BatchTranscribeRequest) {
 			diarize := true
 			r.Options.STT = &protocol.SttOptions{Diarization: &diarize}
@@ -218,6 +230,7 @@ func TestBatchRefusesMalformedSuccess(t *testing.T) {
 		"text no chunks":  `{"text":"hello","audio_duration_s":1.0}`,
 		"chunk no timing": `{"text":"hello","audio_duration_s":1.0,"transcript_chunks":[{"text":"hello"}]}`,
 		"negative start":  `{"text":"hello","audio_duration_s":1.0,"transcript_chunks":[{"text":"hello","start_s":-1,"end_s":1}]}`,
+		"no transcript":   `{"audio_duration_s":2.0}`,
 		"not json":        `<html>`,
 	} {
 		adapter, endpoint, _ := batchServer(t, http.StatusOK, body, nil)

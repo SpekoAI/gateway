@@ -34,11 +34,12 @@ const (
 	batchExtensionID = "api.fonada.ai/v3/asr/transcribe"
 )
 
-// languages are the documented language_id values. FonadaLabs refuses any
+// languages are the documented language_id values (ten, read 2026-11-17;
+// an earlier revision of the page also listed or). FonadaLabs refuses any
 // other code with 400 unsupported_language before it charges.
 var languages = map[string]struct{}{
-	"en": {}, "bn": {}, "gu": {}, "hi": {}, "kn": {}, "ml": {},
-	"mr": {}, "or": {}, "pa": {}, "ta": {}, "te": {},
+	"en": {}, "bn": {}, "gu": {}, "hi": {}, "kn": {},
+	"ml": {}, "mr": {}, "pa": {}, "ta": {}, "te": {},
 }
 
 // BatchConfig controls local transport limits for the transcription adapter.
@@ -93,11 +94,11 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if err != nil {
 		return nil, err
 	}
-	if request.Media.Encoding != "pcm_s16le" || request.Media.SampleRateHz < 8000 || request.Media.SampleRateHz > 48000 {
+	if request.Media.Encoding != "pcm_s16le" || request.Media.SampleRateHz < 8000 || request.Media.SampleRateHz > 48000 || request.Media.Channels < 1 || request.Media.Channels > 2 {
 		return nil, &runtimepkg.ProviderError{
 			Code:    batchhttp.CodeUnsupportedMedia,
-			Message: fmt.Sprintf("FonadaLabs transcribes 16-bit PCM WAV at 8000 to 48000 Hz, got %s/%d Hz", request.Media.Encoding, request.Media.SampleRateHz),
-			Hint:    "Resample the audio to pcm_s16le at 16000 Hz.",
+			Message: fmt.Sprintf("FonadaLabs transcribes mono or stereo 16-bit PCM WAV at 8000 to 48000 Hz, got %s/%d Hz/%d channels", request.Media.Encoding, request.Media.SampleRateHz, request.Media.Channels),
+			Hint:    "Resample the audio to mono pcm_s16le at 16000 Hz.",
 		}
 	}
 	if request.AudioBytes > BatchMaxAudioBytes {
@@ -146,7 +147,7 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 // extension only.
 type batchResponse struct {
 	JobID          string   `json:"job_id"`
-	Text           string   `json:"text"`
+	Text           *string  `json:"text"`
 	Language       string   `json:"language"`
 	AudioDurationS *float64 `json:"audio_duration_s"`
 	Chunks         []struct {
@@ -167,7 +168,15 @@ func parseBatchResponse(body []byte, model, requested string) (*runtimepkg.Batch
 	if payload.AudioDurationS == nil || *payload.AudioDurationS < 0 {
 		return nil, batchhttp.Malformed(errors.New("fonada transcription carries no audio_duration_s"))
 	}
-	text := strings.Join(strings.Fields(payload.Text), " ")
+	// The documented body always carries text, empty for silence. A body
+	// with neither text nor chunks has no transcript to report.
+	if payload.Text == nil && len(payload.Chunks) == 0 {
+		return nil, batchhttp.Malformed(errors.New("fonada transcription carries neither text nor transcript_chunks"))
+	}
+	var text string
+	if payload.Text != nil {
+		text = strings.Join(strings.Fields(*payload.Text), " ")
+	}
 	segments := make([]runtimepkg.BatchSegment, 0, len(payload.Chunks))
 	for _, chunk := range payload.Chunks {
 		chunkText := strings.Join(strings.Fields(chunk.Text), " ")
@@ -219,14 +228,14 @@ func sttLanguage(language string) (string, error) {
 	if _, ok := languages[base]; ok {
 		return base, nil
 	}
-	message := "FonadaLabs Kapture v3 needs a language: en, bn, gu, hi, kn, ml, mr, or, pa, ta or te"
+	message := "FonadaLabs Kapture v3 needs a language: en, bn, gu, hi, kn, ml, mr, pa, ta or te"
 	if lowered != "" && lowered != "auto" {
 		message = fmt.Sprintf("FonadaLabs Kapture v3 does not transcribe %q", strings.TrimSpace(language))
 	}
 	return "", &runtimepkg.ProviderError{
 		Code:    "unsupported_language",
 		Message: message,
-		Hint:    "Send one of en, bn, gu, hi, kn, ml, mr, or, pa, ta or te, or route the audio to another provider.",
+		Hint:    "Send one of en, bn, gu, hi, kn, ml, mr, pa, ta or te, or route the audio to another provider.",
 	}
 }
 
