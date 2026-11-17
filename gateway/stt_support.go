@@ -344,7 +344,7 @@ func validateAssemblyAIVoiceFocus(options *protocol.SttOptions) error {
 // validateAssemblyAIMode refuses a turn-detection preset the model does not
 // have, by name, with the adapter's own rule (assemblyai.ValidateMode).
 func validateAssemblyAIMode(model string, options *protocol.SttOptions) error {
-	if err := assemblyai.ValidateMode(model, options); err != nil {
+	if err := assemblyai.ValidateMode(model, options.Provider("assemblyai")); err != nil {
 		return &SttSupportError{Provider: "assemblyai", Option: "provider_options.assemblyai." + assemblyai.ModeOption, Detail: err.Error()}
 	}
 	return nil

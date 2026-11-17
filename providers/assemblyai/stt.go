@@ -153,9 +153,10 @@ const ModeOption = "mode"
 // ForceEndpoint and exists only on RealtimeAgent37Model. AssemblyAI answers
 // any other value with validation error 3006 after the handshake, so the
 // session would open and then die mid-call. An absent mode is valid: the
-// vendor then uses balanced.
-func ValidateMode(model string, options *protocol.SttOptions) error {
-	raw, exists := options.Provider("assemblyai")[ModeOption]
+// vendor then uses balanced. settings is the caller's assemblyai provider
+// options, so the gateway's and the relay's option types can both pass them.
+func ValidateMode(model string, settings map[string]any) error {
+	raw, exists := settings[ModeOption]
 	if !exists {
 		return nil
 	}
@@ -358,7 +359,7 @@ func streamEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	if err := validateMedia(media); err != nil {
 		return "", err
 	}
-	if err := ValidateMode(model, options.STT); err != nil {
+	if err := ValidateMode(model, options.STT.Provider("assemblyai")); err != nil {
 		return "", err
 	}
 	query := endpoint.Query()
