@@ -454,6 +454,34 @@ func TestBytesTTSSendsSpeedAsGenerationConfig(t *testing.T) {
 	}
 }
 
+// A caller that sets neither new option sends neither field on the bytes
+// path, so pre-existing request bodies keep their shape.
+func TestBytesTTSWithoutOptionsSendsNoOptionFields(t *testing.T) {
+	t.Parallel()
+	bodies := make(chan map[string]any, 1)
+	stream := openBytes(t, func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if json.NewDecoder(r.Body).Decode(&body) != nil {
+			t.Error("invalid provider JSON")
+		}
+		bodies <- body
+		w.Header().Set("Content-Type", "audio/pcm")
+		_, _ = w.Write([]byte{1, 2})
+	}, BytesTTSConfig{}, bytesRequest())
+	if err := stream.AppendText(context.Background(), "Hello."); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	body := <-bodies
+	for _, key := range []string{"generation_config", "max_buffer_delay_ms"} {
+		if _, present := body[key]; present {
+			t.Fatalf("body = %v, carries %q though the caller set neither new option", body, key)
+		}
+	}
+}
+
 // The bytes endpoint has no buffering field, so the setting is refused by
 // name rather than dropped.
 func TestBytesTTSRefusesMaxBufferDelay(t *testing.T) {

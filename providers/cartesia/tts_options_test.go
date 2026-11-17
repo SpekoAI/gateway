@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"testing"
 
@@ -46,6 +47,14 @@ func TestValidateTTSOptions(t *testing.T) {
 		{"speed too fast", "sonic-3.6", map[string]any{"speed": 1.51}, "speed"},
 		{"speed string", "sonic-3.6", map[string]any{"speed": "fast"}, "speed"},
 		{"speed undocumented model", "sonic-2", map[string]any{"speed": 1.2}, "speed"},
+		{"buffer delay negative zero", "sonic-3.6", map[string]any{"max_buffer_delay_ms": math.Copysign(0, -1)}, ""},
+		{"buffer delay exponent form", "sonic-3.6", map[string]any{"max_buffer_delay_ms": 1e3}, ""},
+		{"buffer delay NaN", "sonic-3.6", map[string]any{"max_buffer_delay_ms": math.NaN()}, "max_buffer_delay_ms"},
+		{"buffer delay infinite", "sonic-3.6", map[string]any{"max_buffer_delay_ms": math.Inf(1)}, "max_buffer_delay_ms"},
+		{"buffer delay huge int64", "sonic-3.6", map[string]any{"max_buffer_delay_ms": int64(math.MaxInt64)}, "max_buffer_delay_ms"},
+		{"speed NaN", "sonic-3.6", map[string]any{"speed": math.NaN()}, "speed"},
+		{"speed infinite", "sonic-3.6", map[string]any{"speed": math.Inf(-1)}, "speed"},
+		{"speed bool", "sonic-3.6", map[string]any{"speed": true}, "speed"},
 		{"all three", "sonic-3.6", map[string]any{"normalization": "en-IN", "max_buffer_delay_ms": 250.0, "speed": 1.1}, ""},
 		{"one bad of several", "sonic-3.6", map[string]any{"max_buffer_delay_ms": 250.0, "speed": 2.0}, "speed"},
 	} {
