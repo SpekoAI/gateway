@@ -249,6 +249,30 @@ always reason and refuse `"none"`; `"minimal"` is their floor: Inception
 that can reason: a pinned model that cannot is refused
 (`capability_unsupported`), and auto routing considers only models that can.
 
+The LLM also takes the Router's repetition penalties, which guard against a
+model looping on one phrase until `max_output_tokens`:
+
+```python
+llm = SpekoLLMService(
+    provider="baseten",
+    model="deepseek-ai/DeepSeek-V4.1-Flash",
+    frequency_penalty=0.3,   # -2 to 2, neutral 0
+    presence_penalty=None,   # -2 to 2, neutral 0
+    repetition_penalty=1.1,  # greater than 0 and at most 2, neutral 1
+)
+
+await task.queue_frame(
+    LLMUpdateSettingsFrame(delta=SpekoLLMService.Settings(repetition_penalty=1.15))
+)
+```
+
+`frequency_penalty` and `presence_penalty` are Pipecat's own `LLMSettings`
+fields; `repetition_penalty` is `SpekoLLMService.Settings`'. `None`, the
+default, sends no field. A value out of range raises `ValueError`. The Router
+applies a non-neutral penalty only on Together and Baseten: auto routing keeps
+the request to those models, and a model pinned elsewhere is refused
+(`capability_unsupported`). Older Routers ignore all three.
+
 Options fail closed when the chosen provider cannot honor them. Pin both
 `provider` and `model` when an option is a hard requirement; with `auto`, the
 router is otherwise free to choose another compatible catalog route.

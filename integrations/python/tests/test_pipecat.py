@@ -338,6 +338,95 @@ def test_llm_rejects_unknown_reasoning_effort(effort: object) -> None:
         SpekoLLMService(FakeRelayClient(), reasoning_effort=effort)  # type: ignore[arg-type]
 
 
+def test_llm_omits_penalties_by_default() -> None:
+    llm = SpekoLLMService(FakeRelayClient())  # type: ignore[arg-type]
+
+    request = llm._request(LLMContext(messages=[{"role": "user", "content": "Hi"}]))
+
+    for name in ("frequency_penalty", "presence_penalty", "repetition_penalty"):
+        assert name not in request
+
+
+async def test_llm_sends_penalties() -> None:
+    relay = FakeRelayClient([("response.completed", {})])
+    llm = SpekoLLMService(  # type: ignore[arg-type]
+        relay,
+        provider="together",
+        model="deepseek-ai/DeepSeek-V4.1-Flash",
+        frequency_penalty=0.4,
+        presence_penalty=-0.2,
+        repetition_penalty=1.1,
+    )
+
+    await llm.run_inference(LLMContext(messages=[{"role": "user", "content": "Hi"}]))
+
+    assert relay.requests[0]["frequency_penalty"] == 0.4
+    assert relay.requests[0]["presence_penalty"] == -0.2
+    assert relay.requests[0]["repetition_penalty"] == 1.1
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("frequency_penalty", 2.5, "from -2 to 2"),
+        ("presence_penalty", -2.1, "from -2 to 2"),
+        ("frequency_penalty", True, "from -2 to 2"),
+        ("repetition_penalty", 0, "greater than 0 and at most 2"),
+        ("repetition_penalty", 2.01, "greater than 0 and at most 2"),
+        ("repetition_penalty", float("nan"), "greater than 0 and at most 2"),
+    ],
+)
+def test_llm_rejects_out_of_range_penalties(
+    name: str, value: object, message: str
+) -> None:
+    with pytest.raises(ValueError, match=f"{name} must be None or a number {message}"):
+        SpekoLLMService(FakeRelayClient(), **{name: value})  # type: ignore[arg-type]
+
+
+async def test_llm_penalties_update_at_runtime() -> None:
+    llm = SpekoLLMService(  # type: ignore[arg-type]
+        FakeRelayClient(), provider="baseten", model="deepseek-ai/DeepSeek-V4.1-Flash"
+    )
+    context = LLMContext(messages=[{"role": "user", "content": "Hi"}])
+
+    # frequency_penalty and presence_penalty are Pipecat's own fields.
+    changed = await llm._update_settings(
+        LLMSettings(frequency_penalty=0.5, presence_penalty=0.1)
+    )
+    assert {"frequency_penalty", "presence_penalty"} <= set(changed)
+    request = llm._request(context)
+    assert request["frequency_penalty"] == 0.5
+    assert request["presence_penalty"] == 0.1
+
+    # repetition_penalty is Speko's, typed or through a generic mapping.
+    await llm._update_settings(SpekoLLMService.Settings(repetition_penalty=1.2))
+    assert llm._request(context)["repetition_penalty"] == 1.2
+    await llm._update_settings(LLMSettings.from_mapping({"repetition_penalty": 1.05}))
+    assert llm._request(context)["repetition_penalty"] == 1.05
+    assert "repetition_penalty" not in llm._settings.extra
+
+    # A plain delta leaves the penalties alone; None clears one.
+    await llm._update_settings(LLMSettings(max_tokens=64))
+    assert llm._request(context)["frequency_penalty"] == 0.5
+    await llm._update_settings(LLMSettings(frequency_penalty=None))
+    assert "frequency_penalty" not in llm._request(context)
+
+    with pytest.raises(ValueError, match="repetition_penalty must be None or a number"):
+        await llm._update_settings(SpekoLLMService.Settings(repetition_penalty=0))
+    with pytest.raises(ValueError, match="presence_penalty must be None or a number"):
+        await llm._update_settings(LLMSettings(presence_penalty=3))
+    with pytest.raises(ValueError, match="repetition_penalty must be None or a number"):
+        await llm._update_settings(LLMSettings(extra={"repetition_penalty": 5}))
+    with pytest.raises(ValueError, match="set twice"):
+        await llm._update_settings(
+            SpekoLLMService.Settings(
+                repetition_penalty=1.1, extra={"repetition_penalty": 1.3}
+            )
+        )
+    assert llm._request(context)["repetition_penalty"] == 1.05
+    assert llm._request(context)["presence_penalty"] == 0.1
+
+
 async def test_llm_reasoning_effort_updates_at_runtime() -> None:
     llm = SpekoLLMService(  # type: ignore[arg-type]
         FakeRelayClient(), provider="openai", model="gpt-5.6-luna"

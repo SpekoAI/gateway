@@ -9,6 +9,7 @@ conversation content travels to Router. The wire contract is the public
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import uuid
@@ -83,6 +84,56 @@ def validate_reasoning_effort(value: object) -> ReasoningEffort | None:
         f"reasoning_effort must be None or one of {', '.join(REASONING_EFFORTS)};"
         f" got {value!r}"
     )
+
+
+PENALTIES: tuple[str, ...] = (
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+)
+"""The Router's repetition penalties, sent as top-level fields of the same name.
+
+`frequency_penalty` lowers a token's odds in proportion to how often it has
+already appeared, `presence_penalty` lowers them once it has appeared at all
+(both -2 to 2, neutral 0), and `repetition_penalty` divides the odds of every
+token already in the context (greater than 0 and at most 2, neutral 1). A
+value above neutral is the guard against a model looping on one phrase until
+`max_output_tokens`. Leaving one unset sends no field.
+
+The Router applies a non-neutral penalty only on Together and Baseten. Auto
+routing keeps such a request to those models, and a model pinned elsewhere is
+refused (`capability_unsupported`). Routers before the penalties shipped
+refuse `frequency_penalty` and `presence_penalty` on `/v1/chat/completions`
+and ignore all three on `/v1/llm/responses`, which these integrations use.
+"""
+
+
+def validate_penalty(name: str, value: object) -> float | None:
+    """Return `value` if it is None or within the Router's range, else raise.
+
+    Raises ValueError naming the range, so a bad value fails where the
+    integration is configured rather than as a Router 400 on the first reply.
+    """
+
+    if name not in PENALTIES:
+        raise ValueError(f"unknown penalty {name!r}")
+    if value is None:
+        return None
+    number = (
+        float(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        else math.nan
+    )
+    if name == "repetition_penalty":
+        if 0 < number <= 2:
+            return number
+        raise ValueError(
+            f"repetition_penalty must be None or a number greater than 0 and at"
+            f" most 2; got {value!r}"
+        )
+    if -2 <= number <= 2:
+        return number
+    raise ValueError(f"{name} must be None or a number from -2 to 2; got {value!r}")
 
 
 class RelayError(RuntimeError):
