@@ -213,6 +213,18 @@ func (s *resumableStream) Close(ctx context.Context) error {
 	s.end(nil)
 	return err
 }
+func (s *resumableStream) Interrupt() {
+	s.mu.Lock()
+	s.closed = true
+	stream := s.current
+	if stream == nil {
+		stream = s.detached
+	}
+	s.mu.Unlock()
+	if stream != nil {
+		stream.Interrupt()
+	}
+}
 func (s *resumableStream) Abort(context.Context) error {
 	s.mu.Lock()
 	s.closed = true

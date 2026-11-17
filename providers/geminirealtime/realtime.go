@@ -320,6 +320,7 @@ type liveStream struct {
 	writeMu          sync.Mutex
 	gracefulOnce     sync.Once
 	abortOnce        sync.Once
+	interruptOnce    sync.Once
 	setupOnce        sync.Once
 	closed           atomic.Bool
 	closeErr         error
@@ -374,13 +375,18 @@ func (s *liveStream) Close(context.Context) error {
 	return s.closeError()
 }
 func (s *liveStream) Abort(context.Context) error { return s.abort() }
-func (s *liveStream) abort() error {
-	s.abortOnce.Do(func() {
+func (s *liveStream) Interrupt() {
+	s.interruptOnce.Do(func() {
 		s.closed.Store(true)
 		s.cancel()
 		if s.physical != nil {
 			_ = s.physical.Close()
 		}
+	})
+}
+func (s *liveStream) abort() error {
+	s.abortOnce.Do(func() {
+		s.Interrupt()
 		s.rememberCloseError(s.conn.CloseNow())
 	})
 	return s.closeError()

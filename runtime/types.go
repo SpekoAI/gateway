@@ -175,12 +175,21 @@ type ProviderStream interface {
 	Close(context.Context) error
 }
 
-// AbortingProviderStream is an optional fast-close capability used after the
-// runtime becomes terminal. Normal input draining uses ProviderStream.Close
-// first so an upstream can flush final results. Terminal cleanup then ensures
-// physical teardown completes before releasing tracked provider capacity.
+// AbortingProviderStream provides serialized teardown after the runtime
+// becomes terminal. Immediate concurrent physical interruption uses the
+// separate InterruptingProviderStream capability. Normal input draining uses
+// ProviderStream.Close first; cleanup joins teardown before capacity release.
 type AbortingProviderStream interface {
 	Abort(context.Context) error
+}
+
+// InterruptingProviderStream stops physical I/O promptly without joining a
+// reader, waiting for an event consumer, or acquiring the runtime provider
+// mutex. Interrupt must be safe concurrently with every provider operation.
+// Serialized Abort/Close and event-channel closure still provide teardown
+// evidence; Interrupt alone never releases tracked capacity.
+type InterruptingProviderStream interface {
+	Interrupt()
 }
 
 // ProviderControlStream is an optional capability of speech-to-speech

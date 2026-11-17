@@ -36,6 +36,17 @@ memory cache provides it. Retaining the nonce for its full signed issuance
 lifetime cannot extend the lease or allow the original plan to be reopened.
 The mixed BYOK/managed CLI verifier preserves this capability.
 
+Ordinary local/signature-only admission and the default verifier retain a
+nondecreasing wall-time watermark. Spent local attempts remain fenced while
+their plans can still validate; once expiry permits eviction, a later backward
+clock change cannot revive them. A frozen/rolled-back clock never authorizes
+dropping a live guard. Engine and default nonce caches use fixed-size digest
+keys, default to 65,536 entries each, and refuse new admission with
+`ErrReplayCacheFull` when full. `MaxReplayEntries` can set each bound. Expired
+entries free space; the admission watermark remains. Clock rollback can
+conservatively refuse new plans until their timestamps catch up. SQL-clock
+funded admission retains its separate trusted-time and nonce contract.
+
 The accepted lease deadline bounds the provider's handshake and setup context,
 as well as the running session timer. Partial Google opens return their stream
 for teardown, and physical capacity remains held until abort/close returns and
@@ -55,6 +66,13 @@ response is missing. Recovery cannot reuse that socket, expired credentials,
 or a withdrawn resumption handle. Closing cancels pending delivery; a live
 socket can drain queued input, and a detached socket terminates immediately.
 Provider teardown still precedes physical capacity release.
+
+Terminal abort claims its error before calling the Google stream's concurrent
+`Interrupt`, which closes physical I/O without waiting for the provider mutex,
+an in-progress close handshake, or public event consumption. Pending input,
+receipt publication and serialized `Abort`/`Close` joins happen afterward.
+Interrupting a socket never proves teardown complete: capacity remains held
+until the original close/abort and the provider event source have both ended.
 
 **Managed Google conversation resumption remains refused.** Google's current
 managed token mask pins `sessionResumption` to `{}`; it overwrites a supplied

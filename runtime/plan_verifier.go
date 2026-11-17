@@ -40,6 +40,8 @@ var (
 	// ErrPlanReplay is returned when an otherwise-valid signed plan is used
 	// more than once within its envelope lifetime.
 	ErrPlanReplay = errors.New("runtime: signed session plan has already been used")
+	// ErrReplayCacheFull refuses new work rather than evicting live replay guards.
+	ErrReplayCacheFull = errors.New("runtime: replay cache capacity exhausted")
 	// ErrPlanSignature is returned for malformed, tampered, or unsupported
 	// compact JWS values. It never includes raw credentials or JWS contents.
 	ErrPlanSignature = errors.New("runtime: invalid signed session plan")
@@ -54,9 +56,10 @@ type ReplayCache interface {
 
 // MemoryReplayCache is a bounded-by-expiry in-process replay cache.
 type MemoryReplayCache struct {
-	mu   sync.Mutex
-	now  func() time.Time
-	used map[string]replayUse
+	mu    sync.Mutex
+	now   func() time.Time
+	used  map[[32]byte]replayUse
+	limit int
 }
 
 // ClockedReplayCache retains authenticated nonces for a monotonic TTL,
@@ -74,7 +77,7 @@ func NewMemoryReplayCache(now func() time.Time) *MemoryReplayCache {
 	if now == nil {
 		now = time.Now
 	}
-	return &MemoryReplayCache{now: now, used: make(map[string]replayUse)}
+	return &MemoryReplayCache{now: newAdmissionClock(now).now, used: make(map[[32]byte]replayUse), limit: DefaultMaxReplayEntries}
 }
 
 // TryUse atomically consumes ID until its expiry. It returns false when the ID
@@ -109,14 +112,21 @@ func (c *MemoryReplayCache) tryUse(id string, expiresAt, now time.Time, clocked 
 			delete(c.used, key)
 		}
 	}
-	if _, exists := c.used[id]; exists {
+	key := sha256.Sum256([]byte(id))
+	if _, exists := c.used[key]; exists {
 		return false, nil
+	}
+	if !expiresAt.After(now) {
+		return false, nil
+	}
+	if len(c.used) >= c.limit {
+		return false, ErrReplayCacheFull
 	}
 	use := replayUse{expiresAt: expiresAt}
 	if clocked {
 		use.monotonicDeadline = monotonic.Add(max(expiresAt.Sub(now), 0))
 	}
-	c.used[id] = use
+	c.used[key] = use
 	return true, nil
 }
 
@@ -124,6 +134,8 @@ func (c *MemoryReplayCache) tryUse(id string, expiresAt, now time.Time, clocked 
 // verification policy. JWKSURL must be HTTPS in production; the explicit
 // AllowInsecureJWKS option exists only for hermetic HTTP test fixtures.
 type PlanVerifierConfig struct {
+	// MaxReplayEntries bounds the default cache; custom ReplayCache owns its bound.
+	MaxReplayEntries  int
 	JWKSURL           string
 	Issuer            string
 	Audience          string
@@ -162,6 +174,12 @@ type jwkKey struct {
 // NewPlanVerifier creates the production PlanVerifier implementation used by
 // an embedded runtime or gateway.
 func NewPlanVerifier(config PlanVerifierConfig) (*JWKSPlanVerifier, error) {
+	if config.MaxReplayEntries < 0 {
+		return nil, errors.New("runtime: replay entry limit must be positive")
+	}
+	if config.MaxReplayEntries == 0 {
+		config.MaxReplayEntries = DefaultMaxReplayEntries
+	}
 	if strings.TrimSpace(config.Issuer) == "" || strings.TrimSpace(config.Audience) == "" {
 		return nil, errors.New("runtime: plan verifier issuer and audience are required")
 	}
@@ -190,8 +208,11 @@ func NewPlanVerifier(config PlanVerifierConfig) (*JWKSPlanVerifier, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
+	config.Now = newAdmissionClock(config.Now).now
 	if config.ReplayCache == nil {
-		config.ReplayCache = NewMemoryReplayCache(config.Now)
+		cache := NewMemoryReplayCache(config.Now)
+		cache.limit = config.MaxReplayEntries
+		config.ReplayCache = cache
 	}
 	if config.HTTPClient == nil {
 		config.HTTPClient = http.DefaultClient

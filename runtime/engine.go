@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,8 +23,10 @@ import (
 // Config configures an embedded Engine. Verifier is required because a runtime
 // must not trust a customer-provided plan merely because it is well formed.
 type Config struct {
-	Adapters []Adapter
-	Verifier PlanVerifier
+	// MaxReplayEntries bounds retained attempts. Zero uses DefaultMaxReplayEntries.
+	MaxReplayEntries int
+	Adapters         []Adapter
+	Verifier         PlanVerifier
 	// LocalCredentials maps a signed provider name to a customer-owned BYOK
 	// credential. The engine copies a matching credential only into the
 	// ephemeral adapter request; the verified plan and session retain no secret.
@@ -41,12 +44,17 @@ type Engine struct {
 	telemetry        TelemetrySink
 	limits           Limits
 	now              func() time.Time
+	admissionNow     func() time.Time
+	maxReplayEntries int
 	planUsesMu       sync.Mutex
 	planUses         map[planUseKey]*planUse
 }
 
-type planUseKey struct{ planID, attemptID string }
-type planUse struct{ expiresAt time.Time }
+type planUseKey struct{ planID, attemptID [32]byte }
+type planUse struct {
+	expiresAt time.Time
+	wallClock bool
+}
 
 // A custom verifier may validate signatures without consuming a replay cache.
 // An Engine still admits only one successful stream for each issued attempt.
@@ -62,16 +70,30 @@ func (e *Engine) claimPlanUse(plan protocol.SessionPlan, current func() time.Tim
 		return nil, fmt.Errorf("invalid session plan after verification: %w", err)
 	}
 	retentionNow := time.Now()
+	var wallNow time.Time
 	for key, use := range e.planUses {
-		if !use.expiresAt.After(retentionNow) {
+		expiryNow := retentionNow
+		if use.wallClock {
+			if wallNow.IsZero() {
+				wallNow = e.admissionNow()
+			}
+			expiryNow = wallNow
+		}
+		if !use.expiresAt.After(expiryNow) {
 			delete(e.planUses, key)
 		}
 	}
-	key := planUseKey{plan.PlanID, plan.AttemptID}
+	key := planUseKey{sha256.Sum256([]byte(plan.PlanID)), sha256.Sum256([]byte(plan.AttemptID))}
 	if e.planUses[key] != nil {
 		return nil, ErrPlanReplay
 	}
-	use := &planUse{expiresAt: retentionNow.Add(plan.ExpiresAt.Sub(now))}
+	if len(e.planUses) >= e.maxReplayEntries {
+		return nil, ErrReplayCacheFull
+	}
+	use := &planUse{expiresAt: plan.ExpiresAt, wallClock: !renewableGoogle(plan)}
+	if !use.wallClock {
+		use.expiresAt = retentionNow.Add(plan.ExpiresAt.Sub(now))
+	}
 	e.planUses[key] = use
 	return func(spent bool) {
 		if spent {
@@ -87,6 +109,12 @@ func (e *Engine) claimPlanUse(plan protocol.SessionPlan, current func() time.Tim
 
 // New constructs an Engine with fixed per-session limits.
 func New(config Config) (*Engine, error) {
+	if config.MaxReplayEntries < 0 {
+		return nil, errors.New("runtime: replay entry limit must be positive")
+	}
+	if config.MaxReplayEntries == 0 {
+		config.MaxReplayEntries = DefaultMaxReplayEntries
+	}
 	limits := config.Limits
 	if limits == (Limits{}) {
 		limits = DefaultLimits()
@@ -133,6 +161,8 @@ func New(config Config) (*Engine, error) {
 		telemetry:        config.Telemetry,
 		limits:           limits,
 		now:              config.Now,
+		admissionNow:     newAdmissionClock(config.Now).now,
+		maxReplayEntries: config.MaxReplayEntries,
 		planUses:         make(map[planUseKey]*planUse),
 	}, nil
 }
@@ -142,7 +172,7 @@ func New(config Config) (*Engine, error) {
 func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Session, err error) {
 	authenticated := false
 	var clock *fundedClock
-	current := e.now
+	current := e.admissionNow
 	defer func() {
 		if err != nil && authenticated && !errors.Is(err, ErrPlanReplay) {
 			at := e.now()
@@ -177,7 +207,7 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Sessio
 		}
 		current = clock.timestamp
 	} else {
-		if err := validateOpenRequest(request, e.now()); err != nil {
+		if err := validateOpenRequest(request, current()); err != nil {
 			return nil, err
 		}
 		if err := e.verifier.Verify(ctx, request.Plan); err != nil {
@@ -579,9 +609,9 @@ func (s *Session) Close() {
 	s.input.close()
 }
 
-// Abort immediately makes the session terminal and asks the provider stream
-// to stop asynchronously. Use it when a local transport has failed and
-// graceful input draining would retain capacity without a viable consumer.
+// Abort claims terminal failure and interrupts physical I/O immediately when
+// supported, then joins provider teardown asynchronously. Use it when a local
+// transport has failed and graceful draining has no viable consumer.
 func (s *Session) Abort() {
 	s.fail(ErrSessionAborted)
 }
@@ -836,6 +866,26 @@ func (s *Session) finishPhysical() {
 	releaseAfterProviderStop(s.providerEvents, s.abortProvider, s.releasePhysical)
 }
 
+// Claiming a terminal result must never wait for callbacks, a provider mutex,
+// or an event consumer. Physical interruption follows the claim immediately;
+// the regular teardown path still joins everything before releasing capacity.
+func (s *Session) claimFinish(err error) bool {
+	claimed := false
+	s.finishOnce.Do(func() {
+		s.errMu.Lock()
+		s.err = err
+		s.errMu.Unlock()
+		claimed = true
+	})
+	return claimed
+}
+
+func (s *Session) interruptProvider() {
+	if stream, ok := s.stream.(InterruptingProviderStream); ok {
+		stream.Interrupt()
+	}
+}
+
 func (s *Session) fail(err error) {
 	if err == nil {
 		return
@@ -843,18 +893,18 @@ func (s *Session) fail(err error) {
 	if s.continuation != nil && s.continuation.terminalLeaseExpired.Load() {
 		err = ErrSessionLeaseExpired
 	}
-	s.finishOnce.Do(func() {
-		s.stopLeaseTimer()
-		s.errMu.Lock()
-		s.err = err
-		s.errMu.Unlock()
-		s.input.abort()
-		s.cancel()
-		s.recordUsageFinalized()
-		s.record("session.failed", telemetryErrorData(err))
-		s.emitTerminal(protocol.EventError, errorData(err), providerErrorExtensions(err), nil)
-		go s.finishPhysical()
-	})
+	claimed := s.claimFinish(err)
+	s.cancel()
+	s.interruptProvider()
+	if !claimed {
+		return
+	}
+	s.stopLeaseTimer()
+	s.input.abort()
+	s.recordUsageFinalized()
+	s.record("session.failed", telemetryErrorData(err))
+	s.emitTerminal(protocol.EventError, errorData(err), providerErrorExtensions(err), nil)
+	go s.finishPhysical()
 }
 
 func (s *Session) finish(err error) {
@@ -865,15 +915,16 @@ func (s *Session) finish(err error) {
 		s.fail(err)
 		return
 	}
-	s.finishOnce.Do(func() {
-		s.stopLeaseTimer()
-		s.input.abort()
-		s.cancel()
-		s.recordUsageFinalized()
-		s.record("session.closed", nil)
-		s.emitTerminal(protocol.EventSessionClosed, nil, nil, nil)
-		go s.finishPhysical()
-	})
+	if !s.claimFinish(nil) {
+		return
+	}
+	s.stopLeaseTimer()
+	s.cancel()
+	s.input.abort()
+	s.recordUsageFinalized()
+	s.record("session.closed", nil)
+	s.emitTerminal(protocol.EventSessionClosed, nil, nil, nil)
+	go s.finishPhysical()
 }
 
 func (s *Session) emitRegular(kind protocol.EventType, data json.RawMessage, extensions map[string]json.RawMessage, audio []byte) {
