@@ -153,15 +153,16 @@ func TestModelsFiltersByKindAndProvider(t *testing.T) {
 		adapters["elevenlabs:eleven_v4_turbo"] != "elevenlabs.dialogue.v1" || adapters["elevenlabs:eleven_v3_conversational"] != "elevenlabs.dialogue.v1" {
 		t.Fatalf("provider=elevenlabs returned %v", adapters)
 	}
-	// AssemblyAI serves two published Universal Pro models on one adapter;
-	// both must be discoverable, with the default still resolving to 3.5 Pro.
+	// AssemblyAI serves three published streaming models on one adapter; all
+	// must be discoverable, with the default still resolving to 3.5 Pro.
 	assemblyai := fetchCatalog(t, "/v1/models?provider=assemblyai")
 	ids := make([]string, 0, len(assemblyai.Models))
 	for _, model := range assemblyai.Models {
 		ids = append(ids, model.ID)
 	}
-	if !slices.Contains(ids, "assemblyai:universal-3-5-pro") || !slices.Contains(ids, "assemblyai:universal-3-6-pro") {
-		t.Fatalf("provider=assemblyai returned %v, want both Universal Pro models", ids)
+	if !slices.Contains(ids, "assemblyai:universal-3-5-pro") || !slices.Contains(ids, "assemblyai:universal-3-6-pro") ||
+		!slices.Contains(ids, "assemblyai:assemblyai-stt-3-7-realtime-agent") {
+		t.Fatalf("provider=assemblyai returned %v, want 3.5 Pro, 3.6 Pro and the 3.7 agent model", ids)
 	}
 	for _, entry := range gateway.Catalog() {
 		if entry.Provider == "assemblyai" && entry.DefaultModel != "universal-3-5-pro" {

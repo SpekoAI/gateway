@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/SpekoAI/gateway/protocol"
+	"github.com/SpekoAI/gateway/providers/assemblyai"
 )
 
 // sttSupport records which caller STT options a provider's streaming adapter
@@ -95,10 +96,12 @@ var sttOptionSupport = map[string]sttSupport{
 	// is the second provider behind the canonical noise_reduction ask.
 	// min_turn_silence is the current parameter table's spelling;
 	// min_end_of_turn_silence_when_confident stays for callers holding the
-	// earlier documented name.
+	// earlier documented name. mode is the vendor's turn-detection preset
+	// (assemblyai.ValidateMode holds its values); explicit silence settings
+	// still override the preset's defaults.
 	"assemblyai": {diarization: true, keywords: true, noiseReduction: true, providerKeys: []string{
 		"end_of_turn_confidence_threshold", "min_end_of_turn_silence_when_confident",
-		"min_turn_silence", "max_turn_silence",
+		"min_turn_silence", "max_turn_silence", "mode",
 		"max_speakers", "voice_focus", "voice_focus_threshold", "filter_profanity",
 	}},
 	// Scribe realtime takes repeated keyterms; vad_silence_threshold_secs is
@@ -262,6 +265,9 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 		if err := validateAssemblyAIVoiceFocus(options); err != nil {
 			return err
 		}
+		if err := validateAssemblyAIMode(model, options); err != nil {
+			return err
+		}
 	}
 	// Soniox answers an out-of-range endpoint knob with an error frame after
 	// the handshake, so the session would open and then die mid-call.
@@ -331,6 +337,15 @@ func validateAssemblyAIVoiceFocus(options *protocol.SttOptions) error {
 			Option:   "provider_options.assemblyai.voice_focus",
 			Detail:   "voice focus takes near-field or far-field",
 		}
+	}
+	return nil
+}
+
+// validateAssemblyAIMode refuses a turn-detection preset the model does not
+// have, by name, with the adapter's own rule (assemblyai.ValidateMode).
+func validateAssemblyAIMode(model string, options *protocol.SttOptions) error {
+	if err := assemblyai.ValidateMode(model, options.Provider("assemblyai")); err != nil {
+		return &SttSupportError{Provider: "assemblyai", Option: "provider_options.assemblyai." + assemblyai.ModeOption, Detail: err.Error()}
 	}
 	return nil
 }

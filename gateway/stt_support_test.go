@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/SpekoAI/gateway/protocol"
+	"github.com/SpekoAI/gateway/providers/assemblyai"
 	"github.com/SpekoAI/gateway/providers/elevenlabs"
 )
 
@@ -207,6 +208,29 @@ func TestAssemblyAIVoiceFocusThresholdRequiresVoiceFocus(t *testing.T) {
 	}}
 	if err := validateSttRouteSupport("assemblyai", "universal-3-5-pro", withProviderOption); err != nil {
 		t.Fatalf("an explicit voice_focus satisfies the dependency: %v", err)
+	}
+}
+
+// AssemblyAI answers an unknown mode with validation error 3006 after the
+// handshake. The gateway refuses it at create. manual is not offered.
+func TestAssemblyAIModeIsAKnownPreset(t *testing.T) {
+	t.Parallel()
+	mode := func(value any) *protocol.SttOptions {
+		return &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"assemblyai": {"mode": value}}}
+	}
+	for _, model := range []string{"universal-3-5-pro", "universal-3-6-pro", assemblyai.RealtimeAgent37Model} {
+		for _, preset := range []string{"min_latency", "balanced", "max_accuracy"} {
+			if err := validateSttRouteSupport("assemblyai", model, mode(preset)); err != nil {
+				t.Fatalf("%s must take mode=%s: %v", model, preset, err)
+			}
+		}
+		for _, value := range []any{"manual", "fastest", "MIN_LATENCY", 1} {
+			err := validateSttRouteSupport("assemblyai", model, mode(value))
+			var supportError *SttSupportError
+			if !errors.As(err, &supportError) || supportError.Option != "provider_options.assemblyai.mode" {
+				t.Fatalf("%s mode=%v must be refused by name, got %v", model, value, err)
+			}
+		}
 	}
 }
 
