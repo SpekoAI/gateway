@@ -1221,3 +1221,42 @@ func TestGatewayHandsManagedAdaptersAnAttemptBoundCredentialRefresher(t *testing
 		})
 	}
 }
+
+func TestFundedFallbackDoesNotConsumeAnUnrelatedWarmPlan(t *testing.T) {
+	t.Parallel()
+	adapter := &flakyOpenAdapter{inner: mock.NewSTTAdapter("mock.stt.v1"), openErr: &runtimepkg.ProviderError{Code: "provider_unavailable", Retryable: true, ProviderStatus: 503}, failures: 1}
+	config, plans := newServerConfigWithAdapter(t, adapter, 0, 0, 0, 0)
+	plan := gatewayPlan()
+	plan.Execution.CredentialSource = protocol.CredentialsManaged
+	plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "funded-root", ExpiresAt: plan.ExpiresAt}
+	plan.Telemetry.Token = "gwt1." + strings.Repeat("a", 43)
+	plan.Fallback = &protocol.Fallback{ExchangeURL: "https://control.speko.test/v1/sessions/session-gateway/fallback-plans"}
+	plans.plan = plan
+	plans.fallbackErr = &controlplane.HTTPError{Status: 422, Code: "no_eligible_route"}
+	pool := newWarmPool(t, plans, 2)
+	if err := pool.Warm(context.Background(), managedWarmRequest()); err != nil {
+		t.Fatal(err)
+	}
+	config.WarmPlans = pool
+	server, err := gateway.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := httptest.NewServer(server.Handler())
+	defer peer.Close()
+	body := gatewayRequestBody()
+	body["request"] = map[string]string{"model": "mock-model", "language": "en"}
+	body["execution"] = map[string]string{"provider_route": "provider_direct", "credential_source": "managed", "relay_policy": "forbidden"}
+	response := postJSON(t, peer.URL+"/v1/sessions", body, "local-token", strings.Repeat("a", 190))
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("funded recovery bypassed refusal with warm plan: %d", response.StatusCode)
+	}
+	calls := plans.fallbackCalls()
+	if len(calls) != 1 || len(calls[0].idempotencyKey) > 200 {
+		t.Fatal("funded recovery intent not bounded")
+	}
+	if pool.Metrics().Hits != 1 {
+		t.Fatal("recovery consumed another independently funded warm session")
+	}
+}

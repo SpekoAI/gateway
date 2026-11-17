@@ -155,6 +155,16 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	}
 	spent := false
 	defer func() { finishUse(spent) }()
+	var clock *fundedClock
+	if request.Entitlements != nil && renewableGoogle(request.Plan) {
+		clock = &fundedClock{client: request.Entitlements, plan: request.Plan, wall: e.now}
+		if _, err := clock.synchronize(ctx); err != nil {
+			return nil, err
+		}
+		if !clock.now().Before(request.Plan.Reservation.LeaseExpiresAt) {
+			return nil, ErrSessionLeaseExpired
+		}
+	}
 
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	openStarted := e.now()
@@ -209,7 +219,7 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if request.OnVerifiedCapacity != nil {
 		request.OnVerifiedCapacity(capacity, request.Plan.Execution.CredentialSource)
 	}
-	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential})
+	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential, Continuation: clock != nil})
 	if err != nil {
 		cancel()
 		if stream == nil {
@@ -257,11 +267,25 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if request.Media != nil {
 		session.media = *request.Media
 	}
+	if clock != nil {
+		resumable, ok := stream.(ResumableProviderStream)
+		if !ok || !clock.now().Before(request.Plan.Reservation.LeaseExpiresAt) {
+			cancel()
+			go stopOpenedProvider(stream, release)
+			return nil, errors.New("runtime: funded stream cannot continue")
+		}
+		session.now = clock.timestamp
+		continuationCtx, continuationCancel := context.WithCancel(sessionCtx)
+		session.continuation = &continuation{ctx: continuationCtx, cancel: continuationCancel, session: session, client: request.Entitlements, clock: clock, stream: resumable, expires: request.Plan.Reservation.LeaseExpiresAt, authorizedUnits: request.Plan.Reservation.Usage.AuthorizedUnits, changed: make(chan struct{})}
+	}
 	session.setLeaseDeadline(request.Plan.Reservation.LeaseExpiresAt)
 	session.emitRegular(protocol.EventSessionReady, nil, nil, nil)
 	session.record("session.opened", openLatencyData(openLatency))
 	go session.runInput()
 	go session.runEvents()
+	if session.continuation != nil {
+		go session.continuation.run()
+	}
 	return session, nil
 }
 
@@ -343,6 +367,7 @@ func validateOpenRequest(request OpenRequest, now time.Time) error {
 // Session is an active, single-provider attempt. Its methods are safe to call
 // from multiple goroutines; provider calls remain serialized by runInput.
 type Session struct {
+	continuation    *continuation
 	kind            protocol.SessionKind
 	media           protocol.MediaFormat
 	plan            protocol.SessionPlan
@@ -494,6 +519,10 @@ func (s *Session) SendProviderControl(control protocol.ProviderControl) error {
 // Close begins a graceful close. Queued input is sent in order and the stream
 // then receives Close. It never waits for provider or telemetry I/O.
 func (s *Session) Close() {
+	if s.continuation != nil && s.continuation.close() {
+		s.finish(nil)
+		return
+	}
 	s.input.close()
 }
 
@@ -517,7 +546,11 @@ func (s *Session) setLeaseDeadlineLocked(deadline time.Time) {
 	if s.leaseTimer != nil {
 		s.leaseTimer.Stop()
 	}
-	delay := deadline.Sub(s.now())
+	now := s.now()
+	if s.continuation != nil {
+		now = s.continuation.clock.now()
+	}
+	delay := deadline.Sub(now)
 	if delay < 0 {
 		delay = 0
 	}
@@ -526,7 +559,11 @@ func (s *Session) setLeaseDeadlineLocked(deadline time.Time) {
 		expired := sequence == s.leaseSequence
 		s.leaseMu.Unlock()
 		if expired {
-			s.fail(ErrSessionLeaseExpired)
+			if s.continuation != nil {
+				s.continuation.expire(deadline)
+			} else {
+				s.fail(ErrSessionLeaseExpired)
+			}
 		}
 	})
 }
@@ -568,12 +605,33 @@ func (s *Session) runInput() {
 }
 
 func (s *Session) dispatch(message inputMessage) error {
-	s.providerMu.Lock()
+	for {
+		if s.continuation != nil {
+			if err := s.continuation.beforeIO(); err != nil {
+				if message.kind == inputAudio && message.audio.release != nil {
+					message.audio.release()
+				}
+				return err
+			}
+		}
+		s.providerMu.Lock()
+		if s.continuation == nil || s.continuation.ready() {
+			break
+		}
+		s.providerMu.Unlock()
+	}
 	defer s.providerMu.Unlock()
 
 	switch message.kind {
 	case inputAudio:
 		s.usageMu.Lock()
+		if s.continuation != nil && !s.continuation.audioFits(s.acceptedAudioBytes, int64(len(message.audio.data))) {
+			s.usageMu.Unlock()
+			if message.audio.release != nil {
+				message.audio.release()
+			}
+			return ErrUsageLimitExceeded
+		}
 		if s.usageSealed {
 			s.usageMu.Unlock()
 			if message.audio.release != nil {
@@ -640,6 +698,12 @@ func (s *Session) runEvents() {
 			if event.Err != nil {
 				s.fail(fmt.Errorf("provider stream: %w", event.Err))
 				return
+			}
+			if s.continuation != nil {
+				if err := s.continuation.beforeIO(); err != nil {
+					s.fail(err)
+					return
+				}
 			}
 			// Hosted billing evidence is internal; it must not create a new public
 			// usage event when an adapter has no client-facing correlation payload.

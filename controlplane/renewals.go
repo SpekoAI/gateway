@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -90,4 +91,57 @@ func validEntitlementRenewal(plan protocol.SessionPlan, request EntitlementRenew
 		renewal.AuthorizedUnits == int64(duration/time.Second) && renewal.MaximumAmountMicros > 0 && renewal.Currency == "USD" &&
 		renewal.Credential.Kind == protocol.CredentialBearer && strings.TrimSpace(renewal.Credential.Value) != "" &&
 		renewal.Credential.ExpiresAt.Equal(renewal.LeaseExpiresAt)
+}
+
+// Validate checks a continuation against the original verified plan. It does
+// not verify a plan or grant authority to open a different attempt.
+func (r EntitlementRenewal) Validate(plan protocol.SessionPlan, previous time.Time) error {
+	if plan.Reservation.Billing == nil || !validEntitlementRenewal(plan, EntitlementRenewalRequest{PreviousExpiresAt: previous}, r) {
+		return errors.New("controlplane: invalid entitlement renewal response")
+	}
+	return nil
+}
+
+// EntitlementClock samples the cell's SQL clock without reserving or minting.
+// Callers account for the full round trip before using this sample.
+func (c *Client) EntitlementClock(ctx context.Context, plan protocol.SessionPlan) (time.Time, error) {
+	billing := plan.Reservation.Billing
+	if billing == nil || !gatewayPlanToken.MatchString(plan.Telemetry.Token) || plan.Signature == "" {
+		return time.Time{}, errors.New("controlplane: missing entitlement clock authority")
+	}
+	endpoint, err := url.Parse(billing.RenewalURL)
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil ||
+		endpoint.RawQuery != "" || endpoint.Fragment != "" || !sameOrigin(endpoint, c.baseURL) ||
+		endpoint.EscapedPath() != "/v1/sessions/"+escapeIdentitySegment(plan.SessionID)+"/entitlements/renew" {
+		return time.Time{}, errors.New("controlplane: invalid entitlement clock URL")
+	}
+	endpoint.Path = strings.TrimSuffix(endpoint.Path, "/renew") + "/clock"
+	if endpoint.RawPath != "" {
+		endpoint.RawPath = strings.TrimSuffix(endpoint.RawPath, "/renew") + "/clock"
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return time.Time{}, errors.New("controlplane: invalid clock request")
+	}
+	request.Header.Set("Authorization", "Bearer "+plan.Telemetry.Token)
+	request.Header.Set("Speko-Protocol-Revision", "3")
+	request.Header.Set("Cache-Control", "no-store")
+	client := *c.httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := client.Do(request)
+	if err != nil {
+		return time.Time{}, errors.New("controlplane: entitlement clock unavailable")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return time.Time{}, &HTTPError{Status: response.StatusCode}
+	}
+	var reply struct {
+		ServerTime time.Time `json:"server_time"`
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, 4097))
+	if err != nil || len(data) > 4096 || json.Unmarshal(data, &reply) != nil || reply.ServerTime.IsZero() {
+		return time.Time{}, errors.New("controlplane: invalid entitlement clock response")
+	}
+	return reply.ServerTime, nil
 }

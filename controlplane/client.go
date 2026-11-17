@@ -183,15 +183,42 @@ func (c *Client) ExchangeFallbackPlan(ctx context.Context, current protocol.Sess
 		return protocol.SessionPlan{}, "", errors.New("controlplane: fallback reason and idempotency key are required")
 	}
 	endpoint, err := url.Parse(current.Fallback.ExchangeURL)
-	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || !sameOrigin(endpoint, c.baseURL) {
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || !sameOrigin(endpoint, c.baseURL) {
 		return protocol.SessionPlan{}, "", errors.New("controlplane: fallback exchange URL must use the configured control-plane origin")
 	}
+	bearer, funded, err := c.continuationAuthority(current)
+	if err != nil {
+		return protocol.SessionPlan{}, "", err
+	}
+	if funded && (len(idempotencyKey) > 200 || endpoint.EscapedPath() != "/v1/sessions/"+escapeIdentitySegment(current.SessionID)+"/fallback-plans") {
+		return protocol.SessionPlan{}, "", errors.New("controlplane: invalid funded fallback identity")
+	}
 	var plan protocol.SessionPlan
-	requestID, err := c.postPlan(ctx, endpoint, request, idempotencyKey, &plan)
+	client := *c.httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	data, requestID, err := c.postAuthenticated(ctx, endpoint, request, idempotencyKey, bearer, &client)
 	if err != nil {
 		return protocol.SessionPlan{}, requestID, err
 	}
+	if err := decodePlan(data, &plan); err != nil {
+		return protocol.SessionPlan{}, requestID, err
+	}
+	if funded && (plan.SessionID != current.SessionID || plan.AttemptID == current.AttemptID || plan.PlanID == current.PlanID) {
+		return protocol.SessionPlan{}, requestID, errors.New("controlplane: invalid funded fallback response binding")
+	}
 	return plan, requestID, nil
+}
+
+func (c *Client) continuationAuthority(plan protocol.SessionPlan) (string, bool, error) {
+	if strings.HasPrefix(plan.Telemetry.Token, "gwt1.") || (plan.Reservation.Billing != nil && plan.Reservation.Billing.Mode == "direct_entitlement") {
+		if !gatewayPlanToken.MatchString(plan.Telemetry.Token) || plan.Signature == "" {
+			return "", true, errors.New("controlplane: invalid issued plan continuation token")
+		}
+		return plan.Telemetry.Token, true, nil
+	}
+	// Existing OSS control planes predate gwt1. Their setup-key family remains
+	// unchanged; an invalid gwt1 token never falls back into that family.
+	return c.bearer, false, nil
 }
 
 // CredentialRefreshRequest asks the control plane to re-credential a live
@@ -221,13 +248,22 @@ func (c *Client) RefreshCredential(ctx context.Context, plan protocol.SessionPla
 	}
 	endpoint := *c.baseURL
 	endpoint.Path, endpoint.RawPath, endpoint.RawQuery = decodedPath, rawPath, ""
+	bearer, _, err := c.continuationAuthority(plan)
+	if err != nil {
+		return protocol.DelegatedCredential{}, "", err
+	}
+	nonce := make([]byte, 12)
+	if _, err := rand.Read(nonce); err != nil {
+		return protocol.DelegatedCredential{}, "", errors.New("controlplane: credential refresh key unavailable")
+	}
+	idempotencyKey := "credential:" + hex.EncodeToString(nonce)
 	// The budget bounds the requests too, not only the waits between them: a
 	// stalled retry must not eat the caller's whole reconnect window.
 	ctx, cancel := context.WithTimeout(ctx, credentialRefreshRetryBudget)
 	defer cancel()
 	deadline, _ := ctx.Deadline()
 	for delay := credentialRefreshFirstRetry; ; delay = min(2*delay, credentialRefreshMaxRetry) {
-		credential, requestID, err := c.refreshCredentialOnce(ctx, &endpoint, plan.AttemptID, request)
+		credential, requestID, err := c.refreshCredentialOnce(ctx, &endpoint, request, idempotencyKey, bearer)
 		if err == nil || !credentialRefreshRetryable(err) || time.Now().Add(delay).After(deadline) {
 			return credential, requestID, err
 		}
@@ -241,20 +277,17 @@ func (c *Client) RefreshCredential(ctx context.Context, plan protocol.SessionPla
 	}
 }
 
-func (c *Client) refreshCredentialOnce(ctx context.Context, endpoint *url.URL, attemptID string, request CredentialRefreshRequest) (protocol.DelegatedCredential, string, error) {
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		return protocol.DelegatedCredential{}, "", fmt.Errorf("controlplane: credential refresh key: %w", err)
-	}
-	// Every refresh is a new mint (a single-use token cannot be replayed), so
-	// the key only correlates this one request.
-	idempotencyKey := "credential:" + attemptID + ":" + hex.EncodeToString(nonce)
+func (c *Client) refreshCredentialOnce(ctx context.Context, endpoint *url.URL, request CredentialRefreshRequest, idempotencyKey, bearer string) (protocol.DelegatedCredential, string, error) {
+	// One reconnect intent retains its key across ambiguous delivery retries.
+	// A later invocation creates a new key only for a genuinely new reconnect.
 	var credential protocol.DelegatedCredential
-	requestID, err := c.postJSON(ctx, endpoint, request, idempotencyKey, &credential)
+	client := *c.httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	body, requestID, err := c.postAuthenticated(ctx, endpoint, request, idempotencyKey, bearer, &client)
 	if err != nil {
 		return protocol.DelegatedCredential{}, requestID, err
 	}
-	if strings.TrimSpace(credential.Value) == "" || credential.Kind == "" {
+	if json.Unmarshal(body, &credential) != nil || strings.TrimSpace(credential.Value) == "" || credential.Kind == "" {
 		return protocol.DelegatedCredential{}, requestID, errors.New("controlplane: credential refresh response contained no credential")
 	}
 	return credential, requestID, nil
@@ -273,17 +306,21 @@ func (c *Client) postPlan(ctx context.Context, endpoint *url.URL, value any, ide
 	if err != nil {
 		return requestID, err
 	}
+	return requestID, decodePlan(body, target)
+}
+
+func decodePlan(body []byte, target *protocol.SessionPlan) error {
 	if err := json.Unmarshal(body, target); err == nil && target.Signature != "" {
-		return requestID, nil
+		return nil
 	}
 	var wrapped struct {
 		Plan protocol.SessionPlan `json:"plan"`
 	}
 	if err := json.Unmarshal(body, &wrapped); err != nil || wrapped.Plan.Signature == "" {
-		return requestID, errors.New("controlplane: response did not contain a signed session plan")
+		return errors.New("controlplane: response did not contain a signed session plan")
 	}
 	*target = wrapped.Plan
-	return requestID, nil
+	return nil
 }
 
 func (c *Client) postJSON(ctx context.Context, endpoint *url.URL, value any, idempotencyKey string, target any) (string, error) {

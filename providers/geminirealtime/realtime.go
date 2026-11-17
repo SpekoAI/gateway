@@ -88,6 +88,17 @@ func (a *Adapter) ID() string { return a.id }
 // Open establishes the constrained Google socket and waits for setupComplete.
 // The Engine emits the canonical session.ready event after this returns.
 func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
+	stream, err := a.openSocket(ctx, request, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	if request.Continuation {
+		return newResumableStream(a, request, stream), nil
+	}
+	return stream, nil
+}
+
+func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequest, handle string, responding *atomic.Bool) (*liveStream, error) {
 	if request.Kind != protocol.SessionKindRealtime {
 		return nil, fmt.Errorf("gemini realtime supports realtime sessions, got %q", request.Kind)
 	}
@@ -134,12 +145,20 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
+	if responding == nil {
+		responding = &atomic.Bool{}
+	}
 	stream := &liveStream{
 		conn: conn, ctx: streamCtx, cancel: cancel,
 		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), setupDone: make(chan error, 1),
-		inputMIME: fmt.Sprintf("audio/pcm;rate=%d", request.Media.SampleRateHz),
+		inputMIME:  fmt.Sprintf("audio/pcm;rate=%d", request.Media.SampleRateHz),
+		responding: responding,
 	}
-	if err := stream.writeJSON(ctx, buildSetup("models/"+model, request.Options)); err != nil {
+	setup := buildSetup("models/"+model, request.Options)
+	if handle != "" {
+		setup["setup"].(map[string]any)["sessionResumption"] = map[string]any{"handle": handle}
+	}
+	if err := stream.writeJSON(ctx, setup); err != nil {
 		_ = stream.abort()
 		return nil, err
 	}
@@ -259,15 +278,17 @@ type liveStream struct {
 	inputMIME string
 	setupDone chan error
 
-	writeMu      sync.Mutex
-	gracefulOnce sync.Once
-	abortOnce    sync.Once
-	setupOnce    sync.Once
-	closed       atomic.Bool
-	closeErr     error
-	responding   atomic.Bool
-	terminalMu   sync.Mutex
-	terminalErr  error
+	writeMu          sync.Mutex
+	gracefulOnce     sync.Once
+	abortOnce        sync.Once
+	setupOnce        sync.Once
+	closed           atomic.Bool
+	closeErr         error
+	responding       *atomic.Bool
+	terminalMu       sync.Mutex
+	terminalErr      error
+	resumptionMu     sync.Mutex
+	resumptionHandle string
 }
 
 func (s *liveStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -361,6 +382,10 @@ func (s *liveStream) emit(event runtimepkg.ProviderEvent) {
 func (s *liveStream) settleSetup(err error) { s.setupOnce.Do(func() { s.setupDone <- err }) }
 
 type serverMessage struct {
+	SessionResumptionUpdate *struct {
+		Resumable bool   `json:"resumable"`
+		NewHandle string `json:"newHandle"`
+	} `json:"sessionResumptionUpdate"`
 	SetupComplete *json.RawMessage `json:"setupComplete"`
 	ServerContent *struct {
 		ModelTurn *struct {
@@ -404,6 +429,15 @@ func (s *liveStream) readLoop() {
 }
 
 func (s *liveStream) handle(message serverMessage, raw []byte) {
+	if update := message.SessionResumptionUpdate; update != nil {
+		s.resumptionMu.Lock()
+		if !update.Resumable {
+			s.resumptionHandle = ""
+		} else if update.NewHandle != "" && len(update.NewHandle) <= 16<<10 {
+			s.resumptionHandle = update.NewHandle
+		}
+		s.resumptionMu.Unlock()
+	}
 	if message.SetupComplete != nil {
 		s.settleSetup(nil)
 	}

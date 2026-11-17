@@ -1,0 +1,362 @@
+package runtime
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/SpekoAI/gateway/controlplane"
+	"github.com/SpekoAI/gateway/protocol"
+)
+
+const renewalLead = 15 * time.Second
+
+// fundedClock uses SQL time plus a conservative full RTT. Wall/monotonic
+// divergence pauses traffic until a shared new sample succeeds. The last
+// accepted hard timer stays armed throughout that request.
+type fundedClock struct {
+	client                       EntitlementClient
+	plan                         protocol.SessionPlan
+	wall                         func() time.Time
+	refreshMu                    sync.Mutex
+	mu                           sync.Mutex
+	server, localWall, monotonic time.Time
+}
+
+func (c *fundedClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.server.Add(max(time.Since(c.monotonic), c.wall().Sub(c.localWall), 0))
+}
+
+// A failed resynchronization must not stamp durable receipts with an
+// arbitrary wall-clock jump. Until a new SQL sample arrives, retain the last
+// trusted sample plus monotonic elapsed time for event timestamps.
+func (c *fundedClock) timestamp() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.server.Add(max(time.Since(c.monotonic), 0))
+}
+
+func (c *fundedClock) stale() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delta := c.wall().Sub(c.localWall) - time.Since(c.monotonic)
+	return c.server.IsZero() || delta > time.Second || delta < -time.Second
+}
+
+func (c *fundedClock) synchronize(ctx context.Context) (bool, error) {
+	if !c.stale() {
+		return false, nil
+	}
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	if !c.stale() {
+		return false, nil
+	}
+	for range 2 {
+		started, wallStarted := time.Now(), c.wall()
+		sampleCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		sample, err := c.client.EntitlementClock(sampleCtx, c.plan)
+		cancel()
+		if err != nil {
+			return false, err
+		}
+		received, wall := time.Now(), c.wall()
+		elapsed, wallElapsed := received.Sub(started), wall.Sub(wallStarted)
+		if delta := wallElapsed - elapsed; delta > time.Second || delta < -time.Second {
+			continue
+		}
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		c.mu.Lock()
+		c.server, c.localWall, c.monotonic = sample.Add(max(elapsed, wallElapsed, 0)), wall, received
+		c.mu.Unlock()
+		return true, nil
+	}
+	return false, errors.New("runtime: clock changed during entitlement synchronization")
+}
+
+func renewableGoogle(plan protocol.SessionPlan) bool {
+	b := plan.Reservation.Billing
+	return plan.Execution.CredentialSource == protocol.CredentialsManaged &&
+		plan.Execution.ProviderRoute == protocol.RouteProviderDirect && plan.Route.Provider == "google" &&
+		plan.Route.Adapter == "google.live.v1" && b != nil && b.RenewalURL != "" &&
+		b.RenewableUntil.After(plan.Reservation.LeaseExpiresAt)
+}
+
+type continuation struct {
+	ctx                                context.Context
+	cancel                             context.CancelFunc
+	session                            *Session
+	client                             EntitlementClient
+	clock                              *fundedClock
+	stream                             ResumableProviderStream
+	mu                                 sync.Mutex
+	expires                            time.Time
+	sequence                           int64
+	authorizedUnits                    int64
+	pending, paused, disabled, closing bool
+	changed                            chan struct{}
+}
+
+func (c *continuation) close() bool {
+	c.mu.Lock()
+	c.closing, c.disabled, c.pending = true, true, false
+	paused := c.paused
+	c.mu.Unlock()
+	c.cancel()
+	return paused
+}
+
+func (c *continuation) notifyLocked() { close(c.changed); c.changed = make(chan struct{}) }
+
+func (c *continuation) synchronize(ctx context.Context) error {
+	refreshed, err := c.clock.synchronize(ctx)
+	if err != nil {
+		return err
+	}
+	if refreshed {
+		c.mu.Lock()
+		if !c.paused && c.session.ctx.Err() == nil {
+			c.session.setLeaseDeadline(c.expires)
+		}
+		c.mu.Unlock()
+	}
+	return nil
+}
+
+func (c *continuation) beforeIO() error {
+	for {
+		if err := c.synchronize(c.session.ctx); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		paused, expires, changed := c.paused, c.expires, c.changed
+		c.mu.Unlock()
+		if c.session.ctx.Err() != nil {
+			return ErrSessionClosed
+		}
+		if !paused && c.clock.now().Before(expires) {
+			return nil
+		}
+		if !paused {
+			c.expire(expires)
+			continue
+		}
+		select {
+		case <-changed:
+		case <-c.session.ctx.Done():
+			return ErrSessionClosed
+		}
+	}
+}
+
+func (c *continuation) ready() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.paused && !c.clock.stale() && c.clock.now().Before(c.expires) && c.session.ctx.Err() == nil
+}
+
+func (c *continuation) audioFits(accepted, frame int64) bool {
+	c.mu.Lock()
+	units := c.authorizedUnits
+	c.mu.Unlock()
+	bytesPerSecond := int64(c.session.media.SampleRateHz) * int64(c.session.media.Channels) * 2
+	maximum := int64(math.MaxInt64)
+	if units <= math.MaxInt64/bytesPerSecond {
+		maximum = units * bytesPerSecond
+	}
+	return frame <= maximum-accepted
+}
+
+// expire detaches the old socket even when a committed renewal response is
+// missing. Recovery may use that same pending intent, never that old socket.
+func (c *continuation) expire(expected time.Time) {
+	c.mu.Lock()
+	if c.paused || !c.expires.Equal(expected) || c.clock.now().Before(expected) {
+		c.mu.Unlock()
+		return
+	}
+	c.paused = true
+	recoverable := c.pending && c.stream.CanResume()
+	c.stream.Detach()
+	c.notifyLocked()
+	c.mu.Unlock()
+	if !recoverable {
+		c.session.fail(ErrSessionLeaseExpired)
+	}
+}
+
+func (c *continuation) run() {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := c.synchronize(c.ctx); err != nil {
+			if c.ctx.Err() == nil {
+				c.session.fail(errors.New("runtime: entitlement clock unavailable"))
+			}
+			return
+		}
+		c.mu.Lock()
+		remaining := c.expires.Sub(c.clock.now())
+		if !c.pending && !c.disabled && remaining <= renewalLead && c.expires.Before(c.session.plan.Reservation.Billing.RenewableUntil) {
+			c.pending = true
+			go c.renew(c.expires)
+		}
+		c.mu.Unlock()
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *continuation) renew(previous time.Time) {
+	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+	defer cancel()
+	key := "renew:" + c.session.plan.AttemptID + ":" + previous.UTC().Format(time.RFC3339Nano)
+	var issued *controlplane.EntitlementRenewal
+	var failure error
+	attempts := 0
+	for ctx.Err() == nil {
+		if err := c.synchronize(ctx); err != nil {
+			failure = err
+			break
+		}
+		now := c.clock.now()
+		if !now.Before(c.session.plan.Reservation.Billing.RenewableUntil) {
+			failure = ErrSessionLeaseExpired
+			break
+		}
+		if !c.stream.CanResume() {
+			if !now.Before(previous) {
+				failure = ErrResumptionUnavailable
+				break
+			}
+			if !continuationWait(ctx) {
+				break
+			}
+			continue
+		}
+		if attempts == 3 {
+			break
+		}
+		attempts++
+		requestCtx, requestCancel := context.WithTimeout(ctx, 3*time.Second)
+		renewal, _, err := c.client.RenewEntitlement(requestCtx, c.session.plan, controlplane.EntitlementRenewalRequest{PreviousExpiresAt: previous}, key)
+		requestCancel()
+		if ctx.Err() != nil {
+			break
+		}
+		if err != nil {
+			failure = err
+			var refusal *controlplane.HTTPError
+			if errors.As(err, &refusal) && refusal.Status != http.StatusServiceUnavailable && refusal.Status < 500 {
+				break
+			}
+			if !continuationWait(ctx) {
+				break
+			}
+			continue
+		}
+		if renewal.Validate(c.session.plan, previous) != nil {
+			failure = errors.New("runtime: invalid funded continuation")
+			break
+		}
+		if issued != nil && *issued != renewal {
+			failure = errors.New("runtime: funded continuation changed on replay")
+			break
+		}
+		issued = &renewal
+		c.mu.Lock()
+		sequence := c.sequence
+		authorized := c.authorizedUnits
+		c.mu.Unlock()
+		if sequence == math.MaxInt64 || renewal.Sequence != sequence+1 || renewal.AuthorizedUnits > math.MaxInt64-authorized {
+			failure = errors.New("runtime: invalid funded continuation sequence")
+			break
+		}
+		if err := c.synchronize(ctx); err != nil {
+			failure = err
+			break
+		}
+		if !c.clock.now().Before(renewal.Credential.ExpiresAt) {
+			failure = ErrSessionLeaseExpired
+			break
+		}
+		// A resumability withdrawal during HTTP requires a fresh same-key delivery
+		// check once another handle arrives. Never silently start a new conversation.
+		if !c.stream.CanResume() {
+			continue
+		}
+		c.session.providerMu.Lock()
+		c.mu.Lock()
+		if ctx.Err() != nil {
+			c.mu.Unlock()
+			c.session.providerMu.Unlock()
+			break
+		}
+		c.paused = true
+		c.session.stopLeaseTimer()
+		c.stream.Detach()
+		c.notifyLocked()
+		c.mu.Unlock()
+		resumeCtx, resumeCancel := context.WithTimeout(ctx, renewal.Credential.ExpiresAt.Sub(c.clock.now()))
+		err = c.stream.Resume(resumeCtx, renewal.Credential)
+		c.session.providerMu.Unlock()
+		resumeCancel()
+		if err != nil {
+			failure = err
+			break
+		}
+		if err := c.synchronize(ctx); err != nil {
+			failure = err
+			break
+		}
+		c.mu.Lock()
+		if ctx.Err() != nil || !c.clock.now().Before(renewal.LeaseExpiresAt) {
+			c.mu.Unlock()
+			failure = ErrSessionLeaseExpired
+			break
+		}
+		c.expires, c.sequence, c.paused, c.pending = renewal.LeaseExpiresAt, renewal.Sequence, false, false
+		c.authorizedUnits += renewal.AuthorizedUnits
+		c.session.setLeaseDeadline(c.expires)
+		c.notifyLocked()
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Lock()
+	c.pending, c.disabled = false, true
+	paused := c.paused
+	closing := c.closing
+	c.notifyLocked()
+	c.mu.Unlock()
+	if paused && !closing && c.session.ctx.Err() == nil {
+		if failure == nil {
+			failure = ctx.Err()
+		}
+		if failure == nil {
+			failure = errors.New("renewal delivery retry budget exhausted")
+		}
+		c.session.fail(fmt.Errorf("runtime: funded continuation unavailable: %w", failure))
+	}
+}
+
+func continuationWait(ctx context.Context) bool {
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}

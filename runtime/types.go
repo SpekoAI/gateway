@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/SpekoAI/gateway/controlplane"
 	"github.com/SpekoAI/gateway/protocol"
 )
 
@@ -85,7 +86,29 @@ type OpenRequest struct {
 	Delivery              AudioDeliveryMode
 	// RefreshCredential is passed through to AdapterRequest unchanged.
 	RefreshCredential CredentialRefresher
+	// Entitlements enables SQL-clock lease checks and bounded continuation when
+	// the adapter permits it. Managed Google resumption currently stays refused.
+	// No caller-supplied replacement plan or allowance is accepted.
+	Entitlements EntitlementClient
 }
+
+// EntitlementClient is implemented by the hosted control-plane client.
+type EntitlementClient interface {
+	EntitlementClock(context.Context, protocol.SessionPlan) (time.Time, error)
+	RenewEntitlement(context.Context, protocol.SessionPlan, controlplane.EntitlementRenewalRequest, string) (controlplane.EntitlementRenewal, string, error)
+}
+
+// ResumableProviderStream keeps one event source across funded socket changes.
+// Detach must promptly stop the current socket, independently of an in-flight
+// HTTP renewal or Resume. Resume must wait for provider setup acknowledgment.
+type ResumableProviderStream interface {
+	ProviderStream
+	CanResume() bool
+	Detach()
+	Resume(context.Context, protocol.DelegatedCredential) error
+}
+
+var ErrResumptionUnavailable = errors.New("runtime: provider resumption handle unavailable")
 
 // CredentialRefresher obtains a fresh delegated credential for the SAME plan
 // attempt: same route, same reservation, no new attempt. It exists for
@@ -115,10 +138,12 @@ type Adapter interface {
 
 // AdapterRequest contains the concrete, already-validated execution choice.
 type AdapterRequest struct {
-	Kind    protocol.SessionKind
-	Plan    protocol.SessionPlan
-	Options protocol.RequestOptions
-	Media   *protocol.MediaFormat
+	// Continuation requests a stable ResumableProviderStream event source.
+	Continuation bool
+	Kind         protocol.SessionKind
+	Plan         protocol.SessionPlan
+	Options      protocol.RequestOptions
+	Media        *protocol.MediaFormat
 	// Delivery identifies whether audio is arriving at real-time cadence or
 	// from a buffered upload. Adapters that require real-time pacing use it to
 	// pace only buffered input and avoid adding latency to live streams.
