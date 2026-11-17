@@ -174,6 +174,7 @@ class _GPTLiveSession(_Session):
         self._pending_reply_instructions: str | None = None
         self._pending_reply_future: asyncio.Future | None = None
         self._pending_reply_timer: asyncio.TimerHandle | None = None
+        self._reply_attribution_lost = False
         self._socket: RelayRealtimeSession | None = None
         self._resampler: rtc.AudioResampler | None = None
         self._input_format: tuple[int, int] | None = None
@@ -295,6 +296,14 @@ class _GPTLiveSession(_Session):
     def _generate_reply(
         self, *, instructions=NOT_GIVEN, tool_choice=NOT_GIVEN, tools=NOT_GIVEN
     ) -> None:
+        pending = self._pending_reply_future
+        if pending is not None and pending.cancelled():
+            self._retire_pending_reply(pending)
+        if self._reply_attribution_lost or self._pending_reply_instructions is not None:
+            # No provider ask ID/drain barrier distinguishes a late OLD
+            # delegation from the next request. Keep caller audio/delegation
+            # live, but never install replacement instructions by guesswork.
+            raise llm.RealtimeError("GPT-Live has an unattributed earlier reply")
         self._update_options(tool_choice=tool_choice)
         if is_given(tools) and tools != self._tools.flatten():
             raise llm.RealtimeError("GPT-Live does not support per-response tools")
@@ -308,9 +317,15 @@ class _GPTLiveSession(_Session):
         self._append("session.commentary.append", ask)
         self._pending_reply_instructions = ask
 
-    def _retire_pending_reply(self, future: asyncio.Future | None = None) -> None:
+    def _retire_pending_reply(
+        self, future: asyncio.Future | None = None, *, claimed: bool = False
+    ) -> None:
         if future is not None and self._pending_reply_future is not future:
             return
+        if self._pending_reply_instructions is not None and not claimed:
+            # A permanent local fence, not an invented provider cancellation
+            # ACK. Transcript/append ACKs and unseen IDs cannot clear it.
+            self._reply_attribution_lost = True
         pending = self._pending_reply_future
         if self._pending_reply_timer is not None and (
             pending is None or pending.done()
@@ -444,7 +459,7 @@ class _GPTLiveSession(_Session):
                 context.add_message(
                     role="system", content=self._pending_reply_instructions
                 )
-                self._retire_pending_reply()
+                self._retire_pending_reply(claimed=True)
             fragments = [f for f in self._fragments if f["end_ms"] <= offset]
             if fragments:
                 context.add_message(
@@ -708,15 +723,15 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
         if self._reply is not None and not self._reply.done():
             future.set_exception(llm.RealtimeError("GPT-Live reply is already pending"))
             return future
-        self._reply = future
         try:
             self.duplex_session._generate_reply(
                 instructions=instructions, tool_choice=tool_choice, tools=tools
             )
-        except (llm.RealtimeError, GatewayError):
-            self._fail_reply()
+        except (llm.RealtimeError, GatewayError) as error:
+            future.set_exception(error)
             return future
 
+        self._reply = future
         self.duplex_session._pending_reply_future = future
 
         def expire():

@@ -198,6 +198,7 @@ class _RealtimeSession(llm.RealtimeSession):
         self._input_rate: int | None = None
         self._input_hz = 16000 if self._google else 24000
         self._audio_active = self._committed = False
+        self._activity_interrupt_target: _Generation | None = None
         self._closed = False
         self._failure: GatewayError | None = None
         self._input_text = ""
@@ -347,6 +348,7 @@ class _RealtimeSession(llm.RealtimeSession):
         if self._google and self._manual_turns and not self._audio_active:
             self._enqueue({"realtimeInput": {"activityStart": {}}})
             self._audio_active = True
+            self._activity_interrupt_target = self._generation
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if frame.num_channels != 1:
@@ -396,6 +398,7 @@ class _RealtimeSession(llm.RealtimeSession):
             if self._manual_turns and self._audio_active:
                 self._enqueue({"realtimeInput": {"activityEnd": {}}})
                 self._audio_active = False
+                self._activity_interrupt_target = None
                 self._committed = True
         else:
             self._enqueue({"type": "input_audio_buffer.commit"})
@@ -477,16 +480,23 @@ class _RealtimeSession(llm.RealtimeSession):
                     {"type": "response.cancel", "response_id": self._generation.id}
                 )
             elif self._manual_turns:
-                if not self._model._allow_interruptions or self._audio_active:
-                    # An already-open real input activity cannot be pulsed
-                    # again without altering that caller turn. Close the owned
-                    # transport when an unambiguous cancellation is unavailable.
+                if not self._model._allow_interruptions or (
+                    self._audio_active
+                    and self._activity_interrupt_target is not self._generation
+                ):
+                    # Input opened before this generation cannot cancel it.
+                    # Close only when cancellation is actually unavailable.
                     self._fatal(
                         GatewayError(
                             "Realtime provider cancellation is unavailable",
                             retryable=False,
                         )
                     )
+                    return
+                if self._audio_active:
+                    # External VAD queues a real activityStart targeting this
+                    # generation, then calls interrupt. Preserve its audio/end
+                    # on the same socket; do not pulse or terminate that input.
                     return
                 # A local interrupt of an ACTIVE generation must reach Gemini.
                 # Balance the cancellation pulse without claiming caller audio

@@ -33,8 +33,10 @@ activity. Explicit interruption of an active manual generation requests provider
 cancellation with balanced `activityStart`/`activityEnd` controls; subsequent real
 input still starts its own activity boundary. These are the provider's
 [manual VAD controls](https://ai.google.dev/gemini-api/docs/live-guide#disable-automatic-vad).
-If activity interruption is disabled or real input is already open, explicit
-interruption closes the owned transport. Gemini
+External VAD queues a real activity start before interrupting playback; that
+start cancels the targeted generation while its caller audio/end stays on the
+same socket. If interruption is disabled or the open activity predates the
+current generation, explicit interruption closes the owned transport. Gemini
 function tools are refused before socket creation: supported framework versions
 execute the Agent's original tools and expose no per-call cancellation hook for
 `toolCallCancellation`. This also refuses extended-thinking tool sessions. Native
@@ -52,11 +54,19 @@ to later delegations; results that request no reply are sent as silent context.
 Explicit reply instructions belong only to the next new delegation and its tool
 rounds. A spoken preamble does not retire the task or renew its original
 15-second application timeout. New caller words, typed input, explicit activity,
-a superseding reply, cancellation, failure or expiration retire unclaimed tasks.
+cancellation, failure or expiration retire unclaimed tasks.
 The reply future and this task lifetime are separate: cancellation callbacks
 retire only their own task/timer, and delayed old callbacks cannot clear a new ask.
 These are application conversation rules, not execution or financial authority;
 see [client delegation task state](https://developers.openai.com/api/docs/guides/live-delegation).
+An explicit ask cannot replace an unclaimed task, including after a preamble.
+Retiring an unclaimed task permanently fences further explicit asks on that
+connection: delegation IDs and offsets contain no per-ask correlation, and
+append acknowledgements do not establish that old delegations have drained.
+Late IDs, new caller words and elapsed time cannot clear that fence. Caller
+audio and ordinary transcript-based delegations continue on the same socket;
+claimed task/tool rounds and successive unambiguous replies remain supported.
+There is no automatic redial or history injection to bypass the fence.
 Long Unicode results are split losslessly into bounded native appends.
 
 GPT-Live transcript deltas remain timed fragments, not completed caller turns.

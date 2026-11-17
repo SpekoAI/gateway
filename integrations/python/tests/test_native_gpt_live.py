@@ -52,10 +52,8 @@ def models(socket):
     return voice, backend_client, backend, model
 
 
-@pytest.mark.parametrize("first_delegates", [True, False])
 async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
     native_binary,
-    first_delegates,
 ):
     requests, opened, errors = [], [], []
     finished = asyncio.Queue()
@@ -74,7 +72,7 @@ async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
             body = await request.json()
             requests.append((body, request.headers.copy()))
             index = len(requests) - 1
-            if index in ((0, 2) if first_delegates else (0,)):
+            if index in (0, 2):
                 return response(
                     [
                         (
@@ -105,17 +103,8 @@ async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
         for index, task in enumerate(tasks):
             ask = await ws.receive_json()
             assert task in ask["content"] and ask["delegation_id"] is None
-            if index == 0 and not first_delegates:
-                await ws.send_json(
-                    {
-                        "type": "session.output_audio.delta",
-                        "delta": base64.b64encode(b"\x01\x10" * 2400).decode(),
-                    }
-                )
-                finished.put_nowait(index)
-                continue
-            if index and first_delegates:
-                # A redelivered old delegation cannot consume the new ask.
+            if index:
+                # A redelivered known delegation cannot consume the new ask.
                 await ws.send_json(delegation("del_reply_0"))
             identity = f"del_reply_{index}"
             await ws.send_json(delegation(identity))
@@ -152,31 +141,25 @@ async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
                 messages, calls = await asyncio.wait_for(
                     collect_generation(generation), 5
                 )
-                if index == 0 and not first_delegates:
-                    assert len(messages) == 1 and calls == []
-                else:
-                    assert messages == [] and len(calls) == 1
-                    context = session.chat_ctx
-                    context.items.append(
-                        llm.FunctionCallOutput(
-                            call_id=calls[0].call_id,
-                            name=calls[0].name,
-                            output="owned-result",
-                            is_error=False,
-                        )
+                assert messages == [] and len(calls) == 1
+                context = session.chat_ctx
+                context.items.append(
+                    llm.FunctionCallOutput(
+                        call_id=calls[0].call_id,
+                        name=calls[0].name,
+                        output="owned-result",
+                        is_error=False,
                     )
-                    await session.update_chat_ctx(context)
+                )
+                await session.update_chat_ctx(context)
                 assert await asyncio.wait_for(finished.get(), 5) == index
             await asyncio.wait_for(unrelated_done.wait(), 5)
             inputs = [json.dumps(body["input"]) for body, _ in requests]
-            count = 5 if first_delegates else 3
+            count = 5
             assert len(inputs) == count and len(opened) == 1 and errors == []
-            if first_delegates:
-                assert all(
-                    tasks[0] in value and tasks[1] not in value for value in inputs[:2]
-                )
-            else:
-                assert all(tasks[0] not in value for value in inputs)
+            assert all(
+                tasks[0] in value and tasks[1] not in value for value in inputs[:2]
+            )
             assert all(
                 tasks[1] in value and tasks[0] not in value for value in inputs[-3:-1]
             )
@@ -297,6 +280,11 @@ async def test_gpt_live_preamble_keeps_task_until_delegation_then_new_input_reti
             assert not timer.cancelled(), (
                 "a preamble cannot cancel the original task expiration"
             )
+            with pytest.raises(llm.RealtimeError, match="unattributed"):
+                await session.generate_reply(
+                    instructions="AMBIGUOUS_PREAMBLE_REPLACEMENT"
+                )
+            assert task in session.duplex_session._pending_reply_instructions
             allow_delegation.set()
             if delegates:
                 generation = await asyncio.wait_for(generations.get(), 5)
@@ -331,23 +319,24 @@ async def test_gpt_live_preamble_keeps_task_until_delegation_then_new_input_reti
             await voice.aclose()
 
 
-@pytest.mark.parametrize("late_before_next", [True, False])
-async def test_gpt_live_agent_interrupt_retires_cancelled_future_before_next_ask(
-    native_binary,
-    late_before_next,
+@pytest.mark.parametrize("retire", ["cancel", "expire"])
+@pytest.mark.parametrize("old_before_replacement", [False, True])
+async def test_gpt_live_fences_replacement_before_old_then_new_delegation(
+    native_binary, retire, old_before_replacement
 ):
     from livekit.agents import Agent, AgentSession
 
-    first_seen, cancelled, late_done, done = (asyncio.Event() for _ in range(4))
-    requests, opened = [], []
-    cancelled_task, next_task = "CANCELLED_ONE_OFF_TASK", "NEW_ONE_OFF_TASK"
+    requests, commands, opened = [], [], []
+    first_seen, release_old, done = (asyncio.Event() for _ in range(3))
+    old_done, release_new = asyncio.Event(), asyncio.Event()
+    old, replacement = "RETIRED_OLD_TASK", "REPLACEMENT_MUST_NOT_BE_MISATTRIBUTED"
 
     async def peer(request):
         if request.path == "/v1/llm/responses":
             requests.append(await request.json())
             return response(
                 [
-                    ("response.text.delta", {"delta": "Synthetic answer"}),
+                    ("response.text.delta", {"delta": "Owned backend answer"}),
                     ("response.completed", {}),
                 ]
             )
@@ -356,39 +345,47 @@ async def test_gpt_live_agent_interrupt_retires_cancelled_future_before_next_ask
         await ws.prepare(request)
         await ws.receive_json()
         await ws.send_json({"type": "session.started"})
-        assert cancelled_task in (await ws.receive_json())["content"]
+        assert old in (await ws.receive_json())["content"]
         first_seen.set()
-        await cancelled.wait()
-        if late_before_next:
+        await release_old.wait()
+        # The reversed case requests replacement before releasing OLD. Equal
+        # old/new offsets cannot establish which application ask caused either.
+        for identity in ["del_old_after_replacement", "del_new_caller"]:
+            if identity == "del_new_caller":
+                await ws.send_json(
+                    {
+                        "type": "session.input_transcript.delta",
+                        "delta": "A supported fresh caller request",
+                        "start_ms": 0,
+                        "end_ms": 0,
+                    }
+                )
             await ws.send_json(
                 {
                     "type": "session.delegation.created",
                     "offset_ms": 0,
-                    "delegation": {"id": "del_cancelled_late", "target": "client"},
+                    "delegation": {"id": identity, "target": "client"},
                 }
             )
-            await ws.receive_json()
-            late_done.set()
-        assert next_task in (await ws.receive_json())["content"]
+            while True:
+                command = await ws.receive_json()
+                commands.append(command)
+                if command.get("delegation_id") == identity:
+                    break
+            if identity == "del_old_after_replacement":
+                old_done.set()
+                await release_new.wait()
         await ws.send_json(
             {
-                "type": "session.delegation.created",
-                "offset_ms": 0,
-                "delegation": {"id": "del_new_request", "target": "client"},
+                "type": "session.output_audio.delta",
+                "delta": base64.b64encode(b"\x01\x10" * 2400).decode(),
             }
         )
-        await ws.receive_json()
-        await ws.send_json(
-            {
-                "type": "session.delegation.created",
-                "offset_ms": 0,
-                "delegation": {"id": "del_late_after_new_request", "target": "client"},
-            }
-        )
-        await ws.receive_json()
         done.set()
         async for message in ws:
-            if json.loads(message.data)["type"] == "session.close":
+            command = json.loads(message.data)
+            commands.append(command)
+            if command["type"] == "session.close":
                 await ws.send_json({"type": "session.closed"})
         return ws
 
@@ -398,117 +395,60 @@ async def test_gpt_live_agent_interrupt_retires_cancelled_future_before_next_ask
         session = AgentSession(
             llm=model, turn_detection="manual", vad=None, stt=None, tts=None
         )
+        attempted = None
         try:
             await session.start(agent=agent, record=False)
-            session.generate_reply(instructions=cancelled_task)
-            await asyncio.wait_for(first_seen.wait(), 5)
             adapter = agent._activity._rt_session
+            caller_reply = asyncio.Event()
+            adapter.on("generation_created", lambda _: caller_reply.set())
+            if retire == "expire":
+                adapter._reply_timeout = 0.05
+            speech = session.generate_reply(instructions=old)
+            await asyncio.wait_for(first_seen.wait(), 5)
             reply = adapter._reply
             timer = adapter.duplex_session._pending_reply_timer
-            await asyncio.wait_for(session.interrupt(), 5)
-            assert reply.cancelled(), (
-                "test must exercise LiveKit's actual cancelled reply future"
-            )
-            retained_after_cancel = adapter.duplex_session._pending_reply_instructions
-            cancelled.set()
-            if late_before_next:
-                await asyncio.wait_for(late_done.wait(), 5)
-            session.generate_reply(instructions=next_task)
+            if retire == "cancel":
+                await asyncio.wait_for(session.interrupt(), 5)
+                assert reply.cancelled()
+            else:
+                with pytest.raises(llm.RealtimeError, match="timed out"):
+                    await asyncio.wait_for(asyncio.shield(reply), 5)
+                await asyncio.wait_for(speech, 5)
+            if old_before_replacement:
+                release_old.set()
+                await asyncio.wait_for(old_done.wait(), 5)
+            # Same SDK adapter, after the real framework cancellation/expiry;
+            # call synchronously before releasing the reversed provider events.
+            adapter._reply_timeout = 15
+            attempted = adapter.generate_reply(instructions=replacement)
+            adapter.push_audio(rtc.AudioFrame(b"\x02\x10" * 480, 24000, 1, 480))
+            release_old.set()
+            release_new.set()
             await asyncio.wait_for(done.wait(), 5)
-            assert retained_after_cancel is None
+            await asyncio.wait_for(caller_reply.wait(), 5)
+            assert len(opened) == 1 and len(requests) == 2
+            assert replacement not in json.dumps(requests), (
+                "OLD delegation claimed replacement instructions"
+            )
+            assert old not in json.dumps(requests)
+            assert "fresh caller request" in json.dumps(requests[1]["input"])
+            assert replacement not in json.dumps(commands)
+            audio = [c for c in commands if c["type"] == "session.input_audio.append"]
+            assert len(audio) == 1
+            assert base64.b64decode(audio[0]["audio"]) == b"\x02\x10" * 480
+            with pytest.raises(llm.RealtimeError, match="unattributed"):
+                await attempted
             assert timer.cancelled()
-            assert len(requests) == (3 if late_before_next else 2) and len(opened) == 1
-            inputs = [json.dumps(body["input"]) for body in requests]
-            assert all(cancelled_task not in value for value in inputs)
-            assert next_task in inputs[-2] and next_task not in inputs[-1]
             assert adapter.duplex_session._pending_reply_instructions is None
-            assert cancelled_task not in str(adapter.duplex_session._history)
+            assert replacement not in str(adapter.duplex_session._history)
         finally:
-            cancelled.set()
-            await session.aclose()
-            await model.aclose()
-            await backend.aclose()
-            await backend_client.aclose()
-            await voice.aclose()
-
-
-async def test_gpt_live_expiration_retires_task_and_late_delegation_before_next_ask(
-    native_binary,
-):
-    requests = []
-    release_late, late_done, done = (asyncio.Event() for _ in range(3))
-    expired_task, next_task = "EXPIRED_REPLY_TASK", "NEXT_REPLY_AFTER_EXPIRATION"
-
-    async def peer(request):
-        if request.path == "/v1/llm/responses":
-            requests.append(await request.json())
-            return response(
-                [
-                    ("response.text.delta", {"delta": "Synthetic answer"}),
-                    ("response.completed", {}),
-                ]
-            )
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        await ws.receive_json()
-        await ws.send_json({"type": "session.started"})
-        await ws.receive_json()
-        await release_late.wait()
-        await ws.send_json(
-            {
-                "type": "session.delegation.created",
-                "offset_ms": 0,
-                "delegation": {"id": "del_expired_late", "target": "client"},
-            }
-        )
-        await ws.receive_json()
-        late_done.set()
-        assert next_task in (await ws.receive_json())["content"]
-        await ws.send_json(
-            {
-                "type": "session.delegation.created",
-                "offset_ms": 0,
-                "delegation": {"id": "del_after_expiration", "target": "client"},
-            }
-        )
-        await ws.receive_json()
-        done.set()
-        async for message in ws:
-            if json.loads(message.data)["type"] == "session.close":
-                await ws.send_json({"type": "session.closed"})
-        return ws
-
-    async with native_stack(native_binary, peer) as (socket, _):
-        voice, backend_client, backend, model = models(socket)
-        session = model.session()
-        try:
-            await session._update_session(instructions="Permanent prompt", tools=[])
-            await session.start()
-            session._reply_timeout = 0.1  # Actual local expiration, after native setup.
-            reply = session.generate_reply(instructions=expired_task)
-            timer = session.duplex_session._pending_reply_timer
-            with pytest.raises(llm.RealtimeError, match="timed out"):
-                await asyncio.wait_for(reply, 5)
-            release_late.set()
-            await asyncio.wait_for(late_done.wait(), 5)
-            assert (
-                timer.cancelled()
-                and session.duplex_session._pending_reply_instructions is None
-            )
-            session._reply_timeout = 15
-            following = session.generate_reply(instructions=next_task)
-            following_timer = session.duplex_session._pending_reply_timer
-            await asyncio.wait_for(done.wait(), 5)
-            following.cancel()
-            await asyncio.sleep(0)  # Run the real future's cancellation callback.
-            assert following_timer.cancelled()
-            assert len(requests) == 2
-            assert expired_task not in json.dumps(requests)
-            assert next_task not in json.dumps(requests[0]["input"])
-            assert next_task in json.dumps(requests[1]["input"])
-            assert expired_task not in str(session.duplex_session._history)
-        finally:
-            release_late.set()
+            release_old.set()
+            release_new.set()
+            if attempted is not None:
+                if not attempted.done():
+                    attempted.cancel()
+                elif not attempted.cancelled():
+                    attempted.exception()
             await session.aclose()
             await model.aclose()
             await backend.aclose()

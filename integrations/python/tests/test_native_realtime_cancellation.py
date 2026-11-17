@@ -10,7 +10,7 @@ import json
 import pytest
 from aiohttp import web
 from livekit import rtc
-from livekit.agents import Agent, AgentSession, llm
+from livekit.agents import Agent, AgentSession, llm, vad
 from livekit.agents.voice import io
 from test_native_sidecar import LOCAL_TOKEN, MODEL_KEY, native_stack
 from test_native_sidecar import native_binary as native_binary  # noqa: PLC0414
@@ -164,13 +164,13 @@ async def test_gemini_finishes_initial_history_before_live_audio(
 
 
 @pytest.mark.parametrize("manual", [False, True])
-@pytest.mark.parametrize("cause", ["provider", "explicit"])
+@pytest.mark.parametrize("cause", ["provider", "explicit", "external_vad"])
 async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
     native_binary,
     manual,
     cause,
 ):
-    if cause == "explicit" and not manual:
+    if cause != "provider" and not manual:
         pytest.skip("this regression targets explicit manual-turn cancellation")
     if (
         manual
@@ -250,7 +250,7 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
                 barrier_received.set()
                 break
             before_barrier.append(command)
-            if cause == "explicit" and "activityStart" in command.get(
+            if cause != "provider" and "activityStart" in command.get(
                 "realtimeInput", {}
             ):
                 # The owned provider stops its ACTIVE generation on the control,
@@ -272,10 +272,19 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
 
     async with native_stack(native_binary, peer) as (socket, _):
         client, model = client_model(socket)
+        detector = None
+        if cause == "external_vad":
+            from test_relay_speech_livekit import ControlledVAD
+
+            detector = ControlledVAD()
         agent = AgentSession(
             llm=model,
-            turn_detection="manual" if manual else "realtime_llm",
-            vad=None,
+            turn_detection="vad"
+            if cause == "external_vad"
+            else "manual"
+            if manual
+            else "realtime_llm",
+            vad=detector,
             stt=None,
             tts=None,
         )
@@ -290,6 +299,21 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
             await asyncio.wait_for(audible.wait(), 5)
             if cause == "explicit":
                 await asyncio.wait_for(agent.interrupt(), 5)
+            elif cause == "external_vad":
+                # Exercise LiveKit's real external-VAD callback: it calls
+                # start_user_activity THEN interrupt while speech is active.
+                current_agent._activity.on_vad_inference_done(
+                    vad.VADEvent(
+                        type=vad.VADEventType.INFERENCE_DONE,
+                        samples_index=16000,
+                        timestamp=1,
+                        speech_duration=1,
+                        silence_duration=0,
+                        speaking=True,
+                    )
+                )
+                assert native._audio_active and native._generation.interrupted
+                assert native._failure is None, "genuine caller barge-in aborted I/O"
             await asyncio.wait_for(cleared.wait(), 5)
             assert captured and len(captured) < 100
             assert speech.interrupted
@@ -307,15 +331,19 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
                     {"realtimeInput": {"activityEnd": {}}},
                 ]
                 if cause == "explicit"
+                else [{"realtimeInput": {"activityStart": {}}}]
+                if cause == "external_vad"
                 else []
             ), (
                 "explicit cancellation must reach the provider; feedback must not reopen activity"
             )
             if manual:
-                assert len(second_turn) == 3
-                assert second_turn[0] == {"realtimeInput": {"activityStart": {}}}
-                assert "audio" in second_turn[1]["realtimeInput"]
-                assert second_turn[2] == {"realtimeInput": {"activityEnd": {}}}
+                expected = 2 if cause == "external_vad" else 3
+                assert len(second_turn) == expected
+                if cause != "external_vad":
+                    assert second_turn[0] == {"realtimeInput": {"activityStart": {}}}
+                assert "audio" in second_turn[-2]["realtimeInput"]
+                assert second_turn[-1] == {"realtimeInput": {"activityEnd": {}}}
             else:
                 assert (
                     len(second_turn) == 1 and "audio" in second_turn[0]["realtimeInput"]
