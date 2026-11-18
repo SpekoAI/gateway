@@ -17,6 +17,7 @@ import (
 	"github.com/SpekoAI/gateway/protocol"
 	"github.com/SpekoAI/gateway/providers/geminirealtime"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
+	"github.com/coder/websocket"
 )
 
 type socketObserver struct {
@@ -73,22 +74,30 @@ func (t observerTransport) RoundTrip(r *http.Request) (*http.Response, error) { 
 
 type joinedCloseStream struct {
 	runtimepkg.ResumableProviderStream
-	reached, release chan struct{}
+	reached chan error
+	release chan struct{}
 }
 
+func (s *joinedCloseStream) TerminalError() error {
+	return s.ResumableProviderStream.(runtimepkg.TerminalErrorProviderStream).TerminalError()
+}
+func (s *joinedCloseStream) Abort(ctx context.Context) error {
+	return s.ResumableProviderStream.(runtimepkg.AbortingProviderStream).Abort(ctx)
+}
 func (s *joinedCloseStream) Interrupt() {
 	s.ResumableProviderStream.(runtimepkg.InterruptingProviderStream).Interrupt()
 }
 func (s *joinedCloseStream) Close(ctx context.Context) error {
 	err := s.ResumableProviderStream.Close(ctx)
-	s.reached <- struct{}{}
+	s.reached <- err
 	<-s.release
 	return err
 }
 
 type joinedCloseAdapter struct {
 	runtimepkg.Adapter
-	reached, release chan struct{}
+	reached chan error
+	release chan struct{}
 }
 
 func (a joinedCloseAdapter) Open(ctx context.Context, r runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
@@ -121,7 +130,7 @@ func TestFundedAbortInterruptsBlockedGracefulCloseBeforeJoining(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			joined, joinRelease := make(chan struct{}, 1), make(chan struct{})
+			joined, joinRelease := make(chan error, 1), make(chan struct{})
 			var releaseOnce sync.Once
 			releaseJoin := func() { releaseOnce.Do(func() { close(joinRelease) }) }
 			defer releaseJoin()
@@ -190,6 +199,135 @@ func TestFundedAbortInterruptsBlockedGracefulCloseBeforeJoining(t *testing.T) {
 			}
 			if failures != 1 {
 				t.Fatalf("terminal failure occurrences %d", failures)
+			}
+		})
+	}
+}
+
+func TestFundedGoogleCloseOutcomePrecedesHeldReturn(t *testing.T) {
+	for _, order := range []string{"failed_close_first", "abort_first", "lease_first", "normal_close"} {
+		t.Run(order, func(t *testing.T) {
+			t.Parallel()
+			lease := 30 * time.Second // allow the SDK's real five-second ACK timeout
+			if order == "lease_first" {
+				lease = time.Second
+			}
+			p, _, client := newContinuityPeer(t, lease, 10*time.Second, true)
+			peerRead := make(chan struct{})
+			if order != "normal_close" {
+				p.holdClose = peerRead
+			}
+			defer close(peerRead)
+			closeSent, physicalClosed := make(chan struct{}), make(chan struct{})
+			httpClient := *p.server.Client()
+			transport := httpClient.Transport
+			httpClient.Transport = observerTransport(func(r *http.Request) (*http.Response, error) {
+				response, err := transport.RoundTrip(r)
+				if err == nil && response.StatusCode == 101 {
+					response.Body = &socketObserver{ReadWriteCloser: response.Body.(io.ReadWriteCloser), closeSent: closeSent, physicalClosed: physicalClosed}
+				}
+				return response, err
+			})
+			adapter, err := geminirealtime.New(geminirealtime.Config{HTTPClient: &httpClient, AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			returned, release := make(chan error, 1), make(chan struct{})
+			var releaseOnce sync.Once
+			releaseReturn := func() { releaseOnce.Do(func() { close(release) }) }
+			defer releaseReturn()
+			engine, err := runtimepkg.New(runtimepkg.Config{Adapters: []runtimepkg.Adapter{joinedCloseAdapter{Adapter: adapter, reached: returned, release: release}}, Verifier: p.verifier, Telemetry: &p.telemetry})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var active atomic.Int32
+			released := make(chan struct{}, 1)
+			request := continuityRequest(p, client)
+			request.TrackVerifiedCapacity = func(*protocol.CapacityAttribution, protocol.CredentialSource) (func(), error) {
+				active.Add(1)
+				return func() { active.Add(-1); released <- struct{}{} }, nil
+			}
+			session, err := engine.Open(t.Context(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(session.Abort)
+			_ = awaitContinuity(t, session.Events()) // leave all terminal events unread
+			_ = awaitContinuity(t, p.setups)
+			_ = awaitContinuity(t, p.connected)
+			session.Close()
+			_ = awaitContinuity(t, closeSent)
+			if order == "abort_first" {
+				started := time.Now()
+				session.Abort()
+				_ = awaitContinuity(t, physicalClosed)
+				if time.Since(started) > 300*time.Millisecond {
+					t.Fatal("abort waited for close result or provider mutex")
+				}
+			}
+			// This is the actual adapter/SDK result, held AFTER it returns. The
+			// runtime close caller cannot yet observe either its error or success.
+			closeErr := awaitContinuity(t, returned)
+			_ = awaitContinuity(t, physicalClosed)
+			_ = awaitContinuity(t, session.Done())
+			if active.Load() != 1 {
+				t.Fatal("capacity released while Close's serialized join is held")
+			}
+			switch order {
+			case "failed_close_first":
+				if closeErr == nil {
+					t.Fatal("withheld ACK did not fail the real provider close")
+				}
+				var failure *runtimepkg.ProviderError
+				if !errors.As(session.Err(), &failure) || failure.Code != "provider_unavailable" {
+					t.Fatalf("failed close became clean before Close return: %v", session.Err())
+				}
+			case "abort_first":
+				if !errors.Is(session.Err(), runtimepkg.ErrSessionAborted) {
+					t.Fatalf("close result changed earlier abort: %v", session.Err())
+				}
+			case "lease_first":
+				if !errors.Is(session.Err(), runtimepkg.ErrSessionLeaseExpired) || time.Now().After(p.plan.Reservation.LeaseExpiresAt.Add(300*time.Millisecond)) {
+					t.Fatalf("close result delayed/changed earlier lease expiry: %v", session.Err())
+				}
+			case "normal_close":
+				if closeErr != nil || session.Err() != nil {
+					t.Fatalf("normal close became failure: close=%v session=%v", closeErr, session.Err())
+				}
+				if status := awaitContinuity(t, p.closeStatuses); status != websocket.StatusNormalClosure {
+					t.Fatalf("normal close lost its handshake: %v", status)
+				}
+			}
+			original := session.Err()
+			session.Abort() // a later abort must not replace the established result
+			if session.Err() != original {
+				t.Fatal("later abort replaced the terminal outcome")
+			}
+			releaseReturn()
+			_ = awaitContinuity(t, released)
+			if active.Load() != 0 || session.Err() != original {
+				t.Fatal("teardown join changed outcome or retained capacity")
+			}
+			events := collectEvents(t, session)
+			wantEvent, wantReceipt := protocol.EventError, "session.failed"
+			if order == "normal_close" {
+				wantEvent, wantReceipt = protocol.EventSessionClosed, "session.closed"
+			}
+			if len(events) != 1 || events[0].Type != wantEvent {
+				t.Fatalf("terminal event = %+v, want %s", events, wantEvent)
+			}
+			terminal := 0
+			for _, event := range p.telemetry.snapshot() {
+				if event.Name != "session.failed" && event.Name != "session.closed" {
+					continue
+				}
+				terminal++
+				if event.Name != wantReceipt || event.AttemptID != p.plan.AttemptID || event.Destination.Token != p.plan.Telemetry.Token {
+					t.Fatalf("close published wrong terminal evidence: %+v", event)
+				}
+			}
+			if terminal != 1 {
+				t.Fatalf("terminal evidence count = %d", terminal)
 			}
 		})
 	}

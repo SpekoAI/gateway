@@ -81,6 +81,12 @@ receipt publication and serialized `Abort`/`Close` joins happen afterward.
 Interrupting a socket never proves teardown complete: capacity remains held
 until the original close/abort and the provider event source have both ended.
 
+A failed graceful Google close publishes its terminal provider failure before
+cancelling the reader or closing its event source. The stable bridge preserves
+that outcome even if the Engine's serialized `Close` return is delayed. Event
+closure cannot race the failed return into `session.closed`; earlier abort or
+lease failure still wins, and a successful normal handshake remains clean.
+
 **Managed Google conversation resumption remains refused.** Google's current
 managed token mask pins `sessionResumption` to `{}`; it overwrites a supplied
 handle. Removing that mask would permit resumptions outside `uses:1`, without

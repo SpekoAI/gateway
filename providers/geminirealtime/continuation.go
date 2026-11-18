@@ -200,8 +200,10 @@ func (s *resumableStream) Close(ctx context.Context) error {
 	stream, done := s.current, s.bridgeDone
 	s.mu.Unlock()
 	var err error
+	var terminal error
 	if stream != nil {
 		err = stream.Close(ctx)
+		terminal = stream.TerminalError()
 	}
 	// The bridge forwards final output/usage through the normal close
 	// handshake. Only abort/lease detachment may force the socket closed.
@@ -210,7 +212,7 @@ func (s *resumableStream) Close(ctx context.Context) error {
 	s.closed = true
 	s.current = nil
 	s.mu.Unlock()
-	s.end(nil)
+	s.end(terminal)
 	return err
 }
 func (s *resumableStream) Interrupt() {

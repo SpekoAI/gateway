@@ -374,6 +374,11 @@ func (s *liveStream) Close(context.Context) error {
 		err := s.conn.Close(websocket.StatusNormalClosure, "")
 		s.writeMu.Unlock()
 		s.rememberCloseError(err)
+		if err != nil {
+			// Publish before waking the reader: Events may close and be consumed
+			// before the caller receives Close's return value.
+			s.setTerminal(&runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini Live close handshake failed", Retryable: true, Cause: err})
+		}
 		s.cancel()
 		close(s.gracefulDone)
 	})
@@ -563,10 +568,11 @@ func (s *liveStream) handle(message serverMessage, raw []byte) {
 }
 
 func (s *liveStream) finish(err error) {
-	if s.gracefulStarted.Load() && websocket.CloseStatus(err) == -1 {
+	if s.gracefulStarted.Load() && (websocket.CloseStatus(err) == -1 || isNormalClose(err)) {
 		// The SDK may consume the close acknowledgment itself and wake the
 		// reader with a generic closed-I/O error before Close has returned.
-		// Its actual close result owns that outcome. Explicit provider close
+		// Its published close result owns that outcome, including a normal
+		// acknowledgment followed by a failed transport close. Abnormal close
 		// statuses still propagate; abort/deadline cancellation never waits.
 		select {
 		case <-s.gracefulDone:
