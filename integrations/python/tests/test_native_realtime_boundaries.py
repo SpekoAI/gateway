@@ -454,13 +454,24 @@ async def test_gemini_clear_discards_original_local_capture_before_conversion(
 async def test_gemini_agent_explicit_cancel_stops_owned_provider_request(
     native_binary, before_output
 ):
+    manual = (
+        before_output
+        and "can_disable_turn_detection"
+        in llm.RealtimeCapabilities.__dataclass_fields__
+    )
     ask, output_seen, barrier, closed = (asyncio.Event() for _ in range(4))
     release, controls, errors = asyncio.Event(), [], []
 
     async def peer(request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        await ws.receive_json()
+        setup = await ws.receive_json()
+        assert (
+            setup["setup"]["realtimeInputConfig"]["automaticActivityDetection"][
+                "disabled"
+            ]
+            is manual
+        )
         await ws.send_json({"setupComplete": {}})
         control = await ws.receive_json()
         controls.append(control)
@@ -508,10 +519,10 @@ async def test_gemini_agent_explicit_cancel_stops_owned_provider_request(
 
     async with native_stack(native_binary, peer) as (socket, _):
         client, model = client_model(socket)
-        # Provider VAD for the active response; manual ownership for pre-output cancellation.
+        # Select provider VAD explicitly on the old SDK; it cannot negotiate manual turns.
         actor = AgentSession(
             llm=model,
-            turn_detection="manual" if before_output else "realtime_llm",
+            turn_detection="manual" if manual else "realtime_llm",
             stt=None,
             tts=None,
             vad=None,
@@ -548,6 +559,40 @@ async def test_gemini_agent_explicit_cancel_stops_owned_provider_request(
                 await rejected
         finally:
             release.set()
+            await actor.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.skipif(
+    "can_disable_turn_detection" in llm.RealtimeCapabilities.__dataclass_fields__,
+    reason="SDK can negotiate disabled provider VAD",
+)
+async def test_gemini_unnegotiated_sdk_manual_mode_refuses_before_open(native_binary):
+    opened = []
+
+    async def peer(request):
+        opened.append(request.path)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"setupComplete": {}})
+        async for _ in ws:
+            pass
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        client, model = client_model(socket)
+        actor = AgentSession(
+            llm=model, turn_detection="manual", stt=None, tts=None, vad=None
+        )
+        try:
+            with pytest.raises(GatewayError, match="negotiated turn ownership"):
+                await start_agent(actor)
+                for native in list(model._sessions):
+                    await native.start()
+            assert not opened and not client._attempted
+        finally:
             await actor.aclose()
             await model.aclose()
             await client.aclose()

@@ -298,6 +298,13 @@ async def test_real_agent_session_plays_both_native_realtime_chunks_in_one_turn(
     captured, reported, opened, errors = [], [], [], []
     first, second = b"\x01\x10" * 4800, b"\x02\x10" * 4800
     google = protocol == "google.live.v1"
+    mode = "manual"
+    if (
+        google
+        and "can_disable_turn_detection"
+        not in llm.RealtimeCapabilities.__dataclass_fields__
+    ):
+        mode = "realtime_llm"  # Explicit supported provider-VAD test configuration.
 
     class Output(io.AudioOutput):
         def __init__(self):
@@ -328,6 +335,9 @@ async def test_real_agent_session_plays_both_native_realtime_chunks_in_one_turn(
         await ws.prepare(request)
         configuration = await ws.receive_json()
         if google:
+            assert configuration["setup"]["realtimeInputConfig"][
+                "automaticActivityDetection"
+            ]["disabled"] is (mode == "manual")
             await ws.send_json({"setupComplete": {}})
         else:
             await ws.send_json(
@@ -436,7 +446,7 @@ async def test_real_agent_session_plays_both_native_realtime_chunks_in_one_turn(
         )
         realtime = RealtimeModel(client, protocol=protocol, model=model, voice=voice)
         session = AgentSession(
-            llm=realtime, stt=None, tts=None, vad=None, turn_detection="manual"
+            llm=realtime, stt=None, tts=None, vad=None, turn_detection=mode
         )
         session.output.audio = Output()
         session.on("error", errors.append)
