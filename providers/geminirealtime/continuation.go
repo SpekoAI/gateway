@@ -3,6 +3,7 @@ package geminirealtime
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
@@ -27,8 +28,24 @@ type resumableStream struct {
 
 func newResumableStream(a *Adapter, request runtimepkg.AdapterRequest, stream *liveStream) *resumableStream {
 	s := &resumableStream{adapter: a, request: request, current: stream, events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), bridgeDone: make(chan struct{})}
+	if stream.physical != nil {
+		stream.physical.bindExpiry(func() { s.expirePhysical(stream) })
+	}
 	go s.bridge(stream, s.bridgeDone)
 	return s
+}
+
+func (s *resumableStream) expirePhysical(stream *liveStream) {
+	s.mu.Lock()
+	if s.current == stream {
+		s.detached, s.current = stream, nil
+	}
+	s.mu.Unlock()
+	// Physical expiry detaches this exact socket before waking its bridge.
+	// The coordinator owns terminal-vs-pending-recovery classification. A late
+	// callback for an old socket must never detach an adopted replacement.
+	stream.setTerminal(runtimepkg.ErrSessionLeaseExpired)
+	_ = stream.abort()
 }
 
 func (s *resumableStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -137,6 +154,9 @@ func (s *resumableStream) Resume(ctx context.Context, credential protocol.Delega
 	}
 	request := s.request
 	request.Plan.Route.Credential = &credential
+	// The original root's physical cap cannot authorize a replacement socket.
+	// The coordinator owns the validated renewal cap through Resume/adoption.
+	request.PhysicalDeadline = time.Time{}
 	stream, err := s.adapter.openSocket(ctx, request, handle, previous.responding)
 	if err != nil {
 		if stream != nil {
@@ -231,6 +251,9 @@ func (s *resumableStream) Abort(context.Context) error {
 	s.mu.Lock()
 	s.closed = true
 	stream := s.current
+	if stream == nil {
+		stream = s.detached
+	}
 	done := s.bridgeDone
 	s.current = nil
 	s.mu.Unlock()

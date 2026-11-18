@@ -285,9 +285,17 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Sessio
 	providerCtx := ctx
 	cancelOpen := func() {}
 	var fundedDeadline time.Time
+	var fundedHorizon time.Time
 	if clock != nil {
+		fundedHorizon = request.Plan.Reservation.LeaseExpiresAt
+		if credential := request.Plan.Route.Credential; credential != nil && credential.ExpiresAt.Before(fundedHorizon) {
+			fundedHorizon = credential.ExpiresAt
+		}
+		if end := request.Plan.Reservation.Billing.RenewableUntil; end.Before(fundedHorizon) {
+			fundedHorizon = end
+		}
 		anchored := time.Now()
-		fundedDeadline = anchored.Add(request.Plan.Reservation.LeaseExpiresAt.Sub(clock.now()))
+		fundedDeadline = anchored.Add(fundedHorizon.Sub(clock.now()))
 		providerCtx, cancelOpen = context.WithDeadlineCause(ctx, fundedDeadline, ErrSessionLeaseExpired)
 	}
 	defer cancelOpen()
@@ -296,11 +304,11 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Sessio
 		release()
 		return nil, context.Cause(providerCtx)
 	}
-	stream, err := adapter.Open(providerCtx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential, Continuation: clock != nil})
-	if errors.Is(context.Cause(providerCtx), ErrSessionLeaseExpired) {
-		err = ErrSessionLeaseExpired
+	stream, err := adapter.Open(providerCtx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential, Continuation: clock != nil, PhysicalDeadline: fundedDeadline})
+	if providerCtx.Err() != nil {
+		err = context.Cause(providerCtx)
 	}
-	if err == nil && clock != nil && !clock.now().Before(request.Plan.Reservation.LeaseExpiresAt) {
+	if clock != nil && (!time.Now().Before(fundedDeadline) || !clock.now().Before(fundedHorizon)) {
 		err = ErrSessionLeaseExpired
 	}
 	if err != nil {

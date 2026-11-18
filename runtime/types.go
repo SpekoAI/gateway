@@ -140,10 +140,14 @@ type Adapter interface {
 type AdapterRequest struct {
 	// Continuation requests a stable ResumableProviderStream event source.
 	Continuation bool
-	Kind         protocol.SessionKind
-	Plan         protocol.SessionPlan
-	Options      protocol.RequestOptions
-	Media        *protocol.MediaFormat
+	// PhysicalDeadline is an optional monotonic cap derived by the Engine from
+	// verified funding. It survives setup-context cancellation and a delayed
+	// Open return. It never creates authority or extends signed time bounds.
+	PhysicalDeadline time.Time
+	Kind             protocol.SessionKind
+	Plan             protocol.SessionPlan
+	Options          protocol.RequestOptions
+	Media            *protocol.MediaFormat
 	// Delivery identifies whether audio is arriving at real-time cadence or
 	// from a buffered upload. Adapters that require real-time pacing use it to
 	// pace only buffered input and avoid adding latency to live streams.

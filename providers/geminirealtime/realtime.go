@@ -155,16 +155,21 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	var physical io.Closer
+	var physical *physicalSocket
 	var stopDialAbort func() bool
 	copyClient.Transport = socketTransport(func(r *http.Request) (*http.Response, error) {
 		response, err := transport.RoundTrip(r)
 		if err == nil && response.StatusCode == http.StatusSwitchingProtocols {
-			physical = response.Body
-			body := response.Body
+			body, ok := response.Body.(io.ReadWriteCloser)
+			if !ok {
+				_ = response.Body.Close()
+				return nil, errors.New("gemini realtime upgrade did not expose a duplex transport")
+			}
+			physical = newPhysicalSocket(body, request.PhysicalDeadline)
+			response.Body = physical
 			// Dial may be reading an invalid upgrade response while reporting
 			// its handshake error. That diagnostic read has its own timeout.
-			stopDialAbort = context.AfterFunc(ctx, func() { _ = body.Close() })
+			stopDialAbort = context.AfterFunc(ctx, func() { _ = physical.Close() })
 		}
 		return response, err
 	})
@@ -188,6 +193,10 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 		responding:   responding,
 		gracefulDone: make(chan struct{}),
 	}
+	physical.bindExpiry(func() {
+		stream.setTerminal(runtimepkg.ErrSessionLeaseExpired)
+		stream.Interrupt()
+	})
 	setup := buildSetup("models/"+model, request.Options)
 	if handle != "" {
 		setup["setup"].(map[string]any)["sessionResumption"] = map[string]any{"handle": handle}
@@ -311,7 +320,7 @@ func thinkingLevelFor(model string, requested string) string {
 
 type liveStream struct {
 	conn      *websocket.Conn
-	physical  io.Closer
+	physical  *physicalSocket
 	ctx       context.Context
 	cancel    context.CancelFunc
 	events    chan runtimepkg.ProviderEvent
@@ -378,6 +387,12 @@ func (s *liveStream) Close(context.Context) error {
 		// timeout, transport and protocol errors remain failures.
 		if isNormalClose(err) {
 			err = nil
+		}
+		// The SDK can discard the transport's Close error when it already has
+		// a peer-status mismatch. Read the observed transport result directly;
+		// normalizing a valid status cannot normalize that independent failure.
+		if s.physical != nil {
+			err = errors.Join(err, s.physical.closeError())
 		}
 		s.rememberCloseError(err)
 		if err != nil {
@@ -585,8 +600,17 @@ func (s *liveStream) finish(err error) {
 		case <-s.ctx.Done():
 		}
 	}
-	if s.closed.Load() && (isNormalClose(err) || s.ctx.Err() != nil) || isNormalClose(err) {
+	if s.closed.Load() && s.ctx.Err() != nil {
 		return
+	}
+	if isNormalClose(err) {
+		// The SDK's reader also discards transport-close failures when the
+		// peer initiates a normal close. Observe the same physical result here
+		// before event closure can become successful terminal evidence.
+		if s.physical == nil || s.physical.closeError() == nil {
+			return
+		}
+		err = s.physical.closeError()
 	}
 	failure := &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini Live closed the session", Retryable: true, Cause: err}
 	if status := websocket.CloseStatus(err); status != -1 {

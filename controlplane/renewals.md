@@ -74,6 +74,15 @@ or a withdrawn resumption handle. Closing cancels pending delivery; a live
 socket can drain queued input, and a detached socket terminates immediately.
 Provider teardown still precedes physical capacity release.
 
+The root cap is the earliest original signed credential expiry, funded lease
+and root horizon, mapped once from trusted SQL time to monotonic elapsed time.
+A still-valid shorter credential is admitted normally and may carry I/O only
+until that original cap. The Engine passes the derived cap to the Google
+upgraded transport, whose independent owner survives setupComplete and a held
+adapter Open return. It does not depend on caller/setup-context cancellation
+after handoff. A late Open return fails admission and retains capacity until
+its actual abort/event draining join; it never creates a replacement deadline.
+
 Before a resumed socket can open, the coordinator anchors its validated
 credential/lease/root horizon to monotonic elapsed time. An independent owner
 keeps that exact cap armed during Resume, blocked clock synchronization and
@@ -99,6 +108,12 @@ lease failure still wins, and a successful normal handshake remains clean.
 Both explicit normal peer statuses, 1000 and 1001, are clean in the terminal
 outcome and the Close return. Handshake timeouts, transport errors and abnormal
 protocol statuses remain failures with the same publication ordering.
+The upgraded transport records its own first Close result. A normal peer1001
+can mask that result inside the WebSocket SDK, so the adapter combines the
+observed transport failure with the normalized handshake result before terminal
+publication. The peer-initiated normal-close reader path observes that result
+too. Clean1001 remains clean; an accompanying transport failure cannot
+be erased by its status. No SDK patch or error-text inference is involved.
 
 **Managed Google conversation resumption remains refused.** Google's current
 managed token mask pins `sessionResumption` to `{}`; it overwrites a supplied
