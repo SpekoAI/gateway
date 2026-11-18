@@ -90,7 +90,7 @@ func (e *Engine) claimPlanUse(plan protocol.SessionPlan, current func() time.Tim
 	if len(e.planUses) >= e.maxReplayEntries {
 		return nil, ErrReplayCacheFull
 	}
-	use := &planUse{expiresAt: plan.ExpiresAt, wallClock: !renewableGoogle(plan)}
+	use := &planUse{expiresAt: plan.ExpiresAt, wallClock: !fundedGoogle(plan)}
 	if !use.wallClock {
 		use.expiresAt = retentionNow.Add(plan.ExpiresAt.Sub(now))
 	}
@@ -184,18 +184,21 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Sessio
 			e.recordOpenFailure(request, err, at)
 		}
 	}()
-	if renewableGoogle(request.Plan) {
+	if fundedGoogle(request.Plan) {
 		// The capability is required by the verified plan family, not selected by
 		// the caller's optional callback. No local-clock/uncapped fallback exists.
 		verifier, ok := e.verifier.(ClockedPlanVerifier)
 		if !ok {
-			return nil, errors.New("runtime: renewable funded plans require a SQL-clock verifier")
+			return nil, errors.New("runtime: funded Google plans require a SQL-clock verifier")
 		}
 		clock = &fundedClock{client: request.Entitlements, plan: request.Plan, wall: e.now}
 		err = verifier.VerifyWithClock(ctx, request.Plan, func(ctx context.Context) (time.Time, error) {
 			authenticated = true
+			if !renewableGoogle(request.Plan) {
+				return time.Time{}, ErrFundedGoogleClockAuthority
+			}
 			if request.Entitlements == nil {
-				return time.Time{}, errors.New("runtime: renewable funded plans require SQL-clock authority")
+				return time.Time{}, errors.New("runtime: funded Google plans require SQL-clock authority")
 			}
 			if _, err := clock.synchronize(ctx); err != nil {
 				return time.Time{}, err

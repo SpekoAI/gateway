@@ -86,11 +86,19 @@ func (c *fundedClock) synchronize(ctx context.Context) (bool, error) {
 	return false, errors.New("runtime: clock changed during entitlement synchronization")
 }
 
-func renewableGoogle(plan protocol.SessionPlan) bool {
-	b := plan.Reservation.Billing
+// ErrFundedGoogleClockAuthority refuses a funded shape whose current signed
+// plan supplies no accepted clock endpoint. It never falls into OSS admission.
+var ErrFundedGoogleClockAuthority = errors.New("runtime: funded Google plan has no signed clock authority")
+
+func fundedGoogle(plan protocol.SessionPlan) bool {
 	return plan.Execution.CredentialSource == protocol.CredentialsManaged &&
 		plan.Execution.ProviderRoute == protocol.RouteProviderDirect && plan.Route.Provider == "google" &&
-		plan.Route.Adapter == "google.live.v1" && b != nil && b.RenewalURL != "" &&
+		plan.Route.Adapter == "google.live.v1" && plan.UsesFundedContinuation()
+}
+
+func renewableGoogle(plan protocol.SessionPlan) bool {
+	b := plan.Reservation.Billing
+	return fundedGoogle(plan) && b != nil && b.RenewalURL != "" &&
 		b.RenewableUntil.After(plan.Reservation.LeaseExpiresAt)
 }
 

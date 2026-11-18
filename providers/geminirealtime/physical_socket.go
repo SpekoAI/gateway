@@ -1,7 +1,9 @@
 package geminirealtime
 
 import (
+	"errors"
 	"io"
+	"net"
 	"sync"
 	"time"
 )
@@ -11,16 +13,25 @@ import (
 // setup has finished but an outer adapter has not returned the stream yet.
 type physicalSocket struct {
 	io.ReadWriteCloser
-	closeOnce sync.Once
-	mu        sync.Mutex
-	closeErr  error
-	timer     *time.Timer
-	expired   bool
-	onExpiry  func()
+	mu                      sync.Mutex
+	closeErr                error
+	timer                   *time.Timer
+	expired, closed, joined bool
+	onExpiry                func()
+	normal, interrupt       *physicalCloseAttempt
+	active                  int
+	retryInterrupt          bool
+	stopped                 chan struct{}
+}
+
+type physicalCloseAttempt struct {
+	done     chan struct{}
+	err      error
+	complete bool // protected by physicalSocket.mu
 }
 
 func newPhysicalSocket(body io.ReadWriteCloser, deadline time.Time) *physicalSocket {
-	s := &physicalSocket{ReadWriteCloser: body}
+	s := &physicalSocket{ReadWriteCloser: body, stopped: make(chan struct{})}
 	if !deadline.IsZero() {
 		s.mu.Lock()
 		s.timer = time.AfterFunc(max(time.Until(deadline), 0), s.expire)
@@ -37,7 +48,7 @@ func (s *physicalSocket) expire() {
 	if callback != nil {
 		callback()
 	} else {
-		_ = s.Close() // Dial may still be validating the upgrade response.
+		s.Interrupt() // Dial may still be validating the upgrade response.
 	}
 }
 
@@ -52,18 +63,74 @@ func (s *physicalSocket) bindExpiry(callback func()) {
 }
 
 func (s *physicalSocket) Close() error {
-	s.closeOnce.Do(func() {
-		err := s.ReadWriteCloser.Close()
-		s.mu.Lock()
-		s.closeErr = err
-		timer := s.timer
-		s.mu.Unlock()
-		if err == nil && timer != nil {
-			timer.Stop()
-		}
-	})
-	return s.closeError()
+	attempt := s.startClose(false)
+	if attempt == nil {
+		return s.closeError()
+	}
+	<-attempt.done // serialized SDK teardown may join; interruption never does
+	return attempt.err
 }
+
+// Interrupt never waits for a transport Close, including one already in
+// progress. At most one normal and one interrupt attempt run concurrently.
+// Repeated interruptions retain one retry if the current attempt later fails.
+func (s *physicalSocket) Interrupt() { s.startClose(true) }
+
+func (s *physicalSocket) startClose(interrupt bool) *physicalCloseAttempt {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	slot := &s.normal
+	if interrupt {
+		slot = &s.interrupt
+	}
+	if *slot != nil && !(*slot).complete {
+		attempt := *slot
+		if interrupt {
+			s.retryInterrupt = true
+		}
+		s.mu.Unlock()
+		return attempt
+	}
+	attempt := &physicalCloseAttempt{done: make(chan struct{})}
+	*slot = attempt
+	s.active++
+	s.mu.Unlock()
+	go func() {
+		err := s.ReadWriteCloser.Close()
+		closed := err == nil || errors.Is(err, net.ErrClosed)
+		s.mu.Lock()
+		attempt.err, attempt.complete = err, true
+		s.active--
+		if s.closeErr == nil && err != nil {
+			s.closeErr = err // diagnostic evidence survives a later successful retry
+		}
+		if closed {
+			s.closed = true // actual transport success/already-closed evidence
+			if s.timer != nil {
+				s.timer.Stop()
+			}
+		}
+		retry := interrupt && s.retryInterrupt && !s.closed
+		if interrupt {
+			s.retryInterrupt = false
+		}
+		if s.closed && s.active == 0 && !s.joined {
+			s.joined = true
+			close(s.stopped)
+		}
+		close(attempt.done)
+		s.mu.Unlock()
+		if retry {
+			s.Interrupt()
+		}
+	}()
+	return attempt
+}
+
+func (s *physicalSocket) waitStopped() { <-s.stopped }
 
 func (s *physicalSocket) closeError() error {
 	s.mu.Lock()

@@ -36,6 +36,14 @@ memory cache provides it. Retaining the nonce for its full signed issuance
 lifetime cannot extend the lease or allow the original plan to be reopened.
 The mixed BYOK/managed CLI verifier preserves this capability.
 
+Funded Google classification is independent of renewal eligibility. A managed
+`direct_entitlement` root (or the existing funded token family) cannot fall into
+ordinary local-clock admission merely because its RenewalURL is absent. The
+current clock port derives authority from that signed URL; unsupported
+nonrenewable shapes receive `ErrFundedGoogleClockAuthority` after signature and
+nonce authentication, before clock, minting or provider I/O. No unsigned clock
+endpoint or allowance is invented. Existing ordinary OSS families stay separate.
+
 Ordinary local/signature-only admission and the default verifier retain a
 nondecreasing wall-time watermark. Spent local attempts remain fenced while
 their plans can still validate; once expiry permits eviction, a later backward
@@ -99,6 +107,16 @@ an in-progress close handshake, or public event consumption. Pending input,
 receipt publication and serialized `Abort`/`Close` joins happen afterward.
 Interrupting a socket never proves teardown complete: capacity remains held
 until the original close/abort and the provider event source have both ended.
+
+Interruption starts bounded physical close attempts without waiting for any
+transport Close return. A stalled normal Close cannot block abort/lease terminal
+metadata. At most one normal and one interrupt attempt run concurrently; a
+failed attempt preserves its diagnostic but does not latch future interruption.
+The original cap remains armed while closure is unproven. Serialized teardown
+waits for actual successful/already-closed transport evidence and every active
+attempt to join before releasing capacity. Detach is prompt; replacement setup
+joins its exact predecessor first, and late callbacks still address only their
+original socket.
 
 A failed graceful Google close publishes its terminal provider failure before
 cancelling the reader or closing its event source. The stable bridge preserves

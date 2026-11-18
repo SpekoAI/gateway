@@ -45,7 +45,7 @@ func (s *resumableStream) expirePhysical(stream *liveStream) {
 	// The coordinator owns terminal-vs-pending-recovery classification. A late
 	// callback for an old socket must never detach an adopted replacement.
 	stream.setTerminal(runtimepkg.ErrSessionLeaseExpired)
-	_ = stream.abort()
+	stream.Interrupt()
 }
 
 func (s *resumableStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -121,10 +121,12 @@ func (s *resumableStream) Detach() {
 	stream := s.current
 	if stream != nil {
 		s.detached, s.current = stream, nil
+	} else {
+		stream = s.detached
 	}
 	s.mu.Unlock()
 	if stream != nil {
-		_ = stream.abort()
+		stream.Interrupt()
 	}
 }
 func (s *resumableStream) Resume(ctx context.Context, credential protocol.DelegatedCredential) error {
@@ -147,6 +149,9 @@ func (s *resumableStream) Resume(ctx context.Context, credential protocol.Delega
 		return runtimepkg.ErrResumptionUnavailable
 	}
 	s.Detach()
+	// Detach is a prompt interruption, not teardown proof. Join the old
+	// socket before replacement I/O; the coordinator's adoption cap stays armed.
+	_ = previous.abort()
 	select {
 	case <-done:
 	case <-ctx.Done():
@@ -230,6 +235,9 @@ func (s *resumableStream) Close(ctx context.Context) error {
 	<-done
 	s.mu.Lock()
 	s.closed = true
+	if stream != nil {
+		s.detached = stream // keep the physical join/retry owner after Close returns
+	}
 	s.current = nil
 	s.mu.Unlock()
 	s.end(terminal)
@@ -255,6 +263,9 @@ func (s *resumableStream) Abort(context.Context) error {
 		stream = s.detached
 	}
 	done := s.bridgeDone
+	if stream != nil {
+		s.detached = stream // later interruption can still retry a failed close
+	}
 	s.current = nil
 	s.mu.Unlock()
 	if stream != nil {

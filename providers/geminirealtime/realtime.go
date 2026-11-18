@@ -169,7 +169,7 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 			response.Body = physical
 			// Dial may be reading an invalid upgrade response while reporting
 			// its handshake error. That diagnostic read has its own timeout.
-			stopDialAbort = context.AfterFunc(ctx, func() { _ = physical.Close() })
+			stopDialAbort = context.AfterFunc(ctx, physical.Interrupt)
 		}
 		return response, err
 	})
@@ -178,6 +178,13 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 		stopDialAbort()
 	}
 	if err != nil {
+		if physical != nil {
+			failedCtx, cancelFailed := context.WithCancel(context.Background())
+			failed := &liveStream{physical: physical, ctx: failedCtx, cancel: cancelFailed, events: make(chan runtimepkg.ProviderEvent)}
+			failed.closed.Store(true)
+			physical.bindExpiry(failed.Interrupt)
+			return failed, dialError(response, err)
+		}
 		return nil, dialError(response, err)
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
@@ -332,6 +339,7 @@ type liveStream struct {
 	gracefulStarted  atomic.Bool
 	gracefulDone     chan struct{}
 	abortOnce        sync.Once
+	dialEventsOnce   sync.Once
 	interruptOnce    sync.Once
 	setupOnce        sync.Once
 	closed           atomic.Bool
@@ -376,6 +384,9 @@ func (s *liveStream) Cancel(context.Context) error {
 }
 
 func (s *liveStream) Close(context.Context) error {
+	if s.conn == nil {
+		return s.abort() // failed upgrade: retain its physical join owner
+	}
 	s.gracefulOnce.Do(func() {
 		s.gracefulStarted.Store(true)
 		s.closed.Store(true)
@@ -410,16 +421,25 @@ func (s *liveStream) Interrupt() {
 	s.interruptOnce.Do(func() {
 		s.closed.Store(true)
 		s.cancel()
-		if s.physical != nil {
-			_ = s.physical.Close()
-		}
 	})
+	if s.physical != nil {
+		s.physical.Interrupt() // failed attempts never latch future interruption
+	}
 }
 func (s *liveStream) abort() error {
+	s.Interrupt()
 	s.abortOnce.Do(func() {
-		s.Interrupt()
-		s.rememberCloseError(s.conn.CloseNow())
+		if s.conn != nil {
+			s.rememberCloseError(s.conn.CloseNow())
+		}
 	})
+	if s.physical != nil {
+		s.physical.Interrupt()
+		s.physical.waitStopped() // closure proof AND all physical attempts must join
+	}
+	if s.conn == nil {
+		s.dialEventsOnce.Do(func() { close(s.events) })
+	}
 	return s.closeError()
 }
 func (s *liveStream) rememberCloseError(err error) {
