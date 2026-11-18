@@ -100,7 +100,13 @@ boundary, and replacing Gateway STT with another SDK model retires its pending
 gate without requiring the old model to close.
 Wrapper registration and synchronous stream entry propagate the owned filter
 before asynchronous fallback children start, for both MultiSpeaker/Fallback
-orders. Only instance-owned hooks are installed and released on close.
+orders. On older SDKs without wrapper prewarm, actual input forwarding exposes
+that same parent stream before its PCM reaches the child. Only instance-owned
+hooks are installed and released on close. A custom `stt_node` may drop empty
+finals: the outer stream's next consumer pull retains the real redacted terminal
+witness. Retained SDKs put private bookkeeping behind already yielded events in
+their recognition queue. This emits no extra transcript, provider EOS or usage,
+and preserves custom-node pauses and manual deferral.
 An explicit manual decision deferred during a segmented final retains its
 `skip_reply` value through active VAD speech and rearms when that speech ends.
 Without a manual request, late finals do not start a manual turn. The owned
@@ -225,6 +231,10 @@ new interruption. A replay that ends in old speech stays non-interrupting until
 real quiet separates a fresh onset, including silence captured after replay.
 Already classified real quiet also separates pending resumed capture, even
 when it has not reached the detector's normal end threshold before reset.
+That restores speaking state; it does not establish a fresh interruption. Only
+a fully post-frontier, physically captured voiced inference window starts the
+new interruption duration. Later quiet and padding cannot start that clock or
+reuse pre-EOS speech duration, including with short interruption thresholds.
 Recovery never replays detector-only padding. Pending
 real tails rearm after in-flight padding completes, with no packet-duration delay.
 
@@ -257,6 +267,13 @@ A failed native STT instance, including cancellation during admission before
 `session.ready`, also refuses new streams and new turn admissions,
 including LiveKit's outer AgentSession recovery loop. The worker must obtain
 its recovery decision before constructing a replacement instance.
+Pipecat native TTS likewise latches ambiguous admission, send, receive/EOF and
+framework-receiver failures before any await that removes the context. It emits
+a fatal error and refuses subsequent SDK sentences/admissions on that instance;
+readiness or settings updates do not recover it. Framework queue failure still
+attempts physical session cleanup. Construct a replacement only after the
+control-plane recovery decision. Ordinary local Gateway error recovery retains
+its existing behavior. These local fences prove neither NoIO nor settlement.
 
 The client preserves binary PCM, stream commits, TTS cancellation and native
 error codes. Live usage updates remain progress events; only a terminal frame

@@ -136,6 +136,8 @@ class _DrainingVADStream(vad.VADStream):
         self._speech = bytearray()
         self._processed = self._last_index = 0
         self._replay_until = 0
+        self._capture_frontier = 0
+        self._fresh_speech_start: int | None = None
         self._replay_old_speech = False
         self._last_inference_duration = 0.0
         self._deadline = None
@@ -269,6 +271,28 @@ class _DrainingVADStream(vad.VADStream):
                         frames=[self._frame(bytes(self._speech))],
                         speaking=True,
                     )
+        duration_start = started_at
+        if self._capture_frontier:
+            # Reclassification can restore speaking state, but pre-EOS PCM
+            # cannot supply the duration of a NEW response interruption.
+            # Only a fully post-frontier, physically captured voiced window
+            # starts that clock. Later quiet/padding cannot start it.
+            activation, *_ = state._options()
+            if boundary is not None and boundary.type is vad.VADEventType.END_OF_SPEECH:
+                self._fresh_speech_start = None
+            if (
+                not replaying and not old_speech
+                and self._processed - count >= self._capture_frontier
+                and event.probability >= activation
+                and self._fresh_speech_start is None
+            ):
+                self._fresh_speech_start = self._processed - count
+            duration_start = self._fresh_speech_start
+            if boundary is not None and boundary.type is vad.VADEventType.START_OF_SPEECH:
+                boundary.speech_duration = (
+                    (self._processed - duration_start) / self._sample_rate
+                    if duration_start is not None else 0
+                )
         # samples_index uses the detector rate; outward PCM keeps the source
         # rate. Inference publishes speaking/duration before its transition.
         inference_rate = getattr(options, "sample_rate", 16000)
@@ -280,8 +304,8 @@ class _DrainingVADStream(vad.VADStream):
                 timestamp=self._processed / self._sample_rate,
                 frames=[self._frame(real)],
                 speaking=was_speaking and not replaying and not old_speech,
-                speech_duration=max(0, self._processed - started_at) / self._sample_rate
-                if was_speaking and not replaying and not old_speech
+                speech_duration=max(0, self._processed - duration_start) / self._sample_rate
+                if was_speaking and not replaying and not old_speech and duration_start is not None
                 else 0,
                 silence_duration=0 if replaying or old_speech else state.silence_samples / self._sample_rate,
                 raw_accumulated_speech=0 if replaying or old_speech else state.speech_samples / self._sample_rate,
@@ -403,6 +427,7 @@ class _DrainingVADStream(vad.VADStream):
                                 self._probability.speaking = True
                             if pending:
                                 self._replay_until = len(pending) // 2
+                                self._capture_frontier = self._replay_until
                                 self._probability = self._probability or ProbabilityVAD.for_stream(
                                     self._inner, self._sample_rate
                                 )

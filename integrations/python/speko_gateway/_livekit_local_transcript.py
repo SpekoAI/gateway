@@ -80,6 +80,7 @@ def bind_local_transcript(owner: Any) -> None:
                 stream = frame.f_locals.get("self")
                 if isinstance(stream, stt.RecognizeStream) and type(stream).__module__.startswith("livekit.agents.stt."):
                     models.append(stream._stt)
+                    _observe_consumption(stream, owner)
                     if isinstance(stream._stt, stt.MultiSpeakerAdapter) and stream._stt._suppress_background:
                         filtering = getattr(stream, "_speko_local_filter_binding", None)
                         if filtering is None:
@@ -94,6 +95,7 @@ def bind_local_transcript(owner: Any) -> None:
     # identifies the outer adapter. Follow only its SDK metrics listeners to
     # its activities, without calling callbacks or inspecting customer data.
     seen: set[int] = set()
+    models.extend(activity.stt for activity in activities if isinstance(activity.stt, (stt.MultiSpeakerAdapter, stt.FallbackAdapter)))
     while models:
         model = models.pop()
         if id(model) in seen:
@@ -110,7 +112,7 @@ def bind_local_transcript(owner: Any) -> None:
             target = getattr(callback, "__self__", None)
             if getattr(callback, "__func__", None) is AgentActivity._on_metrics_collected:
                 activities.add(target)
-            elif isinstance(target, stt.FallbackAdapter) and getattr(callback, "__func__", None) is stt.FallbackAdapter._on_metrics_collected:
+            elif isinstance(target, (stt.FallbackAdapter, stt.MultiSpeakerAdapter)) and getattr(callback, "__func__", None) is getattr(type(target), "_on_metrics_collected", None):
                 models.append(target)
     for activity in activities:
         recognition = activity._audio_recognition
@@ -217,6 +219,101 @@ def _filtered_text(canonical: str, parts: list[tuple[str, bool]]) -> str | None:
     return "".join(accepted).strip()
 
 
+_CONSUMED_FINAL = object()
+
+
+class _ConsumedTerminal(stt.SpeechEvent):
+    """Private SDK queue barrier; never transcript, usage or provider EOS."""
+
+    def __init__(self, data: NativeSpeechData) -> None:
+        super().__init__(type=_CONSUMED_FINAL)
+        self.terminal = data
+
+
+class _WrapperInput:
+    """Observe real SDK forwarding to wrappers created asynchronously."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+        self.owners: weakref.WeakSet[Any] = weakref.WeakSet()
+        self.original, self.original_close = stream.push_frame, stream.aclose
+
+        @wraps(self.original)
+        def push(frame: Any) -> Any:
+            # Older MultiSpeaker has no prewarm/metrics forwarding. Its real
+            # parent's input task is on this synchronous stack BEFORE the PCM
+            # reaches the child. Follow that actual stream, without changing
+            # audio, guessing an owner, or reopening any provider request.
+            for owner in list(self.owners):
+                bind_local_transcript(owner)
+            return self.original(frame)
+
+        async def close() -> None:
+            try:
+                await self.original_close()
+            finally:
+                self.restore()
+
+        self.observed, self.observed_close = push, close
+        stream.push_frame, stream.aclose = push, close
+
+    def restore(self) -> None:
+        if self.stream.push_frame is self.observed:
+            self.stream.push_frame = self.original
+        if self.stream.aclose is self.observed_close:
+            self.stream.aclose = self.original_close
+        if getattr(self.stream, "_speko_local_wrapper_input", None) is self:
+            del self.stream._speko_local_wrapper_input
+        for owner in list(self.owners):
+            owner._local_transcript_bindings.discard(self)
+        self.owners.clear()
+
+    def release(self, owner: Any) -> None:
+        self.owners.discard(owner)
+        if not self.owners:
+            self.restore()
+
+
+def _observe_consumption(stream: Any, owner: Any) -> None:
+    capture = getattr(stream, "_speko_local_wrapper_input", None)
+    if capture is None:
+        capture = _WrapperInput(stream)
+        stream._speko_local_wrapper_input = capture
+    capture.owners.add(owner)
+    owner._local_transcript_bindings.add(capture)
+    consumed = getattr(stream, "_speko_local_consumed_finals", None)
+    if consumed is None:
+        consumed = _ConsumedFinals(stream)
+        stream._speko_local_consumed_finals = consumed
+        stream._event_aiter = consumed
+    consumed.owners.add(owner)
+
+
+class _ConsumedFinals:
+    def __init__(self, stream: Any) -> None:
+        self.stream = weakref.ref(stream)
+        self.inner = stream._event_aiter
+        self.owners: weakref.WeakSet[Any] = weakref.WeakSet()
+        self.previous: NativeSpeechData | None = None
+
+    def __aiter__(self) -> Any:
+        return self
+
+    async def __anext__(self) -> Any:
+        previous, self.previous = self.previous, None
+        stream = self.stream()
+        if previous is not None and stream is not None:
+            for owner in list(self.owners):
+                for binding in list(owner._local_transcript_bindings):
+                    if isinstance(binding, _Binding) and binding.activity.stt is stream._stt:
+                        binding.queue_consumed_terminal(previous)
+        event = await self.inner.__anext__()
+        data = event.alternatives[0] if event.alternatives else None
+        if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT and isinstance(data, NativeSpeechData) and data._local_terminal and data._local_suppressed and not data.text:
+            self.previous = data
+        return event
+
+
 class _Prewarm:
     """Observe future activities even when an older wrapper retains its stream."""
 
@@ -242,6 +339,8 @@ class _Prewarm:
             for owner in list(self.owners):
                 bind_local_transcript(owner)
             result = self.original_stream(*args, **kwargs)
+            for owner in list(self.owners):
+                _observe_consumption(result, owner)
             if isinstance(model, stt.MultiSpeakerAdapter) and model._suppress_background:
                 filtering = getattr(result, "_speko_local_filter_binding", None)
                 if filtering is None:
@@ -343,6 +442,39 @@ class _Binding:
             options["trigger"] = "manual" if manual else "stt"
         run(recognition._hooks.retrieve_chat_ctx().copy(), **options)
 
+    def queue_consumed_terminal(self, data: NativeSpeechData) -> None:
+        if self.processing is None:
+            return
+        recognition = self.processing[0]
+        pipeline = getattr(recognition, "_stt_pipeline", None)
+        if pipeline is None:
+            self.consumed_terminal(data)
+        elif not recognition._closing.is_set():
+            # Newer SDKs pump node yields separately from recognition. Preserve
+            # actual processing order, including a queued forwarded terminal.
+            pipeline.event_ch.send_nowait(_ConsumedTerminal(data))
+
+    def consumed_terminal(self, data: NativeSpeechData) -> None:
+        if self.processing is None or not self.owners or not self.pending or self.group != data._local_group or not self._owns_recognition():
+            return
+        self.parts.append(("", True))
+        recognition = self.processing[0]
+        self._reconcile_terminal(recognition, data, recognition._audio_transcript)
+
+    def _reconcile_terminal(self, recognition: Any, data: NativeSpeechData, before: str) -> None:
+        if not data._local_terminal:
+            return
+        filtered = data.canonical_text if data._local_filtered else _filtered_text(data.canonical_text or "", self.parts)
+        if not self.rewritten and filtered is not None and (recognition._audio_transcript != before or any(suppressed for _, suppressed in self.parts)):
+            recognition._audio_transcript = " ".join(text for text in (self.prefix, filtered) if text)
+        if any(suppressed for _, suppressed in self.parts):
+            recognition._audio_interim_transcript = ""
+        self.prefix = None
+        self.pending = False
+        self.group = None
+        self.parts.clear()
+        self._rearm(recognition, after_eos=data._local_after_eos)
+
     def _bind(self) -> None:
         previous = getattr(self.activity, "_speko_native_stt_turn_owner", None)
         if previous is not None:
@@ -388,23 +520,14 @@ class _Binding:
             if part is None:
                 return
             data, before = part
-            if data._local_terminal:
-                filtered = data.canonical_text if data._local_filtered else _filtered_text(data.canonical_text or "", self.parts)
-                if not self.rewritten and filtered is not None and (recognition._audio_transcript != before or any(suppressed for _, suppressed in self.parts)):
-                    recognition._audio_transcript = " ".join(
-                        text for text in (self.prefix, filtered) if text
-                    )
-                if any(suppressed for _, suppressed in self.parts):
-                    recognition._audio_interim_transcript = ""
-                self.prefix = None
-                self.pending = False
-                self.group = None
-                self.parts.clear()
-                self._rearm(recognition, after_eos=data._local_after_eos)
+            self._reconcile_terminal(recognition, data, before)
 
         if inspect.iscoroutinefunction(original):
             @wraps(original)
             async def observed(event: Any) -> Any:
+                if isinstance(event, _ConsumedTerminal):
+                    self.consumed_terminal(event.terminal)
+                    return None
                 part = prepare(event)
                 result = await original(event)
                 reconcile(part)
@@ -414,6 +537,9 @@ class _Binding:
         else:
             @wraps(original)
             def observed(event: Any) -> Any:
+                if isinstance(event, _ConsumedTerminal):
+                    self.consumed_terminal(event.terminal)
+                    return None
                 part = prepare(event)
                 result = original(event)
                 reconcile(part)
