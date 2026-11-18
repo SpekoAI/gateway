@@ -17,8 +17,8 @@ the SDK forwards PCM before its VAD callback and supplies no correlated capture
 frontier. Continuous-input rollover in those modes is not supported. Direct
 manual AgentSession turns require negotiated disabled server VAD; explicitly
 selected provider VAD remains supported. Live mode changes cannot bypass the
-frozen ownership boundary. Healthy supported idle/long manual input has no local
-two-second expiry.
+frozen ownership boundary. Idle/long input within an uncommitted manual turn has
+no local two-second expiry.
 
 Original manual samples count as uncommitted even inside the native resampler.
 Typed AgentSession replies refuse before provider or local conversation mutation
@@ -34,8 +34,14 @@ future do not release this fence. A `turnComplete` marked `IN_PROGRESS` remains
 fenced; extended thinking requires explicit `IDLE`. A turn that ends without output
 fails and retires its pending future/timer rather than lending it to later work.
 After an unambiguous terminal boundary, new typed input starts its own reply.
-Overlapping manual commits have no response correlation; typed admission remains
-refused on that transport rather than guessing from their completion order.
+Additional manual source/activity calls while a response is unsettled are unsafe:
+the synchronous SDK has neither response correlation nor input backpressure.
+They now fail and physically retire the transport BEFORE new capture, conversion
+or provider controls are accepted. Input producers must stop submitting at commit
+and resume after the real terminal boundary. Continuously forwarding PCM after
+commit is not a supported manual lifecycle; no silence inference, buffering,
+replay, permanent live-socket latch or automatic restart substitutes for it.
+Ordinary next audio and typed turns remain supported after genuine terminals.
 Consumed audio transcript IDs cannot replay as typed input.
 
 GPT-Live refuses ALL per-reply instructions, including their associated typed
@@ -55,9 +61,11 @@ original application expiration remains; it does not establish task attribution
 or extend execution authority.
 
 Provider interruption feedback clears playback without a new manual activity.
-Before first output, feedback also preserves the unclaimed response's fence
-without turning SDK re-entry into an unnecessary local abort; typed work still
-waits for the terminal provider boundary.
+Before first output, feedback preserves the response fence for both claimed and
+unclaimed work. Its exact pending futures are marked before SDK re-entry, so
+later framework cancellation retires them without becoming a fatal local stop.
+Unheard interrupted output cannot claim them. Independent local cancellation
+still physically stops and joins; typed work waits for the terminal boundary.
 Supported explicit manual cancellation uses balanced controls where available;
 disabled/unavailable cancellation, provider-VAD explicit cancellation and
 pre-output cancellation physically stop and join the owned transport. There is

@@ -389,65 +389,62 @@ async def test_original_audio_future_survives_clear_and_only_terminal_provider_b
             await client.aclose()
 
 
-@pytest.mark.parametrize("new_first", [False, True])
-async def test_overlapping_commits_cannot_unlock_typed_work_from_an_unkeyed_completion(
-    native_binary, new_first
+@pytest.mark.parametrize("begin", ["audio", "activity"])
+async def test_unclaimed_overlap_surfaces_before_new_input_or_typed_context(
+    native_binary, begin
 ):
     commands, pcm = [], bytearray()
-    committed, connected, generations = (
-        asyncio.Queue(),
-        asyncio.Queue(),
-        asyncio.Queue(),
-    )
+    ended, closed = asyncio.Event(), asyncio.Event()
 
     async def peer(request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         await ws.receive_json()
         await ws.send_json({"setupComplete": {}})
-        connected.put_nowait(ws)
-        async for message in ws:
-            command = json.loads(message.data)
-            commands.append(command)
-            control = command.get("realtimeInput", {})
-            if "audio" in control:
-                pcm.extend(base64.b64decode(control["audio"]["data"]))
-            if "activityEnd" in control:
-                committed.put_nowait(None)
+        try:
+            async for message in ws:
+                command = json.loads(message.data)
+                commands.append(command)
+                control = command.get("realtimeInput", {})
+                if "audio" in control:
+                    pcm.extend(base64.b64decode(control["audio"]["data"]))
+                if "activityEnd" in control:
+                    ended.set()
+        finally:
+            closed.set()
         return ws
 
     async with native_stack(native_binary, peer) as (socket, _):
         client, model = client_model(socket)
         native = model.session(turn_detection_disabled=True)
-        native.on("generation_created", generations.put_nowait)
         try:
             await native._update_session(tools=[])
             await native.start()
-            ws = await asyncio.wait_for(connected.get(), 5)
             first, second = b"\x01\x10" * 480, b"\x03\x40" * 480
-            for raw in (first, second):
-                native.push_audio(rtc.AudioFrame(raw, 16000, 1, 480))
-                native.commit_audio()
-                await asyncio.wait_for(committed.get(), 5)
-            assert bytes(pcm) == first + second
-            outputs = (
-                ("NEW_AUDIO", "OLD_AUDIO") if new_first else ("OLD_AUDIO", "NEW_AUDIO")
+            native.push_audio(rtc.AudioFrame(first, 16000, 1, 480))
+            native.commit_audio()
+            await asyncio.wait_for(ended.wait(), 5)
+            with pytest.raises(GatewayError, match="terminal response"):
+                if begin == "activity":
+                    native.start_user_activity()
+                else:
+                    native.push_audio(rtc.AudioFrame(second, 16000, 1, 480))
+            await asyncio.wait_for(closed.wait(), 5)
+            await asyncio.wait_for(asyncio.shield(native._task), 5)
+            assert bytes(pcm) == first
+            assert (
+                len(
+                    [c for c in commands if "activityEnd" in c.get("realtimeInput", {})]
+                )
+                == 1
             )
-            for text in outputs:
-                await google_output(ws, text)
-                event = await asyncio.wait_for(generations.get(), 5)
-                assert not event.user_initiated
-                messages, calls = await asyncio.wait_for(collect_generation(event), 5)
-                assert messages == [[text, b"\x01\x10" * 2400]] and not calls
-                await refuse_context(native, "NO_TASK_FOR_UNCORRELATED_COMMITS")
-                with pytest.raises(llm.RealtimeError):
-                    await native.generate_reply()
-            assert native._failure is None
             assert not native._pending and not native._pending_timers
-            assert not any("clientContent" in command for command in commands)
-            assert "NO_TASK_FOR_UNCORRELATED_COMMITS" not in history_text(
-                native.chat_ctx
-            )
+            assert not any("clientContent" in c for c in commands)
+            context = native.chat_ctx
+            context.add_message(role="user", content="NO_TASK_FOR_UNCORRELATED_INPUT")
+            with pytest.raises((GatewayError, llm.RealtimeError)):
+                await native.update_chat_ctx(context)
+            assert "NO_TASK_FOR_UNCORRELATED_INPUT" not in history_text(native.chat_ctx)
         finally:
             await native.aclose()
             await model.aclose()
@@ -475,7 +472,7 @@ async def test_committed_audio_stop_joins_physical_request_without_admitting_typ
                 control = command.get("realtimeInput", {})
                 if "audio" in control:
                     pcm.extend(base64.b64decode(control["audio"]["data"]))
-                    if ended.is_set():
+                    if len(pcm) == 1920:
                         new_input.set()
                 if "activityEnd" in control:
                     ended.set()
@@ -491,22 +488,24 @@ async def test_committed_audio_stop_joins_physical_request_without_admitting_typ
             await native.start()
             raw = b"\x04\x12" * 480
             native.push_audio(rtc.AudioFrame(raw, 16000, 1, 480))
-            native.commit_audio()
-            original = (
-                native.generate_reply()
-                if action in {"cancel-future", "close"}
-                else None
-            )
-            await asyncio.wait_for(ended.wait(), 5)
+            if action == "clear-forwarded":
+                native.push_audio(rtc.AudioFrame(raw, 16000, 1, 480))
+                await asyncio.wait_for(new_input.wait(), 5)
+                native.clear_audio()
+                original = None
+            else:
+                native.commit_audio()
+                original = (
+                    native.generate_reply()
+                    if action in {"cancel-future", "close"}
+                    else None
+                )
+                await asyncio.wait_for(ended.wait(), 5)
             if action == "unclaimed-interrupt":
                 native.interrupt()
             elif action == "cancel-future":
                 original.cancel()
-            elif action == "clear-forwarded":
-                native.push_audio(rtc.AudioFrame(raw, 16000, 1, 480))
-                await asyncio.wait_for(new_input.wait(), 5)
-                native.clear_audio()
-            else:
+            elif action == "close":
                 await native.aclose()
             await asyncio.wait_for(closed.wait(), 5)
             await asyncio.wait_for(asyncio.shield(native._task), 5)

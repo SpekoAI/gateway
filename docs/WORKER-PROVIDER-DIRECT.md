@@ -18,7 +18,9 @@ per-reply instructions, including associated typed input, refuse before context
 mutation; unscoped asks require usable canonical context before append. Gemini
 typed replies cannot overtake uncommitted original audio or an unsettled committed
 response. Their ordinary continuation requires a genuine unambiguous provider
-terminal boundary; overlapping manual commits retain typed refusal. These SDK capability
+terminal boundary; unsafe pipelined manual input is refused before acceptance and
+retires its transport. Claimed provider-feedback futures retire without becoming
+local cancellation. These SDK capability
 checks do not attest current requester/source, claim, caller, credential, committed
 lease, provider bounds, durable entry, receipts or cleanup acceptance.
 

@@ -34,8 +34,8 @@ cancellation with balanced `activityStart`/`activityEnd` controls; subsequent re
 input still starts its own activity boundary. These are the provider's
 [manual VAD controls](https://ai.google.dev/gemini-api/docs/live-api/capabilities#disable-automatic-vad).
 Google's manual-VAD protocol forwards PCM as it arrives until an explicit
-`commit_audio()`. Healthy idle and long manually committed utterances have no
-local two-second expiry. Source samples are never replayed into a later turn.
+`commit_audio()`. Idle and long input before that commit have no local two-second
+expiry. Source samples are never replayed into a later turn.
 Pending writes have bounded frame/count/byte limits and the existing physical
 write deadline; overflow closes the owned transport without retrying.
 
@@ -66,18 +66,28 @@ provider's [terminal turn semantics](https://aistudio.google.com/api-reference/l
 `turnComplete` with `IN_PROGRESS` stays fenced, and extended thinking requires
 explicit `IDLE`. A no-output terminal fails and retires its original future/timer.
 After an unambiguous terminal boundary, accepted typed input starts its own reply.
-Overlapping manual commits cannot be correlated to later output; typed work stays
-refused on that transport, without restarting it or fabricating response IDs.
+Manual input producers must stop submitting at commit until that response's
+terminal boundary. An additional source/activity call in this phase fails and
+physically retires the transport BEFORE source samples, conversion or provider
+controls are accepted. The synchronous SDK cannot backpressure or attribute
+pipelined manual input safely; continuous post-commit microphone PCM is not a
+supported lifecycle. It is never classified as silence, buffered/replayed,
+silently sent with permanently failing handles, or automatically retried.
+Ordinary audio and typed turns after a genuine terminal remain supported.
 Clearing local, unconverted input discards its resampler state; it is not flushed
 into a later commit. Clearing already forwarded manual input closes the transport
-because it cannot be recalled. Repeated manual activity starts are idempotent.
+because it cannot be recalled. Activity starts within one uncommitted turn are idempotent.
 If interruption is disabled, or an unrelated preexisting activity has no fresh
 caller start to cancel the current response, explicit interruption closes the
 owned transport. Explicit provider-VAD interruption and cancellation before the
 first model output also abort and join the owned transport: the protocol has no
 dedicated cancel-only operation there, and a new client turn would start new
 model work. The canceled pending future and its timer retire before reuse.
-Provider interruption feedback remains a playback-only acknowledgement path.
+Provider interruption feedback remains distinct from local cancellation, including
+before first output with a claimed future. The exact provider-interrupted futures
+are ineligible for late output, and their asynchronous SDK cancellation retires
+without aborting the healthy session. A prior or subsequent independent local
+cancellation still physically stops and joins the owned transport.
 Gemini function tools are refused before socket creation: supported framework versions
 execute the Agent's original tools and expose no per-call cancellation hook for
 `toolCallCancellation`. This also refuses extended-thinking tool sessions. Native

@@ -321,7 +321,8 @@ class _RealtimeSession(llm.RealtimeSession):
         # This is only a restriction on admitting uncorrelated new work, never
         # a fabricated response identity or acknowledgement.
         self._google_response_pending = False
-        self._google_commits_overlap = False
+        self._google_response_interrupted = False
+        self._google_interrupted_pending: set[asyncio.Future] = set()
         self._google_interruption_feedback = False
         self._activity_interrupt_target: _Generation | None = None
         self._uncommitted_source_samples = 0
@@ -391,7 +392,8 @@ class _RealtimeSession(llm.RealtimeSession):
         for pending in list(self._pending):
             if pending.cancelled():
                 self._pending_cancelled(pending)
-                raise llm.RealtimeError("Realtime session is closed")
+                if self._closed or self._failure is not None:
+                    raise llm.RealtimeError("Realtime session is closed")
 
     @staticmethod
     def _observe_future(future: asyncio.Future) -> None:
@@ -563,6 +565,7 @@ class _RealtimeSession(llm.RealtimeSession):
 
     def start_user_activity(self) -> None:
         self._ensure_live()
+        self._check_manual_input_boundary()
         self._user_started = time.time()
         if self._google and self._manual_turns and not self._audio_active:
             self._enqueue({"realtimeInput": {"activityStart": {}}})
@@ -571,6 +574,7 @@ class _RealtimeSession(llm.RealtimeSession):
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         self._ensure_live()
+        self._check_manual_input_boundary()
         if frame.num_channels != 1:
             raise ValueError("Realtime input must be mono PCM16")
         self._configured.set()
@@ -618,22 +622,45 @@ class _RealtimeSession(llm.RealtimeSession):
     def push_video(self, frame: rtc.VideoFrame) -> None:
         raise llm.RealtimeError("This realtime model accepts audio only")
 
+    def _check_manual_input_boundary(self) -> None:
+        if self._google and self._manual_turns and self._google_response_pending:
+            # No input frontier or response identity can attribute a second
+            # activity. Refuse BEFORE accepting source samples, conversion or
+            # physical controls; do not keep an apparently usable poisoned
+            # transport sending audio whose handles can never succeed.
+            for pending in list(self._pending):
+                self._retire_pending(pending)
+                if not pending.done():
+                    pending.set_exception(
+                        llm.RealtimeError(
+                            "Gemini manual input overlaps an unsettled response"
+                        )
+                    )
+            failure = GatewayError(
+                "Wait for the Gemini terminal response before sending more manual input",
+                retryable=False,
+            )
+            self._fatal(failure)
+            raise failure
+
     def commit_audio(self) -> None:
         self._ensure_live()
+        if self._google and self._manual_turns and self._google_response_pending:
+            raise GatewayError(
+                "Wait for the Gemini terminal response before committing again",
+                retryable=False,
+            )
         if self._resampler:
             for frame in self._resampler.flush():
                 self._send_audio(bytes(frame.data))
         if self._google:
             if self._manual_turns and self._audio_active:
-                # Multiple committed inputs have no independently attributable
-                # response boundary on this protocol. Keep typed work refused
-                # on this transport, even if an older completion arrives late.
-                self._google_commits_overlap |= self._google_response_pending
                 self._enqueue({"realtimeInput": {"activityEnd": {}}})
                 self._audio_active = False
                 self._activity_interrupt_target = None
                 self._committed = True
                 self._google_response_pending = True
+                self._google_response_interrupted = False
         else:
             self._enqueue({"type": "input_audio_buffer.commit"})
         self._uncommitted_source_samples = 0
@@ -691,10 +718,14 @@ class _RealtimeSession(llm.RealtimeSession):
             )
             return future
         committed_reply = self._committed and not is_given(instructions)
-        if self._google and self._google_response_pending and (
-            self._google_commits_overlap
-            or not committed_reply
-            or self._generation is not None
+        if (
+            self._google
+            and self._google_response_pending
+            and (
+                self._google_response_interrupted
+                or not committed_reply
+                or self._generation is not None
+            )
         ):
             future.set_exception(
                 llm.RealtimeError("Wait for the Gemini response to finish")
@@ -719,6 +750,7 @@ class _RealtimeSession(llm.RealtimeSession):
                         {"role": "user", "parts": [{"text": instructions}]}
                     ]
                 self._google_response_pending = True
+                self._google_response_interrupted = False
                 self._enqueue({"clientContent": content})
         else:
             response: dict[str, Any] = {}
@@ -753,6 +785,7 @@ class _RealtimeSession(llm.RealtimeSession):
         )
 
     def _retire_pending(self, future: asyncio.Future) -> None:
+        self._google_interrupted_pending.discard(future)
         if future in self._pending:
             self._pending.remove(future)
         timer = self._pending_timers.pop(future, None)
@@ -761,7 +794,10 @@ class _RealtimeSession(llm.RealtimeSession):
 
     def _pending_cancelled(self, future: asyncio.Future) -> None:
         if future.cancelled() and future in self._pending:
+            provider_interrupted = future in self._google_interrupted_pending
             self._retire_pending(future)
+            if provider_interrupted:
+                return
             # No response identity/cancel acknowledgement exists yet. Retire
             # this exact future and stop the physical request, not just playback.
             self._fatal(
@@ -771,6 +807,8 @@ class _RealtimeSession(llm.RealtimeSession):
             )
 
     def interrupt(self) -> None:
+        if self._google_interruption_feedback:
+            return
         if self._pending:
             for future in list(self._pending):
                 self._retire_pending(future)
@@ -787,11 +825,6 @@ class _RealtimeSession(llm.RealtimeSession):
             )
             return
         if self._google and self._google_response_pending and self._generation is None:
-            if self._google_interruption_feedback:
-                # The provider already interrupted this work. Synchronous SDK
-                # playback feedback must not turn that acknowledgement into
-                # a new local cancellation. The response fence remains held.
-                return
             # An unclaimed commit (including skip_reply=True) still owns a
             # physical response. There is no pre-output cancel identity; do not
             # pretend a local interrupt/clear drained it for a later task.
@@ -1149,6 +1182,7 @@ class _RealtimeSession(llm.RealtimeSession):
                 timer.cancel()
             self._pending.clear()
             self._pending_timers.clear()
+            self._google_interrupted_pending.clear()
             if self._framework_binding is not None:
                 self._framework_binding.release(self)
                 self._framework_binding = None
@@ -1366,12 +1400,20 @@ class _RealtimeSession(llm.RealtimeSession):
                 generation.message(item["id"]).close()
 
     async def _google_event(self, event: dict[str, Any]) -> None:
+        self._ensure_live()
         if "goAway" in event:
             raise GatewayError("Realtime provider session is ending", retryable=False)
         content = event.get("serverContent", {})
         if "toolCall" in event or "toolCallCancellation" in event:
             raise GatewayError("Gemini tool execution is unavailable", retryable=False)
         if content.get("interrupted"):
+            self._google_response_interrupted = True
+            # Keep these real futures ineligible for output. The SDK will
+            # cancel them after its synchronous playback feedback; that exact
+            # cancellation is provider-caused, not a new local stop request.
+            self._google_interrupted_pending.update(
+                pending for pending in self._pending if not pending.done()
+            )
             if self._generation:
                 self._generation.interrupted = True
                 self._generation.close()
@@ -1404,7 +1446,11 @@ class _RealtimeSession(llm.RealtimeSession):
             )
         output = content.get("modelTurn")
         spoken = content.get("outputTranscription")
-        if (output or spoken) and self._generation is None:
+        if (
+            (output or spoken)
+            and self._generation is None
+            and not self._google_response_interrupted
+        ):
             self._google_response_pending = True
             self._begin("google_response_" + uuid.uuid4().hex)
         generation = self._generation
@@ -1454,7 +1500,8 @@ class _RealtimeSession(llm.RealtimeSession):
                 status is None
                 and self._model.model != "gemini-3.8-live-extended-thinking"
             ):
-                self._google_response_pending = self._google_commits_overlap
+                self._google_response_pending = False
+                self._google_response_interrupted = False
                 self._committed = False
                 for pending in list(self._pending):
                     self._retire_pending(pending)
@@ -1485,6 +1532,7 @@ class _RealtimeSession(llm.RealtimeSession):
                 future.set_exception(llm.RealtimeError("Realtime session is closed"))
         self._pending.clear()
         self._pending_timers.clear()
+        self._google_interrupted_pending.clear()
         if self._framework_binding is not None:
             self._framework_binding.release(self)
             self._framework_binding = None
