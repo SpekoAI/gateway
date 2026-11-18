@@ -271,6 +271,8 @@ class _DrainingVADStream(vad.VADStream):
                         frames=[self._frame(bytes(self._speech))],
                         speaking=True,
                     )
+        # Boundary PCM/timestamps/durations retain physical capture timing.
+        # Only the SDK inference clock used for interruption is fenced.
         duration_start = started_at
         if self._capture_frontier:
             # Reclassification can restore speaking state, but pre-EOS PCM
@@ -288,11 +290,6 @@ class _DrainingVADStream(vad.VADStream):
             ):
                 self._fresh_speech_start = self._processed - count
             duration_start = self._fresh_speech_start
-            if boundary is not None and boundary.type is vad.VADEventType.START_OF_SPEECH:
-                boundary.speech_duration = (
-                    (self._processed - duration_start) / self._sample_rate
-                    if duration_start is not None else 0
-                )
         # samples_index uses the detector rate; outward PCM keeps the source
         # rate. Inference publishes speaking/duration before its transition.
         inference_rate = getattr(options, "sample_rate", 16000)
