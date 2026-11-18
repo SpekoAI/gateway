@@ -384,9 +384,13 @@ class _DrainingVADStream(vad.VADStream):
                                 self._inner.end_input()
                                 continue
                             pending = self._audio.pending_real(bytes(self._unprocessed))
+                            # Real quiet already classified before the reset
+                            # separates pending capture even below the normal
+                            # end threshold. Only uninterrupted old speech
+                            # needs the muted replay state.
                             prior_speech = self._probability is not None and (
                                 self._probability.speaking or self._probability.onset_pending
-                            )
+                            ) and self._probability.silence_samples == 0
                             await utils.aio.cancel_and_wait(observed)
                             await self._inner.aclose()
                             self._reset()

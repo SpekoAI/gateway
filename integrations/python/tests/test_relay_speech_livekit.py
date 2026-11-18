@@ -620,7 +620,7 @@ async def test_draining_framework_vad_buffered_silence_has_no_packet_duration_de
         await asyncio.gather(collector, return_exceptions=True)
 
 
-@pytest.mark.parametrize("mode", ["vad", "stt_flush", "stt_flush_resume", "stt_flush_old_backlog", "stt_flush_old_speech", "stt_flush_new_start"])
+@pytest.mark.parametrize("mode", ["vad", "stt_flush", "stt_flush_resume", "stt_flush_old_backlog", "stt_flush_old_speech", "stt_flush_classified_quiet", "stt_flush_new_start"])
 async def test_draining_framework_vad_preserves_actual_response_interruption(mode):
     if "capabilities" not in inspect.signature(io.AudioOutput).parameters:
         pytest.skip("SDK predates the current audio output contract")
@@ -639,7 +639,7 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
             def predict(self, window):
                 nonlocal count
                 count += 1
-                if mode.startswith("stt_flush") and count == 16:
+                if mode.startswith("stt_flush") and count == (18 if mode == "stt_flush_classified_quiet" else 16):
                     loop.call_soon_threadsafe(blocked.set)
                     if not release.wait(3):
                         raise RuntimeError("owned inference release timed out")
@@ -728,10 +728,20 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
         options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
         await session.start(agent=Agent(instructions="Owned response interruption"), **options)
         stt_stream = await asyncio.wait_for(local.started.get(), 3)
-        speech = session.say("Owned ongoing response", audio=response(), allow_interruptions=True)
+        speech = session.say("Owned ongoing response", audio=response(), allow_interruptions=mode != "stt_flush_classified_quiet")
         await asyncio.wait_for(started.wait(), 3)
         await audio.frames.put(frame(b"\xff\x0f" * 7680))  # 480 ms of captured speech
         await asyncio.wait_for(until(lambda: streams and streams[0]._processed >= 7680), 3)
+        if mode == "stt_flush_classified_quiet":
+            # Quiet is real and already classified, but shorter than the
+            # detector's end threshold. Its witness must survive reset.
+            await audio.frames.put(frame(b"\0\0" * 1024))
+            await asyncio.wait_for(until(lambda: streams[0]._processed >= 8704), 3)
+            assert streams[0]._probability.speaking
+            assert streams[0]._probability.silence_samples == 1024
+            # Use the public SDK switch after preparing the old turn, so
+            # only the resumed caller can interrupt the active response.
+            speech.allow_interruptions = True
         assert not speech.interrupted
         if mode == "vad":
             await audio.frames.put(frame(b"\0\0" * 4096))
@@ -758,6 +768,8 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
                 payload = b"\xff\x0f" * 11200 + b"\0\0" * 8000
             elif mode == "stt_flush_old_speech":
                 payload = b"\xff\x0f" * 11200
+            elif mode == "stt_flush_classified_quiet":
+                payload = b"\xff\x0f" * 11264  # 704 ms after classified quiet
             else:
                 quiet, voiced = (4096,1024) if mode == "stt_flush_resume" else (1024,80)
                 payload = b"\0\0" * quiet + b"\xff\x0f" * voiced
@@ -769,9 +781,13 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
             await asyncio.wait_for(until(lambda: streams[0]._segment == streams[0]._flushes), 3)
             await asyncio.wait_for(until(lambda: streams[0]._processed >= len(payload) // 2), 3)
             await asyncio.sleep(0.1)
-            assert not speech.interrupted, "pre-EOS speech cannot interrupt the response after flush"
-            assert session._activity._audio_recognition._speaking is (mode == "stt_flush_resume")
-            assert session.user_state == ("speaking" if mode == "stt_flush_resume" else "listening")
+            if mode == "stt_flush_classified_quiet":
+                assert session._activity._audio_recognition._speaking
+                assert session.user_state == "speaking"
+            else:
+                assert not speech.interrupted, "pre-EOS speech cannot interrupt the response after flush"
+                assert session._activity._audio_recognition._speaking is (mode == "stt_flush_resume")
+                assert session.user_state == ("speaking" if mode == "stt_flush_resume" else "listening")
             if mode == "stt_flush_old_speech":
                 # The replay frontier contains ONLY old speech. Silence is
                 # captured after replay, so it cannot hide a stale new start.

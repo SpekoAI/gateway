@@ -223,6 +223,8 @@ again with fresh detector state and duration counters. This preserves resumed
 speech captured before a delayed STT end; old speech durations cannot become a
 new interruption. A replay that ends in old speech stays non-interrupting until
 real quiet separates a fresh onset, including silence captured after replay.
+Already classified real quiet also separates pending resumed capture, even
+when it has not reached the detector's normal end threshold before reset.
 Recovery never replays detector-only padding. Pending
 real tails rearm after in-flight padding completes, with no packet-duration delay.
 
