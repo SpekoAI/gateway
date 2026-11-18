@@ -55,6 +55,9 @@ original application expiration remains; it does not establish task attribution
 or extend execution authority.
 
 Provider interruption feedback clears playback without a new manual activity.
+Before first output, feedback also preserves the unclaimed response's fence
+without turning SDK re-entry into an unnecessary local abort; typed work still
+waits for the terminal provider boundary.
 Supported explicit manual cancellation uses balanced controls where available;
 disabled/unavailable cancellation, provider-VAD explicit cancellation and
 pre-output cancellation physically stop and join the owned transport. There is

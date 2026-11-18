@@ -528,3 +528,111 @@ async def test_committed_audio_stop_joins_physical_request_without_admitting_typ
             await native.aclose()
             await model.aclose()
             await client.aclose()
+
+
+@pytest.mark.skipif(not MANUAL, reason="SDK cannot negotiate manual AgentSession turns")
+async def test_preoutput_provider_feedback_keeps_unclaimed_commit_fenced_without_abort(
+    native_binary,
+):
+    connected, ended, closed = asyncio.Queue(), asyncio.Event(), asyncio.Event()
+    feedback, terminal, assistants = asyncio.Event(), asyncio.Event(), asyncio.Queue()
+    commands, pcm = [], bytearray()
+
+    async def peer(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"setupComplete": {}})
+        connected.put_nowait(ws)
+        try:
+            async for message in ws:
+                command = json.loads(message.data)
+                commands.append(command)
+                control = command.get("realtimeInput", {})
+                if "audio" in control:
+                    pcm.extend(base64.b64decode(control["audio"]["data"]))
+                if "activityEnd" in control:
+                    ended.set()
+                if command.get("clientContent", {}).get("turnComplete"):
+                    await google_output(ws, "AFTER_ACKNOWLEDGED_INTERRUPTION")
+        finally:
+            closed.set()
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        client, model = client_model(socket)
+        actor = AgentSession(
+            llm=model, turn_detection="manual", vad=None, stt=None, tts=None
+        )
+        actor.on(
+            "conversation_item_added",
+            lambda event: (
+                assistants.put_nowait(event.item.text_content)
+                if isinstance(event.item, llm.ChatMessage)
+                and event.item.role == "assistant"
+                else None
+            ),
+        )
+        try:
+            await start_agent(actor)
+            native = next(iter(model._sessions))
+            native.on("input_speech_stopped", lambda event: feedback.set())
+            native.on(
+                "input_audio_transcription_completed",
+                lambda event: terminal.set() if event.is_final else None,
+            )
+            await native.start()
+            ws = await asyncio.wait_for(connected.get(), 5)
+            raw = b"\x03\x12" * 480
+            native.push_audio(rtc.AudioFrame(raw, 16000, 1, 480))
+            actor.commit_user_turn(skip_reply=True)
+            await asyncio.wait_for(ended.wait(), 5)
+            assert not native._pending and native._generation is None
+            # Real provider feedback re-enters AgentActivity.interrupt even
+            # though no local generation/playback handle exists yet.
+            await ws.send_json({"serverContent": {"interrupted": True}})
+            await asyncio.wait_for(feedback.wait(), 5)
+            assert native._failure is None and not closed.is_set(), (
+                "provider feedback unnecessarily aborted the unclaimed audio response"
+            )
+            await refuse_context(native, "REJECTED_BEFORE_FEEDBACK_TERMINAL")
+            await ws.send_json(
+                {
+                    "serverContent": {
+                        "turnComplete": True,
+                        "inputTranscription": {"text": "original consumed words"},
+                    }
+                }
+            )
+            await asyncio.wait_for(terminal.wait(), 5)
+            speech = actor.generate_reply(
+                user_input="SUPPORTED_AFTER_FEEDBACK_TERMINAL"
+            )
+            await asyncio.wait_for(speech.wait_for_playout(), 5)
+            assert speech.exception() is None
+            assert (
+                await asyncio.wait_for(assistants.get(), 5)
+                == "AFTER_ACKNOWLEDGED_INTERRUPTION"
+            )
+            assert bytes(pcm) == raw and not closed.is_set()
+            assert [
+                c["realtimeInput"]
+                for c in commands
+                if "realtimeInput" in c and "audio" not in c["realtimeInput"]
+            ] == [{"activityStart": {}}, {"activityEnd": {}}]
+            assert "REJECTED_BEFORE_FEEDBACK_TERMINAL" not in json.dumps(commands)
+            assert "REJECTED_BEFORE_FEEDBACK_TERMINAL" not in history_text(
+                native.chat_ctx
+            )
+            assert "REJECTED_BEFORE_FEEDBACK_TERMINAL" not in history_text(
+                actor.history
+            )
+            assert "REJECTED_BEFORE_FEEDBACK_TERMINAL" not in history_text(
+                actor.current_agent.chat_ctx
+            )
+            assert native._failure is None
+        finally:
+            await actor.aclose()
+            await native.aclose()
+            await model.aclose()
+            await client.aclose()

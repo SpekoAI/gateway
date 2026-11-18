@@ -322,6 +322,7 @@ class _RealtimeSession(llm.RealtimeSession):
         # a fabricated response identity or acknowledgement.
         self._google_response_pending = False
         self._google_commits_overlap = False
+        self._google_interruption_feedback = False
         self._activity_interrupt_target: _Generation | None = None
         self._uncommitted_source_samples = 0
         self._framework_binding: _FrameworkTurnBinding | None = None
@@ -786,6 +787,11 @@ class _RealtimeSession(llm.RealtimeSession):
             )
             return
         if self._google and self._google_response_pending and self._generation is None:
+            if self._google_interruption_feedback:
+                # The provider already interrupted this work. Synchronous SDK
+                # playback feedback must not turn that acknowledgement into
+                # a new local cancellation. The response fence remains held.
+                return
             # An unclaimed commit (including skip_reply=True) still owns a
             # physical response. There is no pre-output cancel identity; do not
             # pretend a local interrupt/clear drained it for a later task.
@@ -1371,11 +1377,15 @@ class _RealtimeSession(llm.RealtimeSession):
                 self._generation.close()
             # LiveKit owns frames that already left our channels. Its speech
             # event interrupts the active handle and clears that playback too.
-            self.emit("input_speech_started", llm.InputSpeechStartedEvent())
-            self.emit(
-                "input_speech_stopped",
-                llm.InputSpeechStoppedEvent(user_transcription_enabled=True),
-            )
+            self._google_interruption_feedback = True
+            try:
+                self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+                self.emit(
+                    "input_speech_stopped",
+                    llm.InputSpeechStoppedEvent(user_transcription_enabled=True),
+                )
+            finally:
+                self._google_interruption_feedback = False
         transcript = content.get("inputTranscription")
         if isinstance(transcript, dict) and transcript.get("text"):
             self._input_item = self._input_item or "google_user_" + uuid.uuid4().hex
