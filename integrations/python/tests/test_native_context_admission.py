@@ -31,11 +31,11 @@ ROUTES = [
 
 @pytest.mark.parametrize("protocol,name,voice", ROUTES)
 async def test_first_typed_known_responses_then_connected_ordinary_flow(
-    native_binary, protocol, name, voice
+    native_binary, monkeypatch, protocol, name, voice
 ):
     """No caller input exists before typed work; real terminals retire it."""
     source = OwnedAudioInput()
-    words = asyncio.Queue()
+    words, futures = asyncio.Queue(), asyncio.Queue()
     commands, pcm = [], bytearray()
     responses = 0
 
@@ -83,12 +83,25 @@ async def test_first_typed_known_responses_then_connected_ordinary_flow(
         try:
             agent = await start_agent(actor)
             native = agent.realtime_llm_session
+            generate = native.generate_reply
+
+            def observed(**options):
+                future = generate(**options)
+                futures.put_nowait(future)
+                return future
+
+            monkeypatch.setattr(native, "generate_reply", observed)
             for index in (1, 2):
                 speech = actor.generate_reply(
                     user_input="SAFE_TYPED_USER_" + str(index)
                 )
                 await asyncio.wait_for(speech.wait_for_playout(), 5)
-                assert speech.exception() is None
+                future = await asyncio.wait_for(futures.get(), 5)
+                assert future.done() and not future.cancelled()
+                assert future.exception() is None and future.result() is not None
+                assert not speech.interrupted
+                if hasattr(speech, "exception"):
+                    assert speech.exception() is None
                 assert await asyncio.wait_for(
                     words.get(), 5
                 ) == "SAFE_TYPED_ANSWER_" + str(index)
@@ -396,7 +409,9 @@ async def test_input_overlapping_first_typed_pending_is_stopped_before_capture(
             await asyncio.wait_for(closed.wait(), 5)
             await asyncio.wait_for(asyncio.shield(native._task), 5)
             await asyncio.wait_for(handle.wait_for_playout(), 5)
-            assert handle.exception() is not None or handle.interrupted
+            assert handle.interrupted or (
+                hasattr(handle, "exception") and handle.exception() is not None
+            )
             assert errors and not errors[0].error.recoverable
             assert future.done() and (
                 future.cancelled() or future.exception() is not None
