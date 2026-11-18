@@ -8,7 +8,7 @@ _MAX_CHARACTERS = 240
 _SENTENCE_END = re.compile(
     r"""\.["'”’»」』）)\]]*(?=\s)|[!?]["'”’»」』）)\]]*(?=\s|$)|[。！？؟]["'”’»」』）)\]]*|\r\n|[\r\n]"""
 )
-_TRAILING_PERIOD = re.compile(r"""\.["'”’»」』）)\]]*\s*$""")
+_PERIOD_END = re.compile(r"""\.["'”’»」』）)\]]*(?=\s|$)""")
 _PERIOD_WORD = re.compile(r"[A-Za-z]+(?:\.[A-Za-z]+)*$")
 _CONTINUING_PREFIXES = frozenset({
     "mr", "mrs", "ms", "dr", "prof", "st", "capt", "cpt", "lt", "col",
@@ -67,14 +67,27 @@ class NativeTextBuffer:
         text, self._text = self._text, ""
         return text
 
+    def _idle_end(self) -> int | None:
+        # St. is also a complete street suffix. Keep it with a continuation
+        # during the same bounded lookahead, without treating it as an
+        # indefinitely incomplete title. Dr./fl. retain their required noun.
+        for ending in reversed(list(_PERIOD_END.finditer(self._text))):
+            word = _word_before_period(self._text, ending.start()).lower()
+            if word in _CONTINUING_PREFIXES and word != "st":
+                continue
+            end = ending.end()
+            return len(self._text) if not self._text[end:].strip() else end
+        return None
+
+    def flush_idle(self) -> str:
+        end = self._idle_end()
+        if end is None:
+            return ""
+        text, self._text = self._text[:end], self._text[end:]
+        return text
+
     @property
     def can_flush_idle(self) -> bool:
-        # A token boundary alone cannot complete a period: the next token
-        # may extend a decimal or hostname. All terminal periods get the
-        # feeder's bounded lookahead, including numeric/dotted endings: a
-        # completed "Call 911." must not wait indefinitely for another token.
-        ending = _TRAILING_PERIOD.search(self._text)
-        return ending is not None and (
-            _word_before_period(self._text, ending.start()).lower()
-            not in _CONTINUING_PREFIXES
-        )
+        # A complete prefix remains eligible even with an unfinished next
+        # clause in the buffer. Keep that suffix for the producer's next token.
+        return self._idle_end() is not None

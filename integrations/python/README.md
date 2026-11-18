@@ -269,6 +269,12 @@ commit without a following token; unpunctuated input commits within 240
 characters, preferring a word boundary. Text is split without replacing literal
 strings such as `<stop>` or `<prd>`. An explicit `flush()` completes the SDK
 segment after its audio drains, even before `end_input()`.
+An ambiguous period gets the existing 300 ms lookahead, including a terminal
+street suffix `St.`. An abbreviated completed prefix such as `9 a.m.` can
+commit while an unfinished next clause stays buffered; idle commits retain
+that suffix and every separator for later input. Continuations within the
+lookahead preserve decimal, domain and abbreviation context, while titles
+such as `Dr.` and a unit prefix `fl.` still wait for their following word.
 Each native utterance waits for `utterance.done` before appending the next one
 or closing the session, while incoming LLM text continues buffering. This
 supports provider adapters with one active synthesis context.

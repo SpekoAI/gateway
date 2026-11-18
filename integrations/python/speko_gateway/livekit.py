@@ -1295,15 +1295,16 @@ class SynthesisStream(tts.SynthesizeStream):
                 push(first_token)
                 incoming = asyncio.create_task(self._input_ch.__anext__())
                 while True:
-                    # Coalesce an ambiguous final period across LLM tokens,
-                    # while still speaking "Hello." if its producer pauses.
+                    # Coalesce ambiguous periods across LLM tokens, then
+                    # speak only the completed prefix if the producer pauses.
                     # Keep the read task alive when the lookahead expires;
                     # cancelling a channel read can discard later text.
                     done, _ = await asyncio.wait(
                         [incoming], timeout=0.3 if text.can_flush_idle else None
                     )
                     if not done:
-                        flush()
+                        if ready := text.flush_idle():
+                            pieces.send_nowait(ready)
                         continue
                     try:
                         item = incoming.result()

@@ -41,6 +41,8 @@ MODEL_KEY = "sk_speko_agent_" + "a" * 64
         ),
         ("第一句话已经准备好了。", " 第二句话", "会在门控释放后完成。"),
         ("هل الجملة الأولى جاهزة؟", " الجملة التالية ", "ستنتهي بعد البوابة."),
+        ("They live on Main St.", " Please ", "visit tomorrow."),
+        ("The meeting starts at 9 a.m.", " Please ", "join us."),
         ("Meet Dr. Smith tomorrow.", " Please ", "bring the ID."),
         ("Use 2 fl. oz. of water.", " Then ", "mix gently."),
     ],
@@ -229,6 +231,8 @@ async def collect_stream(stream):
         ("Visit www.example.", "com for help.", 0.2),
         ("Email user@local.", "example for help.", 0.2),
         ("Read example.co.", "uk for help.", 0.2),
+        ("Near St.", " Louis, take the exit.", 0.2),
+        ("Meet at 9 a.m.", " Please join us.", 0.2),
         ("Meet Dr.", " Smith tomorrow.", 0.5),
         ("Use 2 fl.", " oz. of water.", 0.5),
     ],
@@ -336,10 +340,11 @@ async def test_native_tts_preserves_literal_text(native_binary, text):
 
 
 @pytest.mark.parametrize(
-    "first", ["Hello.", "This is a complete sentence.", "Wait<stop>please.", "a" * 240, "Call 911.", "Visit example.com.", "Use 2 fl. oz."]
+    "first", ["Hello.", "This is a complete sentence.", "Wait<stop>please.", "a" * 240, "Call 911.", "Visit example.com.", "Use 2 fl. oz.", "They live on Main St."]
 )
+@pytest.mark.parametrize("chunked", [False, True])
 async def test_native_tts_emits_standalone_text_while_upstream_waits(
-    native_binary, first
+    native_binary, first, chunked
 ):
     release = asyncio.Event()
     commits = []
@@ -371,7 +376,12 @@ async def test_native_tts_emits_standalone_text_while_upstream_waits(
         stream = model.stream()
 
         async def produce():
-            stream.push_text(first)
+            if chunked:
+                for character in first:
+                    stream.push_text(character)
+                    await asyncio.sleep(0)
+            else:
+                stream.push_text(first)
             await release.wait()
             stream.push_text(rest)
             stream.end_input()
