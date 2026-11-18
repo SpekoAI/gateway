@@ -101,13 +101,10 @@ func fundedGoogle(plan protocol.SessionPlan) bool {
 }
 
 func (e *Engine) supportsFundedGoogle(plan protocol.SessionPlan) bool {
-	// Preserve the existing default port. Configured aliases must be declared
-	// by the installed Google adapter, never inferred from an arbitrary ID.
-	if plan.Route.Adapter == "google.live.v1" {
-		return true
-	}
-	_, ok := e.adapters[plan.Route.Adapter].(GoogleRealtimeAdapter)
-	return ok
+	// Every ID, including the default, must identify an installed implementation
+	// that retains physical caps. Wrappers must forward its actual capability.
+	adapter, ok := e.adapters[plan.Route.Adapter].(GoogleRealtimeAdapter)
+	return ok && adapter.GoogleRealtimeAdapter()
 }
 
 func renewableGoogle(plan protocol.SessionPlan) bool {

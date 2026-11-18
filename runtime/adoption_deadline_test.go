@@ -127,6 +127,10 @@ type adoptionDeadlineAdapter struct {
 	joinStarted, joinEnd chan struct{}
 }
 
+func (a *adoptionDeadlineAdapter) GoogleRealtimeAdapter() bool {
+	return installedGoogleCapability(a.Adapter)
+}
+
 func (a *adoptionDeadlineAdapter) Open(ctx context.Context, r runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
 	stream, err := a.Adapter.Open(ctx, r)
 	if err != nil {

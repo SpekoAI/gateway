@@ -86,12 +86,12 @@ func New(config Config) (*Adapter, error) {
 
 func (a *Adapter) ID() string { return a.id }
 
-func (a *Adapter) GoogleRealtimeAdapter() {}
+func (a *Adapter) GoogleRealtimeAdapter() bool { return true }
 
 // Open establishes the constrained Google socket and waits for setupComplete.
 // The Engine emits the canonical session.ready event after this returns.
 func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
-	stream, err := a.openSocket(ctx, request, "", nil)
+	stream, err := a.openSocket(ctx, request, "", nil, nil)
 	if err != nil {
 		if stream == nil {
 			return nil, err
@@ -104,7 +104,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	return stream, nil
 }
 
-func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequest, handle string, responding *atomic.Bool) (*liveStream, error) {
+func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequest, handle string, responding *atomic.Bool, expire func(*liveStream)) (*liveStream, error) {
 	if request.Kind != protocol.SessionKindRealtime {
 		return nil, fmt.Errorf("gemini realtime supports realtime sessions, got %q", request.Kind)
 	}
@@ -203,6 +203,10 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 		gracefulDone: make(chan struct{}),
 	}
 	physical.bindExpiry(func() {
+		if expire != nil {
+			expire(stream) // stable exact-socket detachment, including pending setup
+			return
+		}
 		stream.setTerminal(runtimepkg.ErrSessionLeaseExpired)
 		stream.Interrupt()
 	})

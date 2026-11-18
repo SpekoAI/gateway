@@ -55,6 +55,7 @@ type continuityPeer struct {
 	clockCalls                                    atomic.Int32
 	wallOffset                                    atomic.Int64
 	telemetry                                     collectingTelemetry
+	renewalHandler                                http.HandlerFunc
 }
 
 // ownedContinuationAdapter uses Google's actual socket parser with a
@@ -62,6 +63,11 @@ type continuityPeer struct {
 // state transitions, not acceptance of managed Google resumption. The real
 // managed adapter is tested separately and cannot resume or mint a new slice.
 type ownedContinuationAdapter struct{ *geminirealtime.Adapter }
+
+func installedGoogleCapability(adapter runtimepkg.Adapter) bool {
+	google, ok := adapter.(runtimepkg.GoogleRealtimeAdapter)
+	return ok && google.GoogleRealtimeAdapter()
+}
 
 func (a ownedContinuationAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
 	request.Plan.Execution.CredentialSource = protocol.CredentialsBYOK
@@ -149,6 +155,10 @@ func (p *continuityPeer) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"server_time": time.Now().UTC()})
+		return
+	}
+	if p.renewalHandler != nil {
+		p.renewalHandler(w, r)
 		return
 	}
 	var body map[string]string

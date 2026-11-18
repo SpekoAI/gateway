@@ -170,6 +170,8 @@ type admissionAdapter struct {
 	gateStarted, gateRelease chan struct{}
 }
 
+func (a admissionAdapter) GoogleRealtimeAdapter() bool { return installedGoogleCapability(a.Adapter) }
+
 func (a admissionAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
 	stream, err := a.Adapter.Open(ctx, request)
 	if stream == nil {

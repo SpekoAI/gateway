@@ -100,6 +100,8 @@ type joinedCloseAdapter struct {
 	release chan struct{}
 }
 
+func (a joinedCloseAdapter) GoogleRealtimeAdapter() bool { return installedGoogleCapability(a.Adapter) }
+
 func (a joinedCloseAdapter) Open(ctx context.Context, r runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
 	stream, err := a.Adapter.Open(ctx, r)
 	if err != nil {

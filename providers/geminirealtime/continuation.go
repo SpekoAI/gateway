@@ -37,6 +37,10 @@ func newResumableStream(a *Adapter, request runtimepkg.AdapterRequest, stream *l
 
 func (s *resumableStream) expirePhysical(stream *liveStream) {
 	s.mu.Lock()
+	// Fence adoption of a pending stream under the same lock as s.current.
+	// An already-running old callback must never detach a newer socket.
+	stream.setTerminal(runtimepkg.ErrSessionLeaseExpired)
+	stream.closed.Store(true)
 	if s.current == stream {
 		s.detached, s.current = stream, nil
 	}
@@ -44,7 +48,6 @@ func (s *resumableStream) expirePhysical(stream *liveStream) {
 	// Physical expiry detaches this exact socket before waking its bridge.
 	// The coordinator owns terminal-vs-pending-recovery classification. A late
 	// callback for an old socket must never detach an adopted replacement.
-	stream.setTerminal(runtimepkg.ErrSessionLeaseExpired)
 	stream.Interrupt()
 }
 
@@ -166,7 +169,7 @@ func (s *resumableStream) Resume(ctx context.Context, credential protocol.Delega
 	if request.PhysicalDeadline.IsZero() && !s.request.PhysicalDeadline.IsZero() {
 		return errors.New("gemini realtime: funded replacement physical deadline is missing")
 	}
-	stream, err := s.adapter.openSocket(ctx, request, handle, previous.responding)
+	stream, err := s.adapter.openSocket(ctx, request, handle, previous.responding, s.expirePhysical)
 	if err != nil {
 		if stream != nil {
 			_ = stream.abort()
@@ -176,12 +179,16 @@ func (s *resumableStream) Resume(ctx context.Context, credential protocol.Delega
 		return err
 	}
 	s.mu.Lock()
-	if s.closed || s.closing || ctx.Err() != nil {
+	if s.closed || s.closing || ctx.Err() != nil || stream.closed.Load() {
+		failure := stream.TerminalError()
+		if failure == nil {
+			failure = runtimepkg.ErrSessionClosed
+		}
 		s.mu.Unlock()
 		_ = stream.abort()
 		for range stream.Events() {
 		}
-		return runtimepkg.ErrSessionClosed
+		return failure
 	}
 	s.current, s.detached, s.bridgeDone = stream, nil, make(chan struct{})
 	go s.bridge(stream, s.bridgeDone)

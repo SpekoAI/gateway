@@ -43,10 +43,12 @@ current clock port derives authority from that signed URL; unsupported
 nonrenewable shapes receive `ErrFundedGoogleClockAuthority` after signature and
 nonce authentication, before clock, minting or provider I/O. No unsigned clock
 endpoint or allowance is invented. Existing ordinary OSS families stay separate.
-Configured Google adapter IDs use the same gates. An installed Google adapter
-declares its implementation capability; an arbitrary custom adapter ID cannot
-gain funded acceptance by matching a string. Unrecognized funded Google
-adapters receive `ErrFundedGoogleAdapter` after authentication and before I/O.
+Every Google adapter ID, including `google.live.v1`, requires the installed
+implementation's explicit capability. Wrappers forward that actual capability
+and refuse when it is absent or false; no default-ID exemption exists. A custom
+adapter cannot gain funded acceptance by matching a string. Unrecognized funded
+Google adapters receive `ErrFundedGoogleAdapter` after authentication and before
+clock or provider I/O.
 
 Ordinary local/signature-only admission and the default verifier retain a
 nondecreasing wall-time watermark. Spent local attempts remain fenced while
@@ -113,6 +115,11 @@ The coordinator carries its already validated cap separately from the shorter
 setup/request cancellation deadline. The adapter arms it on the actual pending
 replacement transport before setup blocks, even before `s.current` adoption.
 It never copies the old root cap or maps signed time through the host wall clock.
+Every replacement binds expiry to the stable stream's exact-socket detachment
+before setup. Expiry detaches that predecessor before its event source can end,
+so a valid pending next slice may recover through its original same-key intent.
+The callback fences an expired pending stream under the adoption lock too;
+late callbacks cannot detach a newer socket or make expired setup adoptable.
 
 Terminal abort claims its error before calling the Google stream's concurrent
 `Interrupt`, which closes physical I/O without waiting for the provider mutex,
@@ -123,9 +130,11 @@ until the original close/abort and the provider event source have both ended.
 
 Interruption starts bounded physical close attempts without waiting for any
 transport Close return. A stalled normal Close cannot block abort/lease terminal
-metadata. At most two physical attempts run concurrently; a completed failed
-normal slot can be retried while the previous interrupt return is held. A
-failed attempt preserves its diagnostic but does not latch future interruption.
+metadata. At most two physical attempts run concurrently; an unused normal slot
+or a completed failed slot can be used while the prior interrupt is held. This
+also covers cancellation during invalid-upgrade diagnostic reads, before the
+SDK has called normal Close. A failed attempt preserves its diagnostic but
+does not latch future interruption.
 The original cap remains armed while closure is unproven. Serialized teardown
 waits for actual successful/already-closed transport evidence and every active
 attempt to join before releasing capacity. Detach is prompt; replacement setup

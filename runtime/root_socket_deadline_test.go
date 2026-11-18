@@ -21,6 +21,8 @@ type heldRootAdapter struct {
 	opened, openReturn, joined, joinReturn chan struct{}
 }
 
+func (a *heldRootAdapter) GoogleRealtimeAdapter() bool { return installedGoogleCapability(a.Adapter) }
+
 func (a *heldRootAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
 	stream, err := a.Adapter.Open(ctx, request)
 	if err != nil {

@@ -137,11 +137,12 @@ type Adapter interface {
 }
 
 // GoogleRealtimeAdapter identifies an installed Google realtime implementation
-// with a configured ID. Its funded plans use the same admission and lifecycle
-// gates as the default port. This does not enable managed resumption.
+// for any installed ID. Wrappers return their underlying implementation's
+// capability, and return false when it is absent or refused. This capability
+// promises physical cap retention; it does not enable managed resumption.
 type GoogleRealtimeAdapter interface {
 	Adapter
-	GoogleRealtimeAdapter()
+	GoogleRealtimeAdapter() bool
 }
 
 type providerPhysicalDeadlineKey struct{}
