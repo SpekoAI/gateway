@@ -61,3 +61,33 @@ func TestLatePhysicalCallbackCannotDetachNewerOwnedSocket(t *testing.T) {
 		t.Fatal("newer owned socket failed to return actual response")
 	}
 }
+
+func TestOwnedPhysicalDeadlineCannotBeExtended(t *testing.T) {
+	peer := &fakeGemini{t: t}
+	peer.server = httptest.NewTLSServer(http.HandlerFunc(peer.handle))
+	t.Cleanup(peer.server.Close)
+	adapter, err := New(Config{HTTPClient: peer.server.Client(), AllowedEndpointHosts: []string{peer.host()}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := geminiRequest("wss" + strings.TrimPrefix(peer.server.URL, "https") + socketPath)
+	request.Plan.Execution.CredentialSource = protocol.CredentialsBYOK
+	request.Continuation = true
+	original := time.Now().Add(250 * time.Millisecond)
+	request.PhysicalDeadline = original
+	opened, err := adapter.Open(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stable := opened.(*resumableStream)
+	t.Cleanup(func() { _ = stable.Abort(context.Background()) })
+	old := stable.current
+	stable.TightenPhysicalDeadline(original.Add(time.Second))
+	timer := time.NewTimer(max(time.Until(original.Add(300*time.Millisecond)), 0))
+	defer timer.Stop()
+	select {
+	case <-old.physical.stopped:
+	case <-timer.C:
+		t.Fatal("later deadline extended original owned physical socket authority")
+	}
+}

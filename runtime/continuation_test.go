@@ -53,6 +53,8 @@ type continuityPeer struct {
 	closeWithStatus                               websocket.StatusCode
 	handshakeStarted, handshakeClosed             chan struct{}
 	clockCalls                                    atomic.Int32
+	sqlOffset                                     atomic.Int64
+	clockSamples                                  chan time.Time
 	wallOffset                                    atomic.Int64
 	telemetry                                     collectingTelemetry
 	renewalHandler                                http.HandlerFunc
@@ -154,7 +156,11 @@ func (p *continuityPeer) handle(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"server_time": time.Now().UTC()})
+		sample := time.Now().UTC().Add(time.Duration(p.sqlOffset.Load()))
+		_ = json.NewEncoder(w).Encode(map[string]any{"server_time": sample})
+		if p.clockSamples != nil {
+			p.clockSamples <- sample
+		}
 		return
 	}
 	if p.renewalHandler != nil {

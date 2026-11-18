@@ -123,6 +123,7 @@ type continuation struct {
 	stream               ResumableProviderStream
 	mu                   sync.Mutex
 	expires              time.Time
+	horizon              time.Time // original signed credential/lease/root minimum for this socket
 	// hardDeadline is the monotonic cap anchored before this socket's setup.
 	// SQL resampling and slow setup may tighten it, never restart its lifetime.
 	hardDeadline                       time.Time
@@ -151,6 +152,10 @@ func (c *continuation) synchronize(ctx context.Context) error {
 	if refreshed {
 		c.mu.Lock()
 		if !c.paused && c.session.ctx.Err() == nil {
+			if deadline := time.Now().Add(c.horizon.Sub(c.clock.now())); deadline.Before(c.hardDeadline) {
+				c.hardDeadline = deadline
+				c.stream.TightenPhysicalDeadline(deadline)
+			}
 			c.session.setLeaseDeadline(c.expires)
 		}
 		c.mu.Unlock()
@@ -164,12 +169,12 @@ func (c *continuation) beforeIO() error {
 			return err
 		}
 		c.mu.Lock()
-		paused, expires, hardDeadline, changed := c.paused, c.expires, c.hardDeadline, c.changed
+		paused, expires, horizon, hardDeadline, changed := c.paused, c.expires, c.horizon, c.hardDeadline, c.changed
 		c.mu.Unlock()
 		if c.session.ctx.Err() != nil {
 			return ErrSessionClosed
 		}
-		if !paused && c.clock.now().Before(expires) && time.Now().Before(hardDeadline) {
+		if !paused && c.clock.now().Before(horizon) && time.Now().Before(hardDeadline) {
 			return nil
 		}
 		if !paused {
@@ -187,7 +192,7 @@ func (c *continuation) beforeIO() error {
 func (c *continuation) ready() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return !c.paused && !c.clock.stale() && c.clock.now().Before(c.expires) && time.Now().Before(c.hardDeadline) && c.session.ctx.Err() == nil
+	return !c.paused && !c.clock.stale() && c.clock.now().Before(c.horizon) && time.Now().Before(c.hardDeadline) && c.session.ctx.Err() == nil
 }
 
 func (c *continuation) audioFits(accepted, frame int64) bool {
@@ -206,7 +211,7 @@ func (c *continuation) audioFits(accepted, frame int64) bool {
 // missing. Recovery may use that same pending intent, never that old socket.
 func (c *continuation) expire(expected time.Time) {
 	c.mu.Lock()
-	if c.paused || !c.expires.Equal(expected) || (c.clock.now().Before(expected) && time.Now().Before(c.hardDeadline)) {
+	if c.paused || !c.expires.Equal(expected) || (c.clock.now().Before(c.horizon) && time.Now().Before(c.hardDeadline)) {
 		c.mu.Unlock()
 		return
 	}
@@ -330,8 +335,15 @@ func (c *continuation) renew(previous time.Time) {
 		// BEFORE any provider lock, Detach or Resume can block. Validation binds
 		// the credential expiry to the funded lease and clips it to the original
 		// renewable horizon; no new timing authority is introduced here.
+		horizon := renewal.Credential.ExpiresAt
+		if renewal.LeaseExpiresAt.Before(horizon) {
+			horizon = renewal.LeaseExpiresAt
+		}
+		if end := c.session.plan.Reservation.Billing.RenewableUntil; end.Before(horizon) {
+			horizon = end
+		}
 		anchored := time.Now()
-		hardDeadline := anchored.Add(renewal.Credential.ExpiresAt.Sub(c.clock.now()))
+		hardDeadline := anchored.Add(horizon.Sub(c.clock.now()))
 		c.session.providerMu.Lock()
 		c.mu.Lock()
 		if ctx.Err() != nil || !time.Now().Before(hardDeadline) {
@@ -385,13 +397,18 @@ func (c *continuation) renew(previous time.Time) {
 			break
 		}
 		c.mu.Lock()
-		if expired || ctx.Err() != nil || !time.Now().Before(hardDeadline) || !c.clock.now().Before(renewal.LeaseExpiresAt) {
+		if deadline := time.Now().Add(horizon.Sub(c.clock.now())); deadline.Before(hardDeadline) {
+			hardDeadline = deadline
+		}
+		if expired || ctx.Err() != nil || !time.Now().Before(hardDeadline) || !c.clock.now().Before(horizon) {
 			c.mu.Unlock()
 			failure = ErrSessionLeaseExpired
 			break
 		}
 		c.expires, c.sequence, c.paused, c.pending = renewal.LeaseExpiresAt, renewal.Sequence, false, false
+		c.horizon = horizon
 		c.hardDeadline = hardDeadline
+		c.stream.TightenPhysicalDeadline(hardDeadline)
 		c.authorizedUnits += renewal.AuthorizedUnits
 		c.session.setLeaseDeadline(c.expires)
 		// Install the canonical owner before retiring the adoption timer. A

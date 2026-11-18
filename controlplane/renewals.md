@@ -31,9 +31,11 @@ its nonce before sampling SQL time. Plan, credential and envelope time checks
 then use the same trusted sample, so a short three-second slice works at a
 constant host offset of plus or minus ten seconds. Invalid signatures and
 replays cannot cause clock requests. Custom replay stores must implement
-`ClockedReplayCache.TryUseFor` with atomic monotonic-TTL retention; the default
-memory cache provides it. Retaining the nonce for its full signed issuance
-lifetime cannot extend the lease or allow the original plan to be reopened.
+`FundedReplayCache.TryUseFunded` with atomic monotonic-TTL retention and a
+persisted signed-expiry retirement cutoff; the default memory cache provides
+both. TTL-only `ClockedReplayCache` implementations fail closed before clock
+I/O. Retaining the nonce for its full signed issuance lifetime cannot extend
+the lease or allow the original plan to be reopened.
 The mixed BYOK/managed CLI verifier preserves this capability.
 
 Funded Google classification is independent of renewal eligibility. A managed
@@ -60,6 +62,16 @@ keys, default to 65,536 entries each, and refuse new admission with
 entries free space; the admission watermark remains. Clock rollback can
 conservatively refuse new plans until their timestamps catch up. SQL-clock
 funded admission retains its separate trusted-time and nonce contract.
+
+Funded nonce and Engine-attempt eviction retain a nondecreasing cutoff of the
+signed expiries they retired. A later SQL rollback cannot revive a forgotten
+consumed plan: horizons at/below that cutoff receive `ErrPlanReplay` before new
+provider work. Each cache keeps its configured bounded digest map and one cutoff
+timestamp; eviction reclaims space for distinct newly signed later horizons.
+The cutoff can conservatively refuse an unused older horizon after rollback;
+it does not clamp the authoritative SQL sample, renew an attempt, or retry a
+spent root. Shared nonce caches must update/persist cutoff and eviction
+atomically across consumers; a separate expiring SETNX key is insufficient.
 
 Signing-key freshness has a separate elapsed-time deadline for both session
 and relay verifiers. JWKS `max-age` and `MaxCacheTTL` are measured from request
@@ -101,6 +113,12 @@ upgraded transport, whose independent owner survives setupComplete and a held
 adapter Open return. It does not depend on caller/setup-context cancellation
 after handoff. A late Open return fails admission and retains capacity until
 its actual abort/event draining join; it never creates a replacement deadline.
+The original absolute SQL credential/lease/root minimum is retained alongside
+its monotonic cap. Fresh trusted samples may tighten both the independent
+physical timer and I/O/readiness fence; a backward sample cannot extend either.
+The later SQL lease never replaces an earlier credential horizon. Replacement
+adoption similarly tightens its original cap after any fresh SQL sample without
+resetting the lifetime or reusing the root credential's horizon.
 
 Before a resumed socket can open, the coordinator anchors its validated
 credential/lease/root horizon to monotonic elapsed time. An independent owner

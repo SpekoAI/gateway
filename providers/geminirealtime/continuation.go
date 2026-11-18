@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
@@ -119,6 +120,15 @@ func (s *resumableStream) CanResume() bool {
 	// that mask permits resumptions outside uses:1, without an accepted bound.
 	return s.request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK && !s.closed && !s.closing && s.handle() != ""
 }
+func (s *resumableStream) TightenPhysicalDeadline(deadline time.Time) {
+	s.mu.Lock()
+	stream := s.current
+	s.mu.Unlock()
+	if stream != nil && stream.physical != nil {
+		stream.physical.tighten(deadline)
+	}
+}
+
 func (s *resumableStream) Detach() {
 	s.mu.Lock()
 	stream := s.current

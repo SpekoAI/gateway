@@ -38,7 +38,8 @@ const (
 
 var (
 	// ErrPlanReplay is returned when an otherwise-valid signed plan is used
-	// more than once within its envelope lifetime.
+	// more than once within its envelope lifetime or after its signed horizon
+	// has been retired from a bounded funded cache.
 	ErrPlanReplay = errors.New("runtime: signed session plan has already been used")
 	// ErrReplayCacheFull refuses new work rather than evicting live replay guards.
 	ErrReplayCacheFull = errors.New("runtime: replay cache capacity exhausted")
@@ -56,21 +57,30 @@ type ReplayCache interface {
 
 // MemoryReplayCache is a bounded-by-expiry in-process replay cache.
 type MemoryReplayCache struct {
-	mu    sync.Mutex
-	now   func() time.Time
-	used  map[[32]byte]replayUse
-	limit int
+	mu                   sync.Mutex
+	now                  func() time.Time
+	used                 map[[32]byte]replayUse
+	limit                int
+	fundedRetiredThrough time.Time
 }
 
 // ClockedReplayCache retains authenticated nonces for a monotonic TTL,
-// independently of host wall-clock changes. Shared caches must provide the
-// equivalent atomic SET-if-absent with TTL.
+// independently of host wall-clock changes. TTL alone cannot protect against
+// SQL rollback after eviction; funded admission requires FundedReplayCache.
 type ClockedReplayCache interface {
 	ReplayCache
 	TryUseFor(context.Context, string, time.Duration) (bool, error)
 }
 
-type replayUse struct{ expiresAt, monotonicDeadline time.Time }
+// FundedReplayCache atomically retains a signed expiry cutoff when elapsed
+// guards are retired. A SQL rollback cannot revive a forgotten nonce. Shared
+// implementations must persist the cutoff with eviction, not only SETNX/TTL.
+type FundedReplayCache interface {
+	ClockedReplayCache
+	TryUseFunded(context.Context, string, time.Time, time.Duration) (bool, error)
+}
+
+type replayUse struct{ expiresAt, monotonicDeadline, fundedExpiresAt time.Time }
 
 // NewMemoryReplayCache constructs an in-memory replay cache.
 func NewMemoryReplayCache(now func() time.Time) *MemoryReplayCache {
@@ -83,7 +93,7 @@ func NewMemoryReplayCache(now func() time.Time) *MemoryReplayCache {
 // TryUse atomically consumes ID until its expiry. It returns false when the ID
 // was previously consumed and has not yet expired.
 func (c *MemoryReplayCache) TryUse(_ context.Context, id string, expiresAt time.Time) (bool, error) {
-	return c.tryUse(id, expiresAt, c.now(), false)
+	return c.tryUse(id, expiresAt, c.now(), false, time.Time{})
 }
 
 // TryUseFor retains a nonce for its full authenticated issuance lifetime.
@@ -93,10 +103,20 @@ func (c *MemoryReplayCache) TryUseFor(_ context.Context, id string, ttl time.Dur
 		return false, errors.New("runtime: replay retention must be positive")
 	}
 	now := c.now()
-	return c.tryUse(id, now.Add(ttl), now, true)
+	return c.tryUse(id, now.Add(ttl), now, true, time.Time{})
 }
 
-func (c *MemoryReplayCache) tryUse(id string, expiresAt, now time.Time, clocked bool) (bool, error) {
+// TryUseFunded refuses retired signed horizons without changing the SQL sample
+// used for validation. A newer signed horizon can still use reclaimed space.
+func (c *MemoryReplayCache) TryUseFunded(_ context.Context, id string, expiresAt time.Time, ttl time.Duration) (bool, error) {
+	if expiresAt.IsZero() || ttl <= 0 {
+		return false, errors.New("runtime: funded replay retention requires signed expiry and positive lifetime")
+	}
+	now := c.now()
+	return c.tryUse(id, now.Add(ttl), now, true, expiresAt.UTC())
+}
+
+func (c *MemoryReplayCache) tryUse(id string, expiresAt, now time.Time, clocked bool, fundedExpiry time.Time) (bool, error) {
 	if strings.TrimSpace(id) == "" || expiresAt.IsZero() || now.IsZero() {
 		return false, errors.New("runtime: replay cache requires an id and expiry")
 	}
@@ -109,11 +129,17 @@ func (c *MemoryReplayCache) tryUse(id string, expiresAt, now time.Time, clocked 
 			expired = !use.monotonicDeadline.After(monotonic)
 		}
 		if expired {
+			if use.fundedExpiresAt.After(c.fundedRetiredThrough) {
+				c.fundedRetiredThrough = use.fundedExpiresAt
+			}
 			delete(c.used, key)
 		}
 	}
 	key := sha256.Sum256([]byte(id))
 	if _, exists := c.used[key]; exists {
+		return false, nil
+	}
+	if !fundedExpiry.IsZero() && !fundedExpiry.After(c.fundedRetiredThrough) {
 		return false, nil
 	}
 	if !expiresAt.After(now) {
@@ -122,7 +148,7 @@ func (c *MemoryReplayCache) tryUse(id string, expiresAt, now time.Time, clocked 
 	if len(c.used) >= c.limit {
 		return false, ErrReplayCacheFull
 	}
-	use := replayUse{expiresAt: expiresAt}
+	use := replayUse{expiresAt: expiresAt, fundedExpiresAt: fundedExpiry}
 	if clocked {
 		use.monotonicDeadline = monotonic.Add(max(expiresAt.Sub(now), 0))
 	}
@@ -250,13 +276,14 @@ func (v *JWKSPlanVerifier) VerifyWithClock(ctx context.Context, plan protocol.Se
 		return err
 	}
 
-	cache, ok := v.config.ReplayCache.(ClockedReplayCache)
+	cache, ok := v.config.ReplayCache.(FundedReplayCache)
 	if !ok {
-		return errors.New("runtime: funded plans require a monotonic replay cache")
+		return errors.New("runtime: funded plans require a rollback-safe replay cache")
 	}
-	// Fence the nonce before clock I/O. Retaining the full signed issuance
-	// lifetime can outlast redemption; it cannot extend execution authority.
-	accepted, err := cache.TryUseFor(ctx, envelope.ID, envelope.ExpiresAt.Add(v.config.ClockSkew).Sub(envelope.IssuedAt))
+	// Fence before clock I/O, and retain the signed expiry cutoff on eviction.
+	// The lifetime/cutoff can refuse old authority, never extend execution.
+	expiresAt := envelope.ExpiresAt.Add(v.config.ClockSkew)
+	accepted, err := cache.TryUseFunded(ctx, envelope.ID, expiresAt, expiresAt.Sub(envelope.IssuedAt))
 	if err := replayResult(accepted, err); err != nil {
 		return err
 	}

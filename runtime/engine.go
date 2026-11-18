@@ -38,22 +38,24 @@ type Config struct {
 
 // Engine opens provider-neutral sessions through registered provider adapters.
 type Engine struct {
-	adapters         map[string]Adapter
-	verifier         PlanVerifier
-	localCredentials map[string]LocalCredential
-	telemetry        TelemetrySink
-	limits           Limits
-	now              func() time.Time
-	admissionNow     func() time.Time
-	maxReplayEntries int
-	planUsesMu       sync.Mutex
-	planUses         map[planUseKey]*planUse
+	adapters             map[string]Adapter
+	verifier             PlanVerifier
+	localCredentials     map[string]LocalCredential
+	telemetry            TelemetrySink
+	limits               Limits
+	now                  func() time.Time
+	admissionNow         func() time.Time
+	maxReplayEntries     int
+	planUsesMu           sync.Mutex
+	planUses             map[planUseKey]*planUse
+	fundedRetiredThrough time.Time // signed expiry cutoff, protected by planUsesMu
 }
 
 type planUseKey struct{ planID, attemptID [32]byte }
 type planUse struct {
-	expiresAt time.Time
-	wallClock bool
+	expiresAt       time.Time
+	wallClock       bool
+	signedExpiresAt time.Time
 }
 
 // A custom verifier may validate signatures without consuming a replay cache.
@@ -80,6 +82,11 @@ func (e *Engine) claimPlanUse(plan protocol.SessionPlan, current func() time.Tim
 			expiryNow = wallNow
 		}
 		if !use.expiresAt.After(expiryNow) {
+			// Forget the digest only after retaining its signed expiry cutoff.
+			// Fresh SQL time may roll backwards; retirement must remain terminal.
+			if use.signedExpiresAt.After(e.fundedRetiredThrough) {
+				e.fundedRetiredThrough = use.signedExpiresAt
+			}
 			delete(e.planUses, key)
 		}
 	}
@@ -87,11 +94,15 @@ func (e *Engine) claimPlanUse(plan protocol.SessionPlan, current func() time.Tim
 	if e.planUses[key] != nil {
 		return nil, ErrPlanReplay
 	}
+	if fundedGoogle(plan) && !plan.ExpiresAt.After(e.fundedRetiredThrough) {
+		return nil, ErrPlanReplay
+	}
 	if len(e.planUses) >= e.maxReplayEntries {
 		return nil, ErrReplayCacheFull
 	}
 	use := &planUse{expiresAt: plan.ExpiresAt, wallClock: !fundedGoogle(plan)}
 	if !use.wallClock {
+		use.signedExpiresAt = plan.ExpiresAt.UTC() // the signed claim, not a caller's monotonic annotation
 		use.expiresAt = retentionNow.Add(plan.ExpiresAt.Sub(now))
 	}
 	e.planUses[key] = use
@@ -380,6 +391,7 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Sessio
 		session.continuation = &continuation{ctx: continuationCtx, cancel: continuationCancel, session: session, client: request.Entitlements, clock: clock, stream: resumable, expires: request.Plan.Reservation.LeaseExpiresAt, authorizedUnits: request.Plan.Reservation.Usage.AuthorizedUnits, changed: make(chan struct{})}
 		// A shorter caller setup context limits Open only, not execution.
 		session.continuation.hardDeadline = fundedDeadline
+		session.continuation.horizon = fundedHorizon
 	}
 	session.setLeaseDeadline(request.Plan.Reservation.LeaseExpiresAt)
 	session.emitRegular(protocol.EventSessionReady, nil, nil, nil)

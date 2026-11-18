@@ -105,6 +105,9 @@ type ResumableProviderStream interface {
 	ProviderStream
 	CanResume() bool
 	Detach()
+	// TightenPhysicalDeadline is concurrent and nonblocking. It may only
+	// shorten this socket's Engine-derived cap, never extend or renew it.
+	TightenPhysicalDeadline(time.Time)
 	Resume(context.Context, protocol.DelegatedCredential) error
 }
 

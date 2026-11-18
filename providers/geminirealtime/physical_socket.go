@@ -16,6 +16,7 @@ type physicalSocket struct {
 	mu                      sync.Mutex
 	closeErr                error
 	timer                   *time.Timer
+	deadline                time.Time
 	expired, closed, joined bool
 	onExpiry                func()
 	normal, interrupt       *physicalCloseAttempt
@@ -32,12 +33,26 @@ type physicalCloseAttempt struct {
 
 func newPhysicalSocket(body io.ReadWriteCloser, deadline time.Time) *physicalSocket {
 	s := &physicalSocket{ReadWriteCloser: body, stopped: make(chan struct{})}
-	if !deadline.IsZero() {
-		s.mu.Lock()
-		s.timer = time.AfterFunc(max(time.Until(deadline), 0), s.expire)
-		s.mu.Unlock()
-	}
+	s.tighten(deadline)
 	return s
+}
+
+func (s *physicalSocket) tighten(deadline time.Time) {
+	if deadline.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || (!s.deadline.IsZero() && !deadline.Before(s.deadline)) {
+		return
+	}
+	s.deadline = deadline
+	if s.timer != nil {
+		s.timer.Stop()
+	}
+	// An already-running old callback still addresses only this socket. A
+	// shortened deadline cannot make that callback premature or renew authority.
+	s.timer = time.AfterFunc(max(time.Until(deadline), 0), s.expire)
 }
 
 func (s *physicalSocket) expire() {
