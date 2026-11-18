@@ -150,6 +150,23 @@ func TestBatchTranscribeMapsUploadStatus(t *testing.T) {
 	}
 }
 
+// The async API has no turn-detection preset, so a batch request that names
+// one is refused before any byte is uploaded.
+func TestBatchTranscribeRefusesTheRealtimeModeBeforeUpload(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+	}))
+	defer server.Close()
+	adapter, _ := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+	options := protocol.RequestOptions{STT: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"assemblyai": {"mode": "min_latency"}}}}
+	_, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{Plan: batchPlan(server.URL + "/v2/transcript"), Options: options, Audio: strings.NewReader("x"), AudioBytes: 1})
+	var providerErr *runtimepkg.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeInvalidRequest {
+		t.Fatalf("batch with mode: %v", err)
+	}
+}
+
 func mustJSON(t *testing.T, v any) string {
 	t.Helper()
 	encoded, err := json.Marshal(v)

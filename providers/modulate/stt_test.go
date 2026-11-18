@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -169,6 +170,26 @@ func TestProviderErrorClassification(t *testing.T) {
 		err := providerMessageError(testCase.message)
 		if err.Code != testCase.code || err.Retryable != testCase.retry {
 			t.Errorf("%q => %s retry=%t, want %s retry=%t", testCase.message, err.Code, err.Retryable, testCase.code, testCase.retry)
+		}
+	}
+}
+
+// Modulate's error frame is free text, so it names no provider code even
+// when the text is one word; a close reason names one only when it is a bare
+// code.
+func TestProviderFailuresNameOnlyAVendorCode(t *testing.T) {
+	t.Parallel()
+	for _, frame := range []string{`{"type":"error","error":"Insufficient credits."}`, `{"type":"error","error":"unavailable"}`} {
+		_, err := (&stream{}).handleMessage(json.RawMessage(frame))
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) || providerErr.SafeProviderCode() != "" {
+			t.Fatalf("error frame %s = %#v, want no provider code", frame, err)
+		}
+	}
+	for reason, want := range map[string]string{"quota_exceeded": "quota_exceeded", "Monthly usage limit reached.": ""} {
+		closed := fmt.Errorf("read: %w", websocket.CloseError{Code: 4029, Reason: reason})
+		if got := readError(closed).SafeProviderCode(); got != want {
+			t.Fatalf("close reason %q: SafeProviderCode = %q, want %q", reason, got, want)
 		}
 	}
 }

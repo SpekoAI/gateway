@@ -174,6 +174,24 @@ func TestErrorClassification(t *testing.T) {
 	}
 }
 
+// The error frame's type is Speechmatics' code; it must survive for the
+// failure logs whether the error refuses StartRecognition or ends a stream.
+func TestErrorFramesKeepTheVendorCode(t *testing.T) {
+	t.Parallel()
+	frame := []byte(`{"message":"Error","type":"quota_exceeded","reason":"Concurrent session limit reached","code":4005}`)
+	_, startErr := recognitionStarted(frame)
+	_, streamErr := (&stream{}).handleMessage(frame)
+	for name, err := range map[string]error{"start": startErr, "stream": streamErr} {
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) || providerErr.Code != "provider_quota_exceeded" {
+			t.Fatalf("%s error = %#v, want provider_quota_exceeded", name, err)
+		}
+		if got := providerErr.SafeProviderCode(); got != "quota_exceeded" {
+			t.Fatalf("%s SafeProviderCode = %q, want quota_exceeded", name, got)
+		}
+	}
+}
+
 func testRequest(endpoint string) runtimepkg.AdapterRequest {
 	expiresAt := time.Now().Add(time.Minute)
 	return runtimepkg.AdapterRequest{

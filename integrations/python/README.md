@@ -340,7 +340,9 @@ From 1.8.9, `STT(provider="soniox")` lets LiveKit flush the stream when the
 user stops speaking (VAD end of speech, a turn detector's end-of-turn verdict,
 or `commit_user_turn`). The Gateway turns the flush into Soniox's `finalize`,
 so the final transcript arrives a few hundred milliseconds later instead of
-waiting for Soniox's own endpointer (up to 2 s by default). Other providers
+waiting for Soniox's own endpointer (up to 2 s by default).
+`STT(provider="omi")` gets the same flush: the Gateway sends Omi's
+`finalize`, which Omi answers in about 50 ms server-side. Other providers
 and `provider="auto"` keep waiting for the provider's endpointer.
 Releases before 1.6.10 import `httpx` without declaring it, and openai 3 no
 longer brings it in; this package depends on `httpx`, so any install of it,
@@ -360,6 +362,9 @@ session = AgentSession(
         objective="balanced",     # default: or "quality", "latency", "cost"
         max_output_tokens=8_192,  # default
         reasoning_effort=None,    # default: provider default; or "none" ... "xhigh"
+        frequency_penalty=None,   # default: unset; -2 to 2
+        presence_penalty=None,    # default: unset; -2 to 2
+        repetition_penalty=None,  # default: unset; greater than 0, at most 2
     ),
     tts=TTS(),
 )
@@ -381,12 +386,77 @@ always reason and refuse `"none"`; `"minimal"` is their floor: Inception
 that can reason: a pinned model that cannot is refused
 (`capability_unsupported`), and auto routing considers only models that can.
 
+`frequency_penalty`, `presence_penalty` and `repetition_penalty` guard against
+a model looping on one phrase until `max_output_tokens`. `frequency_penalty`
+lowers a token's odds in proportion to how often it has already appeared and
+`presence_penalty` once it has appeared at all (both -2 to 2, neutral 0);
+`repetition_penalty` divides the odds of every token already in the context
+(greater than 0 and at most 2, neutral 1). Unset, no field is sent; a value
+out of range raises `ValueError` when the LLM is constructed. The Router
+applies a non-neutral penalty only on Together and Baseten: auto routing keeps
+the request to those models, and a model pinned elsewhere is refused
+(`capability_unsupported`). Older Routers ignore all three.
+
 `LLM()` requires `SPEKO_API_KEY` (plus optional `SPEKO_ROUTER_URL`; the old
 `SPEKO_RELAY_URL` remains a fallback) and speaks HTTPS directly to
 `router.speko.dev`, not the local socket — so unlike the
 provider-direct voice legs, the conversation history travels through the
 Speko Router. Function tools are supported; image and audio content is
 silently skipped — only text is forwarded.
+
+Cell-registered model work uses `RelayLLMClient.complete_registered_response`
+for an original `stream:false` body, or `stream_registered_response` for an
+original `stream:true` body. Create that client with the work's current bearer,
+the configured router URL and its session ID. Supply the cell's exact
+`rendering`, `request_body`, `work_nonce` and private `input_blinder`, plus the
+original explicit `idempotency_key`. The transport embeds the untouched request
+string in the v1 four-field protected envelope; it never adds a stream setting or
+reconstructs provider JSON. The 262144-byte UTF-8 input bound and exact metadata
+shape are checked before sending. Unknown provider grammar and authority are
+still verified independently by the native router and cell.
+
+The `agent-graph/openai-responses/v2` and `agent-graph/anthropic-messages/v2`
+renderings additionally require `attempt_id`, the lowercase UUID belonging to
+this invocation's acquired attempt. Supply its matching private `input_blinder`.
+These methods send exactly five fields by adding `speko_model_attempt_id`, while
+preserving the original request string and work idempotency key. Missing/invalid
+IDs and v1 requests mixed with attempt metadata refuse before HTTP. The SDK only
+transports the supplied proof; the cell and native owner verify the winning
+binding and authority. Keep the attempt ID and blinder in memory only. Do not
+reuse an invocation ID after cancellation, restart or an uncertain send, and do
+not replace the work idempotency key with that ID. No retry or fallback is added.
+
+These methods make one POST to `/v1/llm/responses`, carry
+`Speko-Client-Session-ID`, refuse redirects and do not retry or fall back. An
+explicit v1 retry must reuse the original work/input/key and remains subject to
+current cell authority. For v2, an uncertain send requires canonical recovery;
+replacement work needs separate cell authorization and a newly acquired attempt.
+Neither a transport error nor `retryable` proves no
+provider I/O. Cancellation or a truncated/error stream is not a completed
+result. Responses are router transport payloads: the worker must validate and
+commit its model observation separately. No method grants model authority,
+settles a charge, dispatches tools, claims heard audio or enables graph startup.
+Keep the envelope, bearer and blinder in memory only; do not log or spool them.
+
+Registered responses use bounded original UTF-8 JSON before any field is
+discarded: duplicate keys at any object level, non-finite numbers, invalid
+Unicode and non-object payloads are refused. Raw tool argument strings stay
+untouched, including intentional duplicate keys and exact numeric tokens inside
+that string. HTTP bodies and cumulative SSE bytes each have a 1 MiB bound.
+
+The registered stream rejects malformed/unsupported frames and duplicate event
+headers. It withholds its success terminal until clean HTTP EOF and refuses
+any event after that terminal, including an error or a second completion.
+Comments, multiline data and LF/CRLF framing remain supported. Bare CR framing
+is refused so a line ending cannot hide an additional event inside a comment.
+The caller still
+owns cancellation and the original work deadline; waiting for EOF grants no
+extra time or execution authority. A non-JSON or ambiguous HTTP error keeps only
+fixed status diagnostics. Ordinary unregistered methods retain their existing
+response handling.
+The shared SSE decoder dispatches an event only after its blank-line frame
+terminator. EOF after terminal JSON is a truncated stream, including for the
+ordinary `stream_response` method.
 
 Jev evaluations use the separate pooled async client and require an explicit
 idempotency key:
@@ -438,3 +508,51 @@ pipeline = Pipeline(
 Use a Pipecat VAD in the pipeline so `VADUserStoppedSpeakingFrame` commits the
 current Gateway STT utterance. The complete container and Pipecat Cloud setup
 is in the [Pipecat integration guide](../../docs/PIPECAT.md).
+
+### Router-native speech audio
+
+`RelayTTSClient` sends one `POST /v1/tts/speech` and yields the original audio
+bytes. It uses a Speko key and an explicit idempotency key; it never retries,
+follows redirects or falls back to a provider or local Gateway transport.
+Retry keys preserve up to 256 UTF-8 bytes, including interior spaces and Unicode.
+Blank keys, HTTP controls and surrounding HTTP whitespace are refused.
+
+```python
+from speko_gateway import RelayTTSClient
+
+speech = RelayTTSClient(api_key=key, base_url=router_origin, session_id=session_id)
+try:
+    async for chunk in speech.synthesize(
+        {
+            "routing": {"mode": "explicit", "provider": provider, "model": model},
+            "input": text,
+            "language": language,
+            "audio": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
+        },
+        idempotency_key=original_request_id,
+    ):
+        await consume_audio(chunk)
+finally:
+    await speech.aclose()
+```
+
+For caller-bound work, pass its original `work_nonce` and `input_blinder`
+together as keyword arguments. The SDK preserves them and the complete input
+string; it does not mint credentials, choose routes, or authorize another
+attempt. Do not place private work markers inside the request dictionary.
+
+Requests are bounded to 1 MiB; audio defaults to a 64 MiB maximum, configurable
+downward with `max_audio_bytes`. `io_timeout` (default 30 seconds) bounds cumulative
+pending HTTP header/audio waits and excludes time spent consuming a yielded
+chunk. No SDK timeout scope remains active in consumer code. Closure/cancellation
+releases owned responses. HTTP errors expose fixed status diagnostics rather
+than server response content. Audio, EOF, timeouts and failures supply no proof
+of provider non-execution, settlement or actual audible delivery.
+
+With an active `ConversationProbe`, the response's `Speko-Request-ID` attaches
+the Router TTS leg to the turn that started the request, provided that turn is
+still open. This request identity is separate from Gateway TTS session/attempt
+identities. The receiving Gateway must support Router TTS leg attachments.
+Those attachments are posted separately: older Gateways may reject them while
+unrelated turn markers remain deliverable. The probe counts rejected markers
+without retrying them.

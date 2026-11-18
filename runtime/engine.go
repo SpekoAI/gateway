@@ -2,14 +2,14 @@ package runtime
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,6 +41,47 @@ type Engine struct {
 	telemetry        TelemetrySink
 	limits           Limits
 	now              func() time.Time
+	planUsesMu       sync.Mutex
+	planUses         map[planUseKey]*planUse
+}
+
+type planUseKey struct{ planID, attemptID string }
+type planUse struct{ expiresAt time.Time }
+
+// A custom verifier may validate signatures without consuming a replay cache.
+// An Engine still admits only one successful stream for each issued attempt.
+// A failed open with no stream can retry; an acquired stream remains spent even
+// if its setup fails. This is local lifecycle tracking, not provider authority.
+func (e *Engine) claimPlanUse(plan protocol.SessionPlan) (func(bool), error) {
+	e.planUsesMu.Lock()
+	defer e.planUsesMu.Unlock()
+	now := e.now()
+	// Verification may block or yield past expiry. Check again at the fence's
+	// admission point before removing old uses or acquiring a provider stream.
+	if err := plan.Validate(now); err != nil {
+		return nil, fmt.Errorf("invalid session plan after verification: %w", err)
+	}
+	for key, use := range e.planUses {
+		if !use.expiresAt.After(now) {
+			delete(e.planUses, key)
+		}
+	}
+	key := planUseKey{plan.PlanID, plan.AttemptID}
+	if e.planUses[key] != nil {
+		return nil, ErrPlanReplay
+	}
+	use := &planUse{expiresAt: plan.ExpiresAt}
+	e.planUses[key] = use
+	return func(spent bool) {
+		if spent {
+			return
+		}
+		e.planUsesMu.Lock()
+		defer e.planUsesMu.Unlock()
+		if e.planUses[key] == use {
+			delete(e.planUses, key)
+		}
+	}, nil
 }
 
 // New constructs an Engine with fixed per-session limits.
@@ -91,6 +132,7 @@ func New(config Config) (*Engine, error) {
 		telemetry:        config.Telemetry,
 		limits:           limits,
 		now:              config.Now,
+		planUses:         make(map[planUseKey]*planUse),
 	}, nil
 }
 
@@ -107,6 +149,12 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if !ok {
 		return nil, fmt.Errorf("runtime adapter %q is not installed", request.Plan.Route.Adapter)
 	}
+	finishUse, err := e.claimPlanUse(request.Plan)
+	if err != nil {
+		return nil, err
+	}
+	spent := false
+	defer func() { finishUse(spent) }()
 
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	openStarted := e.now()
@@ -167,6 +215,7 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 		if stream == nil {
 			release()
 		} else {
+			spent = true
 			go stopOpenedProvider(stream, release)
 		}
 		e.recordOpenFailure(request, err)
@@ -181,12 +230,14 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	}
 	providerEvents := stream.Events()
 	if providerEvents == nil {
+		spent = true
 		cancel()
 		go stopOpenedProvider(stream, release)
 		e.recordOpenFailure(request, errors.New("provider stream must expose an events channel"))
 		return nil, errors.New("provider stream must expose an events channel")
 	}
 
+	spent = true
 	session := &Session{
 		kind:            request.Kind,
 		plan:            request.Plan,
@@ -326,6 +377,9 @@ type Session struct {
 	usageMu            sync.Mutex
 	usedUnits          int64
 	acceptedAudioBytes int64
+	audioInFlight      bool
+	audioUncertain     bool
+	usageSealed        bool
 	usageOnce          sync.Once
 }
 
@@ -519,16 +573,30 @@ func (s *Session) dispatch(message inputMessage) error {
 
 	switch message.kind {
 	case inputAudio:
+		s.usageMu.Lock()
+		if s.usageSealed {
+			s.usageMu.Unlock()
+			if message.audio.release != nil {
+				message.audio.release()
+			}
+			return ErrSessionClosed
+		}
+		s.audioInFlight = true
+		s.usageMu.Unlock()
 		err := s.stream.WriteAudio(s.ctx, message.audio.data)
+		s.usageMu.Lock()
+		s.audioInFlight = false
 		if err == nil {
-			s.usageMu.Lock()
 			if frameBytes := int64(len(message.audio.data)); frameBytes > math.MaxInt64-s.acceptedAudioBytes {
 				s.acceptedAudioBytes = math.MaxInt64
 			} else {
 				s.acceptedAudioBytes += frameBytes
 			}
-			s.usageMu.Unlock()
+		} else {
+			// A failed transport write may already have reached the provider.
+			s.audioUncertain = true
 		}
+		s.usageMu.Unlock()
 		if message.audio.release != nil {
 			message.audio.release()
 		}
@@ -582,9 +650,9 @@ func (s *Session) runEvents() {
 				s.fail(errors.New("provider emitted an event without a type"))
 				return
 			}
-			// usage.observed is a provider request correlation hint. Its payload
-			// is exactly {"provider_request_id": ...}; other event payloads may
-			// carry transcripts or audio and are never recorded.
+			// usage.observed carries content-free provider correlation/processed
+			// duration metadata, or no data for Gemini. Native extensions never
+			// enter telemetry; other event payloads may carry customer content.
 			if event.Type == protocol.EventUsageObserved {
 				s.record("usage.observed", event.Data)
 			}
@@ -662,7 +730,7 @@ func (s *Session) fail(err error) {
 		s.errMu.Unlock()
 		s.input.abort()
 		s.cancel()
-		s.recordUsageReported()
+		s.recordUsageFinalized()
 		s.record("session.failed", telemetryErrorData(err))
 		s.emitTerminal(protocol.EventError, errorData(err), providerErrorExtensions(err), nil)
 		go s.finishPhysical()
@@ -678,7 +746,7 @@ func (s *Session) finish(err error) {
 		s.stopLeaseTimer()
 		s.input.abort()
 		s.cancel()
-		s.recordUsageReported()
+		s.recordUsageFinalized()
 		s.record("session.closed", nil)
 		s.emitTerminal(protocol.EventSessionClosed, nil, nil, nil)
 		go s.finishPhysical()
@@ -736,7 +804,7 @@ func (s *Session) record(name string, data json.RawMessage) {
 		SessionID:   s.plan.SessionID,
 		AttemptID:   s.plan.AttemptID,
 		At:          s.now(),
-		EventID:     telemetryEventID(s.plan.AttemptID, name, data),
+		EventID:     newTelemetryEventID(),
 		Destination: s.plan.Telemetry,
 		Data:        data,
 		Required:    s.plan.Execution.CredentialSource == protocol.CredentialsManaged && requiredMeteringEvent(name),
@@ -767,44 +835,37 @@ func (s *Session) recordAgentEvent(event protocol.Event) {
 }
 
 func requiredMeteringEvent(name string) bool {
-	return name == "usage.observed" || name == "usage.reported" || name == "session.closed" || name == "session.failed"
+	return name == "usage.observed" || name == "usage.reported" || name == "usage.finalized" || name == "session.closed" || name == "session.failed"
 }
 
-func (s *Session) recordUsageReported() {
+func (s *Session) recordUsageFinalized() {
 	s.usageOnce.Do(func() {
 		s.usageMu.Lock()
+		s.usageSealed = true
 		usedUnits := s.usedUnits
 		acceptedAudioBytes := s.acceptedAudioBytes
+		unknown := s.audioInFlight || s.audioUncertain
 		s.usageMu.Unlock()
-		s.record("usage.reported", usageReportedData(s.kind, s.media, usedUnits, acceptedAudioBytes))
+		// Public termination never waits for a stalled provider. An unresolved
+		// write or compressed duration remains unknown evidence for settlement.
+		if unknown || s.kind == protocol.SessionKindLLM || (acceptedAudioBytes > 0 && s.media.Encoding != "pcm_s16le") {
+			return
+		}
+		s.record("usage.finalized", usageReportedData(s.kind, s.media, usedUnits, acceptedAudioBytes))
 	})
 }
 
 func (e *Engine) recordOpenFailure(request OpenRequest, openErr error) {
-	usage := usageReportedData(request.Kind, mediaValue(request.Media), 0, 0)
 	for _, event := range []TelemetryEvent{
 		{
-			Name: "usage.reported", SessionID: request.Plan.SessionID, AttemptID: request.Plan.AttemptID,
-			At: e.now(), EventID: telemetryEventID(request.Plan.AttemptID, "usage.reported", usage),
-			Destination: request.Plan.Telemetry, Data: usage,
-			Required: request.Plan.Execution.CredentialSource == protocol.CredentialsManaged,
-		},
-		{
 			Name: "session.failed", SessionID: request.Plan.SessionID, AttemptID: request.Plan.AttemptID,
-			At: e.now(), EventID: telemetryEventID(request.Plan.AttemptID, "session.failed", telemetryErrorData(openErr)),
+			At: e.now(), EventID: newTelemetryEventID(),
 			Destination: request.Plan.Telemetry, Data: telemetryErrorData(openErr),
 			Required: request.Plan.Execution.CredentialSource == protocol.CredentialsManaged,
 		},
 	} {
 		e.telemetry.TryRecord(event)
 	}
-}
-
-func mediaValue(media *protocol.MediaFormat) protocol.MediaFormat {
-	if media == nil {
-		return protocol.MediaFormat{}
-	}
-	return *media
 }
 
 func usageReportedData(kind protocol.SessionKind, media protocol.MediaFormat, usedUnits, acceptedAudioBytes int64) json.RawMessage {
@@ -836,15 +897,14 @@ func usageReportedData(kind protocol.SessionKind, media protocol.MediaFormat, us
 	return payload
 }
 
-// telemetryEventID is deterministic so a resent event deduplicates in the
-// control plane's idempotent ingest. Lifecycle events occur at most once per
-// attempt; payload-bearing events additionally key on their content.
-func telemetryEventID(attemptID, name string, data json.RawMessage) string {
-	if len(data) == 0 {
-		return "tel_" + attemptID + "_" + name
-	}
-	sum := sha256.Sum256(data)
-	return "tel_" + attemptID + "_" + name + "_" + hex.EncodeToString(sum[:8])
+// A process nonce plus a monotonic occurrence counter also distinguishes
+// repeated data-free provider observations and retries of a failed open. IDs
+// are allocated at creation and retained by the exporter across delivery retries.
+var telemetryProcessID = rand.Text()
+var telemetryEventSequence atomic.Uint64
+
+func newTelemetryEventID() string {
+	return "tel_" + telemetryProcessID + "_" + strconv.FormatUint(telemetryEventSequence.Add(1), 10)
 }
 
 func openLatencyData(latency time.Duration) json.RawMessage {

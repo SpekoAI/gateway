@@ -544,6 +544,70 @@ def test_llm_rejects_unknown_reasoning_effort(effort: Any) -> None:
         LLM(FakeRelayClient([]), reasoning_effort=effort)  # type: ignore[arg-type]
 
 
+async def test_llm_omits_penalties_by_default() -> None:
+    plugin = LLM(FakeRelayClient([]))  # type: ignore[arg-type]
+
+    body = plugin._request_body(_user_ctx(), [])
+
+    for name in ("frequency_penalty", "presence_penalty", "repetition_penalty"):
+        assert name not in body
+
+    await plugin.aclose()
+
+
+async def test_llm_sends_penalties() -> None:
+    client = FakeRelayClient(_relay_events())
+    plugin = LLM(  # type: ignore[arg-type]
+        client,
+        provider="baseten",
+        model="deepseek-ai/DeepSeek-V4.1-Flash",
+        frequency_penalty=0.4,
+        presence_penalty=-0.2,
+        repetition_penalty=1.1,
+    )
+
+    stream = plugin.chat(chat_ctx=_user_ctx())
+    async for _ in stream:
+        pass
+
+    request = client.requests[0]
+    assert request["frequency_penalty"] == 0.4
+    assert request["presence_penalty"] == -0.2
+    assert request["repetition_penalty"] == 1.1
+
+    await plugin.aclose()
+
+
+async def test_llm_sends_only_the_penalties_given() -> None:
+    plugin = LLM(FakeRelayClient([]), repetition_penalty=2)  # type: ignore[arg-type]
+
+    body = plugin._request_body(_user_ctx(), [])
+
+    assert body["repetition_penalty"] == 2.0
+    assert "frequency_penalty" not in body
+    assert "presence_penalty" not in body
+
+    await plugin.aclose()
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("frequency_penalty", 2.5, "from -2 to 2"),
+        ("presence_penalty", -2.1, "from -2 to 2"),
+        ("frequency_penalty", True, "from -2 to 2"),
+        ("presence_penalty", "0.5", "from -2 to 2"),
+        ("frequency_penalty", float("nan"), "from -2 to 2"),
+        ("repetition_penalty", 0, "greater than 0 and at most 2"),
+        ("repetition_penalty", 2.01, "greater than 0 and at most 2"),
+        ("repetition_penalty", float("inf"), "greater than 0 and at most 2"),
+    ],
+)
+def test_llm_rejects_out_of_range_penalties(name: str, value: Any, message: str) -> None:
+    with pytest.raises(ValueError, match=f"{name} must be None or a number {message}"):
+        LLM(FakeRelayClient([]), **{name: value})  # type: ignore[arg-type]
+
+
 async def test_llm_stream_preserves_relay_error_classification() -> None:
     client = FailingRelayClient([])
     plugin = LLM(client)  # type: ignore[arg-type]
@@ -797,6 +861,9 @@ class _ManualFlushSTTCapabilities:
         # audio.commit is Soniox's mid-stream finalize.
         ("soniox", True),
         (" Soniox ", True),
+        # audio.commit is Omi's finalize, which leaves the session open.
+        ("omi", True),
+        ("OMI", True),
         # The route is unknown until the session plan names it.
         ("auto", False),
         # audio.commit is a no-op on Deepgram Flux and drops a sub-50 ms

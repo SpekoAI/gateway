@@ -3,9 +3,11 @@ package gateway
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/SpekoAI/gateway/protocol"
+	"github.com/SpekoAI/gateway/providers/assemblyai"
 )
 
 // sttSupport records which caller STT options a provider's streaming adapter
@@ -48,26 +50,37 @@ type sttSupport struct {
 type sttModelKeys struct {
 	prefix string
 	keys   []string
+	// noDiarization, when set, is why this family cannot diarize although the
+	// provider's other models can. It is the refusal's detail, so it names
+	// the model to pin instead.
+	noDiarization string
+}
+
+// family returns the first modelKeys row matching the model, or a zero row.
+func (s sttSupport) family(model string) sttModelKeys {
+	for _, family := range s.modelKeys {
+		if strings.HasPrefix(model, family.prefix) {
+			return family
+		}
+	}
+	return sttModelKeys{}
 }
 
 // keysFor returns the settings this provider accepts on this model.
 func (s sttSupport) keysFor(model string) []string {
-	for _, family := range s.modelKeys {
-		if strings.HasPrefix(model, family.prefix) {
-			return append(family.keys, s.providerKeys...)
-		}
-	}
-	return s.providerKeys
+	return append(slices.Clone(s.family(model).keys), s.providerKeys...)
 }
 
 var sttOptionSupport = map[string]sttSupport{
 	// diarize / keyterm+keywords on v1 listen; keyterm on v2 (Flux). Flux owns
 	// turn detection, so its three eot_* knobs are caller-tunable there and
 	// meaningless on v1; the v1 formatting and endpointing knobs are ignored
-	// by the Flux endpoint. Diarization is v1-only. The catalog default is
-	// flux-general-en, so the split guards the DEFAULT route, not an edge.
+	// by the Flux endpoint. Diarization is v1-only: Flux has no diarize
+	// parameter at all. The catalog default is flux-general-en, so the split
+	// guards the DEFAULT route, not an edge.
 	"deepgram": {diarization: true, keywords: true, modelKeys: []sttModelKeys{
-		{prefix: "flux-", keys: []string{"eot_threshold", "eager_eot_threshold", "eot_timeout_ms"}},
+		{prefix: "flux-", keys: []string{"eot_threshold", "eager_eot_threshold", "eot_timeout_ms"},
+			noDiarization: "Deepgram Flux models have no diarization; pin a nova model"},
 		{prefix: "", keys: []string{
 			"punctuate", "numerals", "smart_format", "filler_words", "profanity_filter",
 			"dictation", "measurements",
@@ -83,16 +96,25 @@ var sttOptionSupport = map[string]sttSupport{
 	// is the second provider behind the canonical noise_reduction ask.
 	// min_turn_silence is the current parameter table's spelling;
 	// min_end_of_turn_silence_when_confident stays for callers holding the
-	// earlier documented name.
+	// earlier documented name. mode is the vendor's turn-detection preset
+	// (assemblyai.ValidateMode holds its values); explicit silence settings
+	// still override the preset's defaults.
 	"assemblyai": {diarization: true, keywords: true, noiseReduction: true, providerKeys: []string{
 		"end_of_turn_confidence_threshold", "min_end_of_turn_silence_when_confident",
-		"min_turn_silence", "max_turn_silence",
+		"min_turn_silence", "max_turn_silence", "mode",
 		"max_speakers", "voice_focus", "voice_focus_threshold", "filter_profanity",
 	}},
 	// Scribe realtime takes repeated keyterms; vad_silence_threshold_secs is
 	// the one commit-strategy knob worth exposing (default 1.5s, and the
-	// snappy-vs-patient tradeoff is genuinely per-caller).
-	"elevenlabs": {keywords: true, providerKeys: []string{"vad_silence_threshold_secs"}},
+	// snappy-vs-patient tradeoff is genuinely per-caller). Scribe v3 Live
+	// adds speaker labels, multilingual mode and turn prediction, each of
+	// which closes the socket on any other Scribe model. The adapter's own
+	// table (elevenlabs.ScribeRealtimeCapabilities) is the source; a test
+	// holds this row to it.
+	"elevenlabs": {diarization: true, keywords: true, providerKeys: []string{"vad_silence_threshold_secs"}, modelKeys: []sttModelKeys{
+		{prefix: "scribe_v3_live", keys: []string{"multilang_mode", "turn_prediction"}},
+		{prefix: "", noDiarization: "only Scribe v3 Live labels speakers; pin scribe_v3_live"},
+	}},
 	// enable_speaker_diarization, context terms and the one-way translation
 	// block all ride the start frame, and so do the endpoint knobs: Soniox's
 	// defaults wait up to 2s after speech ends before returning an endpoint,
@@ -120,6 +142,14 @@ var sttOptionSupport = map[string]sttSupport{
 	// (turn_detection: balanced, patient or responsive) as a query
 	// parameter. Nothing else on the socket is tunable.
 	"hopper": {providerKeys: []string{"turn_detection"}},
+	// Omi's realtime start frame takes its endpointer's silence window
+	// (endpointing.silence_ms, 200 to 1100 ms) and nothing else a caller
+	// tunes. Realtime has no keyterms and no word timings, and its speaker
+	// labels are provisional, so none is advertised. The upload's diarize
+	// (which also returns word timings) is a batch-only capability this
+	// streaming table cannot express; inline vocabulary is accepted by Omi but
+	// not applied, so keywords are advertised on neither surface.
+	"omi": {providerKeys: []string{"silence_ms"}},
 	// Keywords fold into the transcription prompt alongside a caller's own
 	// prompt text. gpt-4o-transcribe-diarize is batch-only, so no realtime
 	// diarization. The vendor documents `prompt` on the realtime session for
@@ -196,10 +226,8 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 	if options.Diarize() && !support.diarization {
 		return &SttSupportError{Provider: name, Option: "diarization", Detail: "no speaker labels on this provider's streaming transport"}
 	}
-	// Deepgram's split is model-level: Flux owns turns and takes keyterm, but
-	// has no diarize parameter at all.
-	if options.Diarize() && name == "deepgram" && strings.HasPrefix(model, "flux-") {
-		return &SttSupportError{Provider: name, Option: "diarization", Detail: "Deepgram Flux models have no diarization; pin a nova model"}
+	if detail := support.family(model).noDiarization; options.Diarize() && detail != "" {
+		return &SttSupportError{Provider: name, Option: "diarization", Detail: detail}
 	}
 	if len(options.GetKeywords()) > 0 && !support.keywords {
 		return &SttSupportError{Provider: name, Option: "keywords", Detail: "this provider has no vocabulary-biasing parameter on its streaming transport"}
@@ -237,11 +265,21 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 		if err := validateAssemblyAIVoiceFocus(options); err != nil {
 			return err
 		}
+		if err := validateAssemblyAIMode(model, options); err != nil {
+			return err
+		}
 	}
 	// Soniox answers an out-of-range endpoint knob with an error frame after
 	// the handshake, so the session would open and then die mid-call.
 	if name == "soniox" {
 		if err := validateSonioxEndpointOptions(options); err != nil {
+			return err
+		}
+	}
+	// Omi refuses an out-of-range silence window in place of ready; refusing
+	// it at create names the bounds instead of failing over.
+	if name == "omi" {
+		if err := validateNumericOptions("omi", omiEndpointRanges, options); err != nil {
 			return err
 		}
 	}
@@ -303,21 +341,46 @@ func validateAssemblyAIVoiceFocus(options *protocol.SttOptions) error {
 	return nil
 }
 
+// validateAssemblyAIMode refuses a turn-detection preset the model does not
+// have, by name, with the adapter's own rule (assemblyai.ValidateMode).
+func validateAssemblyAIMode(model string, options *protocol.SttOptions) error {
+	if err := assemblyai.ValidateMode(model, options.Provider("assemblyai")); err != nil {
+		return &SttSupportError{Provider: "assemblyai", Option: "provider_options.assemblyai." + assemblyai.ModeOption, Detail: err.Error()}
+	}
+	return nil
+}
+
+// numericOptionRange bounds one numeric provider setting; whole marks a
+// setting that takes integers.
+type numericOptionRange struct {
+	min, max float64
+	whole    bool
+}
+
 // sonioxEndpointRanges are the documented bounds of Soniox's endpoint knobs
 // (https://soniox.com/docs/stt/rt/endpoint-detection). whole marks the knobs
 // that take integers.
-var sonioxEndpointRanges = map[string]struct {
-	min, max float64
-	whole    bool
-}{
+var sonioxEndpointRanges = map[string]numericOptionRange{
 	"max_endpoint_delay_ms":             {min: 500, max: 3000, whole: true},
 	"endpoint_sensitivity":              {min: -1, max: 1},
 	"endpoint_latency_adjustment_level": {min: 0, max: 3, whole: true},
 }
 
+// omiEndpointRanges is the documented bound of Omi's realtime
+// endpointing.silence_ms.
+var omiEndpointRanges = map[string]numericOptionRange{
+	"silence_ms": {min: 200, max: 1100, whole: true},
+}
+
 func validateSonioxEndpointOptions(options *protocol.SttOptions) error {
-	for key, raw := range options.Provider("soniox") {
-		bounds, ok := sonioxEndpointRanges[key]
+	return validateNumericOptions("soniox", sonioxEndpointRanges, options)
+}
+
+// validateNumericOptions refuses a provider's numeric settings outside their
+// documented bounds.
+func validateNumericOptions(provider string, ranges map[string]numericOptionRange, options *protocol.SttOptions) error {
+	for key, raw := range options.Provider(provider) {
+		bounds, ok := ranges[key]
 		if !ok {
 			continue
 		}
@@ -330,14 +393,14 @@ func validateSonioxEndpointOptions(options *protocol.SttOptions) error {
 		case int64:
 			value = float64(typed)
 		default:
-			return &SttSupportError{Provider: "soniox", Option: "provider_options.soniox." + key, Detail: "must be a number"}
+			return &SttSupportError{Provider: provider, Option: "provider_options." + provider + "." + key, Detail: "must be a number"}
 		}
 		if value < bounds.min || value > bounds.max || bounds.whole && value != math.Trunc(value) {
 			kind := "a number"
 			if bounds.whole {
 				kind = "an integer"
 			}
-			return &SttSupportError{Provider: "soniox", Option: "provider_options.soniox." + key, Detail: fmt.Sprintf("must be %s from %g to %g", kind, bounds.min, bounds.max)}
+			return &SttSupportError{Provider: provider, Option: "provider_options." + provider + "." + key, Detail: fmt.Sprintf("must be %s from %g to %g", kind, bounds.min, bounds.max)}
 		}
 	}
 	return nil

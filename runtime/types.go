@@ -202,8 +202,14 @@ type ProviderError struct {
 	ProviderStatus int
 	Cause          error
 	// Extensions may retain a provider's raw error payload for the local
-	// canonical error event. Telemetry never copies this field.
+	// canonical error event. Telemetry never copies this field; it reads the
+	// provider's error code out of it through SafeProviderCode only.
 	Extensions map[string]json.RawMessage
+	// ProviderCode is optional: the provider's own machine-readable error
+	// code, set by an adapter whose vendor names it where SafeProviderCode's
+	// generic reading of Extensions would not look (a frame's type, a header
+	// object, a mapped numeric code). Leave it empty otherwise.
+	ProviderCode string
 }
 
 func (e *ProviderError) Error() string {
@@ -249,8 +255,10 @@ func (f PlanVerifierFunc) Verify(ctx context.Context, plan protocol.SessionPlan)
 // TelemetryEvent captures local experience metadata only. It intentionally
 // contains no media, transcripts, or provider credentials.
 //
-// EventID is deterministic per attempt and payload so an at-least-once
-// exporter can be deduplicated by the receiver. Destination is empty for
+// EventID identifies one event occurrence and stays stable across delivery
+// retries, so an at-least-once exporter can be deduplicated by the receiver.
+// The Engine assigns IDs at creation; the exporter assigns a missing ID once
+// before enqueueing. Destination is empty for
 // anonymous local routing or carries the plan-scoped contract for an
 // authenticated attempt; Destination.Token is a credential and must never be
 // logged or persisted by a sink. Data carries a redacted, provider-neutral

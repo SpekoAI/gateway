@@ -158,8 +158,9 @@ The gateway can export:
 | --- | --- |
 | `session.opened` | provider connection latency in milliseconds |
 | `agent.event` | canonical event type and sequence number |
-| `usage.observed` | provider request correlation ID |
-| `usage.reported` | accepted character or complete-PCM duration quantity in thousandths of the declared unit |
+| `usage.observed` | optional provider request correlation ID or processed-audio milliseconds; Google may omit the payload |
+| `usage.finalized` | accepted character or complete-PCM duration quantity in thousandths of the declared unit, after an opened session ends |
+| `usage.reported` | legacy observation; never proof of terminal usage |
 | `session.closed` | no payload |
 | `error` | error class, source, retryability, and provider HTTP status |
 
@@ -179,14 +180,21 @@ The exporter code deliberately excludes:
 
 Setting `SPEKO_TELEMETRY_DISABLED=true` suppresses anonymous and optional
 events. On a managed-credential route, the gateway still exports
-`usage.reported`, `usage.observed`, and the terminal `session.closed` or `error`
+`usage.finalized`, `usage.observed`, and the terminal `session.closed` or `error`
 event because those records are required to meter and consolidate the provider
 charge. BYOK routes have no mandatory billing records.
 
-Managed billing is post-paid: nothing is authorized before a session starts, and
-usage is settled monthly from these records afterwards. A lost
-`usage.reported` results in that usage not being billed rather than in a
-fallback charge.
+A failed provider open emits an error, without terminal zero usage. The engine
+fences concurrent or repeated successful opens of an issued plan even with a
+custom signature-only verifier. A failed open that acquired no stream releases
+that local fence; the configured verifier's own replay policy still applies.
+The stock verifier consumes the signed nonce on verification, so a retry with
+the same verifier remains refused. Local fences and replay caches do not persist
+across processes. The control plane reserves funds and reconciles final usage;
+missing telemetry remains unknown evidence, never proof of zero consumption.
+Final usage is also omitted when a write remains in flight at termination, a
+write failed with an uncertain outcome, or accepted compressed audio has no
+reliable duration. Session termination does not wait for a stalled write.
 
 Anonymous BYOK events are sent without an authorization header to
 `https://gateway.speko.dev/v1/anonymous-runtime-events`. The receiver rejects
@@ -195,6 +203,9 @@ API key, plan, reservation, or billing association. Managed plan telemetry is
 sent separately to the authenticated endpoint supplied in the signed plan.
 
 Telemetry delivery is asynchronous, bounded, and never blocks audio or text.
+Each event occurrence has an independent ID, including repeated data-free
+provider observations. That ID and the complete body stay unchanged during
+delivery retries, so receivers can distinguish new facts from duplicate delivery.
 Events can be dropped under pressure or after bounded retries; counters expose
 that condition without recording customer content.
 
@@ -216,7 +227,7 @@ containing an unknown marker type or an unknown data field:
 | `tool.started` / `tool.completed` | 1-based tool index and success flag — never tool names, arguments, or results |
 | `tts.requested` / `tts.first_audio` / `playback.started` / `playback.stopped` | interruption flag and playback position — never synthesized text or audio |
 | `interrupt.detected` / `interrupt.cancel_sent` | timing only |
-| `leg.attached` | the session/attempt IDs (STT/TTS) or relay request ID (LLM) already known to Speko, plus optional provider/model names |
+| `leg.attached` | the Gateway session/attempt IDs (STT/TTS) or Router request ID (TTS/LLM/evaluation) already known to Speko, plus optional provider/model names; identity namespaces are never mixed |
 
 Every marker carries a monotonic millisecond stamp and a sequence number and
 nothing else. Turn markers are always optional telemetry: with a Speko API key
@@ -324,6 +335,49 @@ numeric stream ID. They contain no audio, transcript, synthesis text
 or voice content. A socket that ends before the server's END reply, or a
 synthesis whose audio is cut off, leaves incomplete billing evidence.
 
+### Omi transcription
+
+Omi requests go only to `api.us.omi.health`, which Omi runs in the US (Ohio,
+us-east-2); the adapters accept no other host, so audio is processed in the
+US whichever cell the session starts from. There is no token exchange, so no
+managed provider-direct credential exists. The realtime socket carries the
+delegated key inside its first JSON `start` frame, as Omi's protocol requires,
+rather than in a header or the URL. That frame also carries a random session
+ID, the model, the language, the audio format and any caller `silence_ms`
+endpointing setting, and it is never logged, attached to events or errors, or
+echoed anywhere else. The socket then receives the session's 16 kHz audio.
+Prerecorded uploads send the WAV file, model, language, the response format
+and, when the caller asked for speaker labels or word timings, `diarize`, with
+the key as an `Authorization` bearer and an `Idempotency-Key` derived from
+opaque plan identifiers. When an upload is accepted as a job, the bearer goes
+only to poll URLs on the same Omi host; a result Omi hands back as a signed
+storage `download_url` is fetched without it. Redirects are refused on every
+request. Billing observations carry an opaque operation ID, the Omi session
+or request ID, model, mode and one duration: the `audio_ms` Omi reports in
+the socket's closing `canonical_record`, or the `duration` an upload returns.
+They contain no audio, transcript or language. A socket that ends without
+its `canonical_record` keeps its observation incomplete, carrying the audio
+bytes sent as an estimate rather than settling as complete; an upload
+without `duration` leaves incomplete evidence.
+
+### ElevenLabs Scribe transcription
+
+Realtime Scribe sessions send the session's audio to the validated ElevenLabs
+host with the model, audio format, language and commit strategy in the
+connection URL. Caller keywords travel as `keyterms` in that URL. On
+`scribe_v3_live`, keywords past the URL's limit of 50 terms of 20 characters
+travel instead as `keyterm_library` inside the first audio message, and the
+URL also carries `diarize`, `multilang_mode` or the turn-prediction commit
+strategy when the caller asked for them. Prerecorded uploads send the WAV
+file, model, language, keywords and the caller's ElevenLabs settings as form
+fields; on `scribe_v3` those can include `numbers_format` and
+`secondary_language_codes`, the other languages the caller expects in the
+audio. A BYOK or relay key travels in the `xi-api-key` header; a managed
+single-use token travels in the URL, which is never logged. Billing
+observations carry an opaque operation ID, the ElevenLabs session or
+transcription ID, the model, the mode and the audio duration. They contain no
+audio, transcript, keywords or speaker labels.
+
 ### Soniox usage attribution
 
 Soniox realtime STT and TTS requests using relay or managed plans include
@@ -341,3 +395,24 @@ those asks require; the hint is never dropped to satisfy them, because the
 provider loses speech without it. Keywords combined with diarization or word
 timestamps are rejected locally before audio is read or sent: the provider
 refuses that combination with HTTP 400.
+
+### Meta transcription silence padding
+
+The Meta realtime socket receives the caller's audio and, in the gaps between
+it, zero-valued PCM silence that the adapter writes itself. The service closes
+a stream whose audio falls behind real time, and its endpointing only ends a
+turn while audio keeps arriving. So once the audio written trails the clock by
+400 ms, or at once after a commit, the adapter fills the gap up to the present
+with 100 ms frames of silence, never more than one frame ahead, and keeps the
+stream at real time until caller audio resumes. Each continuous stretch of
+padding stops after 120 seconds, so a client that stays connected and silent
+cannot keep the session running; the service's own idle policy then closes it.
+Caller audio starts a new stretch. Nothing is padded after the end of the
+stream, and a catch-up of padding the service does not accept within 2
+seconds closes the socket. Padding carries no caller content. The service processes
+and charges for the padding, but the caller is never billed for it: the
+adapter records where padding sits in the stream and maps every position the
+service reports back onto the caller's own audio, so billing observations
+count only caller audio the service has processed (never more than was
+forwarded), the published `audio_end_ms` is a position in the caller's audio,
+and the relay's `stt_duration` budget counts caller audio only.

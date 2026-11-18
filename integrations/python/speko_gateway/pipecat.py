@@ -57,9 +57,11 @@ from .client import (
     SessionConfig,
 )
 from .relay import (
+    PENALTIES,
     ReasoningEffort,
     RelayError,
     RelayLLMClient,
+    validate_penalty,
     validate_reasoning_effort,
 )
 from .relay_speech import RelaySpeechClient
@@ -619,9 +621,16 @@ class SpekoLLMSettings(LLMSettings):
         reasoning_effort: The Router's reasoning control, one of "none",
             "minimal", "low", "medium", "high" or "xhigh". None omits the
             field and keeps the provider's default. See `SpekoLLMService`.
+        repetition_penalty: The Router's multiplicative repetition penalty,
+            greater than 0 and at most 2 (1 is neutral). None omits the field.
+            `frequency_penalty` and `presence_penalty` are Pipecat's own
+            `LLMSettings` fields. See `SpekoLLMService`.
     """
 
     reasoning_effort: ReasoningEffort | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    repetition_penalty: float | None | _NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
@@ -641,6 +650,13 @@ class SpekoLLMService(LLMService):
     `LLMUpdateSettingsFrame(delta=SpekoLLMService.Settings(reasoning_effort=...))`.
     While reasoning is enabled (any value but "none") the Router refuses
     `temperature` and `top_p`, so leave both unset then.
+
+    `frequency_penalty`, `presence_penalty` (-2 to 2, neutral 0) and
+    `repetition_penalty` (greater than 0 and at most 2, neutral 1) guard
+    against a model looping on one phrase. None, the default, sends no field.
+    They update at runtime the same way. The Router applies a non-neutral
+    penalty only on Together and Baseten: auto routing keeps the request to
+    those models, and a model pinned elsewhere is refused.
 
     "none" is accepted on models that cannot reason, where it changes nothing
     (older Routers refuse it there, e.g. on gpt-4.1). Four models always reason
@@ -665,6 +681,9 @@ class SpekoLLMService(LLMService):
         temperature: float | None = None,
         top_p: float | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        repetition_penalty: float | None = None,
         system_instruction: str | None = None,
         session_id: str = "",
         **kwargs: Any,
@@ -680,12 +699,15 @@ class SpekoLLMService(LLMService):
             max_tokens=max_output_tokens,
             top_p=top_p,
             top_k=None,
-            frequency_penalty=None,
-            presence_penalty=None,
+            frequency_penalty=validate_penalty("frequency_penalty", frequency_penalty),
+            presence_penalty=validate_penalty("presence_penalty", presence_penalty),
             seed=None,
             filter_incomplete_user_turns=False,
             user_turn_completion_config=None,
             reasoning_effort=validate_reasoning_effort(reasoning_effort),
+            repetition_penalty=validate_penalty(
+                "repetition_penalty", repetition_penalty
+            ),
             extra={},
         )
         kwargs.setdefault("run_in_parallel", False)
@@ -716,6 +738,10 @@ class SpekoLLMService(LLMService):
         delta = _speko_llm_delta(delta)
         if is_setting_given(delta.reasoning_effort):
             validate_reasoning_effort(delta.reasoning_effort)
+        for name in PENALTIES:
+            value = getattr(delta, name)
+            if is_setting_given(value):
+                validate_penalty(name, value)
         changed = await super()._update_settings(delta)
         if "model" in changed:
             self._model = self._settings.model
@@ -855,37 +881,51 @@ class SpekoLLMService(LLMService):
         reasoning_effort = self._settings.reasoning_effort
         if isinstance(reasoning_effort, str):
             request["reasoning_effort"] = reasoning_effort
+        for name in PENALTIES:
+            value = getattr(self._settings, name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                request[name] = value
         return request
 
 
-def _speko_llm_delta(delta: LLMSettings) -> SpekoLLMSettings:
-    """Return `delta` as a SpekoLLMSettings with reasoning_effort out of `extra`.
+# The SpekoLLMSettings fields Pipecat's own LLMSettings lacks.
+_SPEKO_LLM_FIELDS = ("reasoning_effort", "repetition_penalty")
 
-    A plain `LLMSettings.from_mapping({"reasoning_effort": ...})` files the key
-    under `extra`, where it would never reach the request yet would still show
-    in tracing. Lift it onto the field so it is validated and applied like a
-    typed update; a delta that sets both, differently, is ambiguous.
+
+def _speko_llm_delta(delta: LLMSettings) -> SpekoLLMSettings:
+    """Return `delta` as a SpekoLLMSettings with Speko's fields out of `extra`.
+
+    A plain `LLMSettings.from_mapping({"reasoning_effort": ...})` files a key
+    Pipecat does not know under `extra`, where it would never reach the
+    request yet would still show in tracing. Lift each Speko field onto the
+    typed field so it is validated and applied like a typed update; a delta
+    that sets both, differently, is ambiguous.
     """
 
     extra = dict(delta.extra)
-    lifted = extra.pop("reasoning_effort", NOT_GIVEN)
-    typed = getattr(delta, "reasoning_effort", NOT_GIVEN)
-    if isinstance(delta, SpekoLLMSettings) and not is_setting_given(lifted):
+    lifted = {name: extra.pop(name, NOT_GIVEN) for name in _SPEKO_LLM_FIELDS}
+    if isinstance(delta, SpekoLLMSettings) and not any(
+        is_setting_given(value) for value in lifted.values()
+    ):
         return delta
-    if is_setting_given(lifted) and is_setting_given(typed) and lifted != typed:
-        raise ValueError(
-            "reasoning_effort is set twice with different values (field and extra)"
-        )
+    merged: dict[str, Any] = {}
+    for name in _SPEKO_LLM_FIELDS:
+        typed = getattr(delta, name, NOT_GIVEN)
+        if (
+            is_setting_given(lifted[name])
+            and is_setting_given(typed)
+            and lifted[name] != typed
+        ):
+            raise ValueError(
+                f"{name} is set twice with different values (field and extra)"
+            )
+        merged[name] = typed if is_setting_given(typed) else lifted[name]
     values = {
         f.name: getattr(delta, f.name)
         for f in dataclasses.fields(delta)
-        if f.name not in ("extra", "reasoning_effort")
+        if f.name not in ("extra", *_SPEKO_LLM_FIELDS)
     }
-    return SpekoLLMSettings(
-        **values,
-        reasoning_effort=typed if is_setting_given(typed) else lifted,
-        extra=extra,
-    )
+    return SpekoLLMSettings(**values, **merged, extra=extra)
 
 
 # Short aliases mirror the naming style of the existing LiveKit integration.

@@ -833,6 +833,13 @@ type fallbackExchange struct {
 func (c *fakePlanClient) CreateSessionPlan(ctx context.Context, request protocol.SessionPlanRequest, _ controlplane.CreateOptions) (protocol.SessionPlan, string, error) {
 	c.mu.Lock()
 	c.requests = append(c.requests, request)
+	plan := c.plan
+	// Each new issuance is independently usable once. Keep the first fixture
+	// identifiers stable for assertions about that initial admission.
+	if len(c.requests) > 1 {
+		plan.PlanID = fmt.Sprintf("%s_%d", plan.PlanID, len(c.requests))
+		plan.AttemptID = fmt.Sprintf("%s_%d", plan.AttemptID, len(c.requests))
+	}
 	started, release := c.started, c.release
 	c.mu.Unlock()
 	if started != nil {
@@ -848,7 +855,7 @@ func (c *fakePlanClient) CreateSessionPlan(ctx context.Context, request protocol
 			return protocol.SessionPlan{}, "", ctx.Err()
 		}
 	}
-	return c.plan, "cp_gateway_123", nil
+	return plan, "cp_gateway_123", nil
 }
 
 // CreateSessionPlanBatch returns count copies of the fixture plan with distinct

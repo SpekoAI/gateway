@@ -270,6 +270,9 @@ func TestInBandErrorPayloadMapsToTheCanonicalVocabulary(t *testing.T) {
 	if providerErr.Code != "provider_rate_limited" || !providerErr.Retryable || !strings.Contains(providerErr.Message, "quota exhausted") {
 		t.Fatalf("error = %+v, want provider_rate_limited carrying the vendor message", providerErr)
 	}
+	if got := providerErr.SafeProviderCode(); got != "RESOURCE_EXHAUSTED" {
+		t.Fatalf("SafeProviderCode = %q, want RESOURCE_EXHAUSTED", got)
+	}
 }
 
 func TestHTTPStatusesMapToTheCanonicalVocabulary(t *testing.T) {

@@ -66,9 +66,11 @@ from .client import GatewayClient, GatewayError
 from .probe import report_leg as _report_probe_leg
 from .probe import report_marker as _report_probe_marker
 from .relay import (
+    PENALTIES,
     ReasoningEffort,
     RelayError,
     RelayLLMClient,
+    validate_penalty,
     validate_reasoning_effort,
 )
 from .relay_speech import RelaySpeechClient
@@ -137,8 +139,10 @@ _NEWER_STT_CAPABILITIES = frozenset({"keyterms", "chat_context", "manual_flush"}
 # flushes audio that holds no new words, Soniox answers with an empty final,
 # which this plugin does not forward, so LiveKit waits out its
 # transcript_timeout. Without the flush it already waited that long unless a
-# final had arrived in the previous 0.5 s.
-_FLUSH_ON_TURN_END_PROVIDERS = frozenset({"soniox"})
+# final had arrived in the previous 0.5 s. Omi's adapter sends the same
+# commit as Omi's `finalize`, which the live probe (2026-11-06) measured at
+# about 50 ms server-side; the session stays open after it.
+_FLUSH_ON_TURN_END_PROVIDERS = frozenset({"soniox", "omi"})
 
 
 def _stt_capabilities(**declared: Any) -> stt.STTCapabilities:
@@ -1316,6 +1320,13 @@ class LLM(llm.LLM):
     provider's default. While reasoning is enabled (any value but `"none"`)
     the Router refuses `temperature`, so leave temperature unset then.
 
+    `frequency_penalty`, `presence_penalty` (-2 to 2, neutral 0) and
+    `repetition_penalty` (greater than 0 and at most 2, neutral 1) guard
+    against a model looping on one phrase. None, the default, sends no field.
+    The Router applies a non-neutral penalty only on Together and Baseten:
+    auto routing keeps the request to those models, and a model pinned
+    elsewhere is refused (`capability_unsupported`).
+
     `"none"` is accepted on models that cannot reason, where it changes nothing
     (older Routers refuse it there, e.g. on `gpt-4.1`). Four models always
     reason and refuse `"none"`, with `"minimal"` as their floor: Inception
@@ -1335,11 +1346,24 @@ class LLM(llm.LLM):
         max_output_tokens: int = 8_192,
         temperature: float | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        repetition_penalty: float | None = None,
     ) -> None:
         super().__init__()
         if (provider == "auto") != (model == "auto"):
             raise ValueError("provider and model must both be auto or both be explicit")
         reasoning_effort = validate_reasoning_effort(reasoning_effort)
+        given = {
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+            "repetition_penalty": repetition_penalty,
+        }
+        self._penalties: dict[str, float] = {}
+        for name in PENALTIES:
+            value = validate_penalty(name, given[name])
+            if value is not None:
+                self._penalties[name] = value
         self._client = client or RelayLLMClient.from_env()
         self._owns_client = client is None
         self._provider_name = provider
@@ -1400,6 +1424,7 @@ class LLM(llm.LLM):
             body["temperature"] = self._temperature
         if self._reasoning_effort is not None:
             body["reasoning_effort"] = self._reasoning_effort
+        body.update(self._penalties)
         return body
 
     async def aclose(self) -> None:

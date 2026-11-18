@@ -94,6 +94,11 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if model == "" {
 		return nil, errors.New("assemblyai batch adapter requires a speech model")
 	}
+	// The async API has no turn-detection preset. Refuse it before the upload
+	// instead of submitting a field the API ignores or rejects.
+	if _, set := request.Options.STT.Provider("assemblyai")[ModeOption]; set {
+		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInvalidRequest, Message: "assemblyai mode is a realtime setting; the async Transcripts API has no such field"}
+	}
 	if request.AudioBytes > BatchMaxAudioBytes {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInputTooLarge, Message: "the upload exceeds AssemblyAI's 2.2 GB upload limit"}
 	}

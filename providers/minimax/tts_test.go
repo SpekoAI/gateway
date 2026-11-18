@@ -443,6 +443,9 @@ func TestAdapterMapsInBandBaseRespErrors(t *testing.T) {
 			if providerErr.Extensions[extensionID] == nil {
 				t.Fatal("error must retain the raw MiniMax payload")
 			}
+			if got, want := providerErr.SafeProviderCode(), fmt.Sprint(testCase.status); got != want {
+				t.Fatalf("SafeProviderCode = %q, want %q", got, want)
+			}
 			_ = stream.Close(context.Background())
 		})
 	}

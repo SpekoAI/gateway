@@ -723,6 +723,8 @@ func (s *ttsStream) handleMessage(payload []byte) error {
 			Retryable:      retryable,
 			ProviderStatus: message.ErrorCode,
 			Extensions:     ttsExtension(raw),
+			// error_type is Soniox's stable code; error_code is the status.
+			ProviderCode: message.ErrorType,
 		}
 		if message.ErrorType == "max_audio_duration_reached" {
 			// The adapter budgets each stream well under the cap, so this

@@ -2,14 +2,17 @@ package elevenlabs
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	billing "github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -19,7 +22,8 @@ const (
 	BatchAdapterID = "elevenlabs.stt.batch.v1"
 	// BatchEndpoint is Scribe's synchronous file endpoint.
 	BatchEndpoint = "https://api.elevenlabs.io/v1/speech-to-text"
-	// BatchModel is the batch Scribe generation paired with scribe_v2_realtime.
+	// BatchModel is the batch Scribe generation paired with scribe_v2_realtime,
+	// and the default. ModelScribeV3 is the newer batch generation.
 	BatchModel = "scribe_v2"
 	// BatchMaxDurationSeconds is the documented per-file ceiling ("up to 10
 	// hours").
@@ -78,11 +82,27 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		return nil, fmt.Errorf("elevenlabs batch adapter cannot serve provider %q", request.Plan.Route.Provider)
 	}
 	model := strings.TrimSpace(request.Plan.Route.Model)
-	if model == "" || strings.Contains(model, "realtime") {
-		return nil, fmt.Errorf("elevenlabs batch adapter requires a file Scribe model, got %q", model)
+	if model == "" {
+		return nil, errors.New("elevenlabs batch adapter requires a file Scribe model")
+	}
+	capabilities, err := scribeModelFor(model, scribeBatch)
+	if err != nil {
+		return nil, err
+	}
+	// Refused before the upload: the vendor answers a newer model's parameter
+	// on an older model with invalid_parameters after reading the whole file.
+	params, err := capabilities.params(model, request.Options.STT)
+	if err != nil {
+		return nil, err
 	}
 	if request.AudioBytes > BatchMaxAudioBytes {
 		return nil, &runtimepkg.ProviderError{Code: batchhttp.CodeInputTooLarge, Message: "the upload exceeds Scribe's 2 GB file limit"}
+	}
+	// webhook=true makes Scribe accept the job and transcribe later. This
+	// adapter returns the transcript from the response it waits for, so it
+	// would return nothing and could not know what Scribe ends up billing.
+	if batchProviderFlag(request, "webhook") {
+		return nil, &runtimepkg.ProviderError{Code: "invalid_request", Message: "ElevenLabs webhook mode is asynchronous; this batch API returns the transcript in the response, so webhook is not supported"}
 	}
 	credential, err := batchhttp.Credential(request.Plan)
 	if err != nil {
@@ -99,13 +119,13 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		{Name: "tag_audio_events", Value: "false"},
 	}
 	if language := strings.TrimSpace(request.Options.Language); language != "" {
-		fields = append(fields, batchhttp.MultipartField{Name: "language_code", Value: baseLanguageTag(language)})
+		fields = append(fields, batchhttp.MultipartField{Name: "language_code", Value: sttLanguageCode(language)})
 	}
 	for _, keyword := range request.Options.STT.GetKeywords() {
 		fields = append(fields, batchhttp.MultipartField{Name: "keyterms", Value: keyword})
 	}
-	for _, key := range request.Options.STT.ProviderKeys("elevenlabs") {
-		fields = append(fields, batchhttp.MultipartField{Name: key, Value: protocol.SttOptionString(request.Options.STT.Provider("elevenlabs")[key])})
+	for _, param := range params {
+		fields = append(fields, batchhttp.MultipartField{Name: param.name, Value: param.value})
 	}
 	body, contentType := batchhttp.Multipart(fields, "file", "audio.wav", "audio/wav", request.Audio)
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), body)
@@ -130,28 +150,28 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		TranscriptionID   string  `json:"transcription_id"`
 		AudioDurationSecs float64 `json:"audio_duration_secs"`
 		Words             []struct {
-			Text      string  `json:"text"`
-			Type      string  `json:"type"`
-			Start     float64 `json:"start"`
-			End       float64 `json:"end"`
-			SpeakerID string  `json:"speaker_id"`
+			Text      string   `json:"text"`
+			Type      string   `json:"type"`
+			Start     *float64 `json:"start"`
+			End       *float64 `json:"end"`
+			SpeakerID string   `json:"speaker_id"`
 		} `json:"words"`
 	}
 	if err := batchhttp.DecodeJSON(response.Body, &payload); err != nil {
 		return nil, err
 	}
-	words := make([]batchhttp.Word, 0, len(payload.Words))
+	words := make([]scribeWord, 0, len(payload.Words))
 	for _, word := range payload.Words {
 		// Scribe interleaves `spacing` and `audio_event` entries with words;
 		// only words carry transcript text.
 		if word.Type != "" && word.Type != "word" {
 			continue
 		}
-		words = append(words, batchhttp.Word{Text: word.Text, StartMS: batchhttp.SecondsToMS(word.Start), EndMS: batchhttp.SecondsToMS(word.End), Speaker: word.SpeakerID})
+		words = append(words, scribeWord{text: word.Text, start: word.Start, end: word.End, speaker: word.SpeakerID})
 	}
 	result := &runtimepkg.BatchTranscription{
 		Text:              strings.TrimSpace(payload.Text),
-		Segments:          batchhttp.GroupWords(words, 0),
+		Segments:          batchhttp.GroupWords(timeScribeWords(words), 0),
 		Language:          payload.LanguageCode,
 		DurationMS:        batchhttp.SecondsToMS(payload.AudioDurationSecs),
 		ProviderRequestID: payload.TranscriptionID,
@@ -160,5 +180,165 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 	if result.ProviderRequestID == "" {
 		result.ProviderRequestID = response.Header.Get("request-id")
 	}
+	// Scribe's batch and realtime models bill at different rates, so the
+	// observation names the batch model that ran. audio_duration_secs is the
+	// length Scribe processed, but the API documents it as optional. When it
+	// is missing, the duration comes from the upload itself: the request is
+	// always a WAV container of PCM in request.Media, so its data chunk gives
+	// the exact length, as a fraction of a second like the realtime path. Any
+	// other encoding leaves the observation incomplete.
+	observation := billing.Duration("request", model, "batch", response.Body, 1000, "audio_duration_secs")
+	// Only a final 200 carries a finished transcription to measure.
+	if !observation.Complete && response.Status == http.StatusOK {
+		if pcm, ok := wavPCMBytes(request.Audio, request.AudioBytes); ok && request.Media.Encoding == "pcm_s16le" && request.Media.SampleRateHz > 0 {
+			// Scribe bills each channel independently with
+			// use_multi_channel, so the quantity is channel-seconds: every
+			// channel's PCM counts. Otherwise it is the wall-clock length.
+			denominator := int64(request.Media.SampleRateHz) * 2
+			if !batchProviderFlag(request, "use_multi_channel") {
+				denominator *= int64(max(request.Media.Channels, 1))
+			}
+			observation.Quantities["duration_seconds"] = pcm
+			observation.QuantityDenominators = map[string]int64{"duration_seconds": denominator}
+			observation.Complete = true
+		}
+	}
+	observation.ProviderRequestID = result.ProviderRequestID
+	result.Billing = billing.Report(observation)
 	return result, nil
+}
+
+// scribeWord is one Scribe word as the API sent it. Scribe documents start
+// and end as nullable.
+type scribeWord struct {
+	text, speaker string
+	start, end    *float64
+}
+
+// timeScribeWords fills in the times Scribe left out of words, keeping the
+// transcript in time order. A word with one bound keeps it and reaches its
+// neighbour for the other. Words with neither sit between the timed words
+// around them. In each
+// run of untimed words, the leading ones spoken by the previous timed word's
+// speaker close that turn and sit at its end, when the next timed word is
+// someone else's; the rest lead into the next timed word and sit at its
+// start. With no timed word after the run, all of it sits at the last one's
+// end. Read as zero, such a word would open a segment at 0 ms or split a
+// turn on a gap that is not in the audio. Its text stays in the transcript
+// either way.
+func timeScribeWords(words []scribeWord) []batchhttp.Word {
+	out := make([]batchhttp.Word, len(words))
+	timed := make([]bool, len(words))
+	hasStart, hasEnd := make([]bool, len(words)), make([]bool, len(words))
+	for i, word := range words {
+		out[i] = batchhttp.Word{Text: word.text, Speaker: word.speaker}
+		if word.start != nil {
+			out[i].StartMS, hasStart[i] = batchhttp.SecondsToMS(*word.start), true
+		}
+		if word.end != nil {
+			out[i].EndMS, hasEnd[i] = batchhttp.SecondsToMS(*word.end), true
+		}
+		timed[i] = hasStart[i] || hasEnd[i]
+	}
+	// A word with one bound keeps it and reaches the word before it (no start)
+	// or after it (no end), so it opens no gap Scribe did not report.
+	last, seen := int64(0), false
+	for i := range out {
+		if hasEnd[i] && !hasStart[i] {
+			out[i].StartMS = out[i].EndMS
+			if seen {
+				out[i].StartMS = min(last, out[i].EndMS)
+			}
+		}
+		if timed[i] {
+			last, seen = max(out[i].StartMS, out[i].EndMS), true
+		}
+	}
+	next, seen := int64(0), false
+	for i := len(out) - 1; i >= 0; i-- {
+		if hasStart[i] && !hasEnd[i] {
+			out[i].EndMS = out[i].StartMS
+			if seen {
+				out[i].EndMS = max(next, out[i].StartMS)
+			}
+		}
+		if timed[i] {
+			out[i].EndMS = max(out[i].EndMS, out[i].StartMS)
+			next, seen = out[i].StartMS, true
+		}
+	}
+	for i := 0; i < len(out); {
+		if timed[i] {
+			i++
+			continue
+		}
+		end := i
+		for end < len(out) && !timed[end] {
+			end++
+		}
+		previous, next := i-1, end
+		hasPrevious, hasNext := previous >= 0, next < len(out)
+		// Words before split close the previous turn; the rest lead into the next.
+		split := i
+		if hasPrevious && (!hasNext || out[previous].Speaker != out[next].Speaker) {
+			for split < end && (!hasNext || out[split].Speaker == out[previous].Speaker) {
+				split++
+			}
+		}
+		for k := i; k < end; k++ {
+			switch {
+			case k < split:
+				out[k].StartMS, out[k].EndMS = out[previous].EndMS, out[previous].EndMS
+			case hasNext:
+				out[k].StartMS, out[k].EndMS = out[next].StartMS, out[next].StartMS
+			}
+		}
+		i = end
+	}
+	return out
+}
+
+// wavPCMBytes returns the size of a WAV container's data chunk, walking the
+// RIFF chunks from the start. A data size the writer left open (0 or
+// 0xFFFFFFFF) or one past the end of the upload is bounded by the bytes
+// actually uploaded. The reader is rewound afterwards.
+func wavPCMBytes(audio io.ReadSeeker, total int64) (int64, bool) {
+	if audio == nil {
+		return 0, false
+	}
+	if _, err := audio.Seek(0, io.SeekStart); err != nil {
+		return 0, false
+	}
+	defer func() { _, _ = audio.Seek(0, io.SeekStart) }()
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(audio, header); err != nil || string(header[0:4]) != "RIFF" || string(header[8:12]) != "WAVE" {
+		return 0, false
+	}
+	position := int64(12)
+	chunk := make([]byte, 8)
+	for {
+		if _, err := io.ReadFull(audio, chunk); err != nil {
+			return 0, false
+		}
+		position += 8
+		size := int64(binary.LittleEndian.Uint32(chunk[4:8]))
+		if string(chunk[0:4]) == "data" {
+			if remaining := total - position; total > 0 && (size == 0 || size == 0xFFFFFFFF || size > remaining) {
+				size = remaining
+			}
+			return size, size > 0
+		}
+		skip := size + size%2
+		if _, err := audio.Seek(skip, io.SeekCurrent); err != nil {
+			return 0, false
+		}
+		position += skip
+	}
+}
+
+// batchProviderFlag reports whether the caller set an ElevenLabs provider
+// option to true.
+func batchProviderFlag(request runtimepkg.BatchTranscribeRequest, key string) bool {
+	value, ok := request.Options.STT.Provider("elevenlabs")[key]
+	return ok && strings.EqualFold(strings.TrimSpace(protocol.SttOptionString(value)), "true")
 }

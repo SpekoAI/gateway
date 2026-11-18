@@ -108,13 +108,19 @@ var streamingLanguages = map[string]struct{}{
 	"hi": {}, "vi": {}, "ar": {}, "he": {}, "ja": {}, "zh": {},
 }
 
-// universal36Model serves a wider vocabulary than every other model on this
-// socket, so its languages are keyed by model rather than folded into the
-// shared set. The vendor does not refuse a code the model cannot serve: on
-// 2026-09-30 universal-3-5-pro accepted language_codes=["ru"] and returned
-// Russian audio as mixed Cyrillic and Latin gibberish, while universal-3-6-pro
-// returned it exactly.
-const universal36Model = "universal-3-6-pro"
+// The Universal-3.6 Pro generation serves a wider vocabulary than every other
+// model on this socket, so its languages are keyed by model rather than folded
+// into the shared set. The vendor does not refuse a code the model cannot
+// serve: on 2026-09-30 universal-3-5-pro accepted language_codes=["ru"] and
+// returned Russian audio as mixed Cyrillic and Latin gibberish, while
+// universal-3-6-pro returned it exactly.
+const (
+	universal36Model = "universal-3-6-pro"
+	// RealtimeAgent37Model is AssemblyAI-STT-3.7-Realtime-Agent (2026-11-17).
+	// The vendor's model page lists the same 32 languages as Universal-3.6 Pro
+	// and the same parameters.
+	RealtimeAgent37Model = "assemblyai-stt-3-7-realtime-agent"
+)
 
 // universal36Languages adds the fourteen codes the Universal-3.6 Pro launch
 // post names as new (af, ca, et, fa, gl, ko, mr, nn, ro, ru, ur, xh, yue, zu),
@@ -136,9 +142,36 @@ func withLanguages(base map[string]struct{}, extra ...string) map[string]struct{
 	return languages
 }
 
+// ModeOption is the provider_options key of the turn-detection preset. It is a
+// realtime connection parameter: the async Transcripts API has no such field.
+const ModeOption = "mode"
+
+// ValidateMode checks a caller's provider_options.assemblyai.mode against the
+// presets AssemblyAI documents (streaming "Optimizing Accuracy and Latency",
+// read 2026-11-17): min_latency, balanced and max_accuracy. AssemblyAI answers
+// any other value with validation error 3006 after the handshake, so the
+// session would open and then die mid-call. An absent mode is valid: the
+// vendor then uses balanced. settings is the caller's assemblyai provider
+// options, so the gateway's and the relay's option types can both pass them.
+//
+// AssemblyAI's manual mode (3.7 Realtime Agent only) is not offered. A manual
+// turn ends only on ForceEndpoint, which a LiveKit plugin session never sends
+// at a turn boundary, and speaker_labels silently turns manual off.
+func ValidateMode(model string, settings map[string]any) error {
+	raw, exists := settings[ModeOption]
+	if !exists {
+		return nil
+	}
+	switch text, _ := raw.(string); text {
+	case "min_latency", "balanced", "max_accuracy":
+		return nil
+	}
+	return errors.New("assemblyai mode takes min_latency, balanced or max_accuracy")
+}
+
 // languagesFor returns the language_codes vocabulary of one streaming model.
 func languagesFor(model string) map[string]struct{} {
-	if model == universal36Model {
+	if model == universal36Model || model == RealtimeAgent37Model {
 		return universal36Languages
 	}
 	return streamingLanguages
@@ -320,6 +353,9 @@ func streamEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 		return "", errors.New("assemblyai requires a concrete model in the session plan")
 	}
 	if err := validateMedia(media); err != nil {
+		return "", err
+	}
+	if err := ValidateMode(model, options.STT.Provider("assemblyai")); err != nil {
 		return "", err
 	}
 	query := endpoint.Query()

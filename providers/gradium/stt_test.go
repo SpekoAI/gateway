@@ -526,49 +526,54 @@ func TestSTTAdapterRejectsUnroutableRequests(t *testing.T) {
 	}
 }
 
-// TestSTTAdapterOmitsLanguageWhenUnset pins the documented "do not ground on a
-// single language" behavior: the key must be absent, not present and empty,
-// because an empty string is not in Gradium's accepted enumeration.
-func TestSTTAdapterOmitsLanguageWhenUnset(t *testing.T) {
+// TestSTTAdapterSendsAnyLanguageWhenUnset pins Gradium's required
+// `json_config.language`: a setup without it is rejected, so a caller that
+// names no language gets "any" (auto-detect), and "any" itself is accepted.
+func TestSTTAdapterSendsAnyLanguageWhenUnset(t *testing.T) {
 	t.Parallel()
 
-	setups := make(chan map[string]any, 1)
-	server := newSocketServer(t, "/api/speech/asr", func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
-		frame, err := readFrame(ctx, conn)
-		if err != nil {
-			t.Errorf("read setup: %v", err)
-			return
-		}
-		setups <- frame
-		<-ctx.Done()
-	})
-	defer server.Close()
+	for _, language := range []string{"", "  ", "any", "ANY"} {
+		t.Run(language, func(t *testing.T) {
+			t.Parallel()
+			setups := make(chan map[string]any, 1)
+			server := newSocketServer(t, "/api/speech/asr", func(ctx context.Context, request *http.Request, conn *websocket.Conn) {
+				frame, err := readFrame(ctx, conn)
+				if err != nil {
+					t.Errorf("read setup: %v", err)
+					return
+				}
+				setups <- frame
+				<-ctx.Done()
+			})
+			defer server.Close()
 
-	adapter, err := NewSTT(sttConfig(server.URL))
-	if err != nil {
-		t.Fatalf("new adapter: %v", err)
-	}
-	request := sttRequest(server.URL)
-	request.Options.Language = ""
-	stream, err := adapter.Open(context.Background(), request)
-	if err != nil {
-		t.Fatalf("open stream: %v", err)
-	}
-	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+			adapter, err := NewSTT(sttConfig(server.URL))
+			if err != nil {
+				t.Fatalf("new adapter: %v", err)
+			}
+			request := sttRequest(server.URL)
+			request.Options.Language = language
+			stream, err := adapter.Open(context.Background(), request)
+			if err != nil {
+				t.Fatalf("open stream: %v", err)
+			}
+			defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
 
-	select {
-	case setup := <-setups:
-		want := map[string]any{
-			"type":         "setup",
-			"model_name":   "default",
-			"input_format": "pcm_16000",
-			"json_config":  map[string]any{"delay_in_frames": float64(16)},
-		}
-		if !reflect.DeepEqual(setup, want) {
-			t.Fatalf("setup frame = %#v, want %#v", setup, want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("server never received setup")
+			select {
+			case setup := <-setups:
+				want := map[string]any{
+					"type":         "setup",
+					"model_name":   "default",
+					"input_format": "pcm_16000",
+					"json_config":  map[string]any{"language": "any", "delay_in_frames": float64(16)},
+				}
+				if !reflect.DeepEqual(setup, want) {
+					t.Fatalf("setup frame = %#v, want %#v", setup, want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("server never received setup")
+			}
+		})
 	}
 }
 

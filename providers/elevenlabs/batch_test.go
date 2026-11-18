@@ -1,11 +1,14 @@
 package elevenlabs
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -85,6 +88,43 @@ func TestBatchTranscribeUsesScribeFileContract(t *testing.T) {
 	if len(result.Segments) != 2 || result.Segments[0] != (runtimepkg.BatchSegment{Text: "Hello there.", StartMS: 100, EndMS: 800, Speaker: "speaker_0"}) || result.Segments[1].Speaker != "speaker_1" {
 		t.Fatalf("segments = %+v", result.Segments)
 	}
+	// Batch Scribe bills apart from realtime, so the observation names the
+	// batch model and mode, and Scribe's own processed duration.
+	want := protocol.BillingReport{Revision: protocol.BillingRevision, Complete: true, Operations: []protocol.BillingObservation{{
+		OperationID: "request", Model: BatchModel, Mode: "batch", ProviderRequestID: "tx_1",
+		Quantities: map[string]int64{"duration_seconds": 1_823_170}, Complete: true,
+	}}}
+	if result.Billing == nil || !reflect.DeepEqual(*result.Billing, want) {
+		t.Fatalf("billing = %+v, want %+v", result.Billing, want)
+	}
+	if err := result.Billing.Validate(); err != nil {
+		t.Fatalf("billing invalid: %v", err)
+	}
+}
+
+// Without audio_duration_secs there is no vendor quantity, and the uploaded
+// bytes are not substituted for it.
+func TestBatchBillingStaysIncompleteWithoutTheVendorDuration(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("request-id", "rid-2")
+		_, _ = w.Write([]byte(`{"language_code":"en","text":"Hi.","words":[]}`))
+	}))
+	defer server.Close()
+	adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatalf("adapter: %v", err)
+	}
+	result, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{Plan: batchPlan(server.URL + "/v1/speech-to-text"), Audio: strings.NewReader("RIFF....WAVE"), AudioBytes: 12})
+	if err != nil {
+		t.Fatalf("transcribe: %v", err)
+	}
+	want := protocol.BillingReport{Revision: protocol.BillingRevision, Operations: []protocol.BillingObservation{{
+		OperationID: "request", Model: BatchModel, Mode: "batch", ProviderRequestID: "rid-2", Quantities: map[string]int64{},
+	}}}
+	if result.Billing == nil || !reflect.DeepEqual(*result.Billing, want) {
+		t.Fatalf("billing = %+v, want %+v", result.Billing, want)
+	}
 }
 
 func TestBatchTranscribeRefusals(t *testing.T) {
@@ -111,5 +151,135 @@ func TestBatchTranscribeRefusals(t *testing.T) {
 	huge.AudioBytes = BatchMaxAudioBytes + 1
 	if _, err := adapter.Transcribe(context.Background(), huge); !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeInputTooLarge {
 		t.Fatalf("oversized: %v", err)
+	}
+}
+
+func TestBatchTranscribeAliasesNorwegianToScribeCode(t *testing.T) {
+	t.Parallel()
+	seen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("multipart: %v", err)
+		}
+		seen <- r.FormValue("language_code")
+		_, _ = w.Write([]byte(`{"language_code":"nor","text":"Hei.","transcription_id":"tx_1","audio_duration_secs":1}`))
+	}))
+	defer server.Close()
+
+	adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+	if err != nil {
+		t.Fatalf("adapter: %v", err)
+	}
+	if _, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{
+		Plan:       batchPlan(server.URL + "/v1/speech-to-text"),
+		Options:    protocol.RequestOptions{Language: "nb-NO"},
+		Audio:      strings.NewReader("RIFF....WAVE"),
+		AudioBytes: 12,
+	}); err != nil {
+		t.Fatalf("transcribe: %v", err)
+	}
+	if got := <-seen; got != "nor" {
+		t.Fatalf("language_code = %q, want nor", got)
+	}
+}
+
+// testWAV builds a 16-bit PCM WAV container. A LIST chunk precedes data so the
+// chunk walk is exercised, and dataSize overrides the declared data length.
+func testWAV(pcmBytes int, dataSize uint32) []byte {
+	var buf bytes.Buffer
+	put32 := func(v uint32) { _ = binary.Write(&buf, binary.LittleEndian, v) }
+	put16 := func(v uint16) { _ = binary.Write(&buf, binary.LittleEndian, v) }
+	buf.WriteString("RIFF")
+	put32(uint32(4 + 8 + 16 + 8 + 4 + 8 + pcmBytes))
+	buf.WriteString("WAVE")
+	buf.WriteString("fmt ")
+	put32(16)
+	put16(1)
+	put16(1)
+	put32(16_000)
+	put32(32_000)
+	put16(2)
+	put16(16)
+	buf.WriteString("LIST")
+	put32(4)
+	buf.WriteString("INFO")
+	buf.WriteString("data")
+	put32(dataSize)
+	buf.Write(make([]byte, pcmBytes))
+	return buf.Bytes()
+}
+
+// Scribe documents audio_duration_secs as optional. Without it, a finished
+// (200) batch observation takes the length of the uploaded PCM: wall-clock
+// for an ordinary upload, channel-seconds with use_multi_channel, which Scribe
+// bills per channel. A 202 acceptance or an encoding it cannot measure stays
+// incomplete, and webhook mode is refused before anything is sent.
+func TestBatchTranscribeBillsTheUploadWhenScribeOmitsTheDuration(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name            string
+		audio           []byte
+		encoding        string
+		channels        int
+		providerOptions map[string]any
+		status          int
+		wantErr         bool
+		complete        bool
+		want, wantDen   int64
+	}{
+		{name: "declared data chunk", audio: testWAV(48_000, 48_000), encoding: "pcm_s16le", channels: 1, status: 200, complete: true, want: 48_000, wantDen: 32_000},
+		{name: "open-ended data size", audio: testWAV(48_000, 0xFFFFFFFF), encoding: "pcm_s16le", channels: 1, status: 200, complete: true, want: 48_000, wantDen: 32_000},
+		{name: "stereo wall clock", audio: testWAV(64_000, 64_000), encoding: "pcm_s16le", channels: 2, status: 200, complete: true, want: 64_000, wantDen: 64_000},
+		{name: "stereo multichannel bills each channel", audio: testWAV(64_000, 64_000), encoding: "pcm_s16le", channels: 2, providerOptions: map[string]any{"use_multi_channel": true}, status: 200, complete: true, want: 64_000, wantDen: 32_000},
+		{name: "not PCM", audio: testWAV(48_000, 48_000), encoding: "opus", channels: 1, status: 200},
+		{name: "202 acceptance", audio: testWAV(48_000, 48_000), encoding: "pcm_s16le", channels: 1, status: 202},
+		{name: "webhook refused", audio: testWAV(48_000, 48_000), encoding: "pcm_s16le", channels: 1, providerOptions: map[string]any{"webhook": true}, status: 200, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				_ = r.ParseMultipartForm(1 << 20)
+				w.Header().Set("request-id", "rid-nodur")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"language_code":"en","language_probability":0.99,"text":"Hi.","transcription_id":"tx_nodur","words":[]}`))
+			}))
+			defer server.Close()
+			adapter, err := NewBatch(BatchConfig{HTTPClient: server.Client(), AllowedEndpointHosts: []string{"127.0.0.1"}, AllowInsecureEndpoint: true})
+			if err != nil {
+				t.Fatalf("adapter: %v", err)
+			}
+			options := protocol.RequestOptions{}
+			if tc.providerOptions != nil {
+				options.STT = &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"elevenlabs": tc.providerOptions}}
+			}
+			result, err := adapter.Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{
+				Plan:       batchPlan(server.URL + "/v1/speech-to-text"),
+				Options:    options,
+				Media:      protocol.MediaFormat{Encoding: tc.encoding, SampleRateHz: 16_000, Channels: tc.channels},
+				Audio:      bytes.NewReader(tc.audio),
+				AudioBytes: int64(len(tc.audio)),
+			})
+			if tc.wantErr {
+				if err == nil || requests != 0 {
+					t.Fatalf("err = %v after %d requests, want a refusal before any request", err, requests)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("transcribe: %v", err)
+			}
+			got := result.Billing.Operations[0]
+			if got.Complete != tc.complete || result.Billing.Complete != tc.complete {
+				t.Fatalf("complete = %v (report %v), want %v", got.Complete, result.Billing.Complete, tc.complete)
+			}
+			if !tc.complete {
+				return
+			}
+			if got.Quantities["duration_seconds"] != tc.want || got.QuantityDenominators["duration_seconds"] != tc.wantDen || got.Model != BatchModel || got.Mode != "batch" {
+				t.Fatalf("observation = %+v, want %d/%d scribe_v2 batch", got, tc.want, tc.wantDen)
+			}
+		})
 	}
 }

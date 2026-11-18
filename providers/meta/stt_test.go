@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -28,12 +29,20 @@ type fakeRealtime struct {
 	closingReplies []string
 	// ackWith overrides the acknowledgement frame when non-empty.
 	ackWith string
-	server  *httptest.Server
+	// holdOpenAfterEndStream keeps the socket open after the closing replies
+	// until the client closes it, like a service that never hangs up.
+	holdOpenAfterEndStream bool
+	// closeStatus overrides the close code sent after the closing replies.
+	closeStatus websocket.StatusCode
+	server      *httptest.Server
 
 	mu        sync.Mutex
 	handshake map[string]any
 	audio     [][]byte
 	endStream bool
+	// audioAfterEndStream counts binary frames that arrived after endStream
+	// (holdOpenAfterEndStream only).
+	audioAfterEndStream int
 }
 
 func newFakeRealtime(t *testing.T, replies ...string) *fakeRealtime {
@@ -119,7 +128,24 @@ func (f *fakeRealtime) handle(writer http.ResponseWriter, request *http.Request)
 				return
 			}
 		}
-		_ = conn.Close(websocket.StatusNormalClosure, "")
+		if f.holdOpenAfterEndStream {
+			for {
+				kind, _, err := conn.Read(ctx)
+				if err != nil {
+					return
+				}
+				if kind == websocket.MessageBinary {
+					f.mu.Lock()
+					f.audioAfterEndStream++
+					f.mu.Unlock()
+				}
+			}
+		}
+		status := f.closeStatus
+		if status == 0 {
+			status = websocket.StatusNormalClosure
+		}
+		_ = conn.Close(status, "")
 		return
 	}
 }
@@ -203,8 +229,13 @@ func TestTranscribeStreamsPartialsThenTurnFinal(t *testing.T) {
 	request.Options.STT = &protocol.SttOptions{Keywords: []string{"Speko", "  ", "relay"}}
 	stream, ctx := openRealtime(t, fake, request)
 
-	if err := stream.WriteAudio(ctx, []byte("caller-pcm")); err != nil {
-		t.Fatalf("WriteAudio: %v", err)
+	// 4 s of caller audio in 0.5 s frames, so every position the fake
+	// reports lies inside the caller's audio and is published unchanged.
+	callerPCM := bytes.Repeat([]byte("caller-pcm"), bytesPerSecond24k/20)
+	for range 8 {
+		if err := stream.WriteAudio(ctx, callerPCM); err != nil {
+			t.Fatalf("WriteAudio: %v", err)
+		}
 	}
 	if err := stream.CommitAudio(ctx); err != nil {
 		t.Fatalf("CommitAudio: %v", err)
@@ -269,8 +300,19 @@ func TestTranscribeStreamsPartialsThenTurnFinal(t *testing.T) {
 	if keywords, _ := fake.handshake["keywords"].([]any); len(keywords) != 2 || keywords[0] != "Speko" || keywords[1] != "relay" {
 		t.Fatalf("keywords = %v, want blank keywords dropped", fake.handshake["keywords"])
 	}
-	if len(fake.audio) != 1 || string(fake.audio[0]) != "caller-pcm" {
-		t.Fatalf("audio frames = %q, want the PCM forwarded as one binary frame", fake.audio)
+	// The commit starts silence padding once the caller's audio has played
+	// out, so any frame after the caller's is padding.
+	if len(fake.audio) == 0 || !bytes.Equal(fake.audio[0], callerPCM) {
+		t.Fatalf("first audio frame = %.20q, want the PCM forwarded as one binary frame", firstFrame(fake.audio))
+	}
+	callerFrames := 0
+	for index, frame := range fake.audio {
+		switch {
+		case bytes.Equal(frame, callerPCM) && callerFrames == index:
+			callerFrames++
+		case !isPadFrame(frame, bytesPerSecond24k):
+			t.Fatalf("audio frame %d is %d bytes, want the caller's PCM or, after it, a 100 ms frame of silence", index, len(frame))
+		}
 	}
 	if fake.endStream {
 		t.Fatal("endStream was sent before Close")
