@@ -469,6 +469,18 @@ class _RealtimeSession(llm.RealtimeSession):
         ]
         if self._google:
             additions = [item for item in items if item.id not in self._known_items]
+            if (
+                additions
+                and self._manual_turns
+                and (self._audio_active or self._uncommitted_source_samples)
+            ):
+                # AgentSession appends typed input before generate_reply and
+                # treats RealtimeError from this update as best effort. Refuse
+                # with a non-best-effort error BEFORE wire/history mutation;
+                # leave original capture intact for an explicit commit/clear.
+                raise GatewayError(
+                    "Commit manual input before adding typed context", retryable=False
+                )
             # Gemini appends text context. Tool execution stays refused until
             # the framework has an owned per-call cancellation interface.
             if any(
@@ -488,6 +500,9 @@ class _RealtimeSession(llm.RealtimeSession):
                 self._enqueue(
                     {"clientContent": {"turns": turns, "turnComplete": False}}
                 )
+                # This explicit typed turn is new work. It must not consume
+                # the "reply already requested by audio commit" shortcut.
+                self._committed = False
             self._known_items.update(item.id for item in additions)
         else:
             wanted = {item.id for item in items}

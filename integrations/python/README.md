@@ -54,6 +54,10 @@ manual mode. There is no automatic mode switch. Commit manual input before
 requesting a reply; original source samples still held in the native resampler
 also count as uncommitted input. An uncommitted-input
 reply is refused before sending clientContent, and input can continue normally.
+This includes typed `AgentSession.generate_reply(user_input=...)`: context
+updates refuse before provider/local history changes using an error the SDK does
+not treat as best effort. Original capture remains available for real commit.
+Accepted typed input after commit starts a new reply, not the prior audio reply.
 Clearing local, unconverted input discards its resampler state; it is not flushed
 into a later commit. Clearing already forwarded manual input closes the transport
 because it cannot be recalled. Repeated manual activity starts are idempotent.
@@ -79,15 +83,22 @@ Speko LLM transport, and function tools run through `AgentSession`. Repeated
 delegation IDs do not repeat paid backend work. Tool results remain available
 to later delegations; results that request no reply are sent as silent context.
 Per-reply `instructions` are refused before installation for **every** GPT-Live
-ask, including the first and after a previous delegation was claimed. The
+ask, including associated typed `user_input`, the first ask and asks after an
+earlier delegation was claimed. The existing per-activity SDK reply task is
+fenced before its typed append. Unknown wrapper/custom-task ownership refuses
+before opening; losing that binding retires ambiguous I/O before further context
+updates. This is a local SDK capability boundary, not native authority. The
 [client delegation protocol](https://developers.openai.com/api/docs/guides/live-delegation)
 provides IDs and audio offsets, without per-ask correlation or a drain barrier.
 A distinct late old delegation could otherwise claim a new task. Nonempty PCM
 cannot classify speech or make that binding safe; idle microphone input cannot
 silently downgrade an accepted task because no scoped task is accepted.
 
-Unscoped `generate_reply()` sends only a voice-delivery hint. It contributes no
-instructions to backend history or tool contexts. A preamble can fulfill its
+Unscoped `generate_reply()` requires usable canonical startup/history context
+before sending a voice-delivery hint. A fresh empty context refuses that ask
+without inventing a user message or ending ordinary caller audio/delegation.
+Ordinary typed input remains supported and supplies its actual context. The hint
+contributes no instructions to backend history or tool contexts. A preamble can fulfill its
 playback future while its original 15-second application expiration remains;
 cancellation callbacks retire their own hint/timer. Caller audio and ordinary
 transcript-based delegations continue on the same socket. Each delegation and

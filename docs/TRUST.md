@@ -6,33 +6,53 @@ reviewed native authority, producer, configured connector directory and consumer
 pins exist; relay media is not a substitute. See the
 [factory prerequisites](WORKER-PROVIDER-DIRECT.md).
 
-Gemini function tools are refused before a provider socket is opened because the
-supported framework has no owned per-call cancellation interface. Unsolicited
-provider tool requests fail closed. History and typed text stay on the explicitly
-configured native transport; interruptions clear framework playback. GPT-Live
-explicit reply instructions are scoped to the next new delegation and its backend
-tool rounds; unrelated later delegations do not inherit those one-off tasks.
-Audible preambles do not end task lifetime: new caller/app input,
-cancellation or the original application deadline retires an unclaimed task.
-An unclaimed task cannot be replaced; retiring it permanently fences later
-explicit asks on that connection because the provider offers no per-ask
-delegation attribution/drain barrier. Caller audio and ordinary delegations stay
-live, without injecting the retired/replacement instructions or redialing.
-This state and timeout grant no provider-execution or monetary authority.
-Gemini marks completed audio transcripts as already consumed, and playback
-cleanup from provider feedback sends no new manual activity. Explicit local
-interruption of an active manual generation requests provider cancellation with
-balanced activity controls; it does not leave an open synthetic turn or record
-caller speech. External VAD's real activity start cancels its targeted generation
-and preserves that caller input on the existing socket. If continuous PCM
-opened input before that response, a fresh caller start sends a matched end/start
-boundary; it never guesses that the old activity cancelled a later response.
-Disabled interruption and unrelated activity without that fresh start retain
-the physical-stop fallback. No provider credential,
-endpoint, funding or receipt authority is added by these changes. Physical abort
-interrupts the owned socket without relying on consumer progress; an aborted
-connection says nothing about
-provider usage, durable finalization, NoIO or settlement.
+The SDK conversation checks below grant no worker, provider-execution or monetary
+authority. They use existing owned SDK methods, not caller/source attestation,
+and do not install a factory or source handoff.
+
+Gemini function tools are refused before opening because the supported SDK has
+no owned per-call cancellation interface. Asynchronous client VAD/STT turn modes,
+realtime wrappers/fallback and child swaps are also refused before Gemini I/O:
+the SDK forwards PCM before its VAD callback and supplies no correlated capture
+frontier. Continuous-input rollover in those modes is not supported. Direct
+manual AgentSession turns require negotiated disabled server VAD; explicitly
+selected provider VAD remains supported. Live mode changes cannot bypass the
+frozen ownership boundary. Healthy supported idle/long manual input has no local
+two-second expiry.
+
+Original manual samples count as uncommitted even inside the native resampler.
+Typed AgentSession replies refuse before provider or local conversation mutation
+while that input remains uncommitted. This refusal uses an SDK error that is not
+its best-effort context-update exception, and leaves capture intact for explicit
+commit/clear. Clearing still-local samples discards the converter; already
+forwarded manual input cannot be recalled and requires physical stop. After a
+real commit, accepted new typed input starts its own reply rather than consuming
+the prior audio-commit shortcut. Consumed audio transcript IDs cannot replay as
+typed input.
+
+GPT-Live refuses ALL per-reply instructions, including their associated typed
+user_input, before the SDK reply task appends any context. Delegation IDs/offsets
+provide no per-ask attribution or old-delegation drain barrier. The adapter owns
+the existing per-activity SDK reply-task seam; unknown wrapper/custom-task
+ownership refuses before opening, and losing that seam retires ambiguous owned
+I/O before another context update. Ordinary typed input, caller audio and
+canonical backend/tool-round snapshots remain supported.
+
+Unscoped GPT-Live generate_reply requires usable canonical startup/history
+context before sending a voice-delivery hint. A fresh empty context refuses that
+ask without inventing user text, adding the hint to backend history, or ending
+ordinary voice input. Real transcript fragments can still support ordinary
+provider delegations. A preamble may fulfill the playback future while its
+original application expiration remains; it does not establish task attribution
+or extend execution authority.
+
+Provider interruption feedback clears playback without a new manual activity.
+Supported explicit manual cancellation uses balanced controls where available;
+disabled/unavailable cancellation, provider-VAD explicit cancellation and
+pre-output cancellation physically stop and join the owned transport. There is
+no async-VAD rollover fallback or automatic redial. An aborted connection says
+nothing about provider usage, durable finalization, NoIO or settlement. No
+provider credential, endpoint, funding or receipt authority is added here.
 
 This document describes what Speko Gateway can access, where it sends data,
 and what changes when `SPEKO_API_KEY` is configured.

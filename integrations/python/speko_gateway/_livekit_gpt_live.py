@@ -10,6 +10,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import inspect
 import json
 import re
 import time
@@ -33,6 +34,67 @@ _Model = getattr(llm, "DuplexModel", object)
 _Session = getattr(llm, "DuplexSession", object)
 _TEXT_BYTES = 128 << 10
 _ID = re.compile(r"[!-~]{1,200}")
+_SCOPED_REPLY = "GPT-Live per-reply instructions require provider correlation"
+
+
+class _GPTReplyBinding:
+    """Own the existing SDK reply-task seam; no native/worker authority."""
+
+    def __init__(self, activity: Any, session: _GPTLiveRealtimeSession) -> None:
+        from livekit.agents.voice.agent_activity import AgentActivity
+
+        original = getattr(activity, "_realtime_reply_task", None)
+        if (
+            activity.llm is not session.realtime_model
+            or getattr(activity, "_rt_session", None) is not session
+            or not inspect.ismethod(original)
+            or original.__func__ is not AgentActivity._realtime_reply_task
+            or not {"speech_handle", "instructions", "user_input"}.issubset(
+                inspect.signature(original).parameters
+            )
+        ):
+            raise llm.RealtimeError("GPT-Live SDK reply ownership is unavailable")
+        self.activity = weakref.ref(activity)
+        self.session = weakref.ref(session)
+        self.original = original
+
+        async def reply(*args: Any, **options: Any) -> None:
+            current = self.session()
+            try:
+                self.check()
+                if options.get("instructions") is not None:
+                    raise llm.RealtimeError(_SCOPED_REPLY)
+            except (llm.RealtimeError, GatewayError) as failure:
+                # Preserve the real SpeechHandle's failure semantics. This
+                # task has not entered the SDK's typed append/history path.
+                options["speech_handle"]._mark_done(error=failure)
+                return
+            assert current is not None
+            await self.original(*args, **options)
+
+        self.observed = reply
+        activity._realtime_reply_task = reply
+
+    def check(self) -> None:
+        activity, session = self.activity(), self.session()
+        if (
+            activity is None
+            or session is None
+            or activity._realtime_reply_task is not self.observed
+            or activity._rt_session is not session
+            or session._reply_binding is not self
+            or session.duplex_session._closing
+            or session.duplex_session._failure is not None
+        ):
+            # RealtimeError is best-effort during SDK context updates.
+            raise GatewayError(
+                "GPT-Live SDK reply owner is unavailable", retryable=False
+            )
+
+    def release(self) -> None:
+        activity = self.activity()
+        if activity is not None and activity._realtime_reply_task is self.observed:
+            activity._realtime_reply_task = self.original
 
 
 def _failure() -> GatewayError:
@@ -294,6 +356,14 @@ class _GPTLiveSession(_Session):
             raise llm.RealtimeError("GPT-Live history exceeds its bound")
         self._history.insert(items)
 
+    def _backend_context(self) -> llm.ChatContext:
+        context = self._history.copy()
+        if self._instructions:
+            context.items.insert(
+                0, llm.ChatMessage(role="system", content=[self._instructions])
+            )
+        return context
+
     def _generate_reply(
         self, *, instructions=NOT_GIVEN, tool_choice=NOT_GIVEN, tools=NOT_GIVEN
     ) -> None:
@@ -301,9 +371,7 @@ class _GPTLiveSession(_Session):
             # The protocol carries no per-ask identity/drain barrier. Reject
             # scoped tasks BEFORE append instead of running an ambiguous or
             # silently downgraded backend task (including on idle PCM).
-            raise llm.RealtimeError(
-                "GPT-Live per-reply instructions require provider correlation"
-            )
+            raise llm.RealtimeError(_SCOPED_REPLY)
         pending = self._pending_reply_future
         if pending is not None and pending.cancelled():
             self._retire_pending_reply(pending)
@@ -312,6 +380,13 @@ class _GPTLiveSession(_Session):
         self._update_options(tool_choice=tool_choice)
         if is_given(tools) and tools != self._tools.flatten():
             raise llm.RealtimeError("GPT-Live does not support per-response tools")
+        # A delegation may precede any transcript or use an older offset. Only
+        # canonical context independent of that future offset can make this
+        # unscoped ask usable. Never insert the delivery hint as fake context.
+        if not self._model._backend._request_body(
+            self._backend_context(), self._tools.flatten()
+        )["input"]:
+            raise llm.RealtimeError("GPT-Live reply requires canonical backend context")
         ask = "Reply to the caller now. Do not wait for the caller to speak first. After that, pause and listen."
         # This is only an unscoped voice-delivery hint. It contributes no task
         # instructions or privileges to any backend context/tool round.
@@ -444,11 +519,7 @@ class _GPTLiveSession(_Session):
             if len(self._seen_delegations) >= 128:
                 raise _failure()
             self._seen_delegations.add(identity)
-            context = self._history.copy()
-            if self._instructions:
-                context.items.insert(
-                    0, llm.ChatMessage(role="system", content=[self._instructions])
-                )
+            context = self._backend_context()
             pending = self._pending_reply_future
             if pending is not None and pending.cancelled():
                 self._retire_pending_reply(pending)
@@ -663,6 +734,7 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
     def __init__(self, model: GPTLiveModel, inner: llm.RealtimeSession):
         super().__init__(model)
         self._inner = inner
+        self._reply_binding: _GPTReplyBinding | None = None
         self._reply: asyncio.Future | None = None
         self._reply_timeout = 15.0
         inner.on("generation_created", self._generation)
@@ -676,6 +748,30 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
             "remote_item_added",
         ):
             inner.on(event, lambda value, event=event: self.emit(event, value))
+
+    def on(self, event, callback=None):
+        if callback is None:
+            return lambda selected: self.on(event, selected)
+        from livekit.agents.voice.agent_activity import AgentActivity
+
+        owner = getattr(callback, "__self__", None)
+        try:
+            if isinstance(owner, AgentActivity):
+                if (
+                    self._reply_binding is None
+                    or self._reply_binding.activity() is not owner
+                ):
+                    if self._reply_binding is not None:
+                        self._reply_binding.release()
+                    self._reply_binding = _GPTReplyBinding(owner, self)
+            elif isinstance(owner, llm.RealtimeSession) and owner is not self:
+                raise llm.RealtimeError(
+                    "GPT-Live wrapper reply ownership is unavailable"
+                )
+        except (llm.RealtimeError, GatewayError):
+            self.duplex_session._fatal()
+            raise
+        return super().on(event, callback)
 
     @property
     def duplex_session(self):
@@ -764,6 +860,12 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
         await self._inner.update_instructions(instructions)
 
     async def update_chat_ctx(self, chat_ctx):
+        if self._reply_binding is not None:
+            try:
+                self._reply_binding.check()
+            except GatewayError:
+                self.duplex_session._fatal()
+                raise
         await self._inner.update_chat_ctx(chat_ctx)
 
     async def update_tools(self, tools):
@@ -797,4 +899,9 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
 
     async def aclose(self):
         self._fail_reply()
-        await self._inner.aclose()
+        try:
+            await self._inner.aclose()
+        finally:
+            if self._reply_binding is not None:
+                self._reply_binding.release()
+                self._reply_binding = None

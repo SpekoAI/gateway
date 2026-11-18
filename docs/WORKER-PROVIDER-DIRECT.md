@@ -13,7 +13,12 @@ Gemini history completion, typed input, playback interruption, unsafe tool
 admission and GPT-Live delegated reply context. Gemini tools remain refused
 because the supported SDK executes the Agent's original tools without an owned
 per-call cancellation hook. Extended-thinking tool sessions are refused too.
-OpenAI/xAI and GPT-Live retain their separately tested tool rounds.
+OpenAI/xAI and GPT-Live retain their separately tested tool rounds. GPT-Live
+per-reply instructions, including associated typed input, refuse before context
+mutation; unscoped asks require usable canonical context before append. Gemini
+typed replies cannot overtake uncommitted original audio. These SDK capability
+checks do not attest current requester/source, claim, caller, credential, committed
+lease, provider bounds, durable entry, receipts or cleanup acceptance.
 
 ## Required upstream source
 
