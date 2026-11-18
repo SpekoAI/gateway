@@ -151,7 +151,8 @@ const ModeOption = "mode"
 // read 2026-11-17): min_latency, balanced and max_accuracy. AssemblyAI answers
 // any other value with validation error 3006 after the handshake, so the
 // session would open and then die mid-call. An absent mode is valid: the
-// vendor then uses balanced. settings is the caller's assemblyai provider
+// adapter then sends defaultMode, or nothing, and the vendor uses balanced.
+// settings is the caller's assemblyai provider
 // options, so the gateway's and the relay's option types can both pass them.
 //
 // AssemblyAI's manual mode (3.7 Realtime Agent only) is not offered. A manual
@@ -167,6 +168,33 @@ func ValidateMode(model string, settings map[string]any) error {
 		return nil
 	}
 	return errors.New("assemblyai mode takes min_latency, balanced or max_accuracy")
+}
+
+// turnTimingOptions are the caller settings that tune when a turn ends.
+var turnTimingOptions = []string{
+	"end_of_turn_confidence_threshold", "min_end_of_turn_silence_when_confident",
+	"min_turn_silence", "max_turn_silence",
+}
+
+// defaultMode returns the preset to send when the caller chose none. The Speko
+// benchmark measured the 3.7 Realtime Agent with min_latency, the preset
+// AssemblyAI recommended for it, so 3.7 gets min_latency instead of the vendor
+// default balanced, and the served model matches the measured row. A caller who
+// sets a mode or tunes turn timing keeps their own settings: a preset under
+// partial thresholds would change timing the caller chose.
+func defaultMode(model string, settings map[string]any) string {
+	if model != RealtimeAgent37Model {
+		return ""
+	}
+	if _, set := settings[ModeOption]; set {
+		return ""
+	}
+	for _, key := range turnTimingOptions {
+		if _, set := settings[key]; set {
+			return ""
+		}
+	}
+	return "min_latency"
 }
 
 // languagesFor returns the language_codes vocabulary of one streaming model.
@@ -392,6 +420,9 @@ func streamEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 			return "", fmt.Errorf("assemblyai language: %w", err)
 		}
 		query.Set("language_codes", string(encoded))
+	}
+	if mode := defaultMode(model, options.STT.Provider("assemblyai")); mode != "" {
+		query.Set(ModeOption, mode)
 	}
 	if options.STT.Diarize() {
 		// Streaming speaker diarization, spelled exactly as the v3 connection
