@@ -136,6 +136,25 @@ type Adapter interface {
 	Open(context.Context, AdapterRequest) (ProviderStream, error)
 }
 
+// GoogleRealtimeAdapter identifies an installed Google realtime implementation
+// with a configured ID. Its funded plans use the same admission and lifecycle
+// gates as the default port. This does not enable managed resumption.
+type GoogleRealtimeAdapter interface {
+	Adapter
+	GoogleRealtimeAdapter()
+}
+
+type providerPhysicalDeadlineKey struct{}
+
+// ProviderPhysicalDeadline returns the Engine's already validated monotonic
+// replacement cap. It is independent of a caller/setup context's deadline and
+// must be retained through setup, handoff and physical teardown. A zero value
+// means the Engine did not supply a funded replacement cap.
+func ProviderPhysicalDeadline(ctx context.Context) time.Time {
+	deadline, _ := ctx.Value(providerPhysicalDeadlineKey{}).(time.Time)
+	return deadline
+}
+
 // AdapterRequest contains the concrete, already-validated execution choice.
 type AdapterRequest struct {
 	// Continuation requests a stable ResumableProviderStream event source.

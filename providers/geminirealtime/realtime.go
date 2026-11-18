@@ -86,6 +86,8 @@ func New(config Config) (*Adapter, error) {
 
 func (a *Adapter) ID() string { return a.id }
 
+func (a *Adapter) GoogleRealtimeAdapter() {}
+
 // Open establishes the constrained Google socket and waits for setupComplete.
 // The Engine emits the canonical session.ready event after this returns.
 func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
@@ -208,22 +210,24 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 	if handle != "" {
 		setup["setup"].(map[string]any)["sessionResumption"] = map[string]any{"handle": handle}
 	}
+	// Start the sole reader before setup writing. Every acquired stream can
+	// then return its error promptly with a live event/teardown owner, even if
+	// physical Close returns are held. The Engine joins both asynchronously.
+	go stream.readLoop()
 	if err := stream.writeJSON(ctx, setup); err != nil {
-		_ = stream.abort()
-		close(stream.events) // The reader has not started; physical close completed.
+		stream.Interrupt()
 		return stream, err
 	}
-	go stream.readLoop()
 	setupCtx, cancelSetup := context.WithTimeout(ctx, a.setupTimeout)
 	defer cancelSetup()
 	select {
 	case err := <-stream.setupDone:
 		if err != nil {
-			_ = stream.abort()
+			stream.Interrupt()
 			return stream, err
 		}
 	case <-setupCtx.Done():
-		_ = stream.abort()
+		stream.Interrupt()
 		return stream, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini Live did not acknowledge setup", Retryable: true, Cause: setupCtx.Err()}
 	}
 	return stream, nil

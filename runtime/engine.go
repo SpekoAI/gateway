@@ -194,6 +194,9 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Sessio
 		clock = &fundedClock{client: request.Entitlements, plan: request.Plan, wall: e.now}
 		err = verifier.VerifyWithClock(ctx, request.Plan, func(ctx context.Context) (time.Time, error) {
 			authenticated = true
+			if !e.supportsFundedGoogle(request.Plan) {
+				return time.Time{}, ErrFundedGoogleAdapter
+			}
 			if !renewableGoogle(request.Plan) {
 				return time.Time{}, ErrFundedGoogleClockAuthority
 			}

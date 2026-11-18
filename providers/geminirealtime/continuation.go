@@ -2,8 +2,8 @@ package geminirealtime
 
 import (
 	"context"
+	"errors"
 	"sync"
-	"time"
 
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
@@ -159,9 +159,13 @@ func (s *resumableStream) Resume(ctx context.Context, credential protocol.Delega
 	}
 	request := s.request
 	request.Plan.Route.Credential = &credential
-	// The original root's physical cap cannot authorize a replacement socket.
-	// The coordinator owns the validated renewal cap through Resume/adoption.
-	request.PhysicalDeadline = time.Time{}
+	// The root's cap cannot authorize a replacement. Retain the coordinator's
+	// original renewed cap on this exact transport BEFORE setup/Resume can
+	// block, independently of the cancellation budget and s.current adoption.
+	request.PhysicalDeadline = runtimepkg.ProviderPhysicalDeadline(ctx)
+	if request.PhysicalDeadline.IsZero() && !s.request.PhysicalDeadline.IsZero() {
+		return errors.New("gemini realtime: funded replacement physical deadline is missing")
+	}
 	stream, err := s.adapter.openSocket(ctx, request, handle, previous.responding)
 	if err != nil {
 		if stream != nil {

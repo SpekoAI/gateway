@@ -43,6 +43,10 @@ current clock port derives authority from that signed URL; unsupported
 nonrenewable shapes receive `ErrFundedGoogleClockAuthority` after signature and
 nonce authentication, before clock, minting or provider I/O. No unsigned clock
 endpoint or allowance is invented. Existing ordinary OSS families stay separate.
+Configured Google adapter IDs use the same gates. An installed Google adapter
+declares its implementation capability; an arbitrary custom adapter ID cannot
+gain funded acceptance by matching a string. Unrecognized funded Google
+adapters receive `ErrFundedGoogleAdapter` after authentication and before I/O.
 
 Ordinary local/signature-only admission and the default verifier retain a
 nondecreasing wall-time watermark. Spent local attempts remain fenced while
@@ -82,6 +86,11 @@ or a withdrawn resumption handle. Closing cancels pending delivery; a live
 socket can drain queued input, and a detached socket terminates immediately.
 Provider teardown still precedes physical capacity release.
 
+Setup/write/cancellation errors return the acquired stream and original error
+without waiting for physical Close returns. The sole reader and serialized
+teardown retain that exact stream; the Engine publishes its opening failure
+receipt promptly and releases capacity only after both actual joins complete.
+
 The root cap is the earliest original signed credential expiry, funded lease
 and root horizon, mapped once from trusted SQL time to monotonic elapsed time.
 A still-valid shorter credential is admitted normally and may carry I/O only
@@ -100,6 +109,10 @@ A return after expiry cannot adopt sequence or allowance. Failure/cancellation
 retains the deadline until physical teardown actually joins, and capacity
 remains held while that evidence is unknown. This machinery is exercised with
 owned resumable transports; it does not enable managed Google resumption.
+The coordinator carries its already validated cap separately from the shorter
+setup/request cancellation deadline. The adapter arms it on the actual pending
+replacement transport before setup blocks, even before `s.current` adoption.
+It never copies the old root cap or maps signed time through the host wall clock.
 
 Terminal abort claims its error before calling the Google stream's concurrent
 `Interrupt`, which closes physical I/O without waiting for the provider mutex,
@@ -110,7 +123,8 @@ until the original close/abort and the provider event source have both ended.
 
 Interruption starts bounded physical close attempts without waiting for any
 transport Close return. A stalled normal Close cannot block abort/lease terminal
-metadata. At most one normal and one interrupt attempt run concurrently; a
+metadata. At most two physical attempts run concurrently; a completed failed
+normal slot can be retried while the previous interrupt return is held. A
 failed attempt preserves its diagnostic but does not latch future interruption.
 The original cap remains armed while closure is unproven. Serialized teardown
 waits for actual successful/already-closed transport evidence and every active

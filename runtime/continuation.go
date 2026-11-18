@@ -90,10 +90,24 @@ func (c *fundedClock) synchronize(ctx context.Context) (bool, error) {
 // plan supplies no accepted clock endpoint. It never falls into OSS admission.
 var ErrFundedGoogleClockAuthority = errors.New("runtime: funded Google plan has no signed clock authority")
 
+// ErrFundedGoogleAdapter refuses unknown adapter implementations without
+// treating their funded Google plans as ordinary local-clock sessions.
+var ErrFundedGoogleAdapter = errors.New("runtime: funded Google adapter is not supported")
+
 func fundedGoogle(plan protocol.SessionPlan) bool {
 	return plan.Execution.CredentialSource == protocol.CredentialsManaged &&
 		plan.Execution.ProviderRoute == protocol.RouteProviderDirect && plan.Route.Provider == "google" &&
-		plan.Route.Adapter == "google.live.v1" && plan.UsesFundedContinuation()
+		plan.UsesFundedContinuation()
+}
+
+func (e *Engine) supportsFundedGoogle(plan protocol.SessionPlan) bool {
+	// Preserve the existing default port. Configured aliases must be declared
+	// by the installed Google adapter, never inferred from an arbitrary ID.
+	if plan.Route.Adapter == "google.live.v1" {
+		return true
+	}
+	_, ok := e.adapters[plan.Route.Adapter].(GoogleRealtimeAdapter)
+	return ok
 }
 
 func renewableGoogle(plan protocol.SessionPlan) bool {
@@ -359,6 +373,9 @@ func (c *continuation) renew(previous time.Time) {
 		}()
 		c.mu.Unlock()
 		resumeCtx, resumeCancel := context.WithDeadlineCause(ctx, hardDeadline, ErrSessionLeaseExpired)
+		// Keep the cap distinct from the shorter request/cancellation budget.
+		// The provider must arm it on a replacement before setup can block.
+		resumeCtx = context.WithValue(resumeCtx, providerPhysicalDeadlineKey{}, hardDeadline)
 		err = c.stream.Resume(resumeCtx, renewal.Credential)
 		c.session.providerMu.Unlock()
 		resumeCancel()

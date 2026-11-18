@@ -72,7 +72,8 @@ func (s *physicalSocket) Close() error {
 }
 
 // Interrupt never waits for a transport Close, including one already in
-// progress. At most one normal and one interrupt attempt run concurrently.
+// progress. At most two physical attempts run concurrently. A completed failed
+// normal slot remains available when the other interruption is still held.
 // Repeated interruptions retain one retry if the current attempt later fails.
 func (s *physicalSocket) Interrupt() { s.startClose(true) }
 
@@ -85,6 +86,12 @@ func (s *physicalSocket) startClose(interrupt bool) *physicalCloseAttempt {
 	slot := &s.normal
 	if interrupt {
 		slot = &s.interrupt
+		if *slot != nil && !(*slot).complete && s.normal != nil && s.normal.complete {
+			// The SDK's normal close already failed without closure evidence.
+			// An expiry must still be able to use that free slot when the prior
+			// interrupt's transport return is held (the reverse scheduling order).
+			slot = &s.normal
+		}
 	}
 	if *slot != nil && !(*slot).complete {
 		attempt := *slot
