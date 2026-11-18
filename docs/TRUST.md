@@ -55,8 +55,16 @@ user_input, before the SDK reply task appends any context. Delegation IDs/offset
 provide no per-ask attribution or old-delegation drain barrier. The adapter owns
 the existing per-activity SDK reply-task seam; unknown wrapper/custom-task
 ownership refuses before opening, and losing that seam retires ambiguous owned
-I/O before another context update. Ordinary typed input, caller audio and
+I/O before another context update. First typed input before any delivery hint, caller audio and
 canonical backend/tool-round snapshots remain supported.
+After a delivery hint has been queued, new typed user context refuses before
+the SDK reply task, voice append or backend history changes. Direct context
+updates also refuse before mutation. Cancel, expiry, preamble and even a claimed
+delegation do not prove that all older delegates have drained. Captured tool
+results and ordinary caller speech/delegations retain their own supported flow.
+The owned existing Activity context entry checks before the SDK's local history
+assignment, including refusal while its real context lock is busy. The adapter's
+append barrier separately protects direct native-session updates.
 
 Unscoped GPT-Live generate_reply requires usable canonical startup/history
 context before sending a voice-delivery hint. A fresh empty context refuses that
@@ -78,14 +86,24 @@ Typed Gemini work waits for the terminal boundary.
 
 OpenAI/xAI speech-start feedback before a created response ID retires the exact
 pending application future/timer without treating SDK re-entry as a local stop.
-Automatic caller VAD/audio turns remain live on that socket. Later explicit asks,
-context changes, commits and tool dispatch refuse until close: no protocol field
-can safely attribute a late created response to the retired ask. The existing
-owned synchronous SDK reply entry refuses a replacement typed ask before handle
+The existing control path supplies no accepted correlation for later created
+responses. An unseen ID or cancelled terminal cannot prove a new caller turn.
+New input refuses before capture/conversion and stops physically; unknown output
+stops before any SDK generation, playback or history. Continuation is not claimed
+for that ambiguous transport. Explicit asks, context, instructions, tools, tool
+choice, commits and tool dispatch refuse before mutation, including across async
+configuration waits. Known-response provider VAD retains connected caller flow
+and suppresses late frames by the actual interrupted response ID. The existing
+owned SDK configuration entries refuse before local Agent instructions, tools,
+context and tool-choice changes; native entries apply their own pre-mutation checks.
+The owned synchronous SDK reply entry refuses a replacement typed ask before handle
 or history mutation. Unknown wrapper ownership cannot bypass it. Only actual
 SDK cleanup callsites with the retired future/stale generation are exempted;
 independent local stops still stop and join physical I/O. No synthetic turn ID,
 quiet window, new callback, retry or automatic reopen establishes attribution.
+The pinned SDK's existing generation implementation method is checked by its
+actual code/event ownership. Independent stop inside ACTIVE feedback still
+aborts/joins even after that generation was marked interrupted.
 Supported explicit manual cancellation uses balanced controls where available;
 disabled/unavailable cancellation, provider-VAD explicit cancellation and
 pre-output cancellation physically stop and join the owned transport. There is

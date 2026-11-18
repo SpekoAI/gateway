@@ -44,6 +44,7 @@ class _GPTReplyBinding:
         from livekit.agents.voice.agent_activity import AgentActivity
 
         original = getattr(activity, "_realtime_reply_task", None)
+        original_context = activity.update_chat_ctx
         if (
             activity.llm is not session.realtime_model
             or getattr(activity, "_rt_session", None) is not session
@@ -52,18 +53,51 @@ class _GPTReplyBinding:
             or not {"speech_handle", "instructions", "user_input"}.issubset(
                 inspect.signature(original).parameters
             )
+            or not inspect.ismethod(original_context)
+            or original_context.__func__ is not AgentActivity.update_chat_ctx
+            or not isinstance(activity._rt_chat_ctx_lock, asyncio.Lock)
         ):
             raise llm.RealtimeError("GPT-Live SDK reply ownership is unavailable")
         self.activity = weakref.ref(activity)
         self.session = weakref.ref(session)
         self.original = original
+        self.original_context = original_context
+
+        async def context(chat_ctx: llm.ChatContext, **options: Any) -> None:
+            self.check()
+            current = self.session()
+            owner = self.activity()
+            assert current is not None and owner is not None
+            changed = current._changes_user_context(chat_ctx)
+            if changed and (
+                current.duplex_session._reply_hint_issued
+                or owner._rt_chat_ctx_lock.locked()
+            ):
+                # The actual SDK assigns Agent history before acquiring this
+                # lock. Refuse before that assignment, not after a native error.
+                raise GatewayError(
+                    "GPT-Live typed context requires delegation correlation",
+                    retryable=False,
+                )
+            await self.original_context(chat_ctx, **options)
+
+        self.observed_context = context
+        activity.update_chat_ctx = context
 
         async def reply(*args: Any, **options: Any) -> None:
             current = self.session()
             try:
                 self.check()
+                assert current is not None
                 if options.get("instructions") is not None:
                     raise llm.RealtimeError(_SCOPED_REPLY)
+                if (
+                    is_given(options.get("user_input", NOT_GIVEN))
+                    and current.duplex_session._reply_hint_issued
+                ):
+                    raise llm.RealtimeError(
+                        "GPT-Live typed reply requires delegation correlation"
+                    )
             except (llm.RealtimeError, GatewayError) as failure:
                 # Preserve the real SpeechHandle's failure semantics. This
                 # task has not entered the SDK's typed append/history path.
@@ -81,6 +115,7 @@ class _GPTReplyBinding:
             activity is None
             or session is None
             or activity._realtime_reply_task is not self.observed
+            or activity.update_chat_ctx is not self.observed_context
             or activity._rt_session is not session
             or session._reply_binding is not self
             or session.duplex_session._closing
@@ -95,6 +130,8 @@ class _GPTReplyBinding:
         activity = self.activity()
         if activity is not None and activity._realtime_reply_task is self.observed:
             activity._realtime_reply_task = self.original
+        if activity is not None and activity.update_chat_ctx is self.observed_context:
+            activity.update_chat_ctx = self.original_context
 
 
 def _failure() -> GatewayError:
@@ -236,6 +273,9 @@ class _GPTLiveSession(_Session):
         self._pending_reply_hint: str | None = None
         self._pending_reply_future: asyncio.Future | None = None
         self._pending_reply_timer: asyncio.TimerHandle | None = None
+        # A negative capability fence, not an acknowledgement or source proof.
+        # Retirement, preambles and claimed IDs do not drain unseen delegates.
+        self._reply_hint_issued = False
         self._socket: RelayRealtimeSession | None = None
         self._resampler: rtc.AudioResampler | None = None
         self._input_format: tuple[int, int] | None = None
@@ -314,6 +354,15 @@ class _GPTLiveSession(_Session):
             )
 
     async def _append_items(self, items: list[llm.ChatItem]) -> None:
+        if self._reply_hint_issued and any(
+            isinstance(item, llm.ChatMessage) and item.role == "user" for item in items
+        ):
+            # Preflight the whole batch before history, voice append or tool
+            # results. RealtimeError here is best-effort in the SDK.
+            raise GatewayError(
+                "GPT-Live typed context requires delegation correlation",
+                retryable=False,
+            )
         if len(self._history.items) + len(items) > 256:
             raise llm.RealtimeError("GPT-Live history exceeds its bound")
         for item in items:
@@ -393,6 +442,7 @@ class _GPTLiveSession(_Session):
         ask = _text(ask)
         self._retire_pending_reply()
         self._append("session.commentary.append", ask)
+        self._reply_hint_issued = True
         self._pending_reply_hint = ask
 
     def _retire_pending_reply(self, future: asyncio.Future | None = None) -> None:
@@ -866,7 +916,27 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
             except GatewayError:
                 self.duplex_session._fatal()
                 raise
+        if self.duplex_session._reply_hint_issued and self._changes_user_context(
+            chat_ctx
+        ):
+            raise GatewayError(
+                "GPT-Live typed context requires delegation correlation",
+                retryable=False,
+            )
         await self._inner.update_chat_ctx(chat_ctx)
+
+    def _changes_user_context(self, chat_ctx: llm.ChatContext) -> bool:
+        previous = {
+            item.id: item
+            for item in self.chat_ctx.items
+            if isinstance(item, llm.ChatMessage) and item.role == "user"
+        }
+        return any(
+            isinstance(item, llm.ChatMessage)
+            and item.role == "user"
+            and previous.get(item.id) != item
+            for item in chat_ctx.items
+        )
 
     async def update_tools(self, tools):
         await self._inner.update_tools(tools)

@@ -226,7 +226,7 @@ async def server_answer(ws, identity, text):
     ],
 )
 @pytest.mark.parametrize("action", ["provider", "local-before", "local-during"])
-async def test_server_vad_preoutput_feedback_owns_only_its_actual_sdk_future(
+async def test_server_vad_preoutput_feedback_retires_future_before_new_input_refusal(
     native_binary, monkeypatch, protocol, model_name, voice, action
 ):
     source = OwnedAudioInput()
@@ -321,57 +321,24 @@ async def test_server_vad_preoutput_feedback_owns_only_its_actual_sdk_future(
                 )
                 assert timer.cancelled() and not native._pending_timers
                 return
-            assert native._failure is None and not closed.is_set()
             await asyncio.wait_for(original_speech.wait_for_playout(), 5)
             assert original_speech.interrupted and original.cancelled()
             assert (
                 timer.cancelled() and not native._pending and not native._pending_timers
             )
-            await ws.send_json(
-                {
-                    "type": "input_audio_buffer.speech_stopped",
-                    "item_id": "caller_input",
-                    "audio_end_ms": 100,
-                }
-            )
-            # Replacement application work is refused before any late ID,
-            # rather than guessing the next created ID belongs to this ask.
-            with pytest.raises(GatewayError, match="correlation"):
-                actor.generate_reply(user_input="REFUSED_UNCORRELATED_TYPED")
-            assert "REFUSED_UNCORRELATED_TYPED" not in str(actor.history.items)
-            assert "REFUSED_UNCORRELATED_TYPED" not in str(native.chat_ctx.items)
-            # A late response has its genuine server ID, but cannot inherit
-            # the retired application future. Automatic caller turns continue.
-            await ws.send_json(
-                {"type": "response.created", "response": {"id": "old_cancelled"}}
-            )
-            await ws.send_json(
-                {
-                    "type": "response.done",
-                    "response": {"id": "old_cancelled", "status": "cancelled"},
-                }
-            )
-            await ws.send_json(
-                {
-                    "type": "input_audio_buffer.speech_stopped",
-                    "item_id": "caller_input",
-                    "audio_end_ms": 100,
-                }
-            )
-            await server_answer(ws, "caller_response_1", "CALLER_ANSWER")
-            assert await asyncio.wait_for(words.get(), 5) == "CALLER_ANSWER"
-            if hasattr(actor, "wait_for_idle"):
-                await asyncio.wait_for(actor.wait_for_idle(), 5)
-            with pytest.raises(GatewayError, match="correlation"):
-                native.commit_audio()
-            await server_answer(ws, "caller_response_2", "NEXT_ANSWER")
-            assert await asyncio.wait_for(words.get(), 5) == "NEXT_ANSWER"
-            assert "REFUSED_UNCORRELATED_TYPED" not in json.dumps(commands)
+            # No response ID can distinguish the interrupted application ask
+            # from a new caller answer. The continuously connected source is
+            # refused BEFORE its next frame is accepted; this is not advertised
+            # as a healthy caller-continuation lifecycle.
+            await asyncio.wait_for(closed.wait(), 5)
+            await asyncio.wait_for(asyncio.shield(native._task), 5)
+            assert native._failure is not None and "correlation" in str(native._failure)
+            assert native._generation is None and words.empty()
             assert len([c for c in commands if c.get("type") == "response.create"]) == 1
             assert not any(
                 c.get("type") == "input_audio_buffer.commit" for c in commands
             )
-            assert pcm and len(pcm) % 960 == 0 and native._failure is None
+            assert pcm and len(pcm) % 960 == 0
         finally:
             stop.set()
             producer.cancel()

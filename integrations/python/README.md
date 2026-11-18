@@ -93,21 +93,34 @@ model work. The canceled pending future and its timer retire before reuse.
 Provider interruption feedback remains distinct from local cancellation, including
 before first output with a claimed future. The exact provider-interrupted futures
 are ineligible for late output, and their asynchronous SDK cancellation retires
-without aborting the healthy session. Late Gemini feedback after a terminal
+without treating that cancellation as an independent local stop. Late Gemini feedback after a terminal
 clears playback without marking the next response interrupted. In-flight
 feedback remains fenced until its real terminal. A prior or subsequent independent
 local cancellation, including one invoked inside a feedback notification, still
 physically stops and joins the owned transport.
 
 OpenAI/xAI provider speech-start feedback before `response.created` retires the
-exact pending application future and timer. Automatic provider-VAD caller turns
-continue on the same socket. The protocol does not correlate a later created ID
-to that retired request, so subsequent explicit asks, context changes, manual
-commits and tool dispatch refuse until close. The owned synchronous SDK reply
+exact pending application future and timer. This current control path has no
+accepted correlation for a later created response. An unseen ID or cancelled
+terminal cannot establish that it is a new caller answer. New input refuses
+before source capture/conversion and physically stops; an attempted unknown
+response stops before SDK generation, playback or history. No continuation is
+claimed for that ambiguous transport. Subsequent explicit asks, context changes,
+instructions/tools/tool choice, commits and tool dispatch refuse before mutation.
+Both sides of async configuration waits check the boundary. The owned synchronous SDK reply
 entry refuses replacement typed asks before a handle or context is installed.
+The owned existing SDK configuration methods also check before changing Agent
+instructions, tools, context or tool choice; native-session methods independently
+check before changing their own state or sending an update.
 Unknown wrappers cannot supply this ownership for explicit asks. Genuine SDK
 cleanup is distinguished by its actual callsite and retired future/generation;
 an independent local stop is never exempted merely because feedback is active.
+Known-response provider VAD remains supported on the same connected microphone:
+late frames for that interrupted response are suppressed by its actual ID, and
+the next ordinary response remains usable. The pinned SDK's existing generation
+implementation method is included in exact cleanup ownership. An independent
+stop after active feedback, including inside its callback, physically aborts and
+joins even though the generation is already marked interrupted.
 Gemini function tools are refused before socket creation: supported framework versions
 execute the Agent's original tools and expose no per-call cancellation hook for
 `toolCallCancellation`. This also refuses extended-thinking tool sessions. Native
@@ -137,7 +150,15 @@ silently downgrade an accepted task because no scoped task is accepted.
 Unscoped `generate_reply()` requires usable canonical startup/history context
 before sending a voice-delivery hint. A fresh empty context refuses that ask
 without inventing a user message or ending ordinary caller audio/delegation.
-Ordinary typed input remains supported and supplies its actual context. The hint
+The first unscoped typed turn before any delivery hint remains supported. Once
+a hint has been queued, new typed user context refuses before the SDK append,
+including after cancellation, expiry, preamble or a claimed delegation. None of
+these events proves that all older delegations have drained. Direct context
+updates use a non-best-effort refusal before either voice or backend history
+mutation. The existing Activity context method is fenced before its local
+history assignment; a new typed update also refuses while the real SDK context
+lock is busy. Existing tool results still reach their captured rounds. This is a
+negative capability fence, not an acknowledgement or authority proof. The hint
 contributes no instructions to backend history or tool contexts. A preamble can fulfill its
 playback future while its original 15-second application expiration remains;
 cancellation callbacks retire their own hint/timer. Caller audio and ordinary

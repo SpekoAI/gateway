@@ -45,9 +45,18 @@ class _FrameworkTurnBinding:
         self.sessions: weakref.WeakSet[_RealtimeSession] = weakref.WeakSet()
         self.original = activity.update_options
         self.original_reply = activity._generate_reply
+        self.original_configuration = {
+            name: getattr(activity, name)
+            for name in ("update_chat_ctx", "update_instructions", "update_tools")
+        }
         if (
             not inspect.ismethod(self.original_reply)
             or self.original_reply.__func__ is not AgentActivity._generate_reply
+            or any(
+                not inspect.ismethod(method)
+                or method.__func__ is not getattr(AgentActivity, name)
+                for name, method in self.original_configuration.items()
+            )
         ):
             raise GatewayError(
                 "SDK explicit reply ownership is unavailable", retryable=False
@@ -65,9 +74,25 @@ class _FrameworkTurnBinding:
         self.observed_reply = reply
         activity._generate_reply = reply
 
+        def bind_configuration(original: Any) -> Any:
+            async def configuration(*args: Any, **options: Any) -> Any:
+                for session in list(self.sessions):
+                    session._check_context_boundary()
+                return await original(*args, **options)
+
+            return configuration
+
+        self.observed_configuration = {
+            name: bind_configuration(method)
+            for name, method in self.original_configuration.items()
+        }
+        for name, method in self.observed_configuration.items():
+            setattr(activity, name, method)
+
         def update(*args: Any, **options: Any) -> Any:
             change = options.get("turn_detection", NOT_GIVEN)
             for session in list(self.sessions):
+                session._check_context_boundary()
                 if not session._google:
                     continue
                 expected = "manual" if session._manual_turns else "realtime_llm"
@@ -93,6 +118,9 @@ class _FrameworkTurnBinding:
                 activity._generate_reply = self.original_reply
             if activity.update_options is self.observed:
                 activity.update_options = self.original
+            for name, method in self.observed_configuration.items():
+                if getattr(activity, name) is method:
+                    setattr(activity, name, self.original_configuration[name])
             if getattr(activity, "_speko_realtime_turn_binding", None) is self:
                 del activity._speko_realtime_turn_binding
 
@@ -378,7 +406,11 @@ class _RealtimeSession(llm.RealtimeSession):
         owner = getattr(callback, "__self__", None)
         if isinstance(owner, AgentActivity):
             self._bind_framework(owner)
-        elif self._google and isinstance(owner, llm.RealtimeSession) and owner is not self:
+        elif (
+            self._google
+            and isinstance(owner, llm.RealtimeSession)
+            and owner is not self
+        ):
             failure = GatewayError(
                 "Gemini realtime wrapper ownership is unsupported", retryable=False
             )
@@ -439,6 +471,10 @@ class _RealtimeSession(llm.RealtimeSession):
                 owner is None
                 or owner.update_options is not binding.observed
                 or owner._generate_reply is not binding.observed_reply
+                or any(
+                    getattr(owner, name) is not method
+                    for name, method in binding.observed_configuration.items()
+                )
             ):
                 raise GatewayError(
                     "Gemini framework turn owner is unavailable", retryable=False
@@ -490,18 +526,21 @@ class _RealtimeSession(llm.RealtimeSession):
             await self.update_tools(tools)
 
     async def update_instructions(self, instructions: str) -> None:
+        self._check_context_boundary()
         if not self._configured.is_set():
             self._instructions = instructions
             return
         if self._google:
             raise llm.RealtimeError("Gemini instructions are immutable after setup")
         await self._ready
+        self._check_context_boundary()
         self._instructions = instructions
         self._enqueue(
             {"type": "session.update", "session": {"instructions": instructions}}
         )
 
     async def update_tools(self, tools: list[llm.Tool]) -> None:
+        self._check_context_boundary()
         context = llm.ToolContext(tools)
         _relay_tools(context.flatten())
         if self._google and context.flatten():
@@ -518,6 +557,7 @@ class _RealtimeSession(llm.RealtimeSession):
             if self._google:
                 raise llm.RealtimeError("Gemini tools are immutable after setup")
             await self._ready
+            self._check_context_boundary()
             self._enqueue(
                 {
                     "type": "session.update",
@@ -610,9 +650,18 @@ class _RealtimeSession(llm.RealtimeSession):
     ) -> None:
         if not is_given(tool_choice):
             return
+        self._check_context_boundary()
         if self._google and tool_choice not in (None, "auto"):
             raise llm.RealtimeError("Gemini per-response tool choice is unavailable")
         self._tool_choice = tool_choice
+
+    def _check_context_boundary(self) -> None:
+        self._ensure_live()
+        if self._unattributed_application_reply:
+            raise GatewayError(
+                "Explicit reply correlation is unavailable after provider interruption",
+                retryable=False,
+            )
 
     def _enqueue(self, event: dict[str, Any]) -> None:
         self._ensure_live()
@@ -693,6 +742,13 @@ class _RealtimeSession(llm.RealtimeSession):
         raise llm.RealtimeError("This realtime model accepts audio only")
 
     def _check_manual_input_boundary(self) -> None:
+        if self._unattributed_application_reply:
+            failure = GatewayError(
+                "Input response correlation is unavailable after provider interruption",
+                retryable=False,
+            )
+            self._fatal(failure)
+            raise failure
         if self._google and self._manual_turns and self._google_response_pending:
             # No input frontier or response identity can attribute a second
             # activity. Refuse BEFORE accepting source samples, conversion or
@@ -918,7 +974,14 @@ class _RealtimeSession(llm.RealtimeSession):
                     caller.f_locals.get("generate_reply_fut")
                     in self._provider_retired_futures
                 )
-            if code is inspect.unwrap(AgentActivity._realtime_generation_task).__code__:
+            generation_cleanup = (
+                AgentActivity._realtime_generation_task,
+                getattr(AgentActivity, "_realtime_generation_task_impl", None),
+            )
+            if any(
+                method is not None and code is inspect.unwrap(method).__code__
+                for method in generation_cleanup
+            ):
                 event = caller.f_locals.get("generation_ev")
                 return bool(
                     event is not None
@@ -934,6 +997,16 @@ class _RealtimeSession(llm.RealtimeSession):
 
     def interrupt(self) -> None:
         if self._sdk_interruption_cleanup():
+            return
+        if self._generation is not None and self._generation.interrupted:
+            # Genuine SDK playback cleanup was handled above. A separate
+            # caller stop still owns physical cancellation, even when the
+            # provider already marked this active generation interrupted.
+            self._fatal(
+                GatewayError(
+                    "Interrupted provider work locally stopped", retryable=False
+                )
+            )
             return
         if self._pending:
             for future in list(self._pending):
@@ -1460,6 +1533,15 @@ class _RealtimeSession(llm.RealtimeSession):
         self._ensure_live()
         kind = event.get("type")
         if kind == "response.created":
+            if self._unattributed_application_reply:
+                # An unseen server ID, including one followed by a cancelled
+                # terminal, cannot identify the retired application request or
+                # prove this is a new caller answer. Stop before creating any
+                # SDK generation, playback channels or retained history.
+                raise GatewayError(
+                    "Provider response correlation is unavailable after interruption",
+                    retryable=False,
+                )
             self._begin(event["response"]["id"])
             return
         if kind == "input_audio_buffer.speech_started":
@@ -1467,8 +1549,8 @@ class _RealtimeSession(llm.RealtimeSession):
             if self._model._allow_interruptions and self._pending:
                 # No response ID exists for this request yet. Retire its real
                 # futures, never bind a later unkeyed response to a new ask.
-                # Automatic provider-VAD audio remains usable; explicit work
-                # is refused until this one-use transport is closed.
+                # Further input/output cannot establish a new caller turn.
+                # Refuse it before acceptance; never guess the next server ID.
                 self._unattributed_application_reply = True
                 for pending in list(self._pending):
                     if not pending.done():

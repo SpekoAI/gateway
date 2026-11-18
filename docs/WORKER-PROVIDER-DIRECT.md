@@ -22,11 +22,17 @@ terminal boundary. Gemini framework-connected manual sources refuse before
 opening/first turn (late attachment before first PCM); explicit raw native manual
 input has a post-commit safety fence and provider VAD supports connected sources.
 Late terminal feedback cannot suppress the next response. OpenAI/xAI pre-created
-provider feedback retires exact application futures while ordinary server-VAD
-audio continues. Further explicit asks/context/commits/tool dispatch refuse on
-that socket because late response IDs cannot safely correlate the retired ask;
+provider feedback retires exact application futures. A subsequent unknown response
+stops before generation/playback/history, and new input stops before capture;
+no safe continuation is claimed for that ambiguous transport. Known-response
+server-VAD caller flow remains supported. Further explicit asks, configuration,
+context, commits and tool dispatch refuse before mutation on the ambiguous socket;
 the synchronous SDK entry refuses replacement typed input before context mutation.
-Independent local cancellation still physically stops/joins. These SDK capability
+GPT-Live also refuses new typed user context after any queued delivery hint;
+cancel/expiry/preamble/claimed delegation cannot drain unseen old work. First
+typed input before a hint, ordinary speech and captured tool rounds stay supported.
+Independent local cancellation after active feedback still physically stops/joins.
+These SDK capability
 checks do not attest current requester/source, claim, caller, credential, committed
 lease, provider bounds, durable entry, receipts or cleanup acceptance.
 
