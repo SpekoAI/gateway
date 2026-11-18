@@ -345,10 +345,24 @@ class _RealtimeSession(llm.RealtimeSession):
 
     def start_user_activity(self) -> None:
         self._user_started = time.time()
-        if self._google and self._manual_turns and not self._audio_active:
-            self._enqueue({"realtimeInput": {"activityStart": {}}})
-            self._audio_active = True
-            self._activity_interrupt_target = self._generation
+        if self._google and self._manual_turns:
+            if (
+                self._audio_active
+                and self._model._allow_interruptions
+                and self._generation is not None
+                and not self._generation.interrupted
+                and self._activity_interrupt_target is not self._generation
+            ):
+                # Continuous PCM may open input before the response. A NEW
+                # caller/VAD start must reach Gemini now: end the prior input
+                # and start this one, preserving its subsequent audio/end.
+                # Never merely relabel the old start as cancelling this reply.
+                self._enqueue({"realtimeInput": {"activityEnd": {}}})
+                self._audio_active = False
+            if not self._audio_active:
+                self._enqueue({"realtimeInput": {"activityStart": {}}})
+                self._audio_active = True
+                self._activity_interrupt_target = self._generation
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if frame.num_channels != 1:

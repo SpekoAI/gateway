@@ -35,8 +35,13 @@ input still starts its own activity boundary. These are the provider's
 [manual VAD controls](https://ai.google.dev/gemini-api/docs/live-guide#disable-automatic-vad).
 External VAD queues a real activity start before interrupting playback; that
 start cancels the targeted generation while its caller audio/end stays on the
-same socket. If interruption is disabled or the open activity predates the
-current generation, explicit interruption closes the owned transport. Gemini
+same socket. Continuous PCM can already have opened input before a response;
+a fresh caller/VAD start then sends matching `activityEnd`/`activityStart`
+controls before interruption, preserving subsequent caller audio/end. An old
+activity is never simply relabelled as cancelling the current response.
+If interruption is disabled, or an unrelated preexisting activity has no fresh
+caller start to cancel the current response, explicit interruption closes the
+owned transport. Gemini
 function tools are refused before socket creation: supported framework versions
 execute the Agent's original tools and expose no per-call cancellation hook for
 `toolCallCancellation`. This also refuses extended-thinking tool sessions. Native

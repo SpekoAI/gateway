@@ -24,7 +24,11 @@ cleanup from provider feedback sends no new manual activity. Explicit local
 interruption of an active manual generation requests provider cancellation with
 balanced activity controls; it does not leave an open synthetic turn or record
 caller speech. External VAD's real activity start cancels its targeted generation
-and preserves that caller input on the existing socket. No provider credential,
+and preserves that caller input on the existing socket. If continuous PCM
+opened input before that response, a fresh caller start sends a matched end/start
+boundary; it never guesses that the old activity cancelled a later response.
+Disabled interruption and unrelated activity without that fresh start retain
+the physical-stop fallback. No provider credential,
 endpoint, funding or receipt authority is added by these changes. Physical abort
 interrupts the owned socket without relying on consumer progress; an aborted
 connection says nothing about

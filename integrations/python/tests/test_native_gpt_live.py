@@ -411,9 +411,13 @@ async def test_gpt_live_fences_replacement_before_old_then_new_delegation(
                 await asyncio.wait_for(session.interrupt(), 5)
                 assert reply.cancelled()
             else:
-                with pytest.raises(llm.RealtimeError, match="timed out"):
-                    await asyncio.wait_for(asyncio.shield(reply), 5)
+                # Under load the real timeout may fire before first_seen is
+                # observed. LiveKit retains the error on the completed handle;
+                # its adapter intentionally clears the expired future/timer.
                 await asyncio.wait_for(speech, 5)
+                assert isinstance(speech.exception(), llm.RealtimeError)
+                assert "timed out" in str(speech.exception())
+                assert adapter._reply is None
             if old_before_replacement:
                 release_old.set()
                 await asyncio.wait_for(old_done.wait(), 5)
@@ -438,7 +442,8 @@ async def test_gpt_live_fences_replacement_before_old_then_new_delegation(
             assert base64.b64decode(audio[0]["audio"]) == b"\x02\x10" * 480
             with pytest.raises(llm.RealtimeError, match="unattributed"):
                 await attempted
-            assert timer.cancelled()
+            assert timer is None or timer.cancelled()
+            assert adapter.duplex_session._pending_reply_timer is None
             assert adapter.duplex_session._pending_reply_instructions is None
             assert replacement not in str(adapter.duplex_session._history)
         finally:
