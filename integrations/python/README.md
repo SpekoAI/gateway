@@ -44,9 +44,14 @@ Gemini connection. Its public realtime activity callback carries no input
 sample frontier: PCM can reach the old provider activity before that callback,
 even before the first model output. Google's manual protocol supplies neither
 an input prebuffer nor an undo operation. This adapter cannot safely preserve
-that onset and cancel the old response in those configurations. Explicit manual
-AgentSession turns require a framework that negotiates disabled server VAD;
-explicitly selected provider VAD remains supported. Realtime fallback/wrapper
+that onset and cancel the old response in those configurations. A Gemini manual
+AgentSession with a framework audio source is also refused before opening or
+accepting its first turn. The SDK continuously forwards idle microphone PCM
+after commit; no owned input boundary distinguishes it from another turn.
+Attaching such a source later refuses before its first PCM is accepted. There
+is no source-class whitelist or trusted producer flag. Explicit native manual
+input with no framework audio source requires negotiated disabled server VAD;
+explicitly selected provider VAD supports a connected microphone. Realtime fallback/wrapper
 ownership is refused before a Gemini child opens, including child swaps. The
 actual AgentActivity binding fences live turn-mode changes and checks the frozen
 mode before input and physical writes; unknown wrapper ownership cannot select
@@ -66,14 +71,16 @@ provider's [terminal turn semantics](https://aistudio.google.com/api-reference/l
 `turnComplete` with `IN_PROGRESS` stays fenced, and extended thinking requires
 explicit `IDLE`. A no-output terminal fails and retires its original future/timer.
 After an unambiguous terminal boundary, accepted typed input starts its own reply.
-Manual input producers must stop submitting at commit until that response's
+Explicit native manual input producers must stop submitting at commit until that response's
 terminal boundary. An additional source/activity call in this phase fails and
 physically retires the transport BEFORE source samples, conversion or provider
 controls are accepted. The synchronous SDK cannot backpressure or attribute
 pipelined manual input safely; continuous post-commit microphone PCM is not a
 supported lifecycle. It is never classified as silence, buffered/replayed,
 silently sent with permanently failing handles, or automatically retried.
-Ordinary audio and typed turns after a genuine terminal remain supported.
+Ordinary explicit native audio and typed turns after a genuine terminal remain supported.
+Post-commit closure is a raw-input safety fence, not support for a continuously
+connected manual AgentSession source. There is no local idle/utterance duration cap.
 Clearing local, unconverted input discards its resampler state; it is not flushed
 into a later commit. Clearing already forwarded manual input closes the transport
 because it cannot be recalled. Activity starts within one uncommitted turn are idempotent.
@@ -86,8 +93,21 @@ model work. The canceled pending future and its timer retire before reuse.
 Provider interruption feedback remains distinct from local cancellation, including
 before first output with a claimed future. The exact provider-interrupted futures
 are ineligible for late output, and their asynchronous SDK cancellation retires
-without aborting the healthy session. A prior or subsequent independent local
-cancellation still physically stops and joins the owned transport.
+without aborting the healthy session. Late Gemini feedback after a terminal
+clears playback without marking the next response interrupted. In-flight
+feedback remains fenced until its real terminal. A prior or subsequent independent
+local cancellation, including one invoked inside a feedback notification, still
+physically stops and joins the owned transport.
+
+OpenAI/xAI provider speech-start feedback before `response.created` retires the
+exact pending application future and timer. Automatic provider-VAD caller turns
+continue on the same socket. The protocol does not correlate a later created ID
+to that retired request, so subsequent explicit asks, context changes, manual
+commits and tool dispatch refuse until close. The owned synchronous SDK reply
+entry refuses replacement typed asks before a handle or context is installed.
+Unknown wrappers cannot supply this ownership for explicit asks. Genuine SDK
+cleanup is distinguished by its actual callsite and retired future/generation;
+an independent local stop is never exempted merely because feedback is active.
 Gemini function tools are refused before socket creation: supported framework versions
 execute the Agent's original tools and expose no per-call cancellation hook for
 `toolCallCancellation`. This also refuses extended-thinking tool sessions. Native

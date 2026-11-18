@@ -18,9 +18,15 @@ per-reply instructions, including associated typed input, refuse before context
 mutation; unscoped asks require usable canonical context before append. Gemini
 typed replies cannot overtake uncommitted original audio or an unsettled committed
 response. Their ordinary continuation requires a genuine unambiguous provider
-terminal boundary; unsafe pipelined manual input is refused before acceptance and
-retires its transport. Claimed provider-feedback futures retire without becoming
-local cancellation. These SDK capability
+terminal boundary. Gemini framework-connected manual sources refuse before
+opening/first turn (late attachment before first PCM); explicit raw native manual
+input has a post-commit safety fence and provider VAD supports connected sources.
+Late terminal feedback cannot suppress the next response. OpenAI/xAI pre-created
+provider feedback retires exact application futures while ordinary server-VAD
+audio continues. Further explicit asks/context/commits/tool dispatch refuse on
+that socket because late response IDs cannot safely correlate the retired ask;
+the synchronous SDK entry refuses replacement typed input before context mutation.
+Independent local cancellation still physically stops/joins. These SDK capability
 checks do not attest current requester/source, claim, caller, credential, committed
 lease, provider bounds, durable entry, receipts or cleanup acceptance.
 

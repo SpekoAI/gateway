@@ -17,7 +17,7 @@ from test_native_realtime_cancellation import client_model, start_agent
 from test_native_realtime_livekit import collect_generation
 from test_native_sidecar import LOCAL_TOKEN, MODEL_KEY, native_stack
 from test_native_sidecar import native_binary as native_binary  # noqa: PLC0414
-from test_relay_speech_livekit import ControlledVAD, OwnedAudioInput
+from test_relay_speech_livekit import ControlledVAD
 
 from speko_gateway import GatewayError, RelayRealtimeClient
 from speko_gateway.livekit import RealtimeModel
@@ -47,11 +47,9 @@ async def manual_input(socket, attached, monkeypatch):
     client, model = client_model(socket)
     actor, audio, items = None, None, asyncio.Queue()
     if attached:
-        audio = OwnedAudioInput()
         actor = AgentSession(
             llm=model, turn_detection="manual", vad=None, stt=None, tts=None
         )
-        actor.input.audio = audio
         actor.on(
             "conversation_item_added",
             lambda event: (
@@ -273,18 +271,17 @@ async def test_gemini_live_turn_mode_change_stops_before_uncorrelated_pcm(
 
     async with native_stack(native_binary, peer) as (socket, _):
         client, model = client_model(socket)
-        audio = OwnedAudioInput()
         actor = AgentSession(
             llm=model, turn_detection="manual", vad=ControlledVAD(), stt=None, tts=None
         )
-        actor.input.audio = audio
         try:
             await start_agent(actor)
             native = next(iter(model._sessions))
             await native.start()
             with contextlib.suppress(GatewayError, llm.RealtimeError):
                 actor.update_options(turn_detection="vad")
-            audio.frames.put_nowait(rtc.AudioFrame(b"\x05\x21" * 320, 16000, 1, 320))
+            with contextlib.suppress(GatewayError, llm.RealtimeError):
+                native.push_audio(rtc.AudioFrame(b"\x05\x21" * 320, 16000, 1, 320))
             await either(closed, received)
             assert closed.is_set() and not received.is_set(), (
                 "live mode change forwarded uncorrelated caller PCM"
@@ -292,7 +289,6 @@ async def test_gemini_live_turn_mode_change_stops_before_uncorrelated_pcm(
             await asyncio.wait_for(asyncio.shield(native._task), 5)
             assert native._failure is not None and controls == []
         finally:
-            audio.frames.put_nowait(None)
             await actor.aclose()
             await model.aclose()
             await client.aclose()

@@ -39,13 +39,37 @@ class _FrameworkTurnBinding:
     """An instance-owned SDK mode fence, never worker/native authority."""
 
     def __init__(self, activity: Any) -> None:
+        from livekit.agents.voice.agent_activity import AgentActivity
+
         self.activity = weakref.ref(activity)
         self.sessions: weakref.WeakSet[_RealtimeSession] = weakref.WeakSet()
         self.original = activity.update_options
+        self.original_reply = activity._generate_reply
+        if (
+            not inspect.ismethod(self.original_reply)
+            or self.original_reply.__func__ is not AgentActivity._generate_reply
+        ):
+            raise GatewayError(
+                "SDK explicit reply ownership is unavailable", retryable=False
+            )
+
+        def reply(*args: Any, **options: Any) -> Any:
+            for session in list(self.sessions):
+                if session._unattributed_application_reply:
+                    raise GatewayError(
+                        "Explicit reply correlation is unavailable after provider interruption",
+                        retryable=False,
+                    )
+            return self.original_reply(*args, **options)
+
+        self.observed_reply = reply
+        activity._generate_reply = reply
 
         def update(*args: Any, **options: Any) -> Any:
             change = options.get("turn_detection", NOT_GIVEN)
             for session in list(self.sessions):
+                if not session._google:
+                    continue
                 expected = "manual" if session._manual_turns else "realtime_llm"
                 if is_given(change) and change != expected:
                     failure = GatewayError(
@@ -65,6 +89,8 @@ class _FrameworkTurnBinding:
         self.sessions.discard(session)
         activity = self.activity()
         if not self.sessions and activity is not None:
+            if activity._generate_reply is self.observed_reply:
+                activity._generate_reply = self.original_reply
             if activity.update_options is self.observed:
                 activity.update_options = self.original
             if getattr(activity, "_speko_realtime_turn_binding", None) is self:
@@ -227,6 +253,11 @@ class RealtimeModel(llm.RealtimeModel):
             raise GatewayError(
                 "Gemini local interruption ownership is unsupported", retryable=False
             )
+        if disabled and owner._session.input.audio is not None:
+            raise GatewayError(
+                "Gemini manual AgentSession audio sources require an owned turn boundary",
+                retryable=False,
+            )
 
     async def aclose(self) -> None:
         self._closed = True
@@ -323,7 +354,11 @@ class _RealtimeSession(llm.RealtimeSession):
         self._google_response_pending = False
         self._google_response_interrupted = False
         self._google_interrupted_pending: set[asyncio.Future] = set()
-        self._google_interruption_feedback = False
+        self._provider_interruption_feedback = False
+        self._provider_retired_futures: weakref.WeakSet[asyncio.Future] = (
+            weakref.WeakSet()
+        )
+        self._unattributed_application_reply = False
         self._activity_interrupt_target: _Generation | None = None
         self._uncommitted_source_samples = 0
         self._framework_binding: _FrameworkTurnBinding | None = None
@@ -338,23 +373,47 @@ class _RealtimeSession(llm.RealtimeSession):
     def on(self, event: Any, callback: Any = None) -> Any:
         if callback is None:
             return lambda selected: self.on(event, selected)
-        if self._google:
-            from livekit.agents.voice.agent_activity import AgentActivity
+        from livekit.agents.voice.agent_activity import AgentActivity
 
-            owner = getattr(callback, "__self__", None)
-            if isinstance(owner, AgentActivity):
-                self._bind_framework(owner)
-            elif isinstance(owner, llm.RealtimeSession) and owner is not self:
-                failure = GatewayError(
-                    "Gemini realtime wrapper ownership is unsupported", retryable=False
-                )
-                self._fatal(failure)
-                raise failure
+        owner = getattr(callback, "__self__", None)
+        if isinstance(owner, AgentActivity):
+            self._bind_framework(owner)
+        elif self._google and isinstance(owner, llm.RealtimeSession) and owner is not self:
+            failure = GatewayError(
+                "Gemini realtime wrapper ownership is unsupported", retryable=False
+            )
+            self._fatal(failure)
+            raise failure
         return super().on(event, callback)
+
+    def _check_explicit_reply_owner(self) -> None:
+        frame = inspect.currentframe()
+        try:
+            for _ in range(64):
+                if frame is None:
+                    return
+                owner = frame.f_locals.get("self")
+                if isinstance(owner, llm.RealtimeSession) and owner is not self:
+                    raise GatewayError(
+                        "Realtime wrapper explicit reply ownership is unavailable",
+                        retryable=False,
+                    )
+                frame = frame.f_back
+            if frame is not None:
+                raise GatewayError(
+                    "Realtime reply ownership exceeds its bound", retryable=False
+                )
+        finally:
+            del frame
 
     def _bind_framework(self, owner: Any) -> None:
         try:
-            self._model._validate_framework_owner(owner, self._manual_turns)
+            if self._google:
+                self._model._validate_framework_owner(owner, self._manual_turns)
+            elif owner.llm is not self._model:
+                raise GatewayError(
+                    "SDK explicit reply ownership is unavailable", retryable=False
+                )
         except GatewayError as failure:
             self._fatal(failure)
             raise
@@ -376,11 +435,16 @@ class _RealtimeSession(llm.RealtimeSession):
             return
         owner = binding.activity()
         try:
-            if owner is None or owner.update_options is not binding.observed:
+            if (
+                owner is None
+                or owner.update_options is not binding.observed
+                or owner._generate_reply is not binding.observed_reply
+            ):
                 raise GatewayError(
                     "Gemini framework turn owner is unavailable", retryable=False
                 )
-            self._model._validate_framework_owner(owner, self._manual_turns)
+            if self._google:
+                self._model._validate_framework_owner(owner, self._manual_turns)
         except GatewayError as failure:
             self._fatal(failure)
             raise
@@ -469,12 +533,18 @@ class _RealtimeSession(llm.RealtimeSession):
         if not self._configured.is_set():
             self._chat_ctx = chat_ctx.copy()
             return
+        self._check_explicit_reply_owner()
         await self._ready
         items = [
             item
             for item in chat_ctx.items
             if item.type in {"message", "function_call", "function_call_output"}
         ]
+        if self._unattributed_application_reply and items != self._chat_ctx.items:
+            raise GatewayError(
+                "Explicit reply correlation is unavailable after provider interruption",
+                retryable=False,
+            )
         if self._google:
             additions = [item for item in items if item.id not in self._known_items]
             if additions and self._google_response_pending:
@@ -645,6 +715,11 @@ class _RealtimeSession(llm.RealtimeSession):
 
     def commit_audio(self) -> None:
         self._ensure_live()
+        if self._unattributed_application_reply:
+            raise GatewayError(
+                "Explicit reply correlation is unavailable after provider interruption",
+                retryable=False,
+            )
         if self._google and self._manual_turns and self._google_response_pending:
             raise GatewayError(
                 "Wait for the Gemini terminal response before committing again",
@@ -700,8 +775,16 @@ class _RealtimeSession(llm.RealtimeSession):
         future.add_done_callback(self._observe_future)
         try:
             self._ensure_live()
+            self._check_explicit_reply_owner()
         except (llm.RealtimeError, GatewayError) as failure:
             future.set_exception(failure)
+            return future
+        if self._unattributed_application_reply:
+            future.set_exception(
+                llm.RealtimeError(
+                    "Explicit reply correlation is unavailable after provider interruption"
+                )
+            )
             return future
         if self._pending:
             future.set_exception(
@@ -806,8 +889,51 @@ class _RealtimeSession(llm.RealtimeSession):
                 )
             )
 
+    def _sdk_interruption_cleanup(self) -> bool:
+        from livekit.agents.voice.agent_activity import AgentActivity
+
+        frame = inspect.currentframe()
+        try:
+            # Only the immediate genuine SDK callsite may suppress its own
+            # stale cleanup. A programmatic Activity.interrupt, even inside a
+            # provider notification, remains an independent local stop.
+            caller = frame.f_back.f_back if frame and frame.f_back else None
+            if caller is None:
+                return False
+            owner = caller.f_locals.get("self")
+            if not isinstance(owner, AgentActivity) or owner._rt_session is not self:
+                return False
+            code = caller.f_code
+            if code is inspect.unwrap(AgentActivity.interrupt).__code__:
+                parent = caller.f_back
+                return bool(
+                    self._provider_interruption_feedback
+                    and parent is not None
+                    and parent.f_code
+                    is inspect.unwrap(AgentActivity._on_input_speech_started).__code__
+                    and parent.f_locals.get("self") is owner
+                )
+            if code is inspect.unwrap(AgentActivity._realtime_reply_task).__code__:
+                return (
+                    caller.f_locals.get("generate_reply_fut")
+                    in self._provider_retired_futures
+                )
+            if code is inspect.unwrap(AgentActivity._realtime_generation_task).__code__:
+                event = caller.f_locals.get("generation_ev")
+                return bool(
+                    event is not None
+                    and (
+                        self._generation is None
+                        or event is not self._generation.event
+                        or self._generation.interrupted
+                    )
+                )
+            return False
+        finally:
+            del frame
+
     def interrupt(self) -> None:
-        if self._google_interruption_feedback:
+        if self._sdk_interruption_cleanup():
             return
         if self._pending:
             for future in list(self._pending):
@@ -822,6 +948,11 @@ class _RealtimeSession(llm.RealtimeSession):
                 GatewayError(
                     "Realtime reply interrupted before generation", retryable=False
                 )
+            )
+            return
+        if self._unattributed_application_reply and self._generation is None:
+            self._fatal(
+                GatewayError("Unattributed reply locally interrupted", retryable=False)
             )
             return
         if self._google and self._google_response_pending and self._generation is None:
@@ -1183,6 +1314,7 @@ class _RealtimeSession(llm.RealtimeSession):
             self._pending.clear()
             self._pending_timers.clear()
             self._google_interrupted_pending.clear()
+            self._provider_retired_futures.clear()
             if self._framework_binding is not None:
                 self._framework_binding.release(self)
                 self._framework_binding = None
@@ -1288,6 +1420,11 @@ class _RealtimeSession(llm.RealtimeSession):
                     ) from None
 
     async def _function(self, generation: _Generation, item: dict[str, Any]) -> None:
+        if self._unattributed_application_reply:
+            raise GatewayError(
+                "Tool reply correlation is unavailable after provider interruption",
+                retryable=False,
+            )
         call_id = item.get("call_id", item.get("id"))
         if not isinstance(call_id, str) or not isinstance(item.get("name"), str):
             raise GatewayError("Realtime function call is invalid", retryable=False)
@@ -1320,16 +1457,33 @@ class _RealtimeSession(llm.RealtimeSession):
         generation.function_stream.send_nowait(call)
 
     async def _realtime_event(self, event: dict[str, Any]) -> None:
+        self._ensure_live()
         kind = event.get("type")
         if kind == "response.created":
             self._begin(event["response"]["id"])
             return
         if kind == "input_audio_buffer.speech_started":
             self._user_started = time.time()
+            if self._model._allow_interruptions and self._pending:
+                # No response ID exists for this request yet. Retire its real
+                # futures, never bind a later unkeyed response to a new ask.
+                # Automatic provider-VAD audio remains usable; explicit work
+                # is refused until this one-use transport is closed.
+                self._unattributed_application_reply = True
+                for pending in list(self._pending):
+                    if not pending.done():
+                        self._provider_retired_futures.add(pending)
+                    self._retire_pending(pending)
+                    if not pending.done():
+                        pending.cancel()
             if self._model._allow_interruptions and self._generation:
                 self._generation.interrupted = True
                 self._generation.close()
-            self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+            self._provider_interruption_feedback = True
+            try:
+                self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+            finally:
+                self._provider_interruption_feedback = False
             return
         if kind == "input_audio_buffer.speech_stopped":
             self.emit(
@@ -1407,19 +1561,28 @@ class _RealtimeSession(llm.RealtimeSession):
         if "toolCall" in event or "toolCallCancellation" in event:
             raise GatewayError("Gemini tool execution is unavailable", retryable=False)
         if content.get("interrupted"):
-            self._google_response_interrupted = True
-            # Keep these real futures ineligible for output. The SDK will
-            # cancel them after its synchronous playback feedback; that exact
-            # cancellation is provider-caused, not a new local stop request.
-            self._google_interrupted_pending.update(
-                pending for pending in self._pending if not pending.done()
+            in_flight = (
+                self._google_response_pending
+                or self._generation is not None
+                or bool(self._pending)
             )
+            if in_flight:
+                self._google_response_interrupted = True
+                self._provider_retired_futures.update(
+                    pending for pending in self._pending if not pending.done()
+                )
+                # Keep these real futures ineligible for output. The SDK will
+                # cancel them after its synchronous playback feedback; that
+                # exact cancellation is provider-caused, not a new local stop.
+                self._google_interrupted_pending.update(
+                    pending for pending in self._pending if not pending.done()
+                )
             if self._generation:
                 self._generation.interrupted = True
                 self._generation.close()
             # LiveKit owns frames that already left our channels. Its speech
             # event interrupts the active handle and clears that playback too.
-            self._google_interruption_feedback = True
+            self._provider_interruption_feedback = True
             try:
                 self.emit("input_speech_started", llm.InputSpeechStartedEvent())
                 self.emit(
@@ -1427,7 +1590,7 @@ class _RealtimeSession(llm.RealtimeSession):
                     llm.InputSpeechStoppedEvent(user_transcription_enabled=True),
                 )
             finally:
-                self._google_interruption_feedback = False
+                self._provider_interruption_feedback = False
         transcript = content.get("inputTranscription")
         if isinstance(transcript, dict) and transcript.get("text"):
             self._input_item = self._input_item or "google_user_" + uuid.uuid4().hex
@@ -1533,6 +1696,7 @@ class _RealtimeSession(llm.RealtimeSession):
         self._pending.clear()
         self._pending_timers.clear()
         self._google_interrupted_pending.clear()
+        self._provider_retired_futures.clear()
         if self._framework_binding is not None:
             self._framework_binding.release(self)
             self._framework_binding = None

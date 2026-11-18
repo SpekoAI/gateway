@@ -200,11 +200,9 @@ async def test_typed_gemini_reply_preserves_original_uncommitted_capture_and_con
 
     async with native_stack(native_binary, peer) as (socket, _):
         client, model = client_model(socket)
-        audio = OwnedAudioInput()
         actor = AgentSession(
             llm=model, turn_detection="manual", vad=None, stt=None, tts=None
         )
-        actor.input.audio = audio
         actor.on(
             "conversation_item_added",
             lambda event: (
@@ -231,7 +229,7 @@ async def test_typed_gemini_reply_preserves_original_uncommitted_capture_and_con
             monkeypatch.setattr(native, "push_audio", captured)
             monkeypatch.setattr(native, "_send_audio", sent)
             raw = b"\x03\x12" * samples
-            audio.frames.put_nowait(rtc.AudioFrame(raw, 48000, 1, samples))
+            native.push_audio(rtc.AudioFrame(raw, 48000, 1, samples))
             await asyncio.wait_for(accepted.wait(), 5)
             converter = native._resampler
             assert converter is not None and not native._audio_active
@@ -280,7 +278,6 @@ async def test_typed_gemini_reply_preserves_original_uncommitted_capture_and_con
                 if "realtimeInput" in c and "audio" not in c["realtimeInput"]
             ] == ["activityStart", "activityEnd"]
         finally:
-            audio.frames.put_nowait(None)
             await actor.aclose()
             await model.aclose()
             await client.aclose()

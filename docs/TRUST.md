@@ -15,10 +15,14 @@ no owned per-call cancellation interface. Asynchronous client VAD/STT turn modes
 realtime wrappers/fallback and child swaps are also refused before Gemini I/O:
 the SDK forwards PCM before its VAD callback and supplies no correlated capture
 frontier. Continuous-input rollover in those modes is not supported. Direct
-manual AgentSession turns require negotiated disabled server VAD; explicitly
-selected provider VAD remains supported. Live mode changes cannot bypass the
-frozen ownership boundary. Idle/long input within an uncommitted manual turn has
-no local two-second expiry.
+manual input requires negotiated disabled server VAD. A framework-connected
+Gemini manual audio source is incompatible: it is refused before opening/first
+turn, or before the first PCM if attached later. The SDK continuously forwards
+idle PCM after commit without an owned turn boundary. No source type, worker
+flag or producer pause is attestation. Explicit native manual input with no
+framework source remains available; connected audio uses explicitly selected
+provider VAD. Live mode changes cannot bypass the frozen ownership boundary.
+Idle/long raw input within an uncommitted manual turn has no local two-second expiry.
 
 Original manual samples count as uncommitted even inside the native resampler.
 Typed AgentSession replies refuse before provider or local conversation mutation
@@ -41,7 +45,9 @@ or provider controls are accepted. Input producers must stop submitting at commi
 and resume after the real terminal boundary. Continuously forwarding PCM after
 commit is not a supported manual lifecycle; no silence inference, buffering,
 replay, permanent live-socket latch or automatic restart substitutes for it.
-Ordinary next audio and typed turns remain supported after genuine terminals.
+Ordinary explicit native audio and typed turns remain supported after genuine
+terminals. Post-commit closure is a raw-input safety fence, not a supported
+continuous manual microphone lifecycle.
 Consumed audio transcript IDs cannot replay as typed input.
 
 GPT-Live refuses ALL per-reply instructions, including their associated typed
@@ -64,8 +70,22 @@ Provider interruption feedback clears playback without a new manual activity.
 Before first output, feedback preserves the response fence for both claimed and
 unclaimed work. Its exact pending futures are marked before SDK re-entry, so
 later framework cancellation retires them without becoming a fatal local stop.
-Unheard interrupted output cannot claim them. Independent local cancellation
-still physically stops and joins; typed work waits for the terminal boundary.
+Unheard interrupted output cannot claim them. Late Gemini feedback after a real
+terminal clears playback without suppressing the next response; in-flight
+interruption remains fenced to terminal. Independent local cancellation still
+physically stops and joins, including when invoked inside a feedback callback.
+Typed Gemini work waits for the terminal boundary.
+
+OpenAI/xAI speech-start feedback before a created response ID retires the exact
+pending application future/timer without treating SDK re-entry as a local stop.
+Automatic caller VAD/audio turns remain live on that socket. Later explicit asks,
+context changes, commits and tool dispatch refuse until close: no protocol field
+can safely attribute a late created response to the retired ask. The existing
+owned synchronous SDK reply entry refuses a replacement typed ask before handle
+or history mutation. Unknown wrapper ownership cannot bypass it. Only actual
+SDK cleanup callsites with the retired future/stale generation are exempted;
+independent local stops still stop and join physical I/O. No synthetic turn ID,
+quiet window, new callback, retry or automatic reopen establishes attribution.
 Supported explicit manual cancellation uses balanced controls where available;
 disabled/unavailable cancellation, provider-VAD explicit cancellation and
 pre-output cancellation physically stop and join the owned transport. There is

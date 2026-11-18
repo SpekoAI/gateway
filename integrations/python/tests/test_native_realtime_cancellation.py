@@ -181,6 +181,7 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
         pytest.skip("framework cannot negotiate manual realtime turns")
     audible, cleared, release = (asyncio.Event() for _ in range(3))
     barrier_received, second_turn_received = asyncio.Event(), asyncio.Event()
+    terminal = asyncio.Event()
     before_barrier, second_turn = [], []
     captured, errors = [], []
 
@@ -258,7 +259,13 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
                 # The owned provider stops its ACTIVE generation on the control,
                 # then reports interruption. Feedback must not send another one.
                 await ws.send_json(
-                    {"serverContent": {"interrupted": True, "turnComplete": True}}
+                    {
+                        "serverContent": {
+                            "interrupted": True,
+                            "turnComplete": True,
+                            "inputTranscription": {"text": "original spoken words"},
+                        }
+                    }
                 )
         async for message in ws:
             command = json.loads(message.data)
@@ -295,6 +302,10 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
         try:
             current_agent = await start_agent(agent)
             native = next(iter(model._sessions))
+            native.on(
+                "input_audio_transcription_completed",
+                lambda event: terminal.set() if event.is_final else None,
+            )
             native.push_audio(rtc.AudioFrame(b"\x01\x10" * 480, 16000, 1, 480))
             native.commit_audio()
             # Manual activityEnd already starts this audio response. A second
@@ -308,6 +319,8 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
             if cause == "explicit":
                 await asyncio.wait_for(agent.interrupt(), 5)
             await asyncio.wait_for(cleared.wait(), 5)
+            if cause == "explicit":
+                await asyncio.wait_for(terminal.wait(), 5)
             assert captured and len(captured) < 100
             assert speech.interrupted
             await agent.interrupt()
@@ -567,7 +580,7 @@ async def test_gemini_resampled_onset_and_remainder_keep_one_complete_activity(
 
 @pytest.mark.parametrize("kind", ["idle_then_speech", "long_manual_speech"])
 @pytest.mark.parametrize("manual", [True, False])
-async def test_gemini_agent_streams_healthy_idle_and_long_manual_input(
+async def test_gemini_raw_manual_and_connected_provider_vad_keep_idle_and_long_input(
     native_binary, kind, manual
 ):
     if (
@@ -628,14 +641,18 @@ async def test_gemini_agent_streams_healthy_idle_and_long_manual_input(
             tts=None,
             vad=None,
         )
-        session.input.audio = audio
+        if not manual:
+            session.input.audio = audio
         session.on("error", errors.append)
         try:
             await start_agent(session)
             native = next(iter(model._sessions))
             await native.start()
             for raw in frames:
-                audio.frames.put_nowait(rtc.AudioFrame(raw, 16000, 1, 320))
+                if manual:
+                    native.push_audio(rtc.AudioFrame(raw, 16000, 1, 320))
+                else:
+                    audio.frames.put_nowait(rtc.AudioFrame(raw, 16000, 1, 320))
                 await asyncio.sleep(0.02 if kind == "idle_then_speech" else 0)
                 if closed.is_set():
                     break

@@ -360,11 +360,10 @@ async def test_actual_agent_ordinary_audio_then_typed_turn_after_real_terminals(
 
 
 @pytest.mark.skipif(not MANUAL, reason="SDK cannot negotiate manual AgentSession input")
-async def test_actual_agent_source_surfaces_unsafe_overlap_before_sending_new_pcm(
+async def test_late_attached_manual_source_refuses_before_its_first_pcm(
     native_binary, monkeypatch
 ):
-    ended, peer_closed, actor_closed = (asyncio.Event() for _ in range(3))
-    accepted, refused, futures = (asyncio.Queue() for _ in range(3))
+    peer_closed, actor_closed = asyncio.Event(), asyncio.Event()
     pcm = bytearray()
     commands = []
 
@@ -380,8 +379,6 @@ async def test_actual_agent_source_surfaces_unsafe_overlap_before_sending_new_pc
                 control = command.get("realtimeInput", {})
                 if "audio" in control:
                     pcm.extend(base64.b64decode(control["audio"]["data"]))
-                if "activityEnd" in control:
-                    ended.set()
         finally:
             peer_closed.set()
         return ws
@@ -392,51 +389,20 @@ async def test_actual_agent_source_surfaces_unsafe_overlap_before_sending_new_pc
         actor = AgentSession(
             llm=model, turn_detection="manual", vad=None, stt=None, tts=None
         )
-        actor.input.audio = audio
         actor.on("close", lambda event: actor_closed.set())
         try:
             await start_agent(actor)
             native = next(iter(model._sessions))
-            push, generate = native.push_audio, native.generate_reply
-
-            def observed_input(frame):
-                try:
-                    push(frame)
-                except GatewayError as failure:
-                    refused.put_nowait(failure)
-                    raise
-                accepted.put_nowait(frame)
-
-            def observed_reply(**options):
-                future = generate(**options)
-                futures.put_nowait(future)
-                return future
-
-            monkeypatch.setattr(native, "push_audio", observed_input)
-            monkeypatch.setattr(native, "generate_reply", observed_reply)
             await native.start()
-            first, second = b"\x01\x10" * 480, b"\x03\x40" * 480
-            audio.frames.put_nowait(rtc.AudioFrame(first, 16000, 1, 480))
-            await asyncio.wait_for(accepted.get(), 5)
-            actor.commit_user_turn()
-            original = await asyncio.wait_for(futures.get(), 5)
-            await asyncio.wait_for(ended.wait(), 5)
-            audio.frames.put_nowait(rtc.AudioFrame(second, 16000, 1, 480))
-            failure = await asyncio.wait_for(refused.get(), 5)
-            assert not failure.retryable
+            actor.input.audio = audio
+            audio.frames.put_nowait(rtc.AudioFrame(b"\x01\x10" * 480, 16000, 1, 480))
             await asyncio.wait_for(peer_closed.wait(), 5)
             await asyncio.wait_for(actor_closed.wait(), 5)
-            assert bytes(pcm) == first and accepted.empty()
-            assert original.done() and (
-                original.cancelled() or original.exception() is not None
-            )
-            assert (
-                len(
-                    [c for c in commands if "activityEnd" in c.get("realtimeInput", {})]
-                )
-                == 1
-            )
+            assert not pcm and not commands
             assert native._task.done() and not native._pending_timers
+            assert (
+                not native._uncommitted_source_samples and native._user_started is None
+            )
         finally:
             audio.frames.put_nowait(None)
             await actor.aclose()

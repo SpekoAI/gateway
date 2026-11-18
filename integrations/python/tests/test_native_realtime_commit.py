@@ -15,7 +15,6 @@ from test_native_realtime_context import google_output, history_text
 from test_native_realtime_livekit import collect_generation
 from test_native_sidecar import native_binary as native_binary  # noqa: PLC0414
 from test_native_sidecar import native_stack
-from test_relay_speech_livekit import OwnedAudioInput
 
 from speko_gateway import GatewayError
 from speko_gateway.livekit import RealtimeModel
@@ -64,12 +63,10 @@ async def test_committed_audio_rejects_typed_context_before_delayed_first_output
     async with native_stack(native_binary, peer) as (socket, _):
         client, model = client_model(socket)
         actor = None
-        audio = OwnedAudioInput()
         if attached:
             actor = AgentSession(
                 llm=model, turn_detection="manual", vad=None, stt=None, tts=None
             )
-            actor.input.audio = audio
             actor.on(
                 "conversation_item_added",
                 lambda event: (
@@ -106,7 +103,7 @@ async def test_committed_audio_rejects_typed_context_before_delayed_first_output
                     accepted.set()
 
                 monkeypatch.setattr(native, "push_audio", captured)
-                audio.frames.put_nowait(frame)
+                native.push_audio(frame)
                 await asyncio.wait_for(accepted.wait(), 5)
             else:
                 native.push_audio(frame)
@@ -200,7 +197,6 @@ async def test_committed_audio_rejects_typed_context_before_delayed_first_output
                 assert rejected not in history_text(actor.history)
                 assert rejected not in history_text(actor.current_agent.chat_ctx)
         finally:
-            audio.frames.put_nowait(None)
             if actor is not None:
                 await actor.aclose()
             await native.aclose()
