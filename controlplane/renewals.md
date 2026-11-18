@@ -74,6 +74,16 @@ or a withdrawn resumption handle. Closing cancels pending delivery; a live
 socket can drain queued input, and a detached socket terminates immediately.
 Provider teardown still precedes physical capacity release.
 
+Before a resumed socket can open, the coordinator anchors its validated
+credential/lease/root horizon to monotonic elapsed time. An independent owner
+keeps that exact cap armed during Resume, blocked clock synchronization and
+adoption. Successful canonical adoption installs its timer before retiring the
+temporary owner; late setup or resampling cannot restart the socket lifetime.
+A return after expiry cannot adopt sequence or allowance. Failure/cancellation
+retains the deadline until physical teardown actually joins, and capacity
+remains held while that evidence is unknown. This machinery is exercised with
+owned resumable transports; it does not enable managed Google resumption.
+
 Terminal abort claims its error before calling the Google stream's concurrent
 `Interrupt`, which closes physical I/O without waiting for the provider mutex,
 an in-progress close handshake, or public event consumption. Pending input,
@@ -86,6 +96,9 @@ cancelling the reader or closing its event source. The stable bridge preserves
 that outcome even if the Engine's serialized `Close` return is delayed. Event
 closure cannot race the failed return into `session.closed`; earlier abort or
 lease failure still wins, and a successful normal handshake remains clean.
+Both explicit normal peer statuses, 1000 and 1001, are clean in the terminal
+outcome and the Close return. Handshake timeouts, transport errors and abnormal
+protocol statuses remain failures with the same publication ordering.
 
 **Managed Google conversation resumption remains refused.** Google's current
 managed token mask pins `sessionResumption` to `{}`; it overwrites a supplied

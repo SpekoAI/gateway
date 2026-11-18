@@ -50,6 +50,7 @@ type continuityPeer struct {
 	initialClockRefusal, holdSetup, holdHandshake bool
 	badHandshake                                  bool
 	holdClose                                     <-chan struct{}
+	closeWithStatus                               websocket.StatusCode
 	handshakeStarted, handshakeClosed             chan struct{}
 	clockCalls                                    atomic.Int32
 	wallOffset                                    atomic.Int64
@@ -245,6 +246,11 @@ func (p *continuityPeer) provider(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.holdClose != nil {
 		<-p.holdClose
+	}
+	if p.closeWithStatus != 0 {
+		_ = conn.Close(p.closeWithStatus, "owned peer shutdown")
+		p.closed <- token
+		return
 	}
 	for {
 		_, payload, err = conn.Read(r.Context())

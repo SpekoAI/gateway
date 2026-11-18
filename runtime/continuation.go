@@ -95,15 +95,18 @@ func renewableGoogle(plan protocol.SessionPlan) bool {
 }
 
 type continuation struct {
-	terminalLeaseExpired               atomic.Bool
-	ctx                                context.Context
-	cancel                             context.CancelFunc
-	session                            *Session
-	client                             EntitlementClient
-	clock                              *fundedClock
-	stream                             ResumableProviderStream
-	mu                                 sync.Mutex
-	expires                            time.Time
+	terminalLeaseExpired atomic.Bool
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	session              *Session
+	client               EntitlementClient
+	clock                *fundedClock
+	stream               ResumableProviderStream
+	mu                   sync.Mutex
+	expires              time.Time
+	// hardDeadline is the monotonic cap anchored before this socket's setup.
+	// SQL resampling and slow setup may tighten it, never restart its lifetime.
+	hardDeadline                       time.Time
 	sequence                           int64
 	authorizedUnits                    int64
 	pending, paused, disabled, closing bool
@@ -142,12 +145,12 @@ func (c *continuation) beforeIO() error {
 			return err
 		}
 		c.mu.Lock()
-		paused, expires, changed := c.paused, c.expires, c.changed
+		paused, expires, hardDeadline, changed := c.paused, c.expires, c.hardDeadline, c.changed
 		c.mu.Unlock()
 		if c.session.ctx.Err() != nil {
 			return ErrSessionClosed
 		}
-		if !paused && c.clock.now().Before(expires) {
+		if !paused && c.clock.now().Before(expires) && time.Now().Before(hardDeadline) {
 			return nil
 		}
 		if !paused {
@@ -165,7 +168,7 @@ func (c *continuation) beforeIO() error {
 func (c *continuation) ready() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return !c.paused && !c.clock.stale() && c.clock.now().Before(c.expires) && c.session.ctx.Err() == nil
+	return !c.paused && !c.clock.stale() && c.clock.now().Before(c.expires) && time.Now().Before(c.hardDeadline) && c.session.ctx.Err() == nil
 }
 
 func (c *continuation) audioFits(accepted, frame int64) bool {
@@ -184,7 +187,7 @@ func (c *continuation) audioFits(accepted, frame int64) bool {
 // missing. Recovery may use that same pending intent, never that old socket.
 func (c *continuation) expire(expected time.Time) {
 	c.mu.Lock()
-	if c.paused || !c.expires.Equal(expected) || c.clock.now().Before(expected) {
+	if c.paused || !c.expires.Equal(expected) || (c.clock.now().Before(expected) && time.Now().Before(c.hardDeadline)) {
 		c.mu.Unlock()
 		return
 	}
@@ -304,19 +307,50 @@ func (c *continuation) renew(previous time.Time) {
 		if !c.stream.CanResume() {
 			continue
 		}
+		// Freeze the absolute credential/lease/root horizon as elapsed time
+		// BEFORE any provider lock, Detach or Resume can block. Validation binds
+		// the credential expiry to the funded lease and clips it to the original
+		// renewable horizon; no new timing authority is introduced here.
+		anchored := time.Now()
+		hardDeadline := anchored.Add(renewal.Credential.ExpiresAt.Sub(c.clock.now()))
 		c.session.providerMu.Lock()
 		c.mu.Lock()
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !time.Now().Before(hardDeadline) {
 			c.mu.Unlock()
 			c.session.providerMu.Unlock()
+			failure = ErrSessionLeaseExpired
 			break
 		}
 		c.paused = true
-		c.session.stopLeaseTimer()
 		c.stream.Detach()
+		c.session.stopLeaseTimer()
 		c.notifyLocked()
+		adopted, expired := false, false // protected by c.mu, including the timer
+		adoptionTimer := time.AfterFunc(max(time.Until(hardDeadline), 0), func() {
+			c.mu.Lock()
+			if adopted {
+				c.mu.Unlock()
+				return // canonical timer already owns this exact deadline
+			}
+			expired = true
+			c.terminalLeaseExpired.Store(true)
+			c.mu.Unlock()
+			// Detach is concurrent with Resume by contract. Keep the terminal
+			// fence visible before physical closure can wake an event consumer.
+			c.stream.Detach()
+			c.session.fail(ErrSessionLeaseExpired)
+		})
+		defer func() {
+			if adopted {
+				adoptionTimer.Stop()
+				return
+			}
+			// Failure/cancellation is not physical closure evidence. Preserve
+			// this cap until actual serialized teardown and event draining join.
+			go func() { <-c.session.physicalStopped; adoptionTimer.Stop() }()
+		}()
 		c.mu.Unlock()
-		resumeCtx, resumeCancel := context.WithTimeout(ctx, renewal.Credential.ExpiresAt.Sub(c.clock.now()))
+		resumeCtx, resumeCancel := context.WithDeadlineCause(ctx, hardDeadline, ErrSessionLeaseExpired)
 		err = c.stream.Resume(resumeCtx, renewal.Credential)
 		c.session.providerMu.Unlock()
 		resumeCancel()
@@ -329,14 +363,20 @@ func (c *continuation) renew(previous time.Time) {
 			break
 		}
 		c.mu.Lock()
-		if ctx.Err() != nil || !c.clock.now().Before(renewal.LeaseExpiresAt) {
+		if expired || ctx.Err() != nil || !time.Now().Before(hardDeadline) || !c.clock.now().Before(renewal.LeaseExpiresAt) {
 			c.mu.Unlock()
 			failure = ErrSessionLeaseExpired
 			break
 		}
 		c.expires, c.sequence, c.paused, c.pending = renewal.LeaseExpiresAt, renewal.Sequence, false, false
+		c.hardDeadline = hardDeadline
 		c.authorizedUnits += renewal.AuthorizedUnits
 		c.session.setLeaseDeadline(c.expires)
+		// Install the canonical owner before retiring the adoption timer. A
+		// callback already waiting on c.mu observes adopted, and a late return
+		// cannot reset the cap or advance allowance/sequence.
+		adopted = true
+		adoptionTimer.Stop()
 		c.notifyLocked()
 		c.mu.Unlock()
 		return

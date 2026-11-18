@@ -284,8 +284,11 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Sessio
 	}
 	providerCtx := ctx
 	cancelOpen := func() {}
+	var fundedDeadline time.Time
 	if clock != nil {
-		providerCtx, cancelOpen = context.WithTimeoutCause(ctx, request.Plan.Reservation.LeaseExpiresAt.Sub(clock.now()), ErrSessionLeaseExpired)
+		anchored := time.Now()
+		fundedDeadline = anchored.Add(request.Plan.Reservation.LeaseExpiresAt.Sub(clock.now()))
+		providerCtx, cancelOpen = context.WithDeadlineCause(ctx, fundedDeadline, ErrSessionLeaseExpired)
 	}
 	defer cancelOpen()
 	if providerCtx.Err() != nil {
@@ -336,6 +339,7 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Sessio
 		events:          make(chan protocol.Event, e.limits.MaxOutputEvents+1),
 		done:            make(chan struct{}),
 		eventsStopped:   make(chan struct{}),
+		physicalStopped: make(chan struct{}),
 		releasePhysical: release,
 		limits:          e.limits,
 		telemetry:       e.telemetry,
@@ -360,6 +364,8 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Sessio
 		session.now = clock.timestamp
 		continuationCtx, continuationCancel := context.WithCancel(sessionCtx)
 		session.continuation = &continuation{ctx: continuationCtx, cancel: continuationCancel, session: session, client: request.Entitlements, clock: clock, stream: resumable, expires: request.Plan.Reservation.LeaseExpiresAt, authorizedUnits: request.Plan.Reservation.Usage.AuthorizedUnits, changed: make(chan struct{})}
+		// A shorter caller setup context limits Open only, not execution.
+		session.continuation.hardDeadline = fundedDeadline
 	}
 	session.setLeaseDeadline(request.Plan.Reservation.LeaseExpiresAt)
 	session.emitRegular(protocol.EventSessionReady, nil, nil, nil)
@@ -462,6 +468,7 @@ type Session struct {
 	events          chan protocol.Event
 	done            chan struct{}
 	eventsStopped   chan struct{}
+	physicalStopped chan struct{}
 	releasePhysical func()
 	limits          Limits
 	telemetry       TelemetrySink
@@ -634,6 +641,9 @@ func (s *Session) setLeaseDeadlineLocked(deadline time.Time) {
 		now = s.continuation.clock.now()
 	}
 	delay := deadline.Sub(now)
+	if s.continuation != nil {
+		delay = min(delay, time.Until(s.continuation.hardDeadline))
+	}
 	if delay < 0 {
 		delay = 0
 	}
@@ -860,6 +870,7 @@ func releaseAfterProviderStop(events <-chan ProviderEvent, stop, release func())
 }
 
 func (s *Session) finishPhysical() {
+	defer close(s.physicalStopped)
 	<-s.eventsStopped
 	// runEvents has left the channel, so the teardown drain becomes its sole
 	// consumer. Public Done alone does not prove physical termination.

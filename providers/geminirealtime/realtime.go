@@ -373,6 +373,12 @@ func (s *liveStream) Close(context.Context) error {
 		s.writeMu.Lock()
 		err := s.conn.Close(websocket.StatusNormalClosure, "")
 		s.writeMu.Unlock()
+		// The SDK returns the peer's valid 1001 as an error when our sent
+		// status was 1000. Normalize only those explicit normal statuses;
+		// timeout, transport and protocol errors remain failures.
+		if isNormalClose(err) {
+			err = nil
+		}
 		s.rememberCloseError(err)
 		if err != nil {
 			// Publish before waking the reader: Events may close and be consumed
