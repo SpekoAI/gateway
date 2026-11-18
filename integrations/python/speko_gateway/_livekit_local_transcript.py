@@ -15,6 +15,39 @@ from ._livekit_native_speaker import NativeSpeechData
 from ._livekit_native_transcript import _processing_method
 
 
+def observe_local_wrappers(owner: Any) -> None:
+    """Follow SDK wrapper registration before its asynchronous child starts."""
+    original = owner.on
+
+    def on(event: str, callback: Any = None) -> Any:
+        if callback is None:
+            return lambda selected: on(event, selected)
+        result = original(event, callback)
+        target = getattr(callback, "__self__", None)
+        if event == "metrics_collected" and isinstance(target, (stt.FallbackAdapter, stt.MultiSpeakerAdapter)):
+            method = getattr(type(target), "_on_metrics_collected", None)
+            if getattr(callback, "__func__", None) is method:
+                binding = getattr(target, "_speko_local_prewarm_binding", None)
+                if binding is None:
+                    binding = _Prewarm(target)
+                    target._speko_local_prewarm_binding = binding
+                binding.owners.add(owner)
+                owner._local_transcript_bindings.add(binding)
+        return result
+
+    class Registration:
+        def release(self, selected: Any) -> None:
+            if selected.on is on:
+                selected.on = original
+            if getattr(selected, "_speko_local_wrapper_observer", None) is self:
+                del selected._speko_local_wrapper_observer
+
+    binding = Registration()
+    owner.on = on
+    owner._speko_local_wrapper_observer = binding
+    owner._local_transcript_bindings.add(binding)
+
+
 def restore_local_transcript(activity: Any) -> None:
     binding = getattr(activity, "_speko_local_transcript_binding", None)
     if binding is not None:
@@ -191,6 +224,7 @@ class _Prewarm:
         self.model = model
         self.owners: weakref.WeakSet[Any] = weakref.WeakSet()
         self.original = model.prewarm
+        self.original_stream = model.stream
 
         @wraps(self.original)
         def prewarm() -> None:
@@ -201,11 +235,33 @@ class _Prewarm:
         self.observed = prewarm
         model.prewarm = prewarm
 
+        @wraps(self.original_stream)
+        def stream(*args: Any, **kwargs: Any) -> Any:
+            # At this synchronous entry, an outer MultiSpeaker stream is
+            # still on the stack even if fallback later starts its child task.
+            for owner in list(self.owners):
+                bind_local_transcript(owner)
+            result = self.original_stream(*args, **kwargs)
+            if isinstance(model, stt.MultiSpeakerAdapter) and model._suppress_background:
+                filtering = getattr(result, "_speko_local_filter_binding", None)
+                if filtering is None:
+                    filtering = _Filter(result)
+                    result._speko_local_filter_binding = filtering
+                for owner in list(self.owners):
+                    filtering.owners.add(owner)
+                    owner._local_transcript_bindings.add(filtering)
+            return result
+
+        self.observed_stream = stream
+        model.stream = stream
+
     def release(self, owner: Any) -> None:
         self.owners.discard(owner)
         if not self.owners:
             if self.model.prewarm is self.observed:
                 self.model.prewarm = self.original
+            if self.model.stream is self.observed_stream:
+                self.model.stream = self.original_stream
             if getattr(self.model, "_speko_local_prewarm_binding", None) is self:
                 del self.model._speko_local_prewarm_binding
 

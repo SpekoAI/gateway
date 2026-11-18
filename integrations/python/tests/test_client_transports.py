@@ -73,7 +73,7 @@ async def gateway_stt_peer(payloads, *, after_eos=False, final_gate=None):
 
 
 @pytest.mark.parametrize("shape", ["terminal", "middle", "whole"])
-@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("nested", [False, True, "reverse"])
 @pytest.mark.parametrize("manual", [False, True])
 @pytest.mark.parametrize("after_eos", [False, True])
 async def test_gateway_background_suppression_keeps_filtered_canonical_turns(shape, nested, manual, after_eos):
@@ -128,7 +128,7 @@ async def test_gateway_background_suppression_keeps_filtered_canonical_turns(sha
         client = GatewayClient(socket_path=address, local_auth_token="owned-filtered-canonical")
         model = STT(client, diarization=True)
         speaker = stt.MultiSpeakerAdapter(stt=model, suppress_background_speaker=True)
-        wrapped = stt.FallbackAdapter([speaker], max_retry_per_stt=0) if nested else speaker
+        wrapped = stt.MultiSpeakerAdapter(stt=stt.FallbackAdapter([model], max_retry_per_stt=0), suppress_background_speaker=True) if nested == "reverse" else stt.FallbackAdapter([speaker], max_retry_per_stt=0) if nested else speaker
         session = AgentSession(stt=wrapped, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
         session.input.audio = Input()
         session.on("conversation_item_added", lambda event: items.put_nowait(event.item.text_content) if getattr(event.item, "role", None) == "user" else None)

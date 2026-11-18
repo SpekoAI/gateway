@@ -52,6 +52,11 @@ single-model `stt.FallbackAdapter` wrappers, including nested wrappers. An
 ambiguous native failure fences their later stream and recovery calls too.
 Whole-final speaker labels reach LiveKit's `speaker_id`; attributed segments
 become individual timed finals, with explicit segment labels taking precedence.
+A single untimed whole-final label uses the actual captured physical request
+interval for RMS, marked `timing_source="captured_request"`. It does not invent
+provider word timings. Multiple untimed labels cannot be assigned that same
+interval; unavailable attribution or insufficient captured RMS evidence refuses
+primary detection and fences native recovery instead of silently returning None.
 Native `speaker_id` values are opaque identities scoped to each physical
 request; the original vendor label is available as `provider_speaker_id`.
 The same vendor label in a later request does not identify the same person.
@@ -93,6 +98,9 @@ well as `text`; canonical filtering state stays inside the owned filter until
 the group finishes. Finals arriving after provider end-of-speech retain that
 boundary, and replacing Gateway STT with another SDK model retires its pending
 gate without requiring the old model to close.
+Wrapper registration and synchronous stream entry propagate the owned filter
+before asynchronous fallback children start, for both MultiSpeaker/Fallback
+orders. Only instance-owned hooks are installed and released on close.
 An explicit manual decision deferred during a segmented final retains its
 `skip_reply` value through active VAD speech and rearms when that speech ends.
 Without a manual request, late finals do not start a manual turn. The owned
@@ -213,7 +221,9 @@ old-segment events without adding a queued end that could overwrite newer speech
 Unprocessed real capture is recovered from the ordered ledger and classified
 again with fresh detector state and duration counters. This preserves resumed
 speech captured before a delayed STT end; old speech durations cannot become a
-new interruption. Recovery never replays detector-only padding. Pending
+new interruption. A replay that ends in old speech stays non-interrupting until
+real quiet separates a fresh onset, including silence captured after replay.
+Recovery never replays detector-only padding. Pending
 real tails rearm after in-flight padding completes, with no packet-duration delay.
 
 Use `DrainingVAD(detector, flush_mode="segment")` for a batch STT

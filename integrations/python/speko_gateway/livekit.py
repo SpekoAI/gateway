@@ -43,7 +43,11 @@ from ._livekit_bridge import (
     LiveKitTTSStream,
 )
 from ._livekit_draining_vad import DrainingVAD
-from ._livekit_local_transcript import bind_local_transcript, restore_local_transcript
+from ._livekit_local_transcript import (
+    bind_local_transcript,
+    observe_local_wrappers,
+    restore_local_transcript,
+)
 from ._livekit_native_input import (
     NativeInputBinding,
     bind_native_input,
@@ -225,6 +229,8 @@ class STT(stt.STT):
         self._native_reconsider_scheduled = False
         self._native_turn_policy: NativeTurnPolicy | None = None
         self._local_transcript_bindings: weakref.WeakSet[Any] = weakref.WeakSet()
+        if not isinstance(self._client, RelaySpeechClient):
+            observe_local_wrappers(self)
 
     def prewarm(self) -> None:
         if not isinstance(self._client, RelaySpeechClient):
@@ -318,7 +324,7 @@ class STT(stt.STT):
             self._check_native_admission()
             result = original(*args, **kwargs)
             if isinstance(wrapper, stt.MultiSpeakerAdapter):
-                bind_native_speaker_timing(result)
+                bind_native_speaker_timing(result, unsupported=lambda: setattr(self, "_native_failed", True))
             return result
 
         wrapper.stream = stream

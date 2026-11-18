@@ -161,6 +161,8 @@ async def assert_source_times(session, audio, actual, expected):
 
 
 def wrap_native_stt(model, wrapper):
+    if wrapper == "reverse":
+        return stt.MultiSpeakerAdapter(stt=stt.FallbackAdapter([model], max_retry_per_stt=3, retry_interval=0))
     if wrapper in ("multi_speaker", "nested"):
         model = stt.MultiSpeakerAdapter(stt=model)
     if wrapper in ("fallback", "nested"):
@@ -618,7 +620,7 @@ async def test_draining_framework_vad_buffered_silence_has_no_packet_duration_de
         await asyncio.gather(collector, return_exceptions=True)
 
 
-@pytest.mark.parametrize("mode", ["vad", "stt_flush", "stt_flush_resume", "stt_flush_old_backlog", "stt_flush_new_start"])
+@pytest.mark.parametrize("mode", ["vad", "stt_flush", "stt_flush_resume", "stt_flush_old_backlog", "stt_flush_old_speech", "stt_flush_new_start"])
 async def test_draining_framework_vad_preserves_actual_response_interruption(mode):
     if "capabilities" not in inspect.signature(io.AudioOutput).parameters:
         pytest.skip("SDK predates the current audio output contract")
@@ -754,6 +756,8 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
                 return
             if mode == "stt_flush_old_backlog":
                 payload = b"\xff\x0f" * 11200 + b"\0\0" * 8000
+            elif mode == "stt_flush_old_speech":
+                payload = b"\xff\x0f" * 11200
             else:
                 quiet, voiced = (4096,1024) if mode == "stt_flush_resume" else (1024,80)
                 payload = b"\0\0" * quiet + b"\xff\x0f" * voiced
@@ -768,6 +772,14 @@ async def test_draining_framework_vad_preserves_actual_response_interruption(mod
             assert not speech.interrupted, "pre-EOS speech cannot interrupt the response after flush"
             assert session._activity._audio_recognition._speaking is (mode == "stt_flush_resume")
             assert session.user_state == ("speaking" if mode == "stt_flush_resume" else "listening")
+            if mode == "stt_flush_old_speech":
+                # The replay frontier contains ONLY old speech. Silence is
+                # captured after replay, so it cannot hide a stale new start.
+                await audio.frames.put(frame(b"\0\0" * 8000))
+                await asyncio.wait_for(until(lambda: streams[0]._processed >= 19200), 3)
+                await asyncio.sleep(0.05)
+                assert not speech.interrupted, "late silence reused old speech duration"
+                assert not session._activity._audio_recognition._speaking
             await audio.frames.put(frame(b"\xff\x0f" * 9216))
             await asyncio.wait_for(until(lambda: speech.interrupted), 2)
     finally:
@@ -2882,7 +2894,7 @@ async def test_native_model_handoffs_keep_only_the_active_recognition_owner_boun
             await client.aclose()
 
 
-@pytest.mark.parametrize("wrapper", ["direct", "multi_speaker", "fallback", "nested"])
+@pytest.mark.parametrize("wrapper", ["direct", "multi_speaker", "fallback", "nested", "reverse"])
 @pytest.mark.parametrize("attribution", ["whole_final", "segments", "louder", "inherited", "unattributed"])
 @pytest.mark.parametrize("prefix_frames", [0, 35])
 async def test_native_actual_agent_preserves_provider_speakers_through_supported_wrappers(monkeypatch, wrapper, attribution, prefix_frames):
@@ -2897,7 +2909,7 @@ async def test_native_actual_agent_preserves_provider_speakers_through_supported
 
     monkeypatch.setattr(stt.MultiSpeakerAdapter, "stream", capture_stream)
     payload = {"type": "transcript.final", "text": "one two", "speaker": "A"}
-    expected = [("one two", "A", 0.0, 0.0)]
+    expected = [("one two", "A", 0.0, 0.6)]
     if attribution != "whole_final":
         payload["segments"] = [
             {"text": "one", "start_ms": 0, "end_ms": 300, "speaker": "A"},
@@ -2965,17 +2977,14 @@ async def test_native_actual_agent_preserves_provider_speakers_through_supported
                 source.processed(observed)
                 source.emit(kind, frames=[observed], silence_duration=0 if samples == 9600 else 0.55)
             assert await asyncio.wait_for(turns.get(), 3) == "one two"
-            if attribution != "whole_final":
-                expected = [(text, speaker, start + prefix_frames * 0.02, end + prefix_frames * 0.02) for text, speaker, start, end in expected]
+            expected = [(text, speaker, start + prefix_frames * 0.02, end + prefix_frames * 0.02) for text, speaker, start, end in expected]
             assert [(item.text, item.provider_speaker_id) for item in finals] == [(text, speaker) for text, speaker, _, _ in expected]
             assert_request_speakers(finals)
-            if attribution == "whole_final":
-                assert [(item.start_time, item.end_time) for item in finals] == [(0.0, 0.0)]
-            else:
-                await assert_source_times(session, audio, [item.start_time for item in finals], [start for _, _, start, _ in expected])
-                await assert_source_times(session, audio, [item.end_time for item in finals], [end for _, _, _, end in expected])
-            if wrapper in ("multi_speaker", "nested") and attribution != "whole_final":
-                assert [item.is_primary_speaker for item in finals] == [True, None if attribution == "unattributed" else attribution in ("inherited", "louder")]
+            await assert_source_times(session, audio, [item.start_time for item in finals], [start for _, _, start, _ in expected])
+            await assert_source_times(session, audio, [item.end_time for item in finals], [end for _, _, _, end in expected])
+            if wrapper in ("multi_speaker", "nested", "reverse"):
+                assert [item.is_primary_speaker for item in finals] == ([True] if attribution == "whole_final" else [True, None if attribution == "unattributed" else attribution in ("inherited", "louder")])
+            assert all(item.timing_source == ("captured_request" if attribution == "whole_final" else "provider") for item in finals)
         finally:
             await audio.frames.put(None)
             await session.aclose()
@@ -2986,6 +2995,67 @@ async def test_native_actual_agent_preserves_provider_speakers_through_supported
             for stream, on_event, close in speaker_streams:
                 assert stream._detector.on_stt_event == on_event
                 assert stream.aclose == close
+
+
+@pytest.mark.parametrize("shape", ["ambiguous_finals", "insufficient_capture"])
+@pytest.mark.parametrize("wrapper", ["multi_speaker", "nested", "reverse"])
+async def test_native_whole_final_detection_refuses_unavailable_physical_timing(shape, wrapper):
+    source, opened, turns, delivered = ControlledVAD(), [], asyncio.Queue(), []
+
+    async def handle(request):
+        opened.append(request.path)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                for speaker in (["A", "B"] if shape == "ambiguous_finals" else ["A"]):
+                    await ws.send_json({"type": "transcript.final", "text": "whole utterance", "speaker": speaker})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def stt_node(self, audio, settings):
+            async for event in Agent.default.stt_node(self, audio, settings):
+                if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    delivered.extend(event.alternatives)
+                yield event
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source, diarization=True)
+        wrapped = wrap_native_stt(model, wrapper)
+        session = AgentSession(stt=wrapped, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        model.bind_session(session)
+        try:
+            options = {"record": False} if "record" in inspect.signature(session.start).parameters else {}
+            await session.start(agent=OwnedAgent(instructions="Owned unsupported attribution"), **options)
+            for samples, kind in [(320 if shape == "insufficient_capture" else 9600, vad.VADEventType.START_OF_SPEECH), (8800, vad.VADEventType.END_OF_SPEECH)]:
+                value = rtc.AudioFrame(data=(b"\xff\x0f" if kind is vad.VADEventType.START_OF_SPEECH else b"\0\0") * samples, sample_rate=16000, num_channels=1, samples_per_channel=samples)
+                audio.frames.put_nowait(value)
+                observed = await asyncio.wait_for(source.frames.get(), 3)
+                source.processed(observed)
+                source.emit(kind, frames=[observed], silence_duration=0 if kind is vad.VADEventType.START_OF_SPEECH else 0.55)
+            async def refused():
+                while not model._native_failed:
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(refused(), 3)
+            with pytest.raises(GatewayError, match="recovery decision"):
+                model.stream()
+            assert len(opened) == 1 and turns.empty() and delivered == []
+        finally:
+            audio.frames.put_nowait(None)
+            await session.aclose()
+            await wrapped.aclose()
+            await model.aclose()
+            await client.aclose()
 
 
 async def test_overlapping_sdk_activity_updates_keep_the_queued_targets_input_binding():
@@ -3761,15 +3831,15 @@ async def test_retained_closed_native_input_node_cannot_reinstall_hooks_in_local
 
 
 @pytest.mark.parametrize("wrapper", ["direct", "nested"])
-@pytest.mark.parametrize("shape", ["unspaced", "partial", "punctuation", "ambiguous"])
+@pytest.mark.parametrize("shape", ["unspaced", "partial", "partial_inherited", "punctuation", "ambiguous"])
 @pytest.mark.parametrize("copy_fields", [False, True])
 @pytest.mark.parametrize("replay", [False, True])
 async def test_valid_native_segments_keep_canonical_text_and_available_speakers(wrapper, shape, copy_fields, replay):
     if replay and not hasattr(recognition.AudioRecognition, "_process_stt_event"):
         pytest.skip("SDK predates adaptive transcript replay")
-    text = {"unspaced": "你好", "partial": "hello world", "punctuation": "Hello, world!", "ambiguous": "yes yes done"}[shape]
-    segments = [{"text": "你" if shape == "unspaced" else "hello" if shape == "partial" else "Hello", "start_ms": 0, "end_ms": 300, "speaker": "A"}]
-    if shape != "partial":
+    text = {"unspaced": "你好", "partial": "hello world", "partial_inherited": "hello world", "punctuation": "Hello, world!", "ambiguous": "yes yes done"}[shape]
+    segments = [{"text": "你" if shape == "unspaced" else "hello" if shape.startswith("partial") else "Hello", "start_ms": 0, "end_ms": 300, "speaker": "A"}]
+    if not shape.startswith("partial"):
         segments.append({"text": "好" if shape == "unspaced" else "world", "start_ms": 300, "end_ms": 600, "speaker": "B"})
     if shape == "ambiguous":
         segments = [{"text": "yes", "start_ms": 0, "end_ms": 300, "speaker": "B"}, {"text": "done", "start_ms": 300, "end_ms": 600, "speaker": "C"}]
@@ -3783,7 +3853,7 @@ async def test_valid_native_segments_keep_canonical_text_and_available_speakers(
         await ready(ws)
         async for message in ws:
             if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
-                await ws.send_json({"type": "transcript.final", "text": text, "segments": segments, **({"speaker": "A"} if shape == "ambiguous" else {})})
+                await ws.send_json({"type": "transcript.final", "text": text, "segments": segments, **({"speaker": "A"} if shape in ("ambiguous", "partial_inherited") else {})})
                 await ws.send_json({"type": "session.closed", "usage": {}})
                 await ws.close()
         return ws
@@ -3839,8 +3909,11 @@ async def test_valid_native_segments_keep_canonical_text_and_available_speakers(
             assert len(seen) == 1
             assert not model._native_failed
             assert all(not stream._final_batches for stream in model._streams)
-            expected = {None, "C"} if shape == "ambiguous" else {"A", None} if shape == "partial" else {"A", "B"}
+            expected = {None, "C"} if shape == "ambiguous" else {"A", None} if shape == "partial" else {"A"} if shape == "partial_inherited" else {"A", "B"}
             assert {data.provider_speaker_id for data in finals} >= expected
+            if shape == "partial_inherited":
+                assert finals[-1].timing_source is None
+                assert finals[-1].start_time == finals[-1].end_time == 0
             assert_request_speakers(finals)
             if shape == "ambiguous":
                 assert all(data.speaker_id is None for data in finals if "yes" in data.text)
