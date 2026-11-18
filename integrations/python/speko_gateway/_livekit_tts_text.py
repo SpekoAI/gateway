@@ -68,15 +68,20 @@ class NativeTextBuffer:
         return text
 
     def _idle_end(self) -> int | None:
-        # St. is also a complete street suffix. Keep it with a continuation
-        # during the same bounded lookahead, without treating it as an
-        # indefinitely incomplete title. Dr./fl. retain their required noun.
+        # Do not guess whether an abbreviation ends a sentence or introduces
+        # the already-buffered words. Keep all available context together;
+        # push() has already bounded this remainder to <240 characters.
         for ending in reversed(list(_PERIOD_END.finditer(self._text))):
             word = _word_before_period(self._text, ending.start()).lower()
+            end = ending.end()
+            continuation = bool(self._text[end:].strip())
+            if continuation and _abbreviation(self._text, ending.start()):
+                return len(self._text)
+            # Standalone St. may be a complete street suffix. An isolated
+            # title/unit prefix still waits for its following word.
             if word in _CONTINUING_PREFIXES and word != "st":
                 continue
-            end = ending.end()
-            return len(self._text) if not self._text[end:].strip() else end
+            return end if continuation else len(self._text)
         return None
 
     def flush_idle(self) -> str:
@@ -88,6 +93,6 @@ class NativeTextBuffer:
 
     @property
     def can_flush_idle(self) -> bool:
-        # A complete prefix remains eligible even with an unfinished next
-        # clause in the buffer. Keep that suffix for the producer's next token.
+        # Completed prefixes remain eligible; available abbreviation context
+        # travels with its prefix, while other unfinished suffixes stay local.
         return self._idle_end() is not None

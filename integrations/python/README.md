@@ -270,11 +270,14 @@ characters, preferring a word boundary. Text is split without replacing literal
 strings such as `<stop>` or `<prd>`. An explicit `flush()` completes the SDK
 segment after its audio drains, even before `end_input()`.
 An ambiguous period gets the existing 300 ms lookahead, including a terminal
-street suffix `St.`. An abbreviated completed prefix such as `9 a.m.` can
-commit while an unfinished next clause stays buffered; idle commits retain
-that suffix and every separator for later input. Continuations within the
-lookahead preserve decimal, domain and abbreviation context, while titles
-such as `Dr.` and a unit prefix `fl.` still wait for their following word.
+street suffix `St.`. An idle commit coalesces already-buffered abbreviation
+context, so `St. Louis` and `fl. oz. of water` stay together. This also includes
+an available next-clause prefix such as `9 a.m. Please`; the adapter does not
+guess which words introduce a new sentence. Every character and separator is
+preserved, and the existing 240-character bound is unchanged. Standalone
+`Main St.` remains eligible; isolated titles such as `Dr.` and the unit prefix
+`fl.` still wait for their following word. Continuations within the lookahead
+retain decimal and domain values too.
 Each native utterance waits for `utterance.done` before appending the next one
 or closing the session, while incoming LLM text continues buffering. This
 supports provider adapters with one active synthesis context.
