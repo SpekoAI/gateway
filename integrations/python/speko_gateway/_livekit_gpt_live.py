@@ -23,6 +23,7 @@ from livekit.agents import NOT_GIVEN, NotGivenOr, llm, utils
 from livekit.agents.utils import is_given
 from livekit.agents.utils.aio.channel import ChanFull
 
+from ._livekit_context import snapshot_context
 from ._livekit_tools import _relay_tools
 from ._relay_transport import _error
 from .client import GatewayError
@@ -63,14 +64,18 @@ class _GPTReplyBinding:
         self.original = original
         self.original_context = original_context
 
-        async def context(chat_ctx: llm.ChatContext, **options: Any) -> None:
+        async def context(
+            chat_ctx: llm.ChatContext, *, exclude_invalid_function_calls: bool = True
+        ) -> None:
+            from livekit.agents.voice.generation import remove_instructions
+
             self.check()
             current = self.session()
             owner = self.activity()
             assert current is not None and owner is not None
             changed = current._changes_user_context(chat_ctx)
             if changed and (
-                current.duplex_session._reply_hint_issued
+                current.duplex_session._typed_context_unsafe
                 or owner._rt_chat_ctx_lock.locked()
             ):
                 # The actual SDK assigns Agent history before acquiring this
@@ -79,7 +84,20 @@ class _GPTReplyBinding:
                     "GPT-Live typed context requires delegation correlation",
                     retryable=False,
                 )
-            await self.original_context(chat_ctx, **options)
+            staged = snapshot_context(chat_ctx)
+            await current.start()
+            async with owner._rt_chat_ctx_lock:
+                self.check()
+                filtered = snapshot_context(
+                    staged.copy(
+                        tools=owner.tools
+                        if exclude_invalid_function_calls
+                        else NOT_GIVEN
+                    )
+                )
+                remove_instructions(filtered)
+                await current.update_chat_ctx(filtered)
+                owner._agent._chat_ctx = snapshot_context(filtered)
 
         self.observed_context = context
         activity.update_chat_ctx = context
@@ -93,7 +111,8 @@ class _GPTReplyBinding:
                     raise llm.RealtimeError(_SCOPED_REPLY)
                 if (
                     is_given(options.get("user_input", NOT_GIVEN))
-                    and current.duplex_session._reply_hint_issued
+                    and options.get("user_input") is not None
+                    and current.duplex_session._typed_context_unsafe
                 ):
                     raise llm.RealtimeError(
                         "GPT-Live typed reply requires delegation correlation"
@@ -276,6 +295,9 @@ class _GPTLiveSession(_Session):
         # A negative capability fence, not an acknowledgement or source proof.
         # Retirement, preambles and claimed IDs do not drain unseen delegates.
         self._reply_hint_issued = False
+        # Ordinary input can also leave an unseen old delegation. A first
+        # explicit hint is not proof that it precedes all provider work.
+        self._live_input_seen = False
         self._socket: RelayRealtimeSession | None = None
         self._resampler: rtc.AudioResampler | None = None
         self._input_format: tuple[int, int] | None = None
@@ -294,6 +316,10 @@ class _GPTLiveSession(_Session):
     def tools(self):
         return self._tools.copy()
 
+    @property
+    def _typed_context_unsafe(self) -> bool:
+        return self._reply_hint_issued or self._live_input_seen
+
     async def start(self) -> None:
         await asyncio.shield(self._ready)
 
@@ -310,6 +336,7 @@ class _GPTLiveSession(_Session):
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if frame.samples_per_channel:
+            self._live_input_seen = True
             self._retire_pending_reply()
         current = frame.sample_rate, frame.num_channels
         if frame.num_channels != 1:
@@ -354,7 +381,7 @@ class _GPTLiveSession(_Session):
             )
 
     async def _append_items(self, items: list[llm.ChatItem]) -> None:
-        if self._reply_hint_issued and any(
+        if self._typed_context_unsafe and any(
             isinstance(item, llm.ChatMessage) and item.role == "user" for item in items
         ):
             # Preflight the whole batch before history, voice append or tool
@@ -371,7 +398,7 @@ class _GPTLiveSession(_Session):
                 future = self._tool_results.get(item.call_id)
                 if future is not None:
                     if not future.done():
-                        future.set_result(item)
+                        future.set_result(item.model_copy(deep=True))
                     elif _result_digest(future.result()) != digest:
                         raise llm.RealtimeError(
                             "GPT-Live received conflicting tool results"
@@ -388,6 +415,7 @@ class _GPTLiveSession(_Session):
             if self._started and isinstance(item, llm.ChatMessage):
                 text = item.text_content
                 if text:
+                    self._live_input_seen = True
                     self._append(
                         "session.instructions.append"
                         if item.role in {"system", "developer"}
@@ -403,10 +431,10 @@ class _GPTLiveSession(_Session):
             > _TEXT_BYTES
         ):
             raise llm.RealtimeError("GPT-Live history exceeds its bound")
-        self._history.insert(items)
+        self._history.insert(snapshot_context(llm.ChatContext(list(items))).items)
 
     def _backend_context(self) -> llm.ChatContext:
-        context = self._history.copy()
+        context = snapshot_context(self._history)
         if self._instructions:
             context.items.insert(
                 0, llm.ChatMessage(role="system", content=[self._instructions])
@@ -416,7 +444,7 @@ class _GPTLiveSession(_Session):
     def _generate_reply(
         self, *, instructions=NOT_GIVEN, tool_choice=NOT_GIVEN, tools=NOT_GIVEN
     ) -> None:
-        if is_given(instructions):
+        if is_given(instructions) and instructions is not None:
             # The protocol carries no per-ask identity/drain barrier. Reject
             # scoped tasks BEFORE append instead of running an ambiguous or
             # silently downgraded backend task (including on idle PCM).
@@ -498,6 +526,8 @@ class _GPTLiveSession(_Session):
         kind = event.get("type")
         if not self._ready.done() and kind not in {"session.started", "error"}:
             raise _failure()
+        if kind not in {"session.started", "session.closed", "error"}:
+            self._live_input_seen = True
         if kind == "session.started":
             if self._ready.done():
                 raise _failure()
@@ -829,7 +859,7 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
 
     @property
     def chat_ctx(self):
-        return self._inner.chat_ctx
+        return snapshot_context(self._inner.chat_ctx)
 
     @property
     def tools(self):
@@ -904,6 +934,8 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
         await self.duplex_session.start()
 
     async def _update_session(self, **options):
+        if is_given(options.get("chat_ctx", NOT_GIVEN)):
+            options["chat_ctx"] = snapshot_context(options["chat_ctx"])
         await self._inner._update_session(**options)
 
     async def update_instructions(self, instructions):
@@ -916,14 +948,14 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
             except GatewayError:
                 self.duplex_session._fatal()
                 raise
-        if self.duplex_session._reply_hint_issued and self._changes_user_context(
+        if self.duplex_session._typed_context_unsafe and self._changes_user_context(
             chat_ctx
         ):
             raise GatewayError(
                 "GPT-Live typed context requires delegation correlation",
                 retryable=False,
             )
-        await self._inner.update_chat_ctx(chat_ctx)
+        await self._inner.update_chat_ctx(snapshot_context(chat_ctx))
 
     def _changes_user_context(self, chat_ctx: llm.ChatContext) -> bool:
         previous = {

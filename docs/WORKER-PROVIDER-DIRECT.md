@@ -28,9 +28,13 @@ no safe continuation is claimed for that ambiguous transport. Known-response
 server-VAD caller flow remains supported. Further explicit asks, configuration,
 context, commits and tool dispatch refuse before mutation on the ambiguous socket;
 the synchronous SDK entry refuses replacement typed input before context mutation.
-GPT-Live also refuses new typed user context after any queued delivery hint;
+GPT-Live also refuses new typed user context after ordinary live input or any queued delivery hint;
 cancel/expiry/preamble/claimed delegation cannot drain unseen old work. First
-typed input before a hint, ordinary speech and captured tool rounds stay supported.
+typed input before live input/a hint, ordinary speech and captured tool rounds stay supported.
+Provider-VAD typed tasks also refuse after live input because unseen pre-output
+responses have no task correlation/drain proof. Ordinary caller flow remains
+supported. Detached context snapshots and the actual SDK context lock protect
+retained backend/Agent histories; these local checks are not native authority.
 Independent local cancellation after active feedback still physically stops/joins.
 These SDK capability
 checks do not attest current requester/source, claim, caller, credential, committed

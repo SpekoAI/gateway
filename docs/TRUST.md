@@ -45,32 +45,57 @@ or provider controls are accepted. Input producers must stop submitting at commi
 and resume after the real terminal boundary. Continuously forwarding PCM after
 commit is not a supported manual lifecycle; no silence inference, buffering,
 replay, permanent live-socket latch or automatic restart substitutes for it.
-Ordinary explicit native audio and typed turns remain supported after genuine
+Ordinary explicit native manual audio and typed turns remain supported after genuine
 terminals. Post-commit closure is a raw-input safety fence, not a supported
 continuous manual microphone lifecycle.
 Consumed audio transcript IDs cannot replay as typed input.
+
+Provider-VAD input also has an unkeyed pre-output response boundary. Once raw
+PCM or a provider input/unsolicited-response event has been accepted, new typed
+context and instructed replies refuse before SDK history or provider mutation.
+A terminal does not prove all unseen responses drained. Ordinary caller audio,
+known-response barge-in and subsequent caller answers remain supported on that
+socket. Typed work before any live input remains supported, including subsequent
+typed turns after their real response boundaries; new input overlapping such a
+pending typed response physically retires ambiguous I/O before capture. This is
+an operation refusal, not speech classification or caller-presence proof.
+
+The owned Activity context entry stages detached message values. On SDK 1.8.10
+it checks and applies under the actual context lock before publishing Agent
+history, and refuses a busy lock. SDK 1.4.5/1.6.8 have no such lock: the ready
+native path checks, enqueues and publishes without yielding. Manual raw and
+committed-response checks apply at this public entry as well as the native
+adapter. A rejected update cannot remain in Agent history for a later no-op to
+replay. No best-effort native exception is treated as rollback.
 
 GPT-Live refuses ALL per-reply instructions, including their associated typed
 user_input, before the SDK reply task appends any context. Delegation IDs/offsets
 provide no per-ask attribution or old-delegation drain barrier. The adapter owns
 the existing per-activity SDK reply-task seam; unknown wrapper/custom-task
 ownership refuses before opening, and losing that seam retires ambiguous owned
-I/O before another context update. First typed input before any delivery hint, caller audio and
+I/O before another context update. First typed input before any live input or delivery hint, caller audio and
 canonical backend/tool-round snapshots remain supported.
-After a delivery hint has been queued, new typed user context refuses before
+After ordinary PCM, provider events, runtime context append or a delivery hint,
+new typed user context refuses before
 the SDK reply task, voice append or backend history changes. Direct context
 updates also refuse before mutation. Cancel, expiry, preamble and even a claimed
 delegation do not prove that all older delegates have drained. Captured tool
 results and ordinary caller speech/delegations retain their own supported flow.
-The owned existing Activity context entry checks before the SDK's local history
-assignment, including refusal while its real context lock is busy. The adapter's
-append barrier separately protects direct native-session updates.
+The owned existing Activity context entry stages and checks under the actual
+SDK lock before assigning Agent history; a busy lock refuses. The adapter's
+append barrier separately protects direct native-session updates. Retained
+native/backend histories, public native context views, tool results and each
+backend request use detached message snapshots. LiveKit's shallow Agent context
+copy can still mutate the caller's own SDK view, but cannot rewrite the retained
+backend baseline or bypass detection of an explicitly submitted edit.
 
 Unscoped GPT-Live generate_reply requires usable canonical startup/history
 context before sending a voice-delivery hint. A fresh empty context refuses that
 ask without inventing user text, adding the hint to backend history, or ending
 ordinary voice input. Real transcript fragments can still support ordinary
-provider delegations. A preamble may fulfill the playback future while its
+provider delegations. Repeated genuinely unscoped calls remain available;
+`user_input=None` and `instructions=None` mean absent, not a new task.
+A preamble may fulfill the playback future while its
 original application expiration remains; it does not establish task attribution
 or extend execution authority.
 
@@ -82,7 +107,8 @@ Unheard interrupted output cannot claim them. Late Gemini feedback after a real
 terminal clears playback without suppressing the next response; in-flight
 interruption remains fenced to terminal. Independent local cancellation still
 physically stops and joins, including when invoked inside a feedback callback.
-Typed Gemini work waits for the terminal boundary.
+Manual typed Gemini work waits for the terminal boundary; provider-VAD typed
+work after live input remains refused for missing response correlation.
 
 OpenAI/xAI speech-start feedback before a created response ID retires the exact
 pending application future/timer without treating SDK re-entry as a local stop.

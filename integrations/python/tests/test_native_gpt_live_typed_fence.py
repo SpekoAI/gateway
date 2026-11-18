@@ -90,11 +90,10 @@ async def test_typed_ask_refuses_before_context_while_old_delegation_can_arrive(
         voice, backend_client, backend, model = models(socket)
         actor = AgentSession(llm=model, turn_detection="manual", vad=None)
         try:
-            await start_agent(actor)
+            initial = llm.ChatContext.empty()
+            initial.add_message(role="user", content="ORIGINAL_CANONICAL_USER")
+            await start_agent(actor, chat_ctx=initial)
             native = actor.current_agent.realtime_llm_session
-            original_context = actor.current_agent.chat_ctx.copy()
-            original_context.add_message(role="user", content="ORIGINAL_CANONICAL_USER")
-            await actor.current_agent.update_chat_ctx(original_context)
             if retirement == "expired":
                 native._reply_timeout = 0.05
             old = actor.generate_reply()
@@ -276,7 +275,9 @@ async def test_first_unscoped_typed_turn_without_prior_ask_remains_supported(
         voice, backend_client, backend, model = models(socket)
         actor = AgentSession(llm=model, turn_detection="manual", vad=None)
         try:
-            await start_agent(actor)
+            initial = llm.ChatContext.empty()
+            initial.add_message(role="user", content="PRE_HINT_CANONICAL_CONTEXT")
+            await start_agent(actor, chat_ctx=initial)
             if busy_before_first:
                 competing = actor.current_agent.chat_ctx.copy()
                 competing.add_message(role="user", content="BUSY_CONTEXT_MUST_REFUSE")
@@ -288,9 +289,6 @@ async def test_first_unscoped_typed_turn_without_prior_ask_remains_supported(
                 assert "BUSY_CONTEXT_MUST_REFUSE" not in str(
                     actor.current_agent.chat_ctx.items
                 )
-            initial = actor.current_agent.chat_ctx.copy()
-            initial.add_message(role="user", content="PRE_HINT_CANONICAL_CONTEXT")
-            await actor.current_agent.update_chat_ctx(initial)
             first = actor.generate_reply(user_input="FIRST_CANONICAL_TYPED_REQUEST")
             await asyncio.wait_for(first.wait_for_playout(), 5)
             assert first.exception() is None and len(requests) == 1

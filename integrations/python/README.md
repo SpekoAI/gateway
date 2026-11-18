@@ -78,9 +78,22 @@ controls are accepted. The synchronous SDK cannot backpressure or attribute
 pipelined manual input safely; continuous post-commit microphone PCM is not a
 supported lifecycle. It is never classified as silence, buffered/replayed,
 silently sent with permanently failing handles, or automatically retried.
-Ordinary explicit native audio and typed turns after a genuine terminal remain supported.
+Ordinary explicit native manual audio and typed turns after a genuine terminal remain supported.
 Post-commit closure is a raw-input safety fence, not support for a continuously
 connected manual AgentSession source. There is no local idle/utterance duration cap.
+
+For provider VAD, once live PCM or provider input/unsolicited output has arrived,
+new typed context and instructed asks refuse before SDK/native mutation. The
+protocol cannot exclude an older unseen response before first output. A later
+terminal does not provide that missing drain/correlation proof. Ordinary caller
+audio, known-response interruption and subsequent caller answers stay supported.
+Typed turns before live input are supported across their real response boundaries;
+new input overlapping a pending typed response stops the ambiguous physical
+transport before source capture. The context entry stages detached message
+values, validates under the SDK's actual context lock (busy locks refuse), and
+publishes Agent history only after native acceptance. SDK 1.4.5/1.6.8 use their
+ready non-yielding path without a context lock. Rejected raw/committed manual
+context cannot remain in Agent history and replay through a later no-op update.
 Clearing local, unconverted input discards its resampler state; it is not flushed
 into a later commit. Clearing already forwarded manual input closes the transport
 because it cannot be recalled. Activity starts within one uncommitted turn are idempotent.
@@ -150,16 +163,21 @@ silently downgrade an accepted task because no scoped task is accepted.
 Unscoped `generate_reply()` requires usable canonical startup/history context
 before sending a voice-delivery hint. A fresh empty context refuses that ask
 without inventing a user message or ending ordinary caller audio/delegation.
-The first unscoped typed turn before any delivery hint remains supported. Once
-a hint has been queued, new typed user context refuses before the SDK append,
+The first unscoped typed turn before any live input or delivery hint remains supported.
+After ordinary PCM, provider events, runtime context append or a queued hint,
+new typed user context refuses before the SDK append,
 including after cancellation, expiry, preamble or a claimed delegation. None of
 these events proves that all older delegations have drained. Direct context
 updates use a non-best-effort refusal before either voice or backend history
 mutation. The existing Activity context method is fenced before its local
-history assignment; a new typed update also refuses while the real SDK context
-lock is busy. Existing tool results still reach their captured rounds. This is a
-negative capability fence, not an acknowledgement or authority proof. The hint
-contributes no instructions to backend history or tool contexts. A preamble can fulfill its
+history assignment: it stages and checks under the real SDK lock, and a busy lock
+refuses. Native/backend history, public native views, captured backend requests
+and tool results use detached message snapshots. Editing a shallow SDK Agent
+copy can alter the caller's own view but cannot rewrite retained backend history
+or bypass detection when submitted. Existing tool results still reach their captured rounds. This is a
+negative capability fence, not an acknowledgement or authority proof. Repeated
+genuinely unscoped replies remain supported (`None` means no new input/instructions).
+The hint contributes no instructions to backend history or tool contexts. A preamble can fulfill its
 playback future while its original 15-second application expiration remains;
 cancellation callbacks retire their own hint/timer. Caller audio and ordinary
 transcript-based delegations continue on the same socket. Each delegation and

@@ -317,7 +317,9 @@ async def test_gpt_scoped_typed_refusal_cannot_leak_to_later_ordinary_backend(
                         "end_ms": 100,
                     }
                 )
-                await ws.send_json(delegate("ordinary_after_scoped_refusal"))
+                await ws.send_json(
+                    delegate("ordinary_after_scoped_refusal_" + str(len(requests)))
+                )
             elif (
                 command["type"] == "session.commentary.append"
                 and command.get("delegation_id") is None
@@ -377,12 +379,13 @@ async def test_gpt_scoped_typed_refusal_cannot_leak_to_later_ordinary_backend(
             await asyncio.wait_for(actor.wait_for_idle(), 5)
             ordinary = actor.generate_reply(user_input=supported)
             await asyncio.wait_for(ordinary.wait_for_playout(), 5)
-            assert ordinary.exception() is None
+            assert isinstance(ordinary.exception(), llm.RealtimeError)
+            audio.frames.put_nowait(rtc.AudioFrame(b"\x01\x10" * 480, 24000, 1, 480))
             assert await asyncio.wait_for(assistant.get(), 5) == "ordinary answer"
             assert len(opened) == 1 and len(requests) == 2
             assert all(body["max_output_tokens"] == 123 for body in requests)
             assert "ordinary caller words" in json.dumps(requests[0]["input"])
-            assert supported in json.dumps(requests[1]["input"])
+            assert supported not in json.dumps(requests[1]["input"])
             histories = [
                 native.duplex_session._history,
                 native.chat_ctx,
@@ -390,11 +393,15 @@ async def test_gpt_scoped_typed_refusal_cannot_leak_to_later_ordinary_backend(
                 actor.current_agent.chat_ctx,
             ]
             assert all(
-                rejected not in history_text(ctx) and scoped not in history_text(ctx)
+                rejected not in history_text(ctx)
+                and scoped not in history_text(ctx)
+                and supported not in history_text(ctx)
                 for ctx in histories
             )
-            assert rejected not in json.dumps(commands) and scoped not in json.dumps(
-                commands
+            assert (
+                supported not in json.dumps(commands)
+                and rejected not in json.dumps(commands)
+                and scoped not in json.dumps(commands)
             ), "unsupported typed task reached the voice peer"
             assert rejected not in json.dumps(requests) and scoped not in json.dumps(
                 requests

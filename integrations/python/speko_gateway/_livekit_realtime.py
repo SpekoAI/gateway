@@ -18,6 +18,7 @@ from livekit.agents import NOT_GIVEN, NotGivenOr, llm, utils
 from livekit.agents.utils import is_given
 from livekit.agents.utils.aio.channel import ChanFull
 
+from ._livekit_context import snapshot_context
 from ._livekit_tools import _relay_tools
 from ._relay_transport import _error
 from .client import GatewayError
@@ -64,6 +65,15 @@ class _FrameworkTurnBinding:
 
         def reply(*args: Any, **options: Any) -> Any:
             for session in list(self.sessions):
+                if session._vad_input_seen and any(
+                    is_given(options.get(name, NOT_GIVEN))
+                    and options.get(name) is not None
+                    for name in ("user_message", "instructions")
+                ):
+                    raise GatewayError(
+                        "Typed reply requires provider input correlation",
+                        retryable=False,
+                    )
                 if session._unattributed_application_reply:
                     raise GatewayError(
                         "Explicit reply correlation is unavailable after provider interruption",
@@ -74,8 +84,18 @@ class _FrameworkTurnBinding:
         self.observed_reply = reply
         activity._generate_reply = reply
 
-        def bind_configuration(original: Any) -> Any:
+        def bind_configuration(name: str, original: Any) -> Any:
             async def configuration(*args: Any, **options: Any) -> Any:
+                if name == "update_chat_ctx":
+                    sessions = list(self.sessions)
+                    owner = self.activity()
+                    if len(sessions) != 1 or owner is None:
+                        raise GatewayError(
+                            "SDK context ownership is unavailable", retryable=False
+                        )
+                    return await sessions[0]._update_framework_context(
+                        owner, *args, **options
+                    )
                 for session in list(self.sessions):
                     session._check_context_boundary()
                 return await original(*args, **options)
@@ -83,7 +103,7 @@ class _FrameworkTurnBinding:
             return configuration
 
         self.observed_configuration = {
-            name: bind_configuration(method)
+            name: bind_configuration(name, method)
             for name, method in self.original_configuration.items()
         }
         for name, method in self.observed_configuration.items():
@@ -372,6 +392,11 @@ class _RealtimeSession(llm.RealtimeSession):
         self._generation: _Generation | None = None
         self._pending: deque[asyncio.Future[llm.GenerationCreatedEvent]] = deque()
         self._pending_timers: dict[asyncio.Future, asyncio.TimerHandle] = {}
+        self._contextual_futures: weakref.WeakSet[asyncio.Future] = weakref.WeakSet()
+        self._typed_context_queued = False
+        # Negative capability only: provider-VAD input can have another unseen
+        # response. No observed output/terminal establishes a drain barrier.
+        self._vad_input_seen = False
         self._resampler: rtc.AudioResampler | None = None
         self._input_rate: int | None = None
         self._input_hz = 16000 if self._google else 24000
@@ -502,7 +527,7 @@ class _RealtimeSession(llm.RealtimeSession):
 
     @property
     def chat_ctx(self) -> llm.ChatContext:
-        return self._chat_ctx.copy()
+        return snapshot_context(self._chat_ctx)
 
     @property
     def tools(self) -> llm.ToolContext:
@@ -571,10 +596,12 @@ class _RealtimeSession(llm.RealtimeSession):
 
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
         if not self._configured.is_set():
-            self._chat_ctx = chat_ctx.copy()
+            self._chat_ctx = snapshot_context(chat_ctx)
             return
         self._check_explicit_reply_owner()
         await self._ready
+        self._preflight_context(chat_ctx)
+        chat_ctx = snapshot_context(chat_ctx)
         items = [
             item
             for item in chat_ctx.items
@@ -643,7 +670,100 @@ class _RealtimeSession(llm.RealtimeSession):
                         }
                     )
             self._known_items = wanted
-        self._chat_ctx = chat_ctx.copy()
+        if any(
+            isinstance(item, llm.ChatMessage)
+            and item.role == "user"
+            and item.id not in {old.id for old in self._chat_ctx.items}
+            for item in items
+        ):
+            self._typed_context_queued = True
+        self._chat_ctx = snapshot_context(chat_ctx)
+
+    def _preflight_context(self, chat_ctx: llm.ChatContext) -> None:
+        self._check_context_boundary()
+        previous = {item.id: item for item in self._chat_ctx.items}
+        changed_user = any(
+            isinstance(item, llm.ChatMessage)
+            and item.role == "user"
+            and (
+                item.id not in previous
+                or not isinstance(previous[item.id], llm.ChatMessage)
+                or previous[item.id].content != item.content
+                or previous[item.id].role != item.role
+            )
+            for item in chat_ctx.items
+        )
+        if not changed_user:
+            return
+        if self._vad_input_seen:
+            raise GatewayError(
+                "Typed context requires provider input correlation", retryable=False
+            )
+        if self._google:
+            if self._google_response_pending:
+                raise GatewayError(
+                    "Wait for the Gemini response to finish before adding typed context",
+                    retryable=False,
+                )
+            if self._manual_turns and (
+                self._audio_active or self._uncommitted_source_samples
+            ):
+                raise GatewayError(
+                    "Commit manual input before adding typed context", retryable=False
+                )
+        elif self._pending or self._generation is not None:
+            raise GatewayError(
+                "Wait for the realtime response to finish before adding typed context",
+                retryable=False,
+            )
+
+    async def _update_framework_context(
+        self,
+        owner: Any,
+        chat_ctx: llm.ChatContext,
+        *,
+        exclude_invalid_function_calls: bool = True,
+    ) -> None:
+        from livekit.agents.voice.generation import remove_instructions
+
+        staged = snapshot_context(chat_ctx)
+        lock = getattr(owner, "_rt_chat_ctx_lock", None)
+        if isinstance(lock, asyncio.Lock) and lock.locked():
+            raise GatewayError(
+                "SDK context update requires correlation while its lock is busy",
+                retryable=False,
+            )
+        await self.start()
+
+        async def apply() -> None:
+            self._check_framework_mode()
+            if owner._rt_session is not self:
+                raise GatewayError(
+                    "SDK context ownership is unavailable", retryable=False
+                )
+            context = snapshot_context(
+                staged.copy(
+                    tools=owner.tools if exclude_invalid_function_calls else NOT_GIVEN
+                )
+            )
+            remove_instructions(context)
+            self._preflight_context(context)
+            await self.update_chat_ctx(context)
+            # The original SDK assigns this BEFORE its native await. Publish
+            # only after native acceptance, with the real SDK lock held.
+            owner._agent._chat_ctx = snapshot_context(context)
+
+        if lock is None:
+            # 1.4.5/1.6.8 have no context lock. Readiness is already complete;
+            # preflight, native enqueue and assignment do not yield here.
+            await apply()
+        elif isinstance(lock, asyncio.Lock):
+            async with lock:
+                await apply()
+        else:
+            raise GatewayError(
+                "SDK context lock ownership is unavailable", retryable=False
+            )
 
     def update_options(
         self, *, tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN
@@ -696,6 +816,16 @@ class _RealtimeSession(llm.RealtimeSession):
         self._check_manual_input_boundary()
         if frame.num_channels != 1:
             raise ValueError("Realtime input must be mono PCM16")
+        if not self._manual_turns and frame.samples_per_channel:
+            if self._generation is None and any(
+                future in self._contextual_futures for future in self._pending
+            ):
+                failure = GatewayError(
+                    "Input overlaps an uncorrelated typed response", retryable=False
+                )
+                self._fatal(failure)
+                raise failure
+            self._vad_input_seen = True
         self._configured.set()
         if self._input_rate is None:
             self._input_rate = frame.sample_rate
@@ -847,6 +977,14 @@ class _RealtimeSession(llm.RealtimeSession):
                 llm.RealtimeError("A realtime reply is already pending")
             )
             return future
+        contextual = self._typed_context_queued or (
+            is_given(instructions) and instructions is not None
+        )
+        if self._vad_input_seen and contextual:
+            future.set_exception(
+                llm.RealtimeError("Typed reply requires provider input correlation")
+            )
+            return future
         if (
             self._google
             and self._manual_turns
@@ -872,6 +1010,9 @@ class _RealtimeSession(llm.RealtimeSession):
             return future
         self._configured.set()
         self._pending.append(future)
+        if contextual:
+            self._contextual_futures.add(future)
+        self._typed_context_queued = False
         future.add_done_callback(self._pending_cancelled)
         self._pending_timers[future] = asyncio.get_running_loop().call_later(
             self._model._client._setup_timeout, self._reply_timeout, future
@@ -924,6 +1065,7 @@ class _RealtimeSession(llm.RealtimeSession):
         )
 
     def _retire_pending(self, future: asyncio.Future) -> None:
+        self._contextual_futures.discard(future)
         self._google_interrupted_pending.discard(future)
         if future in self._pending:
             self._pending.remove(future)
@@ -1386,6 +1528,7 @@ class _RealtimeSession(llm.RealtimeSession):
                 timer.cancel()
             self._pending.clear()
             self._pending_timers.clear()
+            self._contextual_futures.clear()
             self._google_interrupted_pending.clear()
             self._provider_retired_futures.clear()
             if self._framework_binding is not None:
@@ -1423,6 +1566,8 @@ class _RealtimeSession(llm.RealtimeSession):
                 raise GatewayError("Realtime generations overlap", retryable=False)
             self._end()
         pending = self._pending.popleft() if self._pending else None
+        if pending is not None:
+            self._contextual_futures.discard(pending)
         generation = self._generation = _Generation(response_id, pending is not None)
         if pending is not None:
             self._pending_timers.pop(pending).cancel()
@@ -1542,9 +1687,13 @@ class _RealtimeSession(llm.RealtimeSession):
                     "Provider response correlation is unavailable after interruption",
                     retryable=False,
                 )
+            if not self._manual_turns and not self._pending:
+                self._vad_input_seen = True
             self._begin(event["response"]["id"])
             return
         if kind == "input_audio_buffer.speech_started":
+            if not self._manual_turns:
+                self._vad_input_seen = True
             self._user_started = time.time()
             if self._model._allow_interruptions and self._pending:
                 # No response ID exists for this request yet. Retire its real
@@ -1568,12 +1717,23 @@ class _RealtimeSession(llm.RealtimeSession):
                 self._provider_interruption_feedback = False
             return
         if kind == "input_audio_buffer.speech_stopped":
+            if not self._manual_turns:
+                self._vad_input_seen = True
             self.emit(
                 "input_speech_stopped",
                 llm.InputSpeechStoppedEvent(user_transcription_enabled=False),
             )
             return
         if kind == "conversation.item.input_audio_transcription.completed":
+            if not self._manual_turns:
+                self._vad_input_seen = True
+                if self._generation is None and any(
+                    future in self._contextual_futures for future in self._pending
+                ):
+                    raise GatewayError(
+                        "Provider input overlaps an uncorrelated typed response",
+                        retryable=False,
+                    )
             self._known_items.add(event["item_id"])
             self._chat_ctx.items.append(
                 llm.ChatMessage(
@@ -1675,6 +1835,15 @@ class _RealtimeSession(llm.RealtimeSession):
                 self._provider_interruption_feedback = False
         transcript = content.get("inputTranscription")
         if isinstance(transcript, dict) and transcript.get("text"):
+            if not self._manual_turns:
+                self._vad_input_seen = True
+                if self._generation is None and any(
+                    future in self._contextual_futures for future in self._pending
+                ):
+                    raise GatewayError(
+                        "Provider input overlaps an uncorrelated typed response",
+                        retryable=False,
+                    )
             self._input_item = self._input_item or "google_user_" + uuid.uuid4().hex
             self._input_text += transcript["text"]
             if len(self._input_text) > 128 << 10:
@@ -1696,6 +1865,8 @@ class _RealtimeSession(llm.RealtimeSession):
             and self._generation is None
             and not self._google_response_interrupted
         ):
+            if not self._manual_turns and not self._pending:
+                self._vad_input_seen = True
             self._google_response_pending = True
             self._begin("google_response_" + uuid.uuid4().hex)
         generation = self._generation
@@ -1777,6 +1948,7 @@ class _RealtimeSession(llm.RealtimeSession):
                 future.set_exception(llm.RealtimeError("Realtime session is closed"))
         self._pending.clear()
         self._pending_timers.clear()
+        self._contextual_futures.clear()
         self._google_interrupted_pending.clear()
         self._provider_retired_futures.clear()
         if self._framework_binding is not None:

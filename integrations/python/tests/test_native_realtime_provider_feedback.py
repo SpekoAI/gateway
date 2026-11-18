@@ -229,9 +229,8 @@ async def server_answer(ws, identity, text):
 async def test_server_vad_preoutput_feedback_retires_future_before_new_input_refusal(
     native_binary, monkeypatch, protocol, model_name, voice, action
 ):
-    source = OwnedAudioInput()
     sockets, futures, words = (asyncio.Queue() for _ in range(3))
-    requested, feedback, closed, stop = (asyncio.Event() for _ in range(4))
+    requested, feedback, closed = (asyncio.Event() for _ in range(3))
     commands, pcm = [], bytearray()
 
     async def peer(request):
@@ -252,11 +251,6 @@ async def test_server_vad_preoutput_feedback_retires_future_before_new_input_ref
             closed.set()
         return ws
 
-    async def microphone():
-        while not stop.is_set():
-            source.frames.put_nowait(rtc.AudioFrame(b"\x02\x10" * 480, 24000, 1, 480))
-            await asyncio.sleep(0.02)
-
     async with native_stack(native_binary, peer) as (socket, _):
         client = RelayRealtimeClient(
             api_key=MODEL_KEY,
@@ -268,7 +262,8 @@ async def test_server_vad_preoutput_feedback_retires_future_before_new_input_ref
         actor = AgentSession(
             llm=model, turn_detection="realtime_llm", vad=None, stt=None, tts=None
         )
-        actor.input.audio = source
+        # The explicit task precedes caller input. The continuous-source case
+        # below retains the original input-byte assertions for ordinary flow.
         actor.on(
             "conversation_item_added",
             lambda event: (
@@ -278,7 +273,6 @@ async def test_server_vad_preoutput_feedback_retires_future_before_new_input_ref
                 else None
             ),
         )
-        producer = asyncio.create_task(microphone())
         try:
             await start_agent(actor)
             native = next(iter(model._sessions))
@@ -326,10 +320,11 @@ async def test_server_vad_preoutput_feedback_retires_future_before_new_input_ref
             assert (
                 timer.cancelled() and not native._pending and not native._pending_timers
             )
+            with pytest.raises(GatewayError, match="correlation"):
+                native.push_audio(rtc.AudioFrame(b"\x02\x10" * 480, 24000, 1, 480))
             # No response ID can distinguish the interrupted application ask
-            # from a new caller answer. The continuously connected source is
-            # refused BEFORE its next frame is accepted; this is not advertised
-            # as a healthy caller-continuation lifecycle.
+            # from a new caller answer. The next source frame refuses before
+            # acceptance; this ambiguous lifecycle has no caller continuation.
             await asyncio.wait_for(closed.wait(), 5)
             await asyncio.wait_for(asyncio.shield(native._task), 5)
             assert native._failure is not None and "correlation" in str(native._failure)
@@ -338,12 +333,8 @@ async def test_server_vad_preoutput_feedback_retires_future_before_new_input_ref
             assert not any(
                 c.get("type") == "input_audio_buffer.commit" for c in commands
             )
-            assert pcm and len(pcm) % 960 == 0
+            assert not pcm, "new input must be refused before physical acceptance"
         finally:
-            stop.set()
-            producer.cancel()
-            await asyncio.gather(producer, return_exceptions=True)
-            source.frames.put_nowait(None)
             await actor.aclose()
             await model.aclose()
             await client.aclose()
