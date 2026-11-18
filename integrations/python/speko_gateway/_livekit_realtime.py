@@ -853,6 +853,9 @@ class _RealtimeSession(llm.RealtimeSession):
                 for task in done:
                     task.result()
             finally:
+                # Reader cancellation can race an already-completed receive on
+                # Python 3.10. Stop physical I/O before joining either task.
+                self._socket.abort()
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
         except asyncio.CancelledError:
@@ -1182,10 +1185,12 @@ class _RealtimeSession(llm.RealtimeSession):
         self._closed = True
         self._resampler = None
         self._configured.set()
+        self._commands.close()
+        if self._socket is not None:
+            self._socket.abort()
         if self._running:
             self._task.cancel()
         await asyncio.gather(self._task, return_exceptions=True)
-        self._commands.close()
         if not self._ready.done():
             self._ready.set_exception(
                 GatewayError("Realtime session is closed", retryable=False)

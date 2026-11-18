@@ -559,11 +559,13 @@ async def test_gemini_resampled_onset_and_remainder_keep_one_complete_activity(
 
 
 @pytest.mark.parametrize("kind", ["idle_then_speech", "long_manual_speech"])
+@pytest.mark.parametrize("manual", [True, False])
 async def test_gemini_agent_streams_healthy_idle_and_long_manual_input(
-    native_binary, kind
+    native_binary, kind, manual
 ):
     if (
-        "can_disable_turn_detection"
+        manual
+        and "can_disable_turn_detection"
         not in llm.RealtimeCapabilities.__dataclass_fields__
     ):
         pytest.skip("SDK cannot negotiate explicit manual AgentSession turns")
@@ -586,11 +588,15 @@ async def test_gemini_agent_streams_healthy_idle_and_long_manual_input(
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         setup = await ws.receive_json()
-        assert setup["setup"]["realtimeInputConfig"]["automaticActivityDetection"][
-            "disabled"
-        ]
+        assert (
+            setup["setup"]["realtimeInputConfig"]["automaticActivityDetection"][
+                "disabled"
+            ]
+            is manual
+        )
         await ws.send_json({"setupComplete": {}})
-        assert await ws.receive_json() == {"realtimeInput": {"activityStart": {}}}
+        if manual:
+            assert await ws.receive_json() == {"realtimeInput": {"activityStart": {}}}
         async for msg in ws:
             control = json.loads(msg.data)["realtimeInput"]
             if "activityEnd" in control:
@@ -599,6 +605,8 @@ async def test_gemini_agent_streams_healthy_idle_and_long_manual_input(
             received.extend(base64.b64decode(control["audio"]["data"]))
             if len(received) == len(expected):
                 complete.set()
+                if not manual:
+                    ended.set()
         async for _ in ws:
             pass
         closed.set()
@@ -607,7 +615,11 @@ async def test_gemini_agent_streams_healthy_idle_and_long_manual_input(
     async with native_stack(native_binary, peer) as (socket, _):
         client, model = client_model(socket)
         session = AgentSession(
-            llm=model, turn_detection="manual", stt=None, tts=None, vad=None
+            llm=model,
+            turn_detection="manual" if manual else "realtime_llm",
+            stt=None,
+            tts=None,
+            vad=None,
         )
         session.input.audio = audio
         session.on("error", errors.append)
@@ -729,7 +741,16 @@ async def test_gemini_uncommitted_manual_input_refuses_reply_without_splitting_t
             assert controls == [{"activityStart": {}}, {"activityEnd": {}}]
             assert len(opened) == 1 and native._failure is None
         finally:
-            await native.aclose()
+            closing = asyncio.create_task(native.aclose())
+            try:
+                done, _ = await asyncio.wait({closing}, timeout=2)
+                assert closing in done, (
+                    "native close joined before stopping its physical reader"
+                )
+            finally:
+                if native._socket is not None:
+                    native._socket.abort()
+                await asyncio.gather(closing, return_exceptions=True)
             await model.aclose()
             await client.aclose()
 
@@ -790,6 +811,67 @@ async def test_gemini_input_loss_or_backpressure_closes_one_owned_transport(
             assert len(opened) == 1
         finally:
             release.set()
+            await native.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_gemini_sdk_close_joins_with_its_event_consumer_paused(
+    native_binary, monkeypatch
+):
+    from speko_gateway.relay_realtime import RelayRealtimeSession
+
+    paused, closed, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    opened = []
+    original_events = RelayRealtimeSession.events
+
+    async def paused_events(transport):
+        events = original_events(transport)
+        try:
+            yield await anext(events)  # Actual provider setupComplete.
+            paused.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                # A paused/lost cancellation must not own physical shutdown.
+                pass
+            await closed.wait()
+        finally:
+            await events.aclose()
+
+    monkeypatch.setattr(RelayRealtimeSession, "events", paused_events)
+
+    async def peer(request):
+        opened.append(request.path)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"setupComplete": {}})
+        async for _ in ws:
+            pass
+        closed.set()
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        client, model = client_model(socket)
+        native = model.session(turn_detection_disabled=True)
+        closing = None
+        try:
+            await native._update_session(tools=[])
+            await native.start()
+            await asyncio.wait_for(paused.wait(), 5)
+            closing = asyncio.create_task(native.aclose())
+            done, _ = await asyncio.wait({closing}, timeout=2)
+            assert closed.is_set() and closing in done, (
+                "paused consumer retained physical I/O during SDK close"
+            )
+            assert native._task.done() and len(opened) == 1
+        finally:
+            release.set()
+            if native._socket is not None:
+                native._socket.abort()
+            if closing is not None:
+                await asyncio.gather(closing, return_exceptions=True)
             await native.aclose()
             await model.aclose()
             await client.aclose()
