@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
+import inspect
 import json
 import time
 import uuid
@@ -20,24 +21,18 @@ from livekit.agents.utils.aio.channel import ChanFull
 from ._livekit_tools import _relay_tools
 from ._relay_transport import _error
 from .client import GatewayError
-from .relay_realtime import RealtimeProtocol, RelayRealtimeClient, RelayRealtimeSession
+from .relay_realtime import (
+    _FRAME_BYTES,
+    RealtimeProtocol,
+    RelayRealtimeClient,
+    RelayRealtimeSession,
+)
 
 _PROVIDERS = {
     "openai.realtime.v1": "openai",
     "xai.realtime.v1": "xai",
     "google.live.v1": "google",
 }
-_INPUT_HOLD_SECONDS = 2.0
-_INPUT_HOLD_BYTES = 16000 * 2 * 2
-
-
-@dataclasses.dataclass(eq=False)
-class _HeldInput:
-    until: float
-    rollover: bool
-    pcm: bytearray = dataclasses.field(default_factory=bytearray, repr=False)
-    source_samples: int = 0
-    timer: asyncio.TimerHandle | None = dataclasses.field(default=None, repr=False)
 
 
 def _transcription(**fields: Any) -> llm.InputTranscriptionCompleted:
@@ -116,10 +111,55 @@ class RealtimeModel(llm.RealtimeModel):
     def session(self, *, turn_detection_disabled: bool = False) -> _RealtimeSession:
         if self._closed or self._used:
             raise GatewayError("Realtime model attempt is exhausted", retryable=False)
+        self._validate_sdk_turn_mode(turn_detection_disabled)
         self._used = True
         session = _RealtimeSession(self, turn_detection_disabled)
         self._sessions.add(session)
         return session
+
+    def _validate_sdk_turn_mode(self, disabled: bool) -> None:
+        if self._protocol != "google.live.v1":
+            return
+        from livekit.agents.voice.agent_activity import AgentActivity
+
+        # The SDK session() port passes only a boolean, shared by manual and
+        # asynchronous client-VAD modes. Inspect its actual typed owner at this
+        # synchronous construction boundary; do not install a new audio/VAD
+        # callback or treat an arrival timestamp as a capture frontier. Direct
+        # callers of session(disabled=True) own explicit commit boundaries.
+        frame = inspect.currentframe()
+        try:
+            for _ in range(64):
+                if frame is None:
+                    break
+                owner = frame.f_locals.get("self")
+                if isinstance(owner, AgentActivity) and owner.llm is self:
+                    mode = owner._turn_detection
+                    requested = owner._agent.turn_detection
+                    if not is_given(requested):
+                        requested = owner._session.turn_detection
+                    if requested in ("vad", "stt"):
+                        raise GatewayError(
+                            "Gemini asynchronous VAD requires correlated input capture",
+                            retryable=False,
+                        )
+                    if (disabled and mode != "manual") or mode in ("vad", "stt"):
+                        raise GatewayError(
+                            "Gemini asynchronous VAD requires correlated input capture",
+                            retryable=False,
+                        )
+                    if mode == "manual" and (
+                        not disabled
+                        or getattr(owner, "_interruption_detection_enabled", False)
+                    ):
+                        raise GatewayError(
+                            "Gemini manual input requires explicit negotiated turn ownership",
+                            retryable=False,
+                        )
+                    return
+                frame = frame.f_back
+        finally:
+            del frame
 
     async def aclose(self) -> None:
         self._closed = True
@@ -200,9 +240,8 @@ class _RealtimeSession(llm.RealtimeSession):
         self._configured = asyncio.Event()
         self._ready = asyncio.get_running_loop().create_future()
         self._ready.add_done_callback(self._observe_future)
-        self._commands = utils.aio.Chan[dict[str, Any] | _HeldInput](maxsize=256)
-        self._held_input: _HeldInput | None = None
-        self._input_holds: set[_HeldInput] = set()
+        self._commands = utils.aio.Chan[str](maxsize=256)
+        self._queued_input_bytes = 0
         self._socket: RelayRealtimeSession | None = None
         self._generation: _Generation | None = None
         self._pending: deque[asyncio.Future[llm.GenerationCreatedEvent]] = deque()
@@ -346,11 +385,21 @@ class _RealtimeSession(llm.RealtimeSession):
             raise llm.RealtimeError("Gemini per-response tool choice is unavailable")
         self._tool_choice = tool_choice
 
-    def _enqueue(self, event: dict[str, Any] | _HeldInput) -> None:
+    def _enqueue(self, event: dict[str, Any]) -> None:
         if self._closed or self._failure is not None:
             raise llm.RealtimeError("Realtime session is closed")
+        packet = json.dumps(
+            event, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        size = len(packet.encode("utf-8"))
+        if size > _FRAME_BYTES or self._queued_input_bytes + size > _FRAME_BYTES:
+            self._fatal(
+                GatewayError("Realtime input exceeds its byte bound", retryable=False)
+            )
+            return
         try:
-            self._commands.send_nowait(event)
+            self._commands.send_nowait(packet)
+            self._queued_input_bytes += size
         except ChanFull:
             self._fatal(
                 GatewayError("Realtime input exceeds its bound", retryable=False)
@@ -360,46 +409,14 @@ class _RealtimeSession(llm.RealtimeSession):
         if self._closed or self._failure is not None:
             raise llm.RealtimeError("Realtime session is closed")
         self._user_started = time.time()
-        if self._google and self._manual_turns:
-            rollover = self._audio_active and (
-                self._held_input is not None
-                and self._held_input.rollover
-                or self._model._allow_interruptions
-                and self._generation is not None
-                and not self._generation.interrupted
-                and self._activity_interrupt_target is not self._generation
-            )
-            if self._held_input is not None or rollover:
-                self._flush_input_resampler()
-            if self._failure is not None:
-                return
-            if self._held_input is not None and not self._held_input.pcm:
-                self._fatal(
-                    GatewayError(
-                        "Realtime input could not retain captured audio",
-                        retryable=False,
-                    )
-                )
-                return
-            if rollover:
-                # End only the older activity. Its already-dispatched PCM is
-                # never replayed: the unresolved onset is still held locally.
-                self._enqueue({"realtimeInput": {"activityEnd": {}}})
-                self._audio_active = False
-            if not self._audio_active:
-                self._enqueue({"realtimeInput": {"activityStart": {}}})
-                self._audio_active = True
-                self._activity_interrupt_target = self._generation
-            if self._held_input is not None:
-                held, self._held_input = self._held_input, None
-                # Keep its FIRST capture deadline through queueing and the
-                # physical write; a VAD callback cannot refresh that bound.
-                self._enqueue(held)
+        if self._google and self._manual_turns and not self._audio_active:
+            self._enqueue({"realtimeInput": {"activityStart": {}}})
+            self._audio_active = True
+            self._activity_interrupt_target = self._generation
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if self._closed or self._failure is not None:
             raise llm.RealtimeError("Realtime session is closed")
-        captured_at = asyncio.get_running_loop().time()
         if frame.num_channels != 1:
             raise ValueError("Realtime input must be mono PCM16")
         self._configured.set()
@@ -413,100 +430,33 @@ class _RealtimeSession(llm.RealtimeSession):
                 )
         if frame.sample_rate != self._input_rate:
             raise ValueError("Realtime input rate cannot change during a session")
-        if self._holding_input():
-            if self._held_input is None:
-                loop = asyncio.get_running_loop()
-                held = self._held_input = _HeldInput(
-                    until=captured_at + _INPUT_HOLD_SECONDS,
-                    rollover=self._audio_active,
-                )
-                self._input_holds.add(held)
-                held.timer = loop.call_at(held.until, self._expire_input, held)
-            self._held_input.source_samples += frame.samples_per_channel
-            if (
-                self._held_input.source_samples
-                > frame.sample_rate * _INPUT_HOLD_SECONDS
-            ):
-                self._fatal(
-                    GatewayError(
-                        "Unresolved realtime input exceeds its bound", retryable=False
-                    )
-                )
-                return
         for converted in self._resampler.push(frame) if self._resampler else [frame]:
             self._send_audio(bytes(converted.data))
-
-    def _holding_input(self) -> bool:
-        return (
-            self._google
-            and self._manual_turns
-            and (
-                self._held_input is not None
-                or not self._audio_active
-                or self._generation is not None
-                and self._activity_interrupt_target is not self._generation
-            )
-        )
-
-    def _hold_pcm(self, pcm: bytes) -> None:
-        held = self._held_input
-        if held is None or len(held.pcm) + len(pcm) > _INPUT_HOLD_BYTES:
-            self._fatal(
-                GatewayError(
-                    "Unresolved realtime input exceeds its bound", retryable=False
-                )
-            )
-            return
-        held.pcm.extend(pcm)
-
-    def _expire_input(self, held: _HeldInput) -> None:
-        if held in self._input_holds:
-            self._fatal(
-                GatewayError("Unresolved realtime input expired", retryable=False)
-            )
-
-    def _release_input(self, held: _HeldInput) -> None:
-        if held.timer is not None:
-            held.timer.cancel()
-        held.pcm.clear()
-        self._input_holds.discard(held)
-        if self._held_input is held:
-            self._held_input = None
-
-    def _clear_input_holds(self) -> None:
-        for held in tuple(self._input_holds):
-            self._release_input(held)
-        self._resampler = None
-
-    def _flush_input_resampler(self) -> None:
-        if self._resampler is not None:
-            for frame in self._resampler.flush():
-                pcm = bytes(frame.data)
-                if self._held_input is not None:
-                    self._hold_pcm(pcm)
-                elif pcm:
-                    self._enqueue(self._audio_event(pcm))
 
     def _send_audio(self, pcm: bytes) -> None:
         if not pcm:
             return
-        if self._holding_input():
-            self._hold_pcm(pcm)
+        if len(pcm) > (_FRAME_BYTES - 1024) * 3 // 4:
+            self._fatal(
+                GatewayError("Realtime audio frame exceeds its bound", retryable=False)
+            )
             return
-        self._enqueue(self._audio_event(pcm))
-
-    def _audio_event(self, pcm: bytes) -> dict[str, Any]:
         encoded = base64.b64encode(pcm).decode("ascii")
         if self._google:
-            return {
-                "realtimeInput": {
-                    "audio": {
-                        "data": encoded,
-                        "mimeType": f"audio/pcm;rate={self._input_hz}",
+            if self._manual_turns and not self._audio_active:
+                self.start_user_activity()
+            self._enqueue(
+                {
+                    "realtimeInput": {
+                        "audio": {
+                            "data": encoded,
+                            "mimeType": f"audio/pcm;rate={self._input_hz}",
+                        }
                     }
                 }
-            }
-        return {"type": "input_audio_buffer.append", "audio": encoded}
+            )
+        else:
+            self._enqueue({"type": "input_audio_buffer.append", "audio": encoded})
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
         raise llm.RealtimeError("This realtime model accepts audio only")
@@ -514,12 +464,10 @@ class _RealtimeSession(llm.RealtimeSession):
     def commit_audio(self) -> None:
         if self._closed or self._failure is not None:
             raise llm.RealtimeError("Realtime session is closed")
-        self._flush_input_resampler()
-        if self._failure is not None:
-            return
+        if self._resampler:
+            for frame in self._resampler.flush():
+                self._send_audio(bytes(frame.data))
         if self._google:
-            if self._manual_turns and self._held_input is not None:
-                self.start_user_activity()
             if self._manual_turns and self._audio_active:
                 self._enqueue({"realtimeInput": {"activityEnd": {}}})
                 self._audio_active = False
@@ -531,23 +479,12 @@ class _RealtimeSession(llm.RealtimeSession):
     def clear_audio(self) -> None:
         if not self._google:
             self._enqueue({"type": "input_audio_buffer.clear"})
-        elif self._input_holds:
-            if self._held_input is None or len(self._input_holds) != 1:
-                self._fatal(
-                    GatewayError(
-                        "Queued realtime input cannot be cleared", retryable=False
-                    )
+        elif self._manual_turns and self._audio_active:
+            self._fatal(
+                GatewayError(
+                    "Gemini cannot clear already forwarded manual input",
+                    retryable=False,
                 )
-                return
-            self._release_input(self._held_input)
-            self._resampler = (
-                rtc.AudioResampler(
-                    input_rate=self._input_rate,
-                    output_rate=self._input_hz,
-                    num_channels=1,
-                )
-                if self._input_rate is not None and self._input_rate != self._input_hz
-                else None
             )
 
     def generate_reply(
@@ -565,6 +502,11 @@ class _RealtimeSession(llm.RealtimeSession):
         if self._pending:
             future.set_exception(
                 llm.RealtimeError("A realtime reply is already pending")
+            )
+            return future
+        if self._google and self._manual_turns and self._audio_active:
+            future.set_exception(
+                llm.RealtimeError("Commit manual input before requesting a reply")
             )
             return future
         self._configured.set()
@@ -884,25 +826,12 @@ class _RealtimeSession(llm.RealtimeSession):
 
             async def send() -> None:
                 async for command in self._commands:
-                    if isinstance(command, _HeldInput):
-                        try:
-                            remaining = (
-                                command.until - asyncio.get_running_loop().time()
-                            )
-                            if remaining <= 0:
-                                raise GatewayError(
-                                    "Unresolved realtime input expired", retryable=False
-                                )
-                            await asyncio.wait_for(
-                                self._socket.send_json(
-                                    self._audio_event(bytes(command.pcm))
-                                ),
-                                remaining,
-                            )
-                        finally:
-                            self._release_input(command)
-                    else:
-                        await self._socket.send_json(command)
+                    try:
+                        await self._socket.send(command)
+                    finally:
+                        self._queued_input_bytes = max(
+                            0, self._queued_input_bytes - len(command.encode("utf-8"))
+                        )
 
             writer = asyncio.create_task(send())
 
@@ -935,8 +864,11 @@ class _RealtimeSession(llm.RealtimeSession):
                 else GatewayError("Realtime session failed", retryable=False)
             )
         finally:
-            self._clear_input_holds()
+            self._resampler = None
             self._commands.close()
+            while not self._commands.empty():
+                self._commands.recv_nowait()
+            self._queued_input_bytes = 0
             if self._socket is not None:
                 self._socket.abort()
             if writer is not None:
@@ -972,7 +904,7 @@ class _RealtimeSession(llm.RealtimeSession):
     def _fatal(self, failure: GatewayError) -> None:
         if self._failure is None:
             self._failure = failure
-            self._clear_input_holds()
+            self._resampler = None
             self._configured.set()
             # Stop physical I/O before cancellation/join. Python 3.10 can lose
             # task cancellation when an awaited producer completes concurrently.
@@ -1248,7 +1180,7 @@ class _RealtimeSession(llm.RealtimeSession):
 
     async def aclose(self) -> None:
         self._closed = True
-        self._clear_input_holds()
+        self._resampler = None
         self._configured.set()
         if self._running:
             self._task.cancel()

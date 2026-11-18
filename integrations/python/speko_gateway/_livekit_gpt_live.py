@@ -175,6 +175,7 @@ class _GPTLiveSession(_Session):
         self._pending_reply_future: asyncio.Future | None = None
         self._pending_reply_timer: asyncio.TimerHandle | None = None
         self._reply_attribution_lost = False
+        self._ordinary_input_seen = False
         self._socket: RelayRealtimeSession | None = None
         self._resampler: rtc.AudioResampler | None = None
         self._input_format: tuple[int, int] | None = None
@@ -208,6 +209,9 @@ class _GPTLiveSession(_Session):
             raise _failure() from None
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
+        if frame.samples_per_channel:
+            self._ordinary_input_seen = True
+            self._retire_pending_reply()
         current = frame.sample_rate, frame.num_channels
         if frame.num_channels != 1:
             raise ValueError("GPT-Live input must be mono PCM")
@@ -272,6 +276,7 @@ class _GPTLiveSession(_Session):
                 )
             self._remember([item])
             if isinstance(item, llm.ChatMessage) and item.role == "user":
+                self._ordinary_input_seen = True
                 self._retire_pending_reply()
             if self._started and isinstance(item, llm.ChatMessage):
                 text = item.text_content
@@ -299,7 +304,11 @@ class _GPTLiveSession(_Session):
         pending = self._pending_reply_future
         if pending is not None and pending.cancelled():
             self._retire_pending_reply(pending)
-        if self._reply_attribution_lost or self._pending_reply_instructions is not None:
+        if (
+            self._ordinary_input_seen
+            or self._reply_attribution_lost
+            or self._pending_reply_instructions is not None
+        ):
             # No provider ask ID/drain barrier distinguishes a late OLD
             # delegation from the next request. Keep caller audio/delegation
             # live, but never install replacement instructions by guesswork.
@@ -398,6 +407,7 @@ class _GPTLiveSession(_Session):
         }:
             text = _text(event.get("delta"))
             if kind == "session.input_transcript.delta" and text:
+                self._ordinary_input_seen = True
                 # New caller words supersede an unclaimed one-off task. They
                 # remain transcript fragments, never a fabricated complete turn.
                 self._retire_pending_reply()
@@ -447,6 +457,8 @@ class _GPTLiveSession(_Session):
             if len(self._seen_delegations) >= 128:
                 raise _failure()
             self._seen_delegations.add(identity)
+            if self._pending_reply_instructions is None:
+                self._ordinary_input_seen = True
             context = self._history.copy()
             if self._instructions:
                 context.items.insert(

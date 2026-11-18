@@ -1125,3 +1125,84 @@ async def test_gpt_live_preserves_quiet_tool_policy_and_native_append_bounds(
             await backend.aclose()
             await backend_client.aclose()
             await voice.aclose()
+
+
+async def test_gpt_live_ordinary_inflight_delegation_cannot_claim_explicit_ask(
+    native_binary,
+):
+    requests, commands = [], []
+    transcript, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    marker = "NEW_ONE_OFF_NOT_FOR_OLD_CALLER"
+
+    async def peer(request):
+        if request.path == "/v1/llm/responses":
+            requests.append(await request.json())
+            return response(
+                [
+                    ("response.text.delta", {"delta": "ordinary answer"}),
+                    ("response.completed", {}),
+                ]
+            )
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"type": "session.started"})
+        await ws.send_json(
+            {
+                "type": "session.input_transcript.delta",
+                "delta": "prior caller",
+                "start_ms": 0,
+                "end_ms": 100,
+            }
+        )
+        transcript.set()
+        await release.wait()
+        for identity in ("old_ordinary", "next_ordinary"):
+            await ws.send_json(
+                {
+                    "type": "session.delegation.created",
+                    "offset_ms": 100,
+                    "delegation": {"id": identity, "target": "client"},
+                }
+            )
+            while True:
+                command = await ws.receive_json()
+                commands.append(command)
+                if command.get("delegation_id") == identity:
+                    break
+        finished.set()
+        async for message in ws:
+            if json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "session.closed"})
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        voice, backend_client, backend, model = models(socket)
+        session = model.session()
+        attempt = None
+        try:
+            await session._update_session(instructions="Permanent prompt", tools=[])
+            await session.start()
+            await transcript.wait()
+            while not session.duplex_session._fragments:
+                await asyncio.sleep(0)
+            attempt = session.generate_reply(instructions=marker)
+            release.set()
+            await asyncio.wait_for(finished.wait(), 5)
+            assert len(requests) == 2
+            assert marker not in json.dumps(requests[0]["input"]), (
+                "old ordinary delegation consumed the new explicit task"
+            )
+            assert marker not in json.dumps(requests[1]["input"])
+            assert attempt.done() and isinstance(attempt.exception(), llm.RealtimeError)
+            assert all(marker not in json.dumps(command) for command in commands)
+            assert session.duplex_session._failure is None
+        finally:
+            release.set()
+            if attempt is not None and not attempt.done():
+                attempt.cancel()
+            await session.aclose()
+            await model.aclose()
+            await backend.aclose()
+            await backend_client.aclose()
+            await voice.aclose()

@@ -11,7 +11,7 @@ import struct
 import pytest
 from aiohttp import web
 from livekit import rtc
-from livekit.agents import Agent, AgentSession, llm, vad
+from livekit.agents import Agent, AgentSession, llm
 from livekit.agents.voice import io
 from test_native_sidecar import LOCAL_TOKEN, MODEL_KEY, native_stack
 from test_native_sidecar import native_binary as native_binary  # noqa: PLC0414
@@ -73,7 +73,7 @@ async def test_gemini_spoken_context_update_does_not_resend_audio_as_typed_input
     async with native_stack(native_binary, peer) as (socket, _):
         client, model = client_model(socket)
         session = AgentSession(
-            llm=model, turn_detection="manual", vad=None, stt=None, tts=None
+            llm=model, turn_detection="realtime_llm", vad=None, stt=None, tts=None
         )
         session.on("error", errors.append)
         session.on(
@@ -165,7 +165,7 @@ async def test_gemini_finishes_initial_history_before_live_audio(
 
 
 @pytest.mark.parametrize("manual", [False, True])
-@pytest.mark.parametrize("cause", ["provider", "explicit", "external_vad"])
+@pytest.mark.parametrize("cause", ["provider", "explicit"])
 async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
     native_binary,
     manual,
@@ -300,21 +300,6 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
             await asyncio.wait_for(audible.wait(), 5)
             if cause == "explicit":
                 await asyncio.wait_for(agent.interrupt(), 5)
-            elif cause == "external_vad":
-                # Exercise LiveKit's real external-VAD callback: it calls
-                # start_user_activity THEN interrupt while speech is active.
-                current_agent._activity.on_vad_inference_done(
-                    vad.VADEvent(
-                        type=vad.VADEventType.INFERENCE_DONE,
-                        samples_index=16000,
-                        timestamp=1,
-                        speech_duration=1,
-                        silence_duration=0,
-                        speaking=True,
-                    )
-                )
-                assert native._audio_active and native._generation.interrupted
-                assert native._failure is None, "genuine caller barge-in aborted I/O"
             await asyncio.wait_for(cleared.wait(), 5)
             assert captured and len(captured) < 100
             assert speech.interrupted
@@ -332,17 +317,13 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
                     {"realtimeInput": {"activityEnd": {}}},
                 ]
                 if cause == "explicit"
-                else [{"realtimeInput": {"activityStart": {}}}]
-                if cause == "external_vad"
                 else []
             ), (
                 "explicit cancellation must reach the provider; feedback must not reopen activity"
             )
             if manual:
-                expected = 2 if cause == "external_vad" else 3
-                assert len(second_turn) == expected
-                if cause != "external_vad":
-                    assert second_turn[0] == {"realtimeInput": {"activityStart": {}}}
+                assert len(second_turn) == 3
+                assert second_turn[0] == {"realtimeInput": {"activityStart": {}}}
                 assert "audio" in second_turn[-2]["realtimeInput"]
                 assert second_turn[-1] == {"realtimeInput": {"activityEnd": {}}}
             else:
@@ -376,7 +357,8 @@ async def test_gemini_manual_interrupt_closes_transport_when_control_is_unavaila
         await ws.send_json({"setupComplete": {}})
         if reason == "input_active":
             received.append(await ws.receive_json())
-        await ws.receive_json()  # The explicit reply request.
+        if reason != "input_active":
+            await ws.receive_json()  # The explicit reply request.
         await ws.send_json(
             {"serverContent": {"outputTranscription": {"text": "Active reply"}}}
         )
@@ -392,9 +374,13 @@ async def test_gemini_manual_interrupt_closes_transport_when_control_is_unavaila
         try:
             await session._update_session(instructions="Synthetic task", tools=[])
             await session.start()
+            generations = asyncio.Queue()
+            session.on("generation_created", generations.put_nowait)
             if reason == "input_active":
                 session.start_user_activity()
-            await asyncio.wait_for(session.generate_reply(instructions="Reply"), 5)
+                await asyncio.wait_for(generations.get(), 5)
+            else:
+                await asyncio.wait_for(session.generate_reply(instructions="Reply"), 5)
             session.interrupt()
             await asyncio.wait_for(closed.wait(), 5)
             await asyncio.wait_for(asyncio.shield(session._task), 5)
@@ -411,209 +397,28 @@ async def test_gemini_manual_interrupt_closes_transport_when_control_is_unavaila
             await client.aclose()
 
 
-@pytest.mark.parametrize(
-    "continuous_pcm", [b"\x00\x00", b"\x03\x10"], ids=["silence", "speech"]
-)
-@pytest.mark.parametrize("preexisting_activity", [False, True])
-async def test_gemini_continuous_input_before_response_preserves_real_vad_barge_in(
-    native_binary, continuous_pcm, preexisting_activity
+@pytest.mark.parametrize("turn_mode", ["vad", "stt"])
+async def test_gemini_async_turn_modes_refuse_before_native_input_can_split(
+    native_binary, turn_mode
 ):
-    if (
-        "can_disable_turn_detection"
-        not in llm.RealtimeCapabilities.__dataclass_fields__
-    ):
-        pytest.skip("framework cannot negotiate manual realtime turns")
-    from test_relay_speech_livekit import ControlledVAD, OwnedAudioInput
+    from test_relay_speech_livekit import ControlledVAD
 
-    detector, audio = ControlledVAD(), OwnedAudioInput()
-    audible, cleared, release_output = (asyncio.Event() for _ in range(3))
-    initial_seen, reply_seen, provider_cancelled, caller_seen, turn_ended = (
-        asyncio.Event() for _ in range(5)
-    )
-    synchronized, next_seen = asyncio.Event(), asyncio.Event()
-    opened, controls, turns, errors = [], [], [], []
-    initial_pcm, continuous_pcm = b"\x01\x10" * 480, continuous_pcm * 480
-    onset_pcm, remainder_pcm = b"\x04\x10" * 9600, b"\x06\x10" * 480
-    next_pcm, cancellation_starts = b"\x05\x10" * 480, 0
-
-    def frame(pcm):
-        return rtc.AudioFrame(pcm, 16000, 1, len(pcm) // 2)
-
-    class Output(io.AudioOutput):
-        def __init__(self):
-            options = {"label": "owned-continuous-playback"}
-            if "capabilities" in inspect.signature(io.AudioOutput).parameters:
-                options["capabilities"] = io.AudioOutputCapabilities(pause=False)
-            super().__init__(**options)
-
-        async def capture_frame(self, frame):
-            await super().capture_frame(frame)
-            audible.set()
-            await release_output.wait()
-
-        def flush(self):
-            super().flush()
-
-        def clear_buffer(self):
-            cleared.set()
-            self.on_playback_finished(playback_position=0, interrupted=True)
+    opened = []
 
     async def peer(request):
-        nonlocal cancellation_starts
         opened.append(request.path)
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        setup = await ws.receive_json()
-        assert (
-            setup["setup"]["realtimeInputConfig"]["activityHandling"]
-            == "START_OF_ACTIVITY_INTERRUPTS"
-        )
-        await ws.send_json({"setupComplete": {}})
-        active, generating = None, False
-
-        async def receive():
-            nonlocal active, generating, cancellation_starts
-            command = await ws.receive_json()
-            controls.append(command)
-            real = command.get("realtimeInput", {})
-            if "activityStart" in real:
-                assert active is None, "provider activity starts must stay balanced"
-                active = bytearray()
-                if generating:
-                    generating = False
-                    cancellation_starts += 1
-                    await ws.send_json(
-                        {"serverContent": {"interrupted": True, "turnComplete": True}}
-                    )
-                    provider_cancelled.set()
-            elif "audio" in real:
-                assert active is not None, "manual audio requires its own activity"
-                active.extend(base64.b64decode(real["audio"]["data"]))
-                if initial_pcm in active:
-                    initial_seen.set()
-                if remainder_pcm in active:
-                    caller_seen.set()
-            elif "activityEnd" in real:
-                assert active is not None, "provider activity ends must stay balanced"
-                assert active, "provider feedback produced an empty caller activity"
-                turns.append(bytes(active))
-                if remainder_pcm in active:
-                    turn_ended.set()
-                if next_pcm in active:
-                    next_seen.set()
-                active = None
-            return command
-
-        # The FIFO places already-forwarded continuous input before the reply,
-        # making the provider's generation boundary deterministic.
-        while "clientContent" not in await receive():
-            pass
-        reply_seen.set()
-        generating = True
-        await ws.send_json(
-            {
-                "serverContent": {
-                    "modelTurn": {
-                        "parts": [
-                            {
-                                "inlineData": {
-                                    "mimeType": "audio/pcm;rate=24000",
-                                    "data": base64.b64encode(
-                                        b"\x01\x10" * 48000
-                                    ).decode(),
-                                }
-                            }
-                        ]
-                    }
-                }
-            }
-        )
-        while True:
-            command = await receive()
-            if "clientContent" in command:
-                assert "Continuous input barrier" in str(command)
-                assert active is None, "provider feedback reopened caller activity"
-                synchronized.set()
-                break
-        while not next_seen.is_set():
-            await receive()
-        async for _ in ws:
-            pass
-        return ws
+        return web.Response(status=500)
 
     async with native_stack(native_binary, peer) as (socket, _):
         client, model = client_model(socket)
         session = AgentSession(
-            llm=model, turn_detection="vad", vad=detector, stt=None, tts=None
+            llm=model, turn_detection=turn_mode, vad=ControlledVAD(), stt=None, tts=None
         )
-        session.input.audio, session.output.audio = audio, Output()
-        session.on("error", errors.append)
         try:
-            agent = await start_agent(session)
-            native = next(iter(model._sessions))
-            audio.frames.put_nowait(frame(initial_pcm))
-            await asyncio.wait_for(detector.frames.get(), 5)
-            native.commit_audio()
-            await asyncio.wait_for(initial_seen.wait(), 5)
-            if preexisting_activity:
-                native.start_user_activity()
-            audio.frames.put_nowait(frame(continuous_pcm))
-            await asyncio.wait_for(detector.frames.get(), 5)
-            speech = session.generate_reply(instructions="Active synthetic response")
-            await asyncio.wait_for(reply_seen.wait(), 5)
-            await asyncio.wait_for(audible.wait(), 5)
-            assert native._activity_interrupt_target is not native._generation
-
-            # SDK1.8.10 forwards the identifiable onset to realtime BEFORE
-            # queueing it to VAD; only then release the actual async callback.
-            onset = frame(onset_pcm)
-            audio.frames.put_nowait(onset)
-            assert (
-                bytes((await asyncio.wait_for(detector.frames.get(), 5)).data)
-                == onset_pcm
-            )
-            detector.emit(
-                vad.VADEventType.INFERENCE_DONE, frames=[onset], speech_duration=0.6
-            )
-            await asyncio.wait_for(cleared.wait(), 5)
-            assert native._failure is None, "continuous input barge-in aborted I/O"
-            await asyncio.wait_for(provider_cancelled.wait(), 5)
-            assert speech.interrupted and native._audio_active
-            detector.emit(
-                vad.VADEventType.INFERENCE_DONE, frames=[], speech_duration=0.6
-            )
-            audio.frames.put_nowait(frame(remainder_pcm))
-            await asyncio.wait_for(detector.frames.get(), 5)
-            await asyncio.wait_for(caller_seen.wait(), 5)
-            native.commit_audio()
-            await asyncio.wait_for(turn_ended.wait(), 5)
-            context = agent.chat_ctx.copy()
-            context.add_message(role="user", content="Continuous input barrier")
-            await agent.update_chat_ctx(context)
-            await asyncio.wait_for(synchronized.wait(), 5)
-            audio.frames.put_nowait(frame(next_pcm))
-            await asyncio.wait_for(detector.frames.get(), 5)
-            native.commit_audio()
-            await asyncio.wait_for(next_seen.wait(), 5)
-
-            # Inspect physical provider turns and exact bytes, not method order.
-            assert (
-                b"".join(turns)
-                == initial_pcm + continuous_pcm + onset_pcm + remainder_pcm + next_pcm
-            )
-            onset_turns = [i for i, value in enumerate(turns) if onset_pcm in value]
-            remainder_turns = [
-                i for i, value in enumerate(turns) if remainder_pcm in value
-            ]
-            assert onset_turns == remainder_turns and len(onset_turns) == 1, (
-                "caller onset and remainder were split across provider turns"
-            )
-            assert turns[onset_turns[0]].endswith(onset_pcm + remainder_pcm)
-            assert cancellation_starts == 1
-            assert len(opened) == 1 and errors == [] and native._failure is None
+            with pytest.raises(GatewayError, match="correlated.*capture"):
+                await start_agent(session)
+            assert opened == [] and not client._attempted
         finally:
-            release_output.set()
-            audio.frames.put_nowait(None)
             await session.aclose()
             await model.aclose()
             await client.aclose()
@@ -703,168 +508,6 @@ async def test_native_socket_abort_closes_paused_reader_and_prevents_redial(
             await client.aclose()
 
 
-@pytest.mark.parametrize(
-    "stop",
-    [
-        "samples",
-        "bytes",
-        "pending_deadline",
-        "queued_deadline",
-        "resampler_deadline",
-        "unrepresentable",
-        "queued_clear",
-        "close",
-    ],
-)
-async def test_gemini_retained_input_is_bounded_and_physically_closed(
-    native_binary, monkeypatch, stop
-):
-    from speko_gateway import _livekit_realtime as implementation
-
-    queued = stop in ("queued_deadline", "queued_clear")
-    if "deadline" in stop:
-        monkeypatch.setattr(implementation, "_INPUT_HOLD_SECONDS", 0.1)
-    if stop == "bytes":
-        monkeypatch.setattr(implementation, "_INPUT_HOLD_BYTES", 8)
-    setup_seen, peer_closed = asyncio.Event(), asyncio.Event()
-    opened, delivered, errors = [], [], []
-
-    async def peer(request):
-        opened.append(request.path)
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        await ws.receive_json()
-        setup_seen.set()
-        if not queued:
-            await ws.send_json({"setupComplete": {}})
-        async for message in ws:
-            delivered.append(json.loads(message.data))
-        peer_closed.set()
-        return ws
-
-    async with native_stack(native_binary, peer) as (socket, _):
-        client, model = client_model(socket)
-        session = model.session(turn_detection_disabled=True)
-        session.on("error", errors.append)
-        try:
-            await session._update_session(
-                instructions="Owned retained capture", tools=[]
-            )
-            await asyncio.wait_for(setup_seen.wait(), 5)
-            if not queued:
-                await session.start()
-            rate = 48000 if stop in ("resampler_deadline", "unrepresentable") else 16000
-            samples = 1 if rate == 48000 else 2 if stop == "bytes" else 320
-            session.push_audio(rtc.AudioFrame(b"\x03\x10" * samples, rate, 1, samples))
-            held = session._held_input
-            assert held is not None
-            original_deadline = held.until
-            if stop in ("resampler_deadline", "unrepresentable"):
-                assert not held.pcm, (
-                    "fixture must exercise pre-output resampler capture"
-                )
-            if stop == "samples":
-                session.push_audio(rtc.AudioFrame(b"\x04\x10" * 32000, 16000, 1, 32000))
-            elif stop == "bytes":
-                session.push_audio(rtc.AudioFrame(b"\x04\x10" * 8, 16000, 1, 8))
-            elif stop in ("queued_deadline", "queued_clear", "unrepresentable"):
-                session.commit_audio()
-                if stop != "unrepresentable":
-                    assert session._held_input is None and held in session._input_holds
-                    assert held.until == original_deadline
-                if stop == "queued_clear":
-                    session.clear_audio()
-            elif stop == "pending_deadline":
-                session.push_audio(rtc.AudioFrame(b"\x04\x10" * 320, 16000, 1, 320))
-                assert session._held_input is held and held.until == original_deadline
-            elif stop == "close":
-                await session.aclose()
-            await asyncio.wait_for(peer_closed.wait(), 2)
-            await asyncio.wait_for(asyncio.shield(session._task), 2)
-            assert not session._input_holds and session._held_input is None
-            assert not held.pcm and held.timer.cancelled()
-            assert delivered == [] and len(opened) == 1
-            if stop == "close":
-                assert errors == []
-            else:
-                assert len(errors) == 1 and not errors[0].recoverable
-                assert session._failure is not None and not session._failure.retryable
-                with pytest.raises(llm.RealtimeError, match="closed"):
-                    session.push_audio(rtc.AudioFrame(b"\x05\x10" * 320, 16000, 1, 320))
-            with pytest.raises(GatewayError, match="exhausted"):
-                await client.open(protocol="google.live.v1", model="gemini-3.8-live")
-        finally:
-            await session.aclose()
-            await model.aclose()
-            await client.aclose()
-
-
-async def test_gemini_clear_unresolved_resampled_input_keeps_only_the_next_capture(
-    native_binary,
-):
-    done = asyncio.Event()
-    turns, errors = [], []
-
-    async def peer(request):
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        await ws.receive_json()
-        await ws.send_json({"setupComplete": {}})
-        assert await ws.receive_json() == {"realtimeInput": {"activityStart": {}}}
-        audio = await ws.receive_json()
-        turns.append(base64.b64decode(audio["realtimeInput"]["audio"]["data"]))
-        assert await ws.receive_json() == {"realtimeInput": {"activityEnd": {}}}
-        done.set()
-        async for _ in ws:
-            pass
-        return ws
-
-    async with native_stack(native_binary, peer) as (socket, _):
-        client, model = client_model(socket)
-        session = model.session(turn_detection_disabled=True)
-        session.on("error", errors.append)
-        try:
-            await session._update_session(tools=[])
-            await session.start()
-            session.push_audio(rtc.AudioFrame(b"\x04\x10" * 4800, 48000, 1, 4800))
-            discarded = session._held_input
-            session.clear_audio()
-            assert not discarded.pcm and discarded.timer.cancelled()
-            original = rtc.AudioFrame(b"\x05\x20" * 4800, 48000, 1, 4800)
-            converter = rtc.AudioResampler(
-                input_rate=48000, output_rate=16000, num_channels=1
-            )
-            expected = b"".join(
-                bytes(frame.data)
-                for frame in converter.push(original) + converter.flush()
-            )
-            session.push_audio(original)
-            session.commit_audio()
-            await asyncio.wait_for(done.wait(), 5)
-            assert len(turns) == 1 and len(turns[0]) == len(expected) and expected
-            actual_samples = [
-                sample[0] for sample in struct.iter_unpack("<h", turns[0])
-            ]
-            expected_samples = [
-                sample[0] for sample in struct.iter_unpack("<h", expected)
-            ]
-            # Keep exact length and tight PCM16 value integrity across native
-            # converter instances. The onset/remainder regression at the
-            # provider's native rate remains byte-exact.
-            assert (
-                max(
-                    abs(a - b)
-                    for a, b in zip(actual_samples, expected_samples, strict=True)
-                )
-                <= 2
-            )
-            assert errors == []
-        finally:
-            await session.aclose()
-            await model.aclose()
-            await client.aclose()
-
-
 async def test_gemini_resampled_onset_and_remainder_keep_one_complete_activity(
     native_binary,
 ):
@@ -911,5 +554,242 @@ async def test_gemini_resampled_onset_and_remainder_keep_one_complete_activity(
             assert errors == []
         finally:
             await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize("kind", ["idle_then_speech", "long_manual_speech"])
+async def test_gemini_agent_streams_healthy_idle_and_long_manual_input(
+    native_binary, kind
+):
+    if (
+        "can_disable_turn_detection"
+        not in llm.RealtimeCapabilities.__dataclass_fields__
+    ):
+        pytest.skip("SDK cannot negotiate explicit manual AgentSession turns")
+    from test_relay_speech_livekit import OwnedAudioInput
+
+    audio = OwnedAudioInput()
+    received, errors, opened = bytearray(), [], []
+    complete, closed, ended = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    silence = bytes(640)
+    speech = b"\x04\x20" * 320
+    frames = (
+        ([silence] * 101 + [speech] * 10)
+        if kind == "idle_then_speech"
+        else [speech] * 131
+    )
+    expected = b"".join(frames)
+
+    async def peer(request):
+        opened.append(request.path)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        setup = await ws.receive_json()
+        assert setup["setup"]["realtimeInputConfig"]["automaticActivityDetection"][
+            "disabled"
+        ]
+        await ws.send_json({"setupComplete": {}})
+        assert await ws.receive_json() == {"realtimeInput": {"activityStart": {}}}
+        async for msg in ws:
+            control = json.loads(msg.data)["realtimeInput"]
+            if "activityEnd" in control:
+                ended.set()
+                break
+            received.extend(base64.b64decode(control["audio"]["data"]))
+            if len(received) == len(expected):
+                complete.set()
+        async for _ in ws:
+            pass
+        closed.set()
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        client, model = client_model(socket)
+        session = AgentSession(
+            llm=model, turn_detection="manual", stt=None, tts=None, vad=None
+        )
+        session.input.audio = audio
+        session.on("error", errors.append)
+        try:
+            await start_agent(session)
+            native = next(iter(model._sessions))
+            await native.start()
+            for raw in frames:
+                audio.frames.put_nowait(rtc.AudioFrame(raw, 16000, 1, 320))
+                await asyncio.sleep(0.02 if kind == "idle_then_speech" else 0)
+                if closed.is_set():
+                    break
+            completed = asyncio.create_task(complete.wait())
+            failed = asyncio.create_task(closed.wait())
+            try:
+                await asyncio.wait_for(
+                    asyncio.wait(
+                        [completed, failed], return_when=asyncio.FIRST_COMPLETED
+                    ),
+                    5,
+                )
+                assert complete.is_set() and not closed.is_set(), (
+                    "healthy input closed before its explicit commit"
+                )
+            finally:
+                completed.cancel()
+                failed.cancel()
+                await asyncio.gather(completed, failed, return_exceptions=True)
+            native.commit_audio()
+            await asyncio.wait_for(ended.wait(), 5)
+            assert bytes(received) == expected and len(opened) == 1 and errors == []
+            assert native._failure is None
+        finally:
+            audio.frames.put_nowait(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_gemini_async_vad_without_correlated_capture_refuses_before_open(
+    native_binary,
+):
+    from test_relay_speech_livekit import ControlledVAD
+
+    opened = []
+
+    async def peer(request):
+        opened.append(request.path)
+        return web.Response(status=500)
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        client, model = client_model(socket)
+        session = AgentSession(
+            llm=model, turn_detection="vad", vad=ControlledVAD(), stt=None, tts=None
+        )
+        try:
+            with pytest.raises(GatewayError, match="correlated.*capture"):
+                await start_agent(session)
+            assert opened == [] and not client._attempted
+        finally:
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_gemini_uncommitted_manual_input_refuses_reply_without_splitting_turn(
+    native_binary,
+):
+    received, opened = bytearray(), []
+    onset_received, end_received = asyncio.Event(), asyncio.Event()
+    onset, remainder = b"\x03\x12" * 320, b"\x06\x41" * 640
+    controls = []
+
+    async def peer(request):
+        opened.append(request.path)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"setupComplete": {}})
+        async for message in ws:
+            command = json.loads(message.data)
+            if "clientContent" in command:
+                assert end_received.is_set(), (
+                    "reply entered an uncommitted physical turn"
+                )
+                await ws.send_json(
+                    {"serverContent": {"outputTranscription": {"text": "Next reply"}}}
+                )
+                await ws.send_json({"serverContent": {"turnComplete": True}})
+                continue
+            control = command["realtimeInput"]
+            if "audio" in control:
+                received.extend(base64.b64decode(control["audio"]["data"]))
+                onset_received.set()
+            else:
+                controls.append(control)
+                if "activityEnd" in control:
+                    end_received.set()
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        client, model = client_model(socket)
+        native = model.session(turn_detection_disabled=True)
+        try:
+            await native._update_session(tools=[])
+            await native.start()
+            native.push_audio(rtc.AudioFrame(onset, 16000, 1, 320))
+            await asyncio.wait_for(onset_received.wait(), 5)
+            with pytest.raises(llm.RealtimeError, match="Commit manual input"):
+                await native.generate_reply(instructions="Do not split the caller")
+            native.start_user_activity()  # Idempotent, never rolls the physical activity.
+            native.push_audio(rtc.AudioFrame(remainder, 16000, 1, 640))
+            native.commit_audio()
+            await asyncio.wait_for(end_received.wait(), 5)
+            await asyncio.wait_for(
+                native.generate_reply(instructions="Reply after commit"), 5
+            )
+            assert bytes(received) == onset + remainder
+            assert controls == [{"activityStart": {}}, {"activityEnd": {}}]
+            assert len(opened) == 1 and native._failure is None
+        finally:
+            await native.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "failure", ["queued_bytes", "oversize_frame", "forwarded_clear"]
+)
+async def test_gemini_input_loss_or_backpressure_closes_one_owned_transport(
+    native_binary, monkeypatch, failure
+):
+    closed, read_audio, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    opened, errors = [], []
+
+    async def peer(request):
+        opened.append(request.path)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ws.send_json({"setupComplete": {}})
+        async for message in ws:
+            if "audio" in json.loads(message.data).get("realtimeInput", {}):
+                read_audio.set()
+        closed.set()
+        return ws
+
+    async with native_stack(native_binary, peer) as (socket, _):
+        client, model = client_model(socket)
+        native = model.session(turn_detection_disabled=True)
+        native.on("error", errors.append)
+        try:
+            await native._update_session(tools=[])
+            await native.start()
+            if failure == "queued_bytes":
+                original_send = native._socket.send
+
+                async def paused_send(command):
+                    await release.wait()
+                    await original_send(command)
+
+                monkeypatch.setattr(native._socket, "send", paused_send)
+                # Fewer than 256 frames, but more than the physical byte budget.
+                for _ in range(40):
+                    native.push_audio(rtc.AudioFrame(bytes(64000), 16000, 1, 32000))
+                    if native._failure is not None:
+                        break
+            elif failure == "oversize_frame":
+                native.push_audio(rtc.AudioFrame(bytes(2 << 20), 16000, 1, 1 << 20))
+            else:
+                native.push_audio(rtc.AudioFrame(bytes(640), 16000, 1, 320))
+                await asyncio.wait_for(read_audio.wait(), 5)
+                native.clear_audio()
+            await asyncio.wait_for(closed.wait(), 5)
+            await asyncio.wait_for(asyncio.shield(native._task), 5)
+            assert native._failure is not None and not native._failure.retryable
+            assert len(errors) == 1 and not errors[0].recoverable
+            with pytest.raises(GatewayError, match="exhausted"):
+                await client.open(protocol="google.live.v1", model="gemini-3.8-live")
+            assert len(opened) == 1
+        finally:
+            release.set()
+            await native.aclose()
             await model.aclose()
             await client.aclose()
