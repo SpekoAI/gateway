@@ -25,10 +25,18 @@ Typed AgentSession replies refuse before provider or local conversation mutation
 while that input remains uncommitted. This refusal uses an SDK error that is not
 its best-effort context-update exception, and leaves capture intact for explicit
 commit/clear. Clearing still-local samples discards the converter; already
-forwarded manual input cannot be recalled and requires physical stop. After a
-real commit, accepted new typed input starts its own reply rather than consuming
-the prior audio-commit shortcut. Consumed audio transcript IDs cannot replay as
-typed input.
+forwarded manual input cannot be recalled and requires physical stop. A manual
+commit already starts provider work, including `commit_user_turn(skip_reply=True)`.
+Typed context and new instructed replies remain refused before mutation until
+that response reaches a genuine terminal provider boundary. First output,
+`generationComplete`, interruption feedback, clear, local playback and a resolved
+future do not release this fence. A `turnComplete` marked `IN_PROGRESS` remains
+fenced; extended thinking requires explicit `IDLE`. A turn that ends without output
+fails and retires its pending future/timer rather than lending it to later work.
+After an unambiguous terminal boundary, new typed input starts its own reply.
+Overlapping manual commits have no response correlation; typed admission remains
+refused on that transport rather than guessing from their completion order.
+Consumed audio transcript IDs cannot replay as typed input.
 
 GPT-Live refuses ALL per-reply instructions, including their associated typed
 user_input, before the SDK reply task appends any context. Delegation IDs/offsets

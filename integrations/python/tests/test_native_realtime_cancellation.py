@@ -220,7 +220,8 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
         assert "audio" in (await ws.receive_json())["realtimeInput"]
         if manual:
             assert (await ws.receive_json()) == {"realtimeInput": {"activityEnd": {}}}
-        await ws.receive_json()
+        else:
+            await ws.receive_json()
         await ws.send_json(
             {
                 "serverContent": {
@@ -296,7 +297,13 @@ async def test_gemini_barge_in_clears_audio_already_buffered_in_agent_playback(
             native = next(iter(model._sessions))
             native.push_audio(rtc.AudioFrame(b"\x01\x10" * 480, 16000, 1, 480))
             native.commit_audio()
-            speech = agent.generate_reply(instructions="Speak the synthetic response")
+            # Manual activityEnd already starts this audio response. A second
+            # instructed ask would be uncorrelated with its delayed output.
+            speech = (
+                agent.generate_reply()
+                if manual
+                else agent.generate_reply(instructions="Speak the synthetic response")
+            )
             await asyncio.wait_for(audible.wait(), 5)
             if cause == "explicit":
                 await asyncio.wait_for(agent.interrupt(), 5)
@@ -718,6 +725,14 @@ async def test_gemini_uncommitted_manual_input_refuses_reply_without_splitting_t
                 controls.append(control)
                 if "activityEnd" in control:
                     end_received.set()
+                    await ws.send_json(
+                        {
+                            "serverContent": {
+                                "outputTranscription": {"text": "Committed audio reply"}
+                            }
+                        }
+                    )
+                    await ws.send_json({"serverContent": {"turnComplete": True}})
         return ws
 
     async with native_stack(native_binary, peer) as (socket, _):
@@ -733,10 +748,21 @@ async def test_gemini_uncommitted_manual_input_refuses_reply_without_splitting_t
             native.start_user_activity()  # Idempotent, never rolls the physical activity.
             native.push_audio(rtc.AudioFrame(remainder, 16000, 1, 640))
             native.commit_audio()
+            original_reply = native.generate_reply()
             await asyncio.wait_for(end_received.wait(), 5)
-            await asyncio.wait_for(
-                native.generate_reply(instructions="Reply after commit"), 5
+            from test_native_realtime_livekit import collect_generation
+
+            generation = await asyncio.wait_for(original_reply, 5)
+            messages, calls = await asyncio.wait_for(collect_generation(generation), 5)
+            assert messages == [["Committed audio reply", b""]] and not calls
+            generation = await asyncio.wait_for(
+                native.generate_reply(
+                    instructions="Reply after the committed response"
+                ),
+                5,
             )
+            messages, calls = await asyncio.wait_for(collect_generation(generation), 5)
+            assert messages == [["Next reply", b""]] and not calls
             assert bytes(received) == onset + remainder
             assert controls == [{"activityStart": {}}, {"activityEnd": {}}]
             assert len(opened) == 1 and native._failure is None

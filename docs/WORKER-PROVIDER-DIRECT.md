@@ -16,7 +16,9 @@ per-call cancellation hook. Extended-thinking tool sessions are refused too.
 OpenAI/xAI and GPT-Live retain their separately tested tool rounds. GPT-Live
 per-reply instructions, including associated typed input, refuse before context
 mutation; unscoped asks require usable canonical context before append. Gemini
-typed replies cannot overtake uncommitted original audio. These SDK capability
+typed replies cannot overtake uncommitted original audio or an unsettled committed
+response. Their ordinary continuation requires a genuine unambiguous provider
+terminal boundary; overlapping manual commits retain typed refusal. These SDK capability
 checks do not attest current requester/source, claim, caller, credential, committed
 lease, provider bounds, durable entry, receipts or cleanup acceptance.
 

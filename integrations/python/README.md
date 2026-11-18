@@ -57,7 +57,17 @@ reply is refused before sending clientContent, and input can continue normally.
 This includes typed `AgentSession.generate_reply(user_input=...)`: context
 updates refuse before provider/local history changes using an error the SDK does
 not treat as best effort. Original capture remains available for real commit.
-Accepted typed input after commit starts a new reply, not the prior audio reply.
+Commit already requests an audio response, even with
+`AgentSession.commit_user_turn(skip_reply=True)`. A new typed turn or instructed
+reply refuses before context mutation until that response has safely ended.
+First output, a resolved generation future, `generationComplete`, local clear
+and interruption feedback do not establish that boundary. The adapter uses the
+provider's [terminal turn semantics](https://aistudio.google.com/api-reference/live#BidiGenerateContentServerContent):
+`turnComplete` with `IN_PROGRESS` stays fenced, and extended thinking requires
+explicit `IDLE`. A no-output terminal fails and retires its original future/timer.
+After an unambiguous terminal boundary, accepted typed input starts its own reply.
+Overlapping manual commits cannot be correlated to later output; typed work stays
+refused on that transport, without restarting it or fabricating response IDs.
 Clearing local, unconverted input discards its resampler state; it is not flushed
 into a later commit. Clearing already forwarded manual input closes the transport
 because it cannot be recalled. Repeated manual activity starts are idempotent.

@@ -317,6 +317,11 @@ class _RealtimeSession(llm.RealtimeSession):
         self._input_rate: int | None = None
         self._input_hz = 16000 if self._google else 24000
         self._audio_active = self._committed = False
+        # A commit starts provider work before its first output exists locally.
+        # This is only a restriction on admitting uncorrelated new work, never
+        # a fabricated response identity or acknowledgement.
+        self._google_response_pending = False
+        self._google_commits_overlap = False
         self._activity_interrupt_target: _Generation | None = None
         self._uncommitted_source_samples = 0
         self._framework_binding: _FrameworkTurnBinding | None = None
@@ -469,6 +474,14 @@ class _RealtimeSession(llm.RealtimeSession):
         ]
         if self._google:
             additions = [item for item in items if item.id not in self._known_items]
+            if additions and self._google_response_pending:
+                # RealtimeError is best effort in AgentSession's typed path.
+                # Refuse BEFORE append/history changes while older provider
+                # work could still claim the next reply future.
+                raise GatewayError(
+                    "Wait for the Gemini response to finish before adding typed context",
+                    retryable=False,
+                )
             if (
                 additions
                 and self._manual_turns
@@ -611,10 +624,15 @@ class _RealtimeSession(llm.RealtimeSession):
                 self._send_audio(bytes(frame.data))
         if self._google:
             if self._manual_turns and self._audio_active:
+                # Multiple committed inputs have no independently attributable
+                # response boundary on this protocol. Keep typed work refused
+                # on this transport, even if an older completion arrives late.
+                self._google_commits_overlap |= self._google_response_pending
                 self._enqueue({"realtimeInput": {"activityEnd": {}}})
                 self._audio_active = False
                 self._activity_interrupt_target = None
                 self._committed = True
+                self._google_response_pending = True
         else:
             self._enqueue({"type": "input_audio_buffer.commit"})
         self._uncommitted_source_samples = 0
@@ -671,6 +689,16 @@ class _RealtimeSession(llm.RealtimeSession):
                 llm.RealtimeError("Commit manual input before requesting a reply")
             )
             return future
+        committed_reply = self._committed and not is_given(instructions)
+        if self._google and self._google_response_pending and (
+            self._google_commits_overlap
+            or not committed_reply
+            or self._generation is not None
+        ):
+            future.set_exception(
+                llm.RealtimeError("Wait for the Gemini response to finish")
+            )
+            return future
         self._configured.set()
         self._pending.append(future)
         future.add_done_callback(self._pending_cancelled)
@@ -681,7 +709,7 @@ class _RealtimeSession(llm.RealtimeSession):
             if is_given(tools) or is_given(tool_choice) and tool_choice != "auto":
                 self._reply_timeout(future)
                 return future
-            if self._committed and not is_given(instructions):
+            if committed_reply:
                 self._committed = False
             else:
                 content: dict[str, Any] = {"turnComplete": True}
@@ -689,6 +717,7 @@ class _RealtimeSession(llm.RealtimeSession):
                     content["turns"] = [
                         {"role": "user", "parts": [{"text": instructions}]}
                     ]
+                self._google_response_pending = True
                 self._enqueue({"clientContent": content})
         else:
             response: dict[str, Any] = {}
@@ -750,6 +779,16 @@ class _RealtimeSession(llm.RealtimeSession):
                             "Realtime reply interrupted before generation"
                         )
                     )
+            self._fatal(
+                GatewayError(
+                    "Realtime reply interrupted before generation", retryable=False
+                )
+            )
+            return
+        if self._google and self._google_response_pending and self._generation is None:
+            # An unclaimed commit (including skip_reply=True) still owns a
+            # physical response. There is no pre-output cancel identity; do not
+            # pretend a local interrupt/clear drained it for a later task.
             self._fatal(
                 GatewayError(
                     "Realtime reply interrupted before generation", retryable=False
@@ -1356,6 +1395,7 @@ class _RealtimeSession(llm.RealtimeSession):
         output = content.get("modelTurn")
         spoken = content.get("outputTranscription")
         if (output or spoken) and self._generation is None:
+            self._google_response_pending = True
             self._begin("google_response_" + uuid.uuid4().hex)
         generation = self._generation
         if generation is not None and not generation.interrupted:
@@ -1396,6 +1436,22 @@ class _RealtimeSession(llm.RealtimeSession):
                 )
                 self._input_item, self._input_text = "", ""
             self._end()
+            # generationComplete, interruption feedback, local playback and
+            # a completed Future do not establish an idle provider. Extended
+            # thinking explicitly requires its documented IDLE status.
+            status = content.get("interactionStatus")
+            if status == "IDLE" or (
+                status is None
+                and self._model.model != "gemini-3.8-live-extended-thinking"
+            ):
+                self._google_response_pending = self._google_commits_overlap
+                self._committed = False
+                for pending in list(self._pending):
+                    self._retire_pending(pending)
+                    if not pending.done():
+                        pending.set_exception(
+                            llm.RealtimeError("Gemini turn ended without a reply")
+                        )
 
     async def aclose(self) -> None:
         self._closed = True
