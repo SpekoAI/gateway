@@ -32,13 +32,25 @@ replay speech as typed input. Provider interruption feedback sends no new manual
 activity. Explicit interruption of an active manual generation requests provider
 cancellation with balanced `activityStart`/`activityEnd` controls; subsequent real
 input still starts its own activity boundary. These are the provider's
-[manual VAD controls](https://ai.google.dev/gemini-api/docs/live-guide#disable-automatic-vad).
+[manual VAD controls](https://ai.google.dev/gemini-api/docs/live-api/capabilities#disable-automatic-vad).
 External VAD queues a real activity start before interrupting playback; that
 start cancels the targeted generation while its caller audio/end stays on the
-same socket. Continuous PCM can already have opened input before a response;
-a fresh caller/VAD start then sends matching `activityEnd`/`activityStart`
-controls before interruption, preserving subsequent caller audio/end. An old
-activity is never simply relabelled as cancelling the current response.
+same socket. Manual PCM is retained until the existing SDK activity signal or
+an explicit `commit_audio()`, including the onset that LiveKit forwards before
+its asynchronous VAD callback. If an explicitly started activity predates the
+response, new PCM stays local until the next genuine start closes that older
+activity and opens the caller's activity. Each original sample is sent once;
+onset and remainder stay in the same provider turn. Repeated VAD and provider
+feedback add no synthetic input, and an old activity is never relabelled as
+cancelling the current response.
+Unresolved input has a two-second captured-duration/monotonic bound and a
+64,000-byte converted-PCM bound. The first capture anchors its deadline before
+resampling; VAD, commit, setup waits and queued writes never refresh it. The
+deadline remains active through the physical write. Missing capture, overflow,
+expiry or an unfulfillable queued clear refuses and closes owned I/O; it does
+not drop/replay onset or redial. An explicit clear can discard only still-local
+capture and resets its resampler. These are stricter local retention limits,
+not session funding, native authority or provider eligibility.
 If interruption is disabled, or an unrelated preexisting activity has no fresh
 caller start to cancel the current response, explicit interruption closes the
 owned transport. Gemini
