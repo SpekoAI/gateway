@@ -17,12 +17,13 @@ OpenAI/xAI and GPT-Live retain their separately tested tool rounds.
 
 ## Required upstream source
 
-The canonical runtime profile is proposed in
-[contracts #52](https://github.com/SpekoAI/contracts/pull/52), not accepted or
-vendored here. Its source is `proto/speko/agents/v1/runtime.proto` and
+The canonical runtime profile was accepted from
+[contracts #52](https://github.com/SpekoAI/contracts/pull/52) at
+`5b77ed2dfe0ee0aa6c2309a92e4d81c6423243f0` (merge `518d972`). It is not
+vendored or activated here. Its source is `proto/speko/agents/v1/runtime.proto` and
 `docs/worker-runtime-profile.md`. Both `worker-runtime-v1` and
 `provider-direct-authority-v1` must be negotiated at claim and spec, including
-rollback. The draft only admits LIVEKIT/LIVEKIT; Pipecat remains refused.
+rollback. The profile only admits LIVEKIT/LIVEKIT; Pipecat remains refused.
 Dispatch metadata cannot select an engine, provider or authority.
 
 The router producer and exact connector directory are separate prerequisites.

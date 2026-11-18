@@ -52,7 +52,7 @@ def models(socket):
     return voice, backend_client, backend, model
 
 
-async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
+async def test_gpt_live_refuses_scoped_tasks_and_preserves_successive_tool_rounds(
     native_binary,
 ):
     requests, opened, errors = [], [], []
@@ -102,7 +102,8 @@ async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
         await ws.send_json({"type": "session.started"})
         for index, task in enumerate(tasks):
             ask = await ws.receive_json()
-            assert task in ask["content"] and ask["delegation_id"] is None
+            assert all(task not in ask["content"] for task in tasks)
+            assert ask["delegation_id"] is None
             if index:
                 # A redelivered known delegation cannot consume the new ask.
                 await ws.send_json(delegation("del_reply_0"))
@@ -131,7 +132,9 @@ async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
             )
             await session.start()
             for index, task in enumerate(tasks):
-                reply = session.generate_reply(instructions=task)
+                with pytest.raises(llm.RealtimeError, match="correlation"):
+                    await session.generate_reply(instructions=task)
+                reply = session.generate_reply()
                 rejected = session.generate_reply(
                     instructions="REJECTED_OVERLAPPING_TASK"
                 )
@@ -152,18 +155,18 @@ async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
                     )
                 )
                 await session.update_chat_ctx(context)
-                assert await asyncio.wait_for(finished.get(), 5) == index
+                try:
+                    completed = await asyncio.wait_for(finished.get(), 5)
+                except TimeoutError:
+                    pytest.fail(
+                        f"tool round stalled index={index}, requests={len(requests)}, calls={calls}, waiting={[(k, v.done()) for k, v in session.duplex_session._tool_results.items()]}, ctx={session.chat_ctx.items}"
+                    )
+                assert completed == index
             await asyncio.wait_for(unrelated_done.wait(), 5)
             inputs = [json.dumps(body["input"]) for body, _ in requests]
             count = 5
             assert len(inputs) == count and len(opened) == 1 and errors == []
-            assert all(
-                tasks[0] in value and tasks[1] not in value for value in inputs[:2]
-            )
-            assert all(
-                tasks[1] in value and tasks[0] not in value for value in inputs[-3:-1]
-            )
-            assert all(task not in inputs[-1] for task in tasks)
+            assert all(task not in value for value in inputs for task in tasks)
             assert all("REJECTED_OVERLAPPING_TASK" not in value for value in inputs)
             assert all("Permanent synthetic prompt" in value for value in inputs)
             assert "owned-result" in inputs[-2]
@@ -178,7 +181,7 @@ async def test_gpt_live_scopes_successive_reply_tasks_to_their_own_tool_rounds(
 
 
 @pytest.mark.parametrize("delegates", [True, False])
-async def test_gpt_live_preamble_keeps_task_until_delegation_then_new_input_retires_it(
+async def test_gpt_live_preamble_keeps_unscoped_delivery_until_delegation_or_input(
     native_binary,
     delegates,
 ):
@@ -267,24 +270,25 @@ async def test_gpt_live_preamble_keeps_task_until_delegation_then_new_input_reti
                 instructions="Permanent prompt", tools=[owned_lookup]
             )
             await session.start()
-            reply = session.generate_reply(instructions=task)
+            with pytest.raises(llm.RealtimeError, match="correlation"):
+                await session.generate_reply(instructions=task)
+            reply = session.generate_reply()
             timer = session.duplex_session._pending_reply_timer
             generation = await asyncio.wait_for(reply, 5)
             assert generation is await generations.get()
             messages, calls = await asyncio.wait_for(collect_generation(generation), 5)
             assert len(messages) == 1 and calls == []
-            assert session.duplex_session._pending_reply_instructions == (
-                "Reply to the caller now. Do not wait for the caller to speak first. After that, pause and listen.\n"
-                + task
+            assert session.duplex_session._pending_reply_hint == (
+                "Reply to the caller now. Do not wait for the caller to speak first. After that, pause and listen."
             )
             assert not timer.cancelled(), (
                 "a preamble cannot cancel the original task expiration"
             )
-            with pytest.raises(llm.RealtimeError, match="unattributed"):
+            with pytest.raises(llm.RealtimeError, match="correlation"):
                 await session.generate_reply(
                     instructions="AMBIGUOUS_PREAMBLE_REPLACEMENT"
                 )
-            assert task in session.duplex_session._pending_reply_instructions
+            assert task not in session.duplex_session._pending_reply_hint
             allow_delegation.set()
             if delegates:
                 generation = await asyncio.wait_for(generations.get(), 5)
@@ -303,12 +307,13 @@ async def test_gpt_live_preamble_keeps_task_until_delegation_then_new_input_reti
             await asyncio.wait_for(done.wait(), 5)
             assert len(requests) == (3 if delegates else 1) and failures == []
             if delegates:
-                assert all(task in json.dumps(body["input"]) for body in requests[:2])
+                assert all(
+                    task not in json.dumps(body["input"]) for body in requests[:2]
+                )
             assert task not in json.dumps(requests[-1]["input"])
             assert task not in str(session.duplex_session._history)
             assert (
-                session.duplex_session._pending_reply_instructions is None
-                and timer.cancelled()
+                session.duplex_session._pending_reply_hint is None and timer.cancelled()
             )
         finally:
             allow_delegation.set()
@@ -345,7 +350,7 @@ async def test_gpt_live_fences_replacement_before_old_then_new_delegation(
         await ws.prepare(request)
         await ws.receive_json()
         await ws.send_json({"type": "session.started"})
-        assert old in (await ws.receive_json())["content"]
+        assert old not in (await ws.receive_json())["content"]
         first_seen.set()
         await release_old.wait()
         # The reversed case requests replacement before releasing OLD. Equal
@@ -403,7 +408,9 @@ async def test_gpt_live_fences_replacement_before_old_then_new_delegation(
             adapter.on("generation_created", lambda _: caller_reply.set())
             if retire == "expire":
                 adapter._reply_timeout = 0.05
-            speech = session.generate_reply(instructions=old)
+            with pytest.raises(llm.RealtimeError, match="correlation"):
+                await adapter.generate_reply(instructions=old)
+            speech = session.generate_reply()
             await asyncio.wait_for(first_seen.wait(), 5)
             reply = adapter._reply
             timer = adapter.duplex_session._pending_reply_timer
@@ -440,11 +447,11 @@ async def test_gpt_live_fences_replacement_before_old_then_new_delegation(
             audio = [c for c in commands if c["type"] == "session.input_audio.append"]
             assert len(audio) == 1
             assert base64.b64decode(audio[0]["audio"]) == b"\x02\x10" * 480
-            with pytest.raises(llm.RealtimeError, match="unattributed"):
+            with pytest.raises(llm.RealtimeError, match="correlation"):
                 await attempted
             assert timer is None or timer.cancelled()
             assert adapter.duplex_session._pending_reply_timer is None
-            assert adapter.duplex_session._pending_reply_instructions is None
+            assert adapter.duplex_session._pending_reply_hint is None
             assert replacement not in str(adapter.duplex_session._history)
         finally:
             release_old.set()
@@ -831,7 +838,7 @@ async def test_real_agent_session_runs_gpt_live_backend_tool_and_streams_both_au
         if request.path == "/v1/llm/responses":
             body = await request.json()
             requests.append(body)
-            assert "Say the verified tool result" in json.dumps(body["input"])
+            assert "Say the verified tool result" not in json.dumps(body["input"])
             if len(requests) == 1:
                 return response(
                     [
@@ -928,7 +935,7 @@ async def test_real_agent_session_runs_gpt_live_backend_tool_and_streams_both_au
                 ),
                 record=False,
             )
-            speech = session.generate_reply(instructions="Say the verified tool result")
+            speech = session.generate_reply()
             try:
                 await asyncio.wait_for(audible.wait(), 5)
             except TimeoutError:

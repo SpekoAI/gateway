@@ -46,15 +46,25 @@ even before the first model output. Google's manual protocol supplies neither
 an input prebuffer nor an undo operation. This adapter cannot safely preserve
 that onset and cancel the old response in those configurations. Explicit manual
 AgentSession turns require a framework that negotiates disabled server VAD;
-explicitly selected provider VAD remains supported. There is no automatic mode
-switch. Commit manual input before requesting a reply; an uncommitted-input
+explicitly selected provider VAD remains supported. Realtime fallback/wrapper
+ownership is refused before a Gemini child opens, including child swaps. The
+actual AgentActivity binding fences live turn-mode changes and checks the frozen
+mode before input and physical writes; unknown wrapper ownership cannot select
+manual mode. There is no automatic mode switch. Commit manual input before
+requesting a reply; original source samples still held in the native resampler
+also count as uncommitted input. An uncommitted-input
 reply is refused before sending clientContent, and input can continue normally.
-Clearing already forwarded manual input closes the transport because it cannot
-be recalled. Repeated manual activity starts are idempotent.
+Clearing local, unconverted input discards its resampler state; it is not flushed
+into a later commit. Clearing already forwarded manual input closes the transport
+because it cannot be recalled. Repeated manual activity starts are idempotent.
 If interruption is disabled, or an unrelated preexisting activity has no fresh
 caller start to cancel the current response, explicit interruption closes the
-owned transport. Gemini
-function tools are refused before socket creation: supported framework versions
+owned transport. Explicit provider-VAD interruption and cancellation before the
+first model output also abort and join the owned transport: the protocol has no
+dedicated cancel-only operation there, and a new client turn would start new
+model work. The canceled pending future and its timer retire before reuse.
+Provider interruption feedback remains a playback-only acknowledgement path.
+Gemini function tools are refused before socket creation: supported framework versions
 execute the Agent's original tools and expose no per-call cancellation hook for
 `toolCallCancellation`. This also refuses extended-thinking tool sessions. Native
 OpenAI/xAI and delegated GPT-Live tool rounds keep their separate interfaces.
@@ -68,24 +78,23 @@ Responses backend. Each delegated backend request passes through the native
 Speko LLM transport, and function tools run through `AgentSession`. Repeated
 delegation IDs do not repeat paid backend work. Tool results remain available
 to later delegations; results that request no reply are sent as silent context.
-Explicit reply instructions are supported only while the connection has no
-ordinary caller input or unclaimed delegation; they belong to the first fully
-attributable delegation and its tool rounds. A spoken preamble does not retire the task or renew its original
-15-second application timeout. New caller words, typed input, explicit activity,
-cancellation, failure or expiration retire unclaimed tasks.
-The reply future and this task lifetime are separate: cancellation callbacks
-retire only their own task/timer, and delayed old callbacks cannot clear a new ask.
-These are application conversation rules, not execution or financial authority;
-see [client delegation task state](https://developers.openai.com/api/docs/guides/live-delegation).
-An explicit ask cannot replace an unclaimed task, including after a preamble.
-Ordinary caller PCM, typed input, transcript events, or an ordinary delegation
-permanently fence new explicit asks on that connection, as does retiring an
-unclaimed task: delegation IDs and offsets contain no per-ask correlation, and
-append acknowledgements do not establish that old delegations have drained.
-Late IDs, new caller words and elapsed time cannot clear that fence. Caller
-audio and ordinary transcript-based delegations continue on the same socket;
-claimed task/tool rounds and successive unambiguous replies remain supported.
-There is no automatic redial or history injection to bypass the fence.
+Per-reply `instructions` are refused before installation for **every** GPT-Live
+ask, including the first and after a previous delegation was claimed. The
+[client delegation protocol](https://developers.openai.com/api/docs/guides/live-delegation)
+provides IDs and audio offsets, without per-ask correlation or a drain barrier.
+A distinct late old delegation could otherwise claim a new task. Nonempty PCM
+cannot classify speech or make that binding safe; idle microphone input cannot
+silently downgrade an accepted task because no scoped task is accepted.
+
+Unscoped `generate_reply()` sends only a voice-delivery hint. It contributes no
+instructions to backend history or tool contexts. A preamble can fulfill its
+playback future while its original 15-second application expiration remains;
+cancellation callbacks retire their own hint/timer. Caller audio and ordinary
+transcript-based delegations continue on the same socket. Each delegation and
+its tool rounds share a captured canonical context, and later delegations retain
+verified tool results. There is no automatic redial or history injection to
+bypass the missing correlation capability. These are SDK conversation rules,
+not execution or financial authority.
 Long Unicode results are split losslessly into bounded native appends.
 
 GPT-Live transcript deltas remain timed fragments, not completed caller turns.

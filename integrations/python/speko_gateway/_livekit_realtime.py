@@ -35,6 +35,42 @@ _PROVIDERS = {
 }
 
 
+class _FrameworkTurnBinding:
+    """An instance-owned SDK mode fence, never worker/native authority."""
+
+    def __init__(self, activity: Any) -> None:
+        self.activity = weakref.ref(activity)
+        self.sessions: weakref.WeakSet[_RealtimeSession] = weakref.WeakSet()
+        self.original = activity.update_options
+
+        def update(*args: Any, **options: Any) -> Any:
+            change = options.get("turn_detection", NOT_GIVEN)
+            for session in list(self.sessions):
+                expected = "manual" if session._manual_turns else "realtime_llm"
+                if is_given(change) and change != expected:
+                    failure = GatewayError(
+                        "Gemini turn ownership is immutable", retryable=False
+                    )
+                    session._fatal(failure)
+                    raise failure
+            result = self.original(*args, **options)
+            for session in list(self.sessions):
+                session._check_framework_mode()
+            return result
+
+        self.observed = update
+        activity.update_options = update
+
+    def release(self, session: _RealtimeSession) -> None:
+        self.sessions.discard(session)
+        activity = self.activity()
+        if not self.sessions and activity is not None:
+            if activity.update_options is self.observed:
+                activity.update_options = self.original
+            if getattr(activity, "_speko_realtime_turn_binding", None) is self:
+                del activity._speko_realtime_turn_binding
+
+
 def _transcription(**fields: Any) -> llm.InputTranscriptionCompleted:
     # Added after the supported 1.4.5 framework floor; its absence changes
     # timestamp metadata only. Transcript/finality fields remain mandatory.
@@ -111,55 +147,86 @@ class RealtimeModel(llm.RealtimeModel):
     def session(self, *, turn_detection_disabled: bool = False) -> _RealtimeSession:
         if self._closed or self._used:
             raise GatewayError("Realtime model attempt is exhausted", retryable=False)
-        self._validate_sdk_turn_mode(turn_detection_disabled)
+        owner = self._validate_sdk_turn_mode(turn_detection_disabled)
         self._used = True
         session = _RealtimeSession(self, turn_detection_disabled)
         self._sessions.add(session)
+        if owner is not None:
+            session._bind_framework(owner)
         return session
 
-    def _validate_sdk_turn_mode(self, disabled: bool) -> None:
+    def _validate_sdk_turn_mode(self, disabled: bool) -> Any:
         if self._protocol != "google.live.v1":
             return
         from livekit.agents.voice.agent_activity import AgentActivity
 
-        # The SDK session() port passes only a boolean, shared by manual and
-        # asynchronous client-VAD modes. Inspect its actual typed owner at this
-        # synchronous construction boundary; do not install a new audio/VAD
-        # callback or treat an arrival timestamp as a capture frontier. Direct
-        # callers of session(disabled=True) own explicit commit boundaries.
+        # Refuse wrappers rather than guessing an unmatched framework owner is
+        # a direct manual caller. Automatic restart/swap has no owned one-use
+        # transport/turn boundary here. This is local SDK capability checking,
+        # not a claim, credential, caller-presence or execution-grant proof.
         frame = inspect.currentframe()
+        selected = None
         try:
             for _ in range(64):
                 if frame is None:
                     break
                 owner = frame.f_locals.get("self")
-                if isinstance(owner, AgentActivity) and owner.llm is self:
-                    mode = owner._turn_detection
-                    requested = owner._agent.turn_detection
-                    if not is_given(requested):
-                        requested = owner._session.turn_detection
-                    if requested in ("vad", "stt"):
+                if isinstance(owner, AgentActivity):
+                    self._validate_framework_owner(owner, disabled)
+                    if selected is not None and selected is not owner:
                         raise GatewayError(
-                            "Gemini asynchronous VAD requires correlated input capture",
-                            retryable=False,
+                            "Gemini framework ownership is ambiguous", retryable=False
                         )
-                    if (disabled and mode != "manual") or mode in ("vad", "stt"):
-                        raise GatewayError(
-                            "Gemini asynchronous VAD requires correlated input capture",
-                            retryable=False,
-                        )
-                    if mode == "manual" and (
-                        not disabled
-                        or getattr(owner, "_interruption_detection_enabled", False)
-                    ):
-                        raise GatewayError(
-                            "Gemini manual input requires explicit negotiated turn ownership",
-                            retryable=False,
-                        )
-                    return
+                    selected = owner
+                elif (
+                    isinstance(owner, llm.RealtimeSession)
+                    or isinstance(owner, llm.RealtimeModel)
+                    and owner is not self
+                ):
+                    raise GatewayError(
+                        "Gemini realtime wrappers/fallback ownership is unsupported",
+                        retryable=False,
+                    )
                 frame = frame.f_back
+            if frame is not None:
+                raise GatewayError(
+                    "Gemini framework ownership exceeds its bound", retryable=False
+                )
+            return selected
         finally:
             del frame
+
+    def _validate_framework_owner(self, owner: Any, disabled: bool) -> None:
+        if owner.llm is not self:
+            raise GatewayError(
+                "Gemini realtime wrapper ownership is unsupported", retryable=False
+            )
+        mode = owner._turn_detection
+        requested = owner._agent.turn_detection
+        explicit = is_given(requested)
+        if not explicit:
+            requested = owner._session.turn_detection
+            explicit = getattr(
+                owner._session, "_turn_detection_explicit", is_given(requested)
+            )
+        if (
+            requested in ("vad", "stt")
+            or (disabled and mode != "manual")
+            or mode not in (None, "manual", "realtime_llm")
+        ):
+            raise GatewayError(
+                "Gemini asynchronous VAD requires correlated input capture",
+                retryable=False,
+            )
+        if (mode == "manual" or explicit and requested == "manual") and not disabled:
+            raise GatewayError(
+                "Gemini manual input requires negotiated turn ownership",
+                retryable=False,
+            )
+        if getattr(owner, "_interruption_detection_enabled", False):
+            raise GatewayError(
+                "Gemini local interruption ownership is unsupported", retryable=False
+            )
 
     async def aclose(self) -> None:
         self._closed = True
@@ -251,6 +318,8 @@ class _RealtimeSession(llm.RealtimeSession):
         self._input_hz = 16000 if self._google else 24000
         self._audio_active = self._committed = False
         self._activity_interrupt_target: _Generation | None = None
+        self._uncommitted_source_samples = 0
+        self._framework_binding: _FrameworkTurnBinding | None = None
         self._closed = False
         self._failure: GatewayError | None = None
         self._input_text = ""
@@ -258,6 +327,65 @@ class _RealtimeSession(llm.RealtimeSession):
         self._user_started: float | None = None
         self._running = False
         self._task = asyncio.create_task(self._run())
+
+    def on(self, event: Any, callback: Any = None) -> Any:
+        if callback is None:
+            return lambda selected: self.on(event, selected)
+        if self._google:
+            from livekit.agents.voice.agent_activity import AgentActivity
+
+            owner = getattr(callback, "__self__", None)
+            if isinstance(owner, AgentActivity):
+                self._bind_framework(owner)
+            elif isinstance(owner, llm.RealtimeSession) and owner is not self:
+                failure = GatewayError(
+                    "Gemini realtime wrapper ownership is unsupported", retryable=False
+                )
+                self._fatal(failure)
+                raise failure
+        return super().on(event, callback)
+
+    def _bind_framework(self, owner: Any) -> None:
+        try:
+            self._model._validate_framework_owner(owner, self._manual_turns)
+        except GatewayError as failure:
+            self._fatal(failure)
+            raise
+        binding = getattr(owner, "_speko_realtime_turn_binding", None)
+        if binding is None:
+            binding = _FrameworkTurnBinding(owner)
+            owner._speko_realtime_turn_binding = binding
+        if (
+            self._framework_binding is not None
+            and self._framework_binding is not binding
+        ):
+            self._framework_binding.release(self)
+        binding.sessions.add(self)
+        self._framework_binding = binding
+
+    def _check_framework_mode(self) -> None:
+        binding = self._framework_binding
+        if binding is None:
+            return
+        owner = binding.activity()
+        try:
+            if owner is None or owner.update_options is not binding.observed:
+                raise GatewayError(
+                    "Gemini framework turn owner is unavailable", retryable=False
+                )
+            self._model._validate_framework_owner(owner, self._manual_turns)
+        except GatewayError as failure:
+            self._fatal(failure)
+            raise
+
+    def _ensure_live(self) -> None:
+        if self._closed or self._failure is not None:
+            raise llm.RealtimeError("Realtime session is closed")
+        self._check_framework_mode()
+        for pending in list(self._pending):
+            if pending.cancelled():
+                self._pending_cancelled(pending)
+                raise llm.RealtimeError("Realtime session is closed")
 
     @staticmethod
     def _observe_future(future: asyncio.Future) -> None:
@@ -386,8 +514,7 @@ class _RealtimeSession(llm.RealtimeSession):
         self._tool_choice = tool_choice
 
     def _enqueue(self, event: dict[str, Any]) -> None:
-        if self._closed or self._failure is not None:
-            raise llm.RealtimeError("Realtime session is closed")
+        self._ensure_live()
         packet = json.dumps(
             event, ensure_ascii=False, allow_nan=False, separators=(",", ":")
         )
@@ -406,8 +533,7 @@ class _RealtimeSession(llm.RealtimeSession):
             )
 
     def start_user_activity(self) -> None:
-        if self._closed or self._failure is not None:
-            raise llm.RealtimeError("Realtime session is closed")
+        self._ensure_live()
         self._user_started = time.time()
         if self._google and self._manual_turns and not self._audio_active:
             self._enqueue({"realtimeInput": {"activityStart": {}}})
@@ -415,8 +541,7 @@ class _RealtimeSession(llm.RealtimeSession):
             self._activity_interrupt_target = self._generation
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
-        if self._closed or self._failure is not None:
-            raise llm.RealtimeError("Realtime session is closed")
+        self._ensure_live()
         if frame.num_channels != 1:
             raise ValueError("Realtime input must be mono PCM16")
         self._configured.set()
@@ -430,6 +555,9 @@ class _RealtimeSession(llm.RealtimeSession):
                 )
         if frame.sample_rate != self._input_rate:
             raise ValueError("Realtime input rate cannot change during a session")
+        # Original source ownership precedes conversion. A short raw frame can
+        # remain entirely inside the native resampler without opening activity.
+        self._uncommitted_source_samples += frame.samples_per_channel
         for converted in self._resampler.push(frame) if self._resampler else [frame]:
             self._send_audio(bytes(converted.data))
 
@@ -462,8 +590,7 @@ class _RealtimeSession(llm.RealtimeSession):
         raise llm.RealtimeError("This realtime model accepts audio only")
 
     def commit_audio(self) -> None:
-        if self._closed or self._failure is not None:
-            raise llm.RealtimeError("Realtime session is closed")
+        self._ensure_live()
         if self._resampler:
             for frame in self._resampler.flush():
                 self._send_audio(bytes(frame.data))
@@ -475,8 +602,18 @@ class _RealtimeSession(llm.RealtimeSession):
                 self._committed = True
         else:
             self._enqueue({"type": "input_audio_buffer.commit"})
+        self._uncommitted_source_samples = 0
+        self._reset_resampler()
+
+    def _reset_resampler(self) -> None:
+        self._resampler = None
+        if self._input_rate is not None and self._input_rate != self._input_hz:
+            self._resampler = rtc.AudioResampler(
+                input_rate=self._input_rate, output_rate=self._input_hz, num_channels=1
+            )
 
     def clear_audio(self) -> None:
+        self._ensure_live()
         if not self._google:
             self._enqueue({"type": "input_audio_buffer.clear"})
         elif self._manual_turns and self._audio_active:
@@ -486,6 +623,10 @@ class _RealtimeSession(llm.RealtimeSession):
                     retryable=False,
                 )
             )
+            return
+        # Still-local capture is discarded, never flushed into the next turn.
+        self._uncommitted_source_samples = 0
+        self._reset_resampler()
 
     def generate_reply(
         self,
@@ -496,21 +637,28 @@ class _RealtimeSession(llm.RealtimeSession):
     ) -> asyncio.Future[llm.GenerationCreatedEvent]:
         future = asyncio.get_running_loop().create_future()
         future.add_done_callback(self._observe_future)
-        if self._closed or self._failure is not None:
-            future.set_exception(llm.RealtimeError("Realtime session is closed"))
+        try:
+            self._ensure_live()
+        except (llm.RealtimeError, GatewayError) as failure:
+            future.set_exception(failure)
             return future
         if self._pending:
             future.set_exception(
                 llm.RealtimeError("A realtime reply is already pending")
             )
             return future
-        if self._google and self._manual_turns and self._audio_active:
+        if (
+            self._google
+            and self._manual_turns
+            and (self._audio_active or self._uncommitted_source_samples)
+        ):
             future.set_exception(
                 llm.RealtimeError("Commit manual input before requesting a reply")
             )
             return future
         self._configured.set()
         self._pending.append(future)
+        future.add_done_callback(self._pending_cancelled)
         self._pending_timers[future] = asyncio.get_running_loop().call_later(
             self._model._client._setup_timeout, self._reply_timeout, future
         )
@@ -548,15 +696,51 @@ class _RealtimeSession(llm.RealtimeSession):
         )
 
     def _reply_timeout(self, future: asyncio.Future) -> None:
+        if future not in self._pending:
+            return
         if not future.done():
             future.set_exception(
                 llm.RealtimeError("Realtime reply was not acknowledged")
             )
+        self._retire_pending(future)
+        self._fatal(
+            GatewayError("Realtime reply was not acknowledged", retryable=False)
+        )
+
+    def _retire_pending(self, future: asyncio.Future) -> None:
+        if future in self._pending:
+            self._pending.remove(future)
+        timer = self._pending_timers.pop(future, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _pending_cancelled(self, future: asyncio.Future) -> None:
+        if future.cancelled() and future in self._pending:
+            self._retire_pending(future)
+            # No response identity/cancel acknowledgement exists yet. Retire
+            # this exact future and stop the physical request, not just playback.
             self._fatal(
-                GatewayError("Realtime reply was not acknowledged", retryable=False)
+                GatewayError(
+                    "Realtime reply cancelled before generation", retryable=False
+                )
             )
 
     def interrupt(self) -> None:
+        if self._pending:
+            for future in list(self._pending):
+                self._retire_pending(future)
+                if not future.done():
+                    future.set_exception(
+                        llm.RealtimeError(
+                            "Realtime reply interrupted before generation"
+                        )
+                    )
+            self._fatal(
+                GatewayError(
+                    "Realtime reply interrupted before generation", retryable=False
+                )
+            )
+            return
         if self._generation is not None and not self._generation.interrupted:
             self._generation.interrupted = True
             self._generation.close()
@@ -590,6 +774,14 @@ class _RealtimeSession(llm.RealtimeSession):
                 # never sends another pulse (including asynchronous cleanup).
                 self._enqueue({"realtimeInput": {"activityStart": {}}})
                 self._enqueue({"realtimeInput": {"activityEnd": {}}})
+            else:
+                # Automatic VAD has no dedicated cancel-only control here.
+                # Sending a new client turn would create different model work.
+                self._fatal(
+                    GatewayError(
+                        "Realtime provider cancellation is unavailable", retryable=False
+                    )
+                )
 
     def truncate(
         self,
@@ -772,6 +964,7 @@ class _RealtimeSession(llm.RealtimeSession):
                 return
             if self._failure is not None:
                 raise self._failure
+            self._check_framework_mode()
             configuration = self._configuration()
             self._socket = await self._model._client.open(
                 protocol=self._model._protocol, model=self._model.model
@@ -827,6 +1020,7 @@ class _RealtimeSession(llm.RealtimeSession):
             async def send() -> None:
                 async for command in self._commands:
                     try:
+                        self._ensure_live()
                         await self._socket.send(command)
                     finally:
                         self._queued_input_bytes = max(
@@ -893,6 +1087,11 @@ class _RealtimeSession(llm.RealtimeSession):
                     )
             for timer in self._pending_timers.values():
                 timer.cancel()
+            self._pending.clear()
+            self._pending_timers.clear()
+            if self._framework_binding is not None:
+                self._framework_binding.release(self)
+                self._framework_binding = None
             if self._failure is not None:
                 self.emit(
                     "error",
@@ -908,6 +1107,7 @@ class _RealtimeSession(llm.RealtimeSession):
         if self._failure is None:
             self._failure = failure
             self._resampler = None
+            self._uncommitted_source_samples = 0
             self._configured.set()
             # Stop physical I/O before cancellation/join. Python 3.10 can lose
             # task cancellation when an awaited producer completes concurrently.
@@ -918,6 +1118,7 @@ class _RealtimeSession(llm.RealtimeSession):
                 self._task.cancel()
 
     def _begin(self, response_id: str) -> _Generation:
+        self._ensure_live()
         if self._generation is not None:
             if not self._generation.interrupted:
                 raise GatewayError("Realtime generations overlap", retryable=False)
@@ -1184,6 +1385,7 @@ class _RealtimeSession(llm.RealtimeSession):
     async def aclose(self) -> None:
         self._closed = True
         self._resampler = None
+        self._uncommitted_source_samples = 0
         self._configured.set()
         self._commands.close()
         if self._socket is not None:
@@ -1200,3 +1402,8 @@ class _RealtimeSession(llm.RealtimeSession):
         for future in self._pending:
             if not future.done():
                 future.set_exception(llm.RealtimeError("Realtime session is closed"))
+        self._pending.clear()
+        self._pending_timers.clear()
+        if self._framework_binding is not None:
+            self._framework_binding.release(self)
+            self._framework_binding = None

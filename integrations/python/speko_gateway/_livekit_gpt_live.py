@@ -171,11 +171,9 @@ class _GPTLiveSession(_Session):
         self._completed_results: dict[str, bytes] = {}
         self._fragments: list[dict[str, Any]] = []
         self._fragment_bytes = 0
-        self._pending_reply_instructions: str | None = None
+        self._pending_reply_hint: str | None = None
         self._pending_reply_future: asyncio.Future | None = None
         self._pending_reply_timer: asyncio.TimerHandle | None = None
-        self._reply_attribution_lost = False
-        self._ordinary_input_seen = False
         self._socket: RelayRealtimeSession | None = None
         self._resampler: rtc.AudioResampler | None = None
         self._input_format: tuple[int, int] | None = None
@@ -210,7 +208,6 @@ class _GPTLiveSession(_Session):
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if frame.samples_per_channel:
-            self._ordinary_input_seen = True
             self._retire_pending_reply()
         current = frame.sample_rate, frame.num_channels
         if frame.num_channels != 1:
@@ -276,7 +273,6 @@ class _GPTLiveSession(_Session):
                 )
             self._remember([item])
             if isinstance(item, llm.ChatMessage) and item.role == "user":
-                self._ordinary_input_seen = True
                 self._retire_pending_reply()
             if self._started and isinstance(item, llm.ChatMessage):
                 text = item.text_content
@@ -301,46 +297,38 @@ class _GPTLiveSession(_Session):
     def _generate_reply(
         self, *, instructions=NOT_GIVEN, tool_choice=NOT_GIVEN, tools=NOT_GIVEN
     ) -> None:
+        if is_given(instructions):
+            # The protocol carries no per-ask identity/drain barrier. Reject
+            # scoped tasks BEFORE append instead of running an ambiguous or
+            # silently downgraded backend task (including on idle PCM).
+            raise llm.RealtimeError(
+                "GPT-Live per-reply instructions require provider correlation"
+            )
         pending = self._pending_reply_future
         if pending is not None and pending.cancelled():
             self._retire_pending_reply(pending)
-        if (
-            self._ordinary_input_seen
-            or self._reply_attribution_lost
-            or self._pending_reply_instructions is not None
-        ):
-            # No provider ask ID/drain barrier distinguishes a late OLD
-            # delegation from the next request. Keep caller audio/delegation
-            # live, but never install replacement instructions by guesswork.
-            raise llm.RealtimeError("GPT-Live has an unattributed earlier reply")
+        if self._pending_reply_hint is not None:
+            raise llm.RealtimeError("GPT-Live has an undelivered reply hint")
         self._update_options(tool_choice=tool_choice)
         if is_given(tools) and tools != self._tools.flatten():
             raise llm.RealtimeError("GPT-Live does not support per-response tools")
         ask = "Reply to the caller now. Do not wait for the caller to speak first. After that, pause and listen."
-        if is_given(instructions):
-            ask += "\n" + _text(instructions)
-        # The next new delegation captures this task in its own context. Its
-        # tool rounds share that snapshot; later delegations get no old ask.
+        # This is only an unscoped voice-delivery hint. It contributes no task
+        # instructions or privileges to any backend context/tool round.
         ask = _text(ask)
         self._retire_pending_reply()
         self._append("session.commentary.append", ask)
-        self._pending_reply_instructions = ask
+        self._pending_reply_hint = ask
 
-    def _retire_pending_reply(
-        self, future: asyncio.Future | None = None, *, claimed: bool = False
-    ) -> None:
+    def _retire_pending_reply(self, future: asyncio.Future | None = None) -> None:
         if future is not None and self._pending_reply_future is not future:
             return
-        if self._pending_reply_instructions is not None and not claimed:
-            # A permanent local fence, not an invented provider cancellation
-            # ACK. Transcript/append ACKs and unseen IDs cannot clear it.
-            self._reply_attribution_lost = True
         pending = self._pending_reply_future
         if self._pending_reply_timer is not None and (
             pending is None or pending.done()
         ):
             self._pending_reply_timer.cancel()
-        self._pending_reply_instructions = None
+        self._pending_reply_hint = None
         self._pending_reply_future = None
         self._pending_reply_timer = None
 
@@ -407,9 +395,8 @@ class _GPTLiveSession(_Session):
         }:
             text = _text(event.get("delta"))
             if kind == "session.input_transcript.delta" and text:
-                self._ordinary_input_seen = True
-                # New caller words supersede an unclaimed one-off task. They
-                # remain transcript fragments, never a fabricated complete turn.
+                # Input supersedes the unscoped delivery hint. Transcript
+                # fragments never claim a task or fabricate a complete turn.
                 self._retire_pending_reply()
             start, end = event.get("start_ms"), event.get("end_ms")
             if (
@@ -457,8 +444,6 @@ class _GPTLiveSession(_Session):
             if len(self._seen_delegations) >= 128:
                 raise _failure()
             self._seen_delegations.add(identity)
-            if self._pending_reply_instructions is None:
-                self._ordinary_input_seen = True
             context = self._history.copy()
             if self._instructions:
                 context.items.insert(
@@ -467,11 +452,8 @@ class _GPTLiveSession(_Session):
             pending = self._pending_reply_future
             if pending is not None and pending.cancelled():
                 self._retire_pending_reply(pending)
-            if self._pending_reply_instructions is not None:
-                context.add_message(
-                    role="system", content=self._pending_reply_instructions
-                )
-                self._retire_pending_reply(claimed=True)
+            if self._pending_reply_hint is not None:
+                self._retire_pending_reply()
             fragments = [f for f in self._fragments if f["end_ms"] <= offset]
             if fragments:
                 context.add_message(
@@ -710,7 +692,7 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
     def _generation(self, generation):
         if self._reply is not None and not self._reply.done():
             # A spoken preamble can fulfil this delivery future before the
-            # corresponding delegation arrives. Task lifetime is independent.
+            # backend work arrives. Hint expiration is independent.
             generation.user_initiated = True
             self._reply.set_result(generation)
             self._reply = None
@@ -761,8 +743,8 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
                 self.duplex_session._retire_pending_reply(done)
                 if self._reply is done:
                     self._reply = None
-            # A preamble keeps the task's original expiration alive. Claimed,
-            # cancelled or superseded tasks cannot leave a timer behind.
+            # A preamble keeps the delivery hint's original expiration alive.
+            # Cancellation callbacks retire only their own timer.
             if (
                 done.cancelled()
                 or self.duplex_session._pending_reply_future is not done
