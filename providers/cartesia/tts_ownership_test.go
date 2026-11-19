@@ -727,6 +727,52 @@ func TestAdapterSpeaksATailAppendedAfterTheLastAudio(t *testing.T) {
 	}
 }
 
+// After an idle close, a reconnect to a server that accepts the request and
+// never answers the upgrade fails retryably once the redial deadline passes,
+// instead of holding the fragment for the life of the session.
+func TestAdapterBoundsAReconnectThatNeverAnswers(t *testing.T) {
+	t.Parallel()
+	var handshakes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if handshakes.Add(1) > 1 {
+			<-r.Context().Done() // never answer the upgrade
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "idle")
+	}))
+	defer server.Close()
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.redialTimeout != 10*time.Second {
+		t.Errorf("redial timeout = %v; want 10s", adapter.redialTimeout)
+	}
+	adapter.redialTimeout = 200 * time.Millisecond
+	providerStream, err := adapter.Open(context.Background(), adapterRequest(server.URL))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = providerStream.Close(context.Background()) }()
+	waitForDisconnect(t, providerStream)
+	started := time.Now()
+	err = providerStream.AppendText(context.Background(), "Hello.")
+	var failure *runtimepkg.ProviderError
+	if !errors.As(err, &failure) || !failure.Retryable || failure.Code != "provider_unavailable" {
+		t.Errorf("append to a reconnect that never answers = %v; want a retryable provider_unavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Errorf("append returned after %v; want the 200 ms redial deadline", elapsed)
+	}
+	if got := handshakes.Load(); got != 2 {
+		t.Errorf("handshakes = %d; want the first and one reconnect", got)
+	}
+}
+
 // make16kAudio is duration bytes of 16 kHz pcm_s16le whose first byte marks
 // which fragment it belongs to.
 func make16kAudio(mark byte, bytes int) []byte {

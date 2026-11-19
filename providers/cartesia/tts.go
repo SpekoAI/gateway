@@ -72,6 +72,8 @@ type Adapter struct {
 	maxMessageBytes int64
 	endpointPolicy  upstream.WebSocketPolicy
 	now             func() time.Time
+	// redialTimeout bounds the handshake of a reconnect after an idle close.
+	redialTimeout time.Duration
 }
 
 // New creates a bounded Cartesia TTS adapter.
@@ -106,6 +108,7 @@ func New(config Config) (*Adapter, error) {
 		maxMessageBytes: config.MaxMessageBytes,
 		endpointPolicy:  endpointPolicy,
 		now:             time.Now,
+		redialTimeout:   redialTimeout,
 	}, nil
 }
 
@@ -206,7 +209,9 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 			}
 			token = current.Value
 		}
-		return handshake(ctx, token)
+		dialCtx, cancel := context.WithTimeout(ctx, a.redialTimeout)
+		defer cancel()
+		return handshake(dialCtx, token)
 	}
 	conn, requestID, err := handshake(ctx, credential.Value)
 	if err != nil {
@@ -416,6 +421,9 @@ const (
 	quietGap = 2 * time.Second
 	// defaultBufferDelay is Cartesia's documented max_buffer_delay_ms default.
 	defaultBufferDelay = 3 * time.Second
+	// redialTimeout bounds a reconnect handshake, which otherwise waits as
+	// long as the session for a vendor that never answers the upgrade.
+	redialTimeout = 10 * time.Second
 )
 
 func (s *stream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
