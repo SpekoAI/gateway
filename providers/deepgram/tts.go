@@ -88,7 +88,7 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	if request.Media == nil {
 		return nil, errors.New("deepgram tts requires media configuration")
 	}
-	endpoint, protocolVersion, err := speakEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media)
+	endpoint, protocolVersion, err := speakEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media, spekoPaidKey(request.Plan.Execution))
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +133,7 @@ func (a *TTSAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	return stream, nil
 }
 
-func speakEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, media protocol.MediaFormat) (string, int, error) {
+func speakEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, media protocol.MediaFormat, mipOptOut bool) (string, int, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
 		return "", 0, fmt.Errorf("deepgram tts endpoint: %w", err)
@@ -173,6 +173,9 @@ func speakEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, m
 	query.Set("model", model)
 	query.Set("encoding", "linear16")
 	query.Set("sample_rate", strconv.Itoa(media.SampleRateHz))
+	if mipOptOut {
+		query.Set(mipOptOutParam, "true")
+	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), protocolVersion, nil
 }

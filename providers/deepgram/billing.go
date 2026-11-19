@@ -15,7 +15,8 @@ const multilingualLanguage = "multi"
 
 // streamingBaseQueryKeys and batchBaseQueryKeys are the request parameters
 // that make a transcription happen at all — the ones this adapter sets
-// unconditionally, plus the language and reservation tags. Deepgram's
+// unconditionally, plus the language and reservation tags and the Model
+// Improvement Program opt-out (a data-use flag, not an add-on). Deepgram's
 // published per-minute rates are quoted "before add-ons", so any OTHER
 // parameter on the executed request is reported as a feature.
 //
@@ -34,7 +35,7 @@ const multilingualLanguage = "multi"
 var streamingBaseQueryKeys = map[string]bool{
 	"model": true, "encoding": true, "sample_rate": true, "channels": true,
 	"interim_results": true, "endpointing": true, "language": true,
-	"tag": true, "extra": true,
+	"tag": true, "extra": true, mipOptOutParam: true,
 }
 
 // punctuate, smart_format and utterances are base keys on the prerecorded
@@ -44,7 +45,7 @@ var streamingBaseQueryKeys = map[string]bool{
 // describe no request this adapter is able to send.
 var batchBaseQueryKeys = map[string]bool{
 	"model": true, "language": true, "punctuate": true, "smart_format": true,
-	"utterances": true, "extra": true,
+	"utterances": true, "extra": true, mipOptOutParam: true,
 }
 
 // billingDimensions reads the query that actually went to Deepgram — after
