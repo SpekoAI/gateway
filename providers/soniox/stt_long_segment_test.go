@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
@@ -273,5 +275,139 @@ func TestSTTDiarizedTranslatingLongStretchIsNotCut(t *testing.T) {
 	const before = "3f25a6d4fae9f40f3eabf97bd8a723f18a8979e0326ecb537d4f6183701f6f9d"
 	if got := eventDigest(events); got != before {
 		t.Errorf("event bytes changed: digest %s, want %s", got, before)
+	}
+}
+
+// unspacedPieces is a script written without spaces or punctuation, the way
+// Chinese and Japanese are: no word or sentence boundary anywhere. Some
+// pieces start or end a combining sequence ("e" + U+0301, an emoji joined by
+// U+200D, a heart with variation selector U+FE0F) that no cut may part.
+var unspacedPieces = []string{"今天", "我们", "去了", "市场", "e", "́", "👩", "‍", "💻", "明天", "还要", "❤", "️", "继续", "旅行"}
+
+// longUnspacedStretch is a diarized talk in unspacedPieces with no endpoint,
+// msPerPiece a piece, the speaker changing every 100 pieces. Each frame
+// finalizes perFrame pieces and shows the next one as provisional tail. It
+// returns the frames and the whole text as the finals should spell it.
+func longUnspacedStretch(pieces, perFrame int, msPerPiece int64) ([]map[string]any, string) {
+	piece := func(index int, final bool) map[string]any {
+		start := int64(index) * msPerPiece
+		return sonioxToken(unspacedPieces[index%len(unspacedPieces)], start, start+msPerPiece, 1, final, strconv.Itoa(index/100%2+1))
+	}
+	var frames []map[string]any
+	var text strings.Builder
+	for first := 0; first < pieces; first += perFrame {
+		var tokens []map[string]any
+		for index := first; index < min(first+perFrame, pieces); index++ {
+			tokens = append(tokens, piece(index, true))
+			text.WriteString(unspacedPieces[index%len(unspacedPieces)])
+		}
+		if next := first + perFrame; next < pieces {
+			tokens = append(tokens, piece(next, false))
+		} else {
+			tokens = append(tokens, sonioxEnd(int64(pieces)*msPerPiece+20))
+		}
+		frames = append(frames, sonioxFrame(tokens...))
+	}
+	return frames, text.String()
+}
+
+// With no word or sentence boundary in sight, the stretch is still cut and
+// stays linear: twice the talk, about twice the bytes, no event growing with
+// it. Pieces 2 ms apart pass 2,000 characters long before 20 s.
+func TestSTTDiarizedUnspacedStretchStaysLinear(t *testing.T) {
+	t.Parallel()
+
+	measure := func(pieces int) (total, largest int) {
+		frames, _ := longUnspacedStretch(pieces, 3, 2)
+		_, events := runSTTScriptUntil(t, diarizedRequest, frames, untilSpeechEnded)
+		for _, event := range events {
+			total += len(event.Data)
+			largest = max(largest, len(event.Data))
+		}
+		return total, largest
+	}
+	short, shortLargest := measure(3000)
+	long, longLargest := measure(6000)
+	t.Logf("3000 pieces: %d bytes, largest event %d; 6000 pieces: %d bytes, largest %d", short, shortLargest, long, longLargest)
+	if ratio := float64(long) / float64(short); ratio > 2.3 {
+		t.Errorf("twice the talk cost %.2f times the bytes, want about 2", ratio)
+	}
+	if longLargest > 16_000 {
+		t.Errorf("largest event %d bytes, want at most 16000 whatever the length", longLargest)
+	}
+}
+
+// Cutting text with no boundary keeps every character in exactly one final,
+// in order, and never parts a combining sequence, whether the 2,000
+// characters or the 20 s bound passes first.
+func TestSTTDiarizedUnspacedStretchKeepsEveryCharacterOnce(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name       string
+		msPerPiece int64
+	}{
+		{name: "characters first", msPerPiece: 2},
+		{name: "time first", msPerPiece: 150},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			frames, spelled := longUnspacedStretch(3000, 1, testCase.msPerPiece)
+			_, events := runSTTScriptUntil(t, diarizedRequest, frames, untilSpeechEnded)
+			var finals []string
+			for _, event := range events {
+				if event.Type != protocol.EventTranscriptFinal {
+					continue
+				}
+				text := decodeTranslated(t, event.Data).Text
+				first, _ := utf8.DecodeRuneInString(text)
+				last, _ := utf8.DecodeLastRuneInString(text)
+				if unicode.Is(unicode.M, first) || unicode.Is(unicode.Variation_Selector, first) || first == '‍' || last == '‍' {
+					t.Fatalf("final %d parts a combining sequence: %+q ... %+q", len(finals), first, last)
+				}
+				finals = append(finals, text)
+			}
+			if len(finals) < 3 {
+				t.Fatalf("%d finals, want the stretch cut several times", len(finals))
+			}
+			if got := strings.Join(finals, ""); got != spelled {
+				t.Fatalf("finals spell %d characters, want the %d said, each once, in order", utf8.RuneCountInString(got), utf8.RuneCountInString(spelled))
+			}
+		})
+	}
+}
+
+// Where no word or sentence boundary exists, the cut falls at the last
+// boundary between finalized tokens within the first 2,000 characters that
+// does not part a combining sequence, and never after the last finalized
+// token.
+func TestSTTCutPointWithoutBoundary(t *testing.T) {
+	t.Parallel()
+
+	tokens := func(head int, tail ...string) []sttToken {
+		list := make([]sttToken, 0, head+len(tail))
+		for range head {
+			list = append(list, sttToken{Text: "中"})
+		}
+		for _, text := range tail {
+			list = append(list, sttToken{Text: text})
+		}
+		return list
+	}
+	for _, testCase := range []struct {
+		name   string
+		tokens []sttToken
+		want   int
+	}{
+		{name: "at the bound", tokens: tokens(2001), want: 2000},
+		{name: "keeps the last finalized token", tokens: tokens(30), want: 29},
+		{name: "combining mark stays with its base", tokens: tokens(1999, "e", "́"), want: 1999},
+		{name: "joined emoji stays whole", tokens: tokens(1998, "👩", "‍", "💻"), want: 1998},
+		{name: "variation selector stays", tokens: tokens(1999, "❤", "️"), want: 1999},
+		{name: "multi-character tokens", tokens: tokens(0, strings.Repeat("中", 1500), strings.Repeat("中", 400), strings.Repeat("中", 200)), want: 2},
+	} {
+		if got := sttCutPoint(testCase.tokens); got != testCase.want {
+			t.Errorf("%s: cut at %d, want %d", testCase.name, got, testCase.want)
+		}
 	}
 }

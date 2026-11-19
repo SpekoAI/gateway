@@ -220,10 +220,14 @@ part spans more than 20 s of audio or 2,000 characters, that part's prefix
 goes out once as a `transcript.final` with `speech_final: false`. The prefix
 ends after the last finalized piece that ends a sentence in the last quarter
 of the finalized text, or else at the last word boundary between finalized
-pieces. It never ends inside a word, and never after the last finalized
-piece, which the next piece may continue. Later deltas carry only the rest,
-with run offsets into their own text, and every word reaches exactly one
-final, in order. A session without diarization is never cut, and neither is
+pieces, so it never ends inside a word. Text with neither, such as Chinese or
+Japanese written without spaces, is cut at the last boundary between
+finalized pieces within the first 2,000 characters, skipping any that would
+part a combining sequence (a letter and its combining marks, emoji joined by
+U+200D, a variation selector or skin-tone modifier). The prefix never ends
+after the last finalized piece, which the next piece may continue. Later
+deltas carry only the rest, with run offsets into their own text, and every
+word and character reaches exactly one final, in order. A session without diarization is never cut, and neither is
 a diarized session that asked for Soniox's own translation: that translation
 trails the words and is not aligned to them, so such a session keeps one
 final per segment as before.

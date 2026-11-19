@@ -897,9 +897,10 @@ func sttOverBound(text string, tokens []sttToken) bool {
 
 // sttCutPoint returns how many of the finalized tokens to emit, 0 when there
 // is nowhere to cut. A cut lies between two tokens where the second starts a
-// word or the first ends one or a sentence. The end of the last finalized
-// token is never one: the next piece is not final yet and may continue the
-// word.
+// word or the first ends one or a sentence; text with no such boundary, as
+// Chinese or Japanese written without spaces, is cut by sttCharacterCut. The
+// end of the last finalized token is never one: the next piece is not final
+// yet and may continue the word.
 func sttCutPoint(tokens []sttToken) int {
 	total := 0
 	for _, token := range tokens {
@@ -922,7 +923,41 @@ func sttCutPoint(tokens []sttToken) int {
 	if sentence > 0 {
 		return sentence
 	}
-	return word
+	if word > 0 {
+		return word
+	}
+	return sttCharacterCut(tokens)
+}
+
+// sttCharacterCut is the cut for finalized text with no word or sentence
+// boundary: the last boundary between finalized tokens within the first
+// sttCutCharacters characters. A token boundary is a character boundary; one
+// that would part a combining sequence is skipped (sttJoined).
+func sttCharacterCut(tokens []sttToken) int {
+	cut, offset, hasText := 0, 0, false
+	for index := 1; index < len(tokens); index++ {
+		previous := tokens[index-1].Text
+		offset += utf8.RuneCountInString(previous)
+		if offset > sttCutCharacters {
+			break
+		}
+		hasText = hasText || strings.TrimSpace(previous) != ""
+		if hasText && !sttJoined(previous, tokens[index].Text) {
+			cut = index
+		}
+	}
+	return cut
+}
+
+// sttJoined reports whether next continues the character previous ends:
+// next starts with a combining mark, a zero-width joiner, a variation
+// selector or an emoji skin-tone modifier, or previous ends with a joiner.
+func sttJoined(previous, next string) bool {
+	last, _ := utf8.DecodeLastRuneInString(previous)
+	first, _ := utf8.DecodeRuneInString(next)
+	return last == '\u200d' || first == '\u200d' ||
+		unicode.Is(unicode.M, first) || unicode.Is(unicode.Variation_Selector, first) ||
+		first >= 0x1F3FB && first <= 0x1F3FF
 }
 
 func sttEndsSentence(text string) bool {
