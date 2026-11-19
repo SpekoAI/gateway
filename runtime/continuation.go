@@ -131,6 +131,15 @@ type continuation struct {
 	authorizedUnits                    int64
 	pending, paused, disabled, closing bool
 	changed                            chan struct{}
+	replacement                        *continuationReplacement
+}
+
+// One original renewed slice, including the interval before Resume returns.
+// Every field is protected by continuation.mu; SQL can only shorten its cap.
+type continuationReplacement struct {
+	horizon, deadline time.Time
+	timer             *time.Timer
+	adopted, expired  bool
 }
 
 func (c *continuation) close() bool {
@@ -151,7 +160,13 @@ func (c *continuation) synchronize(ctx context.Context) error {
 	}
 	if refreshed {
 		c.mu.Lock()
-		if !c.paused && c.session.ctx.Err() == nil {
+		if p := c.replacement; p != nil && !p.adopted && c.session.ctx.Err() == nil {
+			if deadline := time.Now().Add(p.horizon.Sub(c.clock.now())); deadline.Before(p.deadline) {
+				p.deadline = deadline
+				p.timer.Reset(max(time.Until(deadline), 0))
+				c.stream.TightenPhysicalDeadline(deadline)
+			}
+		} else if !c.paused && c.session.ctx.Err() == nil {
 			if deadline := time.Now().Add(c.horizon.Sub(c.clock.now())); deadline.Before(c.hardDeadline) {
 				c.hardDeadline = deadline
 				c.stream.TightenPhysicalDeadline(deadline)
@@ -356,14 +371,15 @@ func (c *continuation) renew(previous time.Time) {
 		c.stream.Detach()
 		c.session.stopLeaseTimer()
 		c.notifyLocked()
-		adopted, expired := false, false // protected by c.mu, including the timer
-		adoptionTimer := time.AfterFunc(max(time.Until(hardDeadline), 0), func() {
+		p := &continuationReplacement{horizon: horizon, deadline: hardDeadline}
+		c.replacement = p
+		p.timer = time.AfterFunc(max(time.Until(hardDeadline), 0), func() {
 			c.mu.Lock()
-			if adopted {
+			if p.adopted {
 				c.mu.Unlock()
 				return // canonical timer already owns this exact deadline
 			}
-			expired = true
+			p.expired = true
 			c.terminalLeaseExpired.Store(true)
 			c.mu.Unlock()
 			// Detach is concurrent with Resume by contract. Keep the terminal
@@ -372,19 +388,26 @@ func (c *continuation) renew(previous time.Time) {
 			c.session.fail(ErrSessionLeaseExpired)
 		})
 		defer func() {
+			c.mu.Lock()
+			adopted := p.adopted
+			c.mu.Unlock()
 			if adopted {
-				adoptionTimer.Stop()
+				p.timer.Stop()
 				return
 			}
 			// Failure/cancellation is not physical closure evidence. Preserve
 			// this cap until actual serialized teardown and event draining join.
-			go func() { <-c.session.physicalStopped; adoptionTimer.Stop() }()
+			go func() { <-c.session.physicalStopped; p.timer.Stop() }()
 		}()
 		c.mu.Unlock()
 		resumeCtx, resumeCancel := context.WithDeadlineCause(ctx, hardDeadline, ErrSessionLeaseExpired)
 		// Keep the cap distinct from the shorter request/cancellation budget.
 		// The provider must arm it on a replacement before setup can block.
-		resumeCtx = context.WithValue(resumeCtx, providerPhysicalDeadlineKey{}, hardDeadline)
+		resumeCtx = context.WithValue(resumeCtx, providerPhysicalDeadlineKey{}, func() time.Time {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return p.deadline
+		})
 		err = c.stream.Resume(resumeCtx, renewal.Credential)
 		c.session.providerMu.Unlock()
 		resumeCancel()
@@ -397,10 +420,11 @@ func (c *continuation) renew(previous time.Time) {
 			break
 		}
 		c.mu.Lock()
+		hardDeadline = p.deadline
 		if deadline := time.Now().Add(horizon.Sub(c.clock.now())); deadline.Before(hardDeadline) {
 			hardDeadline = deadline
 		}
-		if expired || ctx.Err() != nil || !time.Now().Before(hardDeadline) || !c.clock.now().Before(horizon) {
+		if p.expired || ctx.Err() != nil || !time.Now().Before(hardDeadline) || !c.clock.now().Before(horizon) {
 			c.mu.Unlock()
 			failure = ErrSessionLeaseExpired
 			break
@@ -414,8 +438,9 @@ func (c *continuation) renew(previous time.Time) {
 		// Install the canonical owner before retiring the adoption timer. A
 		// callback already waiting on c.mu observes adopted, and a late return
 		// cannot reset the cap or advance allowance/sequence.
-		adopted = true
-		adoptionTimer.Stop()
+		p.adopted = true
+		c.replacement = nil
+		p.timer.Stop()
 		c.notifyLocked()
 		c.mu.Unlock()
 		return

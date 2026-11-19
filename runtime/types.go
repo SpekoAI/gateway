@@ -153,8 +153,12 @@ type providerPhysicalDeadlineKey struct{}
 // ProviderPhysicalDeadline returns the Engine's already validated monotonic
 // replacement cap. It is independent of a caller/setup context's deadline and
 // must be retained through setup, handoff and physical teardown. A zero value
-// means the Engine did not supply a funded replacement cap.
+// means the Engine did not supply a funded replacement cap. A SQL refresh may
+// shorten this same pending cap; reading it never renews its original lifetime.
 func ProviderPhysicalDeadline(ctx context.Context) time.Time {
+	if current, ok := ctx.Value(providerPhysicalDeadlineKey{}).(func() time.Time); ok {
+		return current()
+	}
 	deadline, _ := ctx.Value(providerPhysicalDeadlineKey{}).(time.Time)
 	return deadline
 }

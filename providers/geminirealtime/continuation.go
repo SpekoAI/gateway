@@ -18,6 +18,7 @@ type resumableStream struct {
 	request           runtimepkg.AdapterRequest
 	mu                sync.Mutex
 	current, detached *liveStream
+	pending           *pendingPhysicalSocket
 	bridgeDone        chan struct{}
 	closed            bool
 	closing           bool
@@ -25,6 +26,14 @@ type resumableStream struct {
 	events            chan runtimepkg.ProviderEvent
 	eventsClosed      bool
 	terminal          error
+}
+
+// This exact Resume owns its cap before Dial exposes a physical transport.
+// All fields except done are protected by resumableStream.mu.
+type pendingPhysicalSocket struct {
+	deadline time.Time
+	physical *physicalSocket
+	done     chan struct{}
 }
 
 func newResumableStream(a *Adapter, request runtimepkg.AdapterRequest, stream *liveStream) *resumableStream {
@@ -122,8 +131,17 @@ func (s *resumableStream) CanResume() bool {
 }
 func (s *resumableStream) TightenPhysicalDeadline(deadline time.Time) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p := s.pending; p != nil {
+		if !deadline.IsZero() && (p.deadline.IsZero() || deadline.Before(p.deadline)) {
+			p.deadline = deadline
+			if p.physical != nil {
+				p.physical.tighten(deadline)
+			}
+		}
+		return
+	}
 	stream := s.current
-	s.mu.Unlock()
 	if stream != nil && stream.physical != nil {
 		stream.physical.tighten(deadline)
 	}
@@ -137,17 +155,27 @@ func (s *resumableStream) Detach() {
 	} else {
 		stream = s.detached
 	}
+	var pending *physicalSocket
+	if s.pending != nil {
+		pending = s.pending.physical
+	}
 	s.mu.Unlock()
 	if stream != nil {
 		stream.Interrupt()
+	}
+	if pending != nil {
+		pending.Interrupt()
 	}
 }
 func (s *resumableStream) Resume(ctx context.Context, credential protocol.DelegatedCredential) error {
 	if s.request.Plan.Execution.CredentialSource != protocol.CredentialsBYOK {
 		return &runtimepkg.ProviderError{Code: "unsupported_operation", Message: "Managed Google resumption has no accepted provider-enforced bound"}
 	}
+	// Read outside s.mu: the Engine's accessor retains its own original
+	// pending slice lock and can only return a tighter monotonic minimum.
+	deadline := runtimepkg.ProviderPhysicalDeadline(ctx)
 	s.mu.Lock()
-	if s.closed || s.closing {
+	if s.closed || s.closing || s.pending != nil {
 		s.mu.Unlock()
 		return runtimepkg.ErrSessionClosed
 	}
@@ -157,10 +185,24 @@ func (s *resumableStream) Resume(ctx context.Context, credential protocol.Delega
 		previous = s.detached
 	}
 	done := s.bridgeDone
-	s.mu.Unlock()
 	if handle == "" {
+		s.mu.Unlock()
 		return runtimepkg.ErrResumptionUnavailable
 	}
+	pending := &pendingPhysicalSocket{deadline: deadline, done: make(chan struct{})}
+	s.pending = pending
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.pending == pending {
+			s.pending = nil
+		}
+		close(pending.done)
+		s.mu.Unlock()
+	}()
+	// Close the interval between the first cap read and registering pending:
+	// any later refresh now reaches this exact owner through Tighten directly.
+	s.TightenPhysicalDeadline(runtimepkg.ProviderPhysicalDeadline(ctx))
 	s.Detach()
 	// Detach is a prompt interruption, not teardown proof. Join the old
 	// socket before replacement I/O; the coordinator's adoption cap stays armed.
@@ -175,11 +217,25 @@ func (s *resumableStream) Resume(ctx context.Context, credential protocol.Delega
 	// The root's cap cannot authorize a replacement. Retain the coordinator's
 	// original renewed cap on this exact transport BEFORE setup/Resume can
 	// block, independently of the cancellation budget and s.current adoption.
-	request.PhysicalDeadline = runtimepkg.ProviderPhysicalDeadline(ctx)
+	s.mu.Lock()
+	request.PhysicalDeadline = pending.deadline
+	s.mu.Unlock()
 	if request.PhysicalDeadline.IsZero() && !s.request.PhysicalDeadline.IsZero() {
 		return errors.New("gemini realtime: funded replacement physical deadline is missing")
 	}
-	stream, err := s.adapter.openSocket(ctx, request, handle, previous.responding, s.expirePhysical)
+	if !request.PhysicalDeadline.IsZero() && !time.Now().Before(request.PhysicalDeadline) {
+		return runtimepkg.ErrSessionLeaseExpired
+	}
+	stream, err := s.adapter.openSocket(ctx, request, handle, previous.responding, s.expirePhysical, func(physical *physicalSocket) {
+		s.mu.Lock()
+		pending.physical = physical
+		physical.tighten(pending.deadline)
+		closed := s.closed || s.closing
+		s.mu.Unlock()
+		if closed {
+			physical.Interrupt()
+		}
+	})
 	if err != nil {
 		if stream != nil {
 			_ = stream.abort()
@@ -271,9 +327,16 @@ func (s *resumableStream) Interrupt() {
 	if stream == nil {
 		stream = s.detached
 	}
+	var pending *physicalSocket
+	if s.pending != nil {
+		pending = s.pending.physical
+	}
 	s.mu.Unlock()
 	if stream != nil {
 		stream.Interrupt()
+	}
+	if pending != nil {
+		pending.Interrupt()
 	}
 }
 func (s *resumableStream) Abort(context.Context) error {
@@ -284,13 +347,26 @@ func (s *resumableStream) Abort(context.Context) error {
 		stream = s.detached
 	}
 	done := s.bridgeDone
+	pending := s.pending
+	var pendingPhysical *physicalSocket
+	if pending != nil {
+		pendingPhysical = pending.physical
+	}
 	if stream != nil {
 		s.detached = stream // later interruption can still retry a failed close
 	}
 	s.current = nil
 	s.mu.Unlock()
+	if pendingPhysical != nil {
+		pendingPhysical.Interrupt()
+	}
 	if stream != nil {
 		_ = stream.abort()
+	}
+	if pending != nil {
+		// Resume joins its exact setup stream on failure before retiring this
+		// owner. A concurrent abort must not report closure before that join.
+		<-pending.done
 	}
 	<-done
 	s.end(nil)

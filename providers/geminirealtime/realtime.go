@@ -104,7 +104,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	return stream, nil
 }
 
-func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequest, handle string, responding *atomic.Bool, expire func(*liveStream)) (*liveStream, error) {
+func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequest, handle string, responding *atomic.Bool, expire func(*liveStream), acquired ...func(*physicalSocket)) (*liveStream, error) {
 	if request.Kind != protocol.SessionKindRealtime {
 		return nil, fmt.Errorf("gemini realtime supports realtime sessions, got %q", request.Kind)
 	}
@@ -168,6 +168,9 @@ func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequ
 				return nil, errors.New("gemini realtime upgrade did not expose a duplex transport")
 			}
 			physical = newPhysicalSocket(body, request.PhysicalDeadline)
+			if len(acquired) != 0 && acquired[0] != nil {
+				acquired[0](physical)
+			}
 			response.Body = physical
 			// Dial may be reading an invalid upgrade response while reporting
 			// its handshake error. That diagnostic read has its own timeout.

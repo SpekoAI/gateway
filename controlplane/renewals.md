@@ -120,6 +120,24 @@ The later SQL lease never replaces an earlier credential horizon. Replacement
 adoption similarly tightens its original cap after any fresh SQL sample without
 resetting the lifetime or reusing the root credential's horizon.
 
+The pending replacement retains that same absolute horizon and monotonic
+minimum before `Resume` can block. A fresh accepted SQL sample tightens its
+temporary timer and its actual physical owner even while setup or the original
+`Resume` return is held. The read-only context accessor exposes only this
+original, possibly shortened cap; it cannot mint a new horizon. The provider
+registers one pending socket owner before dialing and attaches the upgraded
+transport before handshake/setup. Tightening before acquisition is retained
+and applied to that exact transport; a later deadline cannot extend it.
+Detach/interrupt reaches the pending owner as well as the predecessor, while
+adoption and old expiry callbacks remain bound to their own generation.
+
+Owned TLS tests independently hold the tightening method's return, preventing
+the coordinator from completing its timer path. The pending physical timer
+still closes the actual socket under the original bound. Terminal failure
+metadata does not await a held transport Close return, but capacity does: both
+the original Resume continuation and actual physical teardown must join.
+These are owned-transport controls; managed Google resumption remains refused.
+
 Before a resumed socket can open, the coordinator anchors its validated
 credential/lease/root horizon to monotonic elapsed time. An independent owner
 keeps that exact cap armed during Resume, blocked clock synchronization and
