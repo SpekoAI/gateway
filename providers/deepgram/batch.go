@@ -115,7 +115,8 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 			query.Add(name, keyword)
 		}
 	}
-	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay || request.Plan.Execution.CredentialSource == protocol.CredentialsManaged {
+	if spekoPaidKey(request.Plan.Execution) {
+		query.Set(mipOptOutParam, "true")
 		if reservation := strings.TrimSpace(request.Plan.Reservation.ID); reservation != "" {
 			query.Set("extra", "speko_reservation:"+reservation)
 		}

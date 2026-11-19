@@ -309,6 +309,9 @@ func TestAdapterUsesDeepgramTokenSchemeForBYOK(t *testing.T) {
 		if got := received.URL.Query().Get("extra"); got != "" {
 			t.Fatalf("BYOK request carried unexpected extra metadata %q", got)
 		}
+		if got := received.URL.Query().Get("mip_opt_out"); got != "" {
+			t.Fatalf("BYOK request must keep the customer's own Deepgram setting, got mip_opt_out=%q", got)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not observe BYOK websocket handshake")
 	}
@@ -350,6 +353,9 @@ func TestAdapterUsesDelegatedBearerForManagedRoute(t *testing.T) {
 		}
 		if got := received.URL.Query().Get("extra"); got != "speko_reservation:res_deepgram" {
 			t.Fatalf("managed request metadata = %q", got)
+		}
+		if got := received.URL.Query().Get("mip_opt_out"); got != "true" {
+			t.Fatalf("managed request mip_opt_out = %q, want true", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not observe managed websocket handshake")
@@ -574,11 +580,11 @@ func TestListenEndpointRejectsInvalidMediaAndPath(t *testing.T) {
 		t.Fatalf("endpoint policy: %v", err)
 	}
 
-	_, err = listenEndpoint(policy, "wss://api.deepgram.com/not-listen", "nova-3", protocol.RequestOptions{}, *media(), runtimepkg.AudioDeliveryLive, "")
+	_, err = listenEndpoint(policy, "wss://api.deepgram.com/not-listen", "nova-3", protocol.RequestOptions{}, *media(), runtimepkg.AudioDeliveryLive, "", false)
 	if err == nil {
 		t.Fatal("expected path validation failure")
 	}
-	_, err = listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3", protocol.RequestOptions{}, protocol.MediaFormat{Encoding: "mulaw", SampleRateHz: 8_000, Channels: 1}, runtimepkg.AudioDeliveryLive, "")
+	_, err = listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3", protocol.RequestOptions{}, protocol.MediaFormat{Encoding: "mulaw", SampleRateHz: 8_000, Channels: 1}, runtimepkg.AudioDeliveryLive, "", false)
 	if err == nil {
 		t.Fatalf("expected media validation failure, got %v", err)
 	}

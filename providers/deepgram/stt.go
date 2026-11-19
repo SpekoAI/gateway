@@ -110,10 +110,11 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	// Reservation tagging follows the plan's billing authority, not its credential
 	// placement: a relay plan settles against a Speko reservation exactly like a
 	// managed provider-direct plan, so both must bind provider-side usage to it.
-	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay || request.Plan.Execution.CredentialSource == protocol.CredentialsManaged {
+	spekoKey := spekoPaidKey(request.Plan.Execution)
+	if spekoKey {
 		reservationID = request.Plan.Reservation.ID
 	}
-	endpoint, err := listenEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, request.Delivery, reservationID)
+	endpoint, err := listenEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, request.Delivery, reservationID, spekoKey)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +196,7 @@ func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.Creden
 	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
-func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat, delivery runtimepkg.AudioDeliveryMode, reservationID string) (string, error) {
+func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat, delivery runtimepkg.AudioDeliveryMode, reservationID string, mipOptOut bool) (string, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
 		return "", fmt.Errorf("deepgram endpoint: %w", err)
@@ -224,6 +225,9 @@ func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	query.Set("model", model)
 	query.Set("encoding", encoding)
 	query.Set("sample_rate", strconv.Itoa(media.SampleRateHz))
+	if mipOptOut {
+		query.Set(mipOptOutParam, "true")
+	}
 	if flux {
 		// Flux owns turn detection, so the v1 endpointing/interim controls are not
 		// valid here. Its multilingual model accepts repeatable language_hint;
