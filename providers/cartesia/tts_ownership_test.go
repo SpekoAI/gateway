@@ -326,64 +326,46 @@ func TestAdapterDropsAStaleFrameOfThePreviousUtterance(t *testing.T) {
 	}
 }
 
-// An utterance sent text other than whitespace that ends with no audio at all
-// is a retryable error, not a bare done: at the done of its committed context,
-// and at a commit after Cartesia expired its context without audio. An
-// utterance of whitespace alone ends with a done.
-func TestAdapterReportsAnUtteranceThatProducedNoAudio(t *testing.T) {
+// An utterance Cartesia ends without audio ("...", as for punctuation) ends
+// with audio.done, as before the context switching, and the session speaks the
+// next utterance.
+func TestAdapterEndsAnUtteranceWithoutAudioAndKeepsTheSession(t *testing.T) {
 	t.Parallel()
-	for _, test := range []struct {
-		name     string
-		text     string
-		commitOK bool // the commit is written before Cartesia answers
-		want     string
-	}{
-		{"committed", "Hello.", true, "error"},
-		{"expired", "...", false, "error"},
-		{"committed whitespace", " ", true, "audio.done"},
-		{"expired whitespace", " ", false, "audio.done"},
-	} {
-		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		for audio := range 2 { // the first utterance gets no audio, the second does
 			fragment, err := readGeneration(ctx, conn)
 			if err != nil {
-				t.Errorf("fragment: %v", err)
 				return
 			}
-			if test.commitOK {
-				if _, err := readGeneration(ctx, conn); err != nil {
-					return
-				}
+			if _, err := readGeneration(ctx, conn); err != nil { // the commit
+				return
 			}
-			writeFrames(ctx, t, conn, flushDoneFrame(fragment.ContextID), doneFrame(fragment.ContextID), map[string]any{"type": "test_marker"})
-			waitForClientClose(ctx, conn)
-		})
-		providerStream := openTestStream(t, server.URL)
-		if err := providerStream.AppendText(context.Background(), test.text); err != nil {
-			t.Fatalf("%s: append: %v", test.name, err)
-		}
-		var end runtimepkg.ProviderEvent
-		if test.commitOK {
-			if err := providerStream.CommitText(context.Background()); err != nil {
-				t.Fatalf("%s: commit: %v", test.name, err)
+			frames := []map[string]any{flushDoneFrame(fragment.ContextID), doneFrame(fragment.ContextID)}
+			if audio == 1 {
+				frames = append([]map[string]any{chunkFrame(fragment.ContextID, make16kAudio(1, 1_600))}, frames...)
 			}
-			end = nextEvents(t, providerStream.Events(), 2)[1] // after flush_done
-		} else {
-			_ = nextEvents(t, providerStream.Events(), 2) // flush_done, marker: the expiry done ends only the context
-			if err := providerStream.CommitText(context.Background()); err != nil {
-				end = runtimepkg.ProviderEvent{Err: err}
-			} else {
-				end = nextEvents(t, providerStream.Events(), 1)[0]
+			if !writeFrames(ctx, t, conn, frames...) {
+				return
 			}
 		}
-		if got := describe([]runtimepkg.ProviderEvent{end}); got != test.want {
-			t.Errorf("%s: utterance ended with %s; want %s", test.name, got, test.want)
+		waitForClientClose(ctx, conn)
+	})
+	defer server.Close()
+	providerStream := openTestStream(t, server.URL)
+	defer func() { _ = providerStream.Close(context.Background()) }()
+	for _, utterance := range []struct{ text, want string }{
+		{"...", "warning,audio.done"},
+		{"Hello.", "audio.started,audio.frame1,warning,audio.done"},
+	} {
+		if err := providerStream.AppendText(context.Background(), utterance.text); err != nil {
+			t.Fatalf("append %q: %v", utterance.text, err)
 		}
-		var failure *runtimepkg.ProviderError
-		if test.want == "error" && (!errors.As(end.Err, &failure) || !failure.Retryable || !strings.Contains(failure.Message, "no audio")) {
-			t.Errorf("%s: error = %+v; want a retryable no-audio error", test.name, end.Err)
+		if err := providerStream.CommitText(context.Background()); err != nil {
+			t.Fatalf("commit %q: %v", utterance.text, err)
 		}
-		_ = providerStream.Close(context.Background())
-		server.Close()
+		if got := describe(nextEvents(t, providerStream.Events(), strings.Count(utterance.want, ",")+1)); got != utterance.want {
+			t.Fatalf("%q: events = %s; want %s", utterance.text, got, utterance.want)
+		}
 	}
 }
 

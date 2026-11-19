@@ -57,9 +57,8 @@ type Config struct {
 // and no audio has answered it yet; until then it continues the current
 // context.
 // A socket Cartesia closes in the middle of an utterance is a retryable error
-// by design. An utterance sent text other than whitespace that produced no
-// audio at all is a retryable error; one that produced any audio ends
-// normally.
+// by design. An utterance Cartesia ends, with or without audio, ends with
+// audio.done.
 //
 // Limit: the adapter does not detect partial speech, neither inside a context
 // nor a continuation context that ends without audio: Cartesia gives no
@@ -326,10 +325,9 @@ func validateGenerationOptions(model string, options protocol.RequestOptions, me
 //     the expiry done of an abandoned one, stale frames of an earlier
 //     utterance — are dropped and reported as warnings, never emitted as
 //     audio, timings or done.
-//   - The utterance ends once: at the done of its committed context, or at the
-//     commit itself when no context can speak any more. An utterance sent
-//     text other than whitespace that ends with no audio at all is a
-//     retryable error, not a done.
+//   - The utterance ends once, with audio.done whether or not it produced
+//     audio: at the done of its committed context, or at the commit itself
+//     when no context can speak any more.
 //   - A socket Cartesia closes while no context can speak is replaced by the
 //     next fragment, which was certainly not sent. A socket that closes while
 //     a context can speak, or while a frame is being written, fails the
@@ -386,10 +384,8 @@ type utterance struct {
 	current       *vendorContext
 	lastContextID string
 	committed     bool
-	// speech is set once the utterance was sent text other than whitespace.
-	speech       bool
-	audioStarted bool
-	audioBytes   int
+	audioStarted  bool
+	audioBytes    int
 }
 
 type vendorContext struct {
@@ -460,14 +456,12 @@ func (s *stream) AppendText(ctx context.Context, text string) error {
 // With no utterance to end it returns runtime.ErrNothingToCommit and the
 // session goes on.
 func (s *stream) CommitText(ctx context.Context) error {
-	contextID, conn, ended, noAudio, err := s.beginCommit()
+	contextID, conn, ended, err := s.beginCommit()
 	switch {
 	case err != nil:
 		return err
 	case !ended:
 		return s.send(ctx, conn, s.generationRequest(contextID, "", false))
-	case noAudio:
-		return noAudioError()
 	default:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.contextData(contextID)})
 	}
@@ -626,7 +620,6 @@ func (s *stream) beginFragment(text string) (contextID string, conn *websocket.C
 	c := u.current
 	c.lastFragment = now
 	if strings.TrimSpace(text) != "" {
-		u.speech = true
 		c.awaitingAudio = true
 	}
 	s.writing, s.lostWhileWriting = true, false
@@ -636,28 +629,28 @@ func (s *stream) beginFragment(text string) (contextID string, conn *websocket.C
 // beginCommit marks the utterance committed. ended reports that it ended
 // here, with no context left to finalize; otherwise the write of the final
 // frame is marked in progress.
-func (s *stream) beginCommit() (contextID string, conn *websocket.Conn, ended, noAudio bool, err error) {
+func (s *stream) beginCommit() (contextID string, conn *websocket.Conn, ended bool, err error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if s.closed.Load() || s.closing.Load() {
-		return "", nil, false, false, runtimepkg.ErrSessionClosed
+		return "", nil, false, runtimepkg.ErrSessionClosed
 	}
 	u := s.utterance
 	if u == nil || u.committed {
-		return "", nil, false, false, runtimepkg.ErrNothingToCommit
+		return "", nil, false, runtimepkg.ErrNothingToCommit
 	}
 	u.committed = true
 	if u.current != nil && (s.conn == nil || s.quietLocked(u.current, s.now())) {
 		s.abandonLocked(u)
 	}
 	if u.current == nil {
-		contextID, noAudio = u.lastContextID, u.speech && u.audioBytes == 0
+		contextID = u.lastContextID
 		s.endUtteranceLocked()
-		return contextID, nil, true, noAudio, nil
+		return contextID, nil, true, nil
 	}
 	u.current.committed = true
 	s.writing, s.lostWhileWriting = true, false
-	return u.current.id, s.conn, false, false, nil
+	return u.current.id, s.conn, false, nil
 }
 
 func (s *stream) beginCancel() (contextID string, conn *websocket.Conn, ended bool, err error) {
@@ -815,7 +808,6 @@ const (
 	// doneExpired: Cartesia expired an idle context; the utterance goes on.
 	doneExpired
 	doneFinished
-	doneNoAudio
 )
 
 // acceptDone decides what a done frame means.
@@ -830,11 +822,7 @@ func (s *stream) acceptDone(contextID string) doneOutcome {
 		s.endUtteranceLocked()
 		return doneFinished
 	case c.committed || s.closing.Load():
-		noAudio := c.committed && u.speech && u.audioBytes == 0
 		s.endUtteranceLocked()
-		if noAudio {
-			return doneNoAudio
-		}
 		return doneFinished
 	default:
 		s.abandonLocked(u)
@@ -978,8 +966,6 @@ func (s *stream) handleMessage(payload []byte) error {
 			return s.emitDropped(message, raw)
 		case doneExpired:
 			return nil
-		case doneNoAudio:
-			return noAudioError()
 		default:
 			return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.contextData(message.ContextID), Extensions: extension(raw)})
 		}
@@ -1025,15 +1011,6 @@ func unknownSendError(cause error) *runtimepkg.ProviderError {
 		Hint:      "The provider connection failed while sending this utterance; retry the utterance on a new session.",
 		Retryable: true,
 		Cause:     cause,
-	}
-}
-
-func noAudioError() *runtimepkg.ProviderError {
-	return &runtimepkg.ProviderError{
-		Code:      "provider_unavailable",
-		Message:   "Cartesia produced no audio for the utterance",
-		Hint:      "No audio was produced for this utterance; retry it, and check that it contains speakable text.",
-		Retryable: true,
 	}
 }
 
