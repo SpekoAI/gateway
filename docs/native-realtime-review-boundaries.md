@@ -34,6 +34,26 @@ the resampler; it cannot mix the cleared samples into the next commit. An
 already-started Gemini input cannot be remotely cleared through a fabricated
 control. These behaviors are covered with owned actual SDK/sidecar/PCM controls.
 
+## Automatic Gemini input completion and clear
+
+Automatic input now retains a private queued/published audio sequence and the
+source-sample prefix represented by converted PCM. The first provider turn
+observation freezes its published prefix; native `turnComplete` retires only
+that prefix. A completed observed voice exchange can then accept a genuine
+typed follow-up. Later captured/sent/queued audio and any resampler remainder
+stay pending, including a write queued before that first provider observation.
+A response terminal does not acknowledge an entire continuous input stream.
+When later input cannot be associated with that original turn, it remains
+unresolved rather than being silently marked complete.
+
+`clear_audio()` in automatic mode physically fences queued or transmitted
+unresolved input, just as manual mode already does. The protocol supplies no
+remote buffer-clear acknowledgment to claim. Genuinely still-local conversion
+can be reset, and an already completed original prefix does not permanently
+poison the session's clear path. Automatic `commit_audio()` can flush local
+conversion, but cannot mark its already transmitted input complete by itself.
+No new native control, acknowledgment, timer or admission authority is added.
+
 ## Exact SDK tool cancellation port
 
 The supported LiveKit versions do not expose a public per-call cancellation
