@@ -633,7 +633,9 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 	// produce — except it is already signed and in memory. Preferring it keeps
 	// recovery as fast as the first attempt was, and keeps the one-per-attempt
 	// exchange in reserve for when the pool cannot help.
-	if s.warmPlans != nil {
+	// Funded roots require the platform's predecessor lifecycle; a different
+	// warm session cannot substitute for that authorization.
+	if s.warmPlans != nil && !plan.UsesFundedContinuation() {
 		if retryPlan, warm := s.warmPlans.Take(planRequestFor(body, s.runtime, s.workload)); warm {
 			retrySession, retryErr := s.openSession(ctx, body, retryPlan, inflight)
 			if retryErr == nil {
@@ -646,12 +648,16 @@ func (s *Server) openWithFallback(ctx context.Context, body CreateSessionRequest
 	}
 	// The exchange needs its own idempotency key: the create key already
 	// identifies the plan-issuance request in a different ledger.
+	fallbackKey := idempotencyKey + ":fallback:" + plan.AttemptID
+	if plan.UsesFundedContinuation() {
+		fallbackKey = fmt.Sprintf("fallback:%x", sha256.Sum256([]byte(fallbackKey)))
+	}
 	fallbackPlan, fallbackRequestID, exchangeErr := s.plans.ExchangeFallbackPlan(ctx, plan, controlplane.FallbackRequest{
 		AttemptID:      plan.AttemptID,
 		Reason:         "provider_open_failed",
 		ProviderCode:   providerError.Code,
 		ProviderStatus: providerError.ProviderStatus,
-	}, idempotencyKey+":fallback:"+plan.AttemptID)
+	}, fallbackKey)
 	if exchangeErr != nil {
 		return nil, plan, requestID, err
 	}
@@ -707,6 +713,9 @@ func (s *Server) openSession(ctx context.Context, body CreateSessionRequest, pla
 			credential, _, err := refresher.RefreshCredential(ctx, plan, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"})
 			return credential, err
 		}
+	}
+	if entitlements, ok := s.plans.(runtimepkg.EntitlementClient); ok {
+		open.Entitlements = entitlements
 	}
 	session, err := s.engine.Open(ctx, open)
 	s.mu.Lock()

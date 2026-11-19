@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -85,9 +86,25 @@ func New(config Config) (*Adapter, error) {
 
 func (a *Adapter) ID() string { return a.id }
 
+func (a *Adapter) GoogleRealtimeAdapter() bool { return true }
+
 // Open establishes the constrained Google socket and waits for setupComplete.
 // The Engine emits the canonical session.ready event after this returns.
 func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (runtimepkg.ProviderStream, error) {
+	stream, err := a.openSocket(ctx, request, "", nil, nil)
+	if err != nil {
+		if stream == nil {
+			return nil, err
+		}
+		return stream, err
+	}
+	if request.Continuation {
+		return newResumableStream(a, request, stream), nil
+	}
+	return stream, nil
+}
+
+func (a *Adapter) openSocket(ctx context.Context, request runtimepkg.AdapterRequest, handle string, responding *atomic.Bool, expire func(*liveStream), acquired ...func(*physicalSocket)) (*liveStream, error) {
 	if request.Kind != protocol.SessionKindRealtime {
 		return nil, fmt.Errorf("gemini realtime supports realtime sessions, got %q", request.Kind)
 	}
@@ -128,36 +145,104 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	query.Set("access_token", credential.Value)
 	endpoint.RawQuery = query.Encode()
 
-	conn, response, err := websocket.Dial(ctx, endpoint.String(), &websocket.DialOptions{HTTPClient: a.httpClient})
+	// Retain the upgraded transport's closer. CloseNow waits for an already
+	// running Close handshake, so the physical transport must remain directly
+	// abortable when the funded lease expires during a graceful close.
+	client := a.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	copyClient := *client
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	var physical *physicalSocket
+	var stopDialAbort func() bool
+	copyClient.Transport = socketTransport(func(r *http.Request) (*http.Response, error) {
+		response, err := transport.RoundTrip(r)
+		if err == nil && response.StatusCode == http.StatusSwitchingProtocols {
+			body, ok := response.Body.(io.ReadWriteCloser)
+			if !ok {
+				_ = response.Body.Close()
+				return nil, errors.New("gemini realtime upgrade did not expose a duplex transport")
+			}
+			physical = newPhysicalSocket(body, request.PhysicalDeadline)
+			if len(acquired) != 0 && acquired[0] != nil {
+				acquired[0](physical)
+			}
+			response.Body = physical
+			// Dial may be reading an invalid upgrade response while reporting
+			// its handshake error. That diagnostic read has its own timeout.
+			stopDialAbort = context.AfterFunc(ctx, physical.Interrupt)
+		}
+		return response, err
+	})
+	conn, response, err := websocket.Dial(ctx, endpoint.String(), &websocket.DialOptions{HTTPClient: &copyClient})
+	if stopDialAbort != nil {
+		stopDialAbort()
+	}
 	if err != nil {
+		if physical != nil {
+			failedCtx, cancelFailed := context.WithCancel(context.Background())
+			failed := &liveStream{physical: physical, ctx: failedCtx, cancel: cancelFailed, events: make(chan runtimepkg.ProviderEvent)}
+			failed.closed.Store(true)
+			physical.bindExpiry(failed.Interrupt)
+			return failed, dialError(response, err)
+		}
 		return nil, dialError(response, err)
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
+	if responding == nil {
+		responding = &atomic.Bool{}
+	}
 	stream := &liveStream{
 		conn: conn, ctx: streamCtx, cancel: cancel,
-		events: make(chan runtimepkg.ProviderEvent, a.eventBuffer), setupDone: make(chan error, 1),
-		inputMIME: fmt.Sprintf("audio/pcm;rate=%d", request.Media.SampleRateHz),
+		physical: physical,
+		events:   make(chan runtimepkg.ProviderEvent, a.eventBuffer), setupDone: make(chan error, 1),
+		inputMIME:    fmt.Sprintf("audio/pcm;rate=%d", request.Media.SampleRateHz),
+		responding:   responding,
+		gracefulDone: make(chan struct{}),
 	}
-	if err := stream.writeJSON(ctx, buildSetup("models/"+model, request.Options)); err != nil {
-		_ = stream.abort()
-		return nil, err
+	physical.bindExpiry(func() {
+		if expire != nil {
+			expire(stream) // stable exact-socket detachment, including pending setup
+			return
+		}
+		stream.setTerminal(runtimepkg.ErrSessionLeaseExpired)
+		stream.Interrupt()
+	})
+	setup := buildSetup("models/"+model, request.Options)
+	if handle != "" {
+		setup["setup"].(map[string]any)["sessionResumption"] = map[string]any{"handle": handle}
 	}
+	// Start the sole reader before setup writing. Every acquired stream can
+	// then return its error promptly with a live event/teardown owner, even if
+	// physical Close returns are held. The Engine joins both asynchronously.
 	go stream.readLoop()
+	if err := stream.writeJSON(ctx, setup); err != nil {
+		stream.Interrupt()
+		return stream, err
+	}
 	setupCtx, cancelSetup := context.WithTimeout(ctx, a.setupTimeout)
 	defer cancelSetup()
 	select {
 	case err := <-stream.setupDone:
 		if err != nil {
-			_ = stream.abort()
-			return nil, err
+			stream.Interrupt()
+			return stream, err
 		}
 	case <-setupCtx.Done():
-		_ = stream.abort()
-		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini Live did not acknowledge setup", Retryable: true, Cause: setupCtx.Err()}
+		stream.Interrupt()
+		return stream, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini Live did not acknowledge setup", Retryable: true, Cause: setupCtx.Err()}
 	}
 	return stream, nil
 }
+
+type socketTransport func(*http.Request) (*http.Response, error)
+
+func (t socketTransport) RoundTrip(r *http.Request) (*http.Response, error) { return t(r) }
 
 func validatePCM(direction string, media protocol.MediaFormat, sampleRate int) error {
 	if err := media.Validate(); err != nil {
@@ -253,21 +338,29 @@ func thinkingLevelFor(model string, requested string) string {
 
 type liveStream struct {
 	conn      *websocket.Conn
+	physical  *physicalSocket
 	ctx       context.Context
 	cancel    context.CancelFunc
 	events    chan runtimepkg.ProviderEvent
 	inputMIME string
 	setupDone chan error
 
-	writeMu      sync.Mutex
-	gracefulOnce sync.Once
-	abortOnce    sync.Once
-	setupOnce    sync.Once
-	closed       atomic.Bool
-	closeErr     error
-	responding   atomic.Bool
-	terminalMu   sync.Mutex
-	terminalErr  error
+	writeMu          sync.Mutex
+	gracefulOnce     sync.Once
+	gracefulStarted  atomic.Bool
+	gracefulDone     chan struct{}
+	abortOnce        sync.Once
+	dialEventsOnce   sync.Once
+	interruptOnce    sync.Once
+	setupOnce        sync.Once
+	closed           atomic.Bool
+	closeErr         error
+	responding       *atomic.Bool
+	terminalMu       sync.Mutex
+	terminalErr      error
+	resumptionMu     sync.Mutex
+	resumptionHandle string
+	closeMu          sync.Mutex
 }
 
 func (s *liveStream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -302,24 +395,74 @@ func (s *liveStream) Cancel(context.Context) error {
 }
 
 func (s *liveStream) Close(context.Context) error {
+	if s.conn == nil {
+		return s.abort() // failed upgrade: retain its physical join owner
+	}
 	s.gracefulOnce.Do(func() {
+		s.gracefulStarted.Store(true)
 		s.closed.Store(true)
 		s.writeMu.Lock()
-		s.closeErr = s.conn.Close(websocket.StatusNormalClosure, "")
+		err := s.conn.Close(websocket.StatusNormalClosure, "")
 		s.writeMu.Unlock()
+		// The SDK returns the peer's valid 1001 as an error when our sent
+		// status was 1000. Normalize only those explicit normal statuses;
+		// timeout, transport and protocol errors remain failures.
+		if isNormalClose(err) {
+			err = nil
+		}
+		// The SDK can discard the transport's Close error when it already has
+		// a peer-status mismatch. Read the observed transport result directly;
+		// normalizing a valid status cannot normalize that independent failure.
+		if s.physical != nil {
+			err = errors.Join(err, s.physical.closeError())
+		}
+		s.rememberCloseError(err)
+		if err != nil {
+			// Publish before waking the reader: Events may close and be consumed
+			// before the caller receives Close's return value.
+			s.setTerminal(&runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini Live close handshake failed", Retryable: true, Cause: err})
+		}
 		s.cancel()
+		close(s.gracefulDone)
 	})
-	return s.closeErr
+	return s.closeError()
 }
 func (s *liveStream) Abort(context.Context) error { return s.abort() }
-func (s *liveStream) abort() error {
-	s.abortOnce.Do(func() {
+func (s *liveStream) Interrupt() {
+	s.interruptOnce.Do(func() {
 		s.closed.Store(true)
 		s.cancel()
-		if err := s.conn.CloseNow(); err != nil && s.closeErr == nil {
-			s.closeErr = err
+	})
+	if s.physical != nil {
+		s.physical.Interrupt() // failed attempts never latch future interruption
+	}
+}
+func (s *liveStream) abort() error {
+	s.Interrupt()
+	s.abortOnce.Do(func() {
+		if s.conn != nil {
+			s.rememberCloseError(s.conn.CloseNow())
 		}
 	})
+	if s.physical != nil {
+		s.physical.Interrupt()
+		s.physical.waitStopped() // closure proof AND all physical attempts must join
+	}
+	if s.conn == nil {
+		s.dialEventsOnce.Do(func() { close(s.events) })
+	}
+	return s.closeError()
+}
+func (s *liveStream) rememberCloseError(err error) {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closeErr == nil {
+		s.closeErr = err
+	}
+}
+func (s *liveStream) closeError() error {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
 	return s.closeErr
 }
 func (s *liveStream) TerminalError() error {
@@ -361,6 +504,10 @@ func (s *liveStream) emit(event runtimepkg.ProviderEvent) {
 func (s *liveStream) settleSetup(err error) { s.setupOnce.Do(func() { s.setupDone <- err }) }
 
 type serverMessage struct {
+	SessionResumptionUpdate *struct {
+		Resumable bool   `json:"resumable"`
+		NewHandle string `json:"newHandle"`
+	} `json:"sessionResumptionUpdate"`
 	SetupComplete *json.RawMessage `json:"setupComplete"`
 	ServerContent *struct {
 		ModelTurn *struct {
@@ -404,6 +551,15 @@ func (s *liveStream) readLoop() {
 }
 
 func (s *liveStream) handle(message serverMessage, raw []byte) {
+	if update := message.SessionResumptionUpdate; update != nil {
+		s.resumptionMu.Lock()
+		if !update.Resumable {
+			s.resumptionHandle = ""
+		} else if update.NewHandle != "" && len(update.NewHandle) <= 16<<10 {
+			s.resumptionHandle = update.NewHandle
+		}
+		s.resumptionMu.Unlock()
+	}
 	if message.SetupComplete != nil {
 		s.settleSetup(nil)
 	}
@@ -464,8 +620,28 @@ func (s *liveStream) handle(message serverMessage, raw []byte) {
 }
 
 func (s *liveStream) finish(err error) {
-	if s.closed.Load() && (isNormalClose(err) || s.ctx.Err() != nil) || isNormalClose(err) {
+	if s.gracefulStarted.Load() && (websocket.CloseStatus(err) == -1 || isNormalClose(err)) {
+		// The SDK may consume the close acknowledgment itself and wake the
+		// reader with a generic closed-I/O error before Close has returned.
+		// Its published close result owns that outcome, including a normal
+		// acknowledgment followed by a failed transport close. Abnormal close
+		// statuses still propagate; abort/deadline cancellation never waits.
+		select {
+		case <-s.gracefulDone:
+		case <-s.ctx.Done():
+		}
+	}
+	if s.closed.Load() && s.ctx.Err() != nil {
 		return
+	}
+	if isNormalClose(err) {
+		// The SDK's reader also discards transport-close failures when the
+		// peer initiates a normal close. Observe the same physical result here
+		// before event closure can become successful terminal evidence.
+		if s.physical == nil || s.physical.closeError() == nil {
+			return
+		}
+		err = s.physical.closeError()
 	}
 	failure := &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Gemini Live closed the session", Retryable: true, Cause: err}
 	if status := websocket.CloseStatus(err); status != -1 {

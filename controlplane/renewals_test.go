@@ -187,3 +187,113 @@ func TestRenewEntitlementNormalizesHTTPSDefaultPortsAndReadsTheCellContract(t *t
 		}
 	}
 }
+
+func TestEntitlementClockUsesIssuedTokenAndRejectsRedirectsAndInvalidData(t *testing.T) {
+	for _, mode := range []string{"clock", "redirect", "invalid"} {
+		t.Run(mode, func(t *testing.T) {
+			var plan protocol.SessionPlan
+			calls := 0
+			peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if calls > 1 {
+					t.Error("clock followed redirect")
+					w.WriteHeader(500)
+					return
+				}
+				if r.Method != "GET" || r.URL.Path != "/v1/sessions/session-test/entitlements/clock" || r.Header.Get("Authorization") != "Bearer "+plan.Telemetry.Token || r.Header.Get("Speko-Protocol-Revision") != "3" || r.Header.Get("Cache-Control") != "no-store" {
+					t.Error("invalid clock authority")
+				}
+				switch mode {
+				case "redirect":
+					http.Redirect(w, r, "/elsewhere", 307)
+				case "invalid":
+					_, _ = w.Write([]byte(`{"server_time":"not-a-time"}`))
+				default:
+					_ = json.NewEncoder(w).Encode(map[string]any{"server_time": time.Now().UTC()})
+				}
+			}))
+			defer peer.Close()
+			plan = renewalPlan(peer.URL)
+			sample, err := newClient(t, peer, "sk_speko_setup").EntitlementClock(context.Background(), plan)
+			if mode == "clock" {
+				if err != nil || sample.IsZero() {
+					t.Fatalf("clock %v %v", sample, err)
+				}
+			} else if err == nil {
+				t.Fatal("invalid clock accepted")
+			}
+		})
+	}
+}
+
+func TestFundedRecoveryUsesPlanTokenAndPreservesOneRefreshIntent(t *testing.T) {
+	var plan protocol.SessionPlan
+	var key string
+	refreshes := 0
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+plan.Telemetry.Token || r.Header.Get("Speko-Protocol-Revision") != "3" || len(r.Header.Get("Idempotency-Key")) > 200 {
+			t.Error("funded recovery used wrong token/revision/key")
+		}
+		if strings.HasSuffix(r.URL.Path, "/fallback-plans") {
+			w.WriteHeader(422)
+			_, _ = w.Write([]byte(`{"error":{"code":"no_eligible_route"}}`))
+			return
+		}
+		refreshes++
+		if refreshes == 1 {
+			key = r.Header.Get("Idempotency-Key")
+			w.WriteHeader(503)
+			return
+		}
+		if key != r.Header.Get("Idempotency-Key") {
+			t.Error("refresh forked mint intent")
+		}
+		w.WriteHeader(422)
+		_, _ = w.Write([]byte(`{"error":{"code":"no_eligible_route"}}`))
+	}))
+	defer peer.Close()
+	plan = renewalPlan(peer.URL)
+	plan.Fallback = &protocol.Fallback{ExchangeURL: peer.URL + "/v1/sessions/session-test/fallback-plans"}
+	client := newClient(t, peer, "sk_speko_setup-never-continuation")
+	_, _, err := client.ExchangeFallbackPlan(context.Background(), plan, controlplane.FallbackRequest{AttemptID: plan.AttemptID, Reason: "provider_open_failed"}, "recover-once")
+	var failure *controlplane.HTTPError
+	if !errors.As(err, &failure) || failure.Status != 422 || failure.Code != "no_eligible_route" {
+		t.Fatalf("fallback %v", err)
+	}
+	_, _, err = client.RefreshCredential(context.Background(), plan, controlplane.CredentialRefreshRequest{Reason: "provider_reconnect"})
+	if !errors.As(err, &failure) || failure.Status != 422 || refreshes != 2 {
+		t.Fatalf("refresh %v calls=%d", err, refreshes)
+	}
+}
+
+func TestFundedFallbackRejectsChangedAuthorityBeforeIO(t *testing.T) {
+	calls := 0
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++ }))
+	defer peer.Close()
+	for _, mode := range []string{"token", "missing-token", "path", "query", "key"} {
+		t.Run(mode, func(t *testing.T) {
+			plan := renewalPlan(peer.URL)
+			plan.Fallback = &protocol.Fallback{ExchangeURL: peer.URL + "/v1/sessions/session-test/fallback-plans"}
+			key := "recover"
+			switch mode {
+			case "token":
+				plan.Telemetry.Token = "gwt1.bad"
+			case "missing-token":
+				plan.Telemetry.Token = ""
+			case "path":
+				plan.Fallback.ExchangeURL = peer.URL + "/v1/sessions/foreign/fallback-plans"
+			case "query":
+				plan.Fallback.ExchangeURL += "?authority=other"
+			case "key":
+				key = strings.Repeat("a", 201)
+			}
+			_, _, err := newClient(t, peer, "sk_speko_setup").ExchangeFallbackPlan(context.Background(), plan, controlplane.FallbackRequest{AttemptID: plan.AttemptID, Reason: "provider_open_failed"}, key)
+			if err == nil {
+				t.Fatal("invalid funded fallback accepted")
+			}
+		})
+	}
+	if calls != 0 {
+		t.Fatal("invalid authority reached recovery endpoint")
+	}
+}

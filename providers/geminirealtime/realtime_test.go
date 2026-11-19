@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,6 +19,52 @@ import (
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"github.com/coder/websocket"
 )
+
+func TestGracefulCloseClassifiesReaderWakeupAfterCloseCompletion(t *testing.T) {
+	for _, abnormal := range []bool{false, true} {
+		t.Run(fmt.Sprint("abnormal_status=", abnormal), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			stream := &liveStream{ctx: ctx, cancel: cancel, gracefulDone: make(chan struct{}), events: make(chan runtimepkg.ProviderEvent, 1), setupDone: make(chan error, 1)}
+			stream.gracefulStarted.Store(true)
+			stream.closed.Store(true)
+			err := error(fmt.Errorf("reader woke after local close: %w", net.ErrClosed))
+			if abnormal {
+				err = websocket.CloseError{Code: websocket.StatusPolicyViolation}
+			}
+			done := make(chan struct{})
+			go func() { stream.finish(err); close(done) }()
+			if abnormal {
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("provider refusal waited for graceful close")
+				}
+				var failure *runtimepkg.ProviderError
+				if !errors.As(stream.TerminalError(), &failure) || websocket.CloseStatus(failure.Cause) != websocket.StatusPolicyViolation {
+					t.Fatal("graceful close lost actual provider refusal")
+				}
+				return
+			}
+			select {
+			case <-done:
+				t.Fatal("generic read wakeup classified before local close completed")
+			case <-time.After(20 * time.Millisecond):
+			}
+			// Close publishes its result, cancels its reader, then signals done.
+			cancel()
+			close(stream.gracefulDone)
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("reader did not join completed close")
+			}
+			if stream.TerminalError() != nil || len(stream.events) != 0 {
+				t.Fatal("successful local close became a provider failure")
+			}
+		})
+	}
+}
 
 type fakeGemini struct {
 	t      *testing.T

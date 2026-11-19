@@ -440,8 +440,13 @@ func testConfig(serverURL string) Config {
 
 func collectEvents(t *testing.T, events <-chan runtimepkg.ProviderEvent, want int) []runtimepkg.ProviderEvent {
 	t.Helper()
+	return collectEventsWithin(t, events, want, time.Second)
+}
+
+func collectEventsWithin(t *testing.T, events <-chan runtimepkg.ProviderEvent, want int, timeout time.Duration) []runtimepkg.ProviderEvent {
+	t.Helper()
 	collected := make([]runtimepkg.ProviderEvent, 0, want)
-	timer := time.NewTimer(time.Second)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for len(collected) < want {
 		select {
@@ -454,7 +459,7 @@ func collectEvents(t *testing.T, events <-chan runtimepkg.ProviderEvent, want in
 			}
 			collected = append(collected, event)
 		case <-timer.C:
-			t.Fatal("timed out waiting for events")
+			t.Fatalf("timed out after %s waiting for events (%d/%d received)", timeout, len(collected), want)
 		}
 	}
 	return collected
@@ -730,7 +735,10 @@ func TestAdapterReadsAudioFrameLargerThanOneMiB(t *testing.T) {
 	if err := stream.CommitText(context.Background()); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	events := collectEvents(t, stream.Events(), 3)
+	// This is a frame-size/byte-integrity regression, not a latency budget.
+	// Transferring and decoding 4 MiB of JSON under the race detector can take
+	// over one second when all provider packages run concurrently in CI.
+	events := collectEventsWithin(t, stream.Events(), 3, 10*time.Second)
 	if got := strings.Join(eventTypes(events), ","); got != "audio.started,audio.frame,audio.done" {
 		t.Fatalf("events = %s", got)
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/SpekoAI/gateway/controlplane"
 	"github.com/SpekoAI/gateway/protocol"
 )
 
@@ -85,7 +86,32 @@ type OpenRequest struct {
 	Delivery              AudioDeliveryMode
 	// RefreshCredential is passed through to AdapterRequest unchanged.
 	RefreshCredential CredentialRefresher
+	// Entitlements enables SQL-clock lease checks and bounded continuation when
+	// the adapter permits it. Managed Google resumption currently stays refused.
+	// No caller-supplied replacement plan or allowance is accepted.
+	Entitlements EntitlementClient
 }
+
+// EntitlementClient is implemented by the hosted control-plane client.
+type EntitlementClient interface {
+	EntitlementClock(context.Context, protocol.SessionPlan) (time.Time, error)
+	RenewEntitlement(context.Context, protocol.SessionPlan, controlplane.EntitlementRenewalRequest, string) (controlplane.EntitlementRenewal, string, error)
+}
+
+// ResumableProviderStream keeps one event source across funded socket changes.
+// Detach must promptly stop the current socket, independently of an in-flight
+// HTTP renewal or Resume. Resume must wait for provider setup acknowledgment.
+type ResumableProviderStream interface {
+	ProviderStream
+	CanResume() bool
+	Detach()
+	// TightenPhysicalDeadline is concurrent and nonblocking. It may only
+	// shorten this socket's Engine-derived cap, never extend or renew it.
+	TightenPhysicalDeadline(time.Time)
+	Resume(context.Context, protocol.DelegatedCredential) error
+}
+
+var ErrResumptionUnavailable = errors.New("runtime: provider resumption handle unavailable")
 
 // CredentialRefresher obtains a fresh delegated credential for the SAME plan
 // attempt: same route, same reservation, no new attempt. It exists for
@@ -113,12 +139,42 @@ type Adapter interface {
 	Open(context.Context, AdapterRequest) (ProviderStream, error)
 }
 
+// GoogleRealtimeAdapter identifies an installed Google realtime implementation
+// for any installed ID. Wrappers return their underlying implementation's
+// capability, and return false when it is absent or refused. This capability
+// promises physical cap retention; it does not enable managed resumption.
+type GoogleRealtimeAdapter interface {
+	Adapter
+	GoogleRealtimeAdapter() bool
+}
+
+type providerPhysicalDeadlineKey struct{}
+
+// ProviderPhysicalDeadline returns the Engine's already validated monotonic
+// replacement cap. It is independent of a caller/setup context's deadline and
+// must be retained through setup, handoff and physical teardown. A zero value
+// means the Engine did not supply a funded replacement cap. A SQL refresh may
+// shorten this same pending cap; reading it never renews its original lifetime.
+func ProviderPhysicalDeadline(ctx context.Context) time.Time {
+	if current, ok := ctx.Value(providerPhysicalDeadlineKey{}).(func() time.Time); ok {
+		return current()
+	}
+	deadline, _ := ctx.Value(providerPhysicalDeadlineKey{}).(time.Time)
+	return deadline
+}
+
 // AdapterRequest contains the concrete, already-validated execution choice.
 type AdapterRequest struct {
-	Kind    protocol.SessionKind
-	Plan    protocol.SessionPlan
-	Options protocol.RequestOptions
-	Media   *protocol.MediaFormat
+	// Continuation requests a stable ResumableProviderStream event source.
+	Continuation bool
+	// PhysicalDeadline is an optional monotonic cap derived by the Engine from
+	// verified funding. It survives setup-context cancellation and a delayed
+	// Open return. It never creates authority or extends signed time bounds.
+	PhysicalDeadline time.Time
+	Kind             protocol.SessionKind
+	Plan             protocol.SessionPlan
+	Options          protocol.RequestOptions
+	Media            *protocol.MediaFormat
 	// Delivery identifies whether audio is arriving at real-time cadence or
 	// from a buffered upload. Adapters that require real-time pacing use it to
 	// pace only buffered input and avoid adding latency to live streams.
@@ -150,12 +206,21 @@ type ProviderStream interface {
 	Close(context.Context) error
 }
 
-// AbortingProviderStream is an optional fast-close capability used after the
-// runtime becomes terminal. Normal input draining uses ProviderStream.Close
-// first so an upstream can flush final results. Terminal cleanup then ensures
-// physical teardown completes before releasing tracked provider capacity.
+// AbortingProviderStream provides serialized teardown after the runtime
+// becomes terminal. Immediate concurrent physical interruption uses the
+// separate InterruptingProviderStream capability. Normal input draining uses
+// ProviderStream.Close first; cleanup joins teardown before capacity release.
 type AbortingProviderStream interface {
 	Abort(context.Context) error
+}
+
+// InterruptingProviderStream stops physical I/O promptly without joining a
+// reader, waiting for an event consumer, or acquiring the runtime provider
+// mutex. Interrupt must be safe concurrently with every provider operation.
+// Serialized Abort/Close and event-channel closure still provide teardown
+// evidence; Interrupt alone never releases tracked capacity.
+type InterruptingProviderStream interface {
+	Interrupt()
 }
 
 // ProviderControlStream is an optional capability of speech-to-speech
@@ -243,6 +308,15 @@ func (e *ProviderError) SafeHint() string {
 // signer. An engine refuses to open sessions without a verifier.
 type PlanVerifier interface {
 	Verify(context.Context, protocol.SessionPlan) error
+}
+
+// ClockedPlanVerifier authenticates the exact JWS, issuer and audience before
+// invoking clock and fences the nonce with monotonic retention. It then
+// validates all time bounds against SQL time. Renewable funded roots require
+// this capability.
+type ClockedPlanVerifier interface {
+	PlanVerifier
+	VerifyWithClock(context.Context, protocol.SessionPlan, func(context.Context) (time.Time, error)) error
 }
 
 // PlanVerifierFunc adapts a function into a PlanVerifier.
