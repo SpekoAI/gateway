@@ -175,6 +175,9 @@ async def test_typed_ask_refuses_before_context_while_old_delegation_can_arrive(
                 }
             )
             await asyncio.wait_for(first_backend_done.wait(), 5)
+            # Backend delivery began before voice_output completed. Observe
+            # the original real handle before calling the next input healthy.
+            await asyncio.wait_for(old.wait_for_playout(), 5)
             # Genuine subsequent caller input remains canonical speech, rather
             # than a replacement application task associated by unseen ID.
             native.push_audio(rtc.AudioFrame(b"\x02\x10" * 480, 24000, 1, 480))

@@ -67,6 +67,10 @@ native path checks, enqueues and publishes without yielding. Manual raw and
 committed-response checks apply at this public entry as well as the native
 adapter. A rejected update cannot remain in Agent history for a later no-op to
 replay. No best-effort native exception is treated as rollback.
+Detached snapshots keep SDK-only `ChatMessage.extra` metadata locally, including
+opaque bytes. The provider-content size calculation excludes that field;
+provider text and other serialized fields retain their original limits. The
+metadata does not become provider input or require JSON serialization.
 
 GPT-Live refuses ALL per-reply instructions, including their associated typed
 user_input, before the SDK reply task appends any context. Delegation IDs/offsets
@@ -98,6 +102,13 @@ provider delegations. Repeated genuinely unscoped calls remain available;
 A preamble may fulfill the playback future while its
 original application expiration remains; it does not establish task attribution
 or extend execution authority.
+The original application future is tracked independently of its delivery hint,
+including after a delegation claims the hint. If caller PCM, an activity start
+or an input transcript arrives while that future is pending, its exact future
+fails and the transport stops before new capture, conversion, queuing or history
+changes. A later caller answer cannot complete the old typed handle. Genuine
+completion permits subsequent ordinary caller input; ambiguous overlap has no
+continuation claim or automatic reopen.
 
 Provider interruption feedback clears playback without a new manual activity.
 Before first output, feedback preserves the response fence for both claimed and

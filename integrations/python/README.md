@@ -94,6 +94,10 @@ values, validates under the SDK's actual context lock (busy locks refuse), and
 publishes Agent history only after native acceptance. SDK 1.4.5/1.6.8 use their
 ready non-yielding path without a context lock. Rejected raw/committed manual
 context cannot remain in Agent history and replay through a later no-op update.
+Snapshots retain detached SDK `ChatMessage.extra` metadata, including opaque
+bytes, locally. Provider-content bounds exclude that SDK-only field; it is
+never added to the provider payload. Text and other provider fields still obey
+the original frame and history limits.
 Clearing local, unconverted input discards its resampler state; it is not flushed
 into a later commit. Clearing already forwarded manual input closes the transport
 because it cannot be recalled. Activity starts within one uncommitted turn are idempotent.
@@ -179,7 +183,13 @@ negative capability fence, not an acknowledgement or authority proof. Repeated
 genuinely unscoped replies remain supported (`None` means no new input/instructions).
 The hint contributes no instructions to backend history or tool contexts. A preamble can fulfill its
 playback future while its original 15-second application expiration remains;
-cancellation callbacks retire their own hint/timer. Caller audio and ordinary
+cancellation callbacks retire their own hint/timer. Hint retirement or a claimed
+delegation does not complete the original application future. While that exact
+future is pending, caller PCM, activity starts and input transcripts fail it
+and stop the transport before new capture, resampling, queuing or history
+mutation. An older typed handle cannot succeed with a later caller's answer.
+This overlap is refused; no replacement response or automatic reopen is issued.
+After the original future genuinely completes, caller audio and ordinary
 transcript-based delegations continue on the same socket. Each delegation and
 its tool rounds share a captured canonical context, and later delegations retain
 verified tool results. There is no automatic redial or history injection to

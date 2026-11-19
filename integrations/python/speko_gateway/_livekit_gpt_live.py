@@ -23,7 +23,7 @@ from livekit.agents import NOT_GIVEN, NotGivenOr, llm, utils
 from livekit.agents.utils import is_given
 from livekit.agents.utils.aio.channel import ChanFull
 
-from ._livekit_context import snapshot_context
+from ._livekit_context import context_item_bytes, snapshot_context
 from ._livekit_tools import _relay_tools
 from ._relay_transport import _error
 from .client import GatewayError
@@ -291,6 +291,9 @@ class _GPTLiveSession(_Session):
         self._fragment_bytes = 0
         self._pending_reply_hint: str | None = None
         self._pending_reply_future: asyncio.Future | None = None
+        # Delivery-hint retirement is not completion of the real application
+        # future. Keep its independent identity through a claimed delegation.
+        self._pending_application_reply: asyncio.Future | None = None
         self._pending_reply_timer: asyncio.TimerHandle | None = None
         # A negative capability fence, not an acknowledgement or source proof.
         # Retirement, preambles and claimed IDs do not drain unseen delegates.
@@ -336,6 +339,7 @@ class _GPTLiveSession(_Session):
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if frame.samples_per_channel:
+            self._begin_caller_input()
             self._live_input_seen = True
             self._retire_pending_reply()
         current = frame.sample_rate, frame.num_channels
@@ -424,14 +428,29 @@ class _GPTLiveSession(_Session):
                     )
 
     def _remember(self, items) -> None:
-        combined = self._history.items + items
+        staged = snapshot_context(llm.ChatContext(list(items)))
+        combined = self._history.items + staged.items
         if (
             len(combined) > 256
-            or sum(len(item.model_dump_json().encode("utf-8")) for item in combined)
-            > _TEXT_BYTES
+            or sum(context_item_bytes(item) for item in combined) > _TEXT_BYTES
         ):
             raise llm.RealtimeError("GPT-Live history exceeds its bound")
-        self._history.insert(snapshot_context(llm.ChatContext(list(items))).items)
+        self._history.insert(staged.items)
+
+    def _begin_caller_input(self) -> None:
+        pending = self._pending_application_reply
+        if pending is not None and not pending.done():
+            # No native per-ask identity separates this application reply
+            # from subsequent caller work. Fail its EXACT future before any
+            # capture/resampling/context mutation or provider control.
+            pending.set_exception(
+                llm.RealtimeError(
+                    "Caller input overlaps an unsettled GPT-Live application reply"
+                )
+            )
+            self._retire_pending_reply()
+            self._fatal()
+            raise _failure()
 
     def _backend_context(self) -> llm.ChatContext:
         context = snapshot_context(self._history)
@@ -523,6 +542,8 @@ class _GPTLiveSession(_Session):
         }
 
     async def _event(self, event: dict[str, Any]) -> None:
+        if self._failure is not None:
+            raise self._failure
         kind = event.get("type")
         if not self._ready.done() and kind not in {"session.started", "error"}:
             raise _failure()
@@ -550,6 +571,7 @@ class _GPTLiveSession(_Session):
         }:
             text = _text(event.get("delta"))
             if kind == "session.input_transcript.delta" and text:
+                self._begin_caller_input()
                 # Input supersedes the unscoped delivery hint. Transcript
                 # fragments never claim a task or fabricate a complete turn.
                 self._retire_pending_reply()
@@ -903,6 +925,7 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
 
         self._reply = future
         self.duplex_session._pending_reply_future = future
+        self.duplex_session._pending_application_reply = future
 
         def expire():
             self.duplex_session._retire_pending_reply(future)
@@ -915,6 +938,8 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
         self.duplex_session._pending_reply_timer = timer
 
         def delivered(done):
+            if self.duplex_session._pending_application_reply is done:
+                self.duplex_session._pending_application_reply = None
             if done.cancelled():
                 self.duplex_session._retire_pending_reply(done)
                 if self._reply is done:
@@ -980,6 +1005,7 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
         self._inner.push_audio(frame)
 
     def start_user_activity(self):
+        self.duplex_session._begin_caller_input()
         self.duplex_session._retire_pending_reply()
         self._inner.start_user_activity()
 
