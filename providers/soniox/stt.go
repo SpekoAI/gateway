@@ -664,7 +664,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// The socket is about to close. Flush whatever the endpointer never
 		// got round to marking, then report the provider's own measure of
 		// processed audio, which is the unit an STT reservation is priced in.
-		if err := s.flushSegment(raw); err != nil {
+		if _, err := s.flushSegment(raw); err != nil {
 			return err
 		}
 		processed := message.TotalAudioProcMS
@@ -691,22 +691,24 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	tail := strings.Builder{}
 	translatedTail := strings.Builder{}
 	sawContent := false
-	// tailEndMS is the end of the tail's last piece with text, absent when
-	// that piece has none; tailHasText says there is such a piece.
-	var tailEndMS *int64
+	// tailEndMS is the last end any tail piece carried, the bound a session
+	// without diarization reports. tailOuterEndMS is the end of the tail's
+	// last piece with text, absent when that piece has none, the bound a
+	// diarized session reports; tailHasText says there is such a piece.
+	var tailEndMS, tailOuterEndMS *int64
 	tailHasText := false
 	// tailSpoken is the tail's tokens, kept only on a diarized session.
 	var tailSpoken []sttToken
 
 	for _, token := range message.Tokens {
 		if token.Text == endToken || token.Text == finToken {
-			emptySegment := strings.TrimSpace(s.segment.text.String()) == "" && s.translated.empty()
-			if err := s.flushSegment(raw); err != nil {
+			answered, err := s.flushSegment(raw)
+			if err != nil {
 				return err
 			}
 			if token.Text == finToken {
 				committed := s.commitPending.Swap(false)
-				if emptySegment && committed {
+				if !answered && committed {
 					if err := s.emit(runtimepkg.ProviderEvent{
 						Type:       protocol.EventTranscriptFinal,
 						Data:       sttTranscriptData("", "", "", true, nil, nil, nil, s.requestID),
@@ -720,7 +722,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			// segment; Soniox restarts the tail from scratch afterwards.
 			tail.Reset()
 			translatedTail.Reset()
-			tailEndMS = nil
+			tailEndMS, tailOuterEndMS = nil, nil
 			tailHasText = false
 			tailSpoken = nil
 			sawContent = false
@@ -750,6 +752,10 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			}
 			continue
 		}
+		if len(token.Speaker) > sttSpeakerLabelMaxBytes {
+			// Not a label anyone can use: the piece counts as unlabelled.
+			token.Speaker = ""
+		}
 		if token.IsFinal {
 			s.segment.appendFinal(token)
 			if s.diarize {
@@ -759,8 +765,11 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			continue
 		}
 		tail.WriteString(token.Text)
+		if token.EndMS != nil {
+			tailEndMS = token.EndMS
+		}
 		if strings.TrimSpace(token.Text) != "" {
-			tailEndMS, tailHasText = token.EndMS, true
+			tailOuterEndMS, tailHasText = token.EndMS, true
 		}
 		if s.diarize {
 			tailSpoken = append(tailSpoken, token)
@@ -780,15 +789,23 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	if interim == "" && interimTranslation == "" {
 		return nil
 	}
-	// Each bound is the outer piece's own: the segment's first finalized
-	// piece starts the hypothesis, and the tail's last piece, or the
-	// segment's when the tail has none, ends it. An inner piece's time
-	// never stands in for an outer one that has none.
-	endMS := s.segment.lastEndMS
-	if tailHasText {
-		endMS = tailEndMS
+	// Without diarization the span is the first start and last end any piece
+	// carried, exactly as before speaker labels existed.
+	startMS, endMS := s.segment.startMS, tailEndMS
+	if endMS == nil {
+		endMS = s.segment.endMS
 	}
-	data := sttTranscriptFields(interim, interimTranslation, "", false, s.segment.firstStartMS, endMS, nil, s.requestID)
+	if s.diarize {
+		// Each bound is the outer piece's own: the segment's first finalized
+		// piece starts the hypothesis, and the tail's last piece, or the
+		// segment's when the tail has none, ends it. An inner piece's time
+		// never stands in for an outer one that has none.
+		startMS, endMS = s.segment.firstStartMS, s.segment.lastEndMS
+		if tailHasText {
+			endMS = tailOuterEndMS
+		}
+	}
+	data := sttTranscriptFields(interim, interimTranslation, "", false, startMS, endMS, nil, s.requestID)
 	if s.diarize {
 		// The hypothesis is the segment's finals so far plus the tail. The
 		// finals' runs were built as they arrived; only the tail, which
@@ -810,19 +827,27 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 // being re-attributed. A boundary with translated tokens but no original
 // words (the translation of the previous segment's tail, or the stream
 // finishing) still emits a final, with empty text: dropping it would lose
-// translated words the caller asked, and pays, for.
-func (s *sttStream) flushSegment(raw json.RawMessage) error {
-	spoken := s.segment.spoken
-	text, language, confidence, startMS, endMS := s.segment.flush()
+// translated words the caller asked, and pays, for. A segment that already
+// sent an interim final (cutLongSegment) gets its closing final even with
+// nothing left to say: empty, as a commit's answer to silence is, so a
+// consumer holding the interim text until its segment closes is not left
+// waiting. It reports whether it emitted a final.
+func (s *sttStream) flushSegment(raw json.RawMessage) (bool, error) {
+	spoken, cut := s.segment.spoken, s.segment.cut
+	text, language, confidence, startMS, endMS := s.segment.flush(s.diarize)
 	translation := s.translated.flush()
 	if text == "" && translation == "" {
-		return nil
+		if !cut {
+			return false, nil
+		}
+		// Whitespace has no confidence worth reporting.
+		confidence = nil
 	}
 	data := sttTranscriptFields(text, translation, language, true, startMS, endMS, confidence, s.requestID)
 	if s.diarize {
 		sttSetSpeakers(data, spoken)
 	}
-	return s.emit(runtimepkg.ProviderEvent{
+	return true, s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptFinal,
 		Data:       sonioxMarshalData(data),
 		Extensions: sttExtension(raw),
@@ -860,7 +885,7 @@ func (s *sttStream) cutLongSegment(raw json.RawMessage) error {
 	for _, token := range prefix {
 		head.appendFinal(token)
 	}
-	text, language, confidence, startMS, endMS := head.flush()
+	text, language, confidence, startMS, endMS := head.flush(true)
 	data := sttTranscriptFields(text, s.translated.flush(), language, true, startMS, endMS, confidence, s.requestID)
 	// The speaker has not finished: this only closes a long stretch. interim
 	// says so explicitly, because speech_final false alone is also an
@@ -869,7 +894,7 @@ func (s *sttStream) cutLongSegment(raw json.RawMessage) error {
 	data["speech_final"] = false
 	data["interim"] = true
 	sttSetSpeakers(data, prefix)
-	s.segment = sttSegment{}
+	s.segment = sttSegment{cut: true}
 	for _, token := range rest {
 		s.segment.appendFinal(token)
 		s.segment.spoken = append(s.segment.spoken, token)
@@ -1042,12 +1067,20 @@ type sttSegment struct {
 	text          strings.Builder
 	confidenceSum float64
 	confidenceN   int
+	// startMS is the first start and endMS the last end that any piece
+	// carried: the span a session without diarization has always reported.
+	startMS *int64
+	endMS   *int64
 	// firstStartMS is the start of the first piece with text and lastEndMS
 	// the end of the last, each absent when that piece has none; hasText
-	// says there is such a piece.
+	// says there is such a piece. A diarized session reports these outer
+	// bounds.
 	firstStartMS *int64
 	lastEndMS    *int64
 	hasText      bool
+	// cut says an interim final already carried part of this segment, so its
+	// end owes a closing final even with nothing left to say.
+	cut bool
 	// languages counts tokens per identified language; only a session with
 	// language identification on gets any.
 	languages map[string]int
@@ -1070,6 +1103,12 @@ func (a *sttSegment) appendFinal(token sttToken) {
 		a.confidenceSum += *token.Confidence
 		a.confidenceN++
 	}
+	if token.StartMS != nil && a.startMS == nil {
+		a.startMS = token.StartMS
+	}
+	if token.EndMS != nil {
+		a.endMS = token.EndMS
+	}
 	if strings.TrimSpace(token.Text) != "" {
 		if !a.hasText {
 			a.firstStartMS, a.hasText = token.StartMS, true
@@ -1079,11 +1118,12 @@ func (a *sttSegment) appendFinal(token sttToken) {
 }
 
 // flush returns the segment's text, its majority identified language ("" when
-// none was identified), average confidence, and audio span. The span covers
-// the whole text, so it is reported only when the first piece's start and the
-// last piece's end are both known; otherwise neither is, and only the words'
-// own bounds say when anything was said.
-func (a *sttSegment) flush() (string, string, *float64, *int64, *int64) {
+// none was identified), average confidence, and audio span. With outer, the
+// span covers the whole text, so it is reported only when the first piece's
+// start and the last piece's end are both known; otherwise neither is, and
+// only the words' own bounds say when anything was said. Without outer it is
+// the first start and last end any piece carried, as it always was.
+func (a *sttSegment) flush(outer bool) (string, string, *float64, *int64, *int64) {
 	text := strings.TrimSpace(a.text.String())
 	language, most := "", 0
 	for candidate, count := range a.languages {
@@ -1096,9 +1136,12 @@ func (a *sttSegment) flush() (string, string, *float64, *int64, *int64) {
 		average := a.confidenceSum / float64(a.confidenceN)
 		confidence = &average
 	}
-	startMS, endMS := a.firstStartMS, a.lastEndMS
-	if startMS == nil || endMS == nil {
-		startMS, endMS = nil, nil
+	startMS, endMS := a.startMS, a.endMS
+	if outer {
+		startMS, endMS = a.firstStartMS, a.lastEndMS
+		if startMS == nil || endMS == nil {
+			startMS, endMS = nil, nil
+		}
 	}
 	*a = sttSegment{}
 	return text, language, confidence, startMS, endMS
@@ -1145,6 +1188,11 @@ func sttTranscriptFields(text, translation, language string, isFinal bool, start
 	}
 	return data
 }
+
+// sttSpeakerLabelMaxBytes bounds the vendor's speaker label, which events copy
+// verbatim into every run and word it names. A longer label is dropped and
+// its piece counts as unlabelled.
+const sttSpeakerLabelMaxBytes = 64
 
 // sttSetSpeakers adds a diarized session's labels to a final, in the shape
 // ElevenLabs Scribe v3 Live finals already use (docs/PROTOCOL.md): words, each

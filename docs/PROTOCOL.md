@@ -191,7 +191,8 @@ Scribe v3 Live shape: each word with the vendor's label as `speaker` and its
 `start_ms` and `end_ms`, plus a top-level `speaker` when one speaker said
 every word. Soniox's word pieces are joined into words, and a word starts
 wherever the speaker changes. A word Soniox left unlabelled has no `speaker`,
-and its final then has no top-level `speaker`.
+and its final then has no top-level `speaker`. A label longer than 64 bytes
+is dropped, and its piece counts as unlabelled.
 
 Soniox labels every token, final or not, so each `transcript.delta` attributes
 its whole hypothesis (the segment's finalized words plus the provisional tail)
@@ -210,7 +211,9 @@ On both events, a word's or run's `start_ms` is its first piece's start and
 The event's own `audio_start_ms` and `audio_end_ms` follow the same rule on a
 delta. A final carries the pair only when both are known: together they claim
 the whole text, so an inner piece's time never stands in for a missing outer
-one, on any Soniox session. Router's public `transcript.delta` turns runs into
+one. This rule holds on diarized Soniox sessions only: a session without
+diarization reports the span as it always has, from the first start and the
+last end that any piece carried. Router's public `transcript.delta` turns runs into
 `segments` that carry each run's text and speaker, and `start_ms` and
 `end_ms` only when the run has both.
 
@@ -220,7 +223,9 @@ part spans more than 20 s of audio or 2,000 characters, that part's prefix
 goes out once as a `transcript.final` with `speech_final: false` and
 `interim: true`: an interim final, more of the same segment follows. It never
 answers a commit: a pending `audio.commit` is answered by the segment's last
-final, after the provider has finalized all its audio. Router's public
+final, after the provider has finalized all its audio. A segment that sent
+an interim final always closes with a final that is not interim, with empty
+`text` when nothing was left to say after the cut. Router's public
 `transcript.final` carries the same `interim: true` and never a `commit_id`
 with it.
 
@@ -243,6 +248,12 @@ A session without diarization is never cut, and neither is a diarized session
 that asked for Soniox's own translation: that translation trails the words and
 is not aligned to them, so such a session keeps one final per segment as
 before.
+
+Known limits: a diarized session with Soniox's own translation is never cut,
+so its deltas and its final grow with the segment and repeat every speaker
+run on each delta. A gateway-protocol client that already asks Soniox for
+diarization gets interim finals from this version on, and must read
+`interim` before it takes a final for the end of a turn.
 
 Soniox notes that endpoint detection, which this adapter always enables,
 lowers diarization accuracy.

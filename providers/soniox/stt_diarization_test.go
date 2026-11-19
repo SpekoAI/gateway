@@ -121,43 +121,104 @@ func sonioxFrame(tokens ...map[string]any) map[string]any {
 }
 
 // A session that never asked for diarization reads exactly the bytes it read
-// before speaker labels existed. The want strings are today's output,
-// recorded before the adapter learned to read speakers.
+// before speaker labels existed. The want strings are the output of the
+// adapter before it learned to read speakers (merge base 12c8a91), including
+// pieces that lack a time, and whitespace or empty pieces that carry one.
 func TestSTTUndiarizedSessionKeepsItsExactEventBytes(t *testing.T) {
 	t.Parallel()
 
-	_, events := runSTTScript(t, sttAdapterRequest, []map[string]any{
-		sonioxFrame(
-			sonioxToken("How", 120, 240, 1, false, ""),
-			sonioxToken(" are", 240, 360, 0.5, false, ""),
-		),
-		sonioxFrame(
-			sonioxToken("How", 120, 240, 1, true, ""),
-			sonioxToken(" are", 240, 360, 0.5, true, ""),
-			sonioxToken(" you", 360, 520, 1, false, ""),
-			sonioxToken("?", 520, 600, 0.5, false, ""),
-		),
-		sonioxFrame(
-			sonioxToken(" you", 360, 520, 1, true, ""),
-			sonioxToken("?", 520, 600, 0.5, true, ""),
-			sonioxEnd(640),
-		),
-	}, 4)
-
-	want := []struct {
+	type event struct {
 		kind protocol.EventType
 		data string
+	}
+	for _, testCase := range []struct {
+		name   string
+		frames []map[string]any
+		want   []event
 	}{
-		{protocol.EventTranscriptDelta, `{"audio_end_ms":360,"is_final":false,"provider_request_id":"","speech_final":false,"text":"How are"}`},
-		{protocol.EventTranscriptDelta, `{"audio_end_ms":600,"audio_start_ms":120,"is_final":false,"provider_request_id":"","speech_final":false,"text":"How are you?"}`},
-		{protocol.EventTranscriptFinal, `{"audio_end_ms":600,"audio_start_ms":120,"confidence":0.75,"is_final":true,"provider_request_id":"","speech_final":true,"text":"How are you?"}`},
-		{protocol.EventSpeechEnded, `{"audio_end_ms":640,"reason":"endpoint_detected"}`},
+		{
+			name: "every piece timed",
+			frames: []map[string]any{
+				sonioxFrame(
+					sonioxToken("How", 120, 240, 1, false, ""),
+					sonioxToken(" are", 240, 360, 0.5, false, ""),
+				),
+				sonioxFrame(
+					sonioxToken("How", 120, 240, 1, true, ""),
+					sonioxToken(" are", 240, 360, 0.5, true, ""),
+					sonioxToken(" you", 360, 520, 1, false, ""),
+					sonioxToken("?", 520, 600, 0.5, false, ""),
+				),
+				sonioxFrame(
+					sonioxToken(" you", 360, 520, 1, true, ""),
+					sonioxToken("?", 520, 600, 0.5, true, ""),
+					sonioxEnd(640),
+				),
+			},
+			want: []event{
+				{protocol.EventTranscriptDelta, `{"audio_end_ms":360,"is_final":false,"provider_request_id":"","speech_final":false,"text":"How are"}`},
+				{protocol.EventTranscriptDelta, `{"audio_end_ms":600,"audio_start_ms":120,"is_final":false,"provider_request_id":"","speech_final":false,"text":"How are you?"}`},
+				{protocol.EventTranscriptFinal, `{"audio_end_ms":600,"audio_start_ms":120,"confidence":0.75,"is_final":true,"provider_request_id":"","speech_final":true,"text":"How are you?"}`},
+				{protocol.EventSpeechEnded, `{"audio_end_ms":640,"reason":"endpoint_detected"}`},
+			},
+		},
+		{
+			name: "pieces without a time and timed whitespace",
+			frames: []map[string]any{
+				sonioxFrame(
+					sonioxWithoutTime(sonioxToken("We", 100, 240, 1, false, ""), "start_ms"),
+					sonioxWithoutTime(sonioxToken(" left", 240, 400, 1, false, ""), "end_ms"),
+					sonioxToken(" ", 400, 460, 1, false, ""),
+				),
+				sonioxFrame(
+					sonioxWithoutTime(sonioxToken("We", 100, 240, 1, true, ""), "start_ms"),
+					sonioxWithoutTime(sonioxToken(" left", 240, 400, 1, true, ""), "end_ms"),
+					sonioxToken(" ", 400, 460, 1, true, ""),
+					sonioxToken("early", 460, 700, 0.5, false, ""),
+					sonioxToken("", 700, 720, 1, false, ""),
+				),
+				sonioxFrame(
+					sonioxToken("early", 460, 700, 0.5, true, ""),
+					sonioxToken(".", 700, 760, 1, true, ""),
+					sonioxToken(" ", 760, 900, 1, true, ""),
+					sonioxEnd(950),
+				),
+				sonioxFrame(
+					sonioxToken("", 980, 1000, 1, true, ""),
+					sonioxToken(" ", 1000, 1040, 1, true, ""),
+					sonioxToken("Yes", 1040, 1200, 1, true, ""),
+					sonioxEnd(1250),
+				),
+			},
+			want: []event{
+				{protocol.EventTranscriptDelta, `{"audio_end_ms":460,"is_final":false,"provider_request_id":"","speech_final":false,"text":"We left"}`},
+				{protocol.EventTranscriptDelta, `{"audio_end_ms":720,"audio_start_ms":240,"is_final":false,"provider_request_id":"","speech_final":false,"text":"We left early"}`},
+				{protocol.EventTranscriptFinal, `{"audio_end_ms":900,"audio_start_ms":240,"confidence":0.9166666666666666,"is_final":true,"provider_request_id":"","speech_final":true,"text":"We left early."}`},
+				{protocol.EventSpeechEnded, `{"audio_end_ms":950,"reason":"endpoint_detected"}`},
+				{protocol.EventTranscriptFinal, `{"audio_end_ms":1200,"audio_start_ms":980,"confidence":1,"is_final":true,"provider_request_id":"","speech_final":true,"text":"Yes"}`},
+				{protocol.EventSpeechEnded, `{"audio_end_ms":1250,"reason":"endpoint_detected"}`},
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			_, events := runSTTScript(t, sttAdapterRequest, testCase.frames, len(testCase.want))
+			for index, event := range events {
+				if event.Type != testCase.want[index].kind || string(event.Data) != testCase.want[index].data {
+					t.Errorf("event %d = %s %s\nwant      %s %s", index, event.Type, event.Data, testCase.want[index].kind, testCase.want[index].data)
+				}
+			}
+		})
 	}
-	for index, event := range events {
-		if event.Type != want[index].kind || string(event.Data) != want[index].data {
-			t.Errorf("event %d = %s %s\nwant      %s %s", index, event.Type, event.Data, want[index].kind, want[index].data)
-		}
+}
+
+// sonioxWithoutTime drops the named time fields from a token, as Soniox
+// may leave a piece's start or end unset.
+func sonioxWithoutTime(token map[string]any, fields ...string) map[string]any {
+	for _, field := range fields {
+		delete(token, field)
 	}
+	return token
 }
 
 // enable_speaker_diarization is Soniox's start-frame switch
@@ -344,6 +405,36 @@ func TestSTTDiarizedUnlabelledWordKeepsTheEventUnattributed(t *testing.T) {
 	}, 1)
 	if got, want := speakerView(t, events[0].Data), "Yes um | - | Yes@1[100-300] | um@-[300-400]"; got != want {
 		t.Fatalf("final:\n got %s\nwant %s", got, want)
+	}
+}
+
+// A speaker label is the vendor's, copied verbatim up to 64 bytes. A longer
+// one is no speaker anyone can use: its piece counts as unlabelled, in a
+// delta's runs and a final's words alike, and the label reaches no event.
+func TestSTTDiarizedOverlongLabelCountsAsUnlabelled(t *testing.T) {
+	t.Parallel()
+
+	longest, overlong := strings.Repeat("a", 64), strings.Repeat("b", 65)
+	pieces := func(final bool) []map[string]any {
+		return []map[string]any{
+			sonioxToken("Yes", 100, 300, 1, final, longest),
+			sonioxToken(" um", 300, 400, 1, final, overlong),
+		}
+	}
+	_, events := runSTTScript(t, diarizedRequest, []map[string]any{
+		sonioxFrame(pieces(false)...),
+		sonioxFrame(append(pieces(true), sonioxEnd(440))...),
+	}, 2)
+	if got, want := speakerView(t, events[0].Data), "Yes um | - | <Yes>@"+longest+"[100-300] | <um>@-[300-400]"; got != want {
+		t.Errorf("delta:\n got %s\nwant %s", got, want)
+	}
+	if got, want := speakerView(t, events[1].Data), "Yes um | - | Yes@"+longest+"[100-300] | um@-[300-400]"; got != want {
+		t.Errorf("final:\n got %s\nwant %s", got, want)
+	}
+	for index, event := range events {
+		if strings.Contains(string(event.Data), overlong) {
+			t.Errorf("event %d (%s) carries the overlong label: %s", index, event.Type, event.Data)
+		}
 	}
 }
 

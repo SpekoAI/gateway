@@ -1,6 +1,7 @@
 package soniox
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
+	"github.com/coder/websocket"
 )
 
 // longStretch is a diarized talk with no endpoint, 300 ms a word, the
@@ -146,6 +148,93 @@ func TestSTTDiarizedLongStretchIsCutAtASentenceEnd(t *testing.T) {
 	if afterCut != 2 {
 		t.Fatalf("saw %d finals, want 2", afterCut)
 	}
+}
+
+// A cut leaves the last finalized piece open. When that piece is only
+// whitespace, the segment has nothing left to say when it ends, yet it has
+// already sent an interim final: it still gets its closing final, empty and
+// not interim, so a consumer that holds interim text until its segment
+// closes is not left waiting. Answering a commit, that closing final is the
+// one answer: no second empty final follows it.
+func TestSTTCutSegmentWithNothingLeftStillCloses(t *testing.T) {
+	t.Parallel()
+
+	stretch := func() map[string]any {
+		return sonioxFrame(
+			sonioxToken("Long", 0, 400, 1, true, "1"),
+			sonioxToken(" talk.", 400, 25_000, 1, true, "1"),
+			sonioxToken(" ", 25_000, 25_100, 1, true, "1"),
+		)
+	}
+	check := func(t *testing.T, events []runtimepkg.ProviderEvent, wantTypes string) {
+		t.Helper()
+		if got := strings.Join(eventTypeNames(events), ","); got != wantTypes {
+			t.Fatalf("event types = %s, want %s", got, wantTypes)
+		}
+		var cut, closing map[string]any
+		if err := json.Unmarshal(events[0].Data, &cut); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(events[1].Data, &closing); err != nil {
+			t.Fatal(err)
+		}
+		if cut["text"] != "Long talk." || cut["interim"] != true || cut["speech_final"] != false {
+			t.Errorf("cut final = %v, want interim \"Long talk.\"", cut)
+		}
+		if value, present := closing["interim"]; present || closing["text"] != "" || closing["is_final"] != true || closing["speech_final"] != true {
+			t.Errorf("closing final = %v (interim %v), want empty text, is_final and speech_final true, no interim", closing, value)
+		}
+	}
+
+	t.Run("endpoint", func(t *testing.T) {
+		t.Parallel()
+		_, events := runSTTScriptUntil(t, diarizedRequest, []map[string]any{stretch(), sonioxFrame(sonioxEnd(25_200))}, untilSpeechEnded)
+		check(t, events, "transcript.final,transcript.final,speech.ended")
+	})
+
+	t.Run("commit", func(t *testing.T) {
+		t.Parallel()
+		server := newSTTServer(t, func(ctx context.Context, conn *websocket.Conn) {
+			if _, err := readJSONObject(ctx, conn); err != nil {
+				t.Errorf("read start request: %v", err)
+				return
+			}
+			if err := writeJSONFrame(ctx, conn, stretch()); err != nil {
+				t.Errorf("stretch frame: %v", err)
+				return
+			}
+			if _, err := readJSONObject(ctx, conn); err != nil {
+				t.Errorf("read finalize: %v", err)
+				return
+			}
+			if err := writeJSONFrame(ctx, conn, sonioxFrame(map[string]any{"text": "<fin>", "is_final": true})); err != nil {
+				t.Errorf("fin frame: %v", err)
+				return
+			}
+			if err := writeJSONFrame(ctx, conn, map[string]any{"tokens": []any{}, "finished": true, "total_audio_proc_ms": 25_200}); err != nil {
+				t.Errorf("finished frame: %v", err)
+				return
+			}
+			waitForPeer(ctx, conn)
+		})
+		defer server.Close()
+
+		adapter, err := NewSTT(sttTestConfig(server.URL))
+		if err != nil {
+			t.Fatalf("new adapter: %v", err)
+		}
+		stream, err := adapter.Open(context.Background(), diarizedRequest(server.URL))
+		if err != nil {
+			t.Fatalf("open stream: %v", err)
+		}
+		defer abortStream(stream)
+		events := collectEvents(t, stream.Events(), 1)
+		if err := stream.CommitAudio(context.Background()); err != nil {
+			t.Fatalf("commit audio: %v", err)
+		}
+		events = append(events, collectEvents(t, stream.Events(), 2)...)
+		check(t, events, "transcript.final,transcript.final,usage.observed")
+	})
 }
 
 // However long people talk without an endpoint, a diarized session's events
