@@ -1,0 +1,33 @@
+{
+  "routing": {
+    "mode": "explicit",
+    "provider": "gemini",
+    "model": "gemini-decision-1"
+  },
+  "state": "Caller turn 4 of a delivery support call. The agent just asked for the order number.",
+  "questions": {
+    "agitation": {
+      "type": "score",
+      "instructions": "How agitated does the caller sound?",
+      "criteria": ["calm", "tense", "agitated", "shouting"]
+    },
+    "sentiment": {
+      "type": "choice",
+      "instructions": "How does the caller sound in this turn?",
+      "criteria": {
+        "positive": "pleased, warm, relieved",
+        "neutral": null,
+        "frustrated": "impatient, annoyed, repeating themselves",
+        "other": "none of these fit"
+      }
+    },
+    "wants_human": {
+      "type": "noul",
+      "instructions": "Is the caller asking to speak to a person?",
+      "criteria": {
+        "true": "an explicit request for a human or a manager",
+        "false": null
+      }
+    }
+  }
+}

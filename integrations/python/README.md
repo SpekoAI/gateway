@@ -331,10 +331,13 @@ its recovery decision before constructing a replacement instance.
 Pipecat native TTS likewise latches ambiguous admission, send, receive/EOF and
 framework-receiver failures before any await that removes the context. It emits
 a fatal error and refuses subsequent SDK sentences/admissions on that instance;
-admission cancellation also latches before cleanup and then propagates the
-original cancellation. The owned configuring socket is closed, and later
+admission or send cancellation also latches before cleanup and then propagates
+the original cancellation. The owned configuring socket is closed, and later
 sentences cannot open a replacement merely because no ready session returned.
-readiness or settings updates do not recover it. Framework queue failure still
+Cancellation while a queued sentence only waits for the previous admitted
+utterance starts none of that sentence's transport work. Pipecat's ordinary
+interruption cleanup closes the existing context and permits later independent
+turns. Readiness or settings updates do not recover an ambiguous I/O failure. Framework queue failure still
 attempts physical session cleanup. Construct a replacement only after the
 control-plane recovery decision. Ordinary local Gateway error recovery retains
 its existing behavior. These local fences prove neither NoIO nor settlement.
