@@ -783,7 +783,12 @@ func (s *Session) dispatch(message inputMessage) error {
 	case inputTextAppend:
 		return s.stream.AppendText(s.ctx, message.text)
 	case inputTextCommit:
-		return s.stream.CommitText(s.ctx)
+		// A commit with nothing appended since the last one is answered with
+		// nothing and the session goes on (PROTOCOL.md, input.commit).
+		if err := s.stream.CommitText(s.ctx); !errors.Is(err, ErrNothingToCommit) {
+			return err
+		}
+		return nil
 	case inputCancel:
 		return s.stream.Cancel(s.ctx)
 	case inputProviderControl:
