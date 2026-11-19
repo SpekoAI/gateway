@@ -54,6 +54,30 @@ func (s TranscriptSegment) Validate() error {
 	return nil
 }
 
+// TranscriptDeltaSegment is the part of a delta's provisional text one
+// speaker said. StartMS and EndMS come together or not at all: a hypothesis
+// can know who is speaking before it knows when they stopped, so a segment
+// carries its span only when the provider measured both ends.
+type TranscriptDeltaSegment struct {
+	Text    string `json:"text"`
+	StartMS *int64 `json:"start_ms,omitempty"`
+	EndMS   *int64 `json:"end_ms,omitempty"`
+	// Speaker is the vendor's own label, carried verbatim.
+	Speaker string `json:"speaker,omitempty"`
+}
+
+// Validate checks that the span, when present, is whole, non-negative and
+// ordered.
+func (s TranscriptDeltaSegment) Validate() error {
+	if (s.StartMS == nil) != (s.EndMS == nil) {
+		return fmt.Errorf("start_ms and end_ms must both be present or both absent")
+	}
+	if s.StartMS != nil && (*s.StartMS < 0 || *s.EndMS < *s.StartMS) {
+		return fmt.Errorf("start_ms and end_ms must form a non-negative ordered range")
+	}
+	return nil
+}
+
 // TranscriptWord is one word of the transcript with its own timing. Present
 // only when the request asked for word_timestamps and the routed model
 // advertises it; the vendor's own speaker label rides along when the request
@@ -290,18 +314,31 @@ type STTTranscriptDelta struct {
 	// original words whose translation has not arrived yet, or only a
 	// translation of words already recognised.
 	Translation string `json:"translation,omitempty"`
+	// Segments attributes the hypothesis to speakers before any final: Text
+	// cut wherever the speaker changes, in order, each piece with the
+	// vendor's label and, when the provider measured both its ends, its
+	// span. Present only on a session that asked for diarization, routed to
+	// a provider that labels interim words; absent otherwise, so every other
+	// delta keeps its exact bytes. The labels are provisional: a later delta
+	// or the final may relabel the same words.
+	Segments []TranscriptDeltaSegment `json:"segments,omitempty"`
 }
 
-// Validate checks the frame tag and that the delta says something — empty
-// interim hypotheses are dropped at normalization, never forwarded. On a
-// translating session a delta that advances only the translation is
-// something.
+// Validate checks the frame tag, segments, and that the delta says
+// something — empty interim hypotheses are dropped at normalization, never
+// forwarded. On a translating session a delta that advances only the
+// translation is something.
 func (e STTTranscriptDelta) Validate() error {
 	if e.Type != STTEventTranscriptDelta {
 		return fmt.Errorf("type: got %q, want %q", e.Type, STTEventTranscriptDelta)
 	}
 	if e.Text == "" && e.Translation == "" {
 		return fmt.Errorf("text: required")
+	}
+	for i, segment := range e.Segments {
+		if err := segment.Validate(); err != nil {
+			return fmt.Errorf("segments[%d]: %w", i, err)
+		}
 	}
 	return nil
 }
@@ -326,6 +363,11 @@ type STTTranscriptFinal struct {
 	// only when that commit carried one. A final the provider sent with no
 	// commit pending carries none.
 	CommitID string `json:"commit_id,omitempty"`
+	// Interim marks an interim final: the provider closed part of a long
+	// segment that is still being spoken, and more of the same segment
+	// follows. It never answers an input.commit, so it never carries a
+	// commit_id; the segment's last final does. Absent on every other final.
+	Interim bool `json:"interim,omitempty"`
 }
 
 // Validate checks the frame tag, segments and, when present, the commit id.
@@ -336,6 +378,9 @@ func (e STTTranscriptFinal) Validate() error {
 	}
 	if e.CommitID != "" && !ValidCommitID(e.CommitID) {
 		return fmt.Errorf("commit_id: want 1-64 characters of A-Z a-z 0-9 . _ : -")
+	}
+	if e.Interim && e.CommitID != "" {
+		return fmt.Errorf("commit_id: an interim final never answers a commit")
 	}
 	for i, segment := range e.Segments {
 		if err := segment.Validate(); err != nil {

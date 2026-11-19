@@ -75,7 +75,9 @@ func TestSttRouteSupportFailsClosedByOptionAndProvider(t *testing.T) {
 			options: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
 				"assemblyai": {"voice_focus": "far-field", "voice_focus_threshold": 0.9, "max_speakers": 2},
 			}}, refused: false},
-		{name: "soniox diarizes", provider: "soniox", model: "stt-rt-v3",
+		{name: "soniox v5 diarizes", provider: "soniox", model: "stt-rt-v5",
+			options: &protocol.SttOptions{Diarization: boolPointer(true)}, refused: false},
+		{name: "soniox v6 diarizes", provider: "soniox", model: "stt-rt-v6",
 			options: &protocol.SttOptions{Diarization: boolPointer(true)}, refused: false},
 		{name: "soniox translates", provider: "soniox", model: "stt-rt-v5",
 			options: &protocol.SttOptions{Translation: &protocol.SttTranslation{TargetLanguage: "es"}}, refused: false},

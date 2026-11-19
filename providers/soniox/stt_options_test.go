@@ -93,7 +93,7 @@ func TestFinalReportsMajorityIdentifiedLanguage(t *testing.T) {
 	for _, token := range []sttToken{{Text: "ನಮಸ್ಕಾರ", Language: "kn"}, {Text: " ", Language: "te"}, {Text: " హలో", Language: "te"}, {Text: " ಹೇಗಿದ್ದೀರಿ", Language: "kn"}} {
 		segment.appendFinal(token)
 	}
-	_, language, _, _, _ := segment.flush()
+	_, language, _, _, _ := segment.flush(false)
 	if language != "kn" {
 		t.Fatalf("language: got %q, want kn", language)
 	}

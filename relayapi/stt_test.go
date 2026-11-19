@@ -153,10 +153,15 @@ func TestSTTStreamMessageValidation(t *testing.T) {
 		{"commit id with a slash", relayapi.STTInputCommit{Type: relayapi.STTControlInputCommit, CommitID: "turn/7"}, "commit_id"},
 		{"commit id beyond ASCII", relayapi.STTInputCommit{Type: relayapi.STTControlInputCommit, CommitID: "turné"}, "commit_id"},
 		{"final with bad commit id", relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, CommitID: "turn 7"}, "commit_id"},
+		{"interim final with a commit id", relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, Text: "x", Interim: true, CommitID: "review-1"}, "commit_id"},
 		{"close with wrong tag", relayapi.STTSessionClose{Type: "close"}, `got "close"`},
 		{"ready without request id", relayapi.STTSessionReady{Type: relayapi.STTEventSessionReady, Route: relayapi.Route{Provider: "deepgram", Model: "nova-3", Region: "eu-west-1", AttemptID: "att_1"}}, "request_id: required"},
 		{"ready with incomplete route", relayapi.STTSessionReady{Type: relayapi.STTEventSessionReady, RequestID: "req_1", Route: relayapi.Route{Provider: "deepgram"}}, "route:"},
 		{"empty transcript delta", relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta}, "text: required"},
+		{"delta with bad segment", relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "x", Segments: []relayapi.TranscriptDeltaSegment{{Text: "x", StartMS: ms(10), EndMS: ms(5)}}}, "segments[0]"},
+		{"delta segment with a start and no end", relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "x", Segments: []relayapi.TranscriptDeltaSegment{{Text: "x", StartMS: ms(10)}}}, "segments[0]"},
+		{"delta segment with an end and no start", relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "x", Segments: []relayapi.TranscriptDeltaSegment{{Text: "x", EndMS: ms(10)}}}, "segments[0]"},
+		{"delta segment before zero", relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "x", Segments: []relayapi.TranscriptDeltaSegment{{Text: "x", StartMS: ms(-1), EndMS: ms(5)}}}, "segments[0]"},
 		{"final with bad segment", relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, Text: "x", Segments: []relayapi.TranscriptSegment{{StartMS: 10, EndMS: 5}}}, "segments[0]"},
 		{"usage update with negative usage", relayapi.STTUsageUpdated{Type: relayapi.STTEventUsageUpdated, Usage: relayapi.Usage{DurationMS: -1}}, "must not be negative"},
 		{"closed with negative usage", relayapi.STTSessionClosed{Type: relayapi.STTEventSessionClosed, Usage: relayapi.Usage{DurationMS: -1}}, "must not be negative"},
@@ -166,6 +171,66 @@ func TestSTTStreamMessageValidation(t *testing.T) {
 			t.Parallel()
 			assertInvalid(t, tc.message.Validate(), tc.want)
 		})
+	}
+}
+
+func ms(value int64) *int64 { return &value }
+
+// A delta segment can say who said its text before anyone knows when they
+// stopped: without both times it carries neither, and still validates.
+func TestSTTTranscriptDeltaSegmentWithoutTimes(t *testing.T) {
+	t.Parallel()
+	delta := relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "A B", Segments: []relayapi.TranscriptDeltaSegment{
+		{Text: "A", StartMS: ms(100), EndMS: ms(200), Speaker: "1"},
+		{Text: "B", Speaker: "2"},
+	}}
+	if err := delta.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	encoded, err := json.Marshal(delta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"type":"transcript.delta","text":"A B","segments":[{"text":"A","start_ms":100,"end_ms":200,"speaker":"1"},{"text":"B","speaker":"2"}]}`
+	if string(encoded) != want {
+		t.Fatalf("delta = %s\nwant    %s", encoded, want)
+	}
+}
+
+// Speaker segments on a delta are opt-in: a delta from a session that never
+// asked for diarization keeps the exact bytes it always had.
+func TestSTTTranscriptDeltaWithoutSegmentsKeepsItsBytes(t *testing.T) {
+	t.Parallel()
+	encoded, err := json.Marshal(relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(encoded), `{"type":"transcript.delta","text":"hello"}`; got != want {
+		t.Fatalf("delta = %s, want %s", got, want)
+	}
+}
+
+// An interim final says more of the same segment follows; a final that
+// does not say so keeps the bytes it always had.
+func TestSTTInterimFinalOnTheWire(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		final relayapi.STTTranscriptFinal
+		want  string
+	}{
+		{relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, Text: "first part", Interim: true}, `{"type":"transcript.final","text":"first part","interim":true}`},
+		{relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, Text: "tail", CommitID: "review-1"}, `{"type":"transcript.final","text":"tail","commit_id":"review-1"}`},
+	} {
+		if err := test.final.Validate(); err != nil {
+			t.Fatalf("%s: validate: %v", test.want, err)
+		}
+		encoded, err := json.Marshal(test.final)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(encoded) != test.want {
+			t.Errorf("final = %s\nwant    %s", encoded, test.want)
+		}
 	}
 }
 

@@ -6,15 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"github.com/coder/websocket"
+	"github.com/rivo/uniseg"
 )
 
 const (
@@ -215,6 +219,8 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		cancel:       cancel,
 		events:       make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		closeTimeout: sttGracefulCloseTimeout,
+		diarize:      start.EnableSpeakerDiariz,
+		translating:  start.Translation != nil,
 	}
 	stream.lastAudio.Store(time.Now().UnixNano())
 	go stream.readLoop()
@@ -326,6 +332,14 @@ type sttStream struct {
 	finishedSeen atomic.Bool
 	terminalMu   sync.RWMutex
 	terminalErr  error
+
+	// diarize is set once at Open: the start frame asked Soniox to label
+	// speakers, so transcript events carry the labels. A session that did
+	// not ask emits the same bytes it always did.
+	diarize bool
+	// translating is set once at Open: the start frame asked Soniox for its
+	// own translation. Such a session is never cut (cutLongSegment).
+	translating bool
 
 	// Read-loop owned; never touched by the write side.
 	segment sttSegment
@@ -655,7 +669,7 @@ func (s *sttStream) handleMessage(payload []byte) error {
 		// The socket is about to close. Flush whatever the endpointer never
 		// got round to marking, then report the provider's own measure of
 		// processed audio, which is the unit an STT reservation is priced in.
-		if err := s.flushSegment(raw); err != nil {
+		if _, err := s.flushSegment(raw); err != nil {
 			return err
 		}
 		processed := message.TotalAudioProcMS
@@ -682,17 +696,24 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	tail := strings.Builder{}
 	translatedTail := strings.Builder{}
 	sawContent := false
-	var tailEndMS *int64
+	// tailEndMS is the last end any tail piece carried, the bound a session
+	// without diarization reports. tailOuterEndMS is the end of the tail's
+	// last piece with text, absent when that piece has none, the bound a
+	// diarized session reports; tailHasText says there is such a piece.
+	var tailEndMS, tailOuterEndMS *int64
+	tailHasText := false
+	// tailSpoken is the tail's tokens, kept only on a diarized session.
+	var tailSpoken []sttToken
 
 	for _, token := range message.Tokens {
 		if token.Text == endToken || token.Text == finToken {
-			emptySegment := strings.TrimSpace(s.segment.text.String()) == "" && s.translated.empty()
-			if err := s.flushSegment(raw); err != nil {
+			answered, err := s.flushSegment(raw)
+			if err != nil {
 				return err
 			}
 			if token.Text == finToken {
 				committed := s.commitPending.Swap(false)
-				if emptySegment && committed {
+				if !answered && committed {
 					if err := s.emit(runtimepkg.ProviderEvent{
 						Type:       protocol.EventTranscriptFinal,
 						Data:       sttTranscriptData("", "", "", true, nil, nil, nil, s.requestID),
@@ -706,7 +727,9 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			// segment; Soniox restarts the tail from scratch afterwards.
 			tail.Reset()
 			translatedTail.Reset()
-			tailEndMS = nil
+			tailEndMS, tailOuterEndMS = nil, nil
+			tailHasText = false
+			tailSpoken = nil
 			sawContent = false
 			if token.Text == endToken {
 				// <end> is the semantic endpointer's verdict that the speaker
@@ -734,16 +757,35 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			}
 			continue
 		}
+		if len(token.Speaker) > sttSpeakerLabelMaxBytes {
+			// Not a label anyone can use: the piece counts as unlabelled.
+			token.Speaker = ""
+		}
 		if token.IsFinal {
 			s.segment.appendFinal(token)
+			if s.diarize {
+				s.segment.spoken = append(s.segment.spoken, token)
+				s.segment.runs.add(token)
+			}
 			continue
 		}
 		tail.WriteString(token.Text)
 		if token.EndMS != nil {
 			tailEndMS = token.EndMS
 		}
+		if strings.TrimSpace(token.Text) != "" {
+			tailOuterEndMS, tailHasText = token.EndMS, true
+		}
+		if s.diarize {
+			tailSpoken = append(tailSpoken, token)
+		}
 	}
 
+	if s.diarize && !s.translating {
+		if err := s.cutLongSegment(raw); err != nil {
+			return err
+		}
+	}
 	if !sawContent {
 		return nil
 	}
@@ -752,13 +794,32 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	if interim == "" && interimTranslation == "" {
 		return nil
 	}
-	endMS := tailEndMS
+	// Without diarization the span is the first start and last end any piece
+	// carried, exactly as before speaker labels existed.
+	startMS, endMS := s.segment.startMS, tailEndMS
 	if endMS == nil {
 		endMS = s.segment.endMS
 	}
+	if s.diarize {
+		// Each bound is the outer piece's own: the segment's first finalized
+		// piece starts the hypothesis, and the tail's last piece, or the
+		// segment's when the tail has none, ends it. An inner piece's time
+		// never stands in for an outer one that has none.
+		startMS, endMS = s.segment.firstStartMS, s.segment.lastEndMS
+		if tailHasText {
+			endMS = tailOuterEndMS
+		}
+	}
+	data := sttTranscriptFields(interim, interimTranslation, "", false, startMS, endMS, nil, s.requestID)
+	if s.diarize {
+		// The hypothesis is the segment's finals so far plus the tail. The
+		// finals' runs were built as they arrived; only the tail, which
+		// Soniox re-sends whole on every frame, is added here.
+		sttSetSpeakerRuns(data, s.segment.runs.with(tailSpoken))
+	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptDelta,
-		Data:       sttTranscriptData(interim, interimTranslation, "", false, s.segment.startMS, endMS, nil, s.requestID),
+		Data:       sonioxMarshalData(data),
 		Extensions: sttExtension(raw),
 	})
 }
@@ -771,18 +832,228 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 // being re-attributed. A boundary with translated tokens but no original
 // words (the translation of the previous segment's tail, or the stream
 // finishing) still emits a final, with empty text: dropping it would lose
-// translated words the caller asked, and pays, for.
-func (s *sttStream) flushSegment(raw json.RawMessage) error {
-	text, language, confidence, startMS, endMS := s.segment.flush()
+// translated words the caller asked, and pays, for. A segment that already
+// sent an interim final (cutLongSegment) gets its closing final even with
+// nothing left to say: empty, as a commit's answer to silence is, so a
+// consumer holding the interim text until its segment closes is not left
+// waiting. It reports whether it emitted a final.
+func (s *sttStream) flushSegment(raw json.RawMessage) (bool, error) {
+	spoken, cut := s.segment.spoken, s.segment.cut
+	text, language, confidence, startMS, endMS := s.segment.flush(s.diarize)
 	translation := s.translated.flush()
 	if text == "" && translation == "" {
+		if !cut {
+			return false, nil
+		}
+		// Whitespace has no confidence worth reporting.
+		confidence = nil
+	}
+	data := sttTranscriptFields(text, translation, language, true, startMS, endMS, confidence, s.requestID)
+	if s.diarize {
+		sttSetSpeakers(data, spoken)
+	}
+	return true, s.emit(runtimepkg.ProviderEvent{
+		Type:       protocol.EventTranscriptFinal,
+		Data:       sonioxMarshalData(data),
+		Extensions: sttExtension(raw),
+	})
+}
+
+// A diarized segment's finalized part is cut once it spans more than
+// sttCutAudioMS of audio or sttCutCharacters characters, so that a long talk
+// without an endpoint does not resend an ever longer hypothesis on every
+// delta (docs/PROTOCOL.md). A session without diarization is never cut, and
+// neither is one with Soniox's own translation: the translation trails the
+// words and is not aligned to them, so a prefix final would take the
+// translation of words still in the tail.
+const (
+	sttCutAudioMS    = 20_000
+	sttCutCharacters = 2_000
+)
+
+// cutLongSegment emits the finalized prefix of an over-long segment once, as
+// a final that does not end the utterance, and keeps the rest as the open
+// segment. The prefix ends at the last sentence end in the finalized text's
+// last quarter, else at the last word boundary; never inside a word or a
+// character (sttCutPoint).
+func (s *sttStream) cutLongSegment(raw json.RawMessage) error {
+	spoken := s.segment.spoken
+	if !sttOverBound(s.segment.text.String(), spoken) {
 		return nil
+	}
+	cut := sttCutPoint(spoken)
+	if cut == 0 {
+		return nil
+	}
+	prefix, rest := spoken[:cut], slices.Clone(spoken[cut:])
+	var head sttSegment
+	for _, token := range prefix {
+		head.appendFinal(token)
+	}
+	text, language, confidence, startMS, endMS := head.flush(true)
+	data := sttTranscriptFields(text, s.translated.flush(), language, true, startMS, endMS, confidence, s.requestID)
+	// The speaker has not finished: this only closes a long stretch. interim
+	// says so explicitly, because speech_final false alone is also an
+	// ordinary final on other providers: a consumer answering input.commit
+	// with finals must not take this one as the answer (docs/PROTOCOL.md).
+	data["speech_final"] = false
+	data["interim"] = true
+	sttSetSpeakers(data, prefix)
+	s.segment = sttSegment{cut: true}
+	for _, token := range rest {
+		s.segment.appendFinal(token)
+		s.segment.spoken = append(s.segment.spoken, token)
+		s.segment.runs.add(token)
 	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptFinal,
-		Data:       sttTranscriptData(text, translation, language, true, startMS, endMS, confidence, s.requestID),
+		Data:       sonioxMarshalData(data),
 		Extensions: sttExtension(raw),
 	})
+}
+
+func sttOverBound(text string, tokens []sttToken) bool {
+	if utf8.RuneCountInString(text) > sttCutCharacters {
+		return true
+	}
+	var startMS, endMS *int64
+	for _, token := range tokens {
+		if strings.TrimSpace(token.Text) == "" {
+			continue
+		}
+		if startMS == nil {
+			startMS = token.StartMS
+		}
+		if token.EndMS != nil {
+			endMS = token.EndMS
+		}
+	}
+	return startMS != nil && endMS != nil && *endMS-*startMS > sttCutAudioMS
+}
+
+// sttCutPoint returns how many of the finalized tokens to emit, 0 when there
+// is nowhere to cut. A cut lies between two tokens where the second starts a
+// word or the first ends one or a sentence; text with no such boundary, as
+// Chinese or Japanese written without spaces, is cut by sttCharacterCut. The
+// end of the last finalized token is never one: the next piece is not final
+// yet and may continue the word. Nor is any boundary inside a character
+// (sttGraphemeBreaks): such a candidate is skipped, so the cut steps back to
+// the previous one that is a character boundary.
+func sttCutPoint(tokens []sttToken) int {
+	var text strings.Builder
+	total := 0
+	for _, token := range tokens {
+		text.WriteString(token.Text)
+		total += utf8.RuneCountInString(token.Text)
+	}
+	breaks := sttGraphemeBreaks(text.String())
+	offset, at, sentence, word, hasText := 0, 0, 0, 0, false
+	for index := 1; index < len(tokens); index++ {
+		previous := tokens[index-1].Text
+		offset += utf8.RuneCountInString(previous)
+		at += len(previous)
+		hasText = hasText || strings.TrimSpace(previous) != ""
+		endsSentence := sttEndsSentence(previous)
+		if !hasText || !breaks[at] || !(startsWithSpace(tokens[index].Text) || endsWithSpace(previous) || endsSentence) {
+			continue
+		}
+		word = index
+		if endsSentence && 4*offset >= 3*total {
+			sentence = index
+		}
+	}
+	if sentence > 0 {
+		return sentence
+	}
+	if word > 0 {
+		return word
+	}
+	return sttCharacterCut(tokens, breaks)
+}
+
+// sttCharacterCut is the cut for finalized text with no word or sentence
+// boundary: the last boundary between finalized tokens, within the first
+// sttCutCharacters characters, that is also a character boundary. breaks are
+// the tokens' text's sttGraphemeBreaks.
+func sttCharacterCut(tokens []sttToken, breaks []bool) int {
+	cut, offset, at, hasText := 0, 0, 0, false
+	for index := 1; index < len(tokens); index++ {
+		previous := tokens[index-1].Text
+		offset += utf8.RuneCountInString(previous)
+		at += len(previous)
+		if offset > sttCutCharacters {
+			break
+		}
+		hasText = hasText || strings.TrimSpace(previous) != ""
+		if hasText && breaks[at] {
+			cut = index
+		}
+	}
+	return cut
+}
+
+// sttGraphemeBreaks marks the byte offsets of text where one user-perceived
+// character ends and the next begins, so breaks has len(text)+1 entries and
+// both ends are breaks. These are Unicode's extended grapheme cluster
+// boundaries (UAX #29) as uniseg finds them, with its Unicode 15.0 tables,
+// less the boundaries inside an Indic conjunct (sttInsideConjunct), a rule
+// newer than those tables.
+func sttGraphemeBreaks(text string) []bool {
+	breaks := make([]bool, len(text)+1)
+	breaks[0] = true
+	rest, offset, state := text, 0, -1
+	for rest != "" {
+		var cluster string
+		cluster, rest, _, state = uniseg.FirstGraphemeClusterInString(rest, state)
+		offset += len(cluster)
+		breaks[offset] = true
+	}
+	for offset := 1; offset < len(text); offset++ {
+		if breaks[offset] && sttInsideConjunct(text, offset) {
+			breaks[offset] = false
+		}
+	}
+	return breaks
+}
+
+// sttConjunctLinkers are the viramas that join two consonants into one
+// conjunct (Unicode 15.1 Indic_Conjunct_Break=Linker): Devanagari, Bengali,
+// Gujarati, Oriya, Telugu and Malayalam.
+const sttConjunctLinkers = "\u094d\u09cd\u0acd\u0b4d\u0c4d\u0d4d"
+
+// sttInsideConjunct reports whether offset falls inside an Indic conjunct,
+// such as क्ष: a consonant at offset, and before it a consonant followed by
+// a linker, with only combining marks and joiners around the linker
+// (UAX #29 rule GB9c). Every letter of the six scripts counts as a
+// consonant; a vowel letter after a virama is rare, and keeping it joined
+// only moves a cut one character back.
+func sttInsideConjunct(text string, offset int) bool {
+	next, _ := utf8.DecodeRuneInString(text[offset:])
+	if !sttConjunctLetter(next) {
+		return false
+	}
+	linked := false
+	for before := text[:offset]; before != ""; {
+		previous, size := utf8.DecodeLastRuneInString(before)
+		before = before[:len(before)-size]
+		switch {
+		case strings.ContainsRune(sttConjunctLinkers, previous):
+			linked = true
+		case previous == '\u200d' || unicode.In(previous, unicode.Mn, unicode.Me):
+		default:
+			return linked && sttConjunctLetter(previous)
+		}
+	}
+	return false
+}
+
+func sttConjunctLetter(r rune) bool {
+	return unicode.IsLetter(r) && unicode.In(r, unicode.Devanagari, unicode.Bengali, unicode.Gujarati, unicode.Oriya, unicode.Telugu, unicode.Malayalam)
+}
+
+func sttEndsSentence(text string) bool {
+	last, _ := utf8.DecodeLastRuneInString(strings.TrimRightFunc(text, unicode.IsSpace))
+	return strings.ContainsRune(".!?…。！？", last)
 }
 
 func (s *sttStream) emit(event runtimepkg.ProviderEvent) error {
@@ -801,11 +1072,28 @@ type sttSegment struct {
 	text          strings.Builder
 	confidenceSum float64
 	confidenceN   int
-	startMS       *int64
-	endMS         *int64
+	// startMS is the first start and endMS the last end that any piece
+	// carried: the span a session without diarization has always reported.
+	startMS *int64
+	endMS   *int64
+	// firstStartMS is the start of the first piece with text and lastEndMS
+	// the end of the last, each absent when that piece has none; hasText
+	// says there is such a piece. A diarized session reports these outer
+	// bounds.
+	firstStartMS *int64
+	lastEndMS    *int64
+	hasText      bool
+	// cut says an interim final already carried part of this segment, so its
+	// end owes a closing final even with nothing left to say.
+	cut bool
 	// languages counts tokens per identified language; only a session with
 	// language identification on gets any.
 	languages map[string]int
+	// spoken is the segment's final tokens and runs their speaker runs, both
+	// kept only on a diarized session: the final reports each word's
+	// speaker, a delta each run's.
+	spoken []sttToken
+	runs   sttRuns
 }
 
 func (a *sttSegment) appendFinal(token sttToken) {
@@ -826,11 +1114,21 @@ func (a *sttSegment) appendFinal(token sttToken) {
 	if token.EndMS != nil {
 		a.endMS = token.EndMS
 	}
+	if strings.TrimSpace(token.Text) != "" {
+		if !a.hasText {
+			a.firstStartMS, a.hasText = token.StartMS, true
+		}
+		a.lastEndMS = token.EndMS
+	}
 }
 
 // flush returns the segment's text, its majority identified language ("" when
-// none was identified), average confidence, and audio span.
-func (a *sttSegment) flush() (string, string, *float64, *int64, *int64) {
+// none was identified), average confidence, and audio span. With outer, the
+// span covers the whole text, so it is reported only when the first piece's
+// start and the last piece's end are both known; otherwise neither is, and
+// only the words' own bounds say when anything was said. Without outer it is
+// the first start and last end any piece carried, as it always was.
+func (a *sttSegment) flush(outer bool) (string, string, *float64, *int64, *int64) {
 	text := strings.TrimSpace(a.text.String())
 	language, most := "", 0
 	for candidate, count := range a.languages {
@@ -844,6 +1142,12 @@ func (a *sttSegment) flush() (string, string, *float64, *int64, *int64) {
 		confidence = &average
 	}
 	startMS, endMS := a.startMS, a.endMS
+	if outer {
+		startMS, endMS = a.firstStartMS, a.lastEndMS
+		if startMS == nil || endMS == nil {
+			startMS, endMS = nil, nil
+		}
+	}
 	*a = sttSegment{}
 	return text, language, confidence, startMS, endMS
 }
@@ -862,6 +1166,10 @@ func (t *sttTranslated) flush() string {
 }
 
 func sttTranscriptData(text, translation, language string, isFinal bool, startMS, endMS *int64, confidence *float64, requestID string) json.RawMessage {
+	return sonioxMarshalData(sttTranscriptFields(text, translation, language, isFinal, startMS, endMS, confidence, requestID))
+}
+
+func sttTranscriptFields(text, translation, language string, isFinal bool, startMS, endMS *int64, confidence *float64, requestID string) map[string]any {
 	// Finals are emitted only after <end>, <fin>, or stream completion has
 	// flushed the segment. Unlike locked token chunks, these complete an
 	// utterance and let consumers skip their missing-final safety timeout.
@@ -883,7 +1191,173 @@ func sttTranscriptData(text, translation, language string, isFinal bool, startMS
 	if confidence != nil {
 		data["confidence"] = *confidence
 	}
-	return sonioxMarshalData(data)
+	return data
+}
+
+// sttSpeakerLabelMaxBytes bounds the vendor's speaker label, which events copy
+// verbatim into every run and word it names. A longer label is dropped and
+// its piece counts as unlabelled.
+const sttSpeakerLabelMaxBytes = 64
+
+// sttSetSpeakers adds a diarized session's labels to a final, in the shape
+// ElevenLabs Scribe v3 Live finals already use (docs/PROTOCOL.md): words, each
+// with the vendor's speaker label verbatim and its span, and a top-level
+// speaker when one speaker said every word. A word Soniox left unlabelled could be anyone's,
+// so it has no speaker and the event then names no one. Nothing is added
+// when the tokens hold no words.
+func sttSetSpeakers(data map[string]any, tokens []sttToken) {
+	words := sttSpeakerWords(tokens)
+	if len(words) == 0 {
+		return
+	}
+	entries := make([]map[string]any, len(words))
+	speaker := words[0].speaker
+	for index, word := range words {
+		entry := map[string]any{"text": word.text}
+		if word.startMS != nil {
+			entry["start_ms"] = *word.startMS
+		}
+		if word.endMS != nil {
+			entry["end_ms"] = *word.endMS
+		}
+		if word.speaker != "" {
+			entry["speaker"] = word.speaker
+		}
+		if word.speaker != speaker {
+			speaker = ""
+		}
+		entries[index] = entry
+	}
+	data["words"] = entries
+	if speaker != "" {
+		data["speaker"] = speaker
+	}
+}
+
+// sttSpeakerWord is one word of a diarized transcript event.
+type sttSpeakerWord struct {
+	text           string
+	startMS, endMS *int64
+	speaker        string
+}
+
+// sttSpeakerWords joins Soniox's word pieces into words. A piece carries its
+// own leading space, so a piece starts a new word when it begins with
+// whitespace, follows a piece that ended with whitespace, or has a different
+// speaker than the word so far; any other piece continues the word
+// ("fan" "tastic", "you" "?"). Word text is cut from the pieces in order, so
+// the words of an event appear in its text in the same order. A word's span
+// runs from its first piece's start to its last piece's end, either absent
+// when that piece carries no time.
+func sttSpeakerWords(tokens []sttToken) []sttSpeakerWord {
+	var words []sttSpeakerWord
+	continues := false
+	for _, token := range tokens {
+		if strings.TrimSpace(token.Text) == "" {
+			continues = false
+			continue
+		}
+		last := len(words) - 1
+		if !continues || startsWithSpace(token.Text) || words[last].speaker != token.Speaker {
+			words = append(words, sttSpeakerWord{startMS: token.StartMS, speaker: token.Speaker})
+			last++
+		}
+		words[last].text += strings.TrimSpace(token.Text)
+		// A word ends where its last piece ends; a last piece with no time
+		// leaves the end unknown rather than borrowing an inner piece's.
+		words[last].endMS = token.EndMS
+		continues = !endsWithSpace(token.Text)
+	}
+	return words
+}
+
+// sttRun is one speaker's stretch of a diarized hypothesis: the vendor's
+// label, the span from its first piece's start to its last piece's end (each
+// absent when that piece has no time), and where it sits in the text, in
+// characters (Unicode code points) from the start of the untrimmed segment,
+// from its first non-space character to just past its last.
+type sttRun struct {
+	speaker        string
+	startMS, endMS *int64
+	from, to       int
+}
+
+// sttRuns builds a segment's speaker runs one piece at a time, so a delta
+// costs one entry per run however long the segment grows. A new run starts
+// wherever the label changes, inside a word too: labels are the vendor's,
+// verbatim.
+type sttRuns struct {
+	runs []sttRun
+	// characters counts the code points of every piece added so far, which
+	// is where the next piece starts in the segment's text.
+	characters int
+}
+
+func (r *sttRuns) add(token sttToken) {
+	length := utf8.RuneCountInString(token.Text)
+	if content := strings.TrimSpace(token.Text); content != "" {
+		from := r.characters + length - utf8.RuneCountInString(strings.TrimLeftFunc(token.Text, unicode.IsSpace))
+		last := len(r.runs) - 1
+		if last < 0 || r.runs[last].speaker != token.Speaker {
+			r.runs = append(r.runs, sttRun{speaker: token.Speaker, startMS: token.StartMS, from: from})
+			last++
+		}
+		r.runs[last].endMS = token.EndMS
+		r.runs[last].to = from + utf8.RuneCountInString(content)
+	}
+	r.characters += length
+}
+
+// with returns the runs extended by the tail's pieces, leaving the segment's
+// own runs as they were.
+func (r sttRuns) with(tail []sttToken) sttRuns {
+	extended := sttRuns{runs: slices.Clone(r.runs), characters: r.characters}
+	for _, token := range tail {
+		extended.add(token)
+	}
+	return extended
+}
+
+// sttSetSpeakerRuns adds a diarized session's labels to a delta: speaker_runs,
+// one entry per run with the vendor's label verbatim, its span, and
+// text_start/text_end, the run's character offsets into the delta's text
+// (end exclusive). Runs carry offsets rather than their own text so labels add
+// a few bytes per run to a delta, not a second copy of the hypothesis. A
+// top-level speaker names the one speaker of a single-run delta. A run Soniox
+// left unlabelled has no speaker. Nothing is added when there are no runs.
+func sttSetSpeakerRuns(data map[string]any, runs sttRuns) {
+	if len(runs.runs) == 0 {
+		return
+	}
+	// The delta's text is trimmed, and only whitespace precedes the first
+	// run, so offsets count from the first run's first character.
+	base := runs.runs[0].from
+	entries := make([]map[string]any, len(runs.runs))
+	for index, run := range runs.runs {
+		entry := map[string]any{"text_start": run.from - base, "text_end": run.to - base}
+		if run.speaker != "" {
+			entry["speaker"] = run.speaker
+		}
+		if run.startMS != nil {
+			entry["start_ms"] = *run.startMS
+		}
+		if run.endMS != nil {
+			entry["end_ms"] = *run.endMS
+		}
+		entries[index] = entry
+	}
+	data["speaker_runs"] = entries
+	if len(runs.runs) == 1 && runs.runs[0].speaker != "" {
+		data["speaker"] = runs.runs[0].speaker
+	}
+}
+
+func startsWithSpace(text string) bool {
+	return strings.TrimLeftFunc(text, unicode.IsSpace) != text
+}
+
+func endsWithSpace(text string) bool {
+	return strings.TrimRightFunc(text, unicode.IsSpace) != text
 }
 
 func sttSpeechEndedData(endMS *int64) json.RawMessage {
@@ -997,6 +1471,12 @@ type sttToken struct {
 	// Language is the identified language, present only when the start
 	// frame enabled language identification.
 	Language string `json:"language"`
+	// Speaker is the vendor's label ("1", "2", ...), present on every token
+	// when the start frame enabled speaker diarization
+	// (soniox.com/docs/stt/concepts/speaker-diarization, read 2026-11-19).
+	// Soniox warns that real-time labels can switch and then settle as it
+	// hears more, so a non-final token's label is provisional.
+	Speaker string `json:"speaker"`
 }
 
 type sttInboundMessage struct {

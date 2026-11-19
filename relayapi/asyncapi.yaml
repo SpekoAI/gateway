@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:ea280d09c443a12a44ec39ea527c682ad6d1e09fb219057fbd8883cc1a88bbed
-# yaml-body: sha256:c442a7e741dec4a0360fa8b085c4297bd149c8cf28e0d42576d1587255784968
+# json-mirror: asyncapi.json sha256:6e3817bd5a8eaa0a66f8f343ea3682244a45260461fe637b8b6004877c8d2362
+# yaml-body: sha256:6a04c5d6e04ac8507995d8694be9bb5fd06db7fb71ae7b9250f697b73c45fcaa
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -909,6 +909,34 @@ components:
         - start_ms
         - end_ms
       additionalProperties: false
+    TranscriptDeltaSegment:
+      type: object
+      description: >-
+        The part of a transcript.delta's provisional text one speaker said.
+        start_ms and end_ms come together or not at all: a hypothesis can
+        know who is speaking before it knows when they stopped, so the span
+        is present only when the provider measured both its ends. A segment
+        without it still attributes its text.
+      properties:
+        text:
+          type: string
+        start_ms:
+          type: integer
+          minimum: 0
+          description: Present exactly when end_ms is.
+        end_ms:
+          type: integer
+          minimum: 0
+          description: Present exactly when start_ms is, and not before it.
+        speaker:
+          type: string
+          description: >-
+            Whoever said the span, present only when the provider attributed
+            it. The VENDOR's own label carried verbatim. Absent means
+            unattributed, which is not the same as a new speaker.
+      required:
+        - text
+      additionalProperties: false
     ErrorCode:
       type: string
       description: >-
@@ -1066,6 +1094,8 @@ components:
           description: >-
             Label each transcript segment with the speaker who said it.
             Omitted leaves the vendor default, which is not the same as false.
+            On a provider that labels interim words, transcript.delta also
+            carries segments, so speakers are known before the final.
         keywords:
           type: array
           description: >-
@@ -1192,6 +1222,18 @@ components:
             The interim translation of the current span, present only on a
             session that asked for one. It trails text, so a delta may carry
             only one of the two; a delta with neither is never sent.
+        segments:
+          type: array
+          description: >-
+            Who is saying the hypothesis, before any final: text cut wherever
+            the speaker changes, in order, each piece with the vendor's label
+            and, when the provider measured both its ends, its span. Present
+            only on a session that asked for diarization, routed to a
+            provider that labels interim words; absent otherwise, so every
+            other delta keeps its exact bytes. The labels are provisional: a
+            later delta or the transcript.final may relabel the same words.
+          items:
+            $ref: "#/components/schemas/TranscriptDeltaSegment"
       required:
         - type
         - text
@@ -1210,6 +1252,10 @@ components:
           type: string
         segments:
           type: array
+          description: >-
+            Time-aligned spans of text, in order. A span the provider did not
+            time at both ends is left out rather than given a borrowed time,
+            so the segments can cover less than text.
           items:
             $ref: "#/components/schemas/TranscriptSegment"
         speaker:
@@ -1242,6 +1288,15 @@ components:
             several pending commits, the older ones are answered first by
             empty finals carrying their own ids, and the provider's final
             carries the newest commit's id.
+        interim:
+          type: boolean
+          description: >-
+            True on an interim final: the provider closed part of a long
+            segment that is still being spoken, and more of the same segment
+            follows. An interim final never answers an input.commit and never
+            carries a commit_id; the segment's last final does. A client that
+            stops reading at its commit's answer still gets the whole
+            segment. Absent on every other final.
       required:
         - type
         - text

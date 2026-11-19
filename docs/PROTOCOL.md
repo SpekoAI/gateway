@@ -186,6 +186,78 @@ rewrites a delivered transcript, so a client that stores speakers applies the
 merge itself. Scribe v3 Live `transcript.delta` data carries the vendor's
 `turn_probability`, the estimated chance that the speaker has finished.
 
+On a diarized Soniox session, `transcript.final` data carries `words` in the
+Scribe v3 Live shape: each word with the vendor's label as `speaker` and its
+`start_ms` and `end_ms`, plus a top-level `speaker` when one speaker said
+every word. Soniox's word pieces are joined into words, and a word starts
+wherever the speaker changes. A word Soniox left unlabelled has no `speaker`,
+and its final then has no top-level `speaker`. A label longer than 64 bytes
+is dropped, and its piece counts as unlabelled.
+
+Soniox labels every token, final or not, so each `transcript.delta` attributes
+its whole hypothesis (the segment's finalized words plus the provisional tail)
+as soon as it is heard, and finals are not held back for labels. A delta
+carries `speaker_runs` instead of `words`: one entry per stretch one speaker
+said, with `speaker`, `start_ms`, `end_ms`, and `text_start` and `text_end`,
+the run's offsets into the delta's `text` in Unicode code points, end
+exclusive (Python's `text[text_start:text_end]`). A run starts wherever the
+label changes, inside a word too. The run's text is not repeated, so labels
+keep a long delta close to its unlabelled size. A delta with one run also
+carries a top-level `speaker`. A delta's labels are provisional: a later
+delta or the final may change them.
+
+On both events, a word's or run's `start_ms` is its first piece's start and
+`end_ms` its last piece's end; either is absent when that piece has no time.
+The event's own `audio_start_ms` and `audio_end_ms` follow the same rule on a
+delta. A final carries the pair only when both are known: together they claim
+the whole text, so an inner piece's time never stands in for a missing outer
+one. This rule holds on diarized Soniox sessions only: a session without
+diarization reports the span as it always has, from the first start and the
+last end that any piece carried. Router's public `transcript.delta` turns runs into
+`segments` that carry each run's text and speaker, and `start_ms` and
+`end_ms` only when the run has both.
+
+A diarized segment that runs on without an endpoint is cut, so a long talk
+does not resend an ever longer hypothesis on every delta. Once its finalized
+part spans more than 20 s of audio or 2,000 characters, that part's prefix
+goes out once as a `transcript.final` with `speech_final: false` and
+`interim: true`: an interim final, more of the same segment follows. It never
+answers a commit: a pending `audio.commit` is answered by the segment's last
+final, after the provider has finalized all its audio. A segment that sent
+an interim final always closes with a final that is not interim, with empty
+`text` when nothing was left to say after the cut. Router's public
+`transcript.final` carries the same `interim: true` and never a `commit_id`
+with it.
+
+The prefix ends after the last finalized piece that ends a sentence in the
+last quarter of the finalized text, or else at the last word boundary between
+finalized pieces, so it never ends inside a word. Text with neither, such as
+Chinese or Japanese written without spaces, is cut at the last boundary
+between finalized pieces within the first 2,000 characters. Whichever rule
+picks it, a boundary inside a user-perceived character is skipped for the
+previous one that is a character boundary: Unicode's extended grapheme
+clusters (UAX #29, Unicode 15.0 tables) plus the Indic conjunct rule of
+Unicode 15.1, so Thai กำ, Devanagari क्ष, emoji joined by U+200D, a letter
+with its combining marks, and a character with its variation selector each
+stay in one final. The prefix never ends after the last finalized piece, which
+the next piece may continue. Later deltas carry only the rest, with run
+offsets into their own text, and every word and character reaches exactly one
+final, in order.
+
+A session without diarization is never cut, and neither is a diarized session
+that asked for Soniox's own translation: that translation trails the words and
+is not aligned to them, so such a session keeps one final per segment as
+before.
+
+Known limits: a diarized session with Soniox's own translation is never cut,
+so its deltas and its final grow with the segment and repeat every speaker
+run on each delta. A gateway-protocol client that already asks Soniox for
+diarization gets interim finals from this version on, and must read
+`interim` before it takes a final for the end of a turn.
+
+Soniox notes that endpoint detection, which this adapter always enables,
+lowers diarization accuracy.
+
 ### Realtime sessions: OpenAI Realtime and GPT-Live
 
 `kind: "realtime"` opens a speech-to-speech session. The setup body carries
