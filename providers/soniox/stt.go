@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -215,6 +217,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		cancel:       cancel,
 		events:       make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		closeTimeout: sttGracefulCloseTimeout,
+		diarize:      start.EnableSpeakerDiariz,
 	}
 	stream.lastAudio.Store(time.Now().UnixNano())
 	go stream.readLoop()
@@ -326,6 +329,11 @@ type sttStream struct {
 	finishedSeen atomic.Bool
 	terminalMu   sync.RWMutex
 	terminalErr  error
+
+	// diarize is set once at Open: the start frame asked Soniox to label
+	// speakers, so transcript events carry the labels. A session that did
+	// not ask emits the same bytes it always did.
+	diarize bool
 
 	// Read-loop owned; never touched by the write side.
 	segment sttSegment
@@ -678,6 +686,8 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	translatedTail := strings.Builder{}
 	sawContent := false
 	var tailEndMS *int64
+	// tailSpoken is the tail's tokens, kept only on a diarized session.
+	var tailSpoken []sttToken
 
 	for _, token := range message.Tokens {
 		if token.Text == endToken || token.Text == finToken {
@@ -702,6 +712,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			tail.Reset()
 			translatedTail.Reset()
 			tailEndMS = nil
+			tailSpoken = nil
 			sawContent = false
 			if token.Text == endToken {
 				// <end> is the semantic endpointer's verdict that the speaker
@@ -731,11 +742,17 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 		}
 		if token.IsFinal {
 			s.segment.appendFinal(token)
+			if s.diarize {
+				s.segment.spoken = append(s.segment.spoken, token)
+			}
 			continue
 		}
 		tail.WriteString(token.Text)
 		if token.EndMS != nil {
 			tailEndMS = token.EndMS
+		}
+		if s.diarize {
+			tailSpoken = append(tailSpoken, token)
 		}
 	}
 
@@ -751,9 +768,15 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	if endMS == nil {
 		endMS = s.segment.endMS
 	}
+	data := sttTranscriptFields(interim, interimTranslation, "", false, s.segment.startMS, endMS, nil, s.requestID)
+	if s.diarize {
+		// The hypothesis is the segment's finals so far plus the tail, so
+		// its labels are too; a word piece split across the two joins up.
+		sttSetSpeakers(data, append(slices.Clone(s.segment.spoken), tailSpoken...))
+	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptDelta,
-		Data:       sttTranscriptData(interim, interimTranslation, "", false, s.segment.startMS, endMS, nil, s.requestID),
+		Data:       sonioxMarshalData(data),
 		Extensions: sttExtension(raw),
 	})
 }
@@ -768,14 +791,19 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 // finishing) still emits a final, with empty text: dropping it would lose
 // translated words the caller asked, and pays, for.
 func (s *sttStream) flushSegment(raw json.RawMessage) error {
+	spoken := s.segment.spoken
 	text, language, confidence, startMS, endMS := s.segment.flush()
 	translation := s.translated.flush()
 	if text == "" && translation == "" {
 		return nil
 	}
+	data := sttTranscriptFields(text, translation, language, true, startMS, endMS, confidence, s.requestID)
+	if s.diarize {
+		sttSetSpeakers(data, spoken)
+	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptFinal,
-		Data:       sttTranscriptData(text, translation, language, true, startMS, endMS, confidence, s.requestID),
+		Data:       sonioxMarshalData(data),
 		Extensions: sttExtension(raw),
 	})
 }
@@ -801,6 +829,9 @@ type sttSegment struct {
 	// languages counts tokens per identified language; only a session with
 	// language identification on gets any.
 	languages map[string]int
+	// spoken is the segment's final tokens, kept only on a diarized session
+	// for their speaker labels.
+	spoken []sttToken
 }
 
 func (a *sttSegment) appendFinal(token sttToken) {
@@ -857,6 +888,10 @@ func (t *sttTranslated) flush() string {
 }
 
 func sttTranscriptData(text, translation, language string, isFinal bool, startMS, endMS *int64, confidence *float64, requestID string) json.RawMessage {
+	return sonioxMarshalData(sttTranscriptFields(text, translation, language, isFinal, startMS, endMS, confidence, requestID))
+}
+
+func sttTranscriptFields(text, translation, language string, isFinal bool, startMS, endMS *int64, confidence *float64, requestID string) map[string]any {
 	// Finals are emitted only after <end>, <fin>, or stream completion has
 	// flushed the segment. Unlike locked token chunks, these complete an
 	// utterance and let consumers skip their missing-final safety timeout.
@@ -878,7 +913,88 @@ func sttTranscriptData(text, translation, language string, isFinal bool, startMS
 	if confidence != nil {
 		data["confidence"] = *confidence
 	}
-	return sonioxMarshalData(data)
+	return data
+}
+
+// sttSetSpeakers adds a diarized session's labels to a transcript event, in
+// the shape ElevenLabs Scribe v3 Live finals already use (docs/PROTOCOL.md):
+// words, each with the vendor's speaker label verbatim and its span, and a
+// top-level speaker when one speaker said every word. A word Soniox left unlabelled could be anyone's,
+// so it has no speaker and the event then names no one. Nothing is added
+// when the tokens hold no words.
+func sttSetSpeakers(data map[string]any, tokens []sttToken) {
+	words := sttSpeakerWords(tokens)
+	if len(words) == 0 {
+		return
+	}
+	entries := make([]map[string]any, len(words))
+	speaker := words[0].speaker
+	for index, word := range words {
+		entry := map[string]any{"text": word.text}
+		if word.startMS != nil {
+			entry["start_ms"] = *word.startMS
+		}
+		if word.endMS != nil {
+			entry["end_ms"] = *word.endMS
+		}
+		if word.speaker != "" {
+			entry["speaker"] = word.speaker
+		}
+		if word.speaker != speaker {
+			speaker = ""
+		}
+		entries[index] = entry
+	}
+	data["words"] = entries
+	if speaker != "" {
+		data["speaker"] = speaker
+	}
+}
+
+// sttSpeakerWord is one word of a diarized transcript event.
+type sttSpeakerWord struct {
+	text           string
+	startMS, endMS *int64
+	speaker        string
+}
+
+// sttSpeakerWords joins Soniox's word pieces into words. A piece carries its
+// own leading space, so a piece starts a new word when it begins with
+// whitespace, follows a piece that ended with whitespace, or has a different
+// speaker than the word so far; any other piece continues the word
+// ("fan" "tastic", "you" "?"). Word text is cut from the pieces in order, so
+// the words of an event appear in its text in the same order.
+func sttSpeakerWords(tokens []sttToken) []sttSpeakerWord {
+	var words []sttSpeakerWord
+	continues := false
+	for _, token := range tokens {
+		if strings.TrimSpace(token.Text) == "" {
+			continues = false
+			continue
+		}
+		last := len(words) - 1
+		if !continues || startsWithSpace(token.Text) || words[last].speaker != token.Speaker {
+			words = append(words, sttSpeakerWord{startMS: token.StartMS, speaker: token.Speaker})
+			last++
+		}
+		words[last].text += strings.TrimSpace(token.Text)
+		if words[last].startMS == nil {
+			words[last].startMS = token.StartMS
+		}
+		if token.EndMS != nil {
+			words[last].endMS = token.EndMS
+		}
+		continues = !endsWithSpace(token.Text)
+	}
+	return words
+}
+
+func startsWithSpace(text string) bool {
+	return strings.TrimLeftFunc(text, unicode.IsSpace) != text
+}
+
+func endsWithSpace(text string) bool {
+	return strings.TrimRightFunc(text, unicode.IsSpace) != text
 }
 
 func sttSpeechEndedData(endMS *int64) json.RawMessage {
@@ -992,6 +1108,12 @@ type sttToken struct {
 	// Language is the identified language, present only when the start
 	// frame enabled language identification.
 	Language string `json:"language"`
+	// Speaker is the vendor's label ("1", "2", ...), present on every token
+	// when the start frame enabled speaker diarization
+	// (soniox.com/docs/stt/concepts/speaker-diarization, read 2026-11-19).
+	// Soniox warns that real-time labels can switch and then settle as it
+	// hears more, so a non-final token's label is provisional.
+	Speaker string `json:"speaker"`
 }
 
 type sttInboundMessage struct {
