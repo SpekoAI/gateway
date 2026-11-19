@@ -100,10 +100,15 @@ func New(config Config) (*Adapter, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The handshake never follows a redirect: the API key or the token would
+	// go to a host the endpoint policy never checked. A redirect answer is a
+	// failed dial.
+	dialClient := *httpClient(config.HTTPClient)
+	dialClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Adapter{
 		id:              config.AdapterID,
 		version:         config.Version,
-		httpClient:      config.HTTPClient,
+		httpClient:      &dialClient,
 		eventBuffer:     config.EventBuffer,
 		maxMessageBytes: config.MaxMessageBytes,
 		endpointPolicy:  endpointPolicy,
@@ -169,7 +174,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 				return nil, "", err
 			}
 		}
-		conn, response, err := websocket.Dial(ctx, target, &websocket.DialOptions{HTTPClient: httpClient(a.httpClient), HTTPHeader: headers})
+		conn, response, err := websocket.Dial(ctx, target, &websocket.DialOptions{HTTPClient: a.httpClient, HTTPHeader: headers})
 		if err != nil {
 			status := 0
 			if response != nil {

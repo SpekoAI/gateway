@@ -773,6 +773,46 @@ func TestAdapterBoundsAReconnectThatNeverAnswers(t *testing.T) {
 	}
 }
 
+// A handshake answered with a redirect is a failed dial: neither the
+// customer's key (header) nor a managed token (query, and the Referer a
+// followed redirect would carry) reaches the redirect target.
+func TestAdapterDoesNotFollowAHandshakeRedirect(t *testing.T) {
+	t.Parallel()
+	for _, source := range []protocol.CredentialSource{protocol.CredentialsBYOK, protocol.CredentialsManaged} {
+		var reached atomic.Int32
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reached.Add(1)
+			if r.Header.Get("X-API-Key") != "" || strings.Contains(r.URL.RawQuery+r.Referer(), "secret-credential") {
+				t.Errorf("%s: redirect target got the credential", source)
+			}
+			http.Error(w, "not a cartesia endpoint", http.StatusNotFound)
+		}))
+		redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+		}))
+		adapter, err := New(testConfig(redirector.URL))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := adapterRequest(redirector.URL)
+		request.Plan.Execution.CredentialSource = source
+		request.Plan.Route.Credential.Value = "secret-credential"
+		providerStream, err := adapter.Open(context.Background(), request)
+		var failure *runtimepkg.ProviderError
+		if err == nil {
+			_ = providerStream.Close(context.Background())
+			t.Errorf("%s: open through a redirect succeeded; want a failed dial", source)
+		} else if !errors.As(err, &failure) || failure.ProviderStatus != http.StatusTemporaryRedirect {
+			t.Errorf("%s: open = %v; want a provider error with status 307", source, err)
+		}
+		if got := reached.Load(); got != 0 {
+			t.Errorf("%s: redirect target got %d requests; want none", source, got)
+		}
+		redirector.Close()
+		target.Close()
+	}
+}
+
 // make16kAudio is duration bytes of 16 kHz pcm_s16le whose first byte marks
 // which fragment it belongs to.
 func make16kAudio(mark byte, bytes int) []byte {
