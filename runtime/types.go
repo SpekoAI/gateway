@@ -20,6 +20,10 @@ var (
 	// ErrSessionClosed means an input was submitted after the session started
 	// closing. The caller retains ownership of any rejected audio input.
 	ErrSessionClosed = errors.New("runtime: session is closed")
+	// ErrNothingToCommit means a text commit found no open utterance to end:
+	// nothing was appended since the last one, or it was already committed.
+	// The provider stream stays usable.
+	ErrNothingToCommit = errors.New("runtime: nothing to commit")
 	// ErrSessionAborted means the runtime force-terminated the provider stream
 	// because its local consumer or transport could not continue safely.
 	ErrSessionAborted = errors.New("runtime: session aborted")
