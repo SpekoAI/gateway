@@ -16,9 +16,11 @@ import (
 	"github.com/coder/websocket"
 )
 
-// Cartesia expires a context nobody committed a few seconds after its last
-// input and says so with an ordinary done frame (measured live: 4 to 6 s with
-// max_buffer_delay_ms 0). A caller that pauses before input.commit (the
+// Cartesia expires a context nobody committed and says so with an ordinary
+// done frame. Its docs count one second from the context's last audio output;
+// measured live (sonic-3.6, max_buffer_delay_ms 0) the done came 3.9 to 5.8 s
+// after the last audio chunk arrived, 4.7 to 6.8 s after the last fragment
+// was sent. A caller that pauses before input.commit (the
 // production failure) must get its utterance finished, not a session-closed
 // error, and must not see utterance.done before it commits. Cartesia answers
 // a commit sent after expiry with 400 "Invalid transcript", so none is sent.

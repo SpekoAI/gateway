@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+	"unicode"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -50,6 +52,7 @@ type Adapter struct {
 	eventBuffer     int
 	maxMessageBytes int64
 	endpointPolicy  upstream.WebSocketPolicy
+	now             func() time.Time
 }
 
 // New creates a bounded Cartesia TTS adapter.
@@ -83,6 +86,7 @@ func New(config Config) (*Adapter, error) {
 		eventBuffer:     config.EventBuffer,
 		maxMessageBytes: config.MaxMessageBytes,
 		endpointPolicy:  endpointPolicy,
+		now:             time.Now,
 	}, nil
 }
 
@@ -130,18 +134,20 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	// permanent Cartesia key, which belongs in the X-API-Key header exactly like
 	// a BYOK key. The access_token query channel stays reserved for the
 	// short-lived tokens of managed provider-direct routes.
-	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay {
+	route := request.Plan.Execution.ProviderRoute
+	shortLived := route != protocol.RouteSpekoRelay && request.Plan.Execution.CredentialSource != protocol.CredentialsBYOK
+	if !shortLived {
 		headers.Set("X-API-Key", credential.Value)
-	} else if request.Plan.Execution.CredentialSource == protocol.CredentialsBYOK {
-		headers.Set("X-API-Key", credential.Value)
-	} else {
-		endpoint, err = addAccessToken(endpoint, credential.Value)
-		if err != nil {
-			return nil, err
-		}
 	}
-	dial := func(ctx context.Context) (*websocket.Conn, string, error) {
-		conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: httpClient(a.httpClient), HTTPHeader: headers})
+	handshake := func(ctx context.Context, token string) (*websocket.Conn, string, error) {
+		target := endpoint
+		if shortLived {
+			var err error
+			if target, err = addAccessToken(endpoint, token); err != nil {
+				return nil, "", err
+			}
+		}
+		conn, response, err := websocket.Dial(ctx, target, &websocket.DialOptions{HTTPClient: httpClient(a.httpClient), HTTPHeader: headers})
 		if err != nil {
 			status := 0
 			if response != nil {
@@ -162,21 +168,42 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		}
 		return conn, requestID, nil
 	}
-	conn, requestID, err := dial(ctx)
+	// A new socket on a managed provider-direct route needs a current
+	// short-lived token: the plan's may have expired while the first socket
+	// was open, so every redial asks the refresher and builds the URL again.
+	refresh := request.RefreshCredential
+	redial := func(ctx context.Context) (*websocket.Conn, string, error) {
+		token := credential.Value
+		if shortLived && refresh != nil {
+			current, err := refresh(ctx)
+			if err != nil || !acceptableCredentialKind(route, current.Kind) || strings.TrimSpace(current.Value) == "" || (!current.ExpiresAt.IsZero() && !a.now().Before(current.ExpiresAt)) {
+				return nil, "", &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia credential could not be renewed for a new connection", Retryable: true, Cause: err}
+			}
+			token = current.Value
+		}
+		return handshake(ctx, token)
+	}
+	conn, requestID, err := handshake(ctx, credential.Value)
 	if err != nil {
 		return nil, err
 	}
+	bufferDelay := defaultBufferDelay
+	if settings.maxBufferDelay != nil {
+		bufferDelay = time.Duration(*settings.maxBufferDelay) * time.Millisecond
+	}
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &stream{
-		dial:     dial,
-		conn:     conn,
-		ctx:      streamCtx,
-		cancel:   cancel,
-		events:   make(chan runtimepkg.ProviderEvent, a.eventBuffer),
-		modelID:  request.Plan.Route.Model,
-		voiceID:  request.Options.Voice,
-		language: request.Options.Language,
-		media:    *request.Media,
+		dial:        redial,
+		now:         a.now,
+		bufferDelay: bufferDelay,
+		conn:        conn,
+		ctx:         streamCtx,
+		cancel:      cancel,
+		events:      make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		modelID:     request.Plan.Route.Model,
+		voiceID:     request.Options.Voice,
+		language:    request.Options.Language,
+		media:       *request.Media,
 
 		settings: settings,
 	}
@@ -248,28 +275,48 @@ func validateGenerationOptions(model string, options protocol.RequestOptions, me
 	return nil
 }
 
-// stream keeps one client session on one Cartesia socket at a time. Two
-// things Cartesia ends on its own are absorbed here instead of ending the
-// session:
+// stream keeps one client session on one Cartesia socket at a time.
 //
-//   - A context nobody committed expires
-//     (https://docs.cartesia.ai/use-the-api/tts-websocket/contexts.md says one
-//     second after its last audio; measured live with max_buffer_delay_ms 0,
-//     an ordinary done frame came 4 to 6 s after the last input), so a caller
-//     who pauses inside an utterance outlives it. The caller's utterance
-//     stays open: its next fragment opens a fresh context and its commit
-//     finishes the utterance, sending nothing when no context is left
-//     (Cartesia answers a commit after expiry with 400 "Invalid transcript").
-//   - A socket that closes while no context is in flight is replaced by the
-//     next fragment. A socket that closes with a context in flight fails the
-//     session with a retryable error, since that audio is lost.
+// The caller speaks in utterances: fragments, then a commit. Cartesia speaks
+// in contexts and ends a context nobody committed on its own. Its docs count
+// that expiry from the context's last audio output: one second
+// (https://docs.cartesia.ai/use-the-api/tts-websocket/contexts.md). Measured
+// live on 2026-11-20 (sonic-3.6, max_buffer_delay_ms 0), the expiry done came
+// 3.9 to 5.8 s after the last audio chunk arrived, which was 4.7 to 6.8 s
+// after the last fragment was sent. A fragment that reaches a context after
+// its expiry is spoken on a re-created context after that done, so it must
+// never be written to a context that may be expiring:
+//
+//   - An utterance owns an ordered list of contexts and speaks through the
+//     newest. A fragment that finds that context quiet (no unanswered speech,
+//     nothing for quietGap since its last audio, flush_done or fragment, and
+//     nothing for the buffer delay since its last fragment) abandons it and
+//     opens a new context in the same utterance, whose word timings continue
+//     after the audio already sent. An abandoned context is never written
+//     again.
+//   - Frames are accepted only for the open utterance's newest context while
+//     it can still speak. Frames for any other context — the expiry done of an
+//     abandoned one, stale frames of an earlier utterance — are dropped and
+//     reported as warnings, never emitted as audio, timings or done.
+//   - The utterance ends once: at the done of its committed context, or at the
+//     commit itself when no context can speak any more. Text that ends with no
+//     audio is a retryable error, not a done. A done that arrives while
+//     speakable text written to the context is still unanswered means Cartesia
+//     ended the context before speaking it: whether it will be heard is
+//     unknown, so the utterance fails with a retryable error and nothing is
+//     re-sent.
+//   - A socket Cartesia closes while no context can speak is replaced by the
+//     next fragment, which was certainly not sent. A socket that closes while
+//     a context can speak, or while a frame is being written, fails the
+//     session with a retryable error.
 type stream struct {
 	dial   func(context.Context) (*websocket.Conn, string, error)
+	now    func() time.Time
 	ctx    context.Context
 	cancel context.CancelFunc
 	events chan runtimepkg.ProviderEvent
-	// eventsMu lets the writer side emit (a commit that finishes an expired
-	// utterance) while a reader may close events: emitters hold it shared,
+	// eventsMu lets the writer side emit (a commit that ends an utterance
+	// locally) while a reader may close events: emitters hold it shared,
 	// finish holds it exclusively after cancelling ctx.
 	eventsMu     sync.RWMutex
 	eventsClosed bool
@@ -282,6 +329,8 @@ type stream struct {
 	// settings are the caller's provider_options.cartesia, sent on every
 	// generation of every context; the zero value leaves vendor defaults.
 	settings ttsSettings
+	// bufferDelay is how long Cartesia may hold a fragment before speaking it.
+	bufferDelay time.Duration
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -294,25 +343,55 @@ type stream struct {
 	// conn is nil after Cartesia closed an idle socket, until the next
 	// fragment dials again.
 	conn *websocket.Conn
-	// contextID is the live Cartesia context; contextDone closes when it
-	// ends. contextSent records that Cartesia has seen it, which is what
-	// makes a lost socket lose speech.
-	contextID     string
-	contextDone   chan struct{}
-	contextCommit bool
-	contextCancel bool
-	contextSent   bool
-	// utterance is the caller's utterance, which outlives a context Cartesia
-	// expired; lastContextID names that expired context for the done event.
-	utterance     bool
-	lastContextID string
-	audioStarted  bool
-	// audioBytes counts the utterance's audio so far; timeOffset is where
-	// the live context's own clock starts within the utterance, in seconds.
-	audioBytes        int
-	timeOffset        float64
+	// writing is set, before the I/O, while a frame is being written;
+	// lostWhileWriting records that the socket ended meanwhile, so the writer
+	// reports an unknown outcome instead of the reader calling it idle.
+	writing          bool
+	lostWhileWriting bool
+	utterance        *utterance
+	droppedFrames    int
+
 	providerRequestID string
 }
+
+// utterance is the caller's utterance, from its first fragment until it ends.
+type utterance struct {
+	// current is the context it speaks through; nil once that context ended
+	// or was abandoned, until the next fragment opens another.
+	current       *vendorContext
+	lastContextID string
+	committed     bool
+	text          bool
+	audioStarted  bool
+	audioBytes    int
+}
+
+type vendorContext struct {
+	id string
+	// done closes when the context can no longer speak.
+	done chan struct{}
+	// offset is the utterance audio before this context, in seconds.
+	offset    float64
+	committed bool
+	cancelled bool
+	// pendingSpeech: speakable text was written and neither audio nor
+	// flush_done has arrived since.
+	pendingSpeech bool
+	lastFragment  time.Time
+	lastAnswer    time.Time
+}
+
+const (
+	// quietGap is how long a context may go without audio, flush_done or a
+	// fragment before it is no longer written. The shortest expiry measured
+	// was 3.9 s after the last audio chunk. If Cartesia ever expires a context
+	// sooner (its docs say 1 s after the last audio output), a fragment written
+	// to it is caught as unanswered speech and fails retryably; it is never
+	// emitted in the wrong utterance.
+	quietGap = 2 * time.Second
+	// defaultBufferDelay is Cartesia's documented max_buffer_delay_ms default.
+	defaultBufferDelay = 3 * time.Second
+)
 
 func (s *stream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
 
@@ -320,71 +399,70 @@ func (s *stream) WriteAudio(context.Context, []byte) error { return runtimepkg.E
 
 func (s *stream) CommitAudio(context.Context) error { return runtimepkg.ErrUnsupportedOperation }
 
-// AppendText starts or continues the current Cartesia context. It deliberately
-// sets continue=true until CommitText supplies the explicit utterance boundary.
+// AppendText speaks a fragment of the open utterance, opening one if needed.
+// It sets continue=true until CommitText supplies the utterance boundary.
 func (s *stream) AppendText(ctx context.Context, text string) error {
 	// A streaming LLM may emit word separators as their own chunks. Preserve
 	// them exactly: trimming or rejecting them breaks valid streamed speech.
 	if text == "" {
 		return errors.New("cartesia transcript is empty")
 	}
-	contextID, fresh, err := s.startOrCurrentContext()
-	if err != nil {
-		return err
-	}
-	request := s.generationRequest(contextID, text, true)
-	err = s.writeJSON(ctx, request)
-	if err != nil && fresh && ctx.Err() == nil && !errors.Is(err, runtimepkg.ErrSessionClosed) {
-		// Cartesia has seen nothing of a fresh context, so the socket it
-		// could not reach is replaced without losing speech.
-		if err = s.redial(ctx); err == nil {
-			err = s.writeJSON(ctx, request)
+	for attempt := 0; ; attempt++ {
+		contextID, conn, err := s.beginFragment(text)
+		if err != nil {
+			return err
+		}
+		if conn != nil {
+			return s.send(ctx, conn, s.generationRequest(contextID, text, true))
+		}
+		// Cartesia closed an idle socket: this fragment was certainly not
+		// sent, so it goes out on a new one.
+		if attempt > 0 {
+			return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia streaming connection is closed", Retryable: true}
+		}
+		if err := s.redial(ctx); err != nil {
+			return err
 		}
 	}
-	if err != nil {
-		s.finishContext(contextID)
-		return err
-	}
-	s.markContextSent(contextID)
-	return nil
 }
 
-// CommitText finalizes the active context without appending another transcript
-// fragment, matching Cartesia's documented continuation protocol. When
-// Cartesia already expired the utterance's context, all of its audio has been
-// delivered, so the utterance finishes here without a vendor frame.
+// CommitText ends the open utterance. It finalizes the utterance's context,
+// or ends the utterance here when no context of it can speak any more.
+// With no utterance to end it returns runtime.ErrNothingToCommit and the
+// session goes on.
 func (s *stream) CommitText(ctx context.Context) error {
-	contextID, finished, err := s.commitContext()
-	if err != nil {
+	contextID, conn, ended, noAudio, err := s.beginCommit()
+	switch {
+	case err != nil:
 		return err
-	}
-	if finished {
+	case !ended:
+		return s.send(ctx, conn, s.generationRequest(contextID, "", false))
+	case noAudio:
+		return noAudioError()
+	default:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.contextData(contextID)})
 	}
-	if err := s.writeJSON(ctx, s.generationRequest(contextID, "", false)); err != nil {
-		s.finishContext(contextID)
-		return err
-	}
-	return nil
 }
 
-// Cancel requests Cartesia to cancel queued work for the active context. The
-// provider documents that currently generating audio can continue, so callers
-// must still await its terminal event or close the session.
+// Cancel requests Cartesia to cancel queued work for the utterance's context.
+// The provider documents that currently generating audio can continue, so
+// callers must still await its terminal event or close the session. An
+// utterance with no context left ends here.
 func (s *stream) Cancel(ctx context.Context) error {
-	contextID, live, finished := s.cancelContext()
-	if finished {
+	contextID, conn, ended, err := s.beginCancel()
+	switch {
+	case err != nil:
+		return err
+	case ended:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.contextData(contextID)})
+	default:
+		return s.send(ctx, conn, map[string]any{"context_id": contextID, "cancel": true})
 	}
-	if !live {
-		return runtimepkg.ErrSessionClosed
-	}
-	return s.writeJSON(ctx, map[string]any{"context_id": contextID, "cancel": true})
 }
 
-// Close waits for the active context's done response before closing the
-// socket, preserving final audio when an application gracefully closes right
-// after text.commit.
+// Close waits for the utterance's context, while it can still speak, before
+// closing the socket, preserving final audio when an application gracefully
+// closes right after text.commit.
 func (s *stream) Close(ctx context.Context) error {
 	s.gracefulOnce.Do(func() {
 		s.closing.Store(true)
@@ -426,7 +504,9 @@ func (s *stream) abort() error {
 		if err := conn.CloseNow(); err != nil && s.closeErr == nil {
 			s.closeErr = err
 		}
-		s.finishContext("")
+		s.stateMu.Lock()
+		s.endUtteranceLocked()
+		s.stateMu.Unlock()
 	})
 	return s.closeErr
 }
@@ -437,7 +517,9 @@ func (s *stream) abort() error {
 func (s *stream) finish() {
 	s.finishOnce.Do(func() {
 		s.cancel()
-		s.finishContext("")
+		s.stateMu.Lock()
+		s.endUtteranceLocked()
+		s.stateMu.Unlock()
 		s.eventsMu.Lock()
 		s.eventsClosed = true
 		close(s.events)
@@ -451,8 +533,8 @@ func (s *stream) currentConn() *websocket.Conn {
 	return s.conn
 }
 
-// redial replaces the socket. The caller guarantees no context is in flight
-// on the old one; its reader sees it was replaced and exits quietly.
+// redial replaces a socket Cartesia closed while nothing was in flight; the
+// old socket's reader sees it was replaced and exits quietly.
 func (s *stream) redial(ctx context.Context) error {
 	s.stateMu.Lock()
 	if s.closed.Load() || s.closing.Load() {
@@ -484,166 +566,260 @@ func (s *stream) redial(ctx context.Context) error {
 	return nil
 }
 
-// startOrCurrentContext returns the live context, or opens a fresh one —
-// for a new utterance, or to continue one whose context Cartesia expired.
-func (s *stream) startOrCurrentContext() (contextID string, fresh bool, err error) {
+// beginFragment picks the context a fragment goes to and marks the write in
+// progress before any I/O. A nil conn without an error means Cartesia closed
+// the idle socket and nothing was marked.
+func (s *stream) beginFragment(text string) (contextID string, conn *websocket.Conn, err error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if s.closed.Load() || s.closing.Load() {
-		return "", false, runtimepkg.ErrSessionClosed
+		return "", nil, runtimepkg.ErrSessionClosed
 	}
-	if s.contextID != "" {
-		if s.contextCommit {
-			return "", false, errors.New("cartesia previous utterance has not completed")
+	if s.conn == nil {
+		return "", nil, nil
+	}
+	u := s.utterance
+	if u == nil {
+		u = &utterance{}
+		s.utterance = u
+	} else if u.committed {
+		return "", nil, errors.New("cartesia previous utterance has not completed")
+	}
+	now := s.now()
+	if u.current != nil && s.quietLocked(u.current, now) {
+		s.abandonLocked(u)
+	}
+	if u.current == nil {
+		if err := s.openContextLocked(u); err != nil {
+			return "", nil, err
 		}
-		return s.contextID, false, nil
 	}
-	contextID, err = newContextID()
-	if err != nil {
-		return "", false, err
+	c := u.current
+	c.lastFragment = now
+	u.text = true
+	if speakable(text) {
+		c.pendingSpeech = true
 	}
-	if !s.utterance {
-		s.utterance = true
-		s.audioStarted = false
-		s.audioBytes = 0
-	}
-	s.contextID = contextID
-	s.contextDone = make(chan struct{})
-	s.contextCommit = false
-	s.contextCancel = false
-	s.contextSent = false
-	// A fresh context's timestamps start at zero; within a continued
-	// utterance they start after the audio already sent (pcm_s16le mono).
-	s.timeOffset = 0
-	if s.media.SampleRateHz > 0 {
-		s.timeOffset = float64(s.audioBytes) / float64(2*s.media.SampleRateHz)
-	}
-	return contextID, true, nil
+	s.writing, s.lostWhileWriting = true, false
+	return c.id, s.conn, nil
 }
 
-// commitContext marks the live context committed. With no live context but
-// an open utterance, Cartesia expired the context after its last audio, so the
-// utterance ends here (finished) and names that context for the done event.
-func (s *stream) commitContext() (contextID string, finished bool, err error) {
+// beginCommit marks the utterance committed. ended reports that it ended
+// here, with no context left to finalize; otherwise the write of the final
+// frame is marked in progress.
+func (s *stream) beginCommit() (contextID string, conn *websocket.Conn, ended, noAudio bool, err error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if s.closed.Load() || s.closing.Load() {
-		return "", false, runtimepkg.ErrSessionClosed
+		return "", nil, false, false, runtimepkg.ErrSessionClosed
 	}
-	if s.contextID == "" && s.utterance {
-		contextID = s.lastContextID
+	u := s.utterance
+	if u == nil || u.committed {
+		return "", nil, false, false, runtimepkg.ErrNothingToCommit
+	}
+	u.committed = true
+	if u.current != nil && (s.conn == nil || s.quietLocked(u.current, s.now())) {
+		s.abandonLocked(u)
+	}
+	if u.current == nil {
+		contextID, noAudio = u.lastContextID, u.text && u.audioBytes == 0
 		s.endUtteranceLocked()
-		return contextID, true, nil
+		return contextID, nil, true, noAudio, nil
 	}
-	if s.contextID == "" || s.contextCommit {
-		return "", false, runtimepkg.ErrSessionClosed
-	}
-	s.contextCommit = true
-	return s.contextID, false, nil
+	u.current.committed = true
+	s.writing, s.lostWhileWriting = true, false
+	return u.current.id, s.conn, false, false, nil
 }
 
-// cancelContext marks the live context cancelled, or ends an utterance whose
-// context Cartesia already expired (finished).
-func (s *stream) cancelContext() (contextID string, live, finished bool) {
+func (s *stream) beginCancel() (contextID string, conn *websocket.Conn, ended bool, err error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if s.contextID != "" {
-		s.contextCancel = true
-		return s.contextID, true, false
+	if s.closed.Load() || s.closing.Load() {
+		return "", nil, false, runtimepkg.ErrSessionClosed
 	}
-	if s.utterance {
-		contextID = s.lastContextID
+	u := s.utterance
+	if u == nil {
+		return "", nil, false, runtimepkg.ErrSessionClosed
+	}
+	if u.current != nil && (s.conn == nil || s.quietLocked(u.current, s.now())) {
+		s.abandonLocked(u)
+	}
+	if u.current == nil {
+		contextID = u.lastContextID
 		s.endUtteranceLocked()
-		return contextID, false, true
+		return contextID, nil, true, nil
 	}
-	return "", false, false
+	u.current.cancelled = true
+	s.writing, s.lostWhileWriting = true, false
+	return u.current.id, s.conn, false, nil
 }
 
-func (s *stream) markContextSent(contextID string) {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	if s.contextID == contextID {
-		s.contextSent = true
+// send writes one frame whose write was marked in progress. When the socket
+// fails around the write, Cartesia may or may not have the frame, so the
+// outcome is reported as unknown and nothing is re-sent.
+func (s *stream) send(ctx context.Context, conn *websocket.Conn, value any) error {
+	payload, err := json.Marshal(value)
+	if err == nil {
+		s.writeMu.Lock()
+		err = conn.Write(ctx, websocket.MessageText, payload)
+		s.writeMu.Unlock()
+		if err != nil {
+			err = unknownSendError(err)
+		}
 	}
+	s.stateMu.Lock()
+	lost := s.lostWhileWriting
+	s.writing, s.lostWhileWriting = false, false
+	s.stateMu.Unlock()
+	if err == nil && lost {
+		err = unknownSendError(nil)
+	}
+	return err
 }
 
-func (s *stream) activeDone() <-chan struct{} {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	return s.contextDone
-}
-
-// finishContext ends the live context and the utterance; an empty id ends
-// whatever is open. It reports false for a context that is not live.
-func (s *stream) finishContext(contextID string) bool {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	if contextID != "" && s.contextID != contextID {
+// quietLocked reports whether a context may be expiring: it owes no speech
+// and has heard nothing for quietGap, nor a fragment for the buffer delay.
+func (s *stream) quietLocked(c *vendorContext, now time.Time) bool {
+	if c.committed || c.cancelled || c.pendingSpeech {
 		return false
 	}
-	s.endUtteranceLocked()
-	return true
+	last := c.lastFragment
+	if c.lastAnswer.After(last) {
+		last = c.lastAnswer
+	}
+	return now.Sub(last) > quietGap && now.Sub(c.lastFragment) > s.bufferDelay
 }
 
-func (s *stream) isLiveContext(contextID string) bool {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	return s.contextID == contextID
+func (s *stream) openContextLocked(u *utterance) error {
+	id, err := newContextID()
+	if err != nil {
+		return err
+	}
+	c := &vendorContext{id: id, done: make(chan struct{})}
+	// A context's timestamps start at zero; within an utterance they start
+	// after the audio already sent (pcm_s16le mono).
+	if s.media.SampleRateHz > 0 {
+		c.offset = float64(u.audioBytes) / float64(2*s.media.SampleRateHz)
+	}
+	u.current, u.lastContextID = c, id
+	return nil
+}
+
+// abandonLocked stops writing to the utterance's context and stops accepting
+// its frames; the utterance stays open.
+func (s *stream) abandonLocked(u *utterance) {
+	close(u.current.done)
+	u.current = nil
 }
 
 func (s *stream) endUtteranceLocked() {
-	if s.contextDone != nil {
-		close(s.contextDone)
+	if s.utterance != nil && s.utterance.current != nil {
+		close(s.utterance.current.done)
 	}
-	s.contextID = ""
-	s.contextDone = nil
-	s.contextCommit = false
-	s.contextCancel = false
-	s.contextSent = false
-	s.utterance = false
-	s.lastContextID = ""
-	s.audioStarted = false
+	s.utterance = nil
 }
 
-// expireContext reports whether a done frame is Cartesia expiring a context
-// the caller has not finished. That context ends; the utterance stays open.
-func (s *stream) expireContext(contextID string) bool {
+// activeDone returns the done channel of a context that can still speak.
+func (s *stream) activeDone() <-chan struct{} {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if contextID == "" || contextID != s.contextID || s.contextCommit || s.contextCancel || s.closing.Load() {
-		return false
+	if s.utterance == nil || s.utterance.current == nil || s.quietLocked(s.utterance.current, s.now()) {
+		return nil
 	}
-	close(s.contextDone)
-	s.lastContextID = contextID
-	s.contextID = ""
-	s.contextDone = nil
-	s.contextSent = false
-	return true
+	return s.utterance.current.done
 }
 
-// observeAudio counts the live context's audio and reports whether it starts
-// the utterance's audio.
-func (s *stream) observeAudio(contextID string, bytes int) bool {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	if s.contextID != contextID {
-		return false
+// acceptLocked reports whether a frame belongs to the open utterance's
+// current context, and returns both.
+func (s *stream) acceptLocked(contextID string) (*utterance, *vendorContext, bool) {
+	u := s.utterance
+	if u == nil || u.current == nil || contextID == "" || u.current.id != contextID {
+		return nil, nil, false
 	}
-	s.audioBytes += bytes
-	if s.audioStarted {
-		return false
-	}
-	s.audioStarted = true
-	return true
+	return u, u.current, true
 }
 
-func (s *stream) contextTimeOffset(contextID string) float64 {
+// acceptAudio takes an audio chunk for the current context; started reports
+// the utterance's first audio.
+func (s *stream) acceptAudio(contextID string, bytes int) (accepted, started bool) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if contextID != s.contextID {
-		return 0
+	u, c, ok := s.acceptLocked(contextID)
+	if !ok {
+		return false, false
 	}
-	return s.timeOffset
+	c.pendingSpeech, c.lastAnswer = false, s.now()
+	u.audioBytes += bytes
+	started = !u.audioStarted
+	u.audioStarted = true
+	return true, started
+}
+
+func (s *stream) acceptFlush(contextID string) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	_, c, ok := s.acceptLocked(contextID)
+	if ok {
+		c.pendingSpeech, c.lastAnswer = false, s.now()
+	}
+	return ok
+}
+
+func (s *stream) acceptTimestamps(contextID string) (offset float64, ok bool) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	_, c, ok := s.acceptLocked(contextID)
+	if !ok {
+		return 0, false
+	}
+	return c.offset, true
+}
+
+type doneOutcome int
+
+const (
+	doneDropped doneOutcome = iota
+	// doneExpired: Cartesia expired an idle context; the utterance goes on.
+	doneExpired
+	doneFinished
+	doneNoAudio
+	// doneUnknown: the context ended with speakable text unanswered.
+	doneUnknown
+)
+
+func (s *stream) acceptDone(contextID string) doneOutcome {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	u, c, ok := s.acceptLocked(contextID)
+	switch {
+	case !ok:
+		return doneDropped
+	case c.cancelled:
+		s.endUtteranceLocked()
+		return doneFinished
+	case c.pendingSpeech:
+		s.endUtteranceLocked()
+		return doneUnknown
+	case c.committed || s.closing.Load():
+		noAudio := c.committed && u.text && u.audioBytes == 0
+		s.endUtteranceLocked()
+		if noAudio {
+			return doneNoAudio
+		}
+		return doneFinished
+	default:
+		s.abandonLocked(u)
+		return doneExpired
+	}
+}
+
+// ownsCurrent reports whether a frame names the open utterance's current
+// context.
+func (s *stream) ownsCurrent(contextID string) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	_, _, ok := s.acceptLocked(contextID)
+	return ok
 }
 
 func (s *stream) generationRequest(contextID, transcript string, continuation bool) generation {
@@ -666,26 +842,6 @@ func (s *stream) generationRequest(contextID, transcript string, continuation bo
 	}
 }
 
-func (s *stream) writeJSON(ctx context.Context, value any) error {
-	payload, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	if s.closed.Load() {
-		return runtimepkg.ErrSessionClosed
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	conn := s.currentConn()
-	if conn == nil {
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia streaming connection is closed", Retryable: true}
-	}
-	if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia streaming write failed", Retryable: true, Cause: err}
-	}
-	return nil
-}
-
 // readLoop reads one socket until it ends.
 func (s *stream) readLoop(conn *websocket.Conn) {
 	for {
@@ -706,25 +862,38 @@ func (s *stream) readLoop(conn *websocket.Conn) {
 }
 
 // socketEnded decides what a closed socket means. Our own close ends the
-// stream quietly; a socket already replaced by redial means nothing; Cartesia
-// closing a socket with no context in flight leaves the stream waiting for
-// the next fragment to dial again; and with a context in flight the speech is
-// lost, so the stream fails with a retryable error.
+// stream quietly; a socket already replaced by redial means nothing; a socket
+// lost while a frame was being written is the writer's to report; one lost
+// while the utterance's context can still speak fails the stream with a
+// retryable error; and otherwise the next fragment dials again.
 func (s *stream) socketEnded(conn *websocket.Conn, err error) {
 	s.stateMu.Lock()
 	if s.conn != conn {
 		s.stateMu.Unlock()
 		return
 	}
-	ours := s.closed.Load() || s.ctx.Err() != nil
-	inFlight := s.contextID != "" && s.contextSent
-	if !ours && !inFlight && !s.closing.Load() {
+	if s.closed.Load() || s.ctx.Err() != nil {
+		s.stateMu.Unlock()
+		s.finish()
+		return
+	}
+	if s.writing {
+		s.conn, s.lostWhileWriting = nil, true
+		s.stateMu.Unlock()
+		return
+	}
+	u := s.utterance
+	canSpeak := u != nil && u.current != nil && !s.quietLocked(u.current, s.now())
+	if !canSpeak && !s.closing.Load() {
+		if u != nil && u.current != nil {
+			s.abandonLocked(u)
+		}
 		s.conn = nil
 		s.stateMu.Unlock()
 		return
 	}
 	s.stateMu.Unlock()
-	if !ours && inFlight {
+	if canSpeak {
 		_ = s.emit(runtimepkg.ProviderEvent{Err: &runtimepkg.ProviderError{
 			Code:      "provider_unavailable",
 			Message:   "Cartesia closed the stream mid-utterance",
@@ -753,32 +922,45 @@ func (s *stream) handleMessage(payload []byte) error {
 		if err != nil {
 			return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia sent invalid audio data", Retryable: true, Cause: err}
 		}
-		if s.observeAudio(message.ContextID, len(audio)) {
+		accepted, started := s.acceptAudio(message.ContextID, len(audio))
+		if !accepted {
+			return s.emitDropped(message, raw)
+		}
+		if started {
 			if err := s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioStarted, Data: s.contextData(message.ContextID), Extensions: extension(raw)}); err != nil {
 				return err
 			}
 		}
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: s.contextData(message.ContextID), Extensions: extension(raw), Audio: audio})
 	case "timestamps":
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAlignment, Data: s.alignmentData(message.ContextID, message.WordTimestamps), Extensions: extension(raw)})
-	case "done":
-		if s.expireContext(message.ContextID) {
-			return nil
+		offset, ok := s.acceptTimestamps(message.ContextID)
+		if !ok {
+			return s.emitDropped(message, raw)
 		}
-		if !s.finishContext(message.ContextID) {
-			// A context Cartesia re-created for a fragment that crossed its
-			// expiry ends again; the utterance was already closed.
-			return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, message.Type), Extensions: extension(raw)})
-		}
-		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.contextData(message.ContextID), Extensions: extension(raw)})
+		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAlignment, Data: s.alignmentData(message.ContextID, message.WordTimestamps, offset), Extensions: extension(raw)})
 	case "flush_done":
+		if !s.acceptFlush(message.ContextID) {
+			return s.emitDropped(message, raw)
+		}
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, "flush_done"), Extensions: extension(raw)})
+	case "done":
+		switch s.acceptDone(message.ContextID) {
+		case doneDropped:
+			return s.emitDropped(message, raw)
+		case doneExpired:
+			return nil
+		case doneUnknown:
+			return unknownSpeechError()
+		case doneNoAudio:
+			return noAudioError()
+		default:
+			return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.contextData(message.ContextID), Extensions: extension(raw)})
+		}
 	case "error":
-		if message.ContextID != "" && !s.isLiveContext(message.ContextID) {
-			// Cartesia answers input that reached a context after it expired —
-			// a commit crossing the expiry done gets 400 "Invalid transcript" —
-			// once that context already ended with all of its audio delivered.
-			return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, message.Type), Extensions: extension(raw)})
+		if message.ContextID != "" && !s.ownsCurrent(message.ContextID) {
+			// Cartesia answers input that reached a context after it ended —
+			// a commit crossing the expiry done gets 400 "Invalid transcript".
+			return s.emitDropped(message, raw)
 		}
 		if message.StatusCode == http.StatusBadRequest && (isUnsupportedLanguage(message.Message) || isUnsupportedLanguage(errorText(message.Error))) {
 			return &runtimepkg.ProviderError{
@@ -795,6 +977,56 @@ func (s *stream) handleMessage(payload []byte) error {
 		return &runtimepkg.ProviderError{Code: cartesiaErrorCode(message.StatusCode), Message: cartesiaErrorMessage(message.Message), Retryable: message.StatusCode >= 500, ProviderStatus: message.StatusCode, Extensions: extension(raw)}
 	default:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, message.Type), Extensions: extension(raw)})
+	}
+}
+
+// emitDropped reports a frame for a context that is not the open utterance's
+// current one. It carries the running count of dropped frames.
+func (s *stream) emitDropped(message inbound, raw json.RawMessage) error {
+	s.stateMu.Lock()
+	s.droppedFrames++
+	count := s.droppedFrames
+	s.stateMu.Unlock()
+	data := marshalData(map[string]any{"context_id": message.ContextID, "provider_type": message.Type, "provider_request_id": s.currentProviderRequestID(), "dropped": true, "dropped_frames": count})
+	return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: data, Extensions: extension(raw)})
+}
+
+// speakable reports whether text has anything Cartesia voices: a letter or a
+// digit. Separators and punctuation alone may produce no audio at all.
+func speakable(text string) bool {
+	for _, r := range text {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func unknownSendError(cause error) *runtimepkg.ProviderError {
+	return &runtimepkg.ProviderError{
+		Code:      "provider_unavailable",
+		Message:   "Cartesia connection failed while a frame was being sent; whether Cartesia received it is unknown",
+		Hint:      "The provider connection failed while sending this utterance; retry the utterance on a new session.",
+		Retryable: true,
+		Cause:     cause,
+	}
+}
+
+func unknownSpeechError() *runtimepkg.ProviderError {
+	return &runtimepkg.ProviderError{
+		Code:      "provider_unavailable",
+		Message:   "Cartesia ended the context before speaking text written to it; whether it will be heard is unknown",
+		Hint:      "Retry the utterance on a new session.",
+		Retryable: true,
+	}
+}
+
+func noAudioError() *runtimepkg.ProviderError {
+	return &runtimepkg.ProviderError{
+		Code:      "provider_unavailable",
+		Message:   "Cartesia produced no audio for the utterance",
+		Hint:      "No audio was produced for this utterance; retry it, and check that it contains speakable text.",
+		Retryable: true,
 	}
 }
 
@@ -885,7 +1117,7 @@ func (s *stream) contextData(contextID string) json.RawMessage {
 // Each Cartesia context starts its clock at zero, so the spans of a context
 // that continues an utterance after an expired one are shifted by the audio
 // already sent; the raw block keeps Cartesia's own clock.
-func (s *stream) alignmentData(contextID string, timestamps json.RawMessage) json.RawMessage {
+func (s *stream) alignmentData(contextID string, timestamps json.RawMessage, offset float64) json.RawMessage {
 	payload := map[string]any{"context_id": contextID, "word_timestamps": timestamps, "provider_request_id": s.currentProviderRequestID()}
 	var block struct {
 		Words []string  `json:"words"`
@@ -893,7 +1125,7 @@ func (s *stream) alignmentData(contextID string, timestamps json.RawMessage) jso
 		End   []float64 `json:"end"`
 	}
 	if err := json.Unmarshal(timestamps, &block); err == nil {
-		if offset := s.contextTimeOffset(contextID); offset > 0 {
+		if offset > 0 {
 			for index := range block.Start {
 				block.Start[index] += offset
 			}
