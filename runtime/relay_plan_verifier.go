@@ -52,7 +52,7 @@ func NewRelayPlanVerifier(config PlanVerifierConfig) (*RelayPlanVerifier, error)
 // With PassthroughReplayCache the final step always accepts and the caller
 // owns replay protection; see the type comment for the connector contract.
 func (v *RelayPlanVerifier) Verify(ctx context.Context, plan protocol.RelayPlan) error {
-	now := v.keys.config.Now().UTC()
+	now := v.keys.admissionNow()
 	if err := plan.Validate(now); err != nil {
 		return fmt.Errorf("%w: plan validation: %v", ErrPlanSignature, err)
 	}

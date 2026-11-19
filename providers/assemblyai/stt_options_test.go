@@ -147,6 +147,44 @@ func TestStreamEndpointCarriesRealtimeAgentModelAndMode(t *testing.T) {
 	}
 }
 
+// 3.7 with no caller mode is served the way the benchmark measured it:
+// min_latency. A caller's own mode or turn timing wins, and other models keep
+// the vendor default.
+func TestStreamEndpointDefaultsRealtimeAgentToMinLatency(t *testing.T) {
+	t.Parallel()
+	policy, err := upstream.NewWebSocketPolicy(officialAPIHost, nil, false)
+	if err != nil {
+		t.Fatalf("endpoint policy: %v", err)
+	}
+	media := protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1}
+	withSettings := func(settings map[string]any) protocol.RequestOptions {
+		return protocol.RequestOptions{STT: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"assemblyai": settings}}}
+	}
+	cases := []struct {
+		name    string
+		model   string
+		options protocol.RequestOptions
+		mode    string
+	}{
+		{"3.7 without options", RealtimeAgent37Model, protocol.RequestOptions{Language: "en"}, "min_latency"},
+		{"3.7 with unrelated options", RealtimeAgent37Model, withSettings(map[string]any{"voice_focus": "far-field"}), "min_latency"},
+		{"3.7 with the caller's mode", RealtimeAgent37Model, withSettings(map[string]any{"mode": "max_accuracy"}), "max_accuracy"},
+		{"3.7 with the caller's turn timing", RealtimeAgent37Model, withSettings(map[string]any{"max_turn_silence": 1200}), ""},
+		{"3.7 with the caller's confidence threshold", RealtimeAgent37Model, withSettings(map[string]any{"end_of_turn_confidence_threshold": 0.6}), ""},
+		{"3.6 Pro without options", universal36Model, protocol.RequestOptions{}, ""},
+	}
+	for _, tc := range cases {
+		endpoint, err := streamEndpoint(policy, "wss://streaming.assemblyai.com/v3/ws", tc.model, tc.options, media)
+		if err != nil {
+			t.Fatalf("%s: stream endpoint: %v", tc.name, err)
+		}
+		query := mustQuery(t, endpoint)
+		if got := query.Get("mode"); got != tc.mode || len(query["mode"]) > 1 {
+			t.Fatalf("%s: mode = %v, want %q", tc.name, query["mode"], tc.mode)
+		}
+	}
+}
+
 func mustQuery(t *testing.T, endpoint string) url.Values {
 	t.Helper()
 	parsed, err := url.Parse(endpoint)
