@@ -286,23 +286,30 @@ timeline. All PCM, including VAD prefixes and inference batches, is chunked to
 fit the native frame bound. Pipecat
 uses its pipeline's VAD and explicit commits.
 
-Native LiveKit TTS commits completed sentences while upstream text is still
-arriving, including CJK and Arabic sentence boundaries. Short utterances flush
-promptly, and later provider utterances remain part of the same LiveKit speech
-segment and reported assistant turn. Standalone sentences such as `Hello.`
-commit without a following token; unpunctuated input commits within 240
-characters, preferring a word boundary. Text is split without replacing literal
-strings such as `<stop>` or `<prd>`. An explicit `flush()` completes the SDK
-segment after its audio drains, even before `end_input()`.
-An ambiguous period gets the existing 300 ms lookahead, including a terminal
-street suffix `St.`. An idle commit coalesces already-buffered abbreviation
-context, so `St. Louis` and `fl. oz. of water` stay together. This also includes
-an available next-clause prefix such as `9 a.m. Please`; the adapter does not
-guess which words introduce a new sentence. Every character and separator is
-preserved, and the existing 240-character bound is unchanged. Standalone
-`Main St.` remains eligible; isolated titles such as `Dr.` and the unit prefix
-`fl.` still wait for their following word. Continuations within the lookahead
-retain decimal and domain values too.
+Native LiveKit TTS streams text at confirmed boundaries while upstream text
+continues arriving. An unambiguous sentence delimiter, observed whitespace,
+explicit `flush()`/`commit_text()`, or EOF can complete input. A pause alone
+cannot complete an unfinished word, number or domain: `Ple` may become `Please`,
+`St. Louis` may become `St. Louisville`, and `0.` may become `0.05`. Undelimited
+input now waits for a real boundary instead of flushing merely after 300 ms.
+The existing 300 ms idle lookahead remains for eligible, confirmed abbreviation
+context; it is not enlarged or used to guess the rest of a word.
+
+Every input character and separator stays intact, including literal `<stop>`
+and `<prd>` strings. The original utterance bound is 240 Python string Unicode
+code points, not UTF-8 bytes or grapheme clusters. Bounded commits split only at
+observed separators. A single undelimited unit longer than 240 code points is
+refused without retry; its invalid remainder is not flushed during cleanup.
+A complete unit of up to 240 code points still flushes on explicit completion.
+An explicit `flush()` completes the SDK segment after its audio drains, even
+before `end_input()`.
+
+For plain-text producers that must expose their delimiters immediately,
+LiveKit's existing `tts_text_transforms=[]` option preserves that whitespace.
+The SDK's default Markdown transform can retain a trailing delimiter; the
+adapter then waits for its actual subsequent boundary, flush or EOF. Default
+framework completion remains supported and retains exact post-transform text,
+PCM and canonical reporting. See [the boundary contract](../../docs/native-tts-text-boundaries.md).
 Each native utterance waits for `utterance.done` before appending the next one
 or closing the session, while incoming LLM text continues buffering. This
 supports provider adapters with one active synthesis context.

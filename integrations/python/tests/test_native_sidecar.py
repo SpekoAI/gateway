@@ -53,14 +53,15 @@ MODEL_KEY = "sk_speko_agent_" + "a" * 64
 )
 @pytest.mark.parametrize("pcm_samples", [480, 4800])
 @pytest.mark.parametrize("chunked", [False, True])
-async def test_default_livekit_tts_starts_before_text_finishes_and_preserves_later_audio(
+async def test_livekit_tts_starts_before_text_finishes_and_preserves_later_audio(
     native_binary, first, prefix, ending, first_commit, pcm_samples, chunked
 ):
     release, audible = asyncio.Event(), asyncio.Event()
     commits, captured, opened, reported = [], [], [], []
     rest = prefix + ending
-    # The SDK text transform holds trailing whitespace until the next token.
-    # Complete each buffered word, while asserting every separator at finality.
+    # This producer declares word boundaries. The public SDK transform
+    # option preserves those delimiters instead of holding trailing whitespace.
+    # Text, both PCM payloads and canonical reporting remain exact.
     first_commit = first if first_commit is None else first_commit
     assert (first + rest).startswith(first_commit)
     second_commit = (first + rest)[len(first_commit):]
@@ -158,7 +159,9 @@ async def test_default_livekit_tts_starts_before_text_finishes_and_preserves_lat
             credential_source="managed",
             standby_sessions=0,
         )
-        session = AgentSession(stt=None, llm=None, tts=model, vad=None)
+        session = AgentSession(
+            stt=None, llm=None, tts=model, vad=None, tts_text_transforms=[]
+        )
         session.on(
             "conversation_item_added",
             lambda event: reported.append(event.item.text_content)
@@ -385,14 +388,16 @@ async def test_native_tts_emits_standalone_text_while_upstream_waits(
         stream = model.stream()
 
         async def produce():
+            # Move the existing separator before the gate to declare that
+            # the first word is complete. The total input bytes are unchanged.
             if chunked:
-                for character in first:
+                for character in first + rest[:1]:
                     stream.push_text(character)
                     await asyncio.sleep(0)
             else:
-                stream.push_text(first)
+                stream.push_text(first + rest[:1])
             await release.wait()
-            stream.push_text(rest)
+            stream.push_text(rest[1:])
             stream.end_input()
 
         producer = asyncio.create_task(produce())
