@@ -219,6 +219,7 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		events:       make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		closeTimeout: sttGracefulCloseTimeout,
 		diarize:      start.EnableSpeakerDiariz,
+		translating:  start.Translation != nil,
 	}
 	stream.lastAudio.Store(time.Now().UnixNano())
 	go stream.readLoop()
@@ -335,6 +336,9 @@ type sttStream struct {
 	// speakers, so transcript events carry the labels. A session that did
 	// not ask emits the same bytes it always did.
 	diarize bool
+	// translating is set once at Open: the start frame asked Soniox for its
+	// own translation. Such a session is never cut (cutLongSegment).
+	translating bool
 
 	// Read-loop owned; never touched by the write side.
 	segment sttSegment
@@ -762,7 +766,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 		}
 	}
 
-	if s.diarize {
+	if s.diarize && !s.translating {
 		if err := s.cutLongSegment(raw); err != nil {
 			return err
 		}
@@ -827,7 +831,10 @@ func (s *sttStream) flushSegment(raw json.RawMessage) error {
 // A diarized segment's finalized part is cut once it spans more than
 // sttCutAudioMS of audio or sttCutCharacters characters, so that a long talk
 // without an endpoint does not resend an ever longer hypothesis on every
-// delta (docs/PROTOCOL.md). A session without diarization is never cut.
+// delta (docs/PROTOCOL.md). A session without diarization is never cut, and
+// neither is one with Soniox's own translation: the translation trails the
+// words and is not aligned to them, so a prefix final would take the
+// translation of words still in the tail.
 const (
 	sttCutAudioMS    = 20_000
 	sttCutCharacters = 2_000

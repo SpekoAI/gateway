@@ -1,6 +1,8 @@
 package soniox
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -196,5 +198,80 @@ func TestSTTUndiarizedLongStretchIsNotCut(t *testing.T) {
 	_, events := runSTTScriptUntil(t, sttAdapterRequest, frames, untilSpeechEnded)
 	if finals := countEvents(events, protocol.EventTranscriptFinal); finals != 1 {
 		t.Fatalf("got %d finals, want only the endpoint's", finals)
+	}
+}
+
+// translatingRequest is a diarized session that also asked Soniox for its
+// own one-way translation.
+func translatingRequest(serverURL string) runtimepkg.AdapterRequest {
+	request := diarizedRequest(serverURL)
+	request.Options.STT.Translation = &protocol.SttTranslation{TargetLanguage: "es"}
+	return request
+}
+
+// withTranslation turns a longStretch into a translating session's frames:
+// every original piece is marked as such, and each word's first piece is
+// followed by its final translated token " tN", as Soniox interleaves them.
+func withTranslation(frames []map[string]any) []map[string]any {
+	var out []map[string]any
+	for _, frame := range frames {
+		var tokens []map[string]any
+		for _, item := range frame["tokens"].([]any) {
+			token := item.(map[string]any)
+			text := token["text"].(string)
+			if text == "<end>" {
+				tokens = append(tokens, token)
+				continue
+			}
+			original := map[string]any{"translation_status": "original", "language": "en"}
+			for key, value := range token {
+				original[key] = value
+			}
+			tokens = append(tokens, original)
+			if word, isWord := strings.CutPrefix(text, " w"); isWord && token["is_final"] == true {
+				tokens = append(tokens, map[string]any{"text": " t" + word, "is_final": true, "language": "es", "source_language": "en", "translation_status": "translation"})
+			}
+		}
+		out = append(out, sonioxFrame(tokens...))
+	}
+	return out
+}
+
+// eventDigest is the SHA-256 of every event's type and data bytes, in order.
+func eventDigest(events []runtimepkg.ProviderEvent) string {
+	hash := sha256.New()
+	for _, event := range events {
+		hash.Write([]byte(event.Type))
+		hash.Write([]byte{'\n'})
+		hash.Write(event.Data)
+		hash.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// With Soniox's own translation on, a forced cut would hand the prefix the
+// translation of words still in the tail, so a diarized session that
+// translates is never cut: one final at the endpoint, and every event byte
+// for byte what it was before cutting existed. The digest was recorded on
+// the adapter as it stood before the cut (e8ee7d3).
+func TestSTTDiarizedTranslatingLongStretchIsNotCut(t *testing.T) {
+	t.Parallel()
+
+	frames, _ := longStretch(120, true)
+	_, events := runSTTScriptUntil(t, translatingRequest, withTranslation(frames), untilSpeechEnded)
+	if finals := countEvents(events, protocol.EventTranscriptFinal); finals != 1 {
+		t.Fatalf("got %d finals, want only the endpoint's", finals)
+	}
+	translated := make([]string, 120)
+	for index := range translated {
+		translated[index] = "t" + strconv.Itoa(index)
+	}
+	final := decodeTranslated(t, events[len(events)-2].Data)
+	if got, want := translationValue(final), strings.Join(translated, " "); got != want {
+		t.Errorf("final translation = %q, want every translated word: %q", got, want)
+	}
+	const before = "3f25a6d4fae9f40f3eabf97bd8a723f18a8979e0326ecb537d4f6183701f6f9d"
+	if got := eventDigest(events); got != before {
+		t.Errorf("event bytes changed: digest %s, want %s", got, before)
 	}
 }
