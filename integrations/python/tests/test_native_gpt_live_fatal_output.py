@@ -3,10 +3,8 @@ import base64
 import json
 
 import pytest
-from livekit.agents import llm
-
 from aiohttp import web
-from livekit.agents import AgentSession
+from livekit.agents import AgentSession, llm
 from livekit.agents.voice import io
 from test_native_gpt_live import models
 from test_native_realtime_cancellation import start_agent
@@ -15,12 +13,27 @@ from test_native_sidecar import native_stack
 
 
 @pytest.mark.skipif(not hasattr(llm, "DuplexModel"), reason="SDK predates duplex")
+@pytest.mark.parametrize("failure_at", ["ingress", "segmenter"])
 async def test_buffered_output_after_fatal_cannot_start_an_sdk_generation(
-    native_binary,
+    native_binary, monkeypatch, failure_at
 ):
     asked = asyncio.Event()
     closed = asyncio.Event()
     captured = []
+    release_audio = asyncio.Event()
+    if failure_at == "ingress":
+        from speko_gateway._livekit_gpt_live import _GPTLiveSession
+
+        original_audio = _GPTLiveSession._live_audio
+
+        async def held_audio(session):
+            # Retain real queued PCM until the independent ingress failure has
+            # closed the physical stream. No synthetic generation is injected.
+            await release_audio.wait()
+            async for frame in original_audio(session):
+                yield frame
+
+        monkeypatch.setattr(_GPTLiveSession, "_live_audio", held_audio)
 
     class Output(io.AudioOutput):
         def __init__(self):
@@ -59,14 +72,15 @@ async def test_buffered_output_after_fatal_cannot_start_an_sdk_generation(
                             "delta": base64.b64encode(b"\x01\x10" * 2400).decode(),
                         }
                     )
-                    await ws.send_json(
-                        {
-                            "type": "session.input_transcript.delta",
-                            "delta": "NEW_CALLER",
-                            "start_ms": 0,
-                            "end_ms": 100,
-                        }
-                    )
+                    if failure_at == "ingress":
+                        await ws.send_json(
+                            {
+                                "type": "session.input_transcript.delta",
+                                "delta": "NEW_CALLER",
+                                "start_ms": 0,
+                                "end_ms": 100,
+                            }
+                        )
         finally:
             closed.set()
         return ws
@@ -90,17 +104,37 @@ async def test_buffered_output_after_fatal_cannot_start_an_sdk_generation(
                 ),
             )
             actor.on("speech_created", speech_events.append)
+            if failure_at == "segmenter":
+                original_update = native._inner._gate.update
+
+                def fail_at_actual_segmenter(frame):
+                    native.duplex_session._fatal()
+                    return original_update(frame)
+
+                monkeypatch.setattr(
+                    native._inner._gate, "update", fail_at_actual_segmenter
+                )
             speech = actor.generate_reply(user_input="TYPED")
             await asyncio.wait_for(asked.wait(), 5)
             await asyncio.wait_for(closed.wait(), 5)
+            release_audio.set()
             await asyncio.wait_for(speech.wait_for_playout(), 5)
+            await asyncio.wait_for(asyncio.shield(native._inner._segment_atask), 5)
             assert speech.exception() is not None
             assert native.duplex_session._failure is not None
-            assert not inner_generations
+            if failure_at == "ingress":
+                assert not inner_generations
+            assert not captured
+            assert len(speech_events) == 1
+            assert all(
+                getattr(item, "role", None) != "assistant"
+                for item in actor.history.items
+            )
             assert not generations, (
                 f"emitted {generations!r}; speech_events={speech_events!r}; captured={len(captured)}"
             )
         finally:
+            release_audio.set()
             await actor.aclose()
             await model.aclose()
             await backend.aclose()

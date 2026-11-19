@@ -58,8 +58,14 @@ async def test_unsent_overflow_context_never_enters_native_or_agent_history(
             )
             native.push_audio(frame)
             await asyncio.wait_for(paused.wait(), 5)
-            for _ in range(1 if bound == "bytes" else 256):
+            for _ in range(1 if bound == "bytes" else 255):
                 native.push_audio(frame)
+            accepted = agent.chat_ctx.copy()
+            accepted.add_message(role="assistant", content="ACCEPTED_BEFORE_OVERFLOW")
+            await agent.update_chat_ctx(accepted)
+            assert "ACCEPTED_BEFORE_OVERFLOW" in str(native.chat_ctx.items)
+            assert "ACCEPTED_BEFORE_OVERFLOW" in str(agent.chat_ctx.items)
+            assert native._failure is None
             old_native = str(native.chat_ctx.items)
             old_agent = str(agent.chat_ctx.items)
             old_known = set(native._known_items)

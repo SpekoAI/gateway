@@ -180,7 +180,11 @@ and tool results use detached message snapshots. Editing a shallow SDK Agent
 copy can alter the caller's own view but cannot rewrite retained backend history
 or bypass detection when submitted. Existing tool results still reach their captured rounds. This is a
 negative capability fence, not an acknowledgement or authority proof. Repeated
-genuinely unscoped replies remain supported (`None` means no new input/instructions).
+genuinely unscoped replies remain supported after genuine completion (`None` means
+no new input/instructions). If an original unscoped ask times out or is cancelled
+without correlated completion, later application asks refuse on that session.
+The original delayed delegation cannot claim a replacement future; a later
+preamble, hint retirement or elapsed time does not clear this negative fence.
 The hint contributes no instructions to backend history or tool contexts. A preamble can fulfill its
 playback future while its original 15-second application expiration remains;
 cancellation callbacks retire their own hint/timer. Hint retirement or a claimed
@@ -195,6 +199,12 @@ its tool rounds share a captured canonical context, and later delegations retain
 verified tool results. There is no automatic redial or history injection to
 bypass the missing correlation capability. These are SDK conversation rules,
 not execution or financial authority.
+After a fatal failure, queued duplex audio is refused before SDK segmentation;
+the final generation callback independently refuses a new generation. Failed
+output cannot create a later automatic SpeechHandle, playback or Agent history.
+Realtime queue admission also throws synchronously on its original byte/count
+bounds, before native or Agent context is published. Already accepted context
+is retained; unsent updates do not become accepted history.
 Long Unicode results are split losslessly into bounded native appends.
 
 GPT-Live transcript deltas remain timed fragments, not completed caller turns.

@@ -298,6 +298,9 @@ class _GPTLiveSession(_Session):
         # A negative capability fence, not an acknowledgement or source proof.
         # Retirement, preambles and claimed IDs do not drain unseen delegates.
         self._reply_hint_issued = False
+        # Expiry/cancellation cannot drain a provider's still-unseen delegation.
+        # Once that happens, no later application ask may claim its output.
+        self._unscoped_reply_retired = False
         # Ordinary input can also leave an unseen old delegation. A first
         # explicit hint is not proof that it precedes all provider work.
         self._live_input_seen = False
@@ -313,7 +316,15 @@ class _GPTLiveSession(_Session):
 
     @property
     def audio_stream(self) -> AsyncIterable:
-        return self._audio
+        return self._live_audio()
+
+    async def _live_audio(self) -> AsyncIterable:
+        async for frame in self._audio:
+            # The SDK segmenter can run after the receive loop has already
+            # failed. Queued audio must not create a new SDK generation then.
+            if self._failure is not None or self._closing:
+                break
+            yield frame
 
     @property
     def tools(self):
@@ -470,7 +481,15 @@ class _GPTLiveSession(_Session):
             raise llm.RealtimeError(_SCOPED_REPLY)
         pending = self._pending_reply_future
         if pending is not None and pending.cancelled():
+            self._unscoped_reply_retired = True
             self._retire_pending_reply(pending)
+        application = self._pending_application_reply
+        if application is not None and application.cancelled():
+            self._unscoped_reply_retired = True
+        if self._unscoped_reply_retired:
+            raise llm.RealtimeError(
+                "GPT-Live reply correlation is unavailable after retirement"
+            )
         if self._pending_reply_hint is not None:
             raise llm.RealtimeError("GPT-Live has an undelivered reply hint")
         self._update_options(tool_choice=tool_choice)
@@ -888,6 +907,9 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
         return self._inner.tools
 
     def _generation(self, generation):
+        if self.duplex_session._failure is not None or self.duplex_session._closing:
+            self._fail_reply()
+            return
         if self._reply is not None and not self._reply.done():
             # A spoken preamble can fulfil this delivery future before the
             # backend work arrives. Hint expiration is independent.
@@ -928,6 +950,11 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
         self.duplex_session._pending_application_reply = future
 
         def expire():
+            if (
+                self._reply is future
+                or self.duplex_session._pending_reply_future is future
+            ):
+                self.duplex_session._unscoped_reply_retired = True
             self.duplex_session._retire_pending_reply(future)
             if self._reply is future:
                 if not future.done():
@@ -941,6 +968,7 @@ class _GPTLiveRealtimeSession(llm.RealtimeSession):
             if self.duplex_session._pending_application_reply is done:
                 self.duplex_session._pending_application_reply = None
             if done.cancelled():
+                self.duplex_session._unscoped_reply_retired = True
                 self.duplex_session._retire_pending_reply(done)
                 if self._reply is done:
                     self._reply = None

@@ -885,10 +885,11 @@ async def test_gemini_input_loss_or_backpressure_closes_one_owned_transport(
 
                 monkeypatch.setattr(native._socket, "send", paused_send)
                 # Fewer than 256 frames, but more than the physical byte budget.
-                for _ in range(40):
-                    native.push_audio(rtc.AudioFrame(bytes(64000), 16000, 1, 32000))
-                    if native._failure is not None:
-                        break
+                with pytest.raises(GatewayError, match="byte bound"):
+                    for _ in range(40):
+                        native.push_audio(rtc.AudioFrame(bytes(64000), 16000, 1, 32000))
+                        if native._failure is not None:
+                            break
             elif failure == "oversize_frame":
                 native.push_audio(rtc.AudioFrame(bytes(2 << 20), 16000, 1, 1 << 20))
             else:

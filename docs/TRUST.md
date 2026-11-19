@@ -97,8 +97,11 @@ Unscoped GPT-Live generate_reply requires usable canonical startup/history
 context before sending a voice-delivery hint. A fresh empty context refuses that
 ask without inventing user text, adding the hint to backend history, or ending
 ordinary voice input. Real transcript fragments can still support ordinary
-provider delegations. Repeated genuinely unscoped calls remain available;
-`user_input=None` and `instructions=None` mean absent, not a new task.
+provider delegations. Repeated genuinely unscoped calls remain available after
+genuine completion; `user_input=None` and `instructions=None` mean absent, not a
+new task. Timeout/cancellation without correlated completion irreversibly
+refuses later application asks on that session. Retirement, preambles and later
+provider output cannot establish that an unseen original delegation drained.
 A preamble may fulfill the playback future while its
 original application expiration remains; it does not establish task attribution
 or extend execution authority.
@@ -108,7 +111,12 @@ or an input transcript arrives while that future is pending, its exact future
 fails and the transport stops before new capture, conversion, queuing or history
 changes. A later caller answer cannot complete the old typed handle. Genuine
 completion permits subsequent ordinary caller input; ambiguous overlap has no
-continuation claim or automatic reopen.
+continuation claim or automatic reopen. Queued duplex audio is filtered at its
+actual SDK stream after fatal failure, and the generation callback separately
+checks failure/closure before forwarding a generation. Queue byte/count refusal
+throws synchronously before either retained native or Agent context publication;
+accepted earlier context remains intact. These are local lifecycle refusals,
+not new remote drain or execution authority.
 
 Provider interruption feedback clears playback without a new manual activity.
 Before first output, feedback preserves the response fence for both claimed and

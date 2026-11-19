@@ -790,17 +790,18 @@ class _RealtimeSession(llm.RealtimeSession):
         )
         size = len(packet.encode("utf-8"))
         if size > _FRAME_BYTES or self._queued_input_bytes + size > _FRAME_BYTES:
-            self._fatal(
-                GatewayError("Realtime input exceeds its byte bound", retryable=False)
+            failure = GatewayError(
+                "Realtime input exceeds its byte bound", retryable=False
             )
-            return
+            self._fatal(failure)
+            raise failure
         try:
             self._commands.send_nowait(packet)
             self._queued_input_bytes += size
         except ChanFull:
-            self._fatal(
-                GatewayError("Realtime input exceeds its bound", retryable=False)
-            )
+            failure = GatewayError("Realtime input exceeds its bound", retryable=False)
+            self._fatal(failure)
+            raise failure from None
 
     def start_user_activity(self) -> None:
         self._ensure_live()
