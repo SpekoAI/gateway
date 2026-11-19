@@ -1957,7 +1957,7 @@
       "AudioEvaluationText": {
         "type": "string",
         "description": "A non-blank plain-text string.",
-        "pattern": "\\S"
+        "pattern": "[^\\s\\x85]"
       },
       "AudioEvaluationQuestion": {
         "description": "A noul, choice, or score question in an audio evaluation. Same primitives as EvaluationQuestion, with plain-text content only. Choice option keys must not start or end with whitespace and must not contain control characters or whitespace other than an ASCII space; their length is bounded per model by max_option_name_chars.",
@@ -2036,7 +2036,7 @@
             "minProperties": 2,
             "maxProperties": 255,
             "propertyNames": {
-              "pattern": "^\\S(?:[ \\S]*\\S)?$"
+              "pattern": "^[^\\s\\x00-\\x1F\\x7F-\\x9F](?: *[^\\s\\x00-\\x1F\\x7F-\\x9F])*$"
             },
             "additionalProperties": {
               "oneOf": [

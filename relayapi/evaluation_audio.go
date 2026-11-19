@@ -132,21 +132,28 @@ func (q EvaluationQuestion) validateText() error {
 // control characters, or any other whitespace (Gemini rejects those keys).
 // Length is a per-model bound, MaxOptionNameChars.
 func validateAudioOptionName(name string) error {
-	if strings.TrimSpace(name) != name {
+	if strings.TrimFunc(name, isEvaluationSpace) != name {
 		return fmt.Errorf("must not start or end with whitespace")
 	}
 	for _, r := range name {
-		if unicode.IsControl(r) || (unicode.IsSpace(r) && r != ' ') {
+		if unicode.IsControl(r) || (isEvaluationSpace(r) && r != ' ') {
 			return fmt.Errorf("must not contain control characters or whitespace other than an ASCII space")
 		}
 	}
 	return nil
 }
 
+// isEvaluationSpace is whitespace as both Go (unicode.IsSpace, which includes
+// U+0085) and the OpenAPI schema's ECMAScript \s (which includes U+FEFF)
+// count it, so the published patterns and this validation agree.
+func isEvaluationSpace(r rune) bool {
+	return unicode.IsSpace(r) || r == '\uFEFF'
+}
+
 // evaluationText decodes raw as a JSON string that is not blank.
 func evaluationText(raw json.RawMessage) (string, bool) {
 	var text string
-	if err := json.Unmarshal(raw, &text); err != nil || strings.TrimSpace(text) == "" {
+	if err := json.Unmarshal(raw, &text); err != nil || strings.TrimFunc(text, isEvaluationSpace) == "" {
 		return "", false
 	}
 	return text, true

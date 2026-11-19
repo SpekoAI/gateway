@@ -95,6 +95,26 @@ func TestValidateAudioRejectsStructuredContentAndBadIDs(t *testing.T) {
 			q.Criteria = raw(`{"very angry":null,"other":null}`)
 			r.Questions["sentiment"] = q
 		}, "control characters"},
+		{"option with a byte-order mark", func(r *EvaluationRequest) {
+			q := r.Questions["sentiment"]
+			q.Criteria = raw(`{"calm\ufeff":null,"other":null}`)
+			r.Questions["sentiment"] = q
+		}, "whitespace"},
+		{"option with a C1 control", func(r *EvaluationRequest) {
+			q := r.Questions["sentiment"]
+			q.Criteria = raw(`{"ca\u0085lm":null,"other":null}`)
+			r.Questions["sentiment"] = q
+		}, "control characters"},
+		{"instructions of only a byte-order mark", func(r *EvaluationRequest) {
+			q := r.Questions["agitation"]
+			q.Instructions = raw(`"\ufeff"`)
+			r.Questions["agitation"] = q
+		}, "instructions"},
+		{"instructions of only U+0085", func(r *EvaluationRequest) {
+			q := r.Questions["agitation"]
+			q.Instructions = raw(`"\u0085"`)
+			r.Questions["agitation"] = q
+		}, "instructions"},
 		{"id with a space", func(r *EvaluationRequest) { r.Questions["wants human"] = r.Questions["wants_human"] }, "must match"},
 		{"id too long", func(r *EvaluationRequest) { r.Questions[strings.Repeat("a", 65)] = r.Questions["wants_human"] }, "must match"},
 		{"auto routing", func(r *EvaluationRequest) { r.Routing = Routing{Mode: RoutingModeAuto, Objective: ObjectiveBalanced} }, "explicit"},
