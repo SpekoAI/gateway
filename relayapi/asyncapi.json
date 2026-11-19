@@ -1235,6 +1235,10 @@
             "maxLength": 64,
             "pattern": "^[A-Za-z0-9._:-]+$",
             "description": "The commit_id of the input.commit this final answers, present only when that commit carried one. A final the provider sent with no commit pending carries none. When one provider final answers several pending commits, the older ones are answered first by empty finals carrying their own ids, and the provider's final carries the newest commit's id."
+          },
+          "interim": {
+            "type": "boolean",
+            "description": "True on an interim final: the provider closed part of a long segment that is still being spoken, and more of the same segment follows. An interim final never answers an input.commit and never carries a commit_id; the segment's last final does. A client that stops reading at its commit's answer still gets the whole segment. Absent on every other final."
           }
         },
         "required": [

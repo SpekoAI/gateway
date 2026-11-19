@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:0b94fc6753fdf05f2bfdc7d595e844ea8908e027ba4e4030e54e89a2844af7c4
-# yaml-body: sha256:b1dccc45f6fd58fd757b5e073a0f865f885f42e184642fd2a811c16770458579
+# json-mirror: asyncapi.json sha256:6e3817bd5a8eaa0a66f8f343ea3682244a45260461fe637b8b6004877c8d2362
+# yaml-body: sha256:6a04c5d6e04ac8507995d8694be9bb5fd06db7fb71ae7b9250f697b73c45fcaa
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -1288,6 +1288,15 @@ components:
             several pending commits, the older ones are answered first by
             empty finals carrying their own ids, and the provider's final
             carries the newest commit's id.
+        interim:
+          type: boolean
+          description: >-
+            True on an interim final: the provider closed part of a long
+            segment that is still being spoken, and more of the same segment
+            follows. An interim final never answers an input.commit and never
+            carries a commit_id; the segment's last final does. A client that
+            stops reading at its commit's answer still gets the whole
+            segment. Absent on every other final.
       required:
         - type
         - text

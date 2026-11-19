@@ -860,8 +860,12 @@ func (s *sttStream) cutLongSegment(raw json.RawMessage) error {
 	}
 	text, language, confidence, startMS, endMS := head.flush()
 	data := sttTranscriptFields(text, s.translated.flush(), language, true, startMS, endMS, confidence, s.requestID)
-	// The speaker has not finished: this only closes a long stretch.
+	// The speaker has not finished: this only closes a long stretch. interim
+	// says so explicitly, because speech_final false alone is also an
+	// ordinary final on other providers: a consumer answering input.commit
+	// with finals must not take this one as the answer (docs/PROTOCOL.md).
 	data["speech_final"] = false
+	data["interim"] = true
 	sttSetSpeakers(data, prefix)
 	s.segment = sttSegment{}
 	for _, token := range rest {

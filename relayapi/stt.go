@@ -363,6 +363,11 @@ type STTTranscriptFinal struct {
 	// only when that commit carried one. A final the provider sent with no
 	// commit pending carries none.
 	CommitID string `json:"commit_id,omitempty"`
+	// Interim marks an interim final: the provider closed part of a long
+	// segment that is still being spoken, and more of the same segment
+	// follows. It never answers an input.commit, so it never carries a
+	// commit_id; the segment's last final does. Absent on every other final.
+	Interim bool `json:"interim,omitempty"`
 }
 
 // Validate checks the frame tag, segments and, when present, the commit id.
@@ -373,6 +378,9 @@ func (e STTTranscriptFinal) Validate() error {
 	}
 	if e.CommitID != "" && !ValidCommitID(e.CommitID) {
 		return fmt.Errorf("commit_id: want 1-64 characters of A-Z a-z 0-9 . _ : -")
+	}
+	if e.Interim && e.CommitID != "" {
+		return fmt.Errorf("commit_id: an interim final never answers a commit")
 	}
 	for i, segment := range e.Segments {
 		if err := segment.Validate(); err != nil {

@@ -109,6 +109,14 @@ func TestSTTDiarizedLongStretchIsCutAtASentenceEnd(t *testing.T) {
 	if cut["speech_final"] != false || cut["is_final"] != true {
 		t.Errorf("cut final: is_final %v, speech_final %v; want true, false", cut["is_final"], cut["speech_final"])
 	}
+	// The cut says so explicitly, so a consumer answering commits does not
+	// take it for the segment's end; the endpoint's final does not.
+	if cut["interim"] != true {
+		t.Errorf("cut final: interim %v, want true", cut["interim"])
+	}
+	if value, present := rest["interim"]; present {
+		t.Errorf("endpoint final: interim %v, want no interim key", value)
+	}
 	if start, end := cut["audio_start_ms"], cut["audio_end_ms"]; start != float64(0) || end != float64(59*300+260) {
 		t.Errorf("cut final span = %v-%v, want 0-%d", start, end, 59*300+260)
 	}
