@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import pairwise
 from typing import Any, Protocol
 
+from ._speech_client import SpeechClient, SpeechSession
 from ._voice import CredentialSource, execution_from_env
 from .client import (
     CanonicalEvent,
-    GatewayClient,
     GatewayError,
-    GatewaySession,
     SessionConfig,
 )
+from .relay_speech import RelaySpeechClient
 
 _INTEGRATION_VERSION = "0.1.0"
 
@@ -34,6 +36,11 @@ class LiveKitSpeechEvent:
     # language is the provider-identified language of a final, "" when the
     # provider identified none (a session pinned to one language).
     language: str = ""
+    speaker_id: str | None = None
+    # A segmented native final carries its complete text on its last part.
+    # Empty strings mark earlier parts; None preserves standalone event fakes.
+    canonical_text: str | None = None
+    speaker_segments: tuple[LiveKitSpeechEvent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -48,7 +55,7 @@ class LiveKitSTTBridge:
 
     def __init__(
         self,
-        client: GatewayClient,
+        client: SpeechClient,
         *,
         language: str = "en",
         model: str = "auto",
@@ -88,7 +95,9 @@ class LiveKitSTTBridge:
                 },
             )
         )
-        return LiveKitSTTStream(session)
+        return LiveKitSTTStream(
+            session, local_speakers=not isinstance(self._client, RelaySpeechClient)
+        )
 
 
 class LiveKitTTSBridge:
@@ -96,7 +105,7 @@ class LiveKitTTSBridge:
 
     def __init__(
         self,
-        client: GatewayClient,
+        client: SpeechClient,
         *,
         voice: str = "",
         language: str = "en",
@@ -151,7 +160,7 @@ class LiveKitTTSBridge:
 
 
 class LiveKitTTSStream:
-    def __init__(self, session: GatewaySession) -> None:
+    def __init__(self, session: SpeechSession) -> None:
         self._session = session
 
     @property
@@ -193,8 +202,13 @@ class LiveKitTTSStream:
 
 
 class LiveKitSTTStream:
-    def __init__(self, session: GatewaySession) -> None:
+    def __init__(self, session: SpeechSession, *, local_speakers: bool = False) -> None:
         self._session = session
+        self._local_speakers = local_speakers
+
+    @property
+    def request_id(self) -> str:
+        return str(self._session.metadata.get("request_id", ""))
 
     @property
     def session_id(self) -> str:
@@ -224,8 +238,7 @@ class LiveKitSTTStream:
         async for event in self._session.events():
             if event.type == "error":
                 raise _stream_error(event)
-            mapped = _speech_event(event)
-            if mapped is not None:
+            for mapped in _speech_events(event, local_speakers=self._local_speakers):
                 yield mapped
 
 
@@ -239,23 +252,133 @@ def _stream_error(event: CanonicalEvent) -> GatewayError:
     )
 
 
-def _speech_event(event: CanonicalEvent) -> LiveKitSpeechEvent | None:
+def _speech_events(
+    event: CanonicalEvent, *, local_speakers: bool = False
+) -> tuple[LiveKitSpeechEvent, ...]:
     if event.type not in {
         "speech.started",
         "speech.ended",
         "transcript.delta",
         "transcript.final",
     }:
-        return None
+        return ()
     data = event.data
-    return LiveKitSpeechEvent(
+    mapped = LiveKitSpeechEvent(
         type=event.type,
         text=str(data.get("text", "")),
         start_time=_milliseconds(data.get("audio_start_ms")),
         end_time=_milliseconds(data.get("audio_end_ms")),
         provider_request_id=str(data.get("provider_request_id", "")),
         language=str(data.get("language", "")),
+        speaker_id=_speaker(data.get("speaker"), local_speakers=local_speakers),
+        canonical_text=str(data.get("text", ""))
+        if event.type == "transcript.final"
+        else None,
     )
+    segments = data.get("segments")
+    if (
+        event.type != "transcript.final"
+        or not isinstance(segments, list)
+        or not any(
+            isinstance(segment, dict) and segment.get("speaker") not in (None, "")
+            for segment in segments
+        )
+    ):
+        return (mapped,)
+    # Segment text is optional alignment evidence, not the canonical final.
+    # Forward and backward alignment agree only on unambiguous ordered spans.
+    if any(
+        not isinstance(segment, dict) or not isinstance(segment.get("text"), str)
+        for segment in segments
+    ):
+        raise GatewayError("Native speech attribution is invalid", retryable=False)
+    attributed = []
+    for segment in segments:
+        start = _milliseconds(segment.get("start_ms"))
+        end = _milliseconds(segment.get("end_ms"))
+        if (
+            start is None
+            or end is None
+            or not math.isfinite(start)
+            or not math.isfinite(end)
+            or not 0 <= start <= end
+        ):
+            raise GatewayError("Native speech attribution is invalid", retryable=False)
+        attributed.append(
+            replace(
+                mapped,
+                text=segment["text"],
+                start_time=start,
+                end_time=end,
+                speaker_id=_speaker(
+                    segment.get("speaker"), local_speakers=local_speakers
+                )
+                or mapped.speaker_id,
+            )
+        )
+    attributed = [part for part in attributed if part.text]
+    forward, backward = [], []
+    cursor = 0
+    for part in attributed:
+        start = mapped.text.find(part.text, cursor) if part.text else -1
+        if start < 0:
+            return (replace(mapped, speaker_id=None),)
+        forward.append(start)
+        cursor = start + len(part.text)
+    cursor = len(mapped.text)
+    for part in reversed(attributed):
+        start = mapped.text.rfind(part.text, 0, cursor) if part.text else -1
+        if start < 0:
+            return (replace(mapped, speaker_id=None),)
+        backward.append(start)
+        cursor = start
+    backward.reverse()
+    uncertain = [
+        (start, latest + len(part.text))
+        for part, start, latest in zip(attributed, forward, backward)
+        if start != latest
+    ]
+    parts, cursor = [], 0
+
+    def gap(start: int, end: int) -> None:
+        boundaries = sorted({start, end} | {
+            max(start, min(end, position))
+            for span in uncertain for position in span
+        })
+        for left, right in pairwise(boundaries):
+            if mapped.text[left:right].strip():
+                parts.append(replace(
+                    mapped,
+                    text=mapped.text[left:right],
+                    start_time=None,
+                    end_time=None,
+                    speaker_id=None if any(a < right and left < b for a, b in uncertain) else mapped.speaker_id,
+                    canonical_text="",
+                ))
+
+    for part, start, latest in zip(attributed, forward, backward):
+        if start != latest:
+            continue
+        gap(cursor, start)
+        parts.append(replace(part, canonical_text=""))
+        cursor = start + len(part.text)
+    gap(cursor, len(mapped.text))
+    if not parts:
+        return (mapped,)
+    parts[-1] = replace(parts[-1], canonical_text=mapped.text)
+    return tuple(parts)
+
+
+def _speaker(value: Any, *, local_speakers: bool = False) -> str | None:
+    if value is None or value == "":
+        return None
+    # The local Gateway's existing Modulate adapter uses JSON integer IDs.
+    # Native relay labels remain strings; bool is never a speaker identifier.
+    if local_speakers and type(value) is int:
+        return str(value)
+    if not isinstance(value, str):
+        raise GatewayError("Native speech attribution is invalid", retryable=False)
+    return value
 
 
 def _milliseconds(value: Any) -> float | None:

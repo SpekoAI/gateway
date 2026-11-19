@@ -597,6 +597,11 @@ func (s *sttStream) readLoop() {
 			s.emit(runtimepkg.ProviderEvent{Err: err})
 			return
 		}
+		if s.finishedSeen.Load() {
+			// Finished is terminal evidence. A provider disconnect after it
+			// cannot turn the completed transcript and usage into a failure.
+			return
+		}
 	}
 }
 

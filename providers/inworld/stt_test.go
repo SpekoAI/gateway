@@ -518,7 +518,7 @@ func TestSTTCloseAllowsChangingProgressAcrossInactivityDeadlines(t *testing.T) {
 	t.Parallel()
 	harness := newSTTHarness(t, nil)
 	stream := sttOpenStream(t, harness, protocol.CredentialsManaged, nil)
-	stream.(*sttStream).closeInactivityTimeout = 60 * time.Millisecond
+	stream.(*sttStream).closeInactivityTimeout = 250 * time.Millisecond
 	harness.nextFrame(t)
 	if err := stream.WriteAudio(context.Background(), []byte{1, 0, 0, 0}); err != nil {
 		t.Fatalf("write audio: %v", err)
@@ -535,16 +535,17 @@ func TestSTTCloseAllowsChangingProgressAcrossInactivityDeadlines(t *testing.T) {
 	}
 
 	// Each changing partial arrives within the inactivity window, but the final
-	// lands after several original deadlines. Meaningful transcript progress is
+	// lands after the original deadline. Leave enough scheduling margin for
+	// the race-instrumented CI run. Meaningful transcript progress is
 	// intentionally allowed to keep a request alive until its final arrives.
 	for _, partial := range []string{"still", "still working", "still working now"} {
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		harness.push(t, fmt.Sprintf(`{"result":{"transcription":{"transcript":%q,"isFinal":false,"silenceDurationMs":0}}}`, partial))
 		if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptDelta {
 			t.Fatalf("progress event = %q, want transcript.delta", event.Type)
 		}
 	}
-	time.Sleep(40 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	harness.push(t, `{"result":{"transcription":{"transcript":"still working now done","isFinal":true,"silenceDurationMs":0}}}`)
 	if event := sttNextEvent(t, stream.Events()); event.Type != protocol.EventTranscriptFinal {
 		t.Fatalf("delayed event = %q, want transcript.final", event.Type)

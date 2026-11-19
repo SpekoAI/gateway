@@ -43,6 +43,7 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_llm
 
+from ._speech_client import SpeechSession
 from ._voice import (
     CredentialSource,
     execution_from_env,
@@ -53,7 +54,6 @@ from .client import (
     CanonicalEvent,
     GatewayClient,
     GatewayError,
-    GatewaySession,
     SessionConfig,
 )
 from .relay import (
@@ -64,6 +64,7 @@ from .relay import (
     validate_penalty,
     validate_reasoning_effort,
 )
+from .relay_speech import RelaySpeechClient
 
 _INTEGRATION_VERSION = "0.1.0"
 _logger = logging.getLogger(__name__)
@@ -74,7 +75,7 @@ class SpekoSTTService(PipecatSTTService):
 
     def __init__(
         self,
-        client: GatewayClient | None = None,
+        client: GatewayClient | RelaySpeechClient | None = None,
         *,
         language: str = "en",
         model: str = "auto",
@@ -128,7 +129,7 @@ class SpekoSTTService(PipecatSTTService):
             noise_reduction=noise_reduction,
             provider_options=provider_options,
         )
-        self._session: GatewaySession | None = None
+        self._session: SpeechSession | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._audio_since_commit = False
 
@@ -186,7 +187,9 @@ class SpekoSTTService(PipecatSTTService):
     async def _connect(self) -> None:
         if self._session is not None:
             return
-        await self._client.wait_until_ready(timeout=self._ready_timeout)
+        # Native relay readiness is its actual session.ready admission.
+        if not isinstance(self._client, RelaySpeechClient):
+            await self._client.wait_until_ready(timeout=self._ready_timeout)
         try:
             self._session = await self._open_session(
                 provider=self._provider, model=self._model
@@ -205,7 +208,7 @@ class SpekoSTTService(PipecatSTTService):
             self._receive_events(), name="speko.pipecat.stt.receive"
         )
 
-    async def _open_session(self, *, provider: str, model: str) -> GatewaySession:
+    async def _open_session(self, *, provider: str, model: str) -> SpeechSession:
         request: dict[str, Any] = {
             "provider": provider,
             "language": self._language,
@@ -236,6 +239,7 @@ class SpekoSTTService(PipecatSTTService):
     def _can_fallback_to_auto(self, error: GatewayError) -> bool:
         return (
             self._fallback_to_auto_on_no_eligible_route
+            and not isinstance(self._client, RelaySpeechClient)
             and execution_from_env(self._credential_source)["credential_source"]
             == "managed"
             and error.code == "no_eligible_route"
@@ -304,7 +308,7 @@ class SpekoSTTService(PipecatSTTService):
 
 @dataclass
 class _TTSContextState:
-    session: GatewaySession
+    session: SpeechSession
     task: asyncio.Task[None] | None = None
     finishing: bool = False
     interrupted: bool = False
@@ -317,7 +321,7 @@ class SpekoTTSService(PipecatTTSService):
 
     def __init__(
         self,
-        client: GatewayClient | None = None,
+        client: GatewayClient | RelaySpeechClient | None = None,
         *,
         voice: str = "",
         language: str = "en",
@@ -337,11 +341,20 @@ class SpekoTTSService(PipecatTTSService):
         if native_settings is not None:
             if not isinstance(native_settings, TTSSettings):
                 raise TypeError("settings must be a TTSSettings instance")
-            if is_setting_given(native_settings.model) and native_settings.model is not None:
+            if (
+                is_setting_given(native_settings.model)
+                and native_settings.model is not None
+            ):
                 model = native_settings.model
-            if is_setting_given(native_settings.voice) and native_settings.voice is not None:
+            if (
+                is_setting_given(native_settings.voice)
+                and native_settings.voice is not None
+            ):
                 voice = native_settings.voice
-            if is_setting_given(native_settings.language) and native_settings.language is not None:
+            if (
+                is_setting_given(native_settings.language)
+                and native_settings.language is not None
+            ):
                 language = str(native_settings.language)
         kwargs.setdefault("push_start_frame", True)
         kwargs.setdefault("push_stop_frames", False)
@@ -375,6 +388,7 @@ class SpekoTTSService(PipecatTTSService):
         )
         self._auto_fallback_active = False
         self._contexts: dict[str, _TTSContextState] = {}
+        self._native_failed = False
         self._ready = False
 
     @property
@@ -405,30 +419,54 @@ class SpekoTTSService(PipecatTTSService):
         self, text: str, context_id: str
     ) -> AsyncGenerator[Frame | None, None]:
         state: _TTSContextState | None = None
+        native_io_at_risk = True
         try:
             state = await self._context(context_id)
+            # Waiting on the preceding admitted utterance starts no transport
+            # work for this sentence. Normal interruption may cancel that wait.
+            native_io_at_risk = False
             # Gateway accepts one committed utterance at a time. Its command
             # acknowledgement only queues synthesis; audio.done releases the
             # stream for the next sentence. Audio keeps flowing on the receiver
             # task while this producer waits.
             await state.utterance_done.wait()
+            self._check_native_recovery()
             if state.interrupted or state.closed or state.finishing:
                 return
             state.utterance_done.clear()
+            native_io_at_risk = True
             await state.session.append_text(text)
             # Commit each Pipecat sentence so synthesis starts while the LLM is
             # still producing the remainder of the response.
             await state.session.commit_text()
             await self.start_tts_usage_metrics(text)
             yield None
-        except (GatewayError, OSError) as error:
+        except asyncio.CancelledError:
+            if isinstance(self._client, RelaySpeechClient) and native_io_at_risk:
+                # Admission or a text write may already have reached the peer.
+                # Latch before cleanup yields; waiting alone cannot set it.
+                self._native_failed = True
+                if state is not None:
+                    await self._close_state(context_id, state, interrupted=True)
+            raise
+        except Exception as error:
+            native = isinstance(self._client, RelaySpeechClient)
+            if not native and not isinstance(error, (GatewayError, OSError)):
+                raise
+            if native:
+                self._native_failed = True
+            reported = (
+                error
+                if isinstance(error, (GatewayError, OSError))
+                else GatewayError("Native TTS stream failed", retryable=False)
+            )
             if state is not None:
                 await self._close_state(context_id, state, interrupted=True)
             yield ErrorFrame(
-                error=_gateway_failure("TTS", error),
+                error=_gateway_failure("TTS", reported),
                 fatal=True,
                 processor=self,
-                exception=error,
+                exception=reported if reported is error else None,
             )
             yield TTSStoppedFrame(context_id=context_id)
             await self.remove_audio_context(context_id)
@@ -441,7 +479,12 @@ class SpekoTTSService(PipecatTTSService):
         if state is None or state.finishing:
             return
         state.finishing = True
-        await state.session.finish()
+        try:
+            await state.session.finish()
+        except (GatewayError, OSError):
+            if isinstance(self._client, RelaySpeechClient):
+                self._native_failed = True
+            raise
 
     async def on_audio_context_interrupted(self, context_id: str) -> None:
         state = self._contexts.get(context_id)
@@ -450,18 +493,20 @@ class SpekoTTSService(PipecatTTSService):
 
     async def _ensure_ready(self) -> None:
         if not self._ready:
-            await self._client.wait_until_ready(timeout=self._ready_timeout)
+            # Native relay readiness is checked by the first real admission.
+            if not isinstance(self._client, RelaySpeechClient):
+                await self._client.wait_until_ready(timeout=self._ready_timeout)
             self._ready = True
 
     async def _context(self, context_id: str) -> _TTSContextState:
+        self._check_native_recovery()
         state = self._contexts.get(context_id)
         if state is not None:
             return state
         await self._ensure_ready()
+        self._check_native_recovery()
         if self._auto_fallback_active:
-            session = await self._open_session(
-                provider="auto", model="auto", voice=""
-            )
+            session = await self._open_session(provider="auto", model="auto", voice="")
         else:
             try:
                 session = await self._open_session(
@@ -489,9 +534,17 @@ class SpekoTTSService(PipecatTTSService):
         )
         return state
 
+    def _check_native_recovery(self) -> None:
+        if isinstance(self._client, RelaySpeechClient) and self._native_failed:
+            raise GatewayError(
+                "Native Speko TTS requires a control-plane recovery decision",
+                code="recovery_required",
+                retryable=False,
+            )
+
     async def _open_session(
         self, *, provider: str, model: str, voice: str
-    ) -> GatewaySession:
+    ) -> SpeechSession:
         request: dict[str, Any] = {
             "provider": provider,
             "language": self._language,
@@ -527,6 +580,7 @@ class SpekoTTSService(PipecatTTSService):
     def _can_fallback_to_auto(self, error: GatewayError) -> bool:
         return (
             self._fallback_to_auto_on_no_eligible_route
+            and not isinstance(self._client, RelaySpeechClient)
             and execution_from_env(self._credential_source)["credential_source"]
             == "managed"
             and error.code == "no_eligible_route"
@@ -534,6 +588,7 @@ class SpekoTTSService(PipecatTTSService):
         )
 
     async def _receive_audio(self, context_id: str, state: _TTSContextState) -> None:
+        reported_failure = False
         try:
             async for event in state.session.events():
                 if event.type == "error":
@@ -552,23 +607,51 @@ class SpekoTTSService(PipecatTTSService):
                     )
         except asyncio.CancelledError:
             raise
-        except (GatewayError, OSError) as error:
-            await self.push_error(_gateway_failure("TTS", error), exception=error)
+        except Exception as error:
+            native = isinstance(self._client, RelaySpeechClient)
+            if not native and not isinstance(error, (GatewayError, OSError)):
+                raise
+            if native:
+                # Latch before any await/context removal; the SDK may already
+                # have its next sentence queued for this same turn.
+                self._native_failed = True
+            reported = (
+                error
+                if isinstance(error, (GatewayError, OSError))
+                else GatewayError("Native TTS receiver failed", retryable=False)
+            )
+            await self.push_error(
+                _gateway_failure("TTS", reported),
+                exception=reported if reported is error else None,
+                fatal=native,
+            )
+            reported_failure = True
         finally:
             state.closed = True
             state.utterance_done.set()
-            if not state.interrupted and self.audio_context_available(context_id):
-                await self.append_to_audio_context(
-                    context_id, TTSStoppedFrame(context_id=context_id)
-                )
-                await self.remove_audio_context(context_id)
             try:
-                await state.session.aclose()
-            except (GatewayError, OSError, RuntimeError):
-                pass
+                if not state.interrupted and self.audio_context_available(context_id):
+                    await self.append_to_audio_context(
+                        context_id, TTSStoppedFrame(context_id=context_id)
+                    )
+                    await self.remove_audio_context(context_id)
+            except Exception:
+                if not isinstance(self._client, RelaySpeechClient):
+                    raise
+                self._native_failed = True
+                if not reported_failure:
+                    await self.push_error("Speko Gateway TTS cleanup failed", fatal=True)
+                    reported_failure = True
             finally:
-                if self._contexts.get(context_id) is state:
-                    self._contexts.pop(context_id, None)
+                # Framework queue failure must not skip physical cleanup.
+                try:
+                    await state.session.aclose()
+                except (GatewayError, OSError, RuntimeError):
+                    if isinstance(self._client, RelaySpeechClient):
+                        self._native_failed = True
+                finally:
+                    if self._contexts.get(context_id) is state:
+                        self._contexts.pop(context_id, None)
 
     async def _finish_all(self, *, interrupted: bool) -> None:
         states = list(self._contexts.items())
@@ -576,7 +659,12 @@ class SpekoTTSService(PipecatTTSService):
             for context_id, state in states:
                 if not state.finishing:
                     state.finishing = True
-                    await state.session.finish()
+                    try:
+                        await state.session.finish()
+                    except (GatewayError, OSError):
+                        if isinstance(self._client, RelaySpeechClient):
+                            self._native_failed = True
+                        raise
             if states:
                 await asyncio.gather(
                     *(state.task for _, state in states if state.task is not None),
@@ -594,11 +682,13 @@ class SpekoTTSService(PipecatTTSService):
         try:
             await state.session.cancel()
         except (GatewayError, OSError):
-            pass
+            if isinstance(self._client, RelaySpeechClient):
+                self._native_failed = True
         try:
             await state.session.aclose()
         except (GatewayError, OSError, RuntimeError):
-            pass
+            if isinstance(self._client, RelaySpeechClient):
+                self._native_failed = True
         if state.task is not None and not state.task.done():
             state.task.cancel()
             await asyncio.gather(state.task, return_exceptions=True)

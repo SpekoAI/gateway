@@ -49,12 +49,26 @@ else:
 
 from speko_gateway.client import GatewayClient, USER_AGENT as local_marker
 from speko_gateway.relay import RelayLLMClient, USER_AGENT as router_marker
+from speko_gateway import RelayTTSClient, RelaySpeechClient, RelaySpeechSession
+import speko_gateway.speech as readiness
+import speko_gateway.relay_speech as native
 
 assert GatewayClient.__module__ == 'speko_gateway.client'
 assert RelayLLMClient.__module__ == 'speko_gateway.relay'
 assert local_marker == router_marker == 'speko-gateway/unknown'
+expected = {
+    'RelayTTSClient': readiness.RelayTTSClient,
+    'RelaySpeechClient': native.RelaySpeechClient,
+    'RelaySpeechSession': native.RelaySpeechSession,
+}
+assert len(set(expected.values())) == 3, 'speech implementations must stay distinct'
+exports = {}
+exec('from speko_gateway import *', exports)
+for name, implementation in expected.items():
+    assert globals()[name] is implementation, name
+    assert exports[name] is implementation, name
 print(json.dumps({'metadata_absent': True, 'local_marker': local_marker,
-                  'router_marker': router_marker}))
+                  'router_marker': router_marker, 'speech_exports_distinct': True}))
 """
     result = subprocess.run(
         [sys.executable, "-I", "-S", "-c", script, str(isolated)],
@@ -70,4 +84,5 @@ print(json.dumps({'metadata_absent': True, 'local_marker': local_marker,
         "metadata_absent": True,
         "local_marker": "speko-gateway/unknown",
         "router_marker": "speko-gateway/unknown",
+        "speech_exports_distinct": True,
     }
