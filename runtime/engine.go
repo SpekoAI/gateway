@@ -783,8 +783,9 @@ func (s *Session) dispatch(message inputMessage) error {
 	case inputTextAppend:
 		return s.stream.AppendText(s.ctx, message.text)
 	case inputTextCommit:
-		// A commit with nothing appended since the last one is answered with
-		// nothing and the session goes on (PROTOCOL.md, input.commit).
+		// An adapter that reports a commit with nothing to commit keeps its
+		// session: the commit is answered with nothing (see the provider note
+		// on cartesia.Adapter).
 		if err := s.stream.CommitText(s.ctx); !errors.Is(err, ErrNothingToCommit) {
 			return err
 		}

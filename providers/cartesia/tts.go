@@ -45,6 +45,10 @@ type Config struct {
 }
 
 // Adapter implements Cartesia's /tts/websocket streaming API.
+//
+// Provider note: on this route a text commit with nothing to commit (nothing
+// appended since the last commit) is ignored and the session stays open;
+// other providers end the session.
 type Adapter struct {
 	id              string
 	version         string
