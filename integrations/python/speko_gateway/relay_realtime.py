@@ -182,4 +182,17 @@ class RelayRealtimeSession:
 
     async def aclose(self) -> None:
         self._closed = True
-        await self._websocket.close()
+        deadline = asyncio.get_running_loop().call_later(1, self.abort)
+        try:
+            await self._websocket.close()
+        finally:
+            deadline.cancel()
+            self.abort()
+
+    def abort(self) -> None:
+        """Close the owned upgrade independently of its reader/close handshake.
+
+        Physical close supplies no provider outcome or financial finality.
+        """
+        self._closed = True
+        self._websocket._response.close()

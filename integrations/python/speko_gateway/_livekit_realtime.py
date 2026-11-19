@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
+import inspect
 import json
 import time
 import uuid
@@ -17,6 +18,7 @@ from livekit.agents import NOT_GIVEN, NotGivenOr, llm, utils
 from livekit.agents.utils import is_given
 from livekit.agents.utils.aio.channel import ChanFull
 
+from ._livekit_context import snapshot_context
 from ._livekit_tools import _relay_tools
 from ._relay_transport import _error
 from .client import GatewayError
@@ -195,6 +197,9 @@ class _RealtimeSession(llm.RealtimeSession):
         self._pending: deque[asyncio.Future[llm.GenerationCreatedEvent]] = deque()
         self._pending_timers: dict[asyncio.Future, asyncio.TimerHandle] = {}
         self._resampler: rtc.AudioResampler | None = None
+        self._uncommitted_source_samples = 0
+        self._provider_interruption_feedback = False
+        self._provider_retired_futures: set[asyncio.Future] = set()
         self._input_rate: int | None = None
         self._input_hz = 16000 if self._google else 24000
         self._audio_active = self._committed = False
@@ -213,7 +218,7 @@ class _RealtimeSession(llm.RealtimeSession):
 
     @property
     def chat_ctx(self) -> llm.ChatContext:
-        return self._chat_ctx.copy()
+        return snapshot_context(self._chat_ctx)
 
     @property
     def tools(self) -> llm.ToolContext:
@@ -267,8 +272,9 @@ class _RealtimeSession(llm.RealtimeSession):
         self._configured.set()
 
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
+        chat_ctx = snapshot_context(chat_ctx)
         if not self._configured.is_set():
-            self._chat_ctx = chat_ctx.copy()
+            self._chat_ctx = snapshot_context(chat_ctx)
             return
         await self._ready
         items = [
@@ -277,6 +283,72 @@ class _RealtimeSession(llm.RealtimeSession):
             if item.type in {"message", "function_call", "function_call_output"}
         ]
         if self._google:
+            known = {item.id: item for item in self._chat_ctx.items}
+            new = [item for item in items if item.id not in self._known_items]
+            typed = [item for item in new if isinstance(item, llm.ChatMessage)]
+            original_calls = {
+                item.call_id: item
+                for item in self._chat_ctx.items
+                if isinstance(item, llm.FunctionCall)
+            }
+            valid = (
+                len({item.id for item in items}) == len(items)
+                and all(
+                    isinstance(item, llm.FunctionCallOutput)
+                    and item.call_id in original_calls
+                    and item.name == original_calls[item.call_id].name
+                    or isinstance(item, llm.ChatMessage)
+                    and item.role == "user"
+                    and all(isinstance(part, str) for part in item.content)
+                    for item in new
+                )
+                and all(
+                    item.id not in known
+                    or self._wire_item(item) == self._wire_item(known[item.id])
+                    for item in items
+                    if item.id in self._known_items
+                )
+            )
+            if (
+                not valid
+                or typed
+                and (
+                    self._uncommitted_source_samples
+                    or self._audio_active
+                    or self._committed
+                    or self._pending
+                    or self._generation is not None
+                )
+            ):
+                failure = GatewayError(
+                    "Gemini context cannot be correlated with active input",
+                    retryable=False,
+                )
+                # AgentSession treats update errors as best effort; fence the
+                # same physical session before its later generate call as well.
+                self._fatal(failure)
+                raise failure
+            # Gemini's provider history is append-only. Retain the exact
+            # known values even if an SDK view temporarily omits an item.
+            merged_context = snapshot_context(
+                llm.ChatContext([*self._chat_ctx.items, *new])
+            )
+            if typed:
+                self._enqueue(
+                    {
+                        "clientContent": {
+                            "turns": [
+                                {
+                                    "role": "user",
+                                    "parts": [{"text": item.text_content or ""}],
+                                }
+                                for item in typed
+                            ],
+                            "turnComplete": False,
+                        }
+                    }
+                )
+                self._known_items.update(item.id for item in typed)
             results = [
                 item
                 for item in items
@@ -317,7 +389,7 @@ class _RealtimeSession(llm.RealtimeSession):
                         }
                     )
             self._known_items = wanted
-        self._chat_ctx = chat_ctx.copy()
+        self._chat_ctx = merged_context if self._google else snapshot_context(chat_ctx)
 
     def update_options(
         self, *, tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN
@@ -358,6 +430,8 @@ class _RealtimeSession(llm.RealtimeSession):
                 )
         if frame.sample_rate != self._input_rate:
             raise ValueError("Realtime input rate cannot change during a session")
+        # Capture precedes conversion: short input may stay in the resampler.
+        self._uncommitted_source_samples += frame.samples_per_channel
         for converted in self._resampler.push(frame) if self._resampler else [frame]:
             self._send_audio(bytes(converted.data))
 
@@ -388,6 +462,7 @@ class _RealtimeSession(llm.RealtimeSession):
         if self._resampler:
             for frame in self._resampler.flush():
                 self._send_audio(bytes(frame.data))
+        self._uncommitted_source_samples = 0
         if self._google:
             if self._manual_turns and self._audio_active:
                 self._enqueue({"realtimeInput": {"activityEnd": {}}})
@@ -397,8 +472,20 @@ class _RealtimeSession(llm.RealtimeSession):
             self._enqueue({"type": "input_audio_buffer.commit"})
 
     def clear_audio(self) -> None:
+        if self._google and self._audio_active:
+            self._fatal(
+                GatewayError(
+                    "Gemini captured input cannot be cleared remotely", retryable=False
+                )
+            )
+            return
         if not self._google:
             self._enqueue({"type": "input_audio_buffer.clear"})
+        if self._resampler is not None:
+            self._resampler = rtc.AudioResampler(
+                input_rate=self._input_rate, output_rate=self._input_hz, num_channels=1
+            )
+        self._uncommitted_source_samples = 0
 
     def generate_reply(
         self,
@@ -464,16 +551,90 @@ class _RealtimeSession(llm.RealtimeSession):
                 GatewayError("Realtime reply was not acknowledged", retryable=False)
             )
 
+    def _sdk_interruption_cleanup(self) -> bool:
+        from livekit.agents.voice.agent_activity import AgentActivity
+
+        frame = inspect.currentframe()
+        try:
+            # Only the immediate genuine SDK callsite may suppress its own
+            # stale cleanup. A programmatic Activity.interrupt, even inside a
+            # provider notification, remains an independent local stop.
+            caller = frame.f_back.f_back if frame and frame.f_back else None
+            if caller is None:
+                return False
+            owner = caller.f_locals.get("self")
+            if not isinstance(owner, AgentActivity) or owner._rt_session is not self:
+                return False
+            code = caller.f_code
+            if code is inspect.unwrap(AgentActivity.interrupt).__code__:
+                parent = caller.f_back
+                return bool(
+                    self._provider_interruption_feedback
+                    and parent is not None
+                    and parent.f_code
+                    is inspect.unwrap(AgentActivity._on_input_speech_started).__code__
+                    and parent.f_locals.get("self") is owner
+                )
+            if code is inspect.unwrap(AgentActivity._realtime_reply_task).__code__:
+                return (
+                    caller.f_locals.get("generate_reply_fut")
+                    in self._provider_retired_futures
+                )
+            generation_cleanup = (
+                AgentActivity._realtime_generation_task,
+                getattr(AgentActivity, "_realtime_generation_task_impl", None),
+            )
+            if any(
+                method is not None and code is inspect.unwrap(method).__code__
+                for method in generation_cleanup
+            ):
+                event = caller.f_locals.get("generation_ev")
+                return bool(
+                    event is not None
+                    and (
+                        self._generation is None
+                        or event is not self._generation.event
+                        or self._generation.interrupted
+                    )
+                )
+            return False
+        finally:
+            del frame
+
     def interrupt(self) -> None:
-        if self._generation is not None and not self._generation.interrupted:
+        if self._sdk_interruption_cleanup():
+            return
+        if (
+            self._pending
+            or self._generation is not None
+            and self._generation.interrupted
+        ):
+            self._fatal(
+                GatewayError(
+                    "Unresolved realtime work was locally interrupted", retryable=False
+                )
+            )
+            return
+        if self._generation is not None:
             self._generation.interrupted = True
             self._generation.close()
             if not self._google:
                 self._enqueue(
                     {"type": "response.cancel", "response_id": self._generation.id}
                 )
-        if self._google and self._manual_turns:
-            self.start_user_activity()
+            elif (
+                self._manual_turns
+                and self._model._allow_interruptions
+                and not self._audio_active
+            ):
+                self._enqueue({"realtimeInput": {"activityStart": {}}})
+                self._enqueue({"realtimeInput": {"activityEnd": {}}})
+            else:
+                self._fatal(
+                    GatewayError(
+                        "Realtime provider cancellation is unavailable", retryable=False
+                    )
+                )
 
     def truncate(
         self,
@@ -515,6 +676,12 @@ class _RealtimeSession(llm.RealtimeSession):
                         "functionDeclarations": [
                             {
                                 "name": item["name"],
+                                **(
+                                    {"behavior": "NON_BLOCKING"}
+                                    if self._model.model
+                                    == "gemini-3.8-live-extended-thinking"
+                                    else {}
+                                ),
                                 "description": item.get("description", ""),
                                 "parametersJsonSchema": item.get(
                                     "parameters", {"type": "object"}
@@ -719,7 +886,7 @@ class _RealtimeSession(llm.RealtimeSession):
                         }
                     )
                 await self._socket.send_json(
-                    {"clientContent": {"turns": turns, "turnComplete": False}}
+                    {"clientContent": {"turns": turns, "turnComplete": True}}
                 )
             self._ready.set_result(None)
 
@@ -792,6 +959,8 @@ class _RealtimeSession(llm.RealtimeSession):
     def _fatal(self, failure: GatewayError) -> None:
         if self._failure is None:
             self._failure = failure
+            if self._socket is not None:
+                self._socket.abort()
             self._configured.set()
             if self._running:
                 self._task.cancel()
@@ -987,9 +1156,27 @@ class _RealtimeSession(llm.RealtimeSession):
         if "goAway" in event:
             raise GatewayError("Realtime provider session is ending", retryable=False)
         content = event.get("serverContent", {})
-        if content.get("interrupted") and self._generation:
-            self._generation.interrupted = True
-            self._generation.close()
+        if content.get("interrupted"):
+            if self._generation:
+                self._generation.interrupted = True
+                self._generation.close()
+            if self._pending:
+                self._provider_retired_futures.update(self._pending)
+                self._fatal(
+                    GatewayError(
+                        "Provider interrupted an unclaimed response", retryable=False
+                    )
+                )
+            # Playback can still own buffered audio after native turnComplete.
+            self._provider_interruption_feedback = True
+            try:
+                self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+                self.emit(
+                    "input_speech_stopped",
+                    llm.InputSpeechStoppedEvent(user_transcription_enabled=True),
+                )
+            finally:
+                self._provider_interruption_feedback = False
         transcript = content.get("inputTranscription")
         if isinstance(transcript, dict) and transcript.get("text"):
             self._input_item = self._input_item or "google_user_" + uuid.uuid4().hex
@@ -1039,6 +1226,12 @@ class _RealtimeSession(llm.RealtimeSession):
                 )
         if content.get("turnComplete"):
             if self._input_item:
+                self._known_items.add(self._input_item)
+                self._chat_ctx.items.append(
+                    llm.ChatMessage(
+                        id=self._input_item, role="user", content=[self._input_text]
+                    )
+                )
                 self.emit(
                     "input_audio_transcription_completed",
                     _transcription(
