@@ -81,15 +81,20 @@ async def test_selected_native_standby_failure_never_opens_a_replacement(
             local_auth_token=LOCAL_TOKEN,
         )
         model = TTS(
-            client, provider="fixture", model="fixture-model", standby_sessions=1
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            standby_sessions=1,
         )
-        model.prewarm()
-        await asyncio.wait_for(configured.wait(), 3)
-        stream = model.stream()
-        stream.push_text("Original reply.")
-        stream.end_input()
-        consuming = asyncio.create_task(collect_stream(stream))
+        stream = consuming = None
         try:
+            model.prewarm()
+            await asyncio.wait_for(configured.wait(), 3)
+            stream = model.stream()
+            stream.push_text("Original reply.")
+            stream.end_input()
+            consuming = asyncio.create_task(collect_stream(stream))
             # The actual reply has selected the still-opening standby before
             # the peer fails its original configure. No standby is injected.
             await eventually(lambda: not model._standbys)
@@ -103,10 +108,12 @@ async def test_selected_native_standby_failure_never_opens_a_replacement(
             assert error is not None and not error.retryable
         finally:
             release.set()
-            if not consuming.done():
-                consuming.cancel()
-            await asyncio.gather(consuming, return_exceptions=True)
-            await stream.aclose()
+            if consuming is not None:
+                if not consuming.done():
+                    consuming.cancel()
+                await asyncio.gather(consuming, return_exceptions=True)
+            if stream is not None:
+                await stream.aclose()
             await model.aclose()
             await client.aclose()
 
@@ -146,7 +153,13 @@ async def test_empty_native_requests_release_batches_while_stream_stays_open(
             socket_path=socket,
             local_auth_token=LOCAL_TOKEN,
         )
-        model = STT(client, provider="fixture", model="fixture-model", turn_vad=source)
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=source,
+        )
         session = AgentSession(
             stt=model,
             llm=None,
@@ -255,7 +268,13 @@ async def test_recorded_legacy_consecutive_frames_keep_exact_positions(
             socket_path=socket,
             local_auth_token=LOCAL_TOKEN,
         )
-        model = STT(client, provider="fixture", model="fixture-model", turn_vad=source)
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=source,
+        )
         session = AgentSession(stt=model, llm=None, tts=None, vad=None)
         audio = OwnedAudioInput()
         session.input.audio = audio
