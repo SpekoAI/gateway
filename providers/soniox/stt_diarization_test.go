@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
@@ -16,6 +17,13 @@ import (
 // start frame, sends frames in order, and then waits. It returns the start
 // frame and the first want provider events.
 func runSTTScript(t *testing.T, request func(serverURL string) runtimepkg.AdapterRequest, frames []map[string]any, want int) (map[string]any, []runtimepkg.ProviderEvent) {
+	t.Helper()
+	return runSTTScriptUntil(t, request, frames, func(events []runtimepkg.ProviderEvent) bool { return len(events) >= want })
+}
+
+// runSTTScriptUntil is runSTTScript for a script whose event count is not
+// fixed: it collects until done holds.
+func runSTTScriptUntil(t *testing.T, request func(serverURL string) runtimepkg.AdapterRequest, frames []map[string]any, done func([]runtimepkg.ProviderEvent) bool) (map[string]any, []runtimepkg.ProviderEvent) {
 	t.Helper()
 	starts := make(chan map[string]any, 1)
 	server := newSTTServer(t, func(ctx context.Context, conn *websocket.Conn) {
@@ -45,7 +53,43 @@ func runSTTScript(t *testing.T, request func(serverURL string) runtimepkg.Adapte
 	}
 	t.Cleanup(func() { abortStream(stream) })
 	start := mustReceiveObject(t, starts)
-	return start, collectEvents(t, stream.Events(), want)
+	var events []runtimepkg.ProviderEvent
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for !done(events) {
+		select {
+		case event, ok := <-stream.Events():
+			if !ok {
+				t.Fatalf("provider events closed after %d events", len(events))
+			}
+			if event.Err != nil {
+				t.Fatalf("unexpected provider error: %v", event.Err)
+			}
+			events = append(events, event)
+		case <-timer.C:
+			t.Fatalf("timed out after %d provider events", len(events))
+		}
+	}
+	return start, events
+}
+
+// spanView is an event's whole-text span, "-" where a bound is absent.
+func spanView(t *testing.T, data json.RawMessage) string {
+	t.Helper()
+	var decoded struct {
+		StartMS *int64 `json:"audio_start_ms"`
+		EndMS   *int64 `json:"audio_end_ms"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("decode transcript: %v", err)
+	}
+	number := func(value *int64) string {
+		if value == nil {
+			return "-"
+		}
+		return strconv.FormatInt(*value, 10)
+	}
+	return "[" + number(decoded.StartMS) + "-" + number(decoded.EndMS) + "]"
 }
 
 func diarizedRequest(serverURL string) runtimepkg.AdapterRequest {
@@ -326,6 +370,38 @@ func TestSTTDiarizedBoundsComeOnlyFromTheOuterPieces(t *testing.T) {
 	if got, want := speakerView(t, events[1].Data), "这很好。 | 1 | 这很好。@1[---]"; got != want {
 		t.Errorf("final:\n got %s\nwant %s", got, want)
 	}
+	// The whole text has the same outer pieces, so its span is unknown too,
+	// not the inner piece's 320-360.
+	for index, event := range events {
+		if got := spanView(t, event.Data); got != "[---]" {
+			t.Errorf("event %d (%s) span = %s, want [---]", index, event.Type, got)
+		}
+	}
+}
+
+// A final's span covers its whole text, so it is reported only when its
+// first piece has a start and its last piece an end. Here B started at
+// 300 ms and its end is unknown: "A B" was not said within 100-200 ms. Each
+// speaker's words keep the bounds they have.
+func TestSTTDiarizedFinalSpanNeedsBothOuterBounds(t *testing.T) {
+	t.Parallel()
+
+	pieces := func(final bool) []map[string]any {
+		return []map[string]any{
+			sonioxToken("A", 100, 200, 1, final, "1"),
+			{"text": " B", "start_ms": 300, "confidence": 1, "is_final": final, "speaker": "2"},
+		}
+	}
+	_, events := runSTTScript(t, diarizedRequest, []map[string]any{
+		sonioxFrame(pieces(false)...),
+		sonioxFrame(append(pieces(true), sonioxEnd(400))...),
+	}, 3)
+	if got, want := speakerView(t, events[0].Data)+" "+spanView(t, events[0].Data), "A B | - | <A>@1[100-200] | <B>@2[300--] [---]"; got != want {
+		t.Errorf("delta:\n got %s\nwant %s", got, want)
+	}
+	if got, want := speakerView(t, events[1].Data)+" "+spanView(t, events[1].Data), "A B | - | A@1[100-200] | B@2[300--] [---]"; got != want {
+		t.Errorf("final:\n got %s\nwant %s", got, want)
+	}
 }
 
 // Without an endpoint the hypothesis grows for as long as people talk, and
@@ -356,26 +432,32 @@ func TestSTTDiarizedDeltasStayProportionalWithoutAnEndpoint(t *testing.T) {
 		}
 		return script
 	}
-	total := func(request func(string) runtimepkg.AdapterRequest, labelled bool) (int, runtimepkg.ProviderEvent) {
-		_, events := runSTTScript(t, request, frames(labelled), words)
+	total := func(request func(string) runtimepkg.AdapterRequest, labelled bool) int {
+		_, events := runSTTScriptUntil(t, request, frames(labelled), func(events []runtimepkg.ProviderEvent) bool {
+			return countEvents(events, protocol.EventTranscriptDelta) >= words
+		})
 		sum := 0
 		for _, event := range events {
-			if event.Type != protocol.EventTranscriptDelta {
-				t.Fatalf("event type = %s", event.Type)
-			}
 			sum += len(event.Data)
 		}
-		return sum, events[len(events)-1]
+		return sum
 	}
-	plain, _ := total(sttAdapterRequest, false)
-	labelled, last := total(diarizedRequest, true)
-	t.Logf("labelled deltas %d bytes, unlabelled %d, ratio %.2f", labelled, plain, float64(labelled)/float64(plain))
+	plain := total(sttAdapterRequest, false)
+	labelled := total(diarizedRequest, true)
+	t.Logf("labelled events %d bytes, unlabelled %d, ratio %.2f", labelled, plain, float64(labelled)/float64(plain))
 	if float64(labelled) > 1.5*float64(plain) {
-		t.Fatalf("labelled deltas total %d bytes, %.2f times the %d unlabelled", labelled, float64(labelled)/float64(plain), plain)
+		t.Fatalf("labelled events total %d bytes, %.2f times the %d unlabelled", labelled, float64(labelled)/float64(plain), plain)
 	}
-	if runs := strings.Count(speakerView(t, last.Data), "<"); runs != 8 {
-		t.Fatalf("last delta has %d speaker runs, want 8: %s", runs, last.Data)
+}
+
+func countEvents(events []runtimepkg.ProviderEvent, kind protocol.EventType) int {
+	count := 0
+	for _, event := range events {
+		if event.Type == kind {
+			count++
+		}
 	}
+	return count
 }
 
 // Every word reaches exactly one final, in order, whatever deltas showed it

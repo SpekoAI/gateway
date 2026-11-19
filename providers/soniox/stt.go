@@ -686,7 +686,10 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	tail := strings.Builder{}
 	translatedTail := strings.Builder{}
 	sawContent := false
+	// tailEndMS is the end of the tail's last piece with text, absent when
+	// that piece has none; tailHasText says there is such a piece.
 	var tailEndMS *int64
+	tailHasText := false
 	// tailSpoken is the tail's tokens, kept only on a diarized session.
 	var tailSpoken []sttToken
 
@@ -713,6 +716,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			tail.Reset()
 			translatedTail.Reset()
 			tailEndMS = nil
+			tailHasText = false
 			tailSpoken = nil
 			sawContent = false
 			if token.Text == endToken {
@@ -750,14 +754,19 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			continue
 		}
 		tail.WriteString(token.Text)
-		if token.EndMS != nil {
-			tailEndMS = token.EndMS
+		if strings.TrimSpace(token.Text) != "" {
+			tailEndMS, tailHasText = token.EndMS, true
 		}
 		if s.diarize {
 			tailSpoken = append(tailSpoken, token)
 		}
 	}
 
+	if s.diarize {
+		if err := s.cutLongSegment(raw); err != nil {
+			return err
+		}
+	}
 	if !sawContent {
 		return nil
 	}
@@ -766,11 +775,15 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	if interim == "" && interimTranslation == "" {
 		return nil
 	}
-	endMS := tailEndMS
-	if endMS == nil {
-		endMS = s.segment.endMS
+	// Each bound is the outer piece's own: the segment's first finalized
+	// piece starts the hypothesis, and the tail's last piece, or the
+	// segment's when the tail has none, ends it. An inner piece's time
+	// never stands in for an outer one that has none.
+	endMS := s.segment.lastEndMS
+	if tailHasText {
+		endMS = tailEndMS
 	}
-	data := sttTranscriptFields(interim, interimTranslation, "", false, s.segment.startMS, endMS, nil, s.requestID)
+	data := sttTranscriptFields(interim, interimTranslation, "", false, s.segment.firstStartMS, endMS, nil, s.requestID)
 	if s.diarize {
 		// The hypothesis is the segment's finals so far plus the tail. The
 		// finals' runs were built as they arrived; only the tail, which
@@ -811,6 +824,105 @@ func (s *sttStream) flushSegment(raw json.RawMessage) error {
 	})
 }
 
+// A diarized segment's finalized part is cut once it spans more than
+// sttCutAudioMS of audio or sttCutCharacters characters, so that a long talk
+// without an endpoint does not resend an ever longer hypothesis on every
+// delta (docs/PROTOCOL.md). A session without diarization is never cut.
+const (
+	sttCutAudioMS    = 20_000
+	sttCutCharacters = 2_000
+)
+
+// cutLongSegment emits the finalized prefix of an over-long segment once, as
+// a final that does not end the utterance, and keeps the rest as the open
+// segment. The prefix ends at the last sentence end in the finalized text's
+// last quarter, else at the last word boundary; never inside a word.
+func (s *sttStream) cutLongSegment(raw json.RawMessage) error {
+	spoken := s.segment.spoken
+	if !sttOverBound(s.segment.text.String(), spoken) {
+		return nil
+	}
+	cut := sttCutPoint(spoken)
+	if cut == 0 {
+		return nil
+	}
+	prefix, rest := spoken[:cut], slices.Clone(spoken[cut:])
+	var head sttSegment
+	for _, token := range prefix {
+		head.appendFinal(token)
+	}
+	text, language, confidence, startMS, endMS := head.flush()
+	data := sttTranscriptFields(text, s.translated.flush(), language, true, startMS, endMS, confidence, s.requestID)
+	// The speaker has not finished: this only closes a long stretch.
+	data["speech_final"] = false
+	sttSetSpeakers(data, prefix)
+	s.segment = sttSegment{}
+	for _, token := range rest {
+		s.segment.appendFinal(token)
+		s.segment.spoken = append(s.segment.spoken, token)
+		s.segment.runs.add(token)
+	}
+	return s.emit(runtimepkg.ProviderEvent{
+		Type:       protocol.EventTranscriptFinal,
+		Data:       sonioxMarshalData(data),
+		Extensions: sttExtension(raw),
+	})
+}
+
+func sttOverBound(text string, tokens []sttToken) bool {
+	if utf8.RuneCountInString(text) > sttCutCharacters {
+		return true
+	}
+	var startMS, endMS *int64
+	for _, token := range tokens {
+		if strings.TrimSpace(token.Text) == "" {
+			continue
+		}
+		if startMS == nil {
+			startMS = token.StartMS
+		}
+		if token.EndMS != nil {
+			endMS = token.EndMS
+		}
+	}
+	return startMS != nil && endMS != nil && *endMS-*startMS > sttCutAudioMS
+}
+
+// sttCutPoint returns how many of the finalized tokens to emit, 0 when there
+// is nowhere to cut. A cut lies between two tokens where the second starts a
+// word or the first ends one or a sentence. The end of the last finalized
+// token is never one: the next piece is not final yet and may continue the
+// word.
+func sttCutPoint(tokens []sttToken) int {
+	total := 0
+	for _, token := range tokens {
+		total += utf8.RuneCountInString(token.Text)
+	}
+	offset, sentence, word, hasText := 0, 0, 0, false
+	for index := 1; index < len(tokens); index++ {
+		previous := tokens[index-1].Text
+		offset += utf8.RuneCountInString(previous)
+		hasText = hasText || strings.TrimSpace(previous) != ""
+		endsSentence := sttEndsSentence(previous)
+		if !hasText || !(startsWithSpace(tokens[index].Text) || endsWithSpace(previous) || endsSentence) {
+			continue
+		}
+		word = index
+		if endsSentence && 4*offset >= 3*total {
+			sentence = index
+		}
+	}
+	if sentence > 0 {
+		return sentence
+	}
+	return word
+}
+
+func sttEndsSentence(text string) bool {
+	last, _ := utf8.DecodeLastRuneInString(strings.TrimRightFunc(text, unicode.IsSpace))
+	return strings.ContainsRune(".!?…。！？", last)
+}
+
 func (s *sttStream) emit(event runtimepkg.ProviderEvent) error {
 	select {
 	case s.events <- event:
@@ -827,8 +939,12 @@ type sttSegment struct {
 	text          strings.Builder
 	confidenceSum float64
 	confidenceN   int
-	startMS       *int64
-	endMS         *int64
+	// firstStartMS is the start of the first piece with text and lastEndMS
+	// the end of the last, each absent when that piece has none; hasText
+	// says there is such a piece.
+	firstStartMS *int64
+	lastEndMS    *int64
+	hasText      bool
 	// languages counts tokens per identified language; only a session with
 	// language identification on gets any.
 	languages map[string]int
@@ -851,16 +967,19 @@ func (a *sttSegment) appendFinal(token sttToken) {
 		a.confidenceSum += *token.Confidence
 		a.confidenceN++
 	}
-	if token.StartMS != nil && a.startMS == nil {
-		a.startMS = token.StartMS
-	}
-	if token.EndMS != nil {
-		a.endMS = token.EndMS
+	if strings.TrimSpace(token.Text) != "" {
+		if !a.hasText {
+			a.firstStartMS, a.hasText = token.StartMS, true
+		}
+		a.lastEndMS = token.EndMS
 	}
 }
 
 // flush returns the segment's text, its majority identified language ("" when
-// none was identified), average confidence, and audio span.
+// none was identified), average confidence, and audio span. The span covers
+// the whole text, so it is reported only when the first piece's start and the
+// last piece's end are both known; otherwise neither is, and only the words'
+// own bounds say when anything was said.
 func (a *sttSegment) flush() (string, string, *float64, *int64, *int64) {
 	text := strings.TrimSpace(a.text.String())
 	language, most := "", 0
@@ -874,7 +993,10 @@ func (a *sttSegment) flush() (string, string, *float64, *int64, *int64) {
 		average := a.confidenceSum / float64(a.confidenceN)
 		confidence = &average
 	}
-	startMS, endMS := a.startMS, a.endMS
+	startMS, endMS := a.firstStartMS, a.lastEndMS
+	if startMS == nil || endMS == nil {
+		startMS, endMS = nil, nil
+	}
 	*a = sttSegment{}
 	return text, language, confidence, startMS, endMS
 }

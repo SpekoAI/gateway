@@ -207,6 +207,24 @@ delta or the final may change them.
 
 On both events, a word's or run's `start_ms` is its first piece's start and
 `end_ms` its last piece's end; either is absent when that piece has no time.
+The event's own `audio_start_ms` and `audio_end_ms` follow the same rule on a
+delta. A final carries the pair only when both are known: together they claim
+the whole text, so an inner piece's time never stands in for a missing outer
+one, on any Soniox session. Router's public `transcript.delta` turns runs into
+`segments` that carry each run's text and speaker, and `start_ms` and
+`end_ms` only when the run has both.
+
+A diarized segment that runs on without an endpoint is cut, so a long talk
+does not resend an ever longer hypothesis on every delta. Once its finalized
+part spans more than 20 s of audio or 2,000 characters, that part's prefix
+goes out once as a `transcript.final` with `speech_final: false`. The prefix
+ends after the last finalized piece that ends a sentence in the last quarter
+of the finalized text, or else at the last word boundary between finalized
+pieces. It never ends inside a word, and never after the last finalized
+piece, which the next piece may continue. Later deltas carry only the rest,
+with run offsets into their own text, and every word reaches exactly one
+final, in order. A session without diarization is never cut.
+
 Soniox notes that endpoint detection, which this adapter always enables,
 lowers diarization accuracy.
 
