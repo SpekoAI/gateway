@@ -235,6 +235,9 @@ That restores speaking state; it does not establish a fresh interruption. Only
 a fully post-frontier, physically captured voiced inference window starts the
 new interruption duration. Later quiet and padding cannot start that clock or
 reuse pre-EOS speech duration, including with short interruption thresholds.
+If quiet abandons a tentative onset before `START_OF_SPEECH`, its interruption
+clock is cleared even though no `END_OF_SPEECH` exists. A later onset starts
+its own duration; physical boundary timestamps, PCM and minimums are unchanged.
 Recovery never replays detector-only padding. Pending
 real tails rearm after in-flight padding completes, with no packet-duration delay.
 
@@ -270,6 +273,9 @@ its recovery decision before constructing a replacement instance.
 Pipecat native TTS likewise latches ambiguous admission, send, receive/EOF and
 framework-receiver failures before any await that removes the context. It emits
 a fatal error and refuses subsequent SDK sentences/admissions on that instance;
+admission cancellation also latches before cleanup and then propagates the
+original cancellation. The owned configuring socket is closed, and later
+sentences cannot open a replacement merely because no ready session returned.
 readiness or settings updates do not recover it. Framework queue failure still
 attempts physical session cleanup. Construct a replacement only after the
 control-plane recovery decision. Ordinary local Gateway error recovery retains

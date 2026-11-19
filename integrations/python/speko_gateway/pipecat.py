@@ -436,6 +436,14 @@ class SpekoTTSService(PipecatTTSService):
             await state.session.commit_text()
             await self.start_tts_usage_metrics(text)
             yield None
+        except asyncio.CancelledError:
+            if isinstance(self._client, RelaySpeechClient):
+                # Admission may have sent configure before cancellation. Latch
+                # before cleanup yields so a queued SDK sentence cannot reopen.
+                self._native_failed = True
+                if state is not None:
+                    await self._close_state(context_id, state, interrupted=True)
+            raise
         except Exception as error:
             native = isinstance(self._client, RelaySpeechClient)
             if not native and not isinstance(error, (GatewayError, OSError)):

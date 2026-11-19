@@ -280,7 +280,9 @@ class _DrainingVADStream(vad.VADStream):
             # Only a fully post-frontier, physically captured voiced window
             # starts that clock. Later quiet/padding cannot start it.
             activation, *_ = state._options()
-            if boundary is not None and boundary.type is vad.VADEventType.END_OF_SPEECH:
+            # Quiet can abandon a tentative onset without emitting END. That
+            # onset must not donate its intervening silence to a later one.
+            if not state.speaking and not state.onset_pending:
                 self._fresh_speech_start = None
             if (
                 not replaying and not old_speech

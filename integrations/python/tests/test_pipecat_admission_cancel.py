@@ -72,6 +72,17 @@ async def test_native_admission_cancel_fences_next_actual_sdk_sentence():
                 error_seen.set()
 
         service.push_frame = output
+        original_append = service.append_to_audio_context
+
+        async def append(context_id, frame):
+            await original_append(context_id, frame)
+            # run_tts failures enter Pipecat's real audio-context queue. They
+            # need not pass push_frame before the independent queue runs.
+            if isinstance(frame, ErrorFrame):
+                frames.append(frame)
+                error_seen.set()
+
+        service.append_to_audio_context = append
         active = asyncio.create_task(service._push_tts_frames(sentence("Original.")))
         try:
             await asyncio.wait_for(configured.wait(), 3)
