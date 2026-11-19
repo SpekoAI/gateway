@@ -36,23 +36,50 @@ control. These behaviors are covered with owned actual SDK/sidecar/PCM controls.
 
 ## Automatic Gemini input completion and clear
 
-Automatic input now retains a private queued/published audio sequence and the
-source-sample prefix represented by converted PCM. The first provider turn
-observation freezes its published prefix; native `turnComplete` retires only
-that prefix. A completed observed voice exchange can then accept a genuine
-typed follow-up. Later captured/sent/queued audio and any resampler remainder
-stay pending, including a write queued before that first provider observation.
-A response terminal does not acknowledge an entire continuous input stream.
-When later input cannot be associated with that original turn, it remains
-unresolved rather than being silently marked complete.
+The first provider response cannot identify the input it consumed. On the
+previous `6dc1f2d` candidate an actual peer received A and then B before releasing
+A's first transcript/model output and terminal. That falsely retired B and let
+both a typed context and a clear proceed. Both desired security assertions
+reproduced RED; a first-event snapshot is not an acknowledgment.
 
-`clear_audio()` in automatic mode physically fences queued or transmitted
-unresolved input, just as manual mode already does. The protocol supplies no
-remote buffer-clear acknowledgment to claim. Genuinely still-local conversion
-can be reset, and an already completed original prefix does not permanently
-poison the session's clear path. Automatic `commit_audio()` can flush local
-conversion, but cannot mark its already transmitted input complete by itself.
-No new native control, acknowledgment, timer or admission authority is added.
+The adapter now accepts only a genuine native `voiceActivity` `ACTIVITY_END`
+with a valid `audioOffset`. The offset is measured against the original physical
+16 kHz audio stream. It can retire only a monotonic, already-published converted
+prefix. Missing, malformed, negative, regressed, replayed, unsent or out-of-range
+values cannot retire input. Fractional samples round down; source input retained
+inside the resampler remains pending. Local clear preserves the lifetime stream
+cursor and starts a new local conversion segment, so a previous offset cannot
+be donated to a later source segment. Native audio offsets are not local clocks
+or current-capture counters.
+
+The [native API reference](https://aistudio.google.com/api-reference/live) defines
+that stream offset separately from model-turn completion. Input transcription is
+independently ordered; its text, optional end offset or a model `turnComplete`
+is not used as whole-input acknowledgment. `interactionStatus` is likewise not
+a sample boundary. No new wire field, native control or provider marker is
+invented, and no provider/model support for optional events is assumed.
+
+Actual SDK voice-to-typed positives pass when the owned native peer supplies the
+original `ACTIVITY_END` offset. **The two original unannotated desired R1
+positives remain enabled and RED.** Eventless compatibility is unresolved;
+these positives were not rewritten to add the missing evidence. This partial
+implementation does not close R1 or establish production availability.
+
+`clear_audio()` physically fences unresolved queued or transmitted input. There
+is no fabricated remote buffer-clear acknowledgment. Genuinely still-local
+conversion can be reset. Automatic `commit_audio()` flushes local conversion but
+cannot acknowledge transmitted input by itself; the adapter sends no automatic
+`audioStreamEnd` or activity reset. Reopening an audio stream must not reset its
+original socket lifetime offset.
+
+LiveKit1.4.5 normalizes an AgentSession manual-mode request away when the model
+advertises server turn detection. A stronger actual SDK commit diagnostic showed
+that forcing native manual mode from the original requested setting left that
+pipeline inconsistent, so that production experiment was restored. The new
+floor manual-clear case uses the supported public
+`model.session(turn_detection_disabled=True)` factory; modern lanes retain the
+actual AgentSession manual path. No original uploaded fixture/window/assertion or capability
+skip was changed.
 
 ## Exact SDK tool cancellation port
 

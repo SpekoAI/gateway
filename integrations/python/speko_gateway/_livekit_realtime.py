@@ -7,6 +7,7 @@ import base64
 import dataclasses
 import inspect
 import json
+import re
 import time
 import uuid
 import weakref
@@ -183,8 +184,21 @@ class _Generation:
 @dataclasses.dataclass(frozen=True)
 class _GoogleAudio:
     command: dict[str, Any]
-    source_end: int
-    sequence: int
+    output_end: int
+
+
+def _google_audio_offset(value: Any) -> int | None:
+    # Native protobuf Duration, measured on the ORIGINAL 16 kHz audio stream.
+    # Integer arithmetic rounds partial samples down; no local clock or current
+    # capture counter can supply a missing provider-owned boundary.
+    if not isinstance(value, str) or len(value) > 32:
+        return None
+    match = re.fullmatch(r"(0|[1-9][0-9]*)(?:\.([0-9]{1,9}))?s", value)
+    if match is None:
+        return None
+    seconds, fraction = match.groups()
+    nanoseconds = int(seconds) * 1_000_000_000 + int((fraction or "").ljust(9, "0"))
+    return nanoseconds * 16000 // 1_000_000_000
 
 
 class _RealtimeSession(llm.RealtimeSession):
@@ -210,9 +224,8 @@ class _RealtimeSession(llm.RealtimeSession):
         self._resampler: rtc.AudioResampler | None = None
         self._uncommitted_source_samples = 0
         self._google_source_samples = self._google_output_samples = 0
-        self._google_queued_audio = 0
-        self._google_published_audio = self._google_retired_audio = (0, 0)
-        self._google_turn_audio: tuple[int, int] | None = None
+        self._google_source_base_output = self._google_retired_source = 0
+        self._google_published_audio = self._google_retired_audio = 0
         self._provider_interruption_feedback = False
         self._provider_retired_futures: set[asyncio.Future] = set()
         self._input_rate: int | None = None
@@ -479,14 +492,7 @@ class _RealtimeSession(llm.RealtimeSession):
                 self._enqueue(command)
             else:
                 self._google_output_samples += len(pcm) // 2
-                # Only a source prefix represented by converted PCM can be
-                # retired. Short input still held by Sox remains captured.
-                end = min(
-                    self._google_source_samples,
-                    self._google_output_samples * self._input_rate // self._input_hz,
-                )
-                self._google_queued_audio += 1
-                self._enqueue(_GoogleAudio(command, end, self._google_queued_audio))
+                self._enqueue(_GoogleAudio(command, self._google_output_samples))
         else:
             self._enqueue({"type": "input_audio_buffer.append", "audio": encoded})
 
@@ -510,7 +516,7 @@ class _RealtimeSession(llm.RealtimeSession):
     def clear_audio(self) -> None:
         if self._google and (
             self._audio_active
-            or self._google_queued_audio > self._google_retired_audio[0]
+            or self._google_output_samples > self._google_retired_audio
         ):
             self._fatal(
                 GatewayError(
@@ -525,10 +531,10 @@ class _RealtimeSession(llm.RealtimeSession):
                 input_rate=self._input_rate, output_rate=self._input_hz, num_channels=1
             )
         self._uncommitted_source_samples = 0
-        self._google_source_samples = self._google_output_samples = 0
-        self._google_queued_audio = 0
-        self._google_published_audio = self._google_retired_audio = (0, 0)
-        self._google_turn_audio = None
+        self._google_source_samples = self._google_retired_source = 0
+        # Clear replaces only still-local conversion. Native audioOffset remains
+        # relative to the same original stream after clear; it is never reset.
+        self._google_source_base_output = self._google_output_samples
 
     def generate_reply(
         self,
@@ -937,10 +943,7 @@ class _RealtimeSession(llm.RealtimeSession):
                 async for command in self._commands:
                     if isinstance(command, _GoogleAudio):
                         await self._socket.send_json(command.command)
-                        self._google_published_audio = (
-                            command.sequence,
-                            command.source_end,
-                        )
+                        self._google_published_audio = command.output_end
                         continue
                     if self._google and "toolResponse" in command:
                         responses = command["toolResponse"]["functionResponses"]
@@ -1245,6 +1248,28 @@ class _RealtimeSession(llm.RealtimeSession):
                 raise GatewayError(
                     "Original SDK tool cancellation remains unknown", retryable=False
                 )
+        activity = event.get("voiceActivity")
+        if (
+            not self._manual_turns
+            and isinstance(activity, dict)
+            and activity.get("type") == "ACTIVITY_END"
+        ):
+            end = _google_audio_offset(activity.get("audioOffset"))
+            if (
+                end is not None
+                and self._google_retired_audio < end <= self._google_published_audio
+            ):
+                self._google_retired_audio = end
+                source_end = min(
+                    self._google_source_samples,
+                    max(0, end - self._google_source_base_output)
+                    * self._input_rate
+                    // self._input_hz,
+                )
+                self._uncommitted_source_samples -= (
+                    source_end - self._google_retired_source
+                )
+                self._google_retired_source = source_end
         content = event.get("serverContent", {})
         if content.get("interrupted"):
             if self._generation:
@@ -1267,19 +1292,6 @@ class _RealtimeSession(llm.RealtimeSession):
                 )
             finally:
                 self._provider_interruption_feedback = False
-        if (
-            not self._manual_turns
-            and self._google_turn_audio is None
-            and (
-                content.get("inputTranscription")
-                or content.get("modelTurn")
-                or content.get("outputTranscription")
-                or event.get("toolCall")
-            )
-        ):
-            # Freeze the original published prefix at the first observation.
-            # Later input/queued writes cannot be completed by this turn.
-            self._google_turn_audio = self._google_published_audio
         transcript = content.get("inputTranscription")
         if isinstance(transcript, dict) and transcript.get("text"):
             self._input_item = self._input_item or "google_user_" + uuid.uuid4().hex
@@ -1328,11 +1340,6 @@ class _RealtimeSession(llm.RealtimeSession):
                     },
                 )
         if content.get("turnComplete"):
-            if not self._manual_turns and self._google_turn_audio is not None:
-                _, end = self._google_turn_audio
-                self._uncommitted_source_samples -= end - self._google_retired_audio[1]
-                self._google_retired_audio = self._google_turn_audio
-                self._google_turn_audio = None
             if self._input_item:
                 self._known_items.add(self._input_item)
                 self._chat_ctx.items.append(
