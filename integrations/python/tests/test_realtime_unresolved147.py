@@ -1,4 +1,4 @@
-"""Enabled desired-behavior gates for still-unavailable ownership boundaries."""
+"""Enabled ownership gates and the preserved actual SDK cancellation regression."""
 
 from __future__ import annotations
 

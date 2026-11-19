@@ -9,11 +9,10 @@ The accepted PR142/main lineage is merged normally, including its held-word
 contract, original capture clock, failed standby refusal and empty STT cleanup.
 Go180 grant/allowance/SQL-clock/replay behavior is inherited unchanged.
 
-This continuation fixes four independently reproduced conversation defects:
+This continuation fixes independently reproduced conversation defects:
 
 - Gemini initial history is completed before queued realtime audio is released.
 - Extended-thinking Gemini tools declare the required `NON_BLOCKING` behavior.
-  This setup compatibility alone does not prove cancellable tool execution.
 - Genuine typed user messages reach Gemini before their completion request.
   Context is detached before waits, known native history cannot be rewritten,
   and captured/resampler-held input cannot be overtaken by a typed request.
@@ -22,6 +21,12 @@ This continuation fixes four independently reproduced conversation defects:
   owned by the framework after native `turnComplete`. Exact SDK cleanup is
   distinguished from independent caller cancellation; unresolved local work
   stops the original transport. A local close proves no remote drain or NoIO.
+- Native Gemini tool cancellation latches before waits, cancels only exact
+  framework tasks and separately joins original callback registration and tasks
+  through the private compatibility port described below.
+- GPT transport failure physically closes its original socket and closes owned
+  command/delegation channels before joining children. A latched error is
+  delivered independently of that join; error delivery is not a join receipt.
 
 A short source frame can remain entirely inside the native resampler. Its
 ownership is recorded before conversion. Clearing a still-local frame replaces
@@ -29,22 +34,56 @@ the resampler; it cannot mix the cleared samples into the next commit. An
 already-started Gemini input cannot be remotely cleared through a fabricated
 control. These behaviors are covered with owned actual SDK/sidecar/PCM controls.
 
+## Exact SDK tool cancellation port
+
+The supported LiveKit versions do not expose a public per-call cancellation
+handle to a realtime model. The private port observes only the exact owning
+`AgentSession` instance, captured from its genuine model factory call. It accepts
+registration only in the actual SDK tool-start callback with the original
+`FunctionCall` object and that activity's actual `SpeechHandle`. Completion and
+retained-history notifications issue no registration. Task selection requires
+both original object identities in actual SDK task metadata; matching IDs,
+copied objects or an empty task scan never establish ownership or completion.
+
+The SDK callback runs before creating its actual tool task. The port queues its
+registration observation first, after which the SDK installs task metadata
+synchronously. Owned SDK controls prove cancellation before the first task
+side effect on locked 1.6.8, floor 1.4.5 and retained 1.8.10, including Python
+3.10. This relies on those inspected private SDK implementations, not a portable
+promise about future versions. It patches one instance callback and never
+cancels tasks globally or by provider ID.
+
+Cancellation and closure latch before awaits and request cancellation of known
+original tasks synchronously. Registration and actual task completion join
+separately within one original one-second cancellation budget. Noncooperative,
+missing, copied, late or unowned tasks remain UNKNOWN/unjoined; original task
+references and pending registration hooks remain retained. A timer, cancelled
+future, transport EOF or session close never establishes task completion.
+
+Queued tool results are filtered inside the actual physical write task, after
+its writer lock and task preparation. Other uncancelled results in the same
+batch remain. If cancellation observes an already-entered result write, the
+transport closes and the result remains UNKNOWN; a local latch cannot retract a
+provider result already entering I/O. Previously completed effects or responses
+are not undone. Direct low-level function-stream consumers and wrapper factory
+paths without the exact activity port cannot claim SDK task cancellation.
+
+This is local SDK task control only. It supplies no execution admission,
+provider non-execution, remote NoIO, worker stop, financial release or cleanup
+proof. The actual healthy tool rounds, same-ID independent sessions, callback
+ordering, held physical writes, copied calls, late callbacks and noncooperative
+tasks remain separate controls.
+
 ## Explicit implementation and acceptance blockers
 
-Three enabled desired-behavior gates remain on the ordinary test path:
+Two enabled desired-behavior gates remain on the ordinary test path:
 
-1. **Gemini task cancellation.** A native cancellation names an original call,
-   but the supported SDK function stream exposes no portable per-call owned
-   cancellation/join handle to this model. The actual AgentSession tool can
-   still perform its synthetic effect after cancellation is received. The
-   existing healthy Gemini tool contract is preserved; replacing it with a
-   blanket refusal is not claimed as an implementation of cancellation.
-2. **Scoped GPT task delivery.** The native commentary request has no echoed
+1. **Scoped GPT task delivery.** The native commentary request has no echoed
    causal binding to a later client delegation. The actual delegated backend
    receives startup/history but not the scoped application ask. Retaining a
    global or next-delegation instruction would donate the ask to unrelated old
    work, so that remembered-instruction workaround is not installed.
-3. **Repeated GPT reply ownership.** Two ordinary application asks remain
+2. **Repeated GPT reply ownership.** Two ordinary application asks remain
    callable. Delayed audio from a retired first ask can resolve the second
    reply handle. GPT-Live audio has no per-response/delegation identity or
    response-audio completion marker. Backend completion, a preamble, silence,
@@ -52,12 +91,11 @@ Three enabled desired-behavior gates remain on the ordinary test path:
    provider work drained. The user explicitly requires repeated
    `generate_reply()` support; a one-ask restriction is not installed.
 
-The minimum missing boundaries are an SDK-owned native-call cancellation and
-actual task-join port, and provider-backed per-ask/delegation/audio identity plus
-terminal ownership (or an independently accepted per-ask admission/render
-path). They are requirements, not new wire fields, authentication endpoints,
-issuers or mounted adapters. Constructing another client with the same supplied
-credential is not a fresh authority allocation.
+The missing boundary is provider-backed per-ask/delegation/audio identity plus
+terminal ownership, or an independently accepted per-ask admission/render path.
+This requirement is not a new wire field, authentication endpoint, issuer or
+mounted adapter. Constructing another client with the same supplied credential
+is not a fresh authority allocation.
 
 The owned peers use synthetic content and actual Go/SDK transport. They prove
 local behavior, not provider/factory activation, model funding, execution

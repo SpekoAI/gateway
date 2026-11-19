@@ -11,7 +11,7 @@ import asyncio
 import json
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any, Literal
 
 import aiohttp
@@ -134,6 +134,14 @@ class RelayRealtimeSession:
         return self._websocket.close_code
 
     async def send(self, frame: str | bytes) -> None:
+        await self._send_guarded(frame)
+
+    async def _send_guarded(
+        self,
+        frame: str | bytes,
+        before_write: Callable[[], bool] | None = None,
+        encode: Callable[[], str] | None = None,
+    ) -> None:
         if not isinstance(frame, (str, bytes)):
             raise TypeError("Native realtime frames must be text or bytes")
         size = len(frame.encode("utf-8")) if isinstance(frame, str) else len(frame)
@@ -143,12 +151,19 @@ class RelayRealtimeSession:
             if self._closed:
                 raise GatewayError("Relay realtime socket is closed", retryable=False)
             try:
-                write = (
-                    self._websocket.send_str(frame)
-                    if isinstance(frame, str)
-                    else self._websocket.send_bytes(frame)
-                )
-                await asyncio.wait_for(write, 15)
+
+                async def write() -> None:
+                    # The physical task is created before the final local cut.
+                    # No await separates that cut from the actual socket call.
+                    if before_write is not None and not before_write():
+                        return
+                    selected = encode() if encode is not None else frame
+                    if isinstance(selected, str):
+                        await self._websocket.send_str(selected)
+                    else:
+                        await self._websocket.send_bytes(selected)
+
+                await asyncio.wait_for(write(), 15)
             except (aiohttp.ClientError, OSError, TimeoutError, asyncio.TimeoutError):
                 raise GatewayError(
                     "Relay realtime write failed", retryable=False
@@ -160,6 +175,18 @@ class RelayRealtimeSession:
                 event, ensure_ascii=False, allow_nan=False, separators=(",", ":")
             )
         )
+
+    async def _send_json_guarded(
+        self, event: dict[str, Any], before_write: Callable[[], bool]
+    ) -> None:
+        def encode() -> str:
+            return json.dumps(
+                event, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            )
+
+        # The guard may remove only cancelled native results. Serialize that
+        # selected subset inside the same physical task, after the final cut.
+        await self._send_guarded(encode(), before_write, encode)
 
     async def events(self) -> AsyncIterator[str | bytes]:
         if self._reading:

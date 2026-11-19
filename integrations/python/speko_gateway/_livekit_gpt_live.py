@@ -178,6 +178,7 @@ class _GPTLiveSession(_Session):
         self._ready = asyncio.get_running_loop().create_future()
         self._remote_closed = asyncio.Event()
         self._failure: GatewayError | None = None
+        self._error_announced = False
         self._running = False
         self._task = asyncio.create_task(self._run(), name="SpekoGPTLive")
 
@@ -531,10 +532,23 @@ class _GPTLiveSession(_Session):
             for task in done:
                 task.result()
         except asyncio.CancelledError:
-            pass
+            if not self._closing:
+                self._failure = self._failure or _failure()
         except Exception:  # noqa: BLE001 -- vendor content never enters logs/errors
             self._failure = self._failure or _failure()
         finally:
+            # A completed receive can race cancellation on Python 3.10. Stop
+            # the owned physical socket before joining either child task.
+            if self._socket is not None:
+                self._socket.abort()
+            # Publish the latched failure before closing the audio channel can
+            # make SDK cleanup race the error delivery. This is not a join ACK.
+            self._announce_error()
+            # A canceled channel receive may already have completed on 3.10.
+            # Close the owned channels before joining, so another iteration
+            # cannot wait forever after it consumes that completed receive.
+            self._commands.close()
+            self._delegations.close()
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -547,19 +561,23 @@ class _GPTLiveSession(_Session):
             if not self._ready.done():
                 self._ready.set_exception(self._failure or _failure())
                 self._ready.exception()  # safe when framework never called start()
-            if self._failure is not None:
-                self.emit(
-                    "error",
-                    llm.RealtimeModelError(
-                        timestamp=time.time(),
-                        label=self._model.label,
-                        error=self._failure,
-                        recoverable=False,
-                    ),
-                )
+            self._announce_error()
             if self._socket is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(self._socket.aclose(), 1)
+
+    def _announce_error(self) -> None:
+        if self._failure is not None and not self._error_announced:
+            self._error_announced = True
+            self.emit(
+                "error",
+                llm.RealtimeModelError(
+                    timestamp=time.time(),
+                    label=self._model.label,
+                    error=self._failure,
+                    recoverable=False,
+                ),
+            )
 
     def _fatal(self) -> None:
         if self._failure is None:

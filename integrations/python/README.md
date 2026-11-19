@@ -683,9 +683,11 @@ Those attachments are posted separately: older Gateways may reject them while
 unrelated turn markers remain deliverable. The probe counts rejected markers
 without retrying them.
 
-The PR147 realtime continuation remains **unaccepted** while its enabled tool
-cancellation and GPT scoped/repeated reply ownership gates are failing. Repeated
-GPT application asks remain in the API; a one-ask refusal is not a replacement
-for the supported contract. See [native realtime review boundaries](../../docs/native-realtime-review-boundaries.md)
-for the exact fixed behavior, retained tests and missing cancellation/correlation
-ports. These library callsites issue no fresh execution or funding authority.
+The PR147 realtime continuation remains **unaccepted** while its enabled GPT
+scoped/repeated reply ownership gates are failing. Repeated GPT application asks
+remain in the API; a one-ask refusal is not a replacement for the supported
+contract. Gemini cancellation uses an exact private SDK task/registration port;
+missing or noncooperative ownership remains UNKNOWN. See
+[native realtime review boundaries](../../docs/native-realtime-review-boundaries.md)
+for fixed behavior, retained tests and the missing GPT correlation boundary.
+These library callsites issue no fresh execution or funding authority.

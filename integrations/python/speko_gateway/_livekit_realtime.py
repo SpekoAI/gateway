@@ -19,6 +19,7 @@ from livekit.agents.utils import is_given
 from livekit.agents.utils.aio.channel import ChanFull
 
 from ._livekit_context import snapshot_context
+from ._livekit_tool_cancellation import SdkToolCancellation, capture_activity
 from ._livekit_tools import _relay_tools
 from ._relay_transport import _error
 from .client import GatewayError
@@ -109,6 +110,8 @@ class RealtimeModel(llm.RealtimeModel):
             raise GatewayError("Realtime model attempt is exhausted", retryable=False)
         self._used = True
         session = _RealtimeSession(self, turn_detection_disabled)
+        if session._google:
+            session._tool_port = SdkToolCancellation(session, capture_activity(self))
         self._sessions.add(session)
         return session
 
@@ -194,6 +197,7 @@ class _RealtimeSession(llm.RealtimeSession):
         self._commands = utils.aio.Chan[dict[str, Any]](maxsize=256)
         self._socket: RelayRealtimeSession | None = None
         self._generation: _Generation | None = None
+        self._tool_port: SdkToolCancellation | None = None
         self._pending: deque[asyncio.Future[llm.GenerationCreatedEvent]] = deque()
         self._pending_timers: dict[asyncio.Future, asyncio.TimerHandle] = {}
         self._resampler: rtc.AudioResampler | None = None
@@ -349,6 +353,14 @@ class _RealtimeSession(llm.RealtimeSession):
                     }
                 )
                 self._known_items.update(item.id for item in typed)
+            cancelled_results = [
+                item
+                for item in items
+                if isinstance(item, llm.FunctionCallOutput)
+                and self._tool_port is not None
+                and self._tool_port.is_cancelled(item.call_id)
+            ]
+            self._known_items.update(item.id for item in cancelled_results)
             results = [
                 item
                 for item in items
@@ -892,7 +904,19 @@ class _RealtimeSession(llm.RealtimeSession):
 
             async def send() -> None:
                 async for command in self._commands:
-                    await self._socket.send_json(command)
+                    if self._google and "toolResponse" in command:
+                        responses = command["toolResponse"]["functionResponses"]
+                        if self._tool_port is None:
+                            raise GatewayError(
+                                "Original tool result ownership is unavailable",
+                                retryable=False,
+                            )
+                        await self._socket._send_json_guarded(
+                            command,
+                            self._tool_port.response_guard(responses),
+                        )
+                    else:
+                        await self._socket.send_json(command)
 
             writer = asyncio.create_task(send())
 
@@ -914,6 +938,7 @@ class _RealtimeSession(llm.RealtimeSession):
                 for task in done:
                     task.result()
             finally:
+                self._socket.abort()
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
         except asyncio.CancelledError:
@@ -925,11 +950,20 @@ class _RealtimeSession(llm.RealtimeSession):
                 else GatewayError("Realtime session failed", retryable=False)
             )
         finally:
+            if self._tool_port is not None:
+                self._tool_port.request_close()
+            if self._socket is not None:
+                self._socket.abort()
+            self._commands.close()
             if writer is not None:
                 writer.cancel()
                 await asyncio.gather(writer, return_exceptions=True)
             if self._socket is not None:
                 await self._socket.aclose()
+            if self._tool_port is not None and not await self._tool_port.aclose():
+                self._failure = self._failure or GatewayError(
+                    "Original SDK tool tasks remain unjoined", retryable=False
+                )
             self._commands.close()
             if self._generation:
                 self._generation.close()
@@ -957,6 +991,8 @@ class _RealtimeSession(llm.RealtimeSession):
                 )
 
     def _fatal(self, failure: GatewayError) -> None:
+        if self._tool_port is not None:
+            self._tool_port.request_close()
         if self._failure is None:
             self._failure = failure
             if self._socket is not None:
@@ -1067,6 +1103,8 @@ class _RealtimeSession(llm.RealtimeSession):
             name=item["name"],
             arguments=arguments,
         )
+        if self._tool_port is not None:
+            self._tool_port.record(call)
         generation.calls.add(call_id)
         self._known_items.add(call.id)
         self._chat_ctx.items.append(call)
@@ -1155,6 +1193,20 @@ class _RealtimeSession(llm.RealtimeSession):
     async def _google_event(self, event: dict[str, Any]) -> None:
         if "goAway" in event:
             raise GatewayError("Realtime provider session is ending", retryable=False)
+        cancellation = event.get("toolCallCancellation")
+        if cancellation is not None:
+            identities = (
+                cancellation.get("ids") if isinstance(cancellation, dict) else None
+            )
+            if (
+                not isinstance(identities, list)
+                or not all(isinstance(identity, str) for identity in identities)
+                or self._tool_port is None
+                or not await self._tool_port.cancel(identities)
+            ):
+                raise GatewayError(
+                    "Original SDK tool cancellation remains unknown", retryable=False
+                )
         content = event.get("serverContent", {})
         if content.get("interrupted"):
             if self._generation:
@@ -1250,6 +1302,8 @@ class _RealtimeSession(llm.RealtimeSession):
 
     async def aclose(self) -> None:
         self._closed = True
+        if self._tool_port is not None:
+            self._tool_port.request_close()
         self._configured.set()
         if self._running:
             self._task.cancel()
