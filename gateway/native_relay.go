@@ -375,9 +375,19 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer done()
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		// A WebSocket upgrade has no request body. Refuse before opening
+		// the relay, and never drain an unfinished body to write its refusal.
+		r.Close = true
+		w.Header().Set("Connection", "close")
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		writeError(w, http.StatusBadRequest, "invalid_request", "native WebSocket upgrades do not accept a body")
+		return
+	}
 	endpoint := *s.origin
 	endpoint.Path = r.URL.Path
 	dialCtx, cancelDial := context.WithTimeout(ctx, s.setupTimeout)
+	setupDeadline, _ := dialCtx.Deadline()
 	// websocket.Dial retains only 1 KiB of an unsuccessful upgrade body.
 	// Capture the bounded canonical envelope before that diagnostic truncation.
 	client := *s.client
@@ -428,11 +438,28 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer upstream.CloseNow()
+	control := http.NewResponseController(w)
+	_ = control.SetReadDeadline(setupDeadline)
+	_ = control.SetWriteDeadline(setupDeadline)
+	setupJoined := make(chan struct{})
+	stopSetup := context.AfterFunc(ctx, func() {
+		defer close(setupJoined)
+		_ = control.SetReadDeadline(time.Now())
+		_ = control.SetWriteDeadline(time.Now())
+		_ = upstream.CloseNow()
+	})
+	defer func() {
+		if !stopSetup() {
+			<-setupJoined
+		}
+	}()
 	local, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer local.CloseNow()
+	_ = control.SetReadDeadline(time.Time{})
+	_ = control.SetWriteDeadline(time.Time{})
 	upstream.SetReadLimit(nativeMaxFrameBytes)
 	local.SetReadLimit(nativeMaxFrameBytes)
 	stop := context.AfterFunc(ctx, func() { _ = upstream.CloseNow(); _ = local.CloseNow() })

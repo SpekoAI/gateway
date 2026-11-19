@@ -1239,6 +1239,14 @@ class SynthesisStream(tts.SynthesizeStream):
                 if not isinstance(self._plugin._client, RelaySpeechClient):
                     await self._gateway_stream.append_text(first_token)
                 return
+            if isinstance(self._plugin._client, RelaySpeechClient):
+                # This reply already selected the physical native admission.
+                # Failure before ready cannot authorize a replacement request.
+                raise GatewayError(
+                    "Native TTS selected standby requires a recovery decision",
+                    code="recovery_required",
+                    retryable=False,
+                )
             self._plugin._close_soon(standby)
         self._session = _TTSSession(self._bridge)
         try:

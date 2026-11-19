@@ -1,6 +1,8 @@
 package gateway_test
 
 import (
+	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -44,6 +46,26 @@ func TestNativeRelayBodyBearingUpgradeRefusesBeforeAnyUpstream(t *testing.T) {
 			time.Sleep(3 * setup)
 			if upstream.Load() != 0 || server.Stats().ActiveSessions != 0 {
 				t.Fatalf("body-bearing upgrade escaped/refused late: upstream=%d active=%d", upstream.Load(), server.Stats().ActiveSessions)
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+			if err != nil {
+				t.Fatal("body refusal did not reach the actual socket", err)
+			}
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("body refusal status: %d", response.StatusCode)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			probe, _, err := websocket.Dial(ctx, local.URL+"/v1/stt/stream", &websocket.DialOptions{HTTPHeader: nativeHeaders("sk_speko_agent_owned")})
+			if err != nil {
+				t.Fatal("body-bearing upgrade retained the only native slot", err)
+			}
+			_ = probe.CloseNow()
+			nativeAwait(t, func() bool { return server.Stats().ActiveSessions == 0 })
+			if upstream.Load() != 1 {
+				t.Fatal("legitimate upgrade did not use exactly one upstream", upstream.Load())
 			}
 		})
 	}
