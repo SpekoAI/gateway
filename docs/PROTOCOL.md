@@ -186,6 +186,18 @@ rewrites a delivered transcript, so a client that stores speakers applies the
 merge itself. Scribe v3 Live `transcript.delta` data carries the vendor's
 `turn_probability`, the estimated chance that the speaker has finished.
 
+On a diarized Soniox session, `transcript.delta` and `transcript.final` data
+both carry `words` in the same shape: each word with the vendor's label as
+`speaker` and its `start_ms` and `end_ms`, plus a top-level `speaker` when one
+speaker said every word. Soniox labels every token, final or not, so each
+delta attributes its whole hypothesis (the segment's finalized words plus the
+provisional tail) as soon as it is heard, and finals are not held back for
+labels. A delta's labels are provisional: a later delta or the final may
+change them. Soniox's word pieces are joined into words, and a word starts
+wherever the speaker changes. A word Soniox left unlabelled has no `speaker`,
+and its event then has no top-level `speaker`. Soniox notes that endpoint
+detection, which this adapter always enables, lowers diarization accuracy.
+
 ### Realtime sessions: OpenAI Realtime and GPT-Live
 
 `kind: "realtime"` opens a speech-to-speech session. The setup body carries
