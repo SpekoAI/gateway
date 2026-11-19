@@ -360,7 +360,22 @@ func (c *continuation) renew(previous time.Time) {
 		anchored := time.Now()
 		hardDeadline := anchored.Add(horizon.Sub(c.clock.now()))
 		c.session.providerMu.Lock()
+		// The wait can also cross a wall/monotonic divergence. Join any
+		// in-flight trusted refresh before reading its latest horizon; a
+		// server response observed by another goroutine is not installation.
+		if err := c.synchronize(ctx); err != nil {
+			c.session.providerMu.Unlock()
+			failure = err
+			break
+		}
 		c.mu.Lock()
+		// A trusted sample may have completed while providerMu was held,
+		// before a replacement existed for synchronize to tighten. Reconcile
+		// that same signed horizon atomically with registration. Keep the
+		// original elapsed cap if SQL moved backward; never restart its life.
+		if deadline := time.Now().Add(horizon.Sub(c.clock.now())); deadline.Before(hardDeadline) {
+			hardDeadline = deadline
+		}
 		if ctx.Err() != nil || !time.Now().Before(hardDeadline) {
 			c.mu.Unlock()
 			c.session.providerMu.Unlock()

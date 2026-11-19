@@ -135,8 +135,11 @@ func (s *physicalSocket) startClose(interrupt bool) *physicalCloseAttempt {
 				s.timer.Stop()
 			}
 		}
-		retry := interrupt && s.retryInterrupt && !s.closed
-		if interrupt {
+		// A queued interrupt belongs to the socket, not the occupied slot.
+		// Either failed attempt can free capacity while the other return is
+		// held, including normal Close completing after physical expiry.
+		retry := s.retryInterrupt && !s.closed
+		if retry {
 			s.retryInterrupt = false
 		}
 		if s.closed && s.active == 0 && !s.joined {

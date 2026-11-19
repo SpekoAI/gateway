@@ -125,6 +125,11 @@ minimum before `Resume` can block. A fresh accepted SQL sample tightens its
 temporary timer and its actual physical owner even while setup or the original
 `Resume` return is held. The read-only context accessor exposes only this
 original, possibly shortened cap; it cannot mint a new horizon. The provider
+lock wait itself can cross a completed SQL refresh or clock divergence. After
+that wait, the coordinator joins any required refresh and reconciles the latest
+trusted time with the original cap under the replacement-registration lock.
+Already expired replacements refuse before provider setup; backward SQL never
+extends the original elapsed deadline. The provider
 registers one pending socket owner before dialing and attaches the upgraded
 transport before handshake/setup. Tightening before acquisition is retained
 and applied to that exact transport; a later deadline cannot extend it.
@@ -171,6 +176,9 @@ or a completed failed slot can be used while the prior interrupt is held. This
 also covers cancellation during invalid-upgrade diagnostic reads, before the
 SDK has called normal Close. A failed attempt preserves its diagnostic but
 does not latch future interruption.
+If expiry queues another interruption while both slots are occupied, either
+failed close completion can consume that retry when it frees a slot. The normal
+slot need not finish before expiry, and a held interrupt return cannot strand it.
 The original cap remains armed while closure is unproven. Serialized teardown
 waits for actual successful/already-closed transport evidence and every active
 attempt to join before releasing capacity. Detach is prompt; replacement setup
