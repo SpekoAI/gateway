@@ -49,12 +49,21 @@ type Config struct {
 // appended since the last commit) is ignored and the session stays open;
 // other providers end the session.
 //
-// Limit: an utterance fails when a Cartesia context it sent text to ends
-// without any audio of its own, but a context that speaks only part of its
-// text is not detected (with buffering Cartesia tags no fragment, and with
-// max_buffer_delay_ms 0 a fragment with nothing to voice, such as "!", gets
-// no audio just as a dropped one would; dropped speech was never observed in
-// the probe). The adapter does not inspect text.
+// Cartesia ends a context nobody committed on its own; that expiry ends the
+// vendor's context, not the caller's utterance. A fragment opens a new context
+// of the same utterance once the current one has had no fragment for
+// max(2 s, the configured max_buffer_delay_ms, 3 s by default) and no audio
+// or flush_done for 2 s, unless that context was sent text and has not
+// answered with any audio yet; until then it continues the current context.
+// A socket Cartesia closes in the middle of an utterance is a retryable error
+// by design. An utterance sent text other than whitespace that produced no
+// audio at all is a retryable error; one that produced any audio ends
+// normally.
+//
+// Limit: the adapter does not detect partial speech, neither inside a context
+// nor a continuation context that ends without audio: Cartesia gives no
+// reliable per-fragment marker, and dropped speech was not observed in the
+// live probe. The adapter does not inspect text.
 type Adapter struct {
 	id              string
 	version         string
@@ -304,30 +313,21 @@ func validateGenerationOptions(model string, options protocol.RequestOptions, me
 // never be written to a context that may be expiring:
 //
 //   - An utterance owns an ordered list of contexts and speaks through the
-//     newest. A fragment that finds that context quiet (no unanswered speech,
-//     nothing for quietGap since its last audio, flush_done or fragment, and
-//     nothing for the buffer delay since its last fragment) abandons it and
-//     opens a new context in the same utterance, whose word timings continue
-//     after the audio already sent. An abandoned context is never written
-//     again.
+//     newest. A fragment that finds that context quiet (not awaiting its
+//     first audio, nothing for quietGap since its last audio, flush_done or
+//     fragment, and nothing for the buffer delay since its last fragment)
+//     abandons it and opens a new context in
+//     the same utterance, whose word timings continue after the audio already
+//     sent. An abandoned context is never written again.
 //   - Frames are accepted only for the open utterance's newest context while
-//     it can still speak. Frames for any other context — the expiry done of an
-//     abandoned one, stale frames of an earlier utterance — are dropped and
-//     reported as warnings, never emitted as audio, timings or done.
+//     it can still speak, by context id alone. Frames for any other context —
+//     the expiry done of an abandoned one, stale frames of an earlier
+//     utterance — are dropped and reported as warnings, never emitted as
+//     audio, timings or done.
 //   - The utterance ends once: at the done of its committed context, or at the
-//     commit itself when no context can speak any more. Text that ends with no
-//     audio is a retryable error, not a done.
-//   - Speech is accounted per context: a context sent any text that is not
-//     all whitespace owes audio until a PCM chunk of its own arrives. With
-//     max_buffer_delay_ms 0 Cartesia flushes after every transcript frame and
-//     tags the audio of a context's frame i with flush_id i, counting from 0
-//     (measured live on 2026-11-20, sonic-3.6, API 2026-03-01), so there a
-//     chunk counts only when it carries an explicit flush_id of a frame
-//     written to that context; flush_done proves nothing. A done while audio
-//     is owed means Cartesia ended the context without speaking it: the
-//     utterance fails with a retryable error, before any done, saying how
-//     much of its audio was already sent, and nothing is re-sent. Speech
-//     dropped inside a context is not detected (see Adapter).
+//     commit itself when no context can speak any more. An utterance sent
+//     text other than whitespace that ends with no audio at all is a
+//     retryable error, not a done.
 //   - A socket Cartesia closes while no context can speak is replaced by the
 //     next fragment, which was certainly not sent. A socket that closes while
 //     a context can speak, or while a frame is being written, fails the
@@ -384,9 +384,10 @@ type utterance struct {
 	current       *vendorContext
 	lastContextID string
 	committed     bool
-	text          bool
-	audioStarted  bool
-	audioBytes    int
+	// speech is set once the utterance was sent text other than whitespace.
+	speech       bool
+	audioStarted bool
+	audioBytes   int
 }
 
 type vendorContext struct {
@@ -397,15 +398,14 @@ type vendorContext struct {
 	offset    float64
 	committed bool
 	cancelled bool
-	// Audio owed, see unansweredLocked: speech is set once the context was
-	// sent text that is not all whitespace, pcm counts the audio bytes it
-	// answered with, and frames counts the transcript frames written (with
-	// max_buffer_delay_ms 0, the next one's flush_id).
-	speech       bool
-	pcm          int
-	frames       int
-	lastFragment time.Time
-	lastAnswer   time.Time
+	// awaitingAudio is set while the context was sent text other than
+	// whitespace and has not answered with any audio yet; such a context is
+	// never quiet, so audio still on its way (a buffered fragment is released
+	// only after max_buffer_delay_ms) is not dropped. It never fails anything.
+	awaitingAudio bool
+	heardAudio    bool
+	lastFragment  time.Time
+	lastAnswer    time.Time
 }
 
 const (
@@ -414,8 +414,7 @@ const (
 	// was 3.9 s after the last audio chunk. If Cartesia ever expires a context
 	// sooner (its docs say 1 s after the last audio output), a fragment written
 	// to it is never emitted in the wrong utterance: its frames are dropped,
-	// and the utterance fails retryably only when that context had no audio of
-	// its own (see the limit on Adapter).
+	// and the utterance goes on without it (see the limit on Adapter).
 	quietGap = 2 * time.Second
 	// defaultBufferDelay is Cartesia's documented max_buffer_delay_ms default.
 	defaultBufferDelay = 3 * time.Second
@@ -624,10 +623,9 @@ func (s *stream) beginFragment(text string) (contextID string, conn *websocket.C
 	}
 	c := u.current
 	c.lastFragment = now
-	u.text = true
-	c.frames++
 	if strings.TrimSpace(text) != "" {
-		c.speech = true
+		u.speech = true
+		c.awaitingAudio = !c.heardAudio
 	}
 	s.writing, s.lostWhileWriting = true, false
 	return c.id, s.conn, nil
@@ -651,7 +649,7 @@ func (s *stream) beginCommit() (contextID string, conn *websocket.Conn, ended, n
 		s.abandonLocked(u)
 	}
 	if u.current == nil {
-		contextID, noAudio = u.lastContextID, u.text && u.audioBytes == 0
+		contextID, noAudio = u.lastContextID, u.speech && u.audioBytes == 0
 		s.endUtteranceLocked()
 		return contextID, nil, true, noAudio, nil
 	}
@@ -706,10 +704,11 @@ func (s *stream) send(ctx context.Context, conn *websocket.Conn, value any) erro
 	return err
 }
 
-// quietLocked reports whether a context may be expiring: it owes no speech
-// and has heard nothing for quietGap, nor a fragment for the buffer delay.
+// quietLocked reports whether a context may be expiring: it is not awaiting
+// its first audio and has heard nothing for quietGap, nor a fragment for the
+// buffer delay.
 func (s *stream) quietLocked(c *vendorContext, now time.Time) bool {
-	if c.committed || c.cancelled || s.unansweredLocked(c) {
+	if c.committed || c.cancelled || c.awaitingAudio {
 		return false
 	}
 	last := c.lastFragment
@@ -717,12 +716,6 @@ func (s *stream) quietLocked(c *vendorContext, now time.Time) bool {
 		last = c.lastAnswer
 	}
 	return now.Sub(last) > quietGap && now.Sub(c.lastFragment) > s.bufferDelay
-}
-
-// unansweredLocked reports whether the context was sent text that is not all
-// whitespace and has not answered with any audio of its own.
-func (s *stream) unansweredLocked(c *vendorContext) bool {
-	return c.speech && c.pcm == 0
 }
 
 func (s *stream) openContextLocked(u *utterance) error {
@@ -774,20 +767,16 @@ func (s *stream) acceptLocked(contextID string) (*utterance, *vendorContext, boo
 	return u, u.current, true
 }
 
-// acceptAudio takes an audio chunk for the current context, with the flush_id
-// it carries (nil when it has none); started reports the utterance's first
-// audio. With max_buffer_delay_ms 0 only a chunk tagged with one of the
-// context's own frames answers it.
-func (s *stream) acceptAudio(contextID string, flushID *int, bytes int) (accepted, started bool) {
+// acceptAudio takes an audio chunk for the current context; started reports
+// the utterance's first audio.
+func (s *stream) acceptAudio(contextID string, bytes int) (accepted, started bool) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	u, c, ok := s.acceptLocked(contextID)
 	if !ok {
 		return false, false
 	}
-	if s.bufferDelay != 0 || (flushID != nil && *flushID >= 0 && *flushID < c.frames) {
-		c.pcm += bytes
-	}
+	c.awaitingAudio, c.heardAudio = false, true
 	c.lastAnswer = s.now()
 	u.audioBytes += bytes
 	started = !u.audioStarted
@@ -825,50 +814,30 @@ const (
 	doneExpired
 	doneFinished
 	doneNoAudio
-	// doneUnspoken: the context ended with text it never answered with audio;
-	// part of the utterance, or all of it, will not be heard.
-	doneUnspoken
 )
 
-// acceptDone decides what a done frame means. emitted is the utterance's
-// audio already sent, for an utterance that ends unspoken.
-func (s *stream) acceptDone(contextID string) (outcome doneOutcome, emitted time.Duration) {
+// acceptDone decides what a done frame means.
+func (s *stream) acceptDone(contextID string) doneOutcome {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	u, c, ok := s.acceptLocked(contextID)
 	switch {
 	case !ok:
-		return doneDropped, 0
+		return doneDropped
 	case c.cancelled:
 		s.endUtteranceLocked()
-		return doneFinished, 0
-	case s.unansweredLocked(c):
-		emitted = s.audioDuration(u.audioBytes)
-		noAudio := u.audioBytes == 0
-		s.endUtteranceLocked()
-		if noAudio {
-			return doneNoAudio, 0
-		}
-		return doneUnspoken, emitted
+		return doneFinished
 	case c.committed || s.closing.Load():
-		noAudio := c.committed && u.text && u.audioBytes == 0
+		noAudio := c.committed && u.speech && u.audioBytes == 0
 		s.endUtteranceLocked()
 		if noAudio {
-			return doneNoAudio, 0
+			return doneNoAudio
 		}
-		return doneFinished, 0
+		return doneFinished
 	default:
 		s.abandonLocked(u)
-		return doneExpired, 0
+		return doneExpired
 	}
-}
-
-// audioDuration is the length of bytes of the session's pcm_s16le mono audio.
-func (s *stream) audioDuration(bytes int) time.Duration {
-	if s.media.SampleRateHz <= 0 {
-		return 0
-	}
-	return time.Duration(bytes) * time.Second / time.Duration(2*s.media.SampleRateHz)
 }
 
 // ownsCurrent reports whether a frame names the open utterance's current
@@ -980,7 +949,7 @@ func (s *stream) handleMessage(payload []byte) error {
 		if err != nil {
 			return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia sent invalid audio data", Retryable: true, Cause: err}
 		}
-		accepted, started := s.acceptAudio(message.ContextID, message.FlushID, len(audio))
+		accepted, started := s.acceptAudio(message.ContextID, len(audio))
 		if !accepted {
 			return s.emitDropped(message, raw)
 		}
@@ -1002,14 +971,11 @@ func (s *stream) handleMessage(payload []byte) error {
 		}
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, "flush_done"), Extensions: extension(raw)})
 	case "done":
-		outcome, emitted := s.acceptDone(message.ContextID)
-		switch outcome {
+		switch s.acceptDone(message.ContextID) {
 		case doneDropped:
 			return s.emitDropped(message, raw)
 		case doneExpired:
 			return nil
-		case doneUnspoken:
-			return unspokenError(emitted)
 		case doneNoAudio:
 			return noAudioError()
 		default:
@@ -1057,17 +1023,6 @@ func unknownSendError(cause error) *runtimepkg.ProviderError {
 		Hint:      "The provider connection failed while sending this utterance; retry the utterance on a new session.",
 		Retryable: true,
 		Cause:     cause,
-	}
-}
-
-// unspokenError reports an utterance Cartesia ended with part of its text
-// never spoken, after emitted of its audio was already sent.
-func unspokenError(emitted time.Duration) *runtimepkg.ProviderError {
-	return &runtimepkg.ProviderError{
-		Code:      "provider_unavailable",
-		Message:   fmt.Sprintf("Cartesia ended the utterance with part of its text unspoken, after %d ms of its audio was sent", emitted.Milliseconds()),
-		Hint:      "Part of this utterance was not synthesized after its audio began; retry the utterance on a new session.",
-		Retryable: true,
 	}
 }
 
@@ -1271,7 +1226,4 @@ type inbound struct {
 	Error          json.RawMessage `json:"error"`
 	RequestID      string          `json:"request_id"`
 	WordTimestamps json.RawMessage `json:"word_timestamps"`
-	// FlushID tags an audio chunk with the transcript frame it speaks; nil
-	// when the frame has no flush_id, which is not frame 0.
-	FlushID *int `json:"flush_id"`
 }
