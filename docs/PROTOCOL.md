@@ -186,17 +186,29 @@ rewrites a delivered transcript, so a client that stores speakers applies the
 merge itself. Scribe v3 Live `transcript.delta` data carries the vendor's
 `turn_probability`, the estimated chance that the speaker has finished.
 
-On a diarized Soniox session, `transcript.delta` and `transcript.final` data
-both carry `words` in the same shape: each word with the vendor's label as
-`speaker` and its `start_ms` and `end_ms`, plus a top-level `speaker` when one
-speaker said every word. Soniox labels every token, final or not, so each
-delta attributes its whole hypothesis (the segment's finalized words plus the
-provisional tail) as soon as it is heard, and finals are not held back for
-labels. A delta's labels are provisional: a later delta or the final may
-change them. Soniox's word pieces are joined into words, and a word starts
+On a diarized Soniox session, `transcript.final` data carries `words` in the
+Scribe v3 Live shape: each word with the vendor's label as `speaker` and its
+`start_ms` and `end_ms`, plus a top-level `speaker` when one speaker said
+every word. Soniox's word pieces are joined into words, and a word starts
 wherever the speaker changes. A word Soniox left unlabelled has no `speaker`,
-and its event then has no top-level `speaker`. Soniox notes that endpoint
-detection, which this adapter always enables, lowers diarization accuracy.
+and its final then has no top-level `speaker`.
+
+Soniox labels every token, final or not, so each `transcript.delta` attributes
+its whole hypothesis (the segment's finalized words plus the provisional tail)
+as soon as it is heard, and finals are not held back for labels. A delta
+carries `speaker_runs` instead of `words`: one entry per stretch one speaker
+said, with `speaker`, `start_ms`, `end_ms`, and `text_start` and `text_end`,
+the run's offsets into the delta's `text` in Unicode code points, end
+exclusive (Python's `text[text_start:text_end]`). A run starts wherever the
+label changes, inside a word too. The run's text is not repeated, so labels
+keep a long delta close to its unlabelled size. A delta with one run also
+carries a top-level `speaker`. A delta's labels are provisional: a later
+delta or the final may change them.
+
+On both events, a word's or run's `start_ms` is its first piece's start and
+`end_ms` its last piece's end; either is absent when that piece has no time.
+Soniox notes that endpoint detection, which this adapter always enables,
+lowers diarization accuracy.
 
 ### Realtime sessions: OpenAI Realtime and GPT-Live
 
