@@ -252,11 +252,14 @@ func validateGenerationOptions(model string, options protocol.RequestOptions, me
 // things Cartesia ends on its own are absorbed here instead of ending the
 // session:
 //
-//   - A context expires one second after its last audio output
-//     (https://docs.cartesia.ai/use-the-api/tts-websocket/contexts.md), so a
-//     caller who pauses inside an utterance outlives it. The caller's
-//     utterance stays open: its next fragment opens a fresh context and its
-//     commit finishes the utterance, sending nothing when no context is left.
+//   - A context nobody committed expires
+//     (https://docs.cartesia.ai/use-the-api/tts-websocket/contexts.md says one
+//     second after its last audio; measured live with max_buffer_delay_ms 0,
+//     an ordinary done frame came 4 to 6 s after the last input), so a caller
+//     who pauses inside an utterance outlives it. The caller's utterance
+//     stays open: its next fragment opens a fresh context and its commit
+//     finishes the utterance, sending nothing when no context is left
+//     (Cartesia answers a commit after expiry with 400 "Invalid transcript").
 //   - A socket that closes while no context is in flight is replaced by the
 //     next fragment. A socket that closes with a context in flight fails the
 //     session with a retryable error, since that audio is lost.
@@ -571,14 +574,21 @@ func (s *stream) activeDone() <-chan struct{} {
 }
 
 // finishContext ends the live context and the utterance; an empty id ends
-// whatever is open.
-func (s *stream) finishContext(contextID string) {
+// whatever is open. It reports false for a context that is not live.
+func (s *stream) finishContext(contextID string) bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if contextID != "" && s.contextID != contextID {
-		return
+		return false
 	}
 	s.endUtteranceLocked()
+	return true
+}
+
+func (s *stream) isLiveContext(contextID string) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.contextID == contextID
 }
 
 func (s *stream) endUtteranceLocked() {
@@ -755,11 +765,21 @@ func (s *stream) handleMessage(payload []byte) error {
 		if s.expireContext(message.ContextID) {
 			return nil
 		}
-		s.finishContext(message.ContextID)
+		if !s.finishContext(message.ContextID) {
+			// A context Cartesia re-created for a fragment that crossed its
+			// expiry ends again; the utterance was already closed.
+			return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, message.Type), Extensions: extension(raw)})
+		}
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: s.contextData(message.ContextID), Extensions: extension(raw)})
 	case "flush_done":
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, "flush_done"), Extensions: extension(raw)})
 	case "error":
+		if message.ContextID != "" && !s.isLiveContext(message.ContextID) {
+			// Cartesia answers input that reached a context after it expired —
+			// a commit crossing the expiry done gets 400 "Invalid transcript" —
+			// once that context already ended with all of its audio delivered.
+			return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: s.warningData(message.ContextID, message.Type), Extensions: extension(raw)})
+		}
 		if message.StatusCode == http.StatusBadRequest && (isUnsupportedLanguage(message.Message) || isUnsupportedLanguage(errorText(message.Error))) {
 			return &runtimepkg.ProviderError{
 				Code:           "invalid_request",

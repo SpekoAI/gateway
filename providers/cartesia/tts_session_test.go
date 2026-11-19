@@ -16,10 +16,12 @@ import (
 	"github.com/coder/websocket"
 )
 
-// Cartesia expires a context one second after its last audio output. A
-// caller that pauses before input.commit (the production failure) must get
-// its utterance finished, not a session-closed error, and must not see
-// utterance.done before it commits.
+// Cartesia expires a context nobody committed a few seconds after its last
+// input and says so with an ordinary done frame (measured live: 4 to 6 s with
+// max_buffer_delay_ms 0). A caller that pauses before input.commit (the
+// production failure) must get its utterance finished, not a session-closed
+// error, and must not see utterance.done before it commits. Cartesia answers
+// a commit sent after expiry with 400 "Invalid transcript", so none is sent.
 func TestAdapterCommitAfterCartesiaExpiredTheContextFinishesTheUtterance(t *testing.T) {
 	t.Parallel()
 
@@ -31,11 +33,13 @@ func TestAdapterCommitAfterCartesiaExpiredTheContextFinishesTheUtterance(t *test
 			return
 		}
 		frames <- first
-		// Audio for the fragment, then Cartesia's own expiry of the
-		// still-open context, then a marker proving both were read.
+		// Audio for the fragment, the flush_done Cartesia sends after each
+		// fragment, its own expiry of the still-open context, then a marker
+		// proving all were read.
 		for _, message := range []map[string]any{
 			{"type": "chunk", "context_id": first.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{1, 2})},
-			{"type": "done", "context_id": first.ContextID, "done": true},
+			{"type": "flush_done", "context_id": first.ContextID, "status_code": 206, "done": false, "flush_done": true},
+			{"type": "done", "context_id": first.ContextID, "status_code": 200, "done": true},
 			{"type": "test_marker", "context_id": first.ContextID},
 		} {
 			if err := writeJSON(ctx, conn, message); err != nil {
@@ -74,7 +78,7 @@ func TestAdapterCommitAfterCartesiaExpiredTheContextFinishesTheUtterance(t *test
 	if err := providerStream.AppendText(context.Background(), "Hello, "); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 3)), ","); got != "audio.started,audio.frame,warning" {
+	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 4)), ","); got != "audio.started,audio.frame,warning,warning" {
 		t.Fatalf("events before commit = %s; utterance.done must wait for the commit", got)
 	}
 	if err := providerStream.CommitText(context.Background()); err != nil {
@@ -108,7 +112,9 @@ func TestAdapterCommitAfterCartesiaExpiredTheContextFinishesTheUtterance(t *test
 }
 
 // A pause between two fragments of one utterance can outlast the Cartesia
-// context. The next fragment continues the same utterance on a fresh context:
+// context. Cartesia would accept the old id again (measured live), but its
+// docs call that unsupported, so the next fragment continues the same
+// utterance on a fresh context:
 // no second utterance start, one done after the commit, and word timings that
 // continue after the audio already sent instead of restarting at zero.
 func TestAdapterAppendAfterCartesiaExpiredTheContextContinuesTheUtterance(t *testing.T) {
@@ -127,7 +133,7 @@ func TestAdapterAppendAfterCartesiaExpiredTheContextContinuesTheUtterance(t *tes
 		for _, message := range []map[string]any{
 			{"type": "chunk", "context_id": first.ContextID, "data": base64.StdEncoding.EncodeToString(halfSecond)},
 			{"type": "timestamps", "context_id": first.ContextID, "word_timestamps": map[string]any{"words": []string{"Hello"}, "start": []float64{0}, "end": []float64{0.4}}},
-			{"type": "done", "context_id": first.ContextID, "done": true},
+			{"type": "done", "context_id": first.ContextID, "status_code": 200, "done": true},
 			{"type": "test_marker", "context_id": first.ContextID},
 		} {
 			if err := writeJSON(ctx, conn, message); err != nil {
@@ -188,6 +194,86 @@ func TestAdapterAppendAfterCartesiaExpiredTheContextContinuesTheUtterance(t *tes
 	first, second, final := <-frames, <-frames, <-frames
 	if second.ContextID == first.ContextID || second.Transcript != "world." || !second.Continue || final.ContextID != second.ContextID || final.Continue {
 		t.Fatalf("frames = %+v, %+v, %+v", first, second, final)
+	}
+	if err := providerStream.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// A commit can cross Cartesia's expiry on the wire: Cartesia sends done for
+// the context, then answers the commit that arrived after it with 400
+// "Invalid transcript" (both measured live). The utterance's audio was all
+// delivered, so that late error, like any later frame about a context that
+// already ended, is a warning and the session goes on.
+func TestAdapterCommitCrossingCartesiaExpiryKeepsTheSession(t *testing.T) {
+	t.Parallel()
+
+	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		fragment, err := readGeneration(ctx, conn)
+		if err != nil {
+			t.Errorf("fragment: %v", err)
+			return
+		}
+		if err := writeJSON(ctx, conn, map[string]any{"type": "chunk", "context_id": fragment.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{1, 2})}); err != nil {
+			t.Errorf("chunk: %v", err)
+			return
+		}
+		if commit, err := readGeneration(ctx, conn); err != nil || commit.Continue || commit.ContextID != fragment.ContextID {
+			t.Errorf("commit = %+v, %v", commit, err)
+			return
+		}
+		for _, message := range []map[string]any{
+			{"type": "done", "context_id": fragment.ContextID, "status_code": 200, "done": true},
+			{"type": "error", "context_id": fragment.ContextID, "status_code": 400, "done": true, "title": "Invalid transcript", "message": "Invalid transcript"},
+			// A context Cartesia re-created for a fragment that crossed its
+			// expiry ends again later, about a context the adapter closed.
+			{"type": "done", "context_id": fragment.ContextID, "status_code": 200, "done": true},
+		} {
+			if err := writeJSON(ctx, conn, message); err != nil {
+				t.Errorf("write %v: %v", message["type"], err)
+				return
+			}
+		}
+		next, err := readGeneration(ctx, conn)
+		if err != nil || next.ContextID == fragment.ContextID {
+			t.Errorf("next utterance = %+v, %v", next, err)
+			return
+		}
+		if _, err := readGeneration(ctx, conn); err != nil {
+			t.Errorf("next commit: %v", err)
+			return
+		}
+		for _, message := range []map[string]any{
+			{"type": "chunk", "context_id": next.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{3})},
+			{"type": "done", "context_id": next.ContextID, "status_code": 200, "done": true},
+		} {
+			if err := writeJSON(ctx, conn, message); err != nil {
+				t.Errorf("write %v: %v", message["type"], err)
+				return
+			}
+		}
+		waitForClientClose(ctx, conn)
+	})
+	defer server.Close()
+
+	providerStream := openTestStream(t, server.URL)
+	if err := providerStream.AppendText(context.Background(), "Hello."); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := providerStream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 5)), ","); got != "audio.started,audio.frame,audio.done,warning,warning" {
+		t.Fatalf("events = %s; the late error and done must be warnings", got)
+	}
+	if err := providerStream.AppendText(context.Background(), "Again."); err != nil {
+		t.Fatalf("append next utterance: %v", err)
+	}
+	if err := providerStream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit next utterance: %v", err)
+	}
+	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 3)), ","); got != "audio.started,audio.frame,audio.done" {
+		t.Fatalf("next utterance events = %s", got)
 	}
 	if err := providerStream.Close(context.Background()); err != nil {
 		t.Fatalf("close: %v", err)
