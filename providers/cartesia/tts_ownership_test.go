@@ -29,6 +29,14 @@ func flushChunk(contextID string, flushID int, audio []byte) map[string]any {
 	return map[string]any{"type": "chunk", "context_id": contextID, "status_code": 206, "done": false, "flush_id": flushID, "data": base64.StdEncoding.EncodeToString(audio)}
 }
 
+// untaggedChunk is a chunk without the flush_id field, which Cartesia was
+// never seen to send.
+func untaggedChunk(contextID string, audio []byte) map[string]any {
+	chunk := flushChunk(contextID, 0, audio)
+	delete(chunk, "flush_id")
+	return chunk
+}
+
 func timestampsFrame(contextID, word string, start, end float64) map[string]any {
 	return map[string]any{"type": "timestamps", "context_id": contextID, "status_code": 206, "done": false, "word_timestamps": map[string]any{"words": []string{word}, "start": []float64{start}, "end": []float64{end}}}
 }
@@ -100,10 +108,12 @@ func describe(events []runtimepkg.ProviderEvent) string {
 // The review's sequence with the real adapter: the start of A is spoken; a
 // continuation of A and its commit go out before the adapter reads the
 // expiry done Cartesia already sent for A's context; Cartesia then speaks the
-// continuation on a re-created context. Its audio must never be emitted, least
-// of all inside the next utterance: the utterance fails with a retryable error
-// before any done, and nothing is re-sent.
-func TestAdapterFailsAContinuationThatCrossedTheExpiryInsteadOfMisplacingIt(t *testing.T) {
+// continuation on a re-created context. The context answered with audio, so A
+// ends at that done without its continuation (speech dropped inside a context
+// is not detected, see Adapter), but the continuation's frames are dropped:
+// never emitted, least of all inside the next utterance, and nothing is
+// re-sent.
+func TestAdapterNeverMisplacesAContinuationThatCrossedTheExpiry(t *testing.T) {
 	t.Parallel()
 
 	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
@@ -140,15 +150,8 @@ func TestAdapterFailsAContinuationThatCrossedTheExpiryInsteadOfMisplacingIt(t *t
 	if err := providerStream.CommitText(context.Background()); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	events := nextEvents(t, providerStream.Events(), 1)
-	var failure *runtimepkg.ProviderError
-	if !errors.As(events[0].Err, &failure) || !failure.Retryable || failure.Code != "provider_unavailable" || failure.Hint == "" {
-		t.Fatalf("after the crossing = %s %+v; want a retryable error before any done or audio", describe(events), events[0].Err)
-	}
-	for event := range providerStream.Events() {
-		if event.Type == protocol.EventAudioFrame || event.Type == protocol.EventAudioDone || event.Type == protocol.EventAlignment {
-			t.Fatalf("emitted %s after the failure", event.Type)
-		}
+	if got := describe(nextEvents(t, providerStream.Events(), 4)); got != "audio.done,dropped,dropped,dropped" {
+		t.Fatalf("after the crossing = %s; want A's done, then the continuation's frames dropped", got)
 	}
 }
 
@@ -332,9 +335,9 @@ func TestAdapterDropsAStaleFrameOfThePreviousUtterance(t *testing.T) {
 }
 
 // Text that ends with no audio is a retryable error, not a bare done: at the
-// done of the committed context, at an expiry done for speakable text
-// Cartesia acknowledged without audio, and at a commit after Cartesia expired
-// a context that had nothing speakable.
+// done of the committed context, at an expiry done for text Cartesia
+// acknowledged without audio, and at a commit after Cartesia expired a
+// context that was sent only whitespace.
 func TestAdapterReportsAnUtteranceThatProducedNoAudio(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -344,8 +347,8 @@ func TestAdapterReportsAnUtteranceThatProducedNoAudio(t *testing.T) {
 		expiry   bool // Cartesia expires the context before any commit
 	}{
 		{"committed", "Hello.", true, false},
-		{"expired speakable text", "Hello.", false, true},
-		{"expired, nothing speakable", "...", false, true},
+		{"expired text", "...", false, true},
+		{"expired, only whitespace", " ", false, true},
 	} {
 		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
 			fragment, err := readGeneration(ctx, conn)
@@ -371,7 +374,7 @@ func TestAdapterReportsAnUtteranceThatProducedNoAudio(t *testing.T) {
 			}
 		}
 		var failure *runtimepkg.ProviderError
-		if speakable(test.text) {
+		if strings.TrimSpace(test.text) != "" {
 			events := nextEvents(t, providerStream.Events(), 2)
 			if !errors.As(events[1].Err, &failure) {
 				t.Fatalf("%s: events = %s; want flush_done then an error", test.name, describe(events))
@@ -586,13 +589,11 @@ func TestAdapterRedialsAManagedRouteWithACurrentToken(t *testing.T) {
 	}
 }
 
-// The review's first reproduction, frames in its order: the first fragment's
-// audio arrives, the second fragment and the commit go to the same context,
-// then come the first fragment's late flush_done, done, and the second
-// fragment's audio. The second fragment was never spoken before done, so the
-// utterance fails retryably instead of being confirmed, in either buffering
-// mode.
-func TestAdapterFailsAnUtteranceDoneBeforeItsLastFragmentWasSpoken(t *testing.T) {
+// The review's reproduction: after a 4 s pause the rest of the utterance opens
+// a new context, which Cartesia answers with word timings and done but no
+// audio. Audio of the first context must not count for it, in either
+// buffering mode.
+func TestAdapterFailsAnUtteranceWhoseNewContextProducedNoAudio(t *testing.T) {
 	t.Parallel()
 	for _, settings := range []map[string]any{{"max_buffer_delay_ms": 0.0}, nil} {
 		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
@@ -600,12 +601,15 @@ func TestAdapterFailsAnUtteranceDoneBeforeItsLastFragmentWasSpoken(t *testing.T)
 			if err != nil || !writeFrames(ctx, t, conn, chunkFrame(first.ContextID, make16kAudio(1, 16_000)), wordsFrame(first.ContextID, "Hello,")) {
 				return
 			}
-			for range 2 { // the second fragment and the commit
-				if _, err := readGeneration(ctx, conn); err != nil {
-					return
-				}
+			rest, err := readGeneration(ctx, conn)
+			if err != nil || rest.ContextID == first.ContextID {
+				t.Errorf("rest = %+v, %v; want a new context", rest, err)
+				return
 			}
-			writeFrames(ctx, t, conn, flushDoneFrame(first.ContextID), doneFrame(first.ContextID), flushChunk(first.ContextID, 1, make16kAudio(2, 3_200)))
+			if _, err := readGeneration(ctx, conn); err != nil {
+				return
+			}
+			writeFrames(ctx, t, conn, wordsFrame(rest.ContextID, "world."), doneFrame(rest.ContextID))
 			waitForClientClose(ctx, conn)
 		})
 		clock := &testClock{now: time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC)}
@@ -616,65 +620,27 @@ func TestAdapterFailsAnUtteranceDoneBeforeItsLastFragmentWasSpoken(t *testing.T)
 		if got := describe(nextEvents(t, providerStream.Events(), 3)); got != "audio.started,audio.frame1,alignment" {
 			t.Fatalf("first fragment = %s", got)
 		}
+		clock.Advance(4 * time.Second)
 		if err := providerStream.AppendText(context.Background(), "world."); err != nil {
-			t.Fatalf("second fragment: %v", err)
+			t.Fatalf("append after the pause: %v", err)
 		}
 		if err := providerStream.CommitText(context.Background()); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
-		requireUnspoken(t, providerStream, "warning,error", "500 ms")
+		requireUnspoken(t, providerStream, "alignment,error", "500 ms")
 		server.Close()
 	}
 }
 
-// The review's second reproduction: after a 4 s pause the rest of the
-// utterance opens a new context, which Cartesia answers with flush_done and
-// done but no audio. Audio of the first context must not count for it.
-func TestAdapterFailsAnUtteranceWhoseNewContextProducedNoAudio(t *testing.T) {
-	t.Parallel()
-	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
-		first, err := readGeneration(ctx, conn)
-		if err != nil || !writeFrames(ctx, t, conn, chunkFrame(first.ContextID, make16kAudio(1, 16_000)), flushDoneFrame(first.ContextID)) {
-			return
-		}
-		rest, err := readGeneration(ctx, conn)
-		if err != nil || rest.ContextID == first.ContextID {
-			t.Errorf("rest = %+v, %v; want a new context", rest, err)
-			return
-		}
-		if _, err := readGeneration(ctx, conn); err != nil {
-			return
-		}
-		writeFrames(ctx, t, conn, flushDoneFrame(rest.ContextID), doneFrame(rest.ContextID))
-		waitForClientClose(ctx, conn)
-	})
-	defer server.Close()
-	clock := &testClock{now: time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC)}
-	providerStream := openClockedStream(t, server.URL, clock, map[string]any{"max_buffer_delay_ms": 0.0})
-	if err := providerStream.AppendText(context.Background(), "Hello, "); err != nil {
-		t.Fatalf("append: %v", err)
-	}
-	if got := describe(nextEvents(t, providerStream.Events(), 3)); got != "audio.started,audio.frame1,warning" {
-		t.Fatalf("first fragment = %s", got)
-	}
-	clock.Advance(4 * time.Second)
-	if err := providerStream.AppendText(context.Background(), "world."); err != nil {
-		t.Fatalf("append after the pause: %v", err)
-	}
-	if err := providerStream.CommitText(context.Background()); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-	requireUnspoken(t, providerStream, "warning,error", "500 ms")
-}
-
-// The review's three sequences and their spoken controls. Every client frame
-// is written before Cartesia answers, so audio cannot be told apart by when it
-// arrives: with max_buffer_delay_ms 0 only a chunk tagged with a fragment's own
-// flush_id answers it (an empty flush, or a separator's flush_done, does not);
-// with buffering only timestamps naming as many words as were written do.
-func TestAdapterProvesEveryFragmentWasSpoken(t *testing.T) {
+// A context is confirmed by audio of its own, whatever its text holds: the
+// adapter reads no text or markup. With max_buffer_delay_ms 0 a chunk counts
+// only with an explicit flush_id of a frame written to the context; a chunk
+// without the field is not frame 0. Every client frame is written before
+// Cartesia answers.
+func TestAdapterConfirmsAContextByItsOwnAudio(t *testing.T) {
 	t.Parallel()
 	fifty := make16kAudio(1, 1_600) // 50 ms
+	noBuffering := map[string]any{"max_buffer_delay_ms": 0.0}
 	for _, test := range []struct {
 		name      string
 		buffering map[string]any
@@ -682,21 +648,24 @@ func TestAdapterProvesEveryFragmentWasSpoken(t *testing.T) {
 		answer    func(contextID string) []map[string]any
 		want      string
 	}{
-		{"buffered, only the first fragment's audio and words", nil, []string{"Hello,", "world."}, func(id string) []map[string]any {
-			return []map[string]any{chunkFrame(id, fifty), wordsFrame(id, "Hello,"), flushDoneFrame(id), doneFrame(id)}
-		}, "audio.started,audio.frame1,alignment,warning,error"},
-		{"buffered, both fragments' words", nil, []string{"Hello,", "world."}, func(id string) []map[string]any {
-			return []map[string]any{chunkFrame(id, fifty), wordsFrame(id, "Hello,"), chunkFrame(id, make16kAudio(2, 1_600)), wordsFrame(id, "world."), doneFrame(id)}
-		}, "audio.started,audio.frame1,alignment,audio.frame2,alignment,audio.done"},
-		{"no buffering, one chunk and two flush_done", map[string]any{"max_buffer_delay_ms": 0.0}, []string{"Hello,", "world."}, func(id string) []map[string]any {
-			return []map[string]any{flushChunk(id, 0, fifty), flushDoneFrame(id), flushDoneFrame(id), doneFrame(id)}
-		}, "audio.started,audio.frame1,warning,warning,error"},
-		{"no buffering, a separator's flush_done", map[string]any{"max_buffer_delay_ms": 0.0}, []string{"Hello", " ", "world"}, func(id string) []map[string]any {
+		{"no buffering, a break tag split across fragments", noBuffering, []string{"Hello, ", "<break ", `time="300ms"/>`, "world."}, func(id string) []map[string]any {
+			return []map[string]any{flushChunk(id, 0, fifty), flushDoneFrame(id), flushDoneFrame(id), flushDoneFrame(id), flushChunk(id, 3, make16kAudio(2, 1_600)), flushDoneFrame(id), flushDoneFrame(id), doneFrame(id)}
+		}, "audio.started,audio.frame1,warning,warning,warning,audio.frame2,warning,warning,audio.done"},
+		{"no buffering, a punctuation fragment Cartesia gives no audio", noBuffering, []string{"Hello", "!"}, func(id string) []map[string]any {
 			return []map[string]any{flushChunk(id, 0, fifty), flushDoneFrame(id), flushDoneFrame(id), flushDoneFrame(id), doneFrame(id)}
-		}, "audio.started,audio.frame1,warning,warning,warning,error"},
-		{"no buffering, every fragment's own audio", map[string]any{"max_buffer_delay_ms": 0.0}, []string{"Hello", " ", "world"}, func(id string) []map[string]any {
-			return []map[string]any{flushChunk(id, 0, fifty), flushDoneFrame(id), flushDoneFrame(id), flushChunk(id, 2, make16kAudio(2, 1_600)), flushDoneFrame(id), flushDoneFrame(id), doneFrame(id)}
-		}, "audio.started,audio.frame1,warning,warning,audio.frame2,warning,warning,audio.done"},
+		}, "audio.started,audio.frame1,warning,warning,warning,audio.done"},
+		{"buffered, a literal less-than sign", nil, []string{"The timer shows ", "< 10 seconds left."}, func(id string) []map[string]any {
+			return []map[string]any{chunkFrame(id, fifty), wordsFrame(id, "The", "timer", "shows"), chunkFrame(id, make16kAudio(2, 1_600)), wordsFrame(id, "<", "10", "seconds", "left."), doneFrame(id)}
+		}, "audio.started,audio.frame1,alignment,audio.frame2,alignment,audio.done"},
+		{"no buffering, audio with flush_id 0", noBuffering, []string{"Hello."}, func(id string) []map[string]any {
+			return []map[string]any{flushChunk(id, 0, fifty), flushDoneFrame(id), flushDoneFrame(id), doneFrame(id)}
+		}, "audio.started,audio.frame1,warning,warning,audio.done"},
+		{"no buffering, audio without a flush_id", noBuffering, []string{"Hello."}, func(id string) []map[string]any {
+			return []map[string]any{untaggedChunk(id, fifty), flushDoneFrame(id), flushDoneFrame(id), doneFrame(id)}
+		}, "audio.started,audio.frame1,warning,warning,error"},
+		{"no buffering, audio with a flush_id of no frame written", noBuffering, []string{"Hello."}, func(id string) []map[string]any {
+			return []map[string]any{flushChunk(id, 1, fifty), flushDoneFrame(id), flushDoneFrame(id), doneFrame(id)}
+		}, "audio.started,audio.frame1,warning,warning,error"},
 	} {
 		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
 			var contextID string
@@ -727,29 +696,6 @@ func TestAdapterProvesEveryFragmentWasSpoken(t *testing.T) {
 		}
 		_ = providerStream.Close(context.Background())
 		server.Close()
-	}
-}
-
-// Text is counted by its letters and digits outside markup tags, as the
-// words in Cartesia's timestamps hold them (measured live 2026-11-20).
-func TestSpeakableCountCountsLettersAndDigitsOutsideTags(t *testing.T) {
-	t.Parallel()
-	for text, want := range map[string]int{
-		"":             0,
-		" , — !":       0,
-		"Hello,world.": 10,
-		"В 2026 году т.е. 10 000 рублей.":        22,
-		"Dr. Smith paid $5.50 on 11/20.":         20,
-		`<emotion value="calm"/> Привет,`:        6,
-		` <break time="300ms"/>как дела?`:        7,
-		"[laughter] Хорошо, <spell>АБВ</spell>.": 17,
-		"a <unclosed tag":                        1,
-		"10\u00a0000":                            5,
-		"🙂":                                      0,
-	} {
-		if got := speakableCount(text); got != want {
-			t.Errorf("speakableCount(%q) = %d; want %d", text, got, want)
-		}
 	}
 }
 

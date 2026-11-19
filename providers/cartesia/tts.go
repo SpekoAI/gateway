@@ -14,7 +14,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -49,6 +48,13 @@ type Config struct {
 // Provider note: on this route a text commit with nothing to commit (nothing
 // appended since the last commit) is ignored and the session stays open;
 // other providers end the session.
+//
+// Limit: an utterance fails when a Cartesia context it sent text to ends
+// without any audio of its own, but a context that speaks only part of its
+// text is not detected (with buffering Cartesia tags no fragment, and with
+// max_buffer_delay_ms 0 a fragment with nothing to voice, such as "!", gets
+// no audio just as a dropped one would; dropped speech was never observed in
+// the probe). The adapter does not inspect text.
 type Adapter struct {
 	id              string
 	version         string
@@ -311,20 +317,17 @@ func validateGenerationOptions(model string, options protocol.RequestOptions, me
 //   - The utterance ends once: at the done of its committed context, or at the
 //     commit itself when no context can speak any more. Text that ends with no
 //     audio is a retryable error, not a done.
-//   - Speech is accounted per context and per fragment, from what Cartesia
-//     tags (measured live on 2026-11-20, sonic-3.6, API 2026-03-01). With
-//     max_buffer_delay_ms 0 it flushes after every transcript frame and tags
-//     the audio of a context's frame i with flush_id i, counting from 0, also
-//     for frames with nothing to say: a speakable fragment is spoken once audio
-//     with its own flush_id arrives; flush_done proves nothing. With buffering
-//     all audio carries flush_id 0, but timestamps name the words spoken, as
-//     written in the transcript: the context's speech is all spoken once the
-//     words named hold as many letters and digits, outside markup tags, as the
-//     text written to it. Fragments with nothing to say (no letter or digit
-//     outside a tag) are never awaited. A done while
-//     speech is unanswered means Cartesia ended the context without speaking
-//     it: the utterance fails with a retryable error, before any done, saying
-//     how much of its audio was already sent, and nothing is re-sent.
+//   - Speech is accounted per context: a context sent any text that is not
+//     all whitespace owes audio until a PCM chunk of its own arrives. With
+//     max_buffer_delay_ms 0 Cartesia flushes after every transcript frame and
+//     tags the audio of a context's frame i with flush_id i, counting from 0
+//     (measured live on 2026-11-20, sonic-3.6, API 2026-03-01), so there a
+//     chunk counts only when it carries an explicit flush_id of a frame
+//     written to that context; flush_done proves nothing. A done while audio
+//     is owed means Cartesia ended the context without speaking it: the
+//     utterance fails with a retryable error, before any done, saying how
+//     much of its audio was already sent, and nothing is re-sent. Speech
+//     dropped inside a context is not detected (see Adapter).
 //   - A socket Cartesia closes while no context can speak is replaced by the
 //     next fragment, which was certainly not sent. A socket that closes while
 //     a context can speak, or while a frame is being written, fails the
@@ -394,16 +397,13 @@ type vendorContext struct {
 	offset    float64
 	committed bool
 	cancelled bool
-	// Speech owed, see unansweredLocked. With max_buffer_delay_ms 0, frames
-	// counts the transcript frames written (the next one's flush_id) and owed
-	// holds the flush_ids of speakable fragments no audio was tagged with yet.
-	// With buffering, transcript is the text written, written its letters and
-	// digits and spoken those of the words its timestamps named.
+	// Audio owed, see unansweredLocked: speech is set once the context was
+	// sent text that is not all whitespace, pcm counts the audio bytes it
+	// answered with, and frames counts the transcript frames written (with
+	// max_buffer_delay_ms 0, the next one's flush_id).
+	speech       bool
+	pcm          int
 	frames       int
-	owed         map[int]struct{}
-	transcript   strings.Builder
-	written      int
-	spoken       int
 	lastFragment time.Time
 	lastAnswer   time.Time
 }
@@ -413,8 +413,9 @@ const (
 	// fragment before it is no longer written. The shortest expiry measured
 	// was 3.9 s after the last audio chunk. If Cartesia ever expires a context
 	// sooner (its docs say 1 s after the last audio output), a fragment written
-	// to it is caught as unanswered speech and fails retryably; it is never
-	// emitted in the wrong utterance.
+	// to it is never emitted in the wrong utterance: its frames are dropped,
+	// and the utterance fails retryably only when that context had no audio of
+	// its own (see the limit on Adapter).
 	quietGap = 2 * time.Second
 	// defaultBufferDelay is Cartesia's documented max_buffer_delay_ms default.
 	defaultBufferDelay = 3 * time.Second
@@ -624,14 +625,9 @@ func (s *stream) beginFragment(text string) (contextID string, conn *websocket.C
 	c := u.current
 	c.lastFragment = now
 	u.text = true
-	if s.bufferDelay == 0 {
-		if speakable(text) {
-			c.owed[c.frames] = struct{}{}
-		}
-		c.frames++
-	} else {
-		c.transcript.WriteString(text)
-		c.written = speakableCount(c.transcript.String())
+	c.frames++
+	if strings.TrimSpace(text) != "" {
+		c.speech = true
 	}
 	s.writing, s.lostWhileWriting = true, false
 	return c.id, s.conn, nil
@@ -723,15 +719,10 @@ func (s *stream) quietLocked(c *vendorContext, now time.Time) bool {
 	return now.Sub(last) > quietGap && now.Sub(c.lastFragment) > s.bufferDelay
 }
 
-// unansweredLocked reports whether speech written to the context is still
-// owed: with max_buffer_delay_ms 0, a speakable fragment no audio was tagged
-// with; with buffering, fewer letters and digits in the words timestamps
-// named than in the text written.
+// unansweredLocked reports whether the context was sent text that is not all
+// whitespace and has not answered with any audio of its own.
 func (s *stream) unansweredLocked(c *vendorContext) bool {
-	if s.bufferDelay == 0 {
-		return len(c.owed) > 0
-	}
-	return c.spoken < c.written
+	return c.speech && c.pcm == 0
 }
 
 func (s *stream) openContextLocked(u *utterance) error {
@@ -739,7 +730,7 @@ func (s *stream) openContextLocked(u *utterance) error {
 	if err != nil {
 		return err
 	}
-	c := &vendorContext{id: id, done: make(chan struct{}), owed: map[int]struct{}{}}
+	c := &vendorContext{id: id, done: make(chan struct{})}
 	// A context's timestamps start at zero; within an utterance they start
 	// after the audio already sent (pcm_s16le mono).
 	if s.media.SampleRateHz > 0 {
@@ -783,18 +774,19 @@ func (s *stream) acceptLocked(contextID string) (*utterance, *vendorContext, boo
 	return u, u.current, true
 }
 
-// acceptAudio takes an audio chunk for the current context, tagged with the
-// flush_id of the frame it speaks; started reports the utterance's first
-// audio.
-func (s *stream) acceptAudio(contextID string, flushID, bytes int) (accepted, started bool) {
+// acceptAudio takes an audio chunk for the current context, with the flush_id
+// it carries (nil when it has none); started reports the utterance's first
+// audio. With max_buffer_delay_ms 0 only a chunk tagged with one of the
+// context's own frames answers it.
+func (s *stream) acceptAudio(contextID string, flushID *int, bytes int) (accepted, started bool) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	u, c, ok := s.acceptLocked(contextID)
 	if !ok {
 		return false, false
 	}
-	if bytes > 0 {
-		delete(c.owed, flushID)
+	if s.bufferDelay != 0 || (flushID != nil && *flushID >= 0 && *flushID < c.frames) {
+		c.pcm += bytes
 	}
 	c.lastAnswer = s.now()
 	u.audioBytes += bytes
@@ -813,16 +805,15 @@ func (s *stream) acceptFlush(contextID string) bool {
 	return ok
 }
 
-// acceptTimestamps takes a timestamps frame naming words of the current
-// context, which hold spoken letters and digits.
-func (s *stream) acceptTimestamps(contextID string, spoken int) (offset float64, ok bool) {
+// acceptTimestamps takes a timestamps frame of the current context and
+// returns the offset its timings continue from.
+func (s *stream) acceptTimestamps(contextID string) (offset float64, ok bool) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	_, c, ok := s.acceptLocked(contextID)
 	if !ok {
 		return 0, false
 	}
-	c.spoken += spoken
 	return c.offset, true
 }
 
@@ -834,7 +825,7 @@ const (
 	doneExpired
 	doneFinished
 	doneNoAudio
-	// doneUnspoken: the context ended with speakable text it never answered;
+	// doneUnspoken: the context ended with text it never answered with audio;
 	// part of the utterance, or all of it, will not be heard.
 	doneUnspoken
 )
@@ -1000,11 +991,7 @@ func (s *stream) handleMessage(payload []byte) error {
 		}
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventAudioFrame, Data: s.contextData(message.ContextID), Extensions: extension(raw), Audio: audio})
 	case "timestamps":
-		var named struct {
-			Words []string `json:"words"`
-		}
-		_ = json.Unmarshal(message.WordTimestamps, &named)
-		offset, ok := s.acceptTimestamps(message.ContextID, speakableCount(strings.Join(named.Words, " ")))
+		offset, ok := s.acceptTimestamps(message.ContextID)
 		if !ok {
 			return s.emitDropped(message, raw)
 		}
@@ -1061,52 +1048,6 @@ func (s *stream) emitDropped(message inbound, raw json.RawMessage) error {
 	s.stateMu.Unlock()
 	data := marshalData(map[string]any{"context_id": message.ContextID, "provider_type": message.Type, "provider_request_id": s.currentProviderRequestID(), "dropped": true, "dropped_frames": count})
 	return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: data, Extensions: extension(raw)})
-}
-
-// speakable reports whether text has anything Cartesia voices: a letter or a
-// digit outside markup tags. Separators, punctuation and tags alone may
-// produce no audio at all.
-func speakable(text string) bool {
-	return speakableCount(text) > 0
-}
-
-// speakableCount counts the letters and digits of text outside markup tags.
-// Cartesia's timestamps name the words spoken as the transcript writes them
-// (measured: "10 000" as "10" and "000", "$5.50" and "т.е." unchanged,
-// "<break time="300ms"/>как" as "как", "[laughter]" as itself, an <emotion/>
-// tag not at all), so spoken text and written text count alike, whatever
-// separates the words.
-func speakableCount(text string) int {
-	count := 0
-	for _, r := range withoutTags(text) {
-		if unicode.IsLetter(r) || unicode.IsNumber(r) {
-			count++
-		}
-	}
-	return count
-}
-
-// withoutTags removes Cartesia's SSML-like tags (<break time="1s"/>,
-// <spell>…</spell>): everything from "<" to the next ">", or to the end of
-// text when the tag is not closed yet.
-func withoutTags(text string) string {
-	if !strings.Contains(text, "<") {
-		return text
-	}
-	var out strings.Builder
-	for {
-		open := strings.IndexByte(text, '<')
-		if open < 0 {
-			out.WriteString(text)
-			return out.String()
-		}
-		out.WriteString(text[:open])
-		end := strings.IndexByte(text[open:], '>')
-		if end < 0 {
-			return out.String()
-		}
-		text = text[open+end+1:]
-	}
 }
 
 func unknownSendError(cause error) *runtimepkg.ProviderError {
@@ -1330,7 +1271,7 @@ type inbound struct {
 	Error          json.RawMessage `json:"error"`
 	RequestID      string          `json:"request_id"`
 	WordTimestamps json.RawMessage `json:"word_timestamps"`
-	// FlushID tags an audio chunk with the transcript frame it speaks; an
-	// absent one reads as 0, as in Cartesia's own SDK.
-	FlushID int `json:"flush_id"`
+	// FlushID tags an audio chunk with the transcript frame it speaks; nil
+	// when the frame has no flush_id, which is not frame 0.
+	FlushID *int `json:"flush_id"`
 }
