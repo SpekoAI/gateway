@@ -1,0 +1,782 @@
+package cartesia
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/SpekoAI/gateway/protocol"
+	runtimepkg "github.com/SpekoAI/gateway/runtime"
+	"github.com/coder/websocket"
+)
+
+// Frames as Cartesia sends them (measured live 2026-11-20). With buffering
+// every chunk carries flush_id 0; with max_buffer_delay_ms 0 a chunk carries
+// the flush_id of the context's transcript frame it speaks, counted from 0.
+func chunkFrame(contextID string, audio []byte) map[string]any {
+	return flushChunk(contextID, 0, audio)
+}
+
+func flushChunk(contextID string, flushID int, audio []byte) map[string]any {
+	return map[string]any{"type": "chunk", "context_id": contextID, "status_code": 206, "done": false, "flush_id": flushID, "data": base64.StdEncoding.EncodeToString(audio)}
+}
+
+func timestampsFrame(contextID, word string, start, end float64) map[string]any {
+	return map[string]any{"type": "timestamps", "context_id": contextID, "status_code": 206, "done": false, "word_timestamps": map[string]any{"words": []string{word}, "start": []float64{start}, "end": []float64{end}}}
+}
+
+// wordsFrame names spoken words, 0.1 s each from 0.
+func wordsFrame(contextID string, words ...string) map[string]any {
+	start, end := make([]float64, len(words)), make([]float64, len(words))
+	for i := range words {
+		start[i], end[i] = float64(i)/10, float64(i+1)/10
+	}
+	return map[string]any{"type": "timestamps", "context_id": contextID, "status_code": 206, "done": false, "word_timestamps": map[string]any{"words": words, "start": start, "end": end}}
+}
+
+func flushDoneFrame(contextID string) map[string]any {
+	return map[string]any{"type": "flush_done", "context_id": contextID, "status_code": 206, "done": false, "flush_done": true}
+}
+
+func doneFrame(contextID string) map[string]any {
+	return map[string]any{"type": "done", "context_id": contextID, "status_code": 200, "done": true}
+}
+
+func writeFrames(ctx context.Context, t *testing.T, conn *websocket.Conn, frames ...map[string]any) bool {
+	for _, frame := range frames {
+		if err := writeJSON(ctx, conn, frame); err != nil {
+			t.Errorf("write %v: %v", frame["type"], err)
+			return false
+		}
+	}
+	return true
+}
+
+// nextEvents reads n events, errors included.
+func nextEvents(t *testing.T, events <-chan runtimepkg.ProviderEvent, n int) []runtimepkg.ProviderEvent {
+	t.Helper()
+	out := make([]runtimepkg.ProviderEvent, 0, n)
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for len(out) < n {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				t.Fatalf("events closed after %d of %d", len(out), n)
+			}
+			out = append(out, event)
+		case <-timer.C:
+			t.Fatalf("timed out after %d of %d events", len(out), n)
+		}
+	}
+	return out
+}
+
+func describe(events []runtimepkg.ProviderEvent) string {
+	parts := make([]string, len(events))
+	for i, event := range events {
+		switch {
+		case event.Err != nil:
+			parts[i] = "error"
+		case event.Type == protocol.EventAudioFrame:
+			parts[i] = "audio.frame" + string(rune('0'+event.Audio[0]))
+		case event.Type == protocol.EventWarning && strings.Contains(string(event.Data), `"dropped":true`):
+			parts[i] = "dropped"
+		default:
+			parts[i] = string(event.Type)
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+// The review's sequence with the real adapter: the start of A is spoken; a
+// continuation of A and its commit go out before the adapter reads the
+// expiry done Cartesia already sent for A's context; Cartesia then speaks the
+// continuation on a re-created context. A ends at that done without its
+// continuation (the accepted limit on Adapter), but the continuation's frames
+// are dropped: never emitted, least of all inside the next utterance, and
+// nothing is re-sent.
+func TestAdapterNeverMisplacesAContinuationThatCrossedTheExpiry(t *testing.T) {
+	t.Parallel()
+
+	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		start, err := readGeneration(ctx, conn)
+		if err != nil {
+			t.Errorf("start: %v", err)
+			return
+		}
+		if !writeFrames(ctx, t, conn, chunkFrame(start.ContextID, []byte{1}), timestampsFrame(start.ContextID, "Start", 0, 0.1), flushDoneFrame(start.ContextID)) {
+			return
+		}
+		for range 2 { // the continuation and the commit
+			if _, err := readGeneration(ctx, conn); err != nil {
+				t.Errorf("continuation: %v", err)
+				return
+			}
+		}
+		writeFrames(ctx, t, conn, doneFrame(start.ContextID), chunkFrame(start.ContextID, []byte{2}), timestampsFrame(start.ContextID, "continuation", 0, 0.1), doneFrame(start.ContextID))
+		waitForClientClose(ctx, conn)
+	})
+	defer server.Close()
+
+	providerStream := openTestStream(t, server.URL)
+	defer func() { _ = providerStream.Close(context.Background()) }()
+	if err := providerStream.AppendText(context.Background(), "Start of A, "); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if got := describe(nextEvents(t, providerStream.Events(), 4)); got != "audio.started,audio.frame1,alignment,warning" {
+		t.Fatalf("start of A = %s", got)
+	}
+	if err := providerStream.AppendText(context.Background(), "continuation of A."); err != nil {
+		t.Fatalf("continuation: %v", err)
+	}
+	if err := providerStream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := describe(nextEvents(t, providerStream.Events(), 4)); got != "audio.done,dropped,dropped,dropped" {
+		t.Fatalf("after the crossing = %s; want A's done, then the continuation's frames dropped", got)
+	}
+}
+
+// openStreamWith opens a sonic-3.6 stream with the given provider options.
+func openStreamWith(t *testing.T, serverURL string, settings map[string]any) runtimepkg.ProviderStream {
+	t.Helper()
+	adapter, err := New(testConfig(serverURL))
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	request := adapterRequest(serverURL)
+	request.Plan.Route.Model = "sonic-3.6"
+	if settings != nil {
+		request.Options.TTS = &protocol.TtsOptions{ProviderOptions: map[string]map[string]any{"cartesia": settings}}
+	}
+	providerStream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return providerStream
+}
+
+// bufferModes are the two ways Cartesia was measured to answer: flushing
+// after every fragment (with a flush_done each) and buffering (the default).
+var bufferModes = []struct {
+	name     string
+	settings map[string]any
+}{
+	{"no buffering", map[string]any{"max_buffer_delay_ms": 0.0}},
+	{"default buffering", nil},
+}
+
+// flushDones are the n flush_done frames Cartesia sends without buffering,
+// one per fragment or commit; with buffering it sends none.
+func flushDones(settings map[string]any, contextID string, n int) []map[string]any {
+	var frames []map[string]any
+	for range n {
+		if settings != nil {
+			frames = append(frames, flushDoneFrame(contextID))
+		}
+	}
+	return frames
+}
+
+// warnings is how the flush_done frames of flushDones read as events.
+func warnings(settings map[string]any, n int) string {
+	if settings == nil {
+		return ""
+	}
+	return strings.Repeat("warning,", n)
+}
+
+// The production failure: "Hello, " is spoken, the caller pauses, Cartesia
+// expires the uncommitted context with a done (measured 3.9-5.8 s after the
+// last audio), and "world." follows at 4.5-5 s. That done ends only the
+// vendor's context: the fragment and the commit go out on a new context id of
+// the same utterance, with one audio.started and one audio.done, and word
+// timings that continue after the audio already sent. Late frames of the
+// ended context are dropped.
+func TestAdapterOpensANewContextAfterCartesiaEndedTheOld(t *testing.T) {
+	t.Parallel()
+	for _, mode := range bufferModes {
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+				first, err := readGeneration(ctx, conn)
+				if err != nil {
+					return
+				}
+				// Half a second of 16 kHz mono pcm_s16le, then the expiry done
+				// and a marker proving both were read.
+				frames := append([]map[string]any{chunkFrame(first.ContextID, make16kAudio(1, 16_000)), timestampsFrame(first.ContextID, "Hello", 0, 0.4)}, flushDones(mode.settings, first.ContextID, 1)...)
+				if !writeFrames(ctx, t, conn, append(frames, doneFrame(first.ContextID), map[string]any{"type": "test_marker"})...) {
+					return
+				}
+				next, err := readGeneration(ctx, conn)
+				if err != nil || next.ContextID == first.ContextID || next.Transcript != "world." {
+					t.Errorf("next = %+v, %v; want world. on a new context", next, err)
+					return
+				}
+				commit, err := readGeneration(ctx, conn)
+				if err != nil || commit.Continue || commit.ContextID != next.ContextID {
+					t.Errorf("commit = %+v, %v; want continue:false on %s", commit, err, next.ContextID)
+					return
+				}
+				frames = append([]map[string]any{doneFrame(first.ContextID), chunkFrame(next.ContextID, make16kAudio(2, 1_600)), timestampsFrame(next.ContextID, "world", 0, 0.3)}, flushDones(mode.settings, next.ContextID, 2)...)
+				writeFrames(ctx, t, conn, append(frames, doneFrame(next.ContextID))...)
+				waitForClientClose(ctx, conn)
+			})
+			defer server.Close()
+			providerStream := openStreamWith(t, server.URL, mode.settings)
+			defer func() { _ = providerStream.Close(context.Background()) }()
+			if err := providerStream.AppendText(context.Background(), "Hello, "); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+			want := "audio.started,audio.frame1,alignment," + warnings(mode.settings, 1) + "warning"
+			if got := describe(nextEvents(t, providerStream.Events(), strings.Count(want, ",")+1)); got != want {
+				t.Fatalf("before the pause = %s; want %s", got, want)
+			}
+			if err := providerStream.AppendText(context.Background(), "world."); err != nil {
+				t.Fatalf("append after Cartesia ended the context: %v", err)
+			}
+			if err := providerStream.CommitText(context.Background()); err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+			want = "dropped,audio.frame2,alignment," + warnings(mode.settings, 2) + "audio.done"
+			events := nextEvents(t, providerStream.Events(), strings.Count(want, ",")+1)
+			if got := describe(events); got != want {
+				t.Fatalf("after the pause = %s; want %s", got, want)
+			}
+			if span := spansOf(t, events[2])[0]; span != (protocol.TimingSpan{Text: "world", StartMS: 500, EndMS: 800}) {
+				t.Errorf("continued timing = %+v; want 500-800 ms", span)
+			}
+		})
+	}
+}
+
+// A stale frame of the previous utterance's context that arrives inside the
+// next utterance is dropped, never emitted as audio or timing.
+func TestAdapterDropsAStaleFrameOfThePreviousUtterance(t *testing.T) {
+	t.Parallel()
+	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		a, err := readGeneration(ctx, conn)
+		if err != nil {
+			t.Errorf("a: %v", err)
+			return
+		}
+		if _, err := readGeneration(ctx, conn); err != nil {
+			t.Errorf("a commit: %v", err)
+			return
+		}
+		if !writeFrames(ctx, t, conn, chunkFrame(a.ContextID, []byte{1}), wordsFrame(a.ContextID, "First."), doneFrame(a.ContextID)) {
+			return
+		}
+		b, err := readGeneration(ctx, conn)
+		if err != nil || b.ContextID == a.ContextID {
+			t.Errorf("b = %+v, %v", b, err)
+			return
+		}
+		if !writeFrames(ctx, t, conn, chunkFrame(b.ContextID, []byte{2}), chunkFrame(a.ContextID, []byte{9}), timestampsFrame(a.ContextID, "stale", 0, 0.1), chunkFrame(b.ContextID, []byte{3}), wordsFrame(b.ContextID, "Second.")) {
+			return
+		}
+		if _, err := readGeneration(ctx, conn); err != nil {
+			t.Errorf("b commit: %v", err)
+			return
+		}
+		writeFrames(ctx, t, conn, doneFrame(b.ContextID))
+		waitForClientClose(ctx, conn)
+	})
+	defer server.Close()
+
+	providerStream := openTestStream(t, server.URL)
+	defer func() { _ = providerStream.Close(context.Background()) }()
+	for _, step := range []struct {
+		text string
+		want string
+	}{
+		{"First.", "audio.started,audio.frame1,alignment,audio.done"},
+		{"Second.", "audio.started,audio.frame2,dropped,dropped,audio.frame3,alignment,audio.done"},
+	} {
+		if err := providerStream.AppendText(context.Background(), step.text); err != nil {
+			t.Fatalf("append %q: %v", step.text, err)
+		}
+		if err := providerStream.CommitText(context.Background()); err != nil {
+			t.Fatalf("commit %q: %v", step.text, err)
+		}
+		if got := describe(nextEvents(t, providerStream.Events(), strings.Count(step.want, ",")+1)); got != step.want {
+			t.Fatalf("%q = %s; want %s", step.text, got, step.want)
+		}
+	}
+}
+
+// An utterance Cartesia ends without audio ("...", as for punctuation) ends
+// with audio.done, as before the context switching, and the session speaks the
+// next utterance.
+func TestAdapterEndsAnUtteranceWithoutAudioAndKeepsTheSession(t *testing.T) {
+	t.Parallel()
+	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		for audio := range 2 { // the first utterance gets no audio, the second does
+			fragment, err := readGeneration(ctx, conn)
+			if err != nil {
+				return
+			}
+			if _, err := readGeneration(ctx, conn); err != nil { // the commit
+				return
+			}
+			frames := []map[string]any{flushDoneFrame(fragment.ContextID), doneFrame(fragment.ContextID)}
+			if audio == 1 {
+				frames = append([]map[string]any{chunkFrame(fragment.ContextID, make16kAudio(1, 1_600))}, frames...)
+			}
+			if !writeFrames(ctx, t, conn, frames...) {
+				return
+			}
+		}
+		waitForClientClose(ctx, conn)
+	})
+	defer server.Close()
+	providerStream := openTestStream(t, server.URL)
+	defer func() { _ = providerStream.Close(context.Background()) }()
+	for _, utterance := range []struct{ text, want string }{
+		{"...", "warning,audio.done"},
+		{"Hello.", "audio.started,audio.frame1,warning,audio.done"},
+	} {
+		if err := providerStream.AppendText(context.Background(), utterance.text); err != nil {
+			t.Fatalf("append %q: %v", utterance.text, err)
+		}
+		if err := providerStream.CommitText(context.Background()); err != nil {
+			t.Fatalf("commit %q: %v", utterance.text, err)
+		}
+		if got := describe(nextEvents(t, providerStream.Events(), strings.Count(utterance.want, ",")+1)); got != utterance.want {
+			t.Fatalf("%q: events = %s; want %s", utterance.text, got, utterance.want)
+		}
+	}
+}
+
+// A commit with nothing appended, a second commit while the utterance is
+// finishing, and one after it finished, return runtime.ErrNothingToCommit and
+// leave the session usable.
+func TestAdapterCommitWithNothingToCommitKeepsTheSession(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		fragment, err := readGeneration(ctx, conn)
+		if err != nil {
+			t.Errorf("fragment: %v", err)
+			return
+		}
+		if _, err := readGeneration(ctx, conn); err != nil {
+			t.Errorf("commit: %v", err)
+			return
+		}
+		<-release
+		writeFrames(ctx, t, conn, chunkFrame(fragment.ContextID, []byte{1}), wordsFrame(fragment.ContextID, "Hello."), doneFrame(fragment.ContextID))
+		waitForClientClose(ctx, conn)
+	})
+	defer server.Close()
+
+	providerStream := openTestStream(t, server.URL)
+	defer func() { _ = providerStream.Close(context.Background()) }()
+	nothing := func(when string) {
+		t.Helper()
+		err := providerStream.CommitText(context.Background())
+		if !errors.Is(err, runtimepkg.ErrNothingToCommit) || errors.Is(err, runtimepkg.ErrSessionClosed) {
+			t.Fatalf("commit %s = %v; want ErrNothingToCommit", when, err)
+		}
+	}
+	nothing("before any append")
+	if err := providerStream.AppendText(context.Background(), "Hello."); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := providerStream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	nothing("while the utterance finishes")
+	close(release)
+	if got := describe(nextEvents(t, providerStream.Events(), 4)); got != "audio.started,audio.frame1,alignment,audio.done" {
+		t.Fatalf("utterance = %s", got)
+	}
+	nothing("after the utterance finished")
+}
+
+// The two orders in which a socket can end around the first write of a
+// fragment. Either way the client hears about it: an EOF seen while the write
+// is in progress makes the write's outcome unknown, and an EOF right after a
+// completed write finds speech in flight.
+func TestAdapterReportsASocketLostAroundTheFirstWrite(t *testing.T) {
+	t.Parallel()
+	for _, eofDuringWrite := range []bool{true, false} {
+		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+			waitForClientClose(ctx, conn)
+		})
+		s := openTestStream(t, server.URL).(*stream)
+		contextID, conn, err := s.beginFragment("Hello.")
+		if err != nil || conn == nil {
+			t.Fatalf("begin = %v, %v", conn, err)
+		}
+		if eofDuringWrite {
+			s.socketEnded(conn, io.EOF)
+		}
+		sendErr := s.send(context.Background(), conn, s.generationRequest(contextID, "Hello.", true))
+		var failure *runtimepkg.ProviderError
+		if eofDuringWrite {
+			if !errors.As(sendErr, &failure) || !failure.Retryable || !strings.Contains(failure.Message, "unknown") {
+				t.Errorf("EOF during the write: send = %v; want an unknown-outcome retryable error", sendErr)
+			}
+		} else {
+			if sendErr != nil {
+				t.Fatalf("send: %v", sendErr)
+			}
+			s.socketEnded(conn, io.EOF)
+			events := nextEvents(t, s.Events(), 1)
+			if !errors.As(events[0].Err, &failure) || !failure.Retryable {
+				t.Errorf("EOF after the write: event = %+v; want a retryable error", events[0])
+			}
+		}
+		_ = s.Abort(context.Background())
+		server.Close()
+	}
+}
+
+// A managed provider-direct session authenticates with a short-lived token in
+// the URL. A new socket after Cartesia closed the idle one must carry a
+// current token from the refresher, not the first one.
+func TestAdapterRedialsAManagedRouteWithACurrentToken(t *testing.T) {
+	t.Parallel()
+	var connections atomic.Int32
+	tokens := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := r.URL.Query().Get("access_token")
+		tokens <- token
+		number := connections.Add(1)
+		if (number == 1 && token != "token-1") || (number > 1 && token != "token-2") {
+			http.Error(w, "expired token", http.StatusUnauthorized)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		go func() {
+			defer conn.CloseNow()
+			ctx := context.Background()
+			if number == 1 {
+				_ = conn.Close(websocket.StatusNormalClosure, "idle")
+				return
+			}
+			fragment, err := readGeneration(ctx, conn)
+			if err != nil {
+				return
+			}
+			if _, err := readGeneration(ctx, conn); err != nil {
+				return
+			}
+			writeFrames(ctx, t, conn, chunkFrame(fragment.ContextID, []byte{1}), wordsFrame(fragment.ContextID, "Hello."), doneFrame(fragment.ContextID))
+			waitForClientClose(ctx, conn)
+		}()
+	}))
+	defer server.Close()
+
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refreshes atomic.Int32
+	request := adapterRequest(server.URL)
+	request.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+	request.Plan.Route.Credential.Value = "token-1"
+	request.RefreshCredential = func(context.Context) (protocol.DelegatedCredential, error) {
+		refreshes.Add(1)
+		return protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "token-2", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	}
+	providerStream, err := adapter.Open(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = providerStream.Close(context.Background()) }()
+	waitForDisconnect(t, providerStream)
+	if err := providerStream.AppendText(context.Background(), "Hello."); err != nil {
+		t.Fatalf("append after the idle socket closed: %v", err)
+	}
+	if err := providerStream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := describe(nextEvents(t, providerStream.Events(), 4)); got != "audio.started,audio.frame1,alignment,audio.done" {
+		t.Fatalf("events = %s", got)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Errorf("RefreshCredential called %d times; want once for the new socket", got)
+	}
+	if first, second := <-tokens, <-tokens; first != "token-1" || second != "token-2" {
+		t.Errorf("handshake tokens = %q, %q; want token-1 then token-2", first, second)
+	}
+
+	// A refresher that fails makes the fragment fail retryably, before any
+	// handshake with a stale token.
+	var handshakes atomic.Int32
+	idle := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handshakes.Add(1)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "idle")
+	}))
+	defer idle.Close()
+	idleAdapter, err := New(testConfig(idle.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failingRequest := adapterRequest(idle.URL)
+	failingRequest.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+	failingRequest.Plan.Route.Credential.Value = "token-1"
+	failingRequest.RefreshCredential = func(context.Context) (protocol.DelegatedCredential, error) {
+		return protocol.DelegatedCredential{}, errors.New("control plane unavailable")
+	}
+	failing, err := idleAdapter.Open(context.Background(), failingRequest)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = failing.Close(context.Background()) }()
+	waitForDisconnect(t, failing)
+	var failure *runtimepkg.ProviderError
+	if err := failing.AppendText(context.Background(), "Hello."); !errors.As(err, &failure) || !failure.Retryable || failure.Hint == "" {
+		t.Errorf("append with a failing refresher = %v; want a retryable provider error with a hint", err)
+	}
+	if got := handshakes.Load(); got != 1 {
+		t.Errorf("handshakes = %d; want only the first, none with a stale token", got)
+	}
+}
+
+// The review's sequence: "Hello" is spoken, Cartesia expires its context
+// during a 4 s pause, and a lone "!" then opens a new context, which Cartesia
+// ends without audio, as it does for punctuation. The utterance ends with a
+// done, in either buffering mode.
+func TestAdapterEndsAnUtteranceWhoseContinuationContextHadNoAudio(t *testing.T) {
+	t.Parallel()
+	for _, mode := range bufferModes {
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+				first, err := readGeneration(ctx, conn)
+				if err != nil || !writeFrames(ctx, t, conn, chunkFrame(first.ContextID, make16kAudio(1, 16_000)), wordsFrame(first.ContextID, "Hello"), doneFrame(first.ContextID), map[string]any{"type": "test_marker"}) {
+					return
+				}
+				rest, err := readGeneration(ctx, conn)
+				if err != nil || rest.ContextID == first.ContextID {
+					t.Errorf("rest = %+v, %v; want a new context", rest, err)
+					return
+				}
+				if _, err := readGeneration(ctx, conn); err != nil {
+					return
+				}
+				writeFrames(ctx, t, conn, append(flushDones(mode.settings, rest.ContextID, 2), doneFrame(rest.ContextID))...)
+				waitForClientClose(ctx, conn)
+			})
+			defer server.Close()
+			providerStream := openStreamWith(t, server.URL, mode.settings)
+			defer func() { _ = providerStream.Close(context.Background()) }()
+			if err := providerStream.AppendText(context.Background(), "Hello"); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+			if got := describe(nextEvents(t, providerStream.Events(), 4)); got != "audio.started,audio.frame1,alignment,warning" {
+				t.Fatalf("first fragment = %s", got)
+			}
+			if err := providerStream.AppendText(context.Background(), "!"); err != nil {
+				t.Fatalf("append after the pause: %v", err)
+			}
+			if err := providerStream.CommitText(context.Background()); err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+			want := warnings(mode.settings, 2) + "audio.done"
+			if got := describe(nextEvents(t, providerStream.Events(), strings.Count(want, ",")+1)); got != want {
+				t.Errorf("after the pause = %s; want %s", got, want)
+			}
+		})
+	}
+}
+
+// "Hello," is spoken, " goodbye." is appended, and the commit follows 3.1 s
+// later while Cartesia has not answered the tail yet (it may hold a buffered
+// fragment for the whole buffer delay). In the security review's sequence all
+// of Hello's audio arrives before the append; in the cartesia7 sequence the
+// rest of it arrives after the append. Cartesia has not ended the context, so
+// the commit goes to it, as on main, and the tail is spoken. The pause is real
+// time: no clock may turn it into a guess that the context is ending.
+func TestAdapterSpeaksATailAppendedBeforeALongPause(t *testing.T) {
+	t.Parallel()
+	for _, sequence := range []struct {
+		name string
+		// lateRest sends the rest of Hello's audio after the append.
+		lateRest bool
+	}{
+		{"all of the first audio before the append", false},
+		{"the rest of the first audio after the append", true},
+	} {
+		for _, mode := range bufferModes {
+			t.Run(sequence.name+", "+mode.name, func(t *testing.T) {
+				t.Parallel()
+				server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+					first, err := readGeneration(ctx, conn)
+					if err != nil {
+						return
+					}
+					rest := append([]map[string]any{chunkFrame(first.ContextID, make16kAudio(2, 1_600)), wordsFrame(first.ContextID, "Hello,")}, flushDones(mode.settings, first.ContextID, 1)...)
+					head := []map[string]any{chunkFrame(first.ContextID, make16kAudio(1, 16_000))}
+					if !sequence.lateRest {
+						head = append(head, rest...)
+					}
+					if !writeFrames(ctx, t, conn, head...) {
+						return
+					}
+					tail, err := readGeneration(ctx, conn)
+					if err != nil || tail.ContextID != first.ContextID {
+						t.Errorf("tail = %+v, %v; want the first context", tail, err)
+						return
+					}
+					if sequence.lateRest && !writeFrames(ctx, t, conn, rest...) {
+						return
+					}
+					commit, err := readGeneration(ctx, conn)
+					if err != nil || commit.Continue || commit.ContextID != first.ContextID {
+						t.Errorf("commit = %+v, %v; want continue:false on %s", commit, err, first.ContextID)
+						return
+					}
+					writeFrames(ctx, t, conn, append(append([]map[string]any{chunkFrame(first.ContextID, make16kAudio(3, 3_200))}, flushDones(mode.settings, first.ContextID, 2)...), doneFrame(first.ContextID))...)
+					waitForClientClose(ctx, conn)
+				})
+				defer server.Close()
+				providerStream := openStreamWith(t, server.URL, mode.settings)
+				defer func() { _ = providerStream.Close(context.Background()) }()
+				if err := providerStream.AppendText(context.Background(), "Hello,"); err != nil {
+					t.Fatalf("append: %v", err)
+				}
+				hello := "audio.started,audio.frame1,audio.frame2,alignment," + warnings(mode.settings, 1)
+				before := hello
+				if sequence.lateRest {
+					before = "audio.started,audio.frame1,"
+				}
+				before = strings.TrimSuffix(before, ",")
+				if got := describe(nextEvents(t, providerStream.Events(), strings.Count(before, ",")+1)); got != before {
+					t.Fatalf("before the append = %s; want %s", got, before)
+				}
+				if err := providerStream.AppendText(context.Background(), " goodbye."); err != nil {
+					t.Fatalf("append the tail: %v", err)
+				}
+				if sequence.lateRest {
+					want := strings.TrimSuffix("audio.frame2,alignment,"+warnings(mode.settings, 1), ",")
+					if got := describe(nextEvents(t, providerStream.Events(), strings.Count(want, ",")+1)); got != want {
+						t.Fatalf("rest of the first audio = %s; want %s", got, want)
+					}
+				}
+				time.Sleep(3100 * time.Millisecond)
+				if err := providerStream.CommitText(context.Background()); err != nil {
+					t.Fatalf("commit: %v", err)
+				}
+				want := "audio.frame3," + warnings(mode.settings, 2) + "audio.done"
+				if got := describe(nextEvents(t, providerStream.Events(), strings.Count(want, ",")+1)); got != want {
+					t.Errorf("after the commit = %s; want %s", got, want)
+				}
+			})
+		}
+	}
+}
+
+// After an idle close, a reconnect to a server that accepts the request and
+// never answers the upgrade fails retryably once the redial deadline passes,
+// instead of holding the fragment for the life of the session.
+func TestAdapterBoundsAReconnectThatNeverAnswers(t *testing.T) {
+	t.Parallel()
+	var handshakes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if handshakes.Add(1) > 1 {
+			<-r.Context().Done() // never answer the upgrade
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "idle")
+	}))
+	defer server.Close()
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.redialTimeout != 10*time.Second {
+		t.Errorf("redial timeout = %v; want 10s", adapter.redialTimeout)
+	}
+	adapter.redialTimeout = 200 * time.Millisecond
+	providerStream, err := adapter.Open(context.Background(), adapterRequest(server.URL))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = providerStream.Close(context.Background()) }()
+	waitForDisconnect(t, providerStream)
+	started := time.Now()
+	err = providerStream.AppendText(context.Background(), "Hello.")
+	var failure *runtimepkg.ProviderError
+	if !errors.As(err, &failure) || !failure.Retryable || failure.Code != "provider_unavailable" {
+		t.Errorf("append to a reconnect that never answers = %v; want a retryable provider_unavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Errorf("append returned after %v; want the 200 ms redial deadline", elapsed)
+	}
+	if got := handshakes.Load(); got != 2 {
+		t.Errorf("handshakes = %d; want the first and one reconnect", got)
+	}
+}
+
+// A handshake answered with a redirect is a failed dial: neither the
+// customer's key (header) nor a managed token (query, and the Referer a
+// followed redirect would carry) reaches the redirect target.
+func TestAdapterDoesNotFollowAHandshakeRedirect(t *testing.T) {
+	t.Parallel()
+	for _, source := range []protocol.CredentialSource{protocol.CredentialsBYOK, protocol.CredentialsManaged} {
+		var reached atomic.Int32
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reached.Add(1)
+			if r.Header.Get("X-API-Key") != "" || strings.Contains(r.URL.RawQuery+r.Referer(), "secret-credential") {
+				t.Errorf("%s: redirect target got the credential", source)
+			}
+			http.Error(w, "not a cartesia endpoint", http.StatusNotFound)
+		}))
+		redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+		}))
+		adapter, err := New(testConfig(redirector.URL))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := adapterRequest(redirector.URL)
+		request.Plan.Execution.CredentialSource = source
+		request.Plan.Route.Credential.Value = "secret-credential"
+		providerStream, err := adapter.Open(context.Background(), request)
+		var failure *runtimepkg.ProviderError
+		if err == nil {
+			_ = providerStream.Close(context.Background())
+			t.Errorf("%s: open through a redirect succeeded; want a failed dial", source)
+		} else if !errors.As(err, &failure) || failure.ProviderStatus != http.StatusTemporaryRedirect {
+			t.Errorf("%s: open = %v; want a provider error with status 307", source, err)
+		}
+		if got := reached.Load(); got != 0 {
+			t.Errorf("%s: redirect target got %d requests; want none", source, got)
+		}
+		redirector.Close()
+		target.Close()
+	}
+}
+
+// make16kAudio is duration bytes of 16 kHz pcm_s16le whose first byte marks
+// which fragment it belongs to.
+func make16kAudio(mark byte, bytes int) []byte {
+	audio := make([]byte, bytes)
+	audio[0] = mark
+	return audio
+}

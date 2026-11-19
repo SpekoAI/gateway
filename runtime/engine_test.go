@@ -92,6 +92,63 @@ func TestTTSSessionEmitsBinaryAudioWithoutProviderLogicInEngine(t *testing.T) {
 	}
 }
 
+// A text.commit with nothing appended since the last one, before any append
+// or right after an utterance, is answered with nothing: the adapter's
+// ErrNothingToCommit does not end the session, and the next utterance plays.
+func TestTTSSessionKeepsGoingAfterACommitWithNothingToCommit(t *testing.T) {
+	t.Parallel()
+
+	base := mock.NewTTSAdapter("mock.tts.v1")
+	adapter := mock.NewAdapter(base.ID(), func(request runtimepkg.AdapterRequest) *mock.Stream {
+		stream := base.Factory(request)
+		appendText, commitText := stream.AppendTextHook, stream.CommitTextHook
+		appended := false
+		stream.AppendTextHook = func(ctx context.Context, text string) error {
+			appended = true
+			return appendText(ctx, text)
+		}
+		stream.CommitTextHook = func(ctx context.Context) error {
+			if !appended {
+				return runtimepkg.ErrNothingToCommit
+			}
+			appended = false
+			return commitText(ctx)
+		}
+		return stream
+	})
+	engine := newEngine(t, adapter, runtimepkg.DefaultLimits(), runtimepkg.NopTelemetry{})
+	session := openSession(t, engine, protocol.SessionKindTTS, adapter.ID())
+
+	for step, call := range []func() error{
+		session.CommitText,
+		func() error { return session.AppendText("hello") },
+		session.CommitText,
+		session.CommitText,
+		func() error { return session.AppendText("again") },
+		session.CommitText,
+	} {
+		if err := call(); err != nil {
+			t.Fatalf("step %d: %v", step, err)
+		}
+	}
+	session.Close()
+
+	events := collectEvents(t, session)
+	assertTypes(t, events, []protocol.EventType{
+		protocol.EventSessionReady,
+		protocol.EventAudioStarted,
+		protocol.EventAudioFrame,
+		protocol.EventAudioDone,
+		protocol.EventAudioStarted,
+		protocol.EventAudioFrame,
+		protocol.EventAudioDone,
+		protocol.EventSessionClosed,
+	})
+	if got := string(events[5].Audio); got != "mock-audio:again" {
+		t.Fatalf("second utterance audio = %q", got)
+	}
+}
+
 func TestManagedPalabraTTSSessionReportsUnicodeCharacters(t *testing.T) {
 	t.Parallel()
 
