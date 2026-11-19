@@ -215,11 +215,14 @@ class NativeInputTimeline:
             # frame. If that translation clamps to zero, later occurrences
             # must retain its physical end rather than overlap by that skew.
             start = max(self.position, source.start - _source_epoch(session))
+        synthetic = self.legacy and observed and source.synthetic
         owned.userdata[_POSITION] = _InputPosition(
-            self, start, duration, not self.legacy or observed,
-            self.legacy and observed and source.synthetic,
+            self, start, duration, not self.legacy or observed, synthetic,
         )
-        self.position = start + duration
+        # SDK flush silence has recognition duration but no captured media
+        # duration. Keep its existing provenance from advancing the physical
+        # end against which later real occurrences are ordered.
+        self.position = start if synthetic else start + duration
         return owned
 
     def occurrence_of(self, frame: rtc.AudioFrame) -> _InputPosition:
