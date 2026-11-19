@@ -419,8 +419,12 @@ class SpekoTTSService(PipecatTTSService):
         self, text: str, context_id: str
     ) -> AsyncGenerator[Frame | None, None]:
         state: _TTSContextState | None = None
+        native_io_at_risk = True
         try:
             state = await self._context(context_id)
+            # Waiting on the preceding admitted utterance starts no transport
+            # work for this sentence. Normal interruption may cancel that wait.
+            native_io_at_risk = False
             # Gateway accepts one committed utterance at a time. Its command
             # acknowledgement only queues synthesis; audio.done releases the
             # stream for the next sentence. Audio keeps flowing on the receiver
@@ -430,6 +434,7 @@ class SpekoTTSService(PipecatTTSService):
             if state.interrupted or state.closed or state.finishing:
                 return
             state.utterance_done.clear()
+            native_io_at_risk = True
             await state.session.append_text(text)
             # Commit each Pipecat sentence so synthesis starts while the LLM is
             # still producing the remainder of the response.
@@ -437,9 +442,9 @@ class SpekoTTSService(PipecatTTSService):
             await self.start_tts_usage_metrics(text)
             yield None
         except asyncio.CancelledError:
-            if isinstance(self._client, RelaySpeechClient):
-                # Admission may have sent configure before cancellation. Latch
-                # before cleanup yields so a queued SDK sentence cannot reopen.
+            if isinstance(self._client, RelaySpeechClient) and native_io_at_risk:
+                # Admission or a text write may already have reached the peer.
+                # Latch before cleanup yields; waiting alone cannot set it.
                 self._native_failed = True
                 if state is not None:
                     await self._close_state(context_id, state, interrupted=True)

@@ -174,7 +174,9 @@ async def test_actual_frame_queue_distinguishes_waiting_from_ambiguous_native_io
                 assert [index for index, _ in commits] == [0, 1]
                 assert audio and audio[-1].startswith(b"\x02\x00")
             else:
-                assert service._native_failed
+                assert service._native_failed, (
+                    f"ambiguous {stage} permitted {len(admissions)} physical admissions"
+                )
                 assert len(admissions) == 1, "ambiguous native I/O was readmitted"
                 assert errors and all(
                     isinstance(f, ErrorFrame) and f.fatal for f in errors
