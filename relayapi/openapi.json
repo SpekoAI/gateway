@@ -3,7 +3,7 @@
   "info": {
     "title": "Speko Router API",
     "version": "1.0.0",
-    "description": "The Speko Router is streaming-first: live speech-to-text and text-to-speech sessions, and the three native speech-to-speech routes, all run over WebSocket and are specified in asyncapi.yaml, which this Router serves at /asyncapi.json. This document is the HTTP contract, the request/response surface beside those sockets: model discovery, batch speech transcription, one-shot speech synthesis, LLM responses over JSON or server-sent events, and Jev evaluations. The Go types in package relayapi are the source of truth for every shape in this document, and speccheck_test.go machine-checks the two against each other. The /v1 prefix is the stable major version: compatible fields and capabilities may be added, while breaking changes require a new major path. Before a v1 operation or field is retired, Speko documents a migration, sends the Deprecation header and a Link with rel=\"deprecation\", and provides at least 90 days of notice before the Sunset date. See the public versioning policy for the complete compatibility contract.",
+    "description": "The Speko Router is streaming-first: live speech-to-text and text-to-speech sessions, and the three native speech-to-speech routes, all run over WebSocket and are specified in asyncapi.yaml, which this Router serves at /asyncapi.json. This document is the HTTP contract, the request/response surface beside those sockets: model discovery, batch speech transcription, one-shot speech synthesis, LLM responses over JSON or server-sent events, and typed evaluations (Jev over text, audio decision models over a WAV clip). The Go types in package relayapi are the source of truth for every shape in this document, and speccheck_test.go machine-checks the two against each other. The /v1 prefix is the stable major version: compatible fields and capabilities may be added, while breaking changes require a new major path. Before a v1 operation or field is retired, Speko documents a migration, sends the Deprecation header and a Link with rel=\"deprecation\", and provides at least 90 days of notice before the Sunset date. See the public versioning policy for the complete compatibility contract.",
     "x-speko-versioning-policy": "https://speko.ai/developers/versioning"
   },
   "externalDocs": {
@@ -389,8 +389,8 @@
     "/v1/evaluations": {
       "post": {
         "operationId": "createEvaluation",
-        "summary": "Evaluate typed questions against shared state with Jev",
-        "description": "Executes one non-streaming TypeSafe Jev evaluation. Routing must be explicit. The Router preserves native question ids, option keys, probabilities, confidence, Score legends, and reported usage. The application owns every decision and subsequent action.",
+        "summary": "Answer typed questions about text state or an audio clip",
+        "description": "Executes one non-streaming typed evaluation: noul, choice and score questions answered with calibrated probabilities. Routing must be explicit. A JSON body is a text evaluation over state and is served by models whose evaluation_inputs include text (or advertise none). A multipart body is an audio evaluation: a request part, then one WAV (PCM s16le) clip in the audio part, served by models whose evaluation_inputs include audio. Both shapes return the same EvaluationResponse, so switching decision models is a routing change. A request outside the routed model's evaluation_limits is refused with capability_unsupported before admission. The Router preserves question ids and option keys; vendor answers are normalized to this contract (noul answers carry no confidence, choice and score probabilities sum to 1, Score legends echo the request's levels). For idempotency the multipart content hash covers the decoded part payload bytes only, concatenated in part order (request, then audio). The application owns every decision and subsequent action.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
@@ -403,12 +403,41 @@
               "schema": {
                 "$ref": "#/components/schemas/EvaluationRequest"
               }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "description": "Exactly two parts, hashed for idempotency in this order.",
+                "properties": {
+                  "request": {
+                    "$ref": "#/components/schemas/AudioEvaluationRequest"
+                  },
+                  "audio": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "One WAV (PCM s16le) clip: the material the questions are about. Its sample rate and channel count must be listed in the routed model's audio_formats."
+                  }
+                },
+                "required": [
+                  "request",
+                  "audio"
+                ],
+                "additionalProperties": false
+              },
+              "encoding": {
+                "request": {
+                  "contentType": "application/json"
+                },
+                "audio": {
+                  "contentType": "audio/wav"
+                }
+              }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "The validated Jev evaluation result.",
+            "description": "The validated evaluation result.",
             "headers": {
               "Speko-Request-ID": {
                 "$ref": "#/components/headers/SpekoRequestID"
@@ -817,6 +846,21 @@
             },
             "uniqueItems": true
           },
+          "evaluation_inputs": {
+            "type": "array",
+            "description": "What an evaluation model decides over: text (a JSON body with state) and/or audio (a multipart body with a WAV clip). Omitted means text only. Evaluation models only.",
+            "items": {
+              "type": "string",
+              "enum": [
+                "text",
+                "audio"
+              ]
+            },
+            "uniqueItems": true
+          },
+          "evaluation_limits": {
+            "$ref": "#/components/schemas/EvaluationLimits"
+          },
           "diarization": {
             "type": "boolean",
             "description": "Labels transcript segments by speaker on the streaming transport. A model whose vendor offers diarization only on a batch API reports false, because this advertises what the Router can serve."
@@ -886,7 +930,7 @@
           },
           "audio_formats": {
             "type": "array",
-            "description": "Accepted input formats for STT and S2S models, or output formats for TTS models; omitted for LLM models.",
+            "description": "Accepted input formats for STT and S2S models and for evaluation models that take audio, or output formats for TTS models; omitted for LLM and text-only evaluation models.",
             "items": {
               "$ref": "#/components/schemas/AudioFormat"
             }
@@ -1873,6 +1917,232 @@
           "state",
           "questions"
         ],
+        "additionalProperties": false
+      },
+      "AudioEvaluationRequest": {
+        "type": "object",
+        "description": "The request part of an audio evaluation. Questions use the same primitives as EvaluationRequest, restricted to plain text: instructions, option descriptions, noul criteria and score levels are strings, and question ids match [A-Za-z0-9_-]{1,64}. State is optional plain-text context about the clip; the clip itself is the material being decided.",
+        "properties": {
+          "routing": {
+            "$ref": "#/components/schemas/EvaluationRouting"
+          },
+          "state": {
+            "description": "Optional plain-text context about the clip. Null means absent.",
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AudioEvaluationText"
+              }
+            ]
+          },
+          "questions": {
+            "type": "object",
+            "minProperties": 1,
+            "propertyNames": {
+              "pattern": "^[A-Za-z0-9_-]{1,64}$"
+            },
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AudioEvaluationQuestion"
+            }
+          }
+        },
+        "required": [
+          "routing",
+          "questions"
+        ],
+        "additionalProperties": false
+      },
+      "AudioEvaluationText": {
+        "type": "string",
+        "description": "A non-blank plain-text string.",
+        "pattern": "[^\\s\\x85]"
+      },
+      "AudioEvaluationQuestion": {
+        "description": "A noul, choice, or score question in an audio evaluation. Same primitives as EvaluationQuestion, with plain-text content only. Choice option keys must not start or end with whitespace and must not contain control characters or whitespace other than an ASCII space; their length is bounded per model by max_option_name_chars.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AudioNoulQuestion"
+          },
+          {
+            "$ref": "#/components/schemas/AudioChoiceQuestion"
+          },
+          {
+            "$ref": "#/components/schemas/AudioScoreQuestion"
+          }
+        ]
+      },
+      "AudioNoulQuestion": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "noul"
+            ]
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/AudioEvaluationText"
+          },
+          "criteria": {
+            "type": "object",
+            "minProperties": 1,
+            "properties": {
+              "true": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AudioEvaluationText"
+                  }
+                ]
+              },
+              "false": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AudioEvaluationText"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "type",
+          "instructions"
+        ],
+        "additionalProperties": false
+      },
+      "AudioChoiceQuestion": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "choice"
+            ]
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/AudioEvaluationText"
+          },
+          "criteria": {
+            "type": "object",
+            "minProperties": 2,
+            "maxProperties": 255,
+            "propertyNames": {
+              "pattern": "^[^\\s\\x00-\\x1F\\x7F-\\x9F](?: *[^\\s\\x00-\\x1F\\x7F-\\x9F])*$"
+            },
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/AudioEvaluationText"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "instructions",
+          "criteria"
+        ],
+        "additionalProperties": false
+      },
+      "AudioScoreQuestion": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "score"
+            ]
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/AudioEvaluationText"
+          },
+          "criteria": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 10,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/AudioEvaluationText"
+            }
+          }
+        },
+        "required": [
+          "type",
+          "instructions",
+          "criteria"
+        ],
+        "additionalProperties": false
+      },
+      "EvaluationLimits": {
+        "type": "object",
+        "description": "One evaluation model's published request bounds. An omitted field means the model publishes no such bound. Character counts are Unicode code points. A caller that switches models validates against the intersection of their limits.",
+        "properties": {
+          "max_questions": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_choice_options": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 255
+          },
+          "max_score_levels": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 10
+          },
+          "max_instruction_chars": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_context_chars": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Bound on the state text sent as context."
+          },
+          "max_option_name_chars": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_option_description_chars": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_score_level_chars": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_noul_criterion_chars": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "min_audio_ms": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_audio_ms": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_audio_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Bound on the clip's PCM data bytes."
+          }
+        },
         "additionalProperties": false
       },
       "EvaluationRouting": {
