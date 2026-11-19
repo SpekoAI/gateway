@@ -677,6 +677,74 @@ func TestAdapterKeepsAContextAwaitingItsFirstAudio(t *testing.T) {
 	}
 }
 
+// The security review's reproduction: "Hello," is spoken, " goodbye." follows
+// 1 s later, and the commit 3.1 s after that, before Cartesia has answered the
+// tail (it may hold a buffered fragment for the whole buffer delay). Text
+// appended after the last audio keeps the context from being quiet: the commit
+// goes to Cartesia on the same context, as before the context switching, and
+// the tail is spoken.
+func TestAdapterSpeaksATailAppendedAfterTheLastAudio(t *testing.T) {
+	t.Parallel()
+	for _, settings := range []map[string]any{{"max_buffer_delay_ms": 0.0}, nil} {
+		flushes := func(contextID string, n int) []map[string]any {
+			var frames []map[string]any
+			for range n {
+				if settings != nil {
+					frames = append(frames, flushDoneFrame(contextID))
+				}
+			}
+			return frames
+		}
+		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+			first, err := readGeneration(ctx, conn)
+			if err != nil || !writeFrames(ctx, t, conn, append([]map[string]any{chunkFrame(first.ContextID, make16kAudio(1, 16_000)), wordsFrame(first.ContextID, "Hello,")}, flushes(first.ContextID, 1)...)...) {
+				return
+			}
+			tail, err := readGeneration(ctx, conn)
+			if err != nil || tail.ContextID != first.ContextID {
+				t.Errorf("tail = %+v, %v; want the first context", tail, err)
+				return
+			}
+			commit, err := readGeneration(ctx, conn)
+			if err != nil || commit.Continue || commit.ContextID != first.ContextID {
+				t.Errorf("commit = %+v, %v; want continue:false on %s", commit, err, first.ContextID)
+				return
+			}
+			writeFrames(ctx, t, conn, append(append([]map[string]any{chunkFrame(first.ContextID, make16kAudio(2, 3_200))}, flushes(first.ContextID, 2)...), doneFrame(first.ContextID))...)
+			waitForClientClose(ctx, conn)
+		})
+		clock := &testClock{now: time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC)}
+		providerStream := openClockedStream(t, server.URL, clock, settings)
+		if err := providerStream.AppendText(context.Background(), "Hello,"); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		want := "audio.started,audio.frame1,alignment"
+		if settings != nil {
+			want += ",warning"
+		}
+		if got := describe(nextEvents(t, providerStream.Events(), strings.Count(want, ",")+1)); got != want {
+			t.Fatalf("settings %v: first fragment = %s; want %s", settings, got, want)
+		}
+		clock.Advance(time.Second)
+		if err := providerStream.AppendText(context.Background(), " goodbye."); err != nil {
+			t.Fatalf("append the tail: %v", err)
+		}
+		clock.Advance(3100 * time.Millisecond)
+		if err := providerStream.CommitText(context.Background()); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		want = "audio.frame2,audio.done"
+		if settings != nil {
+			want = "audio.frame2,warning,warning,audio.done"
+		}
+		if got := describe(nextEvents(t, providerStream.Events(), strings.Count(want, ",")+1)); got != want {
+			t.Errorf("settings %v: after the commit = %s; want %s", settings, got, want)
+		}
+		_ = providerStream.Close(context.Background())
+		server.Close()
+	}
+}
+
 // make16kAudio is duration bytes of 16 kHz pcm_s16le whose first byte marks
 // which fragment it belongs to.
 func make16kAudio(mark byte, bytes int) []byte {

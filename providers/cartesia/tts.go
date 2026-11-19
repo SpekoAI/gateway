@@ -53,8 +53,9 @@ type Config struct {
 // vendor's context, not the caller's utterance. A fragment opens a new context
 // of the same utterance once the current one has had no fragment for
 // max(2 s, the configured max_buffer_delay_ms, 3 s by default) and no audio
-// or flush_done for 2 s, unless that context was sent text and has not
-// answered with any audio yet; until then it continues the current context.
+// or flush_done for 2 s, unless text was appended to it after its last audio
+// and no audio has answered it yet; until then it continues the current
+// context.
 // A socket Cartesia closes in the middle of an utterance is a retryable error
 // by design. An utterance sent text other than whitespace that produced no
 // audio at all is a retryable error; one that produced any audio ends
@@ -313,12 +314,13 @@ func validateGenerationOptions(model string, options protocol.RequestOptions, me
 // never be written to a context that may be expiring:
 //
 //   - An utterance owns an ordered list of contexts and speaks through the
-//     newest. A fragment that finds that context quiet (not awaiting its
-//     first audio, nothing for quietGap since its last audio, flush_done or
-//     fragment, and nothing for the buffer delay since its last fragment)
-//     abandons it and opens a new context in
-//     the same utterance, whose word timings continue after the audio already
-//     sent. An abandoned context is never written again.
+//     newest. A fragment that finds that context quiet (no text appended
+//     after its last audio still awaiting audio, nothing for quietGap since
+//     its last audio, flush_done or fragment, and nothing for the buffer delay
+//     since its last fragment) abandons it and opens a new context in the same
+//     utterance, whose word timings continue after the audio already sent. An
+//     abandoned context is never written again. The fragment is judged by the
+//     context's state before it is written.
 //   - Frames are accepted only for the open utterance's newest context while
 //     it can still speak, by context id alone. Frames for any other context —
 //     the expiry done of an abandoned one, stale frames of an earlier
@@ -398,12 +400,12 @@ type vendorContext struct {
 	offset    float64
 	committed bool
 	cancelled bool
-	// awaitingAudio is set while the context was sent text other than
-	// whitespace and has not answered with any audio yet; such a context is
-	// never quiet, so audio still on its way (a buffered fragment is released
-	// only after max_buffer_delay_ms) is not dropped. It never fails anything.
+	// awaitingAudio is set when text other than whitespace is appended and
+	// cleared by the next audio chunk; until then the context is never quiet,
+	// so audio still on its way (Cartesia may hold a buffered fragment for the
+	// whole max_buffer_delay_ms) is spoken, not dropped, and the commit goes
+	// to Cartesia. Its done still ends the context. It never fails anything.
 	awaitingAudio bool
-	heardAudio    bool
 	lastFragment  time.Time
 	lastAnswer    time.Time
 }
@@ -625,7 +627,7 @@ func (s *stream) beginFragment(text string) (contextID string, conn *websocket.C
 	c.lastFragment = now
 	if strings.TrimSpace(text) != "" {
 		u.speech = true
-		c.awaitingAudio = !c.heardAudio
+		c.awaitingAudio = true
 	}
 	s.writing, s.lostWhileWriting = true, false
 	return c.id, s.conn, nil
@@ -704,8 +706,8 @@ func (s *stream) send(ctx context.Context, conn *websocket.Conn, value any) erro
 	return err
 }
 
-// quietLocked reports whether a context may be expiring: it is not awaiting
-// its first audio and has heard nothing for quietGap, nor a fragment for the
+// quietLocked reports whether a context may be expiring: no appended text
+// awaits audio, and it has heard nothing for quietGap, nor a fragment for the
 // buffer delay.
 func (s *stream) quietLocked(c *vendorContext, now time.Time) bool {
 	if c.committed || c.cancelled || c.awaitingAudio {
@@ -776,7 +778,7 @@ func (s *stream) acceptAudio(contextID string, bytes int) (accepted, started boo
 	if !ok {
 		return false, false
 	}
-	c.awaitingAudio, c.heardAudio = false, true
+	c.awaitingAudio = false
 	c.lastAnswer = s.now()
 	u.audioBytes += bytes
 	started = !u.audioStarted
