@@ -25,6 +25,7 @@ func TestAdapterNormalMultiUtteranceSessionSendsUnchangedFrames(t *testing.T) {
 	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
 		var frames []string
 		defer func() { received <- frames }()
+		fragments := 0
 		for {
 			_, payload, err := conn.Read(ctx)
 			if err != nil {
@@ -37,13 +38,20 @@ func TestAdapterNormalMultiUtteranceSessionSendsUnchangedFrames(t *testing.T) {
 				return
 			}
 			if frame.Continue {
+				fragments++
 				continue
 			}
-			for _, message := range []map[string]any{
+			// With max_buffer_delay_ms 0 Cartesia acknowledges every fragment
+			// with flush_done after its audio (measured live).
+			answer := []map[string]any{
 				{"type": "chunk", "context_id": frame.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{1, 2})},
 				{"type": "timestamps", "context_id": frame.ContextID, "word_timestamps": map[string]any{"words": []string{"Hi"}, "start": []float64{0}, "end": []float64{0.1}}},
-				{"type": "done", "context_id": frame.ContextID, "done": true},
-			} {
+			}
+			for ; fragments > 0; fragments-- {
+				answer = append(answer, map[string]any{"type": "flush_done", "context_id": frame.ContextID, "status_code": 206, "flush_done": true})
+			}
+			answer = append(answer, map[string]any{"type": "done", "context_id": frame.ContextID, "done": true})
+			for _, message := range answer {
 				if err := writeJSON(ctx, conn, message); err != nil {
 					t.Errorf("write %v: %v", message["type"], err)
 					return
@@ -65,6 +73,7 @@ func TestAdapterNormalMultiUtteranceSessionSendsUnchangedFrames(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	for _, utterance := range [][]string{{"Hello, ", "world."}, {"Again."}} {
+		want := "audio.started,audio.frame,alignment" + strings.Repeat(",warning", len(utterance)) + ",audio.done"
 		for _, text := range utterance {
 			if err := providerStream.AppendText(context.Background(), text); err != nil {
 				t.Fatalf("append %q: %v", text, err)
@@ -73,8 +82,8 @@ func TestAdapterNormalMultiUtteranceSessionSendsUnchangedFrames(t *testing.T) {
 		if err := providerStream.CommitText(context.Background()); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
-		events := collectProviderEvents(t, providerStream.Events(), 4)
-		if got := strings.Join(eventTypes(events), ","); got != "audio.started,audio.frame,alignment,audio.done" {
+		events := collectProviderEvents(t, providerStream.Events(), 4+len(utterance))
+		if got := strings.Join(eventTypes(events), ","); got != want {
 			t.Fatalf("utterance events = %s", got)
 		}
 	}

@@ -218,10 +218,10 @@ func TestAdapterOpensANewContextOnlyAfterAQuietGap(t *testing.T) {
 					return
 				}
 				if next.ContextID == first.ContextID {
-					writeFrames(ctx, t, conn, chunkFrame(next.ContextID, []byte{2}), timestampsFrame(next.ContextID, "world", 0.5, 0.8), doneFrame(next.ContextID))
+					writeFrames(ctx, t, conn, chunkFrame(next.ContextID, []byte{2}), timestampsFrame(next.ContextID, "world", 0.5, 0.8), flushDoneFrame(next.ContextID), doneFrame(next.ContextID))
 				} else {
 					// The abandoned context's expiry done arrives late.
-					writeFrames(ctx, t, conn, doneFrame(first.ContextID), chunkFrame(next.ContextID, []byte{2}), timestampsFrame(next.ContextID, "world", 0, 0.3), doneFrame(next.ContextID))
+					writeFrames(ctx, t, conn, doneFrame(first.ContextID), chunkFrame(next.ContextID, []byte{2}), timestampsFrame(next.ContextID, "world", 0, 0.3), flushDoneFrame(next.ContextID), doneFrame(next.ContextID))
 				}
 				waitForClientClose(ctx, conn)
 			})
@@ -243,7 +243,7 @@ func TestAdapterOpensANewContextOnlyAfterAQuietGap(t *testing.T) {
 			if err := providerStream.CommitText(context.Background()); err != nil {
 				t.Fatalf("commit: %v", err)
 			}
-			want := "audio.frame2,alignment,audio.done"
+			want := "audio.frame2,alignment,warning,audio.done"
 			if test.newContext {
 				want = "dropped," + want
 			}
@@ -251,7 +251,7 @@ func TestAdapterOpensANewContextOnlyAfterAQuietGap(t *testing.T) {
 			if got := describe(events); got != want {
 				t.Fatalf("after %v = %s; want %s", test.gap, got, want)
 			}
-			if span := spansOf(t, events[len(events)-2])[0]; span != (protocol.TimingSpan{Text: "world", StartMS: 500, EndMS: 800}) {
+			if span := spansOf(t, events[len(events)-3])[0]; span != (protocol.TimingSpan{Text: "world", StartMS: 500, EndMS: 800}) {
 				t.Errorf("continued timing = %+v; want 500-800 ms", span)
 			}
 			if got := <-changed; got != test.newContext {
@@ -317,46 +317,58 @@ func TestAdapterDropsAStaleFrameOfThePreviousUtterance(t *testing.T) {
 }
 
 // Text that ends with no audio is a retryable error, not a bare done: at the
-// done of the committed context, and at a commit after Cartesia expired the
-// context.
+// done of the committed context, at an expiry done for speakable text
+// Cartesia acknowledged without audio, and at a commit after Cartesia expired
+// a context that had nothing speakable.
 func TestAdapterReportsAnUtteranceThatProducedNoAudio(t *testing.T) {
 	t.Parallel()
-	for _, expired := range []bool{false, true} {
+	for _, test := range []struct {
+		name     string
+		text     string
+		commitOK bool // the commit is written before Cartesia answers
+		expiry   bool // Cartesia expires the context before any commit
+	}{
+		{"committed", "Hello.", true, false},
+		{"expired speakable text", "Hello.", false, true},
+		{"expired, nothing speakable", "...", false, true},
+	} {
 		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
 			fragment, err := readGeneration(ctx, conn)
 			if err != nil {
 				t.Errorf("fragment: %v", err)
 				return
 			}
-			if expired {
-				writeFrames(ctx, t, conn, flushDoneFrame(fragment.ContextID), doneFrame(fragment.ContextID), map[string]any{"type": "test_marker"})
-			} else if _, err := readGeneration(ctx, conn); err == nil {
-				writeFrames(ctx, t, conn, flushDoneFrame(fragment.ContextID), doneFrame(fragment.ContextID))
+			if test.commitOK {
+				if _, err := readGeneration(ctx, conn); err != nil {
+					return
+				}
 			}
+			writeFrames(ctx, t, conn, flushDoneFrame(fragment.ContextID), doneFrame(fragment.ContextID), map[string]any{"type": "test_marker"})
 			waitForClientClose(ctx, conn)
 		})
 		providerStream := openTestStream(t, server.URL)
-		if err := providerStream.AppendText(context.Background(), "Hello."); err != nil {
-			t.Fatalf("append: %v", err)
+		if err := providerStream.AppendText(context.Background(), test.text); err != nil {
+			t.Fatalf("%s: append: %v", test.name, err)
+		}
+		if test.commitOK {
+			if err := providerStream.CommitText(context.Background()); err != nil {
+				t.Fatalf("%s: commit: %v", test.name, err)
+			}
 		}
 		var failure *runtimepkg.ProviderError
-		if expired {
-			_ = nextEvents(t, providerStream.Events(), 2) // flush_done, marker
-			err := providerStream.CommitText(context.Background())
-			if !errors.As(err, &failure) {
-				t.Fatalf("commit after expiry without audio = %v; want a provider error", err)
-			}
-		} else {
-			if err := providerStream.CommitText(context.Background()); err != nil {
-				t.Fatalf("commit: %v", err)
-			}
+		if speakable(test.text) {
 			events := nextEvents(t, providerStream.Events(), 2)
 			if !errors.As(events[1].Err, &failure) {
-				t.Fatalf("events = %s; want flush_done then an error", describe(events))
+				t.Fatalf("%s: events = %s; want flush_done then an error", test.name, describe(events))
+			}
+		} else {
+			_ = nextEvents(t, providerStream.Events(), 2) // flush_done, marker
+			if err := providerStream.CommitText(context.Background()); !errors.As(err, &failure) {
+				t.Fatalf("%s: commit after expiry without audio = %v; want a provider error", test.name, err)
 			}
 		}
 		if !failure.Retryable || !strings.Contains(failure.Message, "no audio") {
-			t.Errorf("expired=%t: error = %+v", expired, failure)
+			t.Errorf("%s: error = %+v", test.name, failure)
 		}
 		_ = providerStream.Close(context.Background())
 		server.Close()
@@ -556,5 +568,162 @@ func TestAdapterRedialsAManagedRouteWithACurrentToken(t *testing.T) {
 	}
 	if got := handshakes.Load(); got != 1 {
 		t.Errorf("handshakes = %d; want only the first, none with a stale token", got)
+	}
+}
+
+// The review's first reproduction, frames in its order: the first fragment's
+// audio arrives, the second fragment and the commit go to the same context,
+// then come the first fragment's late flush_done, done, and the second
+// fragment's audio. The second fragment was never spoken before done, so the
+// utterance fails retryably instead of being confirmed, in either buffering
+// mode.
+func TestAdapterFailsAnUtteranceDoneBeforeItsLastFragmentWasSpoken(t *testing.T) {
+	t.Parallel()
+	for _, settings := range []map[string]any{{"max_buffer_delay_ms": 0.0}, nil} {
+		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+			first, err := readGeneration(ctx, conn)
+			if err != nil || !writeFrames(ctx, t, conn, chunkFrame(first.ContextID, make16kAudio(1, 16_000))) {
+				return
+			}
+			for range 2 { // the second fragment and the commit
+				if _, err := readGeneration(ctx, conn); err != nil {
+					return
+				}
+			}
+			writeFrames(ctx, t, conn, flushDoneFrame(first.ContextID), doneFrame(first.ContextID), chunkFrame(first.ContextID, make16kAudio(2, 3_200)))
+			waitForClientClose(ctx, conn)
+		})
+		clock := &testClock{now: time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC)}
+		providerStream := openClockedStream(t, server.URL, clock, settings)
+		if err := providerStream.AppendText(context.Background(), "Hello, "); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		if got := describe(nextEvents(t, providerStream.Events(), 2)); got != "audio.started,audio.frame1" {
+			t.Fatalf("first fragment = %s", got)
+		}
+		if err := providerStream.AppendText(context.Background(), "world."); err != nil {
+			t.Fatalf("second fragment: %v", err)
+		}
+		if err := providerStream.CommitText(context.Background()); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		requireUnspoken(t, providerStream, "warning,error", "500 ms")
+		server.Close()
+	}
+}
+
+// The review's second reproduction: after a 4 s pause the rest of the
+// utterance opens a new context, which Cartesia answers with flush_done and
+// done but no audio. Audio of the first context must not count for it.
+func TestAdapterFailsAnUtteranceWhoseNewContextProducedNoAudio(t *testing.T) {
+	t.Parallel()
+	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		first, err := readGeneration(ctx, conn)
+		if err != nil || !writeFrames(ctx, t, conn, chunkFrame(first.ContextID, make16kAudio(1, 16_000)), flushDoneFrame(first.ContextID)) {
+			return
+		}
+		rest, err := readGeneration(ctx, conn)
+		if err != nil || rest.ContextID == first.ContextID {
+			t.Errorf("rest = %+v, %v; want a new context", rest, err)
+			return
+		}
+		if _, err := readGeneration(ctx, conn); err != nil {
+			return
+		}
+		writeFrames(ctx, t, conn, flushDoneFrame(rest.ContextID), doneFrame(rest.ContextID))
+		waitForClientClose(ctx, conn)
+	})
+	defer server.Close()
+	clock := &testClock{now: time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC)}
+	providerStream := openClockedStream(t, server.URL, clock, map[string]any{"max_buffer_delay_ms": 0.0})
+	if err := providerStream.AppendText(context.Background(), "Hello, "); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if got := describe(nextEvents(t, providerStream.Events(), 3)); got != "audio.started,audio.frame1,warning" {
+		t.Fatalf("first fragment = %s", got)
+	}
+	clock.Advance(4 * time.Second)
+	if err := providerStream.AppendText(context.Background(), "world."); err != nil {
+		t.Fatalf("append after the pause: %v", err)
+	}
+	if err := providerStream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	requireUnspoken(t, providerStream, "warning,error", "500 ms")
+}
+
+// With max_buffer_delay_ms 0 Cartesia answers each fragment with its audio
+// and then flush_done. Audio of an earlier fragment that arrives after a
+// later fragment was written does not answer the later one: a done with
+// fewer flush_done frames than speakable fragments fails the utterance.
+func TestAdapterCountsFlushDonePerSpeakableFragment(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		answer func(contextID string) []map[string]any
+		want   string
+	}{
+		{"every fragment answered, separator not acknowledged", func(id string) []map[string]any {
+			return []map[string]any{chunkFrame(id, make16kAudio(1, 3_200)), flushDoneFrame(id), chunkFrame(id, make16kAudio(2, 3_200)), flushDoneFrame(id), doneFrame(id)}
+		}, "audio.started,audio.frame1,warning,audio.frame2,warning,audio.done"},
+		{"every fragment answered, separator acknowledged", func(id string) []map[string]any {
+			return []map[string]any{chunkFrame(id, make16kAudio(1, 3_200)), flushDoneFrame(id), flushDoneFrame(id), chunkFrame(id, make16kAudio(2, 3_200)), flushDoneFrame(id), doneFrame(id)}
+		}, "audio.started,audio.frame1,warning,warning,audio.frame2,warning,audio.done"},
+		{"last fragment never answered", func(id string) []map[string]any {
+			return []map[string]any{chunkFrame(id, make16kAudio(1, 3_200)), flushDoneFrame(id), doneFrame(id)}
+		}, "audio.started,audio.frame1,warning,error"},
+	} {
+		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+			var contextID string
+			for range 4 { // "Hello,", " ", "world." and the commit
+				generation, err := readGeneration(ctx, conn)
+				if err != nil {
+					return
+				}
+				contextID = generation.ContextID
+			}
+			writeFrames(ctx, t, conn, test.answer(contextID)...)
+			waitForClientClose(ctx, conn)
+		})
+		clock := &testClock{now: time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC)}
+		providerStream := openClockedStream(t, server.URL, clock, map[string]any{"max_buffer_delay_ms": 0.0})
+		for _, text := range []string{"Hello,", " ", "world."} {
+			if err := providerStream.AppendText(context.Background(), text); err != nil {
+				t.Fatalf("%s: append: %v", test.name, err)
+			}
+		}
+		if err := providerStream.CommitText(context.Background()); err != nil {
+			t.Fatalf("%s: commit: %v", test.name, err)
+		}
+		if got := describe(nextEvents(t, providerStream.Events(), strings.Count(test.want, ",")+1)); got != test.want {
+			t.Errorf("%s: events = %s; want %s", test.name, got, test.want)
+		}
+		_ = providerStream.Close(context.Background())
+		server.Close()
+	}
+}
+
+// make16kAudio is duration bytes of 16 kHz pcm_s16le whose first byte marks
+// which fragment it belongs to.
+func make16kAudio(mark byte, bytes int) []byte {
+	audio := make([]byte, bytes)
+	audio[0] = mark
+	return audio
+}
+
+// requireUnspoken reads events up to a retryable error that says how much
+// audio of the utterance was already sent, and checks nothing follows it.
+func requireUnspoken(t *testing.T, providerStream runtimepkg.ProviderStream, want, emitted string) {
+	t.Helper()
+	events := nextEvents(t, providerStream.Events(), strings.Count(want, ",")+1)
+	if got := describe(events); got != want {
+		t.Fatalf("events = %s; want %s", got, want)
+	}
+	var failure *runtimepkg.ProviderError
+	if !errors.As(events[len(events)-1].Err, &failure) || !failure.Retryable || failure.Hint == "" || !strings.Contains(failure.Message, emitted) {
+		t.Fatalf("error = %+v; want a retryable error saying %s of audio was sent", events[len(events)-1].Err, emitted)
+	}
+	for event := range providerStream.Events() {
+		t.Errorf("after the error: %s", describe([]runtimepkg.ProviderEvent{event}))
 	}
 }
