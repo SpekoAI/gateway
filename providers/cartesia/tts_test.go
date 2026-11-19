@@ -57,6 +57,9 @@ func TestAdapterReusesOneSocketForMultipleContextsAndMapsAudio(t *testing.T) {
 			t.Errorf("timestamps: %v", err)
 			return
 		}
+		if !writeFrames(ctx, t, conn, timestampsFrame(first.ContextID, "world", 0.2, 0.4)) {
+			return
+		}
 		if err := writeJSON(ctx, conn, map[string]any{"type": "done", "context_id": first.ContextID, "done": true}); err != nil {
 			t.Errorf("done: %v", err)
 			return
@@ -73,6 +76,9 @@ func TestAdapterReusesOneSocketForMultipleContextsAndMapsAudio(t *testing.T) {
 		}
 		if err := writeJSON(ctx, conn, map[string]any{"type": "chunk", "context_id": third.ContextID, "request_id": "cart_req_456", "data": base64.StdEncoding.EncodeToString([]byte{4, 5})}); err != nil {
 			t.Errorf("second audio chunk: %v", err)
+			return
+		}
+		if !writeFrames(ctx, t, conn, timestampsFrame(third.ContextID, "Again", 0, 0.3)) {
 			return
 		}
 		if err := writeJSON(ctx, conn, map[string]any{"type": "done", "context_id": third.ContextID, "done": true}); err != nil {
@@ -102,11 +108,12 @@ func TestAdapterReusesOneSocketForMultipleContextsAndMapsAudio(t *testing.T) {
 	if err := providerStream.CommitText(context.Background()); err != nil {
 		t.Fatalf("commit text: %v", err)
 	}
-	events := collectProviderEvents(t, providerStream.Events(), 5)
+	events := collectProviderEvents(t, providerStream.Events(), 6)
 	if got := eventTypes(events); strings.Join(got, ",") != strings.Join([]string{
 		string(protocol.EventUsageObserved),
 		string(protocol.EventAudioStarted),
 		string(protocol.EventAudioFrame),
+		string(protocol.EventAlignment),
 		string(protocol.EventAlignment),
 		string(protocol.EventAudioDone),
 	}, ",") {
@@ -145,8 +152,8 @@ func TestAdapterReusesOneSocketForMultipleContextsAndMapsAudio(t *testing.T) {
 	if err := providerStream.CommitText(context.Background()); err != nil {
 		t.Fatalf("commit second context: %v", err)
 	}
-	secondEvents := collectProviderEvents(t, providerStream.Events(), 4)
-	if got := strings.Join(eventTypes(secondEvents), ","); got != "usage.observed,audio.started,audio.frame,audio.done" {
+	secondEvents := collectProviderEvents(t, providerStream.Events(), 5)
+	if got := strings.Join(eventTypes(secondEvents), ","); got != "usage.observed,audio.started,audio.frame,alignment,audio.done" {
 		t.Fatalf("second context event types = %s", got)
 	}
 	if string(secondEvents[2].Audio) != string([]byte{4, 5}) {

@@ -35,11 +35,12 @@ func TestAdapterCommitAfterCartesiaExpiredTheContextFinishesTheUtterance(t *test
 			return
 		}
 		frames <- first
-		// Audio for the fragment, the flush_done Cartesia sends after each
-		// fragment, its own expiry of the still-open context, then a marker
-		// proving all were read.
+		// Audio and words for the fragment, the flush_done Cartesia sends after
+		// each fragment, its own expiry of the still-open context, then a
+		// marker proving all were read.
 		for _, message := range []map[string]any{
 			{"type": "chunk", "context_id": first.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{1, 2})},
+			wordsFrame(first.ContextID, "Hello,"),
 			{"type": "flush_done", "context_id": first.ContextID, "status_code": 206, "done": false, "flush_done": true},
 			{"type": "done", "context_id": first.ContextID, "status_code": 200, "done": true},
 			{"type": "test_marker", "context_id": first.ContextID},
@@ -65,6 +66,7 @@ func TestAdapterCommitAfterCartesiaExpiredTheContextFinishesTheUtterance(t *test
 		frames <- final
 		for _, message := range []map[string]any{
 			{"type": "chunk", "context_id": next.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{3})},
+			wordsFrame(next.ContextID, "Again."),
 			{"type": "done", "context_id": next.ContextID, "done": true},
 		} {
 			if err := writeJSON(ctx, conn, message); err != nil {
@@ -80,7 +82,7 @@ func TestAdapterCommitAfterCartesiaExpiredTheContextFinishesTheUtterance(t *test
 	if err := providerStream.AppendText(context.Background(), "Hello, "); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 4)), ","); got != "audio.started,audio.frame,warning,warning" {
+	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 5)), ","); got != "audio.started,audio.frame,alignment,warning,warning" {
 		t.Fatalf("events before commit = %s; utterance.done must wait for the commit", got)
 	}
 	if err := providerStream.CommitText(context.Background()); err != nil {
@@ -101,7 +103,7 @@ func TestAdapterCommitAfterCartesiaExpiredTheContextFinishesTheUtterance(t *test
 	if err := providerStream.CommitText(context.Background()); err != nil {
 		t.Fatalf("commit next utterance: %v", err)
 	}
-	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 3)), ","); got != "audio.started,audio.frame,audio.done" {
+	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 4)), ","); got != "audio.started,audio.frame,alignment,audio.done" {
 		t.Fatalf("next utterance events = %s", got)
 	}
 	next, final := <-frames, <-frames
@@ -216,8 +218,7 @@ func TestAdapterCommitCrossingCartesiaExpiryKeepsTheSession(t *testing.T) {
 			t.Errorf("fragment: %v", err)
 			return
 		}
-		if err := writeJSON(ctx, conn, map[string]any{"type": "chunk", "context_id": fragment.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{1, 2})}); err != nil {
-			t.Errorf("chunk: %v", err)
+		if !writeFrames(ctx, t, conn, map[string]any{"type": "chunk", "context_id": fragment.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{1, 2})}, wordsFrame(fragment.ContextID, "Hello.")) {
 			return
 		}
 		if commit, err := readGeneration(ctx, conn); err != nil || commit.Continue || commit.ContextID != fragment.ContextID {
@@ -247,6 +248,7 @@ func TestAdapterCommitCrossingCartesiaExpiryKeepsTheSession(t *testing.T) {
 		}
 		for _, message := range []map[string]any{
 			{"type": "chunk", "context_id": next.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{3})},
+			wordsFrame(next.ContextID, "Again."),
 			{"type": "done", "context_id": next.ContextID, "status_code": 200, "done": true},
 		} {
 			if err := writeJSON(ctx, conn, message); err != nil {
@@ -265,7 +267,7 @@ func TestAdapterCommitCrossingCartesiaExpiryKeepsTheSession(t *testing.T) {
 	if err := providerStream.CommitText(context.Background()); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 5)), ","); got != "audio.started,audio.frame,audio.done,warning,warning" {
+	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 6)), ","); got != "audio.started,audio.frame,alignment,audio.done,warning,warning" {
 		t.Fatalf("events = %s; the late error and done must be warnings", got)
 	}
 	if err := providerStream.AppendText(context.Background(), "Again."); err != nil {
@@ -274,7 +276,7 @@ func TestAdapterCommitCrossingCartesiaExpiryKeepsTheSession(t *testing.T) {
 	if err := providerStream.CommitText(context.Background()); err != nil {
 		t.Fatalf("commit next utterance: %v", err)
 	}
-	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 3)), ","); got != "audio.started,audio.frame,audio.done" {
+	if got := strings.Join(eventTypes(collectProviderEvents(t, providerStream.Events(), 4)), ","); got != "audio.started,audio.frame,alignment,audio.done" {
 		t.Fatalf("next utterance events = %s", got)
 	}
 	if err := providerStream.Close(context.Background()); err != nil {
@@ -314,6 +316,7 @@ func TestAdapterRedialsWhenCartesiaClosesTheIdleSocket(t *testing.T) {
 					}
 					for _, message := range []map[string]any{
 						{"type": "chunk", "context_id": frame.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{byte(number)})},
+						wordsFrame(frame.ContextID, "Hello."),
 						{"type": "done", "context_id": frame.ContextID, "done": true},
 					} {
 						if err := writeJSON(ctx, conn, message); err != nil {
@@ -335,8 +338,8 @@ func TestAdapterRedialsWhenCartesiaClosesTheIdleSocket(t *testing.T) {
 				if err := providerStream.CommitText(context.Background()); err != nil {
 					t.Fatalf("commit on connection %d: %v", want, err)
 				}
-				events := collectProviderEvents(t, providerStream.Events(), 3)
-				if got := strings.Join(eventTypes(events), ","); got != "audio.started,audio.frame,audio.done" || string(events[1].Audio) != string([]byte{want}) {
+				events := collectProviderEvents(t, providerStream.Events(), 4)
+				if got := strings.Join(eventTypes(events), ","); got != "audio.started,audio.frame,alignment,audio.done" || string(events[1].Audio) != string([]byte{want}) {
 					t.Fatalf("connection %d events = %s audio=%v", want, got, events[1].Audio)
 				}
 				waitForDisconnect(t, providerStream)

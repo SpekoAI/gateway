@@ -2,7 +2,6 @@ package cartesia
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -25,7 +24,11 @@ func TestAdapterNormalMultiUtteranceSessionSendsUnchangedFrames(t *testing.T) {
 	server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
 		var frames []string
 		defer func() { received <- frames }()
-		fragments := 0
+		// With max_buffer_delay_ms 0 Cartesia answers every transcript frame
+		// as it arrives: audio tagged with the frame's flush_id (counted per
+		// context from 0), words, then flush_done; the final frame gets only
+		// flush_done, then done (measured live).
+		frameIndex := map[string]int{}
 		for {
 			_, payload, err := conn.Read(ctx)
 			if err != nil {
@@ -37,25 +40,18 @@ func TestAdapterNormalMultiUtteranceSessionSendsUnchangedFrames(t *testing.T) {
 				t.Errorf("decode frame: %v", err)
 				return
 			}
+			flushID := frameIndex[frame.ContextID]
+			frameIndex[frame.ContextID]++
+			var answer []map[string]any
 			if frame.Continue {
-				fragments++
-				continue
+				answer = append(answer, flushChunk(frame.ContextID, flushID, []byte{1, 2}), wordsFrame(frame.ContextID, strings.Fields(frame.Transcript)...))
 			}
-			// With max_buffer_delay_ms 0 Cartesia acknowledges every fragment
-			// with flush_done after its audio (measured live).
-			answer := []map[string]any{
-				{"type": "chunk", "context_id": frame.ContextID, "data": base64.StdEncoding.EncodeToString([]byte{1, 2})},
-				{"type": "timestamps", "context_id": frame.ContextID, "word_timestamps": map[string]any{"words": []string{"Hi"}, "start": []float64{0}, "end": []float64{0.1}}},
+			answer = append(answer, flushDoneFrame(frame.ContextID))
+			if !frame.Continue {
+				answer = append(answer, doneFrame(frame.ContextID))
 			}
-			for ; fragments > 0; fragments-- {
-				answer = append(answer, map[string]any{"type": "flush_done", "context_id": frame.ContextID, "status_code": 206, "flush_done": true})
-			}
-			answer = append(answer, map[string]any{"type": "done", "context_id": frame.ContextID, "done": true})
-			for _, message := range answer {
-				if err := writeJSON(ctx, conn, message); err != nil {
-					t.Errorf("write %v: %v", message["type"], err)
-					return
-				}
+			if !writeFrames(ctx, t, conn, answer...) {
+				return
 			}
 		}
 	})
@@ -73,7 +69,7 @@ func TestAdapterNormalMultiUtteranceSessionSendsUnchangedFrames(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	for _, utterance := range [][]string{{"Hello, ", "world."}, {"Again."}} {
-		want := "audio.started,audio.frame,alignment" + strings.Repeat(",warning", len(utterance)) + ",audio.done"
+		want := "audio.started" + strings.Repeat(",audio.frame,alignment,warning", len(utterance)) + ",warning,audio.done"
 		for _, text := range utterance {
 			if err := providerStream.AppendText(context.Background(), text); err != nil {
 				t.Fatalf("append %q: %v", text, err)
@@ -82,7 +78,7 @@ func TestAdapterNormalMultiUtteranceSessionSendsUnchangedFrames(t *testing.T) {
 		if err := providerStream.CommitText(context.Background()); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
-		events := collectProviderEvents(t, providerStream.Events(), 4+len(utterance))
+		events := collectProviderEvents(t, providerStream.Events(), 3+3*len(utterance))
 		if got := strings.Join(eventTypes(events), ","); got != want {
 			t.Fatalf("utterance events = %s", got)
 		}
