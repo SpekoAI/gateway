@@ -53,6 +53,9 @@ func TestProviderErrorKeepsTheVendorTextOutOfTheMessage(t *testing.T) {
 	if err.Code != "authentication_failed" || err.Message != "Hopper TTS rejected the synthesis request (invalid_api_key)" || string(err.Extensions[extensionID]) != string(raw) {
 		t.Fatalf("error = %+v", err)
 	}
+	if got := err.SafeProviderCode(); got != "invalid_api_key" {
+		t.Fatalf("SafeProviderCode = %q, want invalid_api_key", got)
+	}
 	if plain := providerError("x", parseError([]byte("<html>")), http.StatusBadGateway, []byte("<html>")); plain.Extensions != nil || plain.Code != "provider_unavailable" {
 		t.Fatalf("a non-JSON body was attached or misread: %+v", plain)
 	}

@@ -72,23 +72,22 @@ func TestModelsPublishesEveryCatalogEntry(t *testing.T) {
 	// ElevenLabs STT is the row this endpoint exists to make discoverable: it is the
 	// board's strongest transcriber across the most languages and had no adapter at
 	// all until now.
-	var found bool
+	var scribe []string
 	for _, model := range catalog.Models {
 		if model.Provider == "elevenlabs" && model.Kind == "stt" {
-			found = true
-			if model.ID != "elevenlabs:scribe_v2_realtime" {
-				t.Fatalf("elevenlabs stt id = %q, want the realtime model, not the batch one", model.ID)
-			}
+			scribe = append(scribe, model.ID)
 			if model.Adapter != "elevenlabs.stt.v1" || model.Transport != string(protocol.TransportWebSocket) {
 				t.Fatalf("elevenlabs stt row = %+v", model)
 			}
 		}
 	}
-	if !found {
-		t.Fatal("catalog does not publish elevenlabs stt")
+	// The two realtime models, default first, and neither batch id: scribe_v2
+	// and scribe_v3 do not stream.
+	if want := []string{"elevenlabs:scribe_v2_realtime", "elevenlabs:scribe_v3_live"}; !slices.Equal(scribe, want) {
+		t.Fatalf("elevenlabs stt ids = %v, want %v", scribe, want)
 	}
 	wantMultiModel := map[string]bool{
-		"speechify:simba-3.2": false, "speechify:simba-3.0": false,
+		"speechify:simba-3.5": false, "speechify:simba-3.2": false, "speechify:simba-3.0": false,
 		"speechify:simba-multilingual": false, "speechify:simba-english": false,
 		"gemini:gemini-3.1-flash-tts-preview": false, "gemini:gemini-3.8-flash-tts": false,
 		"gemini:gemini-3.8-flash-lite-tts": false, "fish:s2.1-pro": false,
@@ -142,30 +141,36 @@ func TestModelsFiltersByKindAndProvider(t *testing.T) {
 			t.Fatalf("kind=tts returned %s", model.Kind)
 		}
 	}
-	// One STT row, flash on the text-to-speech socket, and the four v3/v4
-	// models on the text-to-dialogue socket, which is the only one serving them.
+	// The two realtime Scribe models, flash on the text-to-speech socket, and
+	// the four v3/v4 models on the text-to-dialogue socket, which is the only
+	// one serving them.
 	elevenlabs := fetchCatalog(t, "/v1/models?provider=elevenlabs")
 	adapters := make(map[string]string, len(elevenlabs.Models))
 	for _, model := range elevenlabs.Models {
 		adapters[model.ID] = model.Adapter
 	}
-	if len(elevenlabs.Models) != 6 || adapters["elevenlabs:eleven_flash_v2_5"] != "elevenlabs.tts.v1" ||
+	if len(elevenlabs.Models) != 7 || adapters["elevenlabs:scribe_v3_live"] != "elevenlabs.stt.v1" || adapters["elevenlabs:eleven_flash_v2_5"] != "elevenlabs.tts.v1" ||
 		adapters["elevenlabs:eleven_v4_turbo"] != "elevenlabs.dialogue.v1" || adapters["elevenlabs:eleven_v3_conversational"] != "elevenlabs.dialogue.v1" {
 		t.Fatalf("provider=elevenlabs returned %v", adapters)
 	}
-	// AssemblyAI serves two published Universal Pro models on one adapter;
-	// both must be discoverable, with the default still resolving to 3.5 Pro.
+	// AssemblyAI serves three published streaming models on one adapter; all
+	// must be discoverable, with the default still resolving to 3.5 Pro.
 	assemblyai := fetchCatalog(t, "/v1/models?provider=assemblyai")
 	ids := make([]string, 0, len(assemblyai.Models))
 	for _, model := range assemblyai.Models {
 		ids = append(ids, model.ID)
 	}
-	if !slices.Contains(ids, "assemblyai:universal-3-5-pro") || !slices.Contains(ids, "assemblyai:universal-3-6-pro") {
-		t.Fatalf("provider=assemblyai returned %v, want both Universal Pro models", ids)
+	if !slices.Contains(ids, "assemblyai:universal-3-5-pro") || !slices.Contains(ids, "assemblyai:universal-3-6-pro") ||
+		!slices.Contains(ids, "assemblyai:assemblyai-stt-3-7-realtime-agent") {
+		t.Fatalf("provider=assemblyai returned %v, want 3.5 Pro, 3.6 Pro and the 3.7 agent model", ids)
 	}
 	for _, entry := range gateway.Catalog() {
 		if entry.Provider == "assemblyai" && entry.DefaultModel != "universal-3-5-pro" {
 			t.Fatalf("assemblyai default = %q, want universal-3-5-pro", entry.DefaultModel)
+		}
+		// Listing scribe_v3_live must not move what a bare or auto pin gets.
+		if entry.Provider == "elevenlabs" && entry.Kind == protocol.SessionKindSTT && entry.DefaultModel != "scribe_v2_realtime" {
+			t.Fatalf("elevenlabs stt default = %q, want scribe_v2_realtime", entry.DefaultModel)
 		}
 	}
 	if unknown := fetchCatalog(t, "/v1/models?provider=nope"); len(unknown.Models) != 0 {
@@ -199,7 +204,7 @@ func TestCatalogReturnsModelListsAsCopies(t *testing.T) {
 		if entries[index].Provider != "speechify" || entries[index].Kind != protocol.SessionKindTTS {
 			continue
 		}
-		if len(entries[index].Models) != 4 {
+		if len(entries[index].Models) != 5 {
 			t.Fatalf("Speechify models = %v", entries[index].Models)
 		}
 		entries[index].Models[0] = "mutated"

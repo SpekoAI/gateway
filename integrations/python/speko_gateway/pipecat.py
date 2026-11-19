@@ -57,9 +57,11 @@ from .client import (
     SessionConfig,
 )
 from .relay import (
+    PENALTIES,
     ReasoningEffort,
     RelayError,
     RelayLLMClient,
+    validate_penalty,
     validate_reasoning_effort,
 )
 from .relay_speech import RelaySpeechClient
@@ -339,11 +341,20 @@ class SpekoTTSService(PipecatTTSService):
         if native_settings is not None:
             if not isinstance(native_settings, TTSSettings):
                 raise TypeError("settings must be a TTSSettings instance")
-            if is_setting_given(native_settings.model) and native_settings.model is not None:
+            if (
+                is_setting_given(native_settings.model)
+                and native_settings.model is not None
+            ):
                 model = native_settings.model
-            if is_setting_given(native_settings.voice) and native_settings.voice is not None:
+            if (
+                is_setting_given(native_settings.voice)
+                and native_settings.voice is not None
+            ):
                 voice = native_settings.voice
-            if is_setting_given(native_settings.language) and native_settings.language is not None:
+            if (
+                is_setting_given(native_settings.language)
+                and native_settings.language is not None
+            ):
                 language = str(native_settings.language)
         kwargs.setdefault("push_start_frame", True)
         kwargs.setdefault("push_stop_frames", False)
@@ -377,6 +388,7 @@ class SpekoTTSService(PipecatTTSService):
         )
         self._auto_fallback_active = False
         self._contexts: dict[str, _TTSContextState] = {}
+        self._native_failed = False
         self._ready = False
 
     @property
@@ -414,6 +426,7 @@ class SpekoTTSService(PipecatTTSService):
             # stream for the next sentence. Audio keeps flowing on the receiver
             # task while this producer waits.
             await state.utterance_done.wait()
+            self._check_native_recovery()
             if state.interrupted or state.closed or state.finishing:
                 return
             state.utterance_done.clear()
@@ -423,14 +436,32 @@ class SpekoTTSService(PipecatTTSService):
             await state.session.commit_text()
             await self.start_tts_usage_metrics(text)
             yield None
-        except (GatewayError, OSError) as error:
+        except asyncio.CancelledError:
+            if isinstance(self._client, RelaySpeechClient):
+                # Admission may have sent configure before cancellation. Latch
+                # before cleanup yields so a queued SDK sentence cannot reopen.
+                self._native_failed = True
+                if state is not None:
+                    await self._close_state(context_id, state, interrupted=True)
+            raise
+        except Exception as error:
+            native = isinstance(self._client, RelaySpeechClient)
+            if not native and not isinstance(error, (GatewayError, OSError)):
+                raise
+            if native:
+                self._native_failed = True
+            reported = (
+                error
+                if isinstance(error, (GatewayError, OSError))
+                else GatewayError("Native TTS stream failed", retryable=False)
+            )
             if state is not None:
                 await self._close_state(context_id, state, interrupted=True)
             yield ErrorFrame(
-                error=_gateway_failure("TTS", error),
+                error=_gateway_failure("TTS", reported),
                 fatal=True,
                 processor=self,
-                exception=error,
+                exception=reported if reported is error else None,
             )
             yield TTSStoppedFrame(context_id=context_id)
             await self.remove_audio_context(context_id)
@@ -443,7 +474,12 @@ class SpekoTTSService(PipecatTTSService):
         if state is None or state.finishing:
             return
         state.finishing = True
-        await state.session.finish()
+        try:
+            await state.session.finish()
+        except (GatewayError, OSError):
+            if isinstance(self._client, RelaySpeechClient):
+                self._native_failed = True
+            raise
 
     async def on_audio_context_interrupted(self, context_id: str) -> None:
         state = self._contexts.get(context_id)
@@ -458,14 +494,14 @@ class SpekoTTSService(PipecatTTSService):
             self._ready = True
 
     async def _context(self, context_id: str) -> _TTSContextState:
+        self._check_native_recovery()
         state = self._contexts.get(context_id)
         if state is not None:
             return state
         await self._ensure_ready()
+        self._check_native_recovery()
         if self._auto_fallback_active:
-            session = await self._open_session(
-                provider="auto", model="auto", voice=""
-            )
+            session = await self._open_session(provider="auto", model="auto", voice="")
         else:
             try:
                 session = await self._open_session(
@@ -492,6 +528,14 @@ class SpekoTTSService(PipecatTTSService):
             name=f"speko.pipecat.tts.receive.{context_id}",
         )
         return state
+
+    def _check_native_recovery(self) -> None:
+        if isinstance(self._client, RelaySpeechClient) and self._native_failed:
+            raise GatewayError(
+                "Native Speko TTS requires a control-plane recovery decision",
+                code="recovery_required",
+                retryable=False,
+            )
 
     async def _open_session(
         self, *, provider: str, model: str, voice: str
@@ -539,6 +583,7 @@ class SpekoTTSService(PipecatTTSService):
         )
 
     async def _receive_audio(self, context_id: str, state: _TTSContextState) -> None:
+        reported_failure = False
         try:
             async for event in state.session.events():
                 if event.type == "error":
@@ -557,23 +602,51 @@ class SpekoTTSService(PipecatTTSService):
                     )
         except asyncio.CancelledError:
             raise
-        except (GatewayError, OSError) as error:
-            await self.push_error(_gateway_failure("TTS", error), exception=error)
+        except Exception as error:
+            native = isinstance(self._client, RelaySpeechClient)
+            if not native and not isinstance(error, (GatewayError, OSError)):
+                raise
+            if native:
+                # Latch before any await/context removal; the SDK may already
+                # have its next sentence queued for this same turn.
+                self._native_failed = True
+            reported = (
+                error
+                if isinstance(error, (GatewayError, OSError))
+                else GatewayError("Native TTS receiver failed", retryable=False)
+            )
+            await self.push_error(
+                _gateway_failure("TTS", reported),
+                exception=reported if reported is error else None,
+                fatal=native,
+            )
+            reported_failure = True
         finally:
             state.closed = True
             state.utterance_done.set()
-            if not state.interrupted and self.audio_context_available(context_id):
-                await self.append_to_audio_context(
-                    context_id, TTSStoppedFrame(context_id=context_id)
-                )
-                await self.remove_audio_context(context_id)
             try:
-                await state.session.aclose()
-            except (GatewayError, OSError, RuntimeError):
-                pass
+                if not state.interrupted and self.audio_context_available(context_id):
+                    await self.append_to_audio_context(
+                        context_id, TTSStoppedFrame(context_id=context_id)
+                    )
+                    await self.remove_audio_context(context_id)
+            except Exception:
+                if not isinstance(self._client, RelaySpeechClient):
+                    raise
+                self._native_failed = True
+                if not reported_failure:
+                    await self.push_error("Speko Gateway TTS cleanup failed", fatal=True)
+                    reported_failure = True
             finally:
-                if self._contexts.get(context_id) is state:
-                    self._contexts.pop(context_id, None)
+                # Framework queue failure must not skip physical cleanup.
+                try:
+                    await state.session.aclose()
+                except (GatewayError, OSError, RuntimeError):
+                    if isinstance(self._client, RelaySpeechClient):
+                        self._native_failed = True
+                finally:
+                    if self._contexts.get(context_id) is state:
+                        self._contexts.pop(context_id, None)
 
     async def _finish_all(self, *, interrupted: bool) -> None:
         states = list(self._contexts.items())
@@ -581,7 +654,12 @@ class SpekoTTSService(PipecatTTSService):
             for context_id, state in states:
                 if not state.finishing:
                     state.finishing = True
-                    await state.session.finish()
+                    try:
+                        await state.session.finish()
+                    except (GatewayError, OSError):
+                        if isinstance(self._client, RelaySpeechClient):
+                            self._native_failed = True
+                        raise
             if states:
                 await asyncio.gather(
                     *(state.task for _, state in states if state.task is not None),
@@ -599,11 +677,13 @@ class SpekoTTSService(PipecatTTSService):
         try:
             await state.session.cancel()
         except (GatewayError, OSError):
-            pass
+            if isinstance(self._client, RelaySpeechClient):
+                self._native_failed = True
         try:
             await state.session.aclose()
         except (GatewayError, OSError, RuntimeError):
-            pass
+            if isinstance(self._client, RelaySpeechClient):
+                self._native_failed = True
         if state.task is not None and not state.task.done():
             state.task.cancel()
             await asyncio.gather(state.task, return_exceptions=True)
@@ -619,9 +699,16 @@ class SpekoLLMSettings(LLMSettings):
         reasoning_effort: The Router's reasoning control, one of "none",
             "minimal", "low", "medium", "high" or "xhigh". None omits the
             field and keeps the provider's default. See `SpekoLLMService`.
+        repetition_penalty: The Router's multiplicative repetition penalty,
+            greater than 0 and at most 2 (1 is neutral). None omits the field.
+            `frequency_penalty` and `presence_penalty` are Pipecat's own
+            `LLMSettings` fields. See `SpekoLLMService`.
     """
 
     reasoning_effort: ReasoningEffort | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    repetition_penalty: float | None | _NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
@@ -641,6 +728,13 @@ class SpekoLLMService(LLMService):
     `LLMUpdateSettingsFrame(delta=SpekoLLMService.Settings(reasoning_effort=...))`.
     While reasoning is enabled (any value but "none") the Router refuses
     `temperature` and `top_p`, so leave both unset then.
+
+    `frequency_penalty`, `presence_penalty` (-2 to 2, neutral 0) and
+    `repetition_penalty` (greater than 0 and at most 2, neutral 1) guard
+    against a model looping on one phrase. None, the default, sends no field.
+    They update at runtime the same way. The Router applies a non-neutral
+    penalty only on Together and Baseten: auto routing keeps the request to
+    those models, and a model pinned elsewhere is refused.
 
     "none" is accepted on models that cannot reason, where it changes nothing
     (older Routers refuse it there, e.g. on gpt-4.1). Four models always reason
@@ -665,6 +759,9 @@ class SpekoLLMService(LLMService):
         temperature: float | None = None,
         top_p: float | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        repetition_penalty: float | None = None,
         system_instruction: str | None = None,
         session_id: str = "",
         **kwargs: Any,
@@ -680,12 +777,15 @@ class SpekoLLMService(LLMService):
             max_tokens=max_output_tokens,
             top_p=top_p,
             top_k=None,
-            frequency_penalty=None,
-            presence_penalty=None,
+            frequency_penalty=validate_penalty("frequency_penalty", frequency_penalty),
+            presence_penalty=validate_penalty("presence_penalty", presence_penalty),
             seed=None,
             filter_incomplete_user_turns=False,
             user_turn_completion_config=None,
             reasoning_effort=validate_reasoning_effort(reasoning_effort),
+            repetition_penalty=validate_penalty(
+                "repetition_penalty", repetition_penalty
+            ),
             extra={},
         )
         kwargs.setdefault("run_in_parallel", False)
@@ -716,6 +816,10 @@ class SpekoLLMService(LLMService):
         delta = _speko_llm_delta(delta)
         if is_setting_given(delta.reasoning_effort):
             validate_reasoning_effort(delta.reasoning_effort)
+        for name in PENALTIES:
+            value = getattr(delta, name)
+            if is_setting_given(value):
+                validate_penalty(name, value)
         changed = await super()._update_settings(delta)
         if "model" in changed:
             self._model = self._settings.model
@@ -855,37 +959,51 @@ class SpekoLLMService(LLMService):
         reasoning_effort = self._settings.reasoning_effort
         if isinstance(reasoning_effort, str):
             request["reasoning_effort"] = reasoning_effort
+        for name in PENALTIES:
+            value = getattr(self._settings, name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                request[name] = value
         return request
 
 
-def _speko_llm_delta(delta: LLMSettings) -> SpekoLLMSettings:
-    """Return `delta` as a SpekoLLMSettings with reasoning_effort out of `extra`.
+# The SpekoLLMSettings fields Pipecat's own LLMSettings lacks.
+_SPEKO_LLM_FIELDS = ("reasoning_effort", "repetition_penalty")
 
-    A plain `LLMSettings.from_mapping({"reasoning_effort": ...})` files the key
-    under `extra`, where it would never reach the request yet would still show
-    in tracing. Lift it onto the field so it is validated and applied like a
-    typed update; a delta that sets both, differently, is ambiguous.
+
+def _speko_llm_delta(delta: LLMSettings) -> SpekoLLMSettings:
+    """Return `delta` as a SpekoLLMSettings with Speko's fields out of `extra`.
+
+    A plain `LLMSettings.from_mapping({"reasoning_effort": ...})` files a key
+    Pipecat does not know under `extra`, where it would never reach the
+    request yet would still show in tracing. Lift each Speko field onto the
+    typed field so it is validated and applied like a typed update; a delta
+    that sets both, differently, is ambiguous.
     """
 
     extra = dict(delta.extra)
-    lifted = extra.pop("reasoning_effort", NOT_GIVEN)
-    typed = getattr(delta, "reasoning_effort", NOT_GIVEN)
-    if isinstance(delta, SpekoLLMSettings) and not is_setting_given(lifted):
+    lifted = {name: extra.pop(name, NOT_GIVEN) for name in _SPEKO_LLM_FIELDS}
+    if isinstance(delta, SpekoLLMSettings) and not any(
+        is_setting_given(value) for value in lifted.values()
+    ):
         return delta
-    if is_setting_given(lifted) and is_setting_given(typed) and lifted != typed:
-        raise ValueError(
-            "reasoning_effort is set twice with different values (field and extra)"
-        )
+    merged: dict[str, Any] = {}
+    for name in _SPEKO_LLM_FIELDS:
+        typed = getattr(delta, name, NOT_GIVEN)
+        if (
+            is_setting_given(lifted[name])
+            and is_setting_given(typed)
+            and lifted[name] != typed
+        ):
+            raise ValueError(
+                f"{name} is set twice with different values (field and extra)"
+            )
+        merged[name] = typed if is_setting_given(typed) else lifted[name]
     values = {
         f.name: getattr(delta, f.name)
         for f in dataclasses.fields(delta)
-        if f.name not in ("extra", "reasoning_effort")
+        if f.name not in ("extra", *_SPEKO_LLM_FIELDS)
     }
-    return SpekoLLMSettings(
-        **values,
-        reasoning_effort=typed if is_setting_given(typed) else lifted,
-        extra=extra,
-    )
+    return SpekoLLMSettings(**values, **merged, extra=extra)
 
 
 # Short aliases mirror the naming style of the existing LiveKit integration.

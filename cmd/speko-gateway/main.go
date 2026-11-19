@@ -40,6 +40,7 @@ import (
 	"github.com/SpekoAI/gateway/providers/modulate"
 	"github.com/SpekoAI/gateway/providers/munsit"
 	"github.com/SpekoAI/gateway/providers/nari"
+	"github.com/SpekoAI/gateway/providers/omi"
 	"github.com/SpekoAI/gateway/providers/openai"
 	"github.com/SpekoAI/gateway/providers/openailive"
 	"github.com/SpekoAI/gateway/providers/openairealtime"
@@ -335,6 +336,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	omiSTTAdapter, err := omi.NewSTT(omi.STTConfig{})
+	if err != nil {
+		return err
+	}
 	adapters := []runtimepkg.Adapter{
 		deepgramAdapter, deepgramTTSAdapter, elevenLabsAdapter, elevenLabsDialogueAdapter, elevenLabsSTTAdapter,
 		fishAdapter,
@@ -347,7 +352,7 @@ func run() error {
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 		geminiSTTAdapter, geminiTTSAdapter, metaSTTAdapter, nariSTTAdapter, nariTTSAdapter,
 		paxaTTSAdapter, munsitSTTAdapter, munsitTTSAdapter, hamsaTTSAdapter,
-		hopperSTTAdapter, hopperTTSAdapter,
+		hopperSTTAdapter, hopperTTSAdapter, omiSTTAdapter,
 	}
 	adapterIDs := make([]string, 0, len(adapters))
 	for _, adapter := range adapters {
@@ -459,12 +464,7 @@ func run() error {
 			if err != nil {
 				return err
 			}
-			verifier = runtimepkg.PlanVerifierFunc(func(ctx context.Context, plan protocol.SessionPlan) error {
-				if plan.Execution.CredentialSource == protocol.CredentialsBYOK {
-					return localPlanner.Verify(ctx, plan)
-				}
-				return hostedVerifier.Verify(ctx, plan)
-			})
+			verifier = gateway.CredentialSourceVerifier{BYOK: localPlanner, Managed: hostedVerifier}
 		}
 		log.Printf("routing=speko local_byok_providers=%d optional_telemetry=%t", len(localCredentials), !telemetryDisabled)
 	}

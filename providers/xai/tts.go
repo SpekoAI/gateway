@@ -688,7 +688,7 @@ func (s *socketStream) handleMessage(payload []byte) error {
 		id := s.finishUtterance()
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: warningData(id, "provider_buffer_cleared", s.currentTraceID()), Extensions: extension(raw)})
 	case "error":
-		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: socketErrorMessage(message.Message), Retryable: false}
+		return &runtimepkg.ProviderError{Code: "provider_unavailable", Message: socketErrorMessage(message.Message), Retryable: false, Extensions: extension(raw)}
 	default:
 		return s.emit(runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: warningData(s.currentUtterance(), message.Type, s.currentTraceID()), Extensions: extension(raw)})
 	}

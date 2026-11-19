@@ -1,6 +1,7 @@
 package inworld
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -184,7 +185,7 @@ func TestTTSSequentialUtterancesReuseOneContextAndConnection(t *testing.T) {
 	}
 }
 
-func TestTTSCancelClosesContextAndNextUtteranceGetsFreshContext(t *testing.T) {
+func TestTTSCancelDiscardsContextAndNextUtteranceGetsFreshContext(t *testing.T) {
 	t.Parallel()
 	contexts := make(chan string, 2)
 	harness := newTTSHarness(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
@@ -192,10 +193,18 @@ func TestTTSCancelClosesContextAndNextUtteranceGetsFreshContext(t *testing.T) {
 		firstID := firstCreate["context_id"].(string)
 		contexts <- firstID
 		_ = readTTSJSON(t, ctx, conn)
-		closeFrame := readTTSJSON(t, ctx, conn)
-		if _, ok := closeFrame["close_context"]; !ok {
-			t.Errorf("cancel frame = %v", closeFrame)
+		cancelFrame := readTTSJSON(t, ctx, conn)
+		if _, ok := cancelFrame["cancel_context"]; !ok || cancelFrame["context_id"] != firstID {
+			t.Errorf("cancel frame = %v, want cancel_context for %s", cancelFrame, firstID)
 		}
+		if _, ok := cancelFrame["close_context"]; ok {
+			t.Errorf("cancel frame %v would synthesize the rest of the utterance", cancelFrame)
+		}
+		// Inworld may still deliver audio generated before the cancel; it
+		// must be dropped rather than played or treated as a protocol error.
+		writeTTSJSON(t, ctx, conn, map[string]any{"result": map[string]any{
+			"contextId": firstID, "audioChunk": map[string]any{"audioContent": base64.StdEncoding.EncodeToString([]byte{9})},
+		}})
 		writeTTSJSON(t, ctx, conn, map[string]any{"result": map[string]any{"contextId": firstID, "contextClosed": map[string]any{}}})
 
 		secondCreate := readTTSJSON(t, ctx, conn)
@@ -216,10 +225,42 @@ func TestTTSCancelClosesContextAndNextUtteranceGetsFreshContext(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 	synthesizeTTS(t, stream, "next")
-	_ = collectTTSEvents(t, stream.Events(), 3)
+	events := collectTTSEvents(t, stream.Events(), 3)
+	if got := eventTypes(events); got != "audio.started,audio.frame,audio.done" {
+		t.Fatalf("events = %s", got)
+	}
+	if !bytes.Equal(events[1].Audio, []byte{1}) {
+		t.Fatalf("audio = %v, want only the next utterance", events[1].Audio)
+	}
 	first, second := <-contexts, <-contexts
 	if first == second {
 		t.Fatalf("canceled context %q was reused", first)
+	}
+}
+
+func TestTTSCancelIsBoundedWhenContextClosedNeverArrives(t *testing.T) {
+	t.Parallel()
+	harness := newTTSHarness(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		_ = readTTSJSON(t, ctx, conn)
+		_ = readTTSJSON(t, ctx, conn)
+		_ = readTTSJSON(t, ctx, conn) // cancel_context, never acknowledged
+		<-ctx.Done()
+	})
+	defer harness.Close()
+
+	stream := openTTSStreamWithConfig(t, harness, Config{GracefulCloseIdleTimeout: 30 * time.Millisecond}, nil)
+	defer func() { _ = stream.Abort(context.Background()) }()
+	synthesizeTTS(t, stream, "cancel me")
+	done := make(chan error, 1)
+	go func() { done <- stream.Cancel(context.Background()) }()
+	select {
+	case err := <-done:
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(err, &providerErr) || providerErr.Code != "provider_unavailable" {
+			t.Fatalf("cancel error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel blocked waiting for contextClosed")
 	}
 }
 

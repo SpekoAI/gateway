@@ -410,6 +410,9 @@ func TestStreamErrorObjectMapsVendorStatusToCode(t *testing.T) {
 			if !strings.Contains(providerError.Message, "upstream said no") {
 				t.Fatalf("stream error dropped the vendor detail: %q", providerError.Message)
 			}
+			if got := providerError.SafeProviderCode(); got != "Failure" {
+				t.Fatalf("SafeProviderCode = %q, want the exception name", got)
+			}
 		})
 	}
 }

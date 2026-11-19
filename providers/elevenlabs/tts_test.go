@@ -1,6 +1,7 @@
 package elevenlabs
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -439,8 +440,13 @@ func testConfig(serverURL string) Config {
 
 func collectEvents(t *testing.T, events <-chan runtimepkg.ProviderEvent, want int) []runtimepkg.ProviderEvent {
 	t.Helper()
+	return collectEventsWithin(t, events, want, time.Second)
+}
+
+func collectEventsWithin(t *testing.T, events <-chan runtimepkg.ProviderEvent, want int, timeout time.Duration) []runtimepkg.ProviderEvent {
+	t.Helper()
 	collected := make([]runtimepkg.ProviderEvent, 0, want)
-	timer := time.NewTimer(time.Second)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for len(collected) < want {
 		select {
@@ -453,7 +459,7 @@ func collectEvents(t *testing.T, events <-chan runtimepkg.ProviderEvent, want in
 			}
 			collected = append(collected, event)
 		case <-timer.C:
-			t.Fatal("timed out waiting for events")
+			t.Fatalf("timed out after %s waiting for events (%d/%d received)", timeout, len(collected), want)
 		}
 	}
 	return collected
@@ -592,6 +598,51 @@ func TestMultiContextEndpointSendsPrimaryLanguageCode(t *testing.T) {
 	}
 }
 
+// An in-band error frame keeps the vendor's code for the failure logs: the
+// relay used to see only provider_unavailable and could not tell an exhausted
+// quota from a missing voice.
+func TestAdapterKeepsTheVendorCodeOfAnErrorFrame(t *testing.T) {
+	t.Parallel()
+	for frame, want := range map[string]string{
+		`{"message":"This request exceeds your quota.","error":"quota_exceeded","code":1008}`: "quota_exceeded",
+		`{"message":"A voice with that id does not exist.","error":"voice_not_found"}`:        "voice_not_found",
+		`{"error":"Something went wrong on our side"}`:                                        "",
+	} {
+		server := newMultiContextServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+			if _, err := readClientMessage(ctx, conn); err != nil {
+				return
+			}
+			_ = conn.Write(ctx, websocket.MessageText, []byte(frame))
+			_ = conn.Close(websocket.StatusPolicyViolation, "error")
+		})
+		adapter, _ := New(testConfig(server.URL))
+		stream, err := adapter.Open(context.Background(), elevenLabsRequest(server.URL, protocol.CredentialsBYOK))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		if err := stream.AppendText(context.Background(), "Hello"); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		var providerErr *runtimepkg.ProviderError
+		for event := range stream.Events() {
+			if event.Err != nil {
+				if !errors.As(event.Err, &providerErr) {
+					t.Fatalf("%s: error = %v, want a provider error", frame, event.Err)
+				}
+				break
+			}
+		}
+		_ = stream.Close(context.Background())
+		server.Close()
+		if providerErr == nil || providerErr.Code != "provider_unavailable" {
+			t.Fatalf("%s: error = %+v, want provider_unavailable", frame, providerErr)
+		}
+		if got := providerErr.SafeProviderCode(); got != want {
+			t.Fatalf("%s: SafeProviderCode = %q, want %q", frame, got, want)
+		}
+	}
+}
+
 // A language the model does not support is a caller error: retrying the same
 // pair is refused identically, so it must not surface as a retryable outage.
 // ElevenLabs sends an unsupported_language error frame and then closes 1008;
@@ -638,5 +689,60 @@ func TestAdapterMapsUnsupportedLanguageToInvalidRequest(t *testing.T) {
 			!strings.Contains(providerErr.Message, "eleven_flash_v2_5") || !strings.Contains(providerErr.Message, `"sw"`) {
 			t.Fatalf("%s: error = %+v, want non-retryable invalid_request naming model and language", name, providerErr)
 		}
+	}
+}
+
+// eleven_multilingual_v2 sends one long generated chunk as a single audio
+// frame larger than 1 MiB (prod, 2026-11-13: "message too big: read limited at
+// 1048577 bytes"). The default limit must take such a frame.
+func TestAdapterReadsAudioFrameLargerThanOneMiB(t *testing.T) {
+	t.Parallel()
+	audio := bytes.Repeat([]byte{1, 2, 3, 4}, 3<<18) // 3 MiB of PCM, 4 MiB as base64
+	server := newMultiContextServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		appendMessage, err := readClientMessage(ctx, conn)
+		if err != nil {
+			t.Errorf("append: %v", err)
+			return
+		}
+		for range 2 { // flush, close context
+			if _, err := readClientMessage(ctx, conn); err != nil {
+				t.Errorf("read: %v", err)
+				return
+			}
+		}
+		if err := writeServerJSON(ctx, conn, map[string]any{
+			"contextId": appendMessage.ContextID,
+			"audio":     base64.StdEncoding.EncodeToString(audio),
+			"isFinal":   true,
+		}); err != nil {
+			t.Errorf("write: %v", err)
+		}
+		_, _ = readClientMessage(ctx, conn)
+	})
+	defer server.Close()
+	adapter, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Open(context.Background(), elevenLabsRequest(server.URL, protocol.CredentialsBYOK))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer stream.Close(context.Background())
+	if err := stream.AppendText(context.Background(), "Hello"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := stream.CommitText(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	// This is a frame-size/byte-integrity regression, not a latency budget.
+	// Transferring and decoding 4 MiB of JSON under the race detector can take
+	// over one second when all provider packages run concurrently in CI.
+	events := collectEventsWithin(t, stream.Events(), 3, 10*time.Second)
+	if got := strings.Join(eventTypes(events), ","); got != "audio.started,audio.frame,audio.done" {
+		t.Fatalf("events = %s", got)
+	}
+	if !bytes.Equal(events[1].Audio, audio) {
+		t.Fatalf("audio = %d bytes, want %d", len(events[1].Audio), len(audio))
 	}
 }

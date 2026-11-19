@@ -434,8 +434,8 @@ func eventTypes(events []runtimepkg.ProviderEvent) []string {
 func TestAdapterMapsUnsupportedLanguageToInvalidRequest(t *testing.T) {
 	t.Parallel()
 	for name, test := range map[string]struct {
-		frame         map[string]any
-		code, message string
+		frame                       map[string]any
+		code, message, providerCode string
 	}{
 		"unsupported language in message": {
 			frame:   map[string]any{"type": "error", "status_code": 400, "done": true, "message": "Your request was invalid: unsupported language 'sw'. See https://docs.cartesia.ai/build-with-cartesia/capability-guides/supported-locales for the accepted codes"},
@@ -451,6 +451,14 @@ func TestAdapterMapsUnsupportedLanguageToInvalidRequest(t *testing.T) {
 			frame:   map[string]any{"type": "error", "status_code": 400, "done": true, "message": "voice not found"},
 			code:    "provider_unavailable",
 			message: "Cartesia reported a streaming error: voice not found",
+		},
+		// Cartesia-Version 2026-03-01 and later name a machine-readable
+		// error_code, which the failure logs read from the kept frame.
+		"bad request with an error code": {
+			frame:        map[string]any{"type": "error", "status_code": 400, "done": true, "error_code": "voice_not_found", "title": "Voice not found", "message": "voice not found"},
+			code:         "provider_unavailable",
+			message:      "Cartesia reported a streaming error: voice not found",
+			providerCode: "voice_not_found",
 		},
 	} {
 		server := newTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
@@ -485,6 +493,9 @@ func TestAdapterMapsUnsupportedLanguageToInvalidRequest(t *testing.T) {
 		server.Close()
 		if providerErr == nil || providerErr.Code != test.code || providerErr.Retryable || providerErr.ProviderStatus != 400 || providerErr.Message != test.message {
 			t.Fatalf("%s: error = %+v, want code %s message %q", name, providerErr, test.code, test.message)
+		}
+		if got := providerErr.SafeProviderCode(); got != test.providerCode {
+			t.Fatalf("%s: SafeProviderCode = %q, want %q", name, got, test.providerCode)
 		}
 	}
 }

@@ -356,8 +356,8 @@ func TestSynthesisRejectionsKeepTheirClassification(t *testing.T) {
 			_ = stream.AppendText(context.Background(), "hello")
 			err := stream.CommitText(context.Background())
 			var providerErr *runtimepkg.ProviderError
-			if !errors.As(err, &providerErr) || providerErr.Code != tc.want || providerErr.Retryable != tc.retryable || providerErr.ProviderStatus != tc.status {
-				t.Fatalf("CommitText error = %#v, want %s retryable=%v", err, tc.want, tc.retryable)
+			if !errors.As(err, &providerErr) || providerErr.Code != tc.want || providerErr.Retryable != tc.retryable || providerErr.ProviderStatus != tc.status || providerErr.SafeProviderCode() != tc.code {
+				t.Fatalf("CommitText error = %#v, want %s retryable=%v with vendor code %q", err, tc.want, tc.retryable, tc.code)
 			}
 		})
 	}

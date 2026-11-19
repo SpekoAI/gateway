@@ -99,6 +99,14 @@ var reservedSttOptionKeys = map[string]struct{}{
 	"translation": {}, "translation_config": {}, "target_language": {},
 }
 
+// SttOptionKeyReserved reports whether a provider setting name, folded the
+// way Normalize folds it, is one the gateway owns. An adapter that can be
+// driven without Normalize refuses these itself.
+func SttOptionKeyReserved(key string) bool {
+	_, reserved := reservedSttOptionKeys[strings.ToLower(strings.TrimSpace(key))]
+	return reserved
+}
+
 // IsZero reports whether the caller asked for nothing, which is every request
 // that predates this type.
 func (o *SttOptions) IsZero() bool {
@@ -231,7 +239,7 @@ func (o *SttOptions) Normalize() error {
 			if _, collision := kept[folded]; collision {
 				return fmt.Errorf("stt options: provider %q names setting %q more than once across casings", name, folded)
 			}
-			if _, reserved := reservedSttOptionKeys[folded]; reserved {
+			if SttOptionKeyReserved(folded) {
 				return fmt.Errorf("stt options: provider_options.%s.%s is owned by the gateway and cannot be forwarded", name, folded)
 			}
 			if err := validateSttOptionValue(name, folded, value); err != nil {

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/SpekoAI/gateway/controlplane"
 	"github.com/SpekoAI/gateway/protocol"
@@ -14,6 +15,26 @@ import (
 type CredentialSourcePlanner struct {
 	byok    PlanClient
 	managed PlanClient
+}
+
+func (p *CredentialSourcePlanner) EntitlementClock(ctx context.Context, plan protocol.SessionPlan) (time.Time, error) {
+	client, ok := p.managed.(interface {
+		EntitlementClock(context.Context, protocol.SessionPlan) (time.Time, error)
+	})
+	if !ok || plan.Execution.CredentialSource != protocol.CredentialsManaged {
+		return time.Time{}, errors.New("gateway: planner cannot sample entitlement time")
+	}
+	return client.EntitlementClock(ctx, plan)
+}
+
+func (p *CredentialSourcePlanner) RenewEntitlement(ctx context.Context, plan protocol.SessionPlan, request controlplane.EntitlementRenewalRequest, key string) (controlplane.EntitlementRenewal, string, error) {
+	client, ok := p.managed.(interface {
+		RenewEntitlement(context.Context, protocol.SessionPlan, controlplane.EntitlementRenewalRequest, string) (controlplane.EntitlementRenewal, string, error)
+	})
+	if !ok || plan.Execution.CredentialSource != protocol.CredentialsManaged {
+		return controlplane.EntitlementRenewal{}, "", errors.New("gateway: planner cannot renew entitlement")
+	}
+	return client.RenewEntitlement(ctx, plan, request, key)
 }
 
 func NewCredentialSourcePlanner(byok, managed PlanClient) (*CredentialSourcePlanner, error) {

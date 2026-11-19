@@ -104,6 +104,56 @@ func TestTTSAdapterUsesAura2WireContractAndMapsAudio(t *testing.T) {
 	}
 }
 
+// A TTS Error frame keeps Deepgram's own code for the failure logs: Aura names
+// it err_code, Flux TTS names it code.
+func TestTTSAdapterKeepsTheVendorCodeOfAnErrorFrame(t *testing.T) {
+	t.Parallel()
+	for frame, want := range map[string]string{
+		`{"type":"Error","err_code":"INVALID_INPUT","err_msg":"The text could not be synthesized."}`: "INVALID_INPUT",
+		`{"type":"Error","code":"MESSAGE-0000","description":"The message could not be parsed."}`:    "MESSAGE-0000",
+	} {
+		server := newSpeakServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+			if _, err := readTTSControl(ctx, conn); err != nil {
+				return
+			}
+			_ = conn.Write(ctx, websocket.MessageText, []byte(frame))
+			<-ctx.Done()
+		})
+		adapter, err := NewTTS(testTTSConfig(server.URL))
+		if err != nil {
+			t.Fatalf("new TTS adapter: %v", err)
+		}
+		stream, err := adapter.Open(context.Background(), deepgramTTSRequest(server.URL, protocol.CredentialsManaged))
+		if err != nil {
+			t.Fatalf("open TTS stream: %v", err)
+		}
+		if err := stream.AppendText(context.Background(), "Hello, "); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		var providerErr *runtimepkg.ProviderError
+		timer := time.NewTimer(2 * time.Second)
+		for providerErr == nil {
+			select {
+			case event, ok := <-stream.Events():
+				if !ok {
+					t.Fatalf("%s: events closed without an error", frame)
+				}
+				if event.Err != nil && !errors.As(event.Err, &providerErr) {
+					t.Fatalf("%s: error = %v, want a provider error", frame, event.Err)
+				}
+			case <-timer.C:
+				t.Fatalf("%s: timed out", frame)
+			}
+		}
+		timer.Stop()
+		_ = stream.Close(context.Background())
+		server.Close()
+		if providerErr.Code != "provider_unavailable" || providerErr.SafeProviderCode() != want {
+			t.Fatalf("%s: error = %+v, SafeProviderCode = %q, want provider_unavailable with %q", frame, providerErr, providerErr.SafeProviderCode(), want)
+		}
+	}
+}
+
 func TestTTSAdapterUsesFluxV2TurnLifecycle(t *testing.T) {
 	t.Parallel()
 	requests := make(chan *http.Request, 1)

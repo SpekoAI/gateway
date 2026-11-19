@@ -2,14 +2,15 @@ package runtime
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,8 +23,10 @@ import (
 // Config configures an embedded Engine. Verifier is required because a runtime
 // must not trust a customer-provided plan merely because it is well formed.
 type Config struct {
-	Adapters []Adapter
-	Verifier PlanVerifier
+	// MaxReplayEntries bounds retained attempts. Zero uses DefaultMaxReplayEntries.
+	MaxReplayEntries int
+	Adapters         []Adapter
+	Verifier         PlanVerifier
 	// LocalCredentials maps a signed provider name to a customer-owned BYOK
 	// credential. The engine copies a matching credential only into the
 	// ephemeral adapter request; the verified plan and session retain no secret.
@@ -35,16 +38,94 @@ type Config struct {
 
 // Engine opens provider-neutral sessions through registered provider adapters.
 type Engine struct {
-	adapters         map[string]Adapter
-	verifier         PlanVerifier
-	localCredentials map[string]LocalCredential
-	telemetry        TelemetrySink
-	limits           Limits
-	now              func() time.Time
+	adapters             map[string]Adapter
+	verifier             PlanVerifier
+	localCredentials     map[string]LocalCredential
+	telemetry            TelemetrySink
+	limits               Limits
+	now                  func() time.Time
+	admissionNow         func() time.Time
+	maxReplayEntries     int
+	planUsesMu           sync.Mutex
+	planUses             map[planUseKey]*planUse
+	fundedRetiredThrough time.Time // signed expiry cutoff, protected by planUsesMu
+}
+
+type planUseKey struct{ planID, attemptID [32]byte }
+type planUse struct {
+	expiresAt       time.Time
+	wallClock       bool
+	signedExpiresAt time.Time
+}
+
+// A custom verifier may validate signatures without consuming a replay cache.
+// An Engine still admits only one successful stream for each issued attempt.
+// A failed open with no stream can retry; an acquired stream remains spent even
+// if its setup fails. This is local lifecycle tracking, not provider authority.
+func (e *Engine) claimPlanUse(plan protocol.SessionPlan, current func() time.Time) (func(bool), error) {
+	e.planUsesMu.Lock()
+	defer e.planUsesMu.Unlock()
+	now := current()
+	// Verification may block or yield past expiry. Check again at the fence's
+	// admission point before removing old uses or acquiring a provider stream.
+	if err := plan.Validate(now); err != nil {
+		return nil, fmt.Errorf("invalid session plan after verification: %w", err)
+	}
+	retentionNow := time.Now()
+	var wallNow time.Time
+	for key, use := range e.planUses {
+		expiryNow := retentionNow
+		if use.wallClock {
+			if wallNow.IsZero() {
+				wallNow = e.admissionNow()
+			}
+			expiryNow = wallNow
+		}
+		if !use.expiresAt.After(expiryNow) {
+			// Forget the digest only after retaining its signed expiry cutoff.
+			// Fresh SQL time may roll backwards; retirement must remain terminal.
+			if use.signedExpiresAt.After(e.fundedRetiredThrough) {
+				e.fundedRetiredThrough = use.signedExpiresAt
+			}
+			delete(e.planUses, key)
+		}
+	}
+	key := planUseKey{sha256.Sum256([]byte(plan.PlanID)), sha256.Sum256([]byte(plan.AttemptID))}
+	if e.planUses[key] != nil {
+		return nil, ErrPlanReplay
+	}
+	if fundedGoogle(plan) && !plan.ExpiresAt.After(e.fundedRetiredThrough) {
+		return nil, ErrPlanReplay
+	}
+	if len(e.planUses) >= e.maxReplayEntries {
+		return nil, ErrReplayCacheFull
+	}
+	use := &planUse{expiresAt: plan.ExpiresAt, wallClock: !fundedGoogle(plan)}
+	if !use.wallClock {
+		use.signedExpiresAt = plan.ExpiresAt.UTC() // the signed claim, not a caller's monotonic annotation
+		use.expiresAt = retentionNow.Add(plan.ExpiresAt.Sub(now))
+	}
+	e.planUses[key] = use
+	return func(spent bool) {
+		if spent {
+			return
+		}
+		e.planUsesMu.Lock()
+		defer e.planUsesMu.Unlock()
+		if e.planUses[key] == use {
+			delete(e.planUses, key)
+		}
+	}, nil
 }
 
 // New constructs an Engine with fixed per-session limits.
 func New(config Config) (*Engine, error) {
+	if config.MaxReplayEntries < 0 {
+		return nil, errors.New("runtime: replay entry limit must be positive")
+	}
+	if config.MaxReplayEntries == 0 {
+		config.MaxReplayEntries = DefaultMaxReplayEntries
+	}
 	limits := config.Limits
 	if limits == (Limits{}) {
 		limits = DefaultLimits()
@@ -91,22 +172,79 @@ func New(config Config) (*Engine, error) {
 		telemetry:        config.Telemetry,
 		limits:           limits,
 		now:              config.Now,
+		admissionNow:     newAdmissionClock(config.Now).now,
+		maxReplayEntries: config.MaxReplayEntries,
+		planUses:         make(map[planUseKey]*planUse),
 	}, nil
 }
 
 // Open verifies a concrete session plan, opens its selected adapter, and emits
 // session.ready only after the upstream stream is ready to accept work.
-func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error) {
-	if err := validateOpenRequest(request, e.now()); err != nil {
-		return nil, err
+func (e *Engine) Open(ctx context.Context, request OpenRequest) (session *Session, err error) {
+	authenticated := false
+	var clock *fundedClock
+	current := e.admissionNow
+	defer func() {
+		if err != nil && authenticated && !errors.Is(err, ErrPlanReplay) {
+			at := e.now()
+			if clock != nil {
+				if trusted := clock.timestamp(); !trusted.IsZero() {
+					at = trusted
+				}
+			}
+			e.recordOpenFailure(request, err, at)
+		}
+	}()
+	if fundedGoogle(request.Plan) {
+		// The capability is required by the verified plan family, not selected by
+		// the caller's optional callback. No local-clock/uncapped fallback exists.
+		verifier, ok := e.verifier.(ClockedPlanVerifier)
+		if !ok {
+			return nil, errors.New("runtime: funded Google plans require a SQL-clock verifier")
+		}
+		clock = &fundedClock{client: request.Entitlements, plan: request.Plan, wall: e.now}
+		err = verifier.VerifyWithClock(ctx, request.Plan, func(ctx context.Context) (time.Time, error) {
+			authenticated = true
+			if !e.supportsFundedGoogle(request.Plan) {
+				return time.Time{}, ErrFundedGoogleAdapter
+			}
+			if !renewableGoogle(request.Plan) {
+				return time.Time{}, ErrFundedGoogleClockAuthority
+			}
+			if request.Entitlements == nil {
+				return time.Time{}, errors.New("runtime: funded Google plans require SQL-clock authority")
+			}
+			if _, err := clock.synchronize(ctx); err != nil {
+				return time.Time{}, err
+			}
+			return clock.now(), nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("verify funded session plan: %w", err)
+		}
+		current = clock.timestamp
+	} else {
+		if err := validateOpenRequest(request, current()); err != nil {
+			return nil, err
+		}
+		if err := e.verifier.Verify(ctx, request.Plan); err != nil {
+			return nil, fmt.Errorf("verify session plan: %w", err)
+		}
+		authenticated = true
 	}
-	if err := e.verifier.Verify(ctx, request.Plan); err != nil {
-		return nil, fmt.Errorf("verify session plan: %w", err)
+	if err := validateOpenRequest(request, current()); err != nil {
+		return nil, err
 	}
 	adapter, ok := e.adapters[request.Plan.Route.Adapter]
 	if !ok {
 		return nil, fmt.Errorf("runtime adapter %q is not installed", request.Plan.Route.Adapter)
 	}
+	finishUse, err := e.claimPlanUse(request.Plan, current)
+	if err != nil {
+		return nil, err
+	}
+	spent := false
+	defer func() { finishUse(spent) }()
 
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	openStarted := e.now()
@@ -161,33 +299,61 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if request.OnVerifiedCapacity != nil {
 		request.OnVerifiedCapacity(capacity, request.Plan.Execution.CredentialSource)
 	}
-	stream, err := adapter.Open(ctx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential})
+	providerCtx := ctx
+	cancelOpen := func() {}
+	var fundedDeadline time.Time
+	var fundedHorizon time.Time
+	if clock != nil {
+		fundedHorizon = request.Plan.Reservation.LeaseExpiresAt
+		if credential := request.Plan.Route.Credential; credential != nil && credential.ExpiresAt.Before(fundedHorizon) {
+			fundedHorizon = credential.ExpiresAt
+		}
+		if end := request.Plan.Reservation.Billing.RenewableUntil; end.Before(fundedHorizon) {
+			fundedHorizon = end
+		}
+		anchored := time.Now()
+		fundedDeadline = anchored.Add(fundedHorizon.Sub(clock.now()))
+		providerCtx, cancelOpen = context.WithDeadlineCause(ctx, fundedDeadline, ErrSessionLeaseExpired)
+	}
+	defer cancelOpen()
+	if providerCtx.Err() != nil {
+		cancel()
+		release()
+		return nil, context.Cause(providerCtx)
+	}
+	stream, err := adapter.Open(providerCtx, AdapterRequest{Kind: request.Kind, Plan: adapterPlan, Options: adapterOptions, Media: request.Media, Delivery: request.Delivery, RefreshCredential: request.RefreshCredential, Continuation: clock != nil, PhysicalDeadline: fundedDeadline})
+	if providerCtx.Err() != nil {
+		err = context.Cause(providerCtx)
+	}
+	if clock != nil && (!time.Now().Before(fundedDeadline) || !clock.now().Before(fundedHorizon)) {
+		err = ErrSessionLeaseExpired
+	}
 	if err != nil {
 		cancel()
 		if stream == nil {
 			release()
 		} else {
+			spent = true
 			go stopOpenedProvider(stream, release)
 		}
-		e.recordOpenFailure(request, err)
 		return nil, fmt.Errorf("open provider stream: %w", err)
 	}
 	openLatency := e.now().Sub(openStarted)
 	if stream == nil {
 		cancel()
 		release()
-		e.recordOpenFailure(request, errors.New("provider stream is required"))
 		return nil, errors.New("provider stream is required")
 	}
 	providerEvents := stream.Events()
 	if providerEvents == nil {
+		spent = true
 		cancel()
 		go stopOpenedProvider(stream, release)
-		e.recordOpenFailure(request, errors.New("provider stream must expose an events channel"))
 		return nil, errors.New("provider stream must expose an events channel")
 	}
 
-	session := &Session{
+	spent = true
+	session = &Session{
 		kind:            request.Kind,
 		plan:            request.Plan,
 		stream:          stream,
@@ -198,6 +364,7 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 		events:          make(chan protocol.Event, e.limits.MaxOutputEvents+1),
 		done:            make(chan struct{}),
 		eventsStopped:   make(chan struct{}),
+		physicalStopped: make(chan struct{}),
 		releasePhysical: release,
 		limits:          e.limits,
 		telemetry:       e.telemetry,
@@ -206,11 +373,34 @@ func (e *Engine) Open(ctx context.Context, request OpenRequest) (*Session, error
 	if request.Media != nil {
 		session.media = *request.Media
 	}
+	if clock != nil {
+		resumable, ok := stream.(ResumableProviderStream)
+		if !ok {
+			err = errors.New("runtime: funded stream cannot continue")
+		}
+		if !clock.now().Before(request.Plan.Reservation.LeaseExpiresAt) {
+			err = ErrSessionLeaseExpired
+		}
+		if err != nil {
+			cancel()
+			go stopOpenedProvider(stream, release)
+			return nil, err
+		}
+		session.now = clock.timestamp
+		continuationCtx, continuationCancel := context.WithCancel(sessionCtx)
+		session.continuation = &continuation{ctx: continuationCtx, cancel: continuationCancel, session: session, client: request.Entitlements, clock: clock, stream: resumable, expires: request.Plan.Reservation.LeaseExpiresAt, authorizedUnits: request.Plan.Reservation.Usage.AuthorizedUnits, changed: make(chan struct{})}
+		// A shorter caller setup context limits Open only, not execution.
+		session.continuation.hardDeadline = fundedDeadline
+		session.continuation.horizon = fundedHorizon
+	}
 	session.setLeaseDeadline(request.Plan.Reservation.LeaseExpiresAt)
 	session.emitRegular(protocol.EventSessionReady, nil, nil, nil)
 	session.record("session.opened", openLatencyData(openLatency))
 	go session.runInput()
 	go session.runEvents()
+	if session.continuation != nil {
+		go session.continuation.run()
+	}
 	return session, nil
 }
 
@@ -292,6 +482,7 @@ func validateOpenRequest(request OpenRequest, now time.Time) error {
 // Session is an active, single-provider attempt. Its methods are safe to call
 // from multiple goroutines; provider calls remain serialized by runInput.
 type Session struct {
+	continuation    *continuation
 	kind            protocol.SessionKind
 	media           protocol.MediaFormat
 	plan            protocol.SessionPlan
@@ -303,6 +494,7 @@ type Session struct {
 	events          chan protocol.Event
 	done            chan struct{}
 	eventsStopped   chan struct{}
+	physicalStopped chan struct{}
 	releasePhysical func()
 	limits          Limits
 	telemetry       TelemetrySink
@@ -326,6 +518,9 @@ type Session struct {
 	usageMu            sync.Mutex
 	usedUnits          int64
 	acceptedAudioBytes int64
+	audioInFlight      bool
+	audioUncertain     bool
+	usageSealed        bool
 	usageOnce          sync.Once
 }
 
@@ -440,12 +635,16 @@ func (s *Session) SendProviderControl(control protocol.ProviderControl) error {
 // Close begins a graceful close. Queued input is sent in order and the stream
 // then receives Close. It never waits for provider or telemetry I/O.
 func (s *Session) Close() {
+	if s.continuation != nil && s.continuation.close() {
+		s.finish(nil)
+		return
+	}
 	s.input.close()
 }
 
-// Abort immediately makes the session terminal and asks the provider stream
-// to stop asynchronously. Use it when a local transport has failed and
-// graceful input draining would retain capacity without a viable consumer.
+// Abort claims terminal failure and interrupts physical I/O immediately when
+// supported, then joins provider teardown asynchronously. Use it when a local
+// transport has failed and graceful draining has no viable consumer.
 func (s *Session) Abort() {
 	s.fail(ErrSessionAborted)
 }
@@ -463,7 +662,14 @@ func (s *Session) setLeaseDeadlineLocked(deadline time.Time) {
 	if s.leaseTimer != nil {
 		s.leaseTimer.Stop()
 	}
-	delay := deadline.Sub(s.now())
+	now := s.now()
+	if s.continuation != nil {
+		now = s.continuation.clock.now()
+	}
+	delay := deadline.Sub(now)
+	if s.continuation != nil {
+		delay = min(delay, time.Until(s.continuation.hardDeadline))
+	}
 	if delay < 0 {
 		delay = 0
 	}
@@ -472,7 +678,11 @@ func (s *Session) setLeaseDeadlineLocked(deadline time.Time) {
 		expired := sequence == s.leaseSequence
 		s.leaseMu.Unlock()
 		if expired {
-			s.fail(ErrSessionLeaseExpired)
+			if s.continuation != nil {
+				s.continuation.expire(deadline)
+			} else {
+				s.fail(ErrSessionLeaseExpired)
+			}
 		}
 	})
 }
@@ -514,21 +724,56 @@ func (s *Session) runInput() {
 }
 
 func (s *Session) dispatch(message inputMessage) error {
-	s.providerMu.Lock()
+	for {
+		if s.continuation != nil {
+			if err := s.continuation.beforeIO(); err != nil {
+				if message.kind == inputAudio && message.audio.release != nil {
+					message.audio.release()
+				}
+				return err
+			}
+		}
+		s.providerMu.Lock()
+		if s.continuation == nil || s.continuation.ready() {
+			break
+		}
+		s.providerMu.Unlock()
+	}
 	defer s.providerMu.Unlock()
 
 	switch message.kind {
 	case inputAudio:
+		s.usageMu.Lock()
+		if s.continuation != nil && !s.continuation.audioFits(s.acceptedAudioBytes, int64(len(message.audio.data))) {
+			s.usageMu.Unlock()
+			if message.audio.release != nil {
+				message.audio.release()
+			}
+			return ErrUsageLimitExceeded
+		}
+		if s.usageSealed {
+			s.usageMu.Unlock()
+			if message.audio.release != nil {
+				message.audio.release()
+			}
+			return ErrSessionClosed
+		}
+		s.audioInFlight = true
+		s.usageMu.Unlock()
 		err := s.stream.WriteAudio(s.ctx, message.audio.data)
+		s.usageMu.Lock()
+		s.audioInFlight = false
 		if err == nil {
-			s.usageMu.Lock()
 			if frameBytes := int64(len(message.audio.data)); frameBytes > math.MaxInt64-s.acceptedAudioBytes {
 				s.acceptedAudioBytes = math.MaxInt64
 			} else {
 				s.acceptedAudioBytes += frameBytes
 			}
-			s.usageMu.Unlock()
+		} else {
+			// A failed transport write may already have reached the provider.
+			s.audioUncertain = true
 		}
+		s.usageMu.Unlock()
 		if message.audio.release != nil {
 			message.audio.release()
 		}
@@ -573,6 +818,12 @@ func (s *Session) runEvents() {
 				s.fail(fmt.Errorf("provider stream: %w", event.Err))
 				return
 			}
+			if s.continuation != nil {
+				if err := s.continuation.beforeIO(); err != nil {
+					s.fail(err)
+					return
+				}
+			}
 			// Hosted billing evidence is internal; it must not create a new public
 			// usage event when an adapter has no client-facing correlation payload.
 			if event.Type == protocol.EventUsageObserved && event.Billing != nil && len(event.Data) == 0 && len(event.Extensions) == 0 && len(event.Audio) == 0 {
@@ -582,9 +833,9 @@ func (s *Session) runEvents() {
 				s.fail(errors.New("provider emitted an event without a type"))
 				return
 			}
-			// usage.observed is a provider request correlation hint. Its payload
-			// is exactly {"provider_request_id": ...}; other event payloads may
-			// carry transcripts or audio and are never recorded.
+			// usage.observed carries content-free provider correlation/processed
+			// duration metadata, or no data for Gemini. Native extensions never
+			// enter telemetry; other event payloads may carry customer content.
 			if event.Type == protocol.EventUsageObserved {
 				s.record("usage.observed", event.Data)
 			}
@@ -645,44 +896,72 @@ func releaseAfterProviderStop(events <-chan ProviderEvent, stop, release func())
 }
 
 func (s *Session) finishPhysical() {
+	defer close(s.physicalStopped)
 	<-s.eventsStopped
 	// runEvents has left the channel, so the teardown drain becomes its sole
 	// consumer. Public Done alone does not prove physical termination.
 	releaseAfterProviderStop(s.providerEvents, s.abortProvider, s.releasePhysical)
 }
 
+// Claiming a terminal result must never wait for callbacks, a provider mutex,
+// or an event consumer. Physical interruption follows the claim immediately;
+// the regular teardown path still joins everything before releasing capacity.
+func (s *Session) claimFinish(err error) bool {
+	claimed := false
+	s.finishOnce.Do(func() {
+		s.errMu.Lock()
+		s.err = err
+		s.errMu.Unlock()
+		claimed = true
+	})
+	return claimed
+}
+
+func (s *Session) interruptProvider() {
+	if stream, ok := s.stream.(InterruptingProviderStream); ok {
+		stream.Interrupt()
+	}
+}
+
 func (s *Session) fail(err error) {
 	if err == nil {
 		return
 	}
-	s.finishOnce.Do(func() {
-		s.stopLeaseTimer()
-		s.errMu.Lock()
-		s.err = err
-		s.errMu.Unlock()
-		s.input.abort()
-		s.cancel()
-		s.recordUsageReported()
-		s.record("session.failed", telemetryErrorData(err))
-		s.emitTerminal(protocol.EventError, errorData(err), providerErrorExtensions(err), nil)
-		go s.finishPhysical()
-	})
+	if s.continuation != nil && s.continuation.terminalLeaseExpired.Load() {
+		err = ErrSessionLeaseExpired
+	}
+	claimed := s.claimFinish(err)
+	s.cancel()
+	s.interruptProvider()
+	if !claimed {
+		return
+	}
+	s.stopLeaseTimer()
+	s.input.abort()
+	s.recordUsageFinalized()
+	s.record("session.failed", telemetryErrorData(err))
+	s.emitTerminal(protocol.EventError, errorData(err), providerErrorExtensions(err), nil)
+	go s.finishPhysical()
 }
 
 func (s *Session) finish(err error) {
+	if err == nil && s.continuation != nil && s.continuation.terminalLeaseExpired.Load() {
+		err = ErrSessionLeaseExpired
+	}
 	if err != nil {
 		s.fail(err)
 		return
 	}
-	s.finishOnce.Do(func() {
-		s.stopLeaseTimer()
-		s.input.abort()
-		s.cancel()
-		s.recordUsageReported()
-		s.record("session.closed", nil)
-		s.emitTerminal(protocol.EventSessionClosed, nil, nil, nil)
-		go s.finishPhysical()
-	})
+	if !s.claimFinish(nil) {
+		return
+	}
+	s.stopLeaseTimer()
+	s.cancel()
+	s.input.abort()
+	s.recordUsageFinalized()
+	s.record("session.closed", nil)
+	s.emitTerminal(protocol.EventSessionClosed, nil, nil, nil)
+	go s.finishPhysical()
 }
 
 func (s *Session) emitRegular(kind protocol.EventType, data json.RawMessage, extensions map[string]json.RawMessage, audio []byte) {
@@ -736,7 +1015,7 @@ func (s *Session) record(name string, data json.RawMessage) {
 		SessionID:   s.plan.SessionID,
 		AttemptID:   s.plan.AttemptID,
 		At:          s.now(),
-		EventID:     telemetryEventID(s.plan.AttemptID, name, data),
+		EventID:     newTelemetryEventID(),
 		Destination: s.plan.Telemetry,
 		Data:        data,
 		Required:    s.plan.Execution.CredentialSource == protocol.CredentialsManaged && requiredMeteringEvent(name),
@@ -767,44 +1046,37 @@ func (s *Session) recordAgentEvent(event protocol.Event) {
 }
 
 func requiredMeteringEvent(name string) bool {
-	return name == "usage.observed" || name == "usage.reported" || name == "session.closed" || name == "session.failed"
+	return name == "usage.observed" || name == "usage.reported" || name == "usage.finalized" || name == "session.closed" || name == "session.failed"
 }
 
-func (s *Session) recordUsageReported() {
+func (s *Session) recordUsageFinalized() {
 	s.usageOnce.Do(func() {
 		s.usageMu.Lock()
+		s.usageSealed = true
 		usedUnits := s.usedUnits
 		acceptedAudioBytes := s.acceptedAudioBytes
+		unknown := s.audioInFlight || s.audioUncertain
 		s.usageMu.Unlock()
-		s.record("usage.reported", usageReportedData(s.kind, s.media, usedUnits, acceptedAudioBytes))
+		// Public termination never waits for a stalled provider. An unresolved
+		// write or compressed duration remains unknown evidence for settlement.
+		if unknown || s.kind == protocol.SessionKindLLM || (acceptedAudioBytes > 0 && s.media.Encoding != "pcm_s16le") {
+			return
+		}
+		s.record("usage.finalized", usageReportedData(s.kind, s.media, usedUnits, acceptedAudioBytes))
 	})
 }
 
-func (e *Engine) recordOpenFailure(request OpenRequest, openErr error) {
-	usage := usageReportedData(request.Kind, mediaValue(request.Media), 0, 0)
+func (e *Engine) recordOpenFailure(request OpenRequest, openErr error, at time.Time) {
 	for _, event := range []TelemetryEvent{
 		{
-			Name: "usage.reported", SessionID: request.Plan.SessionID, AttemptID: request.Plan.AttemptID,
-			At: e.now(), EventID: telemetryEventID(request.Plan.AttemptID, "usage.reported", usage),
-			Destination: request.Plan.Telemetry, Data: usage,
-			Required: request.Plan.Execution.CredentialSource == protocol.CredentialsManaged,
-		},
-		{
 			Name: "session.failed", SessionID: request.Plan.SessionID, AttemptID: request.Plan.AttemptID,
-			At: e.now(), EventID: telemetryEventID(request.Plan.AttemptID, "session.failed", telemetryErrorData(openErr)),
+			At: at, EventID: newTelemetryEventID(),
 			Destination: request.Plan.Telemetry, Data: telemetryErrorData(openErr),
 			Required: request.Plan.Execution.CredentialSource == protocol.CredentialsManaged,
 		},
 	} {
 		e.telemetry.TryRecord(event)
 	}
-}
-
-func mediaValue(media *protocol.MediaFormat) protocol.MediaFormat {
-	if media == nil {
-		return protocol.MediaFormat{}
-	}
-	return *media
 }
 
 func usageReportedData(kind protocol.SessionKind, media protocol.MediaFormat, usedUnits, acceptedAudioBytes int64) json.RawMessage {
@@ -836,15 +1108,14 @@ func usageReportedData(kind protocol.SessionKind, media protocol.MediaFormat, us
 	return payload
 }
 
-// telemetryEventID is deterministic so a resent event deduplicates in the
-// control plane's idempotent ingest. Lifecycle events occur at most once per
-// attempt; payload-bearing events additionally key on their content.
-func telemetryEventID(attemptID, name string, data json.RawMessage) string {
-	if len(data) == 0 {
-		return "tel_" + attemptID + "_" + name
-	}
-	sum := sha256.Sum256(data)
-	return "tel_" + attemptID + "_" + name + "_" + hex.EncodeToString(sum[:8])
+// A process nonce plus a monotonic occurrence counter also distinguishes
+// repeated data-free provider observations and retries of a failed open. IDs
+// are allocated at creation and retained by the exporter across delivery retries.
+var telemetryProcessID = rand.Text()
+var telemetryEventSequence atomic.Uint64
+
+func newTelemetryEventID() string {
+	return "tel_" + telemetryProcessID + "_" + strconv.FormatUint(telemetryEventSequence.Add(1), 10)
 }
 
 func openLatencyData(latency time.Duration) json.RawMessage {

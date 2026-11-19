@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -48,12 +50,15 @@ import (
 //     reaches between turns routinely, so this adapter keeps it alive itself.
 //     The text-to-speech socket needs nothing equivalent.
 //
-// Two vendor parameters the text-to-speech path sets are deliberately NOT set
-// here, because the dialogue endpoint does not document them and an undocumented
-// query parameter is a 400 risk on a route that has already reserved credit:
-// `sync_alignment` (so alignment arrives only if the vendor volunteers it, and
-// this adapter forwards it when it does) and `language_code` (a request-body
-// field on the dialogue API, not a socket parameter — v3 infers the language).
+// The vendor's AsyncAPI for this socket (api-reference/text-to-dialogue/
+// ttd-websocket, read 2026-11-09) lists `language_code` as a handshake query
+// parameter, so a session language is sent there with the same ISO 639-1
+// normalisation and aliases as the text-to-speech socket (ttsLanguageCode); a
+// session without one leaves the model to infer the language. The same schema
+// lists `sync_alignment` and `apply_text_normalization`, but this adapter
+// still sets neither: no request option carries text normalization, and
+// alignment arrives only if the vendor volunteers it (this adapter forwards it
+// when it does) rather than changing the frame stream the read loop expects.
 const (
 	// DialogueAdapterID identifies the ElevenLabs text-to-dialogue socket.
 	DialogueAdapterID = "elevenlabs.dialogue.v1"
@@ -155,7 +160,7 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 	if request.Plan.Execution.CredentialSource == protocol.CredentialsManaged && request.Plan.Execution.ProviderRoute != protocol.RouteSpekoRelay {
 		singleUseToken = credential.Value
 	}
-	endpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media, singleUseToken)
+	endpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options.Language, *request.Media, singleUseToken)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +198,7 @@ func (a *DialogueAdapter) Open(ctx context.Context, request runtimepkg.AdapterRe
 			if !acceptableCredentialKind(request.Plan.Execution.ProviderRoute, fresh.Kind) || strings.TrimSpace(fresh.Value) == "" {
 				return nil, errors.New("elevenlabs dialogue reconnect requires a bearer credential")
 			}
-			freshEndpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, *request.Media, fresh.Value)
+			freshEndpoint, err := dialogueSocket(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options.Language, *request.Media, fresh.Value)
 			if err != nil {
 				return nil, err
 			}
@@ -253,7 +258,7 @@ func (a *DialogueAdapter) dialDialogue(ctx context.Context, client *http.Client,
 // dialogueSocket validates the route and builds the socket URL. The path is
 // fixed — unlike the text-to-speech socket there is no voice segment to append,
 // because the voice is registered in the handshake instead.
-func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model string, media protocol.MediaFormat, singleUseToken string) (string, error) {
+func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model, language string, media protocol.MediaFormat, singleUseToken string) (string, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
 		return "", fmt.Errorf("elevenlabs dialogue endpoint: %w", err)
@@ -282,6 +287,9 @@ func dialogueSocket(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	query := endpoint.Query()
 	query.Set("model_id", model)
 	query.Set("output_format", "pcm_"+strconv.Itoa(media.SampleRateHz))
+	if language := ttsLanguageCode(language); language != "" {
+		query.Set("language_code", language)
+	}
 	if singleUseToken != "" {
 		query.Set("single_use_token", singleUseToken)
 	}
@@ -303,6 +311,10 @@ type dialogueItem struct {
 	payload    []byte
 	err        error // the connection failed
 	ended      bool  // the connection closed normally
+	// commitDone ends a turn whose every clause was flushed and spoken before
+	// CommitText arrived: the commit has no text left to flush, the vendor
+	// sends no final for an empty flush, so the pump finishes the turn.
+	commitDone bool
 }
 
 // dialogueStream serves one TTS session across successive sockets. Readers
@@ -340,6 +352,13 @@ type dialogueStream struct {
 	// finishes or is cancelled: a Cancel with nothing in flight has nothing to
 	// stop and keeps the connection.
 	speaking bool
+	// unflushed is the text appended since the last flush. pendingFlushes
+	// counts flushes written whose is_final_audio_for_turn has not arrived:
+	// the vendor answers every flush that carried text with one final, so a
+	// clause flush (see AppendText) must not end the turn. Only the final that
+	// leaves nothing pending after CommitText does.
+	unflushed      string
+	pendingFlushes int
 
 	writeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -374,6 +393,42 @@ func (s *dialogueStream) AppendText(ctx context.Context, text string) error {
 	if s.committed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
+	// A clause that ended on the previous append is complete once this one
+	// opens with whitespace: "3." then "5" is a number, "now." then " Next"
+	// is a sentence boundary.
+	s.mu.RLock()
+	boundaryBefore := startsWithSpace(text) && endsAtClause(s.unflushed, false)
+	s.mu.RUnlock()
+	if boundaryBefore {
+		if err := s.flushClause(ctx); err != nil {
+			return err
+		}
+	}
+	// A chunk can carry a boundary inside it ("Hello, how"): the part up to
+	// it is written and flushed on its own, the rest follows as the next input.
+	if split := lastClauseSplit(text); split > 0 {
+		if err := s.writeInput(ctx, text[:split]); err != nil {
+			return err
+		}
+		if err := s.flushClause(ctx); err != nil {
+			return err
+		}
+		text = text[split:]
+	}
+	if err := s.writeInput(ctx, text); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	boundaryAfter := endsAtClause(s.unflushed, true)
+	s.mu.RUnlock()
+	if boundaryAfter {
+		return s.flushClause(ctx)
+	}
+	return nil
+}
+
+// writeInput writes one inputs frame and records its text as unflushed.
+func (s *dialogueStream) writeInput(ctx context.Context, text string) error {
 	if err := s.writeJSON(ctx, map[string]any{
 		"inputs": []map[string]any{{"text": text, "voice_id": s.voiceID, "new_turn": false}},
 	}); err != nil {
@@ -381,8 +436,107 @@ func (s *dialogueStream) AppendText(ctx context.Context, text string) error {
 	}
 	s.mu.Lock()
 	s.speaking = true
+	s.unflushed += text
 	s.mu.Unlock()
 	return nil
+}
+
+// lastClauseSplit returns the byte offset just after the last clause boundary
+// strictly inside text, or 0 when there is none. A boundary is clause
+// punctuation, optional closing quotes or brackets, then whitespace (kept with
+// the clause); a full-width mark needs no whitespace. A boundary at the very
+// end is endsAtClause's case, not a split.
+func lastClauseSplit(text string) int {
+	split := 0
+	for i := 0; i < len(text); {
+		r, size := utf8.DecodeRuneInString(text[i:])
+		i += size
+		if !strings.ContainsRune(clauseEnd, r) {
+			continue
+		}
+		fullWidth := strings.ContainsRune(fullWidthClauseEnd, r)
+		j := i
+		for j < len(text) {
+			c, n := utf8.DecodeRuneInString(text[j:])
+			if !strings.ContainsRune(`"'”’»)]`, c) {
+				break
+			}
+			j += n
+		}
+		k := j
+		for k < len(text) {
+			c, n := utf8.DecodeRuneInString(text[k:])
+			if !unicode.IsSpace(c) {
+				break
+			}
+			k += n
+		}
+		if (k > j || fullWidth) && k < len(text) {
+			split = k
+		}
+	}
+	return split
+}
+
+// flushClause flushes the text appended so far without ending the turn. The
+// dialogue socket holds the first audio of an unflushed turn for about 600 ms,
+// and an LLM streams a reply token by token and commits only at its end.
+// Measured vendor-direct from asia-south1 on 2026-11-04 (eleven_v4_turbo,
+// Hindi, one word every 60 ms): first audio p50 601 ms with a flush only at
+// the end, p50 126 ms with a flush at each clause. The vendor answers the
+// flush with one is_final_audio_for_turn, which handleMessage absorbs while
+// later text or the commit is still pending.
+func (s *dialogueStream) flushClause(ctx context.Context) error {
+	s.mu.Lock()
+	if strings.TrimSpace(s.unflushed) == "" {
+		s.mu.Unlock()
+		return nil
+	}
+	s.unflushed = ""
+	s.pendingFlushes++
+	s.mu.Unlock()
+	if err := s.writeJSON(ctx, map[string]any{"flush": true}); err != nil {
+		s.mu.Lock()
+		if s.pendingFlushes > 0 {
+			s.pendingFlushes--
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// clauseEnd is the punctuation that closes a clause or sentence in the
+// scripts agents speak: Latin, Devanagari danda, CJK full width, Arabic.
+const clauseEnd = ".,;:!?…।॥。，、；：！？؟،؛"
+
+// fullWidthClauseEnd needs no whitespace after it: CJK text has none.
+const fullWidthClauseEnd = "。，、；：！？"
+
+// endsAtClause reports whether text ends with clause punctuation, optionally
+// followed by closing quotes or brackets and, when requireSpace is set, then
+// by whitespace. Requiring the space keeps "3." or "e.g." from splitting
+// before the next token shows whether the clause really ended.
+func endsAtClause(text string, requireSpace bool) bool {
+	trimmed := strings.TrimRightFunc(text, unicode.IsSpace)
+	spaced := len(trimmed) < len(text)
+	trimmed = strings.TrimRight(trimmed, `"'”’»)]`)
+	if trimmed == "" {
+		return false
+	}
+	last, _ := utf8.DecodeLastRuneInString(trimmed)
+	if !strings.ContainsRune(clauseEnd, last) {
+		return false
+	}
+	if strings.ContainsRune(fullWidthClauseEnd, last) {
+		return true
+	}
+	return spaced || !requireSpace
+}
+
+func startsWithSpace(text string) bool {
+	first, _ := utf8.DecodeRuneInString(text)
+	return unicode.IsSpace(first)
 }
 
 // CommitText flushes. The dialogue socket buffers to a fixed server-side
@@ -394,11 +548,38 @@ func (s *dialogueStream) CommitText(ctx context.Context) error {
 	if s.closed.Load() {
 		return runtimepkg.ErrSessionClosed
 	}
+	// The commit and the turn state change together under mu, so a final the
+	// pump applies concurrently sees either the turn before the commit or the
+	// turn after it, never a committed flag without the counter that goes
+	// with it.
+	s.mu.Lock()
 	if !s.committed.CompareAndSwap(false, true) {
+		s.mu.Unlock()
 		return runtimepkg.ErrSessionClosed
 	}
+	unflushed := strings.TrimSpace(s.unflushed) != ""
+	pending, speaking, generation := s.pendingFlushes, s.speaking, s.generation
+	if unflushed {
+		s.unflushed = ""
+		s.pendingFlushes++
+	}
+	s.mu.Unlock()
+	if speaking && !unflushed {
+		// Every clause is already flushed: the final still pending ends the
+		// turn. If they have all arrived nothing else will, so the pump is
+		// told to finish the turn itself.
+		if pending == 0 {
+			go s.deliver(dialogueItem{generation: generation, commitDone: true})
+		}
+		return nil
+	}
 	if err := s.writeJSON(ctx, map[string]any{"flush": true}); err != nil {
+		s.mu.Lock()
+		if unflushed && s.pendingFlushes > 0 {
+			s.pendingFlushes--
+		}
 		s.committed.Store(false)
+		s.mu.Unlock()
 		return err
 	}
 	return nil
@@ -442,6 +623,7 @@ func (s *dialogueStream) Cancel(context.Context) error {
 	done := make(chan struct{})
 	s.reconnected, s.reconnectErr = done, nil
 	s.speaking, s.audioStarted = false, false
+	s.unflushed, s.pendingFlushes = "", 0
 	s.committed.Store(false)
 	s.mu.Unlock()
 	if old != nil {
@@ -696,10 +878,22 @@ func (s *dialogueStream) apply(item dialogueItem) ([]runtimepkg.ProviderEvent, c
 	}
 	var events []runtimepkg.ProviderEvent
 	switch {
-	case item.ended:
-	case item.err != nil:
-		if !s.closed.Load() {
-			events = []runtimepkg.ProviderEvent{{Err: item.err}}
+	case item.commitDone:
+		if !s.committed.Load() || s.pendingFlushes != 0 || !s.speaking {
+			return nil, s.superseded, false
+		}
+		return []runtimepkg.ProviderEvent{s.finishTurn(nil)}, s.superseded, false
+	case item.ended, item.err != nil:
+		// A close can end the socket before the commitDone item for a fully
+		// flushed turn reaches the pump (LiveKit closes right after
+		// committing), and a close without a status frame arrives as a read
+		// error. That turn is complete either way, so it gets its audio.done
+		// before anything else.
+		if s.committed.Load() && s.pendingFlushes == 0 && s.speaking {
+			events = append(events, s.finishTurn(nil))
+		}
+		if item.err != nil && !s.closed.Load() {
+			events = append(events, runtimepkg.ProviderEvent{Err: item.err})
 		}
 	default:
 		var err error
@@ -741,6 +935,24 @@ func (m dialogueInbound) finishesTurn() bool {
 	return m.IsFinalForTurn || m.IsFinal || m.IsFinalCamel
 }
 
+// finishTurn resets the turn and returns its audio.done. It runs under s.mu.
+// The session then takes the next turn: the socket accepts another
+// inputs+flush round on the same connection (verified live 2026-10-28 for
+// eleven_v4_turbo and eleven_v3_conversational). Reset BEFORE emitting, so a
+// caller that appends as soon as it sees audio.done is not refused. This
+// mirrors finishContext on the text-to-speech arm, where Pipecat commits
+// sentence by sentence.
+func (s *dialogueStream) finishTurn(raw json.RawMessage) runtimepkg.ProviderEvent {
+	s.audioStarted, s.speaking = false, false
+	s.unflushed, s.pendingFlushes = "", 0
+	s.committed.Store(false)
+	event := runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: contextData("")}
+	if raw != nil {
+		event.Extensions = extension(raw)
+	}
+	return event
+}
+
 // handleMessage translates one vendor frame. It runs under s.mu, inside apply.
 func (s *dialogueStream) handleMessage(payload []byte) ([]runtimepkg.ProviderEvent, error) {
 	var message dialogueInbound
@@ -755,7 +967,7 @@ func (s *dialogueStream) handleMessage(payload []byte) ([]runtimepkg.ProviderEve
 		// from an exhausted quota. The error field is the vendor's own
 		// message, never the credential, which rides the handshake and the
 		// request header.
-		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: fmt.Sprintf("ElevenLabs dialogue reported a streaming error: %s", strings.TrimSpace(string(message.Error))), Retryable: false}
+		return nil, &runtimepkg.ProviderError{Code: "provider_unavailable", Message: fmt.Sprintf("ElevenLabs dialogue reported a streaming error: %s", strings.TrimSpace(string(message.Error))), Retryable: false, Extensions: extension(raw)}
 	}
 	var events []runtimepkg.ProviderEvent
 	if message.Audio != "" {
@@ -777,15 +989,18 @@ func (s *dialogueStream) handleMessage(payload []byte) ([]runtimepkg.ProviderEve
 		events = append(events, runtimepkg.ProviderEvent{Type: protocol.EventAlignment, Data: contextData(""), Extensions: extension(raw)})
 	}
 	if message.finishesTurn() {
-		// The turn is over, so the session takes the next one: the socket
-		// accepts another inputs+flush round on the same connection (verified
-		// live 2026-10-28 for eleven_v4_turbo and eleven_v3_conversational).
-		// Reset BEFORE emitting, so a caller that appends as soon as it sees
-		// audio.done is not refused. This mirrors finishContext on the
-		// text-to-speech arm, where Pipecat commits sentence by sentence.
-		s.audioStarted, s.speaking = false, false
-		s.committed.Store(false)
-		return append(events, runtimepkg.ProviderEvent{Type: protocol.EventAudioDone, Data: contextData(""), Extensions: extension(raw)}), nil
+		// One final answers one flush. A clause flush's final arrives while
+		// later text is still coming, or while the commit's own flush is still
+		// pending, and ends nothing. A final with no flush on record keeps its
+		// old meaning and ends the turn.
+		hadPending := s.pendingFlushes > 0
+		if hadPending {
+			s.pendingFlushes--
+		}
+		if hadPending && (!s.committed.Load() || s.pendingFlushes > 0) {
+			return events, nil
+		}
+		return append(events, s.finishTurn(raw)), nil
 	}
 	if message.Audio == "" && len(message.Alignment) == 0 {
 		events = append(events, runtimepkg.ProviderEvent{Type: protocol.EventWarning, Data: marshalData(map[string]any{"message": "ignored ElevenLabs dialogue message"}), Extensions: extension(raw)})

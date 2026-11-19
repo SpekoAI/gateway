@@ -43,6 +43,13 @@ func TestDialogueAdapterRegistersOneVoiceAndFlushesWithoutClosing(t *testing.T) 
 					t.Errorf("first input = %+v, err=%v", first, err)
 					return
 				}
+				// "Hello, " closes a clause, so it is flushed on its own before
+				// the rest of the reply arrives.
+				clause, err := readDialogueMessage(ctx, conn)
+				if err != nil || !clause.Flush || len(clause.Inputs) != 0 || clause.CloseSocket {
+					t.Errorf("clause flush = %+v, err=%v", clause, err)
+					return
+				}
 				second, err := readDialogueMessage(ctx, conn)
 				if err != nil || len(second.Inputs) != 1 || second.Inputs[0].Text != "world." {
 					t.Errorf("second input = %+v, err=%v", second, err)
@@ -53,13 +60,16 @@ func TestDialogueAdapterRegistersOneVoiceAndFlushesWithoutClosing(t *testing.T) 
 					t.Errorf("flush = %+v, err=%v", flush, err)
 					return
 				}
-				if err := writeServerJSON(ctx, conn, map[string]any{"audio": base64.StdEncoding.EncodeToString([]byte{1, 2, 3})}); err != nil {
-					t.Errorf("write audio: %v", err)
-					return
-				}
-				if err := writeServerJSON(ctx, conn, map[string]any{"is_final": true}); err != nil {
-					t.Errorf("write final: %v", err)
-					return
+				// One final per flush, as the live socket sends them.
+				for _, audio := range [][]byte{{1, 2, 3}, {4, 5, 6}} {
+					if err := writeServerJSON(ctx, conn, map[string]any{"audio": base64.StdEncoding.EncodeToString(audio)}); err != nil {
+						t.Errorf("write audio: %v", err)
+						return
+					}
+					if err := writeServerJSON(ctx, conn, map[string]any{"is_final": true}); err != nil {
+						t.Errorf("write final: %v", err)
+						return
+					}
 				}
 				closeSocket, err := readDialogueMessage(ctx, conn)
 				if err != nil || !closeSocket.CloseSocket {
@@ -87,8 +97,9 @@ func TestDialogueAdapterRegistersOneVoiceAndFlushesWithoutClosing(t *testing.T) 
 			if err := stream.CommitText(context.Background()); err != nil {
 				t.Fatalf("commit: %v", err)
 			}
-			events := collectEvents(t, stream.Events(), 3)
-			if got := eventTypes(events); strings.Join(got, ",") != "audio.started,audio.frame,audio.done" {
+			// The clause flush's final ends nothing: one audio.done, after both.
+			events := collectEvents(t, stream.Events(), 4)
+			if got := eventTypes(events); strings.Join(got, ",") != "audio.started,audio.frame,audio.frame,audio.done" {
 				t.Fatalf("event types = %v", got)
 			}
 			if err := stream.Close(context.Background()); err != nil {
@@ -103,10 +114,13 @@ func TestDialogueAdapterRegistersOneVoiceAndFlushesWithoutClosing(t *testing.T) 
 			if query.Get("output_format") != "pcm_16000" {
 				t.Fatalf("output_format = %q", query.Get("output_format"))
 			}
-			// Neither parameter is documented on this endpoint; sending one is a 400
-			// risk after admission has already reserved credit.
-			if query.Has("sync_alignment") || query.Has("language_code") {
-				t.Fatalf("undocumented dialogue query parameters sent: %v", query)
+			// The session language rides the documented language_code; the
+			// adapter never opts into sync_alignment or text normalization here.
+			if query.Get("language_code") != "en" {
+				t.Fatalf("language_code = %q, want en", query.Get("language_code"))
+			}
+			if query.Has("sync_alignment") || query.Has("apply_text_normalization") {
+				t.Fatalf("unrequested dialogue query parameters sent: %v", query)
 			}
 			if request.Header.Get("xi-api-key") == "" {
 				t.Fatal("xi-api-key header missing")
@@ -154,13 +168,36 @@ func TestDialogueSocketServesV4Family(t *testing.T) {
 	}
 	media := protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1}
 	for _, model := range []string{"eleven_v4", "eleven_v4_turbo"} {
-		raw, err := dialogueSocket(adapter.endpointPolicy, "wss://api.elevenlabs.io"+dialogueEndpoint, model, media, "")
+		raw, err := dialogueSocket(adapter.endpointPolicy, "wss://api.elevenlabs.io"+dialogueEndpoint, model, "", media, "")
 		if err != nil {
 			t.Fatalf("%s: %v", model, err)
 		}
 		endpoint, _ := url.Parse(raw)
 		if endpoint.Path != dialogueEndpoint || endpoint.Query().Get("model_id") != model || endpoint.Query().Get("output_format") != "pcm_24000" {
 			t.Fatalf("%s endpoint = %s", model, raw)
+		}
+	}
+}
+
+// The dialogue socket documents language_code as a handshake query parameter.
+// It takes the text-to-speech socket's ISO 639-1 spelling and aliases, and
+// is omitted when the session names no language.
+func TestDialogueSocketSendsLanguageCode(t *testing.T) {
+	t.Parallel()
+	adapter, err := NewDialogue(Config{})
+	if err != nil {
+		t.Fatalf("new dialogue adapter: %v", err)
+	}
+	media := protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 24_000, Channels: 1}
+	for language, want := range map[string]string{"es-MX": "es", "nb-NO": "no", "": "", "  ": ""} {
+		raw, err := dialogueSocket(adapter.endpointPolicy, "wss://api.elevenlabs.io"+dialogueEndpoint, "eleven_v3_conversational", language, media, "")
+		if err != nil {
+			t.Fatalf("%q: %v", language, err)
+		}
+		endpoint, _ := url.Parse(raw)
+		query := endpoint.Query()
+		if got := query.Get("language_code"); got != want || (want == "" && query.Has("language_code")) {
+			t.Fatalf("language %q: endpoint = %s, want language_code %q", language, raw, want)
 		}
 	}
 }
@@ -376,6 +413,10 @@ func TestDialogueAdapterCarriesTheVendorErrorText(t *testing.T) {
 		}
 		if !strings.Contains(event.Err.Error(), "voice_not_found") {
 			t.Fatalf("error lost the vendor text: %v", event.Err)
+		}
+		var providerErr *runtimepkg.ProviderError
+		if !errors.As(event.Err, &providerErr) || providerErr.SafeProviderCode() != "voice_not_found" {
+			t.Fatalf("error lost the vendor code: %+v", event.Err)
 		}
 		if strings.Contains(event.Err.Error(), "customer-elevenlabs-key") {
 			t.Fatalf("error leaked the credential: %v", event.Err)

@@ -73,7 +73,7 @@ func TestBatchTranscribeUsesPreRecordedContract(t *testing.T) {
 		t.Fatal("body was not the raw WAV container")
 	}
 	query := request.URL.Query()
-	for key, want := range map[string]string{"model": "nova-3", "language": "en", "diarize": "true", "utterances": "true", "punctuate": "true", "smart_format": "true", "keyterm": "Speko", "numerals": "true", "extra": "speko_reservation:rsv_1"} {
+	for key, want := range map[string]string{"model": "nova-3", "language": "en", "diarize": "true", "utterances": "true", "punctuate": "true", "smart_format": "true", "keyterm": "Speko", "numerals": "true", "extra": "speko_reservation:rsv_1", "mip_opt_out": "true"} {
 		if got := query.Get(key); got != want {
 			t.Fatalf("query %s = %q, want %q", key, got, want)
 		}

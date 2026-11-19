@@ -411,8 +411,8 @@ func TestSetupErrorsFailOpenWithTheirClassification(t *testing.T) {
 			fake.ack = `{"type":"error","error":{"code":"` + tc.code + `","message":"nope","requestId":"req-x"}}`
 			_, err := newTestSTT(t, fake).Open(context.Background(), sttRequest(fake.endpoint()))
 			var providerErr *runtimepkg.ProviderError
-			if !errors.As(err, &providerErr) || providerErr.Code != tc.want || providerErr.Retryable != tc.retryable {
-				t.Fatalf("Open error = %#v, want %s retryable=%v", err, tc.want, tc.retryable)
+			if !errors.As(err, &providerErr) || providerErr.Code != tc.want || providerErr.Retryable != tc.retryable || providerErr.SafeProviderCode() != tc.code {
+				t.Fatalf("Open error = %#v, want %s retryable=%v with vendor code %s", err, tc.want, tc.retryable, tc.code)
 			}
 		})
 	}
@@ -452,8 +452,8 @@ func TestMidSessionErrorIsReportedOnce(t *testing.T) {
 			failures = append(failures, providerErr)
 		}
 	}
-	if len(failures) != 1 || failures[0].Code != "provider_quota_exceeded" || failures[0].Retryable {
-		t.Fatalf("failures = %#v, want one non-retryable quota error", failures)
+	if len(failures) != 1 || failures[0].Code != "provider_quota_exceeded" || failures[0].Retryable || failures[0].SafeProviderCode() != "INSUFFICIENT_CREDITS" {
+		t.Fatalf("failures = %#v, want one non-retryable quota error naming INSUFFICIENT_CREDITS", failures)
 	}
 }
 
@@ -506,7 +506,7 @@ func TestCloseReasonCarriesTheErrorCode(t *testing.T) {
 			failures = append(failures, providerErr)
 		}
 	}
-	if len(failures) != 1 || failures[0].Code != "provider_quota_exceeded" || failures[0].Retryable {
-		t.Fatalf("failures = %#v, want the close reason's classification", failures)
+	if len(failures) != 1 || failures[0].Code != "provider_quota_exceeded" || failures[0].Retryable || failures[0].SafeProviderCode() != "INSUFFICIENT_CREDITS" {
+		t.Fatalf("failures = %#v, want the close reason's classification and code", failures)
 	}
 }
