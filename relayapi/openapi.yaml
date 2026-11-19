@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:f7953ce55bfff1b064c5d85e7d2cc8a36e2493d1d7c8acc9b52b0a6634caeba8
-# yaml-body: sha256:1a4ce90ec074cc4b261f94fef0660eca8e32d4872bbfbb0e6d6e66fd70fc0ca9
+# json-mirror: openapi.json sha256:6894b708b0f529469e24403bc6fda3a9ae6cdb6e3ba7fdd6536e80904c4469b3
+# yaml-body: sha256:da151211d12b19b344f08442e446d47cca64fbe0d81ccab381308c73124264b1
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -1876,6 +1876,7 @@ components:
           type: array
           minItems: 2
           maxItems: 10
+          uniqueItems: true
           items:
             $ref: "#/components/schemas/AudioEvaluationText"
       required: [type, instructions, criteria]

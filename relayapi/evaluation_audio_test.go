@@ -115,6 +115,11 @@ func TestValidateAudioRejectsStructuredContentAndBadIDs(t *testing.T) {
 			q.Instructions = raw(`"\u0085"`)
 			r.Questions["agitation"] = q
 		}, "instructions"},
+		{"repeated score level", func(r *EvaluationRequest) {
+			q := r.Questions["agitation"]
+			q.Criteria = raw(`["calm","tense","calm"]`)
+			r.Questions["agitation"] = q
+		}, "repeats score level 0"},
 		{"id with a space", func(r *EvaluationRequest) { r.Questions["wants human"] = r.Questions["wants_human"] }, "must match"},
 		{"id too long", func(r *EvaluationRequest) { r.Questions[strings.Repeat("a", 65)] = r.Questions["wants_human"] }, "must match"},
 		{"auto routing", func(r *EvaluationRequest) { r.Routing = Routing{Mode: RoutingModeAuto, Objective: ObjectiveBalanced} }, "explicit"},
@@ -161,7 +166,7 @@ func TestEvaluationLimitsAcceptNameTheFirstExceededBound(t *testing.T) {
 		t.Fatalf("limits must validate: %v", err)
 	}
 	shape := audioEvaluationRequest().Shape()
-	shape.AudioMS = 4_000
+	shape.Audio, shape.AudioMS = true, 4_000
 	if name, ok := limits.Accepts(shape); !ok {
 		t.Fatalf("Accepts() refused %q", name)
 	}
@@ -246,6 +251,9 @@ func TestAudioEvaluationModelValidation(t *testing.T) {
 			m.Capabilities.EvaluationInputs = []string{EvaluationInputAudio, EvaluationInputAudio}
 		}, "evaluation_inputs: duplicate"},
 		{"bad limits", func(m *Model) { m.Capabilities.EvaluationLimits = &EvaluationLimits{MaxChoiceOptions: 1} }, "evaluation_limits"},
+		{"opus clip format", func(m *Model) {
+			m.AudioFormats = []AudioFormat{{Encoding: "opus", SampleRatesHz: []int{48_000}, Channels: []int{1}}}
+		}, "pcm_s16le only"},
 		{"inputs on an llm", func(m *Model) {
 			m.Kind = KindLLM
 			m.AudioFormats = nil
@@ -274,5 +282,28 @@ func TestEvaluationLimitsWireNamesAreStable(t *testing.T) {
 	}
 	if string(payload) != `{"max_questions":25,"min_audio_ms":1000}` {
 		t.Fatalf("EvaluationLimits wire = %s", payload)
+	}
+}
+
+func TestEvaluationLimitsApplyAudioBoundsOnlyToClips(t *testing.T) {
+	t.Parallel()
+	limits := EvaluationLimits{MaxInstructionChars: 1, MinAudioMS: 1_000, MaxAudioMS: 60_000}
+	text := EvaluationRequest{Questions: map[string]EvaluationQuestion{"q": {Type: EvaluationQuestionNoul, Instructions: raw(`" "`)}}}
+	shape := text.Shape()
+	// A blank instruction is one character, not its three-byte JSON encoding.
+	if shape.MaxInstructionChars != 1 {
+		t.Fatalf("MaxInstructionChars = %d, want 1", shape.MaxInstructionChars)
+	}
+	// A text request carries no clip, so the minimum clip duration is moot.
+	if limit, ok := limits.Accepts(shape); !ok {
+		t.Fatalf("text request refused by %s", limit)
+	}
+	shape.Audio, shape.AudioMS, shape.AudioBytes = true, 500, 16_000
+	if limit, ok := limits.Accepts(shape); ok || limit != "min_audio_ms" {
+		t.Fatalf("short clip: Accepts = (%q, %v), want min_audio_ms refusal", limit, ok)
+	}
+	shape.AudioMS = 61_000
+	if limit, ok := limits.Accepts(shape); ok || limit != "max_audio_ms" {
+		t.Fatalf("long clip: Accepts = (%q, %v), want max_audio_ms refusal", limit, ok)
 	}
 }

@@ -118,10 +118,17 @@ func (q EvaluationQuestion) validateText() error {
 	case EvaluationQuestionScore:
 		var criteria []json.RawMessage
 		_ = json.Unmarshal(q.Criteria, &criteria)
+		seen := make(map[string]int, len(criteria))
 		for index, level := range criteria {
-			if _, ok := evaluationText(level); !ok {
+			text, ok := evaluationText(level)
+			if !ok {
 				return fmt.Errorf("criteria[%d]: must be a non-blank string", index)
 			}
+			// Levels are an ordered scale; Hume refuses repeated ones.
+			if first, duplicate := seen[text]; duplicate {
+				return fmt.Errorf("criteria[%d]: repeats score level %d", index, first)
+			}
+			seen[text] = index
 		}
 	}
 	return nil
@@ -170,7 +177,8 @@ func evaluationTextOrNull(raw json.RawMessage) bool {
 // evaluationChars counts what a vendor's length limit counts: the code points
 // of a string, or the encoded size of structured content.
 func evaluationChars(raw json.RawMessage) int {
-	if text, ok := evaluationText(raw); ok {
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
 		return utf8.RuneCountInString(text)
 	}
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
@@ -238,8 +246,12 @@ type EvaluationShape struct {
 	MaxOptionDescriptionChars int
 	MaxScoreLevelChars        int
 	MaxNoulCriterionChars     int
-	AudioMS                   int64
-	AudioBytes                int64
+	// Audio is true when the request carries a clip. Audio bounds apply only
+	// then, so a model that takes both text and audio does not hold text
+	// requests to its minimum clip duration.
+	Audio      bool
+	AudioMS    int64
+	AudioBytes int64
 }
 
 // Shape measures the request's questions and context. Call it on a request
@@ -294,15 +306,22 @@ func (l EvaluationLimits) Accepts(shape EvaluationShape) (string, bool) {
 		{"max_option_description_chars", int64(l.MaxOptionDescriptionChars), int64(shape.MaxOptionDescriptionChars)},
 		{"max_score_level_chars", int64(l.MaxScoreLevelChars), int64(shape.MaxScoreLevelChars)},
 		{"max_noul_criterion_chars", int64(l.MaxNoulCriterionChars), int64(shape.MaxNoulCriterionChars)},
-		{"max_audio_ms", l.MaxAudioMS, shape.AudioMS},
-		{"max_audio_bytes", l.MaxAudioBytes, shape.AudioBytes},
+	}
+	if shape.Audio {
+		checks = append(checks, []struct {
+			name         string
+			limit, value int64
+		}{
+			{"max_audio_ms", l.MaxAudioMS, shape.AudioMS},
+			{"max_audio_bytes", l.MaxAudioBytes, shape.AudioBytes},
+		}...)
 	}
 	for _, check := range checks {
 		if check.limit > 0 && check.value > check.limit {
 			return check.name, false
 		}
 	}
-	if l.MinAudioMS > 0 && shape.AudioMS < l.MinAudioMS {
+	if shape.Audio && l.MinAudioMS > 0 && shape.AudioMS < l.MinAudioMS {
 		return "min_audio_ms", false
 	}
 	return "", true
