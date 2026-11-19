@@ -116,7 +116,8 @@ var sttOptionSupport = map[string]sttSupport{
 		{prefix: "", noDiarization: "only Scribe v3 Live labels speakers; pin scribe_v3_live"},
 	}},
 	// enable_speaker_diarization, context terms and the one-way translation
-	// block all ride the start frame, and so do the endpoint knobs: Soniox's
+	// block all ride the start frame, and the adapter reports the per-token
+	// speaker labels on deltas and finals. So do the endpoint knobs: Soniox's
 	// defaults wait up to 2s after speech ends before returning an endpoint,
 	// which a voice agent hears as a slow turn.
 	"soniox": {diarization: true, keywords: true, translation: true, providerKeys: []string{
