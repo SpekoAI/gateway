@@ -48,6 +48,24 @@
     "translation": "hola"
   },
   {
+    "type": "transcript.delta",
+    "text": "How are you? I'm fine",
+    "segments": [
+      {
+        "text": "How are you?",
+        "start_ms": 120,
+        "end_ms": 600,
+        "speaker": "1"
+      },
+      {
+        "text": "I'm fine",
+        "start_ms": 900,
+        "end_ms": 1300,
+        "speaker": "2"
+      }
+    ]
+  },
+  {
     "type": "transcript.final",
     "text": "hello world",
     "segments": [

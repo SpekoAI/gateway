@@ -157,6 +157,7 @@ func TestSTTStreamMessageValidation(t *testing.T) {
 		{"ready without request id", relayapi.STTSessionReady{Type: relayapi.STTEventSessionReady, Route: relayapi.Route{Provider: "deepgram", Model: "nova-3", Region: "eu-west-1", AttemptID: "att_1"}}, "request_id: required"},
 		{"ready with incomplete route", relayapi.STTSessionReady{Type: relayapi.STTEventSessionReady, RequestID: "req_1", Route: relayapi.Route{Provider: "deepgram"}}, "route:"},
 		{"empty transcript delta", relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta}, "text: required"},
+		{"delta with bad segment", relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "x", Segments: []relayapi.TranscriptSegment{{StartMS: 10, EndMS: 5}}}, "segments[0]"},
 		{"final with bad segment", relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, Text: "x", Segments: []relayapi.TranscriptSegment{{StartMS: 10, EndMS: 5}}}, "segments[0]"},
 		{"usage update with negative usage", relayapi.STTUsageUpdated{Type: relayapi.STTEventUsageUpdated, Usage: relayapi.Usage{DurationMS: -1}}, "must not be negative"},
 		{"closed with negative usage", relayapi.STTSessionClosed{Type: relayapi.STTEventSessionClosed, Usage: relayapi.Usage{DurationMS: -1}}, "must not be negative"},
@@ -166,6 +167,19 @@ func TestSTTStreamMessageValidation(t *testing.T) {
 			t.Parallel()
 			assertInvalid(t, tc.message.Validate(), tc.want)
 		})
+	}
+}
+
+// Speaker segments on a delta are opt-in: a delta from a session that never
+// asked for diarization keeps the exact bytes it always had.
+func TestSTTTranscriptDeltaWithoutSegmentsKeepsItsBytes(t *testing.T) {
+	t.Parallel()
+	encoded, err := json.Marshal(relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(encoded), `{"type":"transcript.delta","text":"hello"}`; got != want {
+		t.Fatalf("delta = %s, want %s", got, want)
 	}
 }
 

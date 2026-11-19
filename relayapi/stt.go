@@ -290,18 +290,30 @@ type STTTranscriptDelta struct {
 	// original words whose translation has not arrived yet, or only a
 	// translation of words already recognised.
 	Translation string `json:"translation,omitempty"`
+	// Segments attributes the hypothesis to speakers before any final: Text
+	// cut wherever the speaker changes, in order, each piece with the
+	// vendor's label and its span. Present only on a session that asked for
+	// diarization, routed to a provider that labels interim words; absent
+	// otherwise, so every other delta keeps its exact bytes. The labels are
+	// provisional: a later delta or the final may relabel the same words.
+	Segments []TranscriptSegment `json:"segments,omitempty"`
 }
 
-// Validate checks the frame tag and that the delta says something — empty
-// interim hypotheses are dropped at normalization, never forwarded. On a
-// translating session a delta that advances only the translation is
-// something.
+// Validate checks the frame tag, segments, and that the delta says
+// something — empty interim hypotheses are dropped at normalization, never
+// forwarded. On a translating session a delta that advances only the
+// translation is something.
 func (e STTTranscriptDelta) Validate() error {
 	if e.Type != STTEventTranscriptDelta {
 		return fmt.Errorf("type: got %q, want %q", e.Type, STTEventTranscriptDelta)
 	}
 	if e.Text == "" && e.Translation == "" {
 		return fmt.Errorf("text: required")
+	}
+	for i, segment := range e.Segments {
+		if err := segment.Validate(); err != nil {
+			return fmt.Errorf("segments[%d]: %w", i, err)
+		}
 	}
 	return nil
 }

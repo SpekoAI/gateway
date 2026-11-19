@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:ea280d09c443a12a44ec39ea527c682ad6d1e09fb219057fbd8883cc1a88bbed
-# yaml-body: sha256:c442a7e741dec4a0360fa8b085c4297bd149c8cf28e0d42576d1587255784968
+# json-mirror: asyncapi.json sha256:e1653d0c4ad0636d5497a0b3c3092a34e491d7e95e5606fd5bb3eeea01728d2e
+# yaml-body: sha256:fdb49c2ea052f943626d31dd0fec62c07f0b5b22020222fe75ee24d5de087c1c
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -1066,6 +1066,8 @@ components:
           description: >-
             Label each transcript segment with the speaker who said it.
             Omitted leaves the vendor default, which is not the same as false.
+            On a provider that labels interim words, transcript.delta also
+            carries segments, so speakers are known before the final.
         keywords:
           type: array
           description: >-
@@ -1192,6 +1194,18 @@ components:
             The interim translation of the current span, present only on a
             session that asked for one. It trails text, so a delta may carry
             only one of the two; a delta with neither is never sent.
+        segments:
+          type: array
+          description: >-
+            Who is saying the hypothesis, before any final: text cut wherever
+            the speaker changes, in order, each piece with the vendor's label
+            and its span. Present only on a session that asked for
+            diarization, routed to a provider that labels interim words;
+            absent otherwise, so every other delta keeps its exact bytes. The
+            labels are provisional: a later delta or the transcript.final may
+            relabel the same words.
+          items:
+            $ref: "#/components/schemas/TranscriptSegment"
       required:
         - type
         - text

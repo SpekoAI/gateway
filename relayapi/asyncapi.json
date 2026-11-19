@@ -1033,7 +1033,7 @@
         "properties": {
           "diarization": {
             "type": "boolean",
-            "description": "Label each transcript segment with the speaker who said it. Omitted leaves the vendor default, which is not the same as false."
+            "description": "Label each transcript segment with the speaker who said it. Omitted leaves the vendor default, which is not the same as false. On a provider that labels interim words, transcript.delta also carries segments, so speakers are known before the final."
           },
           "keywords": {
             "type": "array",
@@ -1159,6 +1159,13 @@
           "translation": {
             "type": "string",
             "description": "The interim translation of the current span, present only on a session that asked for one. It trails text, so a delta may carry only one of the two; a delta with neither is never sent."
+          },
+          "segments": {
+            "type": "array",
+            "description": "Who is saying the hypothesis, before any final: text cut wherever the speaker changes, in order, each piece with the vendor's label and its span. Present only on a session that asked for diarization, routed to a provider that labels interim words; absent otherwise, so every other delta keeps its exact bytes. The labels are provisional: a later delta or the transcript.final may relabel the same words.",
+            "items": {
+              "$ref": "#/components/schemas/TranscriptSegment"
+            }
           }
         },
         "required": [
