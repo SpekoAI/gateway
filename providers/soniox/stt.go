@@ -18,6 +18,7 @@ import (
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 	"github.com/coder/websocket"
+	"github.com/rivo/uniseg"
 )
 
 const (
@@ -843,7 +844,8 @@ const (
 // cutLongSegment emits the finalized prefix of an over-long segment once, as
 // a final that does not end the utterance, and keeps the rest as the open
 // segment. The prefix ends at the last sentence end in the finalized text's
-// last quarter, else at the last word boundary; never inside a word.
+// last quarter, else at the last word boundary; never inside a word or a
+// character (sttCutPoint).
 func (s *sttStream) cutLongSegment(raw json.RawMessage) error {
 	spoken := s.segment.spoken
 	if !sttOverBound(s.segment.text.String(), spoken) {
@@ -904,19 +906,25 @@ func sttOverBound(text string, tokens []sttToken) bool {
 // word or the first ends one or a sentence; text with no such boundary, as
 // Chinese or Japanese written without spaces, is cut by sttCharacterCut. The
 // end of the last finalized token is never one: the next piece is not final
-// yet and may continue the word.
+// yet and may continue the word. Nor is any boundary inside a character
+// (sttGraphemeBreaks): such a candidate is skipped, so the cut steps back to
+// the previous one that is a character boundary.
 func sttCutPoint(tokens []sttToken) int {
+	var text strings.Builder
 	total := 0
 	for _, token := range tokens {
+		text.WriteString(token.Text)
 		total += utf8.RuneCountInString(token.Text)
 	}
-	offset, sentence, word, hasText := 0, 0, 0, false
+	breaks := sttGraphemeBreaks(text.String())
+	offset, at, sentence, word, hasText := 0, 0, 0, 0, false
 	for index := 1; index < len(tokens); index++ {
 		previous := tokens[index-1].Text
 		offset += utf8.RuneCountInString(previous)
+		at += len(previous)
 		hasText = hasText || strings.TrimSpace(previous) != ""
 		endsSentence := sttEndsSentence(previous)
-		if !hasText || !(startsWithSpace(tokens[index].Text) || endsWithSpace(previous) || endsSentence) {
+		if !hasText || !breaks[at] || !(startsWithSpace(tokens[index].Text) || endsWithSpace(previous) || endsSentence) {
 			continue
 		}
 		word = index
@@ -930,38 +938,87 @@ func sttCutPoint(tokens []sttToken) int {
 	if word > 0 {
 		return word
 	}
-	return sttCharacterCut(tokens)
+	return sttCharacterCut(tokens, breaks)
 }
 
 // sttCharacterCut is the cut for finalized text with no word or sentence
-// boundary: the last boundary between finalized tokens within the first
-// sttCutCharacters characters. A token boundary is a character boundary; one
-// that would part a combining sequence is skipped (sttJoined).
-func sttCharacterCut(tokens []sttToken) int {
-	cut, offset, hasText := 0, 0, false
+// boundary: the last boundary between finalized tokens, within the first
+// sttCutCharacters characters, that is also a character boundary. breaks are
+// the tokens' text's sttGraphemeBreaks.
+func sttCharacterCut(tokens []sttToken, breaks []bool) int {
+	cut, offset, at, hasText := 0, 0, 0, false
 	for index := 1; index < len(tokens); index++ {
 		previous := tokens[index-1].Text
 		offset += utf8.RuneCountInString(previous)
+		at += len(previous)
 		if offset > sttCutCharacters {
 			break
 		}
 		hasText = hasText || strings.TrimSpace(previous) != ""
-		if hasText && !sttJoined(previous, tokens[index].Text) {
+		if hasText && breaks[at] {
 			cut = index
 		}
 	}
 	return cut
 }
 
-// sttJoined reports whether next continues the character previous ends:
-// next starts with a combining mark, a zero-width joiner, a variation
-// selector or an emoji skin-tone modifier, or previous ends with a joiner.
-func sttJoined(previous, next string) bool {
-	last, _ := utf8.DecodeLastRuneInString(previous)
-	first, _ := utf8.DecodeRuneInString(next)
-	return last == '\u200d' || first == '\u200d' ||
-		unicode.Is(unicode.M, first) || unicode.Is(unicode.Variation_Selector, first) ||
-		first >= 0x1F3FB && first <= 0x1F3FF
+// sttGraphemeBreaks marks the byte offsets of text where one user-perceived
+// character ends and the next begins, so breaks has len(text)+1 entries and
+// both ends are breaks. These are Unicode's extended grapheme cluster
+// boundaries (UAX #29) as uniseg finds them, with its Unicode 15.0 tables,
+// less the boundaries inside an Indic conjunct (sttInsideConjunct), a rule
+// newer than those tables.
+func sttGraphemeBreaks(text string) []bool {
+	breaks := make([]bool, len(text)+1)
+	breaks[0] = true
+	rest, offset, state := text, 0, -1
+	for rest != "" {
+		var cluster string
+		cluster, rest, _, state = uniseg.FirstGraphemeClusterInString(rest, state)
+		offset += len(cluster)
+		breaks[offset] = true
+	}
+	for offset := 1; offset < len(text); offset++ {
+		if breaks[offset] && sttInsideConjunct(text, offset) {
+			breaks[offset] = false
+		}
+	}
+	return breaks
+}
+
+// sttConjunctLinkers are the viramas that join two consonants into one
+// conjunct (Unicode 15.1 Indic_Conjunct_Break=Linker): Devanagari, Bengali,
+// Gujarati, Oriya, Telugu and Malayalam.
+const sttConjunctLinkers = "\u094d\u09cd\u0acd\u0b4d\u0c4d\u0d4d"
+
+// sttInsideConjunct reports whether offset falls inside an Indic conjunct,
+// such as क्ष: a consonant at offset, and before it a consonant followed by
+// a linker, with only combining marks and joiners around the linker
+// (UAX #29 rule GB9c). Every letter of the six scripts counts as a
+// consonant; a vowel letter after a virama is rare, and keeping it joined
+// only moves a cut one character back.
+func sttInsideConjunct(text string, offset int) bool {
+	next, _ := utf8.DecodeRuneInString(text[offset:])
+	if !sttConjunctLetter(next) {
+		return false
+	}
+	linked := false
+	for before := text[:offset]; before != ""; {
+		previous, size := utf8.DecodeLastRuneInString(before)
+		before = before[:len(before)-size]
+		switch {
+		case strings.ContainsRune(sttConjunctLinkers, previous):
+			linked = true
+		case previous == '\u200d' || unicode.In(previous, unicode.Mn, unicode.Me):
+		default:
+			return linked && sttConjunctLetter(previous)
+		}
+	}
+	return false
+}
+
+func sttConjunctLetter(r rune) bool {
+	return unicode.IsLetter(r) && unicode.In(r, unicode.Devanagari, unicode.Bengali, unicode.Gujarati, unicode.Oriya, unicode.Telugu, unicode.Malayalam)
 }
 
 func sttEndsSentence(text string) bool {

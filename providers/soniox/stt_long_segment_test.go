@@ -7,8 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
@@ -288,35 +286,45 @@ func TestSTTDiarizedTranslatingLongStretchIsNotCut(t *testing.T) {
 
 // unspacedPieces is a script written without spaces or punctuation, the way
 // Chinese and Japanese are: no word or sentence boundary anywhere. Some
-// pieces start or end a combining sequence ("e" + U+0301, an emoji joined by
-// U+200D, a heart with variation selector U+FE0F) that no cut may part.
+// pieces start or end a character made of several code points ("e" +
+// U+0301, an emoji joined by U+200D, a heart with variation selector U+FE0F)
+// that no cut may part.
 var unspacedPieces = []string{"今天", "我们", "去了", "市场", "e", "́", "👩", "‍", "💻", "明天", "还要", "❤", "️", "继续", "旅行"}
 
 // longUnspacedStretch is a diarized talk in unspacedPieces with no endpoint,
-// msPerPiece a piece, the speaker changing every 100 pieces. Each frame
-// finalizes perFrame pieces and shows the next one as provisional tail. It
+// msPerPiece a piece, perFrame pieces finalized a frame (pieceStretch). It
 // returns the frames and the whole text as the finals should spell it.
 func longUnspacedStretch(pieces, perFrame int, msPerPiece int64) ([]map[string]any, string) {
+	list := make([]string, pieces)
+	for index := range list {
+		list[index] = unspacedPieces[index%len(unspacedPieces)]
+	}
+	return pieceStretch(list, perFrame, msPerPiece), strings.Join(list, "")
+}
+
+// pieceStretch is a diarized talk of the given pieces with no endpoint,
+// msPerPiece a piece, the speaker changing every 100 pieces. Each frame
+// finalizes perFrame pieces and shows the next one as provisional tail; the
+// last frame ends the segment.
+func pieceStretch(pieces []string, perFrame int, msPerPiece int64) []map[string]any {
 	piece := func(index int, final bool) map[string]any {
 		start := int64(index) * msPerPiece
-		return sonioxToken(unspacedPieces[index%len(unspacedPieces)], start, start+msPerPiece, 1, final, strconv.Itoa(index/100%2+1))
+		return sonioxToken(pieces[index], start, start+msPerPiece, 1, final, strconv.Itoa(index/100%2+1))
 	}
 	var frames []map[string]any
-	var text strings.Builder
-	for first := 0; first < pieces; first += perFrame {
+	for first := 0; first < len(pieces); first += perFrame {
 		var tokens []map[string]any
-		for index := first; index < min(first+perFrame, pieces); index++ {
+		for index := first; index < min(first+perFrame, len(pieces)); index++ {
 			tokens = append(tokens, piece(index, true))
-			text.WriteString(unspacedPieces[index%len(unspacedPieces)])
 		}
-		if next := first + perFrame; next < pieces {
+		if next := first + perFrame; next < len(pieces) {
 			tokens = append(tokens, piece(next, false))
 		} else {
-			tokens = append(tokens, sonioxEnd(int64(pieces)*msPerPiece+20))
+			tokens = append(tokens, sonioxEnd(int64(len(pieces))*msPerPiece+20))
 		}
 		frames = append(frames, sonioxFrame(tokens...))
 	}
-	return frames, text.String()
+	return frames
 }
 
 // With no word or sentence boundary in sight, the stretch is still cut and
@@ -346,7 +354,7 @@ func TestSTTDiarizedUnspacedStretchStaysLinear(t *testing.T) {
 }
 
 // Cutting text with no boundary keeps every character in exactly one final,
-// in order, and never parts a combining sequence, whether the 2,000
+// in order, and never parts a character, whether the 2,000
 // characters or the 20 s bound passes first.
 func TestSTTDiarizedUnspacedStretchKeepsEveryCharacterOnce(t *testing.T) {
 	t.Parallel()
@@ -362,24 +370,8 @@ func TestSTTDiarizedUnspacedStretchKeepsEveryCharacterOnce(t *testing.T) {
 			t.Parallel()
 			frames, spelled := longUnspacedStretch(3000, 1, testCase.msPerPiece)
 			_, events := runSTTScriptUntil(t, diarizedRequest, frames, untilSpeechEnded)
-			var finals []string
-			for _, event := range events {
-				if event.Type != protocol.EventTranscriptFinal {
-					continue
-				}
-				text := decodeTranslated(t, event.Data).Text
-				first, _ := utf8.DecodeRuneInString(text)
-				last, _ := utf8.DecodeLastRuneInString(text)
-				if unicode.Is(unicode.M, first) || unicode.Is(unicode.Variation_Selector, first) || first == '‍' || last == '‍' {
-					t.Fatalf("final %d parts a combining sequence: %+q ... %+q", len(finals), first, last)
-				}
-				finals = append(finals, text)
-			}
-			if len(finals) < 3 {
-				t.Fatalf("%d finals, want the stretch cut several times", len(finals))
-			}
-			if got := strings.Join(finals, ""); got != spelled {
-				t.Fatalf("finals spell %d characters, want the %d said, each once, in order", utf8.RuneCountInString(got), utf8.RuneCountInString(spelled))
+			if finals := checkFinalsCover(t, events, spelled); finals < 3 {
+				t.Fatalf("%d finals, want the stretch cut several times", finals)
 			}
 		})
 	}
@@ -387,7 +379,7 @@ func TestSTTDiarizedUnspacedStretchKeepsEveryCharacterOnce(t *testing.T) {
 
 // Where no word or sentence boundary exists, the cut falls at the last
 // boundary between finalized tokens within the first 2,000 characters that
-// does not part a combining sequence, and never after the last finalized
+// does not part a character, and never after the last finalized
 // token.
 func TestSTTCutPointWithoutBoundary(t *testing.T) {
 	t.Parallel()

@@ -228,12 +228,16 @@ The prefix ends after the last finalized piece that ends a sentence in the
 last quarter of the finalized text, or else at the last word boundary between
 finalized pieces, so it never ends inside a word. Text with neither, such as
 Chinese or Japanese written without spaces, is cut at the last boundary
-between finalized pieces within the first 2,000 characters, skipping any that
-would part a combining sequence (a letter and its combining marks, emoji
-joined by U+200D, a variation selector or a skin-tone modifier). The prefix
-never ends after the last finalized piece, which the next piece may continue.
-Later deltas carry only the rest, with run offsets into their own text, and
-every word and character reaches exactly one final, in order.
+between finalized pieces within the first 2,000 characters. Whichever rule
+picks it, a boundary inside a user-perceived character is skipped for the
+previous one that is a character boundary: Unicode's extended grapheme
+clusters (UAX #29, Unicode 15.0 tables) plus the Indic conjunct rule of
+Unicode 15.1, so Thai กำ, Devanagari क्ष, emoji joined by U+200D, a letter
+with its combining marks, and a character with its variation selector each
+stay in one final. The prefix never ends after the last finalized piece, which
+the next piece may continue. Later deltas carry only the rest, with run
+offsets into their own text, and every word and character reaches exactly one
+final, in order.
 
 A session without diarization is never cut, and neither is a diarized session
 that asked for Soniox's own translation: that translation trails the words and
