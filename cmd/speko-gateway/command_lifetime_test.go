@@ -23,6 +23,7 @@ func TestGatewayCLIProcess(t *testing.T) {
 	if os.Getenv("SPEKO_TEST_CLI_LIFETIME_PROCESS") != "1" {
 		return
 	}
+	trustOwnedCLIPeer(t)
 	if err := run(); err != nil {
 		t.Fatal(err)
 	}

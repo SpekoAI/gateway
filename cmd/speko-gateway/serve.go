@@ -8,12 +8,17 @@ import (
 	"time"
 
 	"github.com/SpekoAI/gateway/controlplane"
-	"github.com/SpekoAI/gateway/gateway"
 )
 
 // The command owns every background lifetime. Both signals and Serve errors
 // stop/join periodic reporting before the final report and terminal DELETE.
-func serveGateway(ctx context.Context, server *gateway.Server, listener net.Listener, reporter *instanceReporter, heartbeat func() controlplane.InstanceHeartbeat, interval time.Duration, warm func(context.Context)) error {
+type gatewayProcess interface {
+	Serve(net.Listener) error
+	BeginDrain()
+	Drain(context.Context) error
+}
+
+func serveGateway(ctx context.Context, server gatewayProcess, listener net.Listener, reporter *instanceReporter, heartbeat func() controlplane.InstanceHeartbeat, interval time.Duration, warm func(context.Context)) error {
 	background, cancel := context.WithCancel(ctx)
 	defer cancel()
 	serveErrors, serveDone := make(chan error, 1), make(chan struct{})

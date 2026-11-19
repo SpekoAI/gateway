@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -118,7 +119,7 @@ func TestTTSAdapterSendsDocumentedSetupAndStreamsAudioBeforeDone(t *testing.T) {
 	})
 	defer server.Close()
 
-	adapter, err := NewTTS(ttsConfig(server.URL))
+	adapter, err := NewTTS(ttsConfig(server))
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}
@@ -126,6 +127,7 @@ func TestTTSAdapterSendsDocumentedSetupAndStreamsAudioBeforeDone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
+	defer func() { _ = stream.(*ttsStream).conn.Close(websocket.StatusNormalClosure, "") }()
 	events := stream.Events()
 
 	if err := stream.AppendText(context.Background(), "Hello, world."); err != nil {
@@ -218,7 +220,7 @@ func TestTTSAdapterFallsBackToPlanVoice(t *testing.T) {
 	})
 	defer server.Close()
 
-	adapter, err := NewTTS(ttsConfig(server.URL))
+	adapter, err := NewTTS(ttsConfig(server))
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}
@@ -259,7 +261,7 @@ func TestTTSAdapterMapsSampleRateOntoOutputFormat(t *testing.T) {
 	})
 	defer server.Close()
 
-	adapter, err := NewTTS(ttsConfig(server.URL))
+	adapter, err := NewTTS(ttsConfig(server))
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}
@@ -318,7 +320,7 @@ func TestTTSAdapterClassifiesErrorFrames(t *testing.T) {
 			})
 			defer server.Close()
 
-			adapter, err := NewTTS(ttsConfig(server.URL))
+			adapter, err := NewTTS(ttsConfig(server))
 			if err != nil {
 				t.Fatalf("new adapter: %v", err)
 			}
@@ -362,13 +364,12 @@ func TestTTSAdapterClassifiesHandshakeFailures(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			server := newSocketServer(t, "/never-upgraded", func(context.Context, *http.Request, *websocket.Conn) {})
-			server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(testCase.status)
-			})
+			}))
 			defer server.Close()
 
-			adapter, err := NewTTS(ttsConfig(server.URL))
+			adapter, err := NewTTS(ttsConfig(server))
 			if err != nil {
 				t.Fatalf("new adapter: %v", err)
 			}
@@ -457,7 +458,7 @@ func TestTTSAdapterRejectsAudioOperations(t *testing.T) {
 	})
 	defer server.Close()
 
-	adapter, err := NewTTS(ttsConfig(server.URL))
+	adapter, err := NewTTS(ttsConfig(server))
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}

@@ -714,7 +714,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         if self._wait_for_turn_commit and self._turn_text and (self._turn_commit is None or self._turn_commit.done()):
             self._turn_commit = asyncio.get_running_loop().create_future()
         self._pending_transcript = False
-        batch = NativeFinalBatch(self, self._canonical_turn, tuple(event.text for event in self._finals)) if self._wait_for_turn_commit else None
+        batch = NativeFinalBatch(self, self._canonical_turn, tuple(event.text for event in self._finals)) if self._wait_for_turn_commit and self._finals else None
         for index, event in enumerate(self._finals):
             capture_end = (self._processed_samples if speech_end is None else speech_end) if len(self._finals) == 1 else None
             self._emit(event, stt.SpeechEventType.FINAL_TRANSCRIPT, batch, index, capture_end)

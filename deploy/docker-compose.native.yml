@@ -1,0 +1,23 @@
+services:
+  gateway:
+    image: ${SPEKO_GATEWAY_IMAGE:?set a reviewed image digest or a local build}
+    command: ["native"]
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      SPEKO_LOCAL_AUTH_TOKEN: ${SPEKO_LOCAL_AUTH_TOKEN:?set socket authorization}
+      SPEKO_RELAY_URL: ${SPEKO_RELAY_URL:?set the configured HTTPS relay origin}
+      SPEKO_SOCKET_PATH: /run/speko/runtime.sock
+      SPEKO_MAX_SESSIONS: ${SPEKO_MAX_SESSIONS:-100}
+      SPEKO_NATIVE_MAX_REQUEST_BYTES: ${SPEKO_NATIVE_MAX_REQUEST_BYTES:-134217728}
+      SPEKO_NATIVE_SETUP_TIMEOUT: ${SPEKO_NATIVE_SETUP_TIMEOUT:-30s}
+      SPEKO_NATIVE_WRITE_TIMEOUT: ${SPEKO_NATIVE_WRITE_TIMEOUT:-15s}
+    volumes:
+      - speko-runtime:/run/speko
+    stop_grace_period: 35s
+    restart: unless-stopped
+
+volumes:
+  speko-runtime:
