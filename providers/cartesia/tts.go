@@ -177,7 +177,13 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		if shortLived && refresh != nil {
 			current, err := refresh(ctx)
 			if err != nil || !acceptableCredentialKind(route, current.Kind) || strings.TrimSpace(current.Value) == "" || (!current.ExpiresAt.IsZero() && !a.now().Before(current.ExpiresAt)) {
-				return nil, "", &runtimepkg.ProviderError{Code: "provider_unavailable", Message: "Cartesia credential could not be renewed for a new connection", Retryable: true, Cause: err}
+				return nil, "", &runtimepkg.ProviderError{
+					Code:      "provider_unavailable",
+					Message:   "Cartesia credential could not be renewed for a new connection",
+					Hint:      "The provider credential could not be renewed to reconnect; retry the utterance on a new session.",
+					Retryable: true,
+					Cause:     err,
+				}
 			}
 			token = current.Value
 		}

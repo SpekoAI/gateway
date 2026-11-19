@@ -524,16 +524,37 @@ func TestAdapterRedialsAManagedRouteWithACurrentToken(t *testing.T) {
 
 	// A refresher that fails makes the fragment fail retryably, before any
 	// handshake with a stale token.
-	request.RefreshCredential = func(context.Context) (protocol.DelegatedCredential, error) {
+	var handshakes atomic.Int32
+	idle := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handshakes.Add(1)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "idle")
+	}))
+	defer idle.Close()
+	idleAdapter, err := New(testConfig(idle.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failingRequest := adapterRequest(idle.URL)
+	failingRequest.Plan.Execution.CredentialSource = protocol.CredentialsManaged
+	failingRequest.Plan.Route.Credential.Value = "token-1"
+	failingRequest.RefreshCredential = func(context.Context) (protocol.DelegatedCredential, error) {
 		return protocol.DelegatedCredential{}, errors.New("control plane unavailable")
 	}
-	failing, err := adapter.Open(context.Background(), request)
-	if err == nil {
-		defer func() { _ = failing.Close(context.Background()) }()
-		waitForDisconnect(t, failing)
-		var failure *runtimepkg.ProviderError
-		if err := failing.AppendText(context.Background(), "Hello."); !errors.As(err, &failure) || !failure.Retryable {
-			t.Errorf("append with a failing refresher = %v; want a retryable provider error", err)
-		}
+	failing, err := idleAdapter.Open(context.Background(), failingRequest)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = failing.Close(context.Background()) }()
+	waitForDisconnect(t, failing)
+	var failure *runtimepkg.ProviderError
+	if err := failing.AppendText(context.Background(), "Hello."); !errors.As(err, &failure) || !failure.Retryable || failure.Hint == "" {
+		t.Errorf("append with a failing refresher = %v; want a retryable provider error with a hint", err)
+	}
+	if got := handshakes.Load(); got != 1 {
+		t.Errorf("handshakes = %d; want only the first, none with a stale token", got)
 	}
 }
