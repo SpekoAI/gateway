@@ -1,6 +1,11 @@
 package deepgram
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
@@ -69,5 +74,52 @@ func TestMIPOptOutIsNotABilledFeature(t *testing.T) {
 		if _, features := billingDimensions(map[string][]string{"model": {"nova-3"}, "mip_opt_out": {"true"}}, base); len(features) != 0 {
 			t.Errorf("%s: mip_opt_out reported as add-on features %v", name, features)
 		}
+	}
+}
+
+func callerOptOutFalse() *protocol.SttOptions {
+	return &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"deepgram": {"mip_opt_out": false}}}
+}
+
+// A caller's provider options are merged into the query. On a Speko-paid key
+// the opt-out must still win; on a customer's key the caller's value stands.
+func TestCallerOptionsCannotTurnOffTheManagedOptOut(t *testing.T) {
+	t.Parallel()
+	policy, err := upstream.NewWebSocketPolicy(officialAPIHost, nil, false)
+	if err != nil {
+		t.Fatalf("policy: %v", err)
+	}
+	for _, test := range []struct {
+		optOut bool
+		want   string
+	}{{true, "true"}, {false, "false"}} {
+		listen, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3", optionsWith(callerOptOutFalse()), *media(), runtimepkg.AudioDeliveryLive, "", test.optOut)
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		if got := queryOf(t, listen).Get("mip_opt_out"); got != test.want {
+			t.Errorf("streaming optOut=%v: mip_opt_out=%q, want %q", test.optOut, got, test.want)
+		}
+	}
+
+	observed := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		observed <- r.URL.Query().Get("mip_opt_out")
+		_, _ = w.Write([]byte(`{"metadata":{"request_id":"req-1","duration":1},"results":{"channels":[{"alternatives":[{"transcript":"hi"}]}]}}`))
+	}))
+	defer server.Close()
+	audio := "RIFF....WAVEfmt data...."
+	if _, err := newBatchTestAdapter(t, server).Transcribe(context.Background(), runtimepkg.BatchTranscribeRequest{
+		Plan:       batchPlan(server.URL+"/v1/listen", "nova-3"),
+		Options:    protocol.RequestOptions{Language: "en", STT: callerOptOutFalse()},
+		Media:      protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 8000, Channels: 1},
+		Audio:      strings.NewReader(audio),
+		AudioBytes: int64(len(audio)),
+	}); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if got := <-observed; got != "true" {
+		t.Errorf("batch on a managed plan: mip_opt_out=%q, want true", got)
 	}
 }

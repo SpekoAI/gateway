@@ -116,13 +116,16 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		}
 	}
 	if spekoPaidKey(request.Plan.Execution) {
-		query.Set(mipOptOutParam, "true")
 		if reservation := strings.TrimSpace(request.Plan.Reservation.ID); reservation != "" {
 			query.Set("extra", "speko_reservation:"+reservation)
 		}
 	}
 	for _, key := range request.Options.STT.ProviderKeys("deepgram") {
 		query.Set(key, protocol.SttOptionString(request.Options.STT.Provider("deepgram")[key]))
+	}
+	// After the caller's options, so a caller value cannot turn it off.
+	if spekoPaidKey(request.Plan.Execution) {
+		query.Set(mipOptOutParam, "true")
 	}
 	endpoint.RawQuery = query.Encode()
 

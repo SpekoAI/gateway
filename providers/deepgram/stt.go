@@ -225,9 +225,6 @@ func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	query.Set("model", model)
 	query.Set("encoding", encoding)
 	query.Set("sample_rate", strconv.Itoa(media.SampleRateHz))
-	if mipOptOut {
-		query.Set(mipOptOutParam, "true")
-	}
 	if flux {
 		// Flux owns turn detection, so the v1 endpointing/interim controls are not
 		// valid here. Its multilingual model accepts repeatable language_hint;
@@ -279,6 +276,10 @@ func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	// validation and can never appear.
 	for _, key := range options.STT.ProviderKeys("deepgram") {
 		query.Set(key, protocol.SttOptionString(options.STT.Provider("deepgram")[key]))
+	}
+	// After the caller's options, so a caller value cannot turn it off.
+	if mipOptOut {
+		query.Set(mipOptOutParam, "true")
 	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil
