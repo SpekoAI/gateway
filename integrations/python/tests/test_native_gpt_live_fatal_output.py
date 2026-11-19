@@ -119,7 +119,11 @@ async def test_buffered_output_after_fatal_cannot_start_an_sdk_generation(
             await asyncio.wait_for(closed.wait(), 5)
             release_audio.set()
             await asyncio.wait_for(speech.wait_for_playout(), 5)
-            await asyncio.wait_for(asyncio.shield(native._inner._segment_atask), 5)
+            segmenter = native._inner._segment_atask
+            await asyncio.wait_for(asyncio.gather(segmenter, return_exceptions=True), 5)
+            assert segmenter.done()
+            if not segmenter.cancelled():
+                assert segmenter.exception() is None
             assert speech.exception() is not None
             assert native.duplex_session._failure is not None
             if failure_at == "ingress":
