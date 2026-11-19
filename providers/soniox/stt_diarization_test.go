@@ -151,7 +151,9 @@ func TestSTTDiarizationOptionRidesTheStartFrameOnlyWhenAsked(t *testing.T) {
 
 // speakerView renders a diarized transcript event as
 // "text | speaker | word@speaker[start-end] ...", "-" marking an absent field,
-// so a whole attribution reads on one line.
+// so a whole attribution reads on one line. Speaker runs render the same way,
+// as "<run text>@speaker[start-end]" with the text cut out of the event's text
+// at the run's character offsets.
 func speakerView(t *testing.T, data json.RawMessage) string {
 	t.Helper()
 	var decoded struct {
@@ -163,6 +165,13 @@ func speakerView(t *testing.T, data json.RawMessage) string {
 			EndMS   *int64  `json:"end_ms"`
 			Speaker *string `json:"speaker"`
 		} `json:"words"`
+		Runs []struct {
+			TextStart int     `json:"text_start"`
+			TextEnd   int     `json:"text_end"`
+			StartMS   *int64  `json:"start_ms"`
+			EndMS     *int64  `json:"end_ms"`
+			Speaker   *string `json:"speaker"`
+		} `json:"speaker_runs"`
 	}
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("decode transcript: %v", err)
@@ -182,6 +191,13 @@ func speakerView(t *testing.T, data json.RawMessage) string {
 	parts := []string{decoded.Text, optional(decoded.Speaker)}
 	for _, word := range decoded.Words {
 		parts = append(parts, word.Text+"@"+optional(word.Speaker)+"["+number(word.StartMS)+"-"+number(word.EndMS)+"]")
+	}
+	characters := []rune(decoded.Text)
+	for _, run := range decoded.Runs {
+		if run.TextStart < 0 || run.TextEnd > len(characters) || run.TextStart > run.TextEnd {
+			t.Fatalf("run offsets [%d,%d) outside %q", run.TextStart, run.TextEnd, decoded.Text)
+		}
+		parts = append(parts, "<"+string(characters[run.TextStart:run.TextEnd])+">@"+optional(run.Speaker)+"["+number(run.StartMS)+"-"+number(run.EndMS)+"]")
 	}
 	return strings.Join(parts, " | ")
 }
@@ -230,7 +246,8 @@ func TestSTTDiarizedFinalsCarryTheSpeakerOfEachWord(t *testing.T) {
 // Soniox labels non-final tokens too, so a delta attributes the hypothesis
 // as soon as it is heard. The speaker changes inside the non-final tail of
 // the first frame; in the second, the first speaker's words are final and
-// the second speaker's are still provisional, and the delta covers both.
+// the second speaker's are still provisional, and the delta covers both. A
+// delta carries one entry per speaker run, not per word.
 func TestSTTDiarizedDeltaAttributesASpeakerChangeInsideTheHypothesis(t *testing.T) {
 	t.Parallel()
 
@@ -256,9 +273,9 @@ func TestSTTDiarizedDeltaAttributesASpeakerChangeInsideTheHypothesis(t *testing.
 	}, 3)
 
 	for index, want := range []string{
-		"Hello there. Hi | - | Hello@1[100-300] | there.@1[300-560] | Hi@2[900-1000]",
-		"Hello there. Hi! How | - | Hello@1[100-300] | there.@1[300-560] | Hi!@2[900-1040] | How@2[1100-1200]",
-		"Hello there. Hi! | - | Hello@1[100-300] | there.@1[300-560] | Hi!@2[900-1040]",
+		"Hello there. Hi | - | <Hello there.>@1[100-560] | <Hi>@2[900-1000]",
+		"Hello there. Hi! How | - | <Hello there.>@1[100-560] | <Hi! How>@2[900-1200]",
+		"Hello there. Hi! | - | <Hello there.>@1[100-560] | <Hi!>@2[900-1040]",
 	} {
 		if events[index].Type != protocol.EventTranscriptDelta {
 			t.Fatalf("event %d type = %s", index, events[index].Type)
@@ -283,5 +300,127 @@ func TestSTTDiarizedUnlabelledWordKeepsTheEventUnattributed(t *testing.T) {
 	}, 1)
 	if got, want := speakerView(t, events[0].Data), "Yes um | - | Yes@1[100-300] | um@-[300-400]"; got != want {
 		t.Fatalf("final:\n got %s\nwant %s", got, want)
+	}
+}
+
+// A word, and a run, is bounded by its own first and last pieces. When those
+// pieces carry no time, the bound is unknown and stays absent, rather than
+// borrowing an inner piece's time and looking fully timed.
+func TestSTTDiarizedBoundsComeOnlyFromTheOuterPieces(t *testing.T) {
+	t.Parallel()
+
+	pieces := func(final bool) []map[string]any {
+		return []map[string]any{
+			{"text": "这", "end_ms": 320, "is_final": final, "speaker": "1"},
+			{"text": "很好", "start_ms": 320, "end_ms": 360, "is_final": final, "speaker": "1"},
+			{"text": "。", "start_ms": 360, "is_final": final, "speaker": "1"},
+		}
+	}
+	_, events := runSTTScript(t, diarizedRequest, []map[string]any{
+		sonioxFrame(pieces(false)...),
+		sonioxFrame(append(pieces(true), sonioxEnd(400))...),
+	}, 2)
+	if got, want := speakerView(t, events[0].Data), "这很好。 | 1 | <这很好。>@1[---]"; got != want {
+		t.Errorf("delta:\n got %s\nwant %s", got, want)
+	}
+	if got, want := speakerView(t, events[1].Data), "这很好。 | 1 | 这很好。@1[---]"; got != want {
+		t.Errorf("final:\n got %s\nwant %s", got, want)
+	}
+}
+
+// Without an endpoint the hypothesis grows for as long as people talk, and
+// every delta repeats it. Labels must add a bounded share to that, not a
+// per-word list: 800 words, one new word per update, speakers alternating
+// every 100 words, stay within 1.5 times the bytes of the same stream
+// without labels.
+func TestSTTDiarizedDeltasStayProportionalWithoutAnEndpoint(t *testing.T) {
+	t.Parallel()
+
+	const words = 800
+	frames := func(labelled bool) []map[string]any {
+		speaker := func(index int) string {
+			if !labelled {
+				return ""
+			}
+			return strconv.Itoa(index/100%2 + 1)
+		}
+		script := make([]map[string]any, 0, words)
+		for index := range words {
+			start := int64(index * 300)
+			tokens := []map[string]any{sonioxToken(" word"+strconv.Itoa(index%50), start, start+250, 1, false, speaker(index))}
+			if index > 0 {
+				previous := int64((index - 1) * 300)
+				tokens = append([]map[string]any{sonioxToken(" word"+strconv.Itoa((index-1)%50), previous, previous+250, 1, true, speaker(index-1))}, tokens...)
+			}
+			script = append(script, sonioxFrame(tokens...))
+		}
+		return script
+	}
+	total := func(request func(string) runtimepkg.AdapterRequest, labelled bool) (int, runtimepkg.ProviderEvent) {
+		_, events := runSTTScript(t, request, frames(labelled), words)
+		sum := 0
+		for _, event := range events {
+			if event.Type != protocol.EventTranscriptDelta {
+				t.Fatalf("event type = %s", event.Type)
+			}
+			sum += len(event.Data)
+		}
+		return sum, events[len(events)-1]
+	}
+	plain, _ := total(sttAdapterRequest, false)
+	labelled, last := total(diarizedRequest, true)
+	t.Logf("labelled deltas %d bytes, unlabelled %d, ratio %.2f", labelled, plain, float64(labelled)/float64(plain))
+	if float64(labelled) > 1.5*float64(plain) {
+		t.Fatalf("labelled deltas total %d bytes, %.2f times the %d unlabelled", labelled, float64(labelled)/float64(plain), plain)
+	}
+	if runs := strings.Count(speakerView(t, last.Data), "<"); runs != 8 {
+		t.Fatalf("last delta has %d speaker runs, want 8: %s", runs, last.Data)
+	}
+}
+
+// Every word reaches exactly one final, in order, whatever deltas showed it
+// before: words first heard as provisional tail, segments closed by the
+// endpointer, and a speaker change inside a segment.
+func TestSTTDiarizedEveryWordLandsInExactlyOneFinal(t *testing.T) {
+	t.Parallel()
+
+	var script []map[string]any
+	var spoken []string
+	for index := range 30 {
+		word := "w" + strconv.Itoa(index)
+		spoken = append(spoken, word)
+		start := int64(index * 300)
+		speaker := strconv.Itoa(index/7%2 + 1)
+		script = append(script, sonioxFrame(sonioxToken(" "+word, start, start+250, 1, false, speaker)))
+		frame := sonioxFrame(sonioxToken(" "+word, start, start+250, 1, true, speaker))
+		if index%10 == 9 {
+			frame = sonioxFrame(sonioxToken(" "+word, start, start+250, 1, true, speaker), sonioxEnd(start+280))
+		}
+		script = append(script, frame)
+	}
+	// 30 tail deltas, 27 deltas re-sending the segment after a word is
+	// final (none after the 3 frames carrying <end>), 3 finals, 3
+	// speech.ended.
+	_, events := runSTTScript(t, diarizedRequest, script, 63)
+
+	var finals []string
+	for _, event := range events {
+		if event.Type != protocol.EventTranscriptFinal {
+			continue
+		}
+		var final struct {
+			Words []struct {
+				Text string `json:"text"`
+			} `json:"words"`
+		}
+		if err := json.Unmarshal(event.Data, &final); err != nil {
+			t.Fatal(err)
+		}
+		for _, word := range final.Words {
+			finals = append(finals, word.Text)
+		}
+	}
+	if got, want := strings.Join(finals, " "), strings.Join(spoken, " "); got != want {
+		t.Fatalf("final words:\n got %s\nwant %s", got, want)
 	}
 }

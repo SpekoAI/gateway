@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
@@ -744,6 +745,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			s.segment.appendFinal(token)
 			if s.diarize {
 				s.segment.spoken = append(s.segment.spoken, token)
+				s.segment.runs.add(token)
 			}
 			continue
 		}
@@ -770,9 +772,10 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	}
 	data := sttTranscriptFields(interim, interimTranslation, "", false, s.segment.startMS, endMS, nil, s.requestID)
 	if s.diarize {
-		// The hypothesis is the segment's finals so far plus the tail, so
-		// its labels are too; a word piece split across the two joins up.
-		sttSetSpeakers(data, append(slices.Clone(s.segment.spoken), tailSpoken...))
+		// The hypothesis is the segment's finals so far plus the tail. The
+		// finals' runs were built as they arrived; only the tail, which
+		// Soniox re-sends whole on every frame, is added here.
+		sttSetSpeakerRuns(data, s.segment.runs.with(tailSpoken))
 	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptDelta,
@@ -829,9 +832,11 @@ type sttSegment struct {
 	// languages counts tokens per identified language; only a session with
 	// language identification on gets any.
 	languages map[string]int
-	// spoken is the segment's final tokens, kept only on a diarized session
-	// for their speaker labels.
+	// spoken is the segment's final tokens and runs their speaker runs, both
+	// kept only on a diarized session: the final reports each word's
+	// speaker, a delta each run's.
 	spoken []sttToken
+	runs   sttRuns
 }
 
 func (a *sttSegment) appendFinal(token sttToken) {
@@ -916,10 +921,10 @@ func sttTranscriptFields(text, translation, language string, isFinal bool, start
 	return data
 }
 
-// sttSetSpeakers adds a diarized session's labels to a transcript event, in
-// the shape ElevenLabs Scribe v3 Live finals already use (docs/PROTOCOL.md):
-// words, each with the vendor's speaker label verbatim and its span, and a
-// top-level speaker when one speaker said every word. A word Soniox left unlabelled could be anyone's,
+// sttSetSpeakers adds a diarized session's labels to a final, in the shape
+// ElevenLabs Scribe v3 Live finals already use (docs/PROTOCOL.md): words, each
+// with the vendor's speaker label verbatim and its span, and a top-level
+// speaker when one speaker said every word. A word Soniox left unlabelled could be anyone's,
 // so it has no speaker and the event then names no one. Nothing is added
 // when the tokens hold no words.
 func sttSetSpeakers(data map[string]any, tokens []sttToken) {
@@ -963,7 +968,9 @@ type sttSpeakerWord struct {
 // whitespace, follows a piece that ended with whitespace, or has a different
 // speaker than the word so far; any other piece continues the word
 // ("fan" "tastic", "you" "?"). Word text is cut from the pieces in order, so
-// the words of an event appear in its text in the same order.
+// the words of an event appear in its text in the same order. A word's span
+// runs from its first piece's start to its last piece's end, either absent
+// when that piece carries no time.
 func sttSpeakerWords(tokens []sttToken) []sttSpeakerWord {
 	var words []sttSpeakerWord
 	continues := false
@@ -978,15 +985,93 @@ func sttSpeakerWords(tokens []sttToken) []sttSpeakerWord {
 			last++
 		}
 		words[last].text += strings.TrimSpace(token.Text)
-		if words[last].startMS == nil {
-			words[last].startMS = token.StartMS
-		}
-		if token.EndMS != nil {
-			words[last].endMS = token.EndMS
-		}
+		// A word ends where its last piece ends; a last piece with no time
+		// leaves the end unknown rather than borrowing an inner piece's.
+		words[last].endMS = token.EndMS
 		continues = !endsWithSpace(token.Text)
 	}
 	return words
+}
+
+// sttRun is one speaker's stretch of a diarized hypothesis: the vendor's
+// label, the span from its first piece's start to its last piece's end (each
+// absent when that piece has no time), and where it sits in the text, in
+// characters (Unicode code points) from the start of the untrimmed segment,
+// from its first non-space character to just past its last.
+type sttRun struct {
+	speaker        string
+	startMS, endMS *int64
+	from, to       int
+}
+
+// sttRuns builds a segment's speaker runs one piece at a time, so a delta
+// costs one entry per run however long the segment grows. A new run starts
+// wherever the label changes, inside a word too: labels are the vendor's,
+// verbatim.
+type sttRuns struct {
+	runs []sttRun
+	// characters counts the code points of every piece added so far, which
+	// is where the next piece starts in the segment's text.
+	characters int
+}
+
+func (r *sttRuns) add(token sttToken) {
+	length := utf8.RuneCountInString(token.Text)
+	if content := strings.TrimSpace(token.Text); content != "" {
+		from := r.characters + length - utf8.RuneCountInString(strings.TrimLeftFunc(token.Text, unicode.IsSpace))
+		last := len(r.runs) - 1
+		if last < 0 || r.runs[last].speaker != token.Speaker {
+			r.runs = append(r.runs, sttRun{speaker: token.Speaker, startMS: token.StartMS, from: from})
+			last++
+		}
+		r.runs[last].endMS = token.EndMS
+		r.runs[last].to = from + utf8.RuneCountInString(content)
+	}
+	r.characters += length
+}
+
+// with returns the runs extended by the tail's pieces, leaving the segment's
+// own runs as they were.
+func (r sttRuns) with(tail []sttToken) sttRuns {
+	extended := sttRuns{runs: slices.Clone(r.runs), characters: r.characters}
+	for _, token := range tail {
+		extended.add(token)
+	}
+	return extended
+}
+
+// sttSetSpeakerRuns adds a diarized session's labels to a delta: speaker_runs,
+// one entry per run with the vendor's label verbatim, its span, and
+// text_start/text_end, the run's character offsets into the delta's text
+// (end exclusive). Runs carry offsets rather than their own text so labels add
+// a few bytes per run to a delta, not a second copy of the hypothesis. A
+// top-level speaker names the one speaker of a single-run delta. A run Soniox
+// left unlabelled has no speaker. Nothing is added when there are no runs.
+func sttSetSpeakerRuns(data map[string]any, runs sttRuns) {
+	if len(runs.runs) == 0 {
+		return
+	}
+	// The delta's text is trimmed, and only whitespace precedes the first
+	// run, so offsets count from the first run's first character.
+	base := runs.runs[0].from
+	entries := make([]map[string]any, len(runs.runs))
+	for index, run := range runs.runs {
+		entry := map[string]any{"text_start": run.from - base, "text_end": run.to - base}
+		if run.speaker != "" {
+			entry["speaker"] = run.speaker
+		}
+		if run.startMS != nil {
+			entry["start_ms"] = *run.startMS
+		}
+		if run.endMS != nil {
+			entry["end_ms"] = *run.endMS
+		}
+		entries[index] = entry
+	}
+	data["speaker_runs"] = entries
+	if len(runs.runs) == 1 && runs.runs[0].speaker != "" {
+		data["speaker"] = runs.runs[0].speaker
+	}
 }
 
 func startsWithSpace(text string) bool {
