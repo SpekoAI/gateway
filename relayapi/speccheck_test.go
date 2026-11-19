@@ -378,6 +378,7 @@ func wireSchemaTable() []struct {
 		{relayapi.STTOptions{}, both("STTOptions")},
 		{relayapi.STTTranslation{}, both("STTTranslation")},
 		{relayapi.TranscriptSegment{}, both("TranscriptSegment")},
+		{relayapi.TranscriptDeltaSegment{}, asyncapi("TranscriptDeltaSegment")},
 		{relayapi.TranscriptWord{}, openapi("TranscriptWord")},
 		{relayapi.TranscriptionResponse{}, openapi("TranscriptionResponse")},
 		{relayapi.AudioConfig{}, both("AudioConfig")},

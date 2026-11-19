@@ -54,6 +54,30 @@ func (s TranscriptSegment) Validate() error {
 	return nil
 }
 
+// TranscriptDeltaSegment is the part of a delta's provisional text one
+// speaker said. StartMS and EndMS come together or not at all: a hypothesis
+// can know who is speaking before it knows when they stopped, so a segment
+// carries its span only when the provider measured both ends.
+type TranscriptDeltaSegment struct {
+	Text    string `json:"text"`
+	StartMS *int64 `json:"start_ms,omitempty"`
+	EndMS   *int64 `json:"end_ms,omitempty"`
+	// Speaker is the vendor's own label, carried verbatim.
+	Speaker string `json:"speaker,omitempty"`
+}
+
+// Validate checks that the span, when present, is whole, non-negative and
+// ordered.
+func (s TranscriptDeltaSegment) Validate() error {
+	if (s.StartMS == nil) != (s.EndMS == nil) {
+		return fmt.Errorf("start_ms and end_ms must both be present or both absent")
+	}
+	if s.StartMS != nil && (*s.StartMS < 0 || *s.EndMS < *s.StartMS) {
+		return fmt.Errorf("start_ms and end_ms must form a non-negative ordered range")
+	}
+	return nil
+}
+
 // TranscriptWord is one word of the transcript with its own timing. Present
 // only when the request asked for word_timestamps and the routed model
 // advertises it; the vendor's own speaker label rides along when the request
@@ -292,11 +316,12 @@ type STTTranscriptDelta struct {
 	Translation string `json:"translation,omitempty"`
 	// Segments attributes the hypothesis to speakers before any final: Text
 	// cut wherever the speaker changes, in order, each piece with the
-	// vendor's label and its span. Present only on a session that asked for
-	// diarization, routed to a provider that labels interim words; absent
-	// otherwise, so every other delta keeps its exact bytes. The labels are
-	// provisional: a later delta or the final may relabel the same words.
-	Segments []TranscriptSegment `json:"segments,omitempty"`
+	// vendor's label and, when the provider measured both its ends, its
+	// span. Present only on a session that asked for diarization, routed to
+	// a provider that labels interim words; absent otherwise, so every other
+	// delta keeps its exact bytes. The labels are provisional: a later delta
+	// or the final may relabel the same words.
+	Segments []TranscriptDeltaSegment `json:"segments,omitempty"`
 }
 
 // Validate checks the frame tag, segments, and that the delta says
