@@ -75,9 +75,6 @@ async def test_actual_frame_queue_distinguishes_waiting_from_ambiguous_native_io
                     if index != 0 or stage == "send":
                         await ws.send_json({"type": "utterance.done", "sequence": 1})
                     if index == 0 and stage == "send":
-                        request.transport.get_extra_info("socket").setsockopt(
-                            socket.SOL_SOCKET, socket.SO_RCVBUF, 4096
-                        )
                         request.transport.pause_reading()
                         paused.set()
                         try:
