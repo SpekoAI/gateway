@@ -1,6 +1,7 @@
 package relayapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -175,16 +176,66 @@ func (c STTSessionConfigure) Validate() error {
 }
 
 // STTInputCommit marks the end of the audio the client wants finalized.
+// Every commit is answered by exactly one transcript.final, which may be
+// empty when nothing was left to finalize.
 type STTInputCommit struct {
 	Type STTControlType `json:"type"`
+	// CommitID optionally names the commit; the transcript.final that
+	// answers it carries the same id, so a client can tell its answer from
+	// a final the provider sent on its own. See ValidCommitID for the form.
+	CommitID string `json:"commit_id,omitempty"`
+	// commitIDSent records a commit_id member on the wire, so Validate can
+	// refuse "commit_id":"" instead of reading it as no id.
+	commitIDSent bool
 }
 
-// Validate checks the frame tag.
+// UnmarshalJSON notes whether the frame carried commit_id. A null
+// commit_id counts as absent, as a null member does everywhere in relayapi.
+func (c *STTInputCommit) UnmarshalJSON(data []byte) error {
+	type wire STTInputCommit
+	var decoded struct {
+		wire
+		CommitID *string `json:"commit_id"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = STTInputCommit(decoded.wire)
+	if decoded.CommitID != nil {
+		c.CommitID, c.commitIDSent = *decoded.CommitID, true
+	}
+	return nil
+}
+
+// Validate checks the frame tag and, when present, the commit id.
 func (c STTInputCommit) Validate() error {
 	if c.Type != STTControlInputCommit {
 		return fmt.Errorf("type: got %q, want %q", c.Type, STTControlInputCommit)
 	}
+	if (c.CommitID != "" || c.commitIDSent) && !ValidCommitID(c.CommitID) {
+		return fmt.Errorf("commit_id: want 1-64 characters of A-Z a-z 0-9 . _ : -")
+	}
 	return nil
+}
+
+// MaxCommitIDLength bounds STTInputCommit.CommitID.
+const MaxCommitIDLength = 64
+
+// ValidCommitID reports whether id is a well-formed commit id: 1 to
+// MaxCommitIDLength characters, each an ASCII letter or digit or one of
+// . _ : -
+func ValidCommitID(id string) bool {
+	if id == "" || len(id) > MaxCommitIDLength {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		switch c := id[i]; {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == ':', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // STTSessionClose asks the server to finish outstanding transcripts and end
@@ -207,6 +258,11 @@ type STTSessionReady struct {
 	Type      STTEventType `json:"type"`
 	RequestID string       `json:"request_id"`
 	Route     Route        `json:"route"`
+	// CommitIDs is true when the server echoes each input.commit's commit_id
+	// on the transcript.final that answers it, so a client can choose
+	// correlated commits up front instead of guessing. False and absent both
+	// mean no echo.
+	CommitIDs bool `json:"commit_ids,omitempty"`
 }
 
 // Validate checks the frame tag, request id, and route.
@@ -266,13 +322,20 @@ type STTTranscriptFinal struct {
 	// caller rendering captions concatenates finals rather than pairing them
 	// one to one.
 	Translation string `json:"translation,omitempty"`
+	// CommitID is the id of the input.commit this final answers, present
+	// only when that commit carried one. A final the provider sent with no
+	// commit pending carries none.
+	CommitID string `json:"commit_id,omitempty"`
 }
 
-// Validate checks the frame tag and segments. Text may be empty: a
-// finalized span of silence is legitimate.
+// Validate checks the frame tag, segments and, when present, the commit id.
+// Text may be empty: a finalized span of silence is legitimate.
 func (e STTTranscriptFinal) Validate() error {
 	if e.Type != STTEventTranscriptFinal {
 		return fmt.Errorf("type: got %q, want %q", e.Type, STTEventTranscriptFinal)
+	}
+	if e.CommitID != "" && !ValidCommitID(e.CommitID) {
+		return fmt.Errorf("commit_id: want 1-64 characters of A-Z a-z 0-9 . _ : -")
 	}
 	for i, segment := range e.Segments {
 		if err := segment.Validate(); err != nil {

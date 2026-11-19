@@ -110,10 +110,11 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	// Reservation tagging follows the plan's billing authority, not its credential
 	// placement: a relay plan settles against a Speko reservation exactly like a
 	// managed provider-direct plan, so both must bind provider-side usage to it.
-	if request.Plan.Execution.ProviderRoute == protocol.RouteSpekoRelay || request.Plan.Execution.CredentialSource == protocol.CredentialsManaged {
+	spekoKey := spekoPaidKey(request.Plan.Execution)
+	if spekoKey {
 		reservationID = request.Plan.Reservation.ID
 	}
-	endpoint, err := listenEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, request.Delivery, reservationID)
+	endpoint, err := listenEndpoint(a.endpointPolicy, request.Plan.Route.Endpoint, request.Plan.Route.Model, request.Options, *request.Media, request.Delivery, reservationID, spekoKey)
 	if err != nil {
 		return nil, err
 	}
@@ -130,8 +131,9 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		authorizationScheme = "Token"
 	}
 	headers.Set("Authorization", authorizationScheme+" "+credential.Value)
+	handshake := newSTTHandshakeObserver(configHTTPClient(a.httpClient))
 	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
-		HTTPClient: configHTTPClient(a.httpClient),
+		HTTPClient: handshake.client,
 		HTTPHeader: headers,
 	})
 	if err != nil {
@@ -139,13 +141,17 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		if response != nil {
 			status = response.StatusCode
 		}
-		return nil, &runtimepkg.ProviderError{
+		failure := &runtimepkg.ProviderError{
 			Code:           dialErrorCode(status),
 			Message:        "Deepgram streaming connection could not be established",
 			Retryable:      status == 0 || status == http.StatusTooManyRequests || status >= 500,
 			ProviderStatus: status,
 			Cause:          err,
 		}
+		if refusedAt, ok := handshake.capacityRefusedAt(response); ok {
+			return nil, &sttCapacityRefusal{failure: failure, refusedAt: refusedAt}
+		}
+		return nil, failure
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
@@ -190,7 +196,7 @@ func acceptableCredentialKind(route protocol.ProviderRoute, kind protocol.Creden
 	return kind == protocol.CredentialBearer || (route == protocol.RouteSpekoRelay && kind == protocol.CredentialRelayAccess)
 }
 
-func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat, delivery runtimepkg.AudioDeliveryMode, reservationID string) (string, error) {
+func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, options protocol.RequestOptions, media protocol.MediaFormat, delivery runtimepkg.AudioDeliveryMode, reservationID string, mipOptOut bool) (string, error) {
 	endpoint, err := policy.Parse(rawEndpoint)
 	if err != nil {
 		return "", fmt.Errorf("deepgram endpoint: %w", err)
@@ -270,6 +276,10 @@ func listenEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	// validation and can never appear.
 	for _, key := range options.STT.ProviderKeys("deepgram") {
 		query.Set(key, protocol.SttOptionString(options.STT.Provider("deepgram")[key]))
+	}
+	// After the caller's options, so a caller value cannot turn it off.
+	if mipOptOut {
+		query.Set(mipOptOutParam, "true")
 	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil
@@ -482,9 +492,10 @@ func (s *stream) handleMessage(payload []byte) error {
 		return s.emitResults(message, raw)
 	case "Error":
 		return &runtimepkg.ProviderError{
-			Code:      "provider_unavailable",
-			Message:   deepgramErrorMessage(message.Description),
-			Retryable: false,
+			Code:       "provider_unavailable",
+			Message:    deepgramErrorMessage(message.Description),
+			Retryable:  false,
+			Extensions: extension(raw),
 		}
 	default:
 		return s.emit(runtimepkg.ProviderEvent{

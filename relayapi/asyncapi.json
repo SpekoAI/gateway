@@ -1144,13 +1144,20 @@
       },
       "STTInputCommit": {
         "type": "object",
-        "description": "Marks the end of the audio the client wants finalized.",
+        "description": "Marks the end of the audio the client wants finalized. Every input.commit is answered by exactly one transcript.final, in commit order; the answer may be empty when the provider had nothing left to finalize.",
         "properties": {
           "type": {
             "type": "string",
             "enum": [
               "input.commit"
             ]
+          },
+          "commit_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "description": "Optional id for this commit. The transcript.final that answers it carries the same commit_id, so a client can tell its answer from a final the provider sent on its own. 1 to 64 characters of ASCII letters, digits, and . _ : -; anything else is refused as an invalid request."
           }
         },
         "required": [
@@ -1189,6 +1196,10 @@
           },
           "route": {
             "$ref": "#/components/schemas/Route"
+          },
+          "commit_ids": {
+            "type": "boolean",
+            "description": "True when the server echoes each input.commit's commit_id on the transcript.final that answers it; only true lets a client rely on commit_id correlation. Absent or false means the server does not echo commit ids. The Router sends it only as true."
           }
         },
         "required": [
@@ -1248,6 +1259,13 @@
           "translation": {
             "type": "string",
             "description": "The finalized translation delivered with this span, present only on a session that asked for one; text stays the original words. The vendor translates after it transcribes, so the translation of a span's last words can arrive on the NEXT transcript.final, and a final may carry a translation with empty text. Concatenate finals in order rather than pairing them one to one."
+          },
+          "commit_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "description": "The commit_id of the input.commit this final answers, present only when that commit carried one. A final the provider sent with no commit pending carries none. When one provider final answers several pending commits, the older ones are answered first by empty finals carrying their own ids, and the provider's final carries the newest commit's id."
           }
         },
         "required": [
@@ -1302,7 +1320,7 @@
         "properties": {
           "provider_options": {
             "type": "object",
-            "description": "The vendor's OWN settings, namespaced by provider name. Values are scalars only (boolean, number, or string of at most 256 characters); at most 8 providers, each with at most 16 settings. Settings addressed to a provider the request does not reach are ignored by design. Settings addressed to the routed provider fail closed: a key or value its route cannot honor is refused with capability_unsupported naming it (in auto mode that candidate is skipped instead), and a provider name that accepts no settings at all is refused as invalid_request. Accepted today: cartesia.normalization (\"auto\", \"off\", or a language or locale such as \"en-IN\", which reads numbers, dates and currency by that language's conventions while the speech stays in the session language; sonic-3.6 only); elevenlabs.stability, elevenlabs.similarity_boost and elevenlabs.style (0 to 1), elevenlabs.speed (0.7 to 1.2) and elevenlabs.use_speaker_boost (boolean). ElevenLabs v3 and v4 models stream on the text-to-dialogue socket, which accepts stability only.",
+            "description": "The vendor's OWN settings, namespaced by provider name. Values are scalars only (boolean, number, or string of at most 256 characters); at most 8 providers, each with at most 16 settings. Settings addressed to a provider the request does not reach are ignored by design. Settings addressed to the routed provider fail closed: a key or value its route cannot honor is refused with capability_unsupported naming it (in auto mode that candidate is skipped instead), and a provider name that accepts no settings at all is refused as invalid_request. Accepted today: cartesia.normalization (\"auto\", \"off\", or a language or locale such as \"en-IN\", which reads numbers, dates and currency by that language's conventions while the speech stays in the session language; sonic-3.6 only); cartesia.max_buffer_delay_ms (an integer from 0 to 5000, the longest Cartesia holds text before it starts speaking while more text may still follow; 0 starts at once, and committing the utterance ends the wait; accepted on the stream and one-shot routes alike); cartesia.speed (0.6 to 1.5, sent as generation_config.speed; instant voice clones honor it, professional clones ignore it); both on sonic-3, sonic-3.5 and sonic-3.6; elevenlabs.stability, elevenlabs.similarity_boost and elevenlabs.style (0 to 1), elevenlabs.speed (0.7 to 1.2) and elevenlabs.use_speaker_boost (boolean). ElevenLabs v3 and v4 models stream on the text-to-dialogue socket, which accepts stability only.",
             "additionalProperties": {
               "type": "object",
               "additionalProperties": {

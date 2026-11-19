@@ -272,9 +272,9 @@ class ConversationProbe:
     ) -> None:
         """Bind a provider leg's identity to the open turn.
 
-        Linkage is explicit, never inferred: STT/TTS legs carry the Gateway
-        session/attempt identifiers, and hosted Router legs carry the relay
-        request ID.
+        Linkage is explicit, never inferred: Gateway legs carry both session
+        and attempt identifiers, and hosted Router legs carry only a request
+        ID. TTS supports either namespace without mixing them.
         """
 
         if self._turn_id is None or (
@@ -282,15 +282,15 @@ class ConversationProbe:
         ):
             return
         data: dict[str, Any] = {"kind": kind}
-        if kind in ("stt", "tts"):
-            if not session_id or not attempt_id:
+        if kind == "tts" and request_id or kind in ("llm", "evaluation"):
+            if not request_id or session_id or attempt_id:
+                return
+            data["request_id"] = str(request_id)
+        elif kind in ("stt", "tts"):
+            if not session_id or not attempt_id or request_id:
                 return
             data["session_id"] = str(session_id)
             data["attempt_id"] = str(attempt_id)
-        elif kind in ("llm", "evaluation"):
-            if not request_id:
-                return
-            data["request_id"] = str(request_id)
         else:
             return
         if provider:
@@ -565,7 +565,9 @@ class ConversationProbe:
                 batch_size = min(_MAX_BATCH_EVENTS, len(self._pending))
                 batch = [self._pending.popleft() for _ in range(batch_size)]
                 try:
-                    await self._client.post_turn_events(batch)
+                    dropped = await self._client.post_turn_events(batch)
+                    if type(dropped) is int:
+                        self.dropped_events += dropped
                 except asyncio.CancelledError:
                     raise
                 except Exception:

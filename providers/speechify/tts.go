@@ -31,12 +31,13 @@ const (
 	defaultMaxResponseBytes = 128 << 20
 	defaultCloseIdleTimeout = 30 * time.Second
 	// Raw HTTP callers are expected to pin a date version. This is the version
-	// used by Speechify's current official SDK examples and includes Simba 3.2.
+	// used by Speechify's current official SDK examples and includes Simba 3.2;
+	// simba-3.5 answers under it too, as 24 kHz PCM (measured 2026-10-20).
 	apiVersion = "2026-07-07"
 )
 
 var simbaModels = map[string]struct{}{
-	"simba-3.2": {}, "simba-3.0": {}, "simba-multilingual": {}, "simba-english": {},
+	"simba-3.5": {}, "simba-3.2": {}, "simba-3.0": {}, "simba-multilingual": {}, "simba-english": {},
 }
 
 type Config struct {

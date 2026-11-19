@@ -136,6 +136,9 @@ class _DrainingVADStream(vad.VADStream):
         self._speech = bytearray()
         self._processed = self._last_index = 0
         self._replay_until = 0
+        self._capture_frontier = 0
+        self._fresh_speech_start: int | None = None
+        self._replay_old_speech = False
         self._last_inference_duration = 0.0
         self._deadline = None
 
@@ -218,6 +221,18 @@ class _DrainingVADStream(vad.VADStream):
         maximum_bytes = math.ceil(maximum * self._sample_rate) * 2
         if self._probability.speaking:
             self._speech.extend(real[: max(0, maximum_bytes - len(self._speech))])
+        old_speech = self._replay_old_speech
+        if old_speech:
+            # STT ended the old turn, but unclassified capture can still be
+            # its uninterrupted speech. A real quiet classification separates
+            # that backlog from a fresh onset; padding alone never reaches here.
+            _, deactivation, *_ = self._probability._options()
+            if event.probability <= deactivation:
+                self._probability.speaking = False
+                self._probability.speech_samples = 0
+                self._probability.silence_samples = 0
+                self._speech.clear()
+                self._replay_old_speech = False
         was_speaking = self._probability.speaking
         started_at = self._probability.started_at
         boundary = self._probability.observe(
@@ -246,7 +261,7 @@ class _DrainingVADStream(vad.VADStream):
             boundary = None
             if self._processed >= self._replay_until:
                 self._replay_until = 0
-                if state.speaking:
+                if state.speaking and not self._replay_old_speech:
                     boundary = vad.VADEvent(
                         type=vad.VADEventType.START_OF_SPEECH,
                         samples_index=event.samples_index,
@@ -256,6 +271,27 @@ class _DrainingVADStream(vad.VADStream):
                         frames=[self._frame(bytes(self._speech))],
                         speaking=True,
                     )
+        # Boundary PCM/timestamps/durations retain physical capture timing.
+        # Only the SDK inference clock used for interruption is fenced.
+        duration_start = started_at
+        if self._capture_frontier:
+            # Reclassification can restore speaking state, but pre-EOS PCM
+            # cannot supply the duration of a NEW response interruption.
+            # Only a fully post-frontier, physically captured voiced window
+            # starts that clock. Later quiet/padding cannot start it.
+            activation, *_ = state._options()
+            # Quiet can abandon a tentative onset without emitting END. That
+            # onset must not donate its intervening silence to a later one.
+            if not state.speaking and not state.onset_pending:
+                self._fresh_speech_start = None
+            if (
+                not replaying and not old_speech
+                and self._processed - count >= self._capture_frontier
+                and event.probability >= activation
+                and self._fresh_speech_start is None
+            ):
+                self._fresh_speech_start = self._processed - count
+            duration_start = self._fresh_speech_start
         # samples_index uses the detector rate; outward PCM keeps the source
         # rate. Inference publishes speaking/duration before its transition.
         inference_rate = getattr(options, "sample_rate", 16000)
@@ -266,13 +302,13 @@ class _DrainingVADStream(vad.VADStream):
                 samples_index=index,
                 timestamp=self._processed / self._sample_rate,
                 frames=[self._frame(real)],
-                speaking=was_speaking and not replaying,
-                speech_duration=max(0, self._processed - started_at) / self._sample_rate
-                if was_speaking and not replaying
+                speaking=was_speaking and not replaying and not old_speech,
+                speech_duration=max(0, self._processed - duration_start) / self._sample_rate
+                if was_speaking and not replaying and not old_speech and duration_start is not None
                 else 0,
-                silence_duration=0 if replaying else state.silence_samples / self._sample_rate,
-                raw_accumulated_speech=0 if replaying else state.speech_samples / self._sample_rate,
-                raw_accumulated_silence=0 if replaying else state.silence_samples / self._sample_rate,
+                silence_duration=0 if replaying or old_speech else state.silence_samples / self._sample_rate,
+                raw_accumulated_speech=0 if replaying or old_speech else state.speech_samples / self._sample_rate,
+                raw_accumulated_silence=0 if replaying or old_speech else state.silence_samples / self._sample_rate,
             )
         )
         if boundary is not None:
@@ -286,7 +322,7 @@ class _DrainingVADStream(vad.VADStream):
 
     def _finish_speech(self) -> None:
         state = self._probability
-        if state is None or not state.speaking:
+        if state is None or not state.speaking or self._replay_old_speech:
             return
         options = self._inner._opts
         self._emit(
@@ -371,13 +407,27 @@ class _DrainingVADStream(vad.VADStream):
                                 self._inner.end_input()
                                 continue
                             pending = self._audio.pending_real(bytes(self._unprocessed))
+                            # Real quiet already classified before the reset
+                            # separates pending capture even below the normal
+                            # end threshold. Only uninterrupted old speech
+                            # needs the muted replay state.
+                            prior_speech = self._probability is not None and (
+                                self._probability.speaking or self._probability.onset_pending
+                            ) and self._probability.silence_samples == 0
                             await utils.aio.cancel_and_wait(observed)
                             await self._inner.aclose()
                             self._reset()
                             self._segment += 1
+                            if prior_speech and pending:
+                                self._replay_old_speech = True
+                                self._probability = ProbabilityVAD.for_stream(self._inner, self._sample_rate)
+                                if self._probability is None:
+                                    raise GatewayError("Unsupported local speech detector stream", retryable=False)
+                                self._probability.speaking = True
                             if pending:
                                 self._replay_until = len(pending) // 2
-                                self._probability = ProbabilityVAD.for_stream(
+                                self._capture_frontier = self._replay_until
+                                self._probability = self._probability or ProbabilityVAD.for_stream(
                                     self._inner, self._sample_rate
                                 )
                                 if self._probability is None:

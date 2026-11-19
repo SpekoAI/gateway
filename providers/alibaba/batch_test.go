@@ -127,6 +127,9 @@ func TestBatchTranscribeRefusals(t *testing.T) {
 	if !errors.As(err, &providerErr) || providerErr.Code != batchhttp.CodeProviderError || string(providerErr.Extensions[batchExtensionID]) != `"file too long"` {
 		t.Fatalf("failed task: %v", err)
 	}
+	if got := providerErr.SafeProviderCode(); got != "InvalidFile" {
+		t.Fatalf("failed task SafeProviderCode = %q, want InvalidFile", got)
+	}
 }
 
 // rewriteScheme lets the test hand the adapter an https result URL that the

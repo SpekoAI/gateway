@@ -3,6 +3,7 @@ package relayapi_test
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/SpekoAI/gateway/relayapi"
@@ -147,6 +148,11 @@ func TestSTTStreamMessageValidation(t *testing.T) {
 		{"configure with too many channels", func() relayapi.STTSessionConfigure { c := configure; c.Audio.Channels = 9; return c }(), "channels"},
 		{"configure with unnormalized routing", func() relayapi.STTSessionConfigure { c := configure; c.Routing = relayapi.Routing{}; return c }(), "routing: mode: unsupported value"},
 		{"commit with wrong tag", relayapi.STTInputCommit{Type: "commit"}, `got "commit"`},
+		{"commit id too long", relayapi.STTInputCommit{Type: relayapi.STTControlInputCommit, CommitID: strings.Repeat("a", relayapi.MaxCommitIDLength+1)}, "commit_id"},
+		{"commit id with a space", relayapi.STTInputCommit{Type: relayapi.STTControlInputCommit, CommitID: "turn 7"}, "commit_id"},
+		{"commit id with a slash", relayapi.STTInputCommit{Type: relayapi.STTControlInputCommit, CommitID: "turn/7"}, "commit_id"},
+		{"commit id beyond ASCII", relayapi.STTInputCommit{Type: relayapi.STTControlInputCommit, CommitID: "turné"}, "commit_id"},
+		{"final with bad commit id", relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, CommitID: "turn 7"}, "commit_id"},
 		{"close with wrong tag", relayapi.STTSessionClose{Type: "close"}, `got "close"`},
 		{"ready without request id", relayapi.STTSessionReady{Type: relayapi.STTEventSessionReady, Route: relayapi.Route{Provider: "deepgram", Model: "nova-3", Region: "eu-west-1", AttemptID: "att_1"}}, "request_id: required"},
 		{"ready with incomplete route", relayapi.STTSessionReady{Type: relayapi.STTEventSessionReady, RequestID: "req_1", Route: relayapi.Route{Provider: "deepgram"}}, "route:"},
@@ -160,5 +166,62 @@ func TestSTTStreamMessageValidation(t *testing.T) {
 			t.Parallel()
 			assertInvalid(t, tc.message.Validate(), tc.want)
 		})
+	}
+}
+
+// A commit id is 1 to 64 ASCII letters, digits, and . _ : - so it can be
+// echoed verbatim and matched byte for byte.
+func TestSTTCommitIDForm(t *testing.T) {
+	t.Parallel()
+	for _, id := range []string{"a", "Z9", "turn-7:a_b.c", strings.Repeat("x", relayapi.MaxCommitIDLength)} {
+		if !relayapi.ValidCommitID(id) {
+			t.Errorf("ValidCommitID(%q) = false, want true", id)
+		}
+		if err := (relayapi.STTInputCommit{Type: relayapi.STTControlInputCommit, CommitID: id}).Validate(); err != nil {
+			t.Errorf("commit with id %q: %v", id, err)
+		}
+	}
+	for _, id := range []string{"", strings.Repeat("x", relayapi.MaxCommitIDLength+1), "a b", "a/b", "a\nb", "é", "a+b", "{}"} {
+		if relayapi.ValidCommitID(id) {
+			t.Errorf("ValidCommitID(%q) = true, want false", id)
+		}
+	}
+	if err := (relayapi.STTInputCommit{Type: relayapi.STTControlInputCommit}).Validate(); err != nil {
+		t.Fatalf("a commit without an id must stay valid: %v", err)
+	}
+}
+
+// On the wire, a commit_id that is sent must be well formed: an empty one is
+// refused rather than read as no id. Omitted and null both mean no id.
+func TestSTTInputCommitFrameCommitID(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		frame, wantID string
+		valid         bool
+	}{
+		{`{"type":"input.commit"}`, "", true},
+		{`{"type":"input.commit","commit_id":null}`, "", true},
+		{`{"type":"input.commit","commit_id":"turn-7"}`, "turn-7", true},
+		{`{"type":"input.commit","commit_id":""}`, "", false},
+		{`{"type":"input.commit","commit_id":"turn 7"}`, "turn 7", false},
+	} {
+		var commit relayapi.STTInputCommit
+		if err := json.Unmarshal([]byte(test.frame), &commit); err != nil {
+			t.Fatalf("%s: decode: %v", test.frame, err)
+		}
+		if commit.CommitID != test.wantID {
+			t.Errorf("%s: commit_id = %q, want %q", test.frame, commit.CommitID, test.wantID)
+		}
+		err := commit.Validate()
+		if test.valid && err != nil {
+			t.Errorf("%s: %v, want valid", test.frame, err)
+		}
+		if !test.valid && (err == nil || !strings.Contains(err.Error(), "commit_id")) {
+			t.Errorf("%s: Validate() = %v, want a commit_id error", test.frame, err)
+		}
+	}
+	var commit relayapi.STTInputCommit
+	if err := json.Unmarshal([]byte(`{"type":"input.commit","commit_id":7}`), &commit); err == nil {
+		t.Fatal("a numeric commit_id must not decode")
 	}
 }

@@ -43,7 +43,11 @@ from ._livekit_bridge import (
 )
 from ._livekit_draining_vad import DrainingVAD
 from ._livekit_gpt_live import GPTLiveModel
-from ._livekit_local_transcript import bind_local_transcript, restore_local_transcript
+from ._livekit_local_transcript import (
+    bind_local_transcript,
+    observe_local_wrappers,
+    restore_local_transcript,
+)
 from ._livekit_native_input import (
     NativeInputBinding,
     bind_native_input,
@@ -65,9 +69,11 @@ from .client import GatewayClient, GatewayError
 from .probe import report_leg as _report_probe_leg
 from .probe import report_marker as _report_probe_marker
 from .relay import (
+    PENALTIES,
     ReasoningEffort,
     RelayError,
     RelayLLMClient,
+    validate_penalty,
     validate_reasoning_effort,
 )
 from .relay_speech import RelaySpeechClient
@@ -136,8 +142,10 @@ _NEWER_STT_CAPABILITIES = frozenset({"keyterms", "chat_context", "manual_flush"}
 # flushes audio that holds no new words, Soniox answers with an empty final,
 # which this plugin does not forward, so LiveKit waits out its
 # transcript_timeout. Without the flush it already waited that long unless a
-# final had arrived in the previous 0.5 s.
-_FLUSH_ON_TURN_END_PROVIDERS = frozenset({"soniox"})
+# final had arrived in the previous 0.5 s. Omi's adapter sends the same
+# commit as Omi's `finalize`, which the live probe (2026-11-06) measured at
+# about 50 ms server-side; the session stays open after it.
+_FLUSH_ON_TURN_END_PROVIDERS = frozenset({"soniox", "omi"})
 
 
 def _stt_capabilities(**declared: Any) -> stt.STTCapabilities:
@@ -228,6 +236,8 @@ class STT(stt.STT):
         self._native_reconsider_scheduled = False
         self._native_turn_policy: NativeTurnPolicy | None = None
         self._local_transcript_bindings: weakref.WeakSet[Any] = weakref.WeakSet()
+        if not isinstance(self._client, RelaySpeechClient):
+            observe_local_wrappers(self)
 
     def prewarm(self) -> None:
         if not isinstance(self._client, RelaySpeechClient):
@@ -321,7 +331,7 @@ class STT(stt.STT):
             self._check_native_admission()
             result = original(*args, **kwargs)
             if isinstance(wrapper, stt.MultiSpeakerAdapter):
-                bind_native_speaker_timing(result)
+                bind_native_speaker_timing(result, unsupported=lambda: setattr(self, "_native_failed", True))
             return result
 
         wrapper.stream = stream
@@ -1231,6 +1241,14 @@ class SynthesisStream(tts.SynthesizeStream):
                 if not isinstance(self._plugin._client, RelaySpeechClient):
                     await self._gateway_stream.append_text(first_token)
                 return
+            if isinstance(self._plugin._client, RelaySpeechClient):
+                # This reply already selected the physical native admission.
+                # Failure before ready cannot authorize a replacement request.
+                raise GatewayError(
+                    "Native TTS selected standby requires a recovery decision",
+                    code="recovery_required",
+                    retryable=False,
+                )
             self._plugin._close_soon(standby)
         self._session = _TTSSession(self._bridge)
         try:
@@ -1297,15 +1315,16 @@ class SynthesisStream(tts.SynthesizeStream):
                 push(first_token)
                 incoming = asyncio.create_task(self._input_ch.__anext__())
                 while True:
-                    # Coalesce an ambiguous final period across LLM tokens,
-                    # while still speaking "Hello." if its producer pauses.
+                    # Coalesce ambiguous periods across LLM tokens, keeping
+                    # available abbreviation context when the producer pauses.
                     # Keep the read task alive when the lookahead expires;
                     # cancelling a channel read can discard later text.
                     done, _ = await asyncio.wait(
                         [incoming], timeout=0.3 if text.can_flush_idle else None
                     )
                     if not done:
-                        flush()
+                        if ready := text.flush_idle():
+                            pieces.send_nowait(ready)
                         continue
                     try:
                         item = incoming.result()
@@ -1412,6 +1431,13 @@ class LLM(llm.LLM):
     provider's default. While reasoning is enabled (any value but `"none"`)
     the Router refuses `temperature`, so leave temperature unset then.
 
+    `frequency_penalty`, `presence_penalty` (-2 to 2, neutral 0) and
+    `repetition_penalty` (greater than 0 and at most 2, neutral 1) guard
+    against a model looping on one phrase. None, the default, sends no field.
+    The Router applies a non-neutral penalty only on Together and Baseten:
+    auto routing keeps the request to those models, and a model pinned
+    elsewhere is refused (`capability_unsupported`).
+
     `"none"` is accepted on models that cannot reason, where it changes nothing
     (older Routers refuse it there, e.g. on `gpt-4.1`). Four models always
     reason and refuse `"none"`, with `"minimal"` as their floor: Inception
@@ -1431,11 +1457,24 @@ class LLM(llm.LLM):
         max_output_tokens: int = 8_192,
         temperature: float | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        repetition_penalty: float | None = None,
     ) -> None:
         super().__init__()
         if (provider == "auto") != (model == "auto"):
             raise ValueError("provider and model must both be auto or both be explicit")
         reasoning_effort = validate_reasoning_effort(reasoning_effort)
+        given = {
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+            "repetition_penalty": repetition_penalty,
+        }
+        self._penalties: dict[str, float] = {}
+        for name in PENALTIES:
+            value = validate_penalty(name, given[name])
+            if value is not None:
+                self._penalties[name] = value
         self._client = client or RelayLLMClient.from_env()
         self._owns_client = client is None
         self._provider_name = provider
@@ -1498,6 +1537,7 @@ class LLM(llm.LLM):
             body["temperature"] = self._temperature
         if self._reasoning_effort is not None:
             body["reasoning_effort"] = self._reasoning_effort
+        body.update(self._penalties)
         return body
 
     async def aclose(self) -> None:

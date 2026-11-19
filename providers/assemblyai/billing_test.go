@@ -45,6 +45,7 @@ func TestTurnDetectionSettingsAreNotBillingFeatures(t *testing.T) {
 		"min_end_of_turn_silence_when_confident",
 		"min_turn_silence",
 		"max_turn_silence",
+		"mode",
 	} {
 		options := protocol.RequestOptions{STT: &protocol.SttOptions{
 			ProviderOptions: map[string]map[string]any{"assemblyai": {key: 400}},

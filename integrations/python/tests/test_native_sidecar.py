@@ -37,27 +37,39 @@ MODEL_KEY = "sk_speko_agent_" + "a" * 64
 
 
 @pytest.mark.parametrize(
-    "first,prefix,ending",
+    "first,prefix,ending,first_commit",
     [
         (
             "The first complete sentence is ready.",
             " The next sentence ",
             "will finish after the gate.",
+            None,
         ),
-        ("第一句话已经准备好了。", " 第二句话", "会在门控释放后完成。"),
-        ("هل الجملة الأولى جاهزة؟", " الجملة التالية ", "ستنتهي بعد البوابة."),
-        ("Meet Dr. Smith tomorrow.", " Please ", "bring the ID."),
-        ("Use 2 fl. oz. of water.", " Then ", "mix gently."),
+        ("第一句话已经准备好了。", " 第二句话", "会在门控释放后完成。", None),
+        ("هل الجملة الأولى جاهزة؟", " الجملة التالية ", "ستنتهي بعد البوابة.", None),
+        ("They live on Main St.", " Please ", "visit tomorrow.", "They live on Main St. Please"),
+        ("The meeting starts at 9 a.m.", " Please ", "join us.", "The meeting starts at 9 a.m. Please"),
+        ("Meet Dr. Smith tomorrow.", " Please ", "bring the ID.", None),
+        ("Use 2 fl. oz. of water.", " Then ", "mix gently.", None),
+        ("Travel via St.", " Louis ", "tomorrow.", "Travel via St. Louis"),
+        ("Use 2 fl. oz.", " of water ", "daily.", "Use 2 fl. oz. of water"),
+        ("Meet Dr.", " Smith ", "tomorrow.", "Meet Dr. Smith"),
     ],
 )
 @pytest.mark.parametrize("pcm_samples", [480, 4800])
 @pytest.mark.parametrize("chunked", [False, True])
-async def test_default_livekit_tts_starts_before_text_finishes_and_preserves_later_audio(
-    native_binary, first, prefix, ending, pcm_samples, chunked
+async def test_livekit_tts_starts_before_text_finishes_and_preserves_later_audio(
+    native_binary, first, prefix, ending, first_commit, pcm_samples, chunked
 ):
     release, audible = asyncio.Event(), asyncio.Event()
     commits, captured, opened, reported = [], [], [], []
     rest = prefix + ending
+    # This producer declares word boundaries. The public SDK transform
+    # option preserves those delimiters instead of holding trailing whitespace.
+    # Text, both PCM payloads and canonical reporting remain exact.
+    first_commit = first if first_commit is None else first_commit
+    assert (first + rest).startswith(first_commit)
+    second_commit = (first + rest)[len(first_commit):]
 
     async def handle(request):
         ws = web.WebSocketResponse()
@@ -152,7 +164,9 @@ async def test_default_livekit_tts_starts_before_text_finishes_and_preserves_lat
             credential_source="managed",
             standby_sessions=0,
         )
-        session = AgentSession(stt=None, llm=None, tts=model, vad=None)
+        session = AgentSession(
+            stt=None, llm=None, tts=model, vad=None, tts_text_transforms=[]
+        )
         session.on(
             "conversation_item_added",
             lambda event: reported.append(event.item.text_content)
@@ -172,12 +186,12 @@ async def test_default_livekit_tts_starts_before_text_finishes_and_preserves_lat
             )
             speech = session.say(text(), allow_interruptions=False)
             await asyncio.wait_for(audible.wait(), 3)
-            assert not release.is_set() and commits == [first], (
+            assert not release.is_set() and commits == [first_commit], (
                 "first audio must precede the remaining LLM text"
             )
             release.set()
             await asyncio.wait_for(speech.wait_for_playout(), 3)
-            assert commits == [first, rest]
+            assert commits == [first_commit, second_commit]
             expected = (1000).to_bytes(2, "little", signed=True) * pcm_samples + (
                 2000
             ).to_bytes(2, "little", signed=True) * pcm_samples
@@ -234,6 +248,8 @@ async def collect_stream(stream):
         ("Visit www.example.", "com for help.", 0.2),
         ("Email user@local.", "example for help.", 0.2),
         ("Read example.co.", "uk for help.", 0.2),
+        ("Near St.", " Louis, take the exit.", 0.2),
+        ("Meet at 9 a.m.", " Please join us.", 0.2),
         ("Meet Dr.", " Smith tomorrow.", 0.5),
         ("Use 2 fl.", " oz. of water.", 0.5),
     ],
@@ -341,10 +357,11 @@ async def test_native_tts_preserves_literal_text(native_binary, text):
 
 
 @pytest.mark.parametrize(
-    "first", ["Hello.", "This is a complete sentence.", "Wait<stop>please.", "a" * 240, "Call 911.", "Visit example.com.", "Use 2 fl. oz."]
+    "first", ["Hello.", "This is a complete sentence.", "Wait<stop>please.", "a" * 240, "Call 911.", "Visit example.com.", "Use 2 fl. oz.", "They live on Main St.", "Travel via St. Louis", "Use 2 fl. oz. of water", "Meet Dr. Smith"]
 )
+@pytest.mark.parametrize("chunked", [False, True])
 async def test_native_tts_emits_standalone_text_while_upstream_waits(
-    native_binary, first
+    native_binary, first, chunked
 ):
     release = asyncio.Event()
     commits = []
@@ -376,9 +393,16 @@ async def test_native_tts_emits_standalone_text_while_upstream_waits(
         stream = model.stream()
 
         async def produce():
-            stream.push_text(first)
+            # Move the existing separator before the gate to declare that
+            # the first word is complete. The total input bytes are unchanged.
+            if chunked:
+                for character in first + rest[:1]:
+                    stream.push_text(character)
+                    await asyncio.sleep(0)
+            else:
+                stream.push_text(first + rest[:1])
             await release.wait()
-            stream.push_text(rest)
+            stream.push_text(rest[1:])
             stream.end_input()
 
         producer = asyncio.create_task(produce())

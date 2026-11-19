@@ -477,6 +477,15 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer done()
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		// A WebSocket upgrade has no request body. Refuse before opening
+		// the relay, and never drain an unfinished body to write its refusal.
+		r.Close = true
+		w.Header().Set("Connection", "close")
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		writeError(w, http.StatusBadRequest, "invalid_request", "native WebSocket upgrades do not accept a body")
+		return
+	}
 	// Query-selected voice can start work as soon as the upstream upgrades.
 	// Validate the local handshake first, while retaining the ability to pass
 	// an upstream's canonical HTTP refusal back before upgrading this socket.
@@ -488,6 +497,7 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	endpoint.Path = r.URL.Path
 	endpoint.RawQuery = r.URL.RawQuery
 	dialCtx, cancelDial := context.WithTimeout(ctx, s.setupTimeout)
+	setupDeadline, _ := dialCtx.Deadline()
 	// websocket.Dial retains only 1 KiB of an unsuccessful upgrade body.
 	// Capture the bounded canonical envelope before that diagnostic truncation.
 	client := *s.client
@@ -565,11 +575,28 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	}
 	defer closeUpstream()
 	upgrade := &nativeUpgradeWriter{ResponseWriter: w}
+	control := http.NewResponseController(w)
+	_ = control.SetReadDeadline(setupDeadline)
+	_ = control.SetWriteDeadline(setupDeadline)
+	setupJoined := make(chan struct{})
+	stopSetup := context.AfterFunc(ctx, func() {
+		defer close(setupJoined)
+		_ = control.SetReadDeadline(time.Now())
+		_ = control.SetWriteDeadline(time.Now())
+		closeUpstream()
+	})
+	defer func() {
+		if !stopSetup() {
+			<-setupJoined
+		}
+	}()
 	local, err := websocket.Accept(upgrade, r, nil)
 	if err != nil {
 		return
 	}
 	defer local.CloseNow()
+	_ = control.SetReadDeadline(time.Time{})
+	_ = control.SetWriteDeadline(time.Time{})
 	closeSockets := func() {
 		closeUpstream()
 		nativeCloseSocket(upgrade.connection)

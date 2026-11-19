@@ -211,12 +211,18 @@ class NativeInputTimeline:
             # or a delegate's release. Translate its absolute media position
             # only when the recognition pipeline receives this occurrence.
             session = self.session() if self.session is not None else None
-            start = max(Fraction(0), source.start - _source_epoch(session))
+            # The recorder publishes its epoch after capturing the first
+            # frame. If that translation clamps to zero, later occurrences
+            # must retain its physical end rather than overlap by that skew.
+            start = max(self.position, source.start - _source_epoch(session))
+        synthetic = self.legacy and observed and source.synthetic
         owned.userdata[_POSITION] = _InputPosition(
-            self, start, duration, not self.legacy or observed,
-            self.legacy and observed and source.synthetic,
+            self, start, duration, not self.legacy or observed, synthetic,
         )
-        self.position += duration
+        # SDK flush silence has recognition duration but no captured media
+        # duration. Keep its existing provenance from advancing the physical
+        # end against which later real occurrences are ordered.
+        self.position = start if synthetic else start + duration
         return owned
 
     def occurrence_of(self, frame: rtc.AudioFrame) -> _InputPosition:

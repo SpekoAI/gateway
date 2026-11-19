@@ -110,7 +110,9 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 			return nil, err
 		}
 		if response.Status < 200 || response.Status >= 300 {
-			return nil, batchhttp.StatusError(batchExtensionID, response.Status, response.Body)
+			failure := batchhttp.StatusError(batchExtensionID, response.Status, response.Body)
+			failure.ProviderCode = batchErrorType(response.Body)
+			return nil, failure
 		}
 		return response, nil
 	}
@@ -215,7 +217,9 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 			final = current
 			return true, nil
 		case "error":
-			return false, batchhttp.Failed(batchExtensionID, current.ErrorMessage)
+			failure := batchhttp.Failed(batchExtensionID, current.ErrorMessage)
+			failure.ProviderCode = current.ErrorType
+			return false, failure
 		case "queued", "processing", "":
 			return false, nil
 		default:
@@ -319,8 +323,21 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 type batchJob struct {
 	ID              string `json:"id"`
 	Status          string `json:"status"`
+	ErrorType       string `json:"error_type"`
 	ErrorMessage    string `json:"error_message"`
 	AudioDurationMS int64  `json:"audio_duration_ms"`
+}
+
+// batchErrorType is the error_type of a REST error body
+// ({"status_code":400,"error_type":"invalid_request","message":...}), the
+// stable code Soniox names on every surface. SafeProviderCode does not read
+// it from the kept body, so the adapter names it.
+func batchErrorType(body []byte) string {
+	var envelope struct {
+		ErrorType string `json:"error_type"`
+	}
+	_ = json.Unmarshal(body, &envelope)
+	return envelope.ErrorType
 }
 
 // deleteQuietly releases a stored file or transcription. Cleanup failures are

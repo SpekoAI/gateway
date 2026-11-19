@@ -196,7 +196,7 @@ settings:
 stt = STT(
     provider="deepgram",             # pin provider AND model when an option is a requirement:
     model="nova-3",                  # deepgram's default is Flux, which has no diarization
-    diarization=True,                # speaker labels (deepgram nova, assemblyai, soniox)
+    diarization=True,                # speaker labels (deepgram nova, assemblyai, soniox, elevenlabs scribe_v3_live)
     keywords=["Speko", "Casey"],     # vocabulary biasing, every provider's own spelling
     noise_reduction=True,            # gladia enhancer, assemblyai voice focus, openai near-field
     provider_options={               # vendor-native settings, allow-listed per provider AND model
@@ -214,6 +214,42 @@ an option is a requirement. Settings under `provider_options` never narrow
 routing; a provider the session does not reach simply ignores its entry, and a
 setting outside a provider's allow-list is refused by name. Speaker labels
 arrive on the raw vendor frames each event carries in `extensions`.
+
+ElevenLabs serves two realtime Scribe models on one adapter. `scribe_v2_realtime`
+is the default. Pin `model="scribe_v3_live"` for Scribe v3 Live, which adds
+three things the gateway refuses on any other Scribe model:
+
+```python
+stt = STT(
+    provider="elevenlabs",
+    model="scribe_v3_live",
+    diarization=True,                # each final carries the vendor's speaker labels
+    keywords=catalog_terms,          # terms past 50 x 20 characters ride the keyterm library
+    provider_options={
+        "elevenlabs": {
+            "turn_prediction": True, # commit on predicted end of turn; VAD stays active
+            "multilang_mode": True,  # follow speakers who switch languages
+        },
+    },
+)
+```
+
+With `diarization=True` a final is emitted when ElevenLabs sends the
+speaker-labelled transcript for the segment, which follows the commit, so
+finals arrive later than without it. Partials and other events that follow
+the commit wait behind that final, so the next segment's partial never
+arrives before the previous segment's final. Each word carries `speaker`, and the
+final carries `speaker` when one speaker said all of it. A word ElevenLabs has
+not attributed to a speaker carries no `speaker`, and then neither does its
+final. The gateway waits at most 0.8 s after a commit for its labels, also
+while the session closes, so no event is delayed longer than that. A final can
+still arrive with no speakers at all: when ElevenLabs has not labelled a
+segment within 0.8 s, the stream ends first, or ElevenLabs sends no labels for
+it, the committed text is delivered without them rather than dropped, and
+labels that arrive later are ignored. When ElevenLabs
+later decides two labels are one person, the gateway relabels the finals that follow
+and emits a `warning` event with `provider_type: "speakers_merged"`,
+`from_speaker` and `to_speaker`; finals already delivered keep their label.
 
 `LLM()` requires `SPEKO_API_KEY` and speaks HTTPS directly to the relay —
 not the local socket — under the public [`relayapi`](relayapi/doc.go)
@@ -332,6 +368,7 @@ Every catalog provider has a BYOK credential variable:
 | MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
 | Munsit | `SPEKO_MUNSIT_BYOK_API_KEY` | API key, sent as `x-api-key`; BYOK/Relay only because Munsit has no token exchange |
 | Nari Labs | `SPEKO_NARI_BYOK_API_KEY` | API key; one key serves both the synthesis endpoint and the transcription socket |
+| Omi Health | `SPEKO_OMI_BYOK_API_KEY` | API key; sent inside the realtime socket's JSON `start` frame and as a bearer on uploads; BYOK/Relay only because Omi has no token exchange |
 | OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
 | Palabra | `SPEKO_PALABRA_BYOK_API_KEY` | API key; dedicated STT/TTS sockets do not expose a scoped short-lived grant |
 | Paxa Labs | `SPEKO_PAXA_BYOK_API_KEY` | API key |
@@ -382,7 +419,7 @@ restarting the Gateway.
 | --- | --- | --- | --- |
 | STT | Deepgram | `deepgram.stt.v1` | `flux-general-en` |
 | TTS | Deepgram | `deepgram.tts.v1` | `flux-haley-en` |
-| STT | ElevenLabs | `elevenlabs.stt.v1` | `scribe_v2_realtime` |
+| STT | ElevenLabs | `elevenlabs.stt.v1` | `scribe_v2_realtime` (`scribe_v3_live` by pin) |
 | TTS | ElevenLabs | `elevenlabs.tts.v1` | `eleven_flash_v2_5` |
 | TTS | ElevenLabs (v3/v4) | `elevenlabs.dialogue.v1` | `eleven_v4_turbo` |
 | STT | Cartesia | `cartesia.stt.v1` | `ink-2` |
@@ -423,6 +460,10 @@ restarting the Gateway.
 | TTS | Munsit | `munsit.tts.v1` | `faseeh-v1-preview` |
 | STT | Hopper | `hopper.stt.v1` | `nemotron-asr` |
 | TTS | Hopper | `hopper.tts.v1` | `qwen3-tts` |
+| STT | Omi Health | `omi.stt.v1` | `omi-medical-1` |
+
+Whole-input HTTP synthesis is available through the explicitly registered
+[Cartesia bytes adapter](docs/CARTESIA_BYTES_TTS.md), `cartesia.tts.bytes.v1`.
 
 Provider endpoints are checked against exact official host allowlists before
 credentials are attached. Production connections require TLS and port 443.

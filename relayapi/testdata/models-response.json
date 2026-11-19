@@ -303,6 +303,56 @@
         "max_pcm_bytes": 46120960,
         "max_duration_seconds": 180
       }
+    },
+    {
+      "id": "gemini-decision-1",
+      "provider": "gemini",
+      "kind": "evaluation",
+      "capabilities": {
+        "streaming": false,
+        "tools": false,
+        "structured_output": false,
+        "cached_input": false,
+        "reasoning": false,
+        "diarization": false,
+        "keywords": false,
+        "noise_reduction": false,
+        "word_timestamps": false,
+        "word_timings": false,
+        "character_timings": false,
+        "translation": false,
+        "evaluation_question_types": [
+          "choice",
+          "score",
+          "noul"
+        ],
+        "evaluation_inputs": [
+          "audio"
+        ],
+        "evaluation_limits": {
+          "max_questions": 1000,
+          "max_choice_options": 255,
+          "max_score_levels": 10,
+          "max_audio_ms": 60000,
+          "max_audio_bytes": 2097152
+        }
+      },
+      "regions": [
+        "us-east-1"
+      ],
+      "audio_formats": [
+        {
+          "encoding": "pcm_s16le",
+          "sample_rate_range_hz": {
+            "min": 8000,
+            "max": 48000
+          },
+          "channels": [
+            1,
+            2
+          ]
+        }
+      ]
     }
   ],
   "catalog_digest": "sha256:8c1f2ad94e0f6bd3fbc7d2a4f4f36f5f5f2c9f0b1d4e7a8c3b6d9e0f1a2b3c4d",

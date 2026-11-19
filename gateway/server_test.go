@@ -836,6 +836,13 @@ type fallbackExchange struct {
 func (c *fakePlanClient) CreateSessionPlan(ctx context.Context, request protocol.SessionPlanRequest, _ controlplane.CreateOptions) (protocol.SessionPlan, string, error) {
 	c.mu.Lock()
 	c.requests = append(c.requests, request)
+	plan := c.plan
+	// Each new issuance is independently usable once. Keep the first fixture
+	// identifiers stable for assertions about that initial admission.
+	if len(c.requests) > 1 {
+		plan.PlanID = fmt.Sprintf("%s_%d", plan.PlanID, len(c.requests))
+		plan.AttemptID = fmt.Sprintf("%s_%d", plan.AttemptID, len(c.requests))
+	}
 	started, release := c.started, c.release
 	c.mu.Unlock()
 	if started != nil {
@@ -851,7 +858,7 @@ func (c *fakePlanClient) CreateSessionPlan(ctx context.Context, request protocol
 			return protocol.SessionPlan{}, "", ctx.Err()
 		}
 	}
-	return c.plan, "cp_gateway_123", nil
+	return plan, "cp_gateway_123", nil
 }
 
 // CreateSessionPlanBatch returns count copies of the fixture plan with distinct
@@ -1213,6 +1220,50 @@ func TestGatewayHandsManagedAdaptersAnAttemptBoundCredentialRefresher(t *testing
 			}
 			if refreshed := <-plans.refreshed; refreshed.SessionID != plan.SessionID || refreshed.AttemptID != plan.AttemptID {
 				t.Fatalf("refreshed %s/%s, want the open attempt %s/%s", refreshed.SessionID, refreshed.AttemptID, plan.SessionID, plan.AttemptID)
+			}
+		})
+	}
+}
+
+func TestFundedFallbackDoesNotConsumeAnUnrelatedWarmPlan(t *testing.T) {
+	for _, token := range []string{"gwt1." + strings.Repeat("a", 43), "malformed-funded-token"} {
+		t.Run(token, func(t *testing.T) {
+			t.Parallel()
+			adapter := &flakyOpenAdapter{inner: mock.NewSTTAdapter("mock.stt.v1"), openErr: &runtimepkg.ProviderError{Code: "provider_unavailable", Retryable: true, ProviderStatus: 503}, failures: 1}
+			config, plans := newServerConfigWithAdapter(t, adapter, 0, 0, 0, 0)
+			plan := gatewayPlan()
+			plan.Execution.CredentialSource = protocol.CredentialsManaged
+			plan.Route.Credential = &protocol.DelegatedCredential{Kind: protocol.CredentialBearer, Value: "funded-root", ExpiresAt: plan.ExpiresAt}
+			plan.Telemetry.Token = token
+			plan.Reservation.Billing = &protocol.BillingAuthorization{Mode: "direct_entitlement", State: "estimated", Currency: "USD", MaximumAmountMicros: 100}
+			plan.Fallback = &protocol.Fallback{ExchangeURL: "https://control.speko.test/v1/sessions/session-gateway/fallback-plans"}
+			plans.plan = plan
+			plans.fallbackErr = &controlplane.HTTPError{Status: 422, Code: "no_eligible_route"}
+			pool := newWarmPool(t, plans, 2)
+			if err := pool.Warm(context.Background(), managedWarmRequest()); err != nil {
+				t.Fatal(err)
+			}
+			config.WarmPlans = pool
+			server, err := gateway.New(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			peer := httptest.NewServer(server.Handler())
+			defer peer.Close()
+			body := gatewayRequestBody()
+			body["request"] = map[string]string{"model": "mock-model", "language": "en"}
+			body["execution"] = map[string]string{"provider_route": "provider_direct", "credential_source": "managed", "relay_policy": "forbidden"}
+			response := postJSON(t, peer.URL+"/v1/sessions", body, "local-token", strings.Repeat("a", 190))
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadGateway {
+				t.Fatalf("funded recovery bypassed refusal with warm plan: %d", response.StatusCode)
+			}
+			calls := plans.fallbackCalls()
+			if len(calls) != 1 || len(calls[0].idempotencyKey) > 200 {
+				t.Fatal("funded recovery intent not bounded")
+			}
+			if pool.Metrics().Hits != 1 {
+				t.Fatal("recovery consumed another independently funded warm session")
 			}
 		})
 	}

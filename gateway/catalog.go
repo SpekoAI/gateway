@@ -67,9 +67,11 @@ type CatalogModelRoute struct {
 var providerCatalog = []CatalogEntry{
 	{Provider: "deepgram", Kind: protocol.SessionKindSTT, Adapter: "deepgram.stt.v1", DefaultModel: "flux-general-en", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.deepgram.com/v2/listen", ModelRoutes: []CatalogModelRoute{{ModelPrefix: "flux-", Endpoint: "wss://api.deepgram.com/v2/listen"}, {ModelPrefix: "", Endpoint: "wss://api.deepgram.com/v1/listen"}}},
 	{Provider: "deepgram", Kind: protocol.SessionKindTTS, Adapter: "deepgram.tts.v1", DefaultModel: "flux-haley-en", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.deepgram.com/v2/speak", ModelRoutes: []CatalogModelRoute{{ModelPrefix: "flux-", Endpoint: "wss://api.deepgram.com/v2/speak"}, {ModelPrefix: "", Endpoint: "wss://api.deepgram.com/v1/speak"}}},
-	// The realtime Scribe family, NOT the batch `scribe_v2`: only this id streams
-	// over /v1/speech-to-text/realtime.
-	{Provider: "elevenlabs", Kind: protocol.SessionKindSTT, Adapter: "elevenlabs.stt.v1", DefaultModel: "scribe_v2_realtime", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/speech-to-text/realtime"},
+	// The realtime Scribe family, NOT the batch `scribe_v2` and `scribe_v3`:
+	// only these ids stream over /v1/speech-to-text/realtime. scribe_v3_live
+	// shares the socket and is listed so an explicit pin resolves and
+	// discovery shows it; scribe_v2_realtime stays the default a bare pin gets.
+	{Provider: "elevenlabs", Kind: protocol.SessionKindSTT, Adapter: "elevenlabs.stt.v1", DefaultModel: "scribe_v2_realtime", Models: []string{"scribe_v2_realtime", "scribe_v3_live"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/speech-to-text/realtime"},
 	{Provider: "elevenlabs", Kind: protocol.SessionKindTTS, Adapter: "elevenlabs.tts.v1", DefaultModel: "eleven_flash_v2_5", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/text-to-speech"},
 	// v3/v4 stream only on the text-to-dialogue socket, a separate adapter. The
 	// row sits after the text-to-speech one so a bare or `auto` model keeps
@@ -77,9 +79,10 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "elevenlabs", Kind: protocol.SessionKindTTS, Adapter: "elevenlabs.dialogue.v1", DefaultModel: "eleven_v4_turbo", Models: []string{"eleven_v4_turbo", "eleven_v4", "eleven_v3_conversational", "eleven_v3"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.elevenlabs.io/v1/text-to-dialogue/stream-input"},
 	{Provider: "cartesia", Kind: protocol.SessionKindSTT, Adapter: "cartesia.stt.v1", DefaultModel: "ink-2", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/stt/websocket"},
 	{Provider: "cartesia", Kind: protocol.SessionKindTTS, Adapter: "cartesia.tts.v1", DefaultModel: "sonic-3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket"},
-	// universal-3-6-pro (2026-09-29) shares the socket and parameters and is
-	// listed so discovery shows it; 3.5 Pro stays the default a bare pin gets.
-	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "universal-3-5-pro", Models: []string{"universal-3-5-pro", "universal-3-6-pro"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
+	// universal-3-6-pro (2026-09-29) and assemblyai-stt-3-7-realtime-agent
+	// (2026-11-17) share the socket and parameters and are listed so discovery
+	// shows them; 3.5 Pro stays the default a bare pin gets.
+	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "universal-3-5-pro", Models: []string{"universal-3-5-pro", "universal-3-6-pro", "assemblyai-stt-3-7-realtime-agent"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
 	// Modulate selects its two streaming transcription models by endpoint path,
 	// not a model query field. English Fast is the conversational default;
 	// multilingual remains explicitly selectable through the same adapter.
@@ -162,7 +165,7 @@ var providerCatalog = []CatalogEntry{
 	// prerecorded sibling (POST /v1/asr/transcribe) is a BatchTranscriber,
 	// which this catalog does not publish.
 	{Provider: "meta", Kind: protocol.SessionKindSTT, Adapter: "meta.stt.v1", DefaultModel: "muse-voice-transcribe-1.0", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.meta.ai/v1/asr/realtime"},
-	{Provider: "speechify", Kind: protocol.SessionKindTTS, Adapter: "speechify.tts.v1", DefaultModel: "simba-3.0", Models: []string{"simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"}, DefaultVoice: "geffen_32", Transport: protocol.TransportHTTP, Endpoint: "https://api.speechify.ai/v1/audio/stream"},
+	{Provider: "speechify", Kind: protocol.SessionKindTTS, Adapter: "speechify.tts.v1", DefaultModel: "simba-3.0", Models: []string{"simba-3.5", "simba-3.2", "simba-3.0", "simba-multilingual", "simba-english"}, DefaultVoice: "geffen_32", Transport: protocol.TransportHTTP, Endpoint: "https://api.speechify.ai/v1/audio/stream"},
 	// Nari Labs serves Qwen3-ASR and Qwen3-TTS in two serving classes each;
 	// the realtime socket adds intent=transcription itself.
 	{Provider: "nari", Kind: protocol.SessionKindSTT, Adapter: "nari.stt.v1", DefaultModel: "qwen3-asr-fast", Models: []string{"qwen3-asr-fast", "qwen3-asr"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://api.narilabs.com/v1/realtime"},
@@ -185,6 +188,11 @@ var providerCatalog = []CatalogEntry{
 	// streams 24 kHz PCM and refuses requests without a voice.
 	{Provider: "hopper", Kind: protocol.SessionKindSTT, Adapter: "hopper.stt.v1", DefaultModel: "nemotron-asr", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.withhopper.com/stt/websocket"},
 	{Provider: "hopper", Kind: protocol.SessionKindTTS, Adapter: "hopper.tts.v1", DefaultModel: "qwen3-tts", DefaultVoice: "elena", Transport: protocol.TransportHTTP, Endpoint: "https://api.withhopper.com/v1/audio/speech"},
+	// Omi Health: omi-medical-1 over the US (Ohio) realtime socket, with the
+	// key inside the JSON start frame. 16 kHz mono PCM16 only. The
+	// prerecorded sibling (POST /v1/audio/transcriptions) is a
+	// BatchTranscriber, which this catalog does not publish.
+	{Provider: "omi", Kind: protocol.SessionKindSTT, Adapter: "omi.stt.v1", DefaultModel: "omi-medical-1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.us.omi.health/v1/stream"},
 	{Provider: "speechmatics", Kind: protocol.SessionKindSTT, Adapter: "speechmatics.stt.v1", DefaultModel: "standard", Models: []string{"standard", "enhanced"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://global.rt.speechmatics.com/v2/"},
 }
 

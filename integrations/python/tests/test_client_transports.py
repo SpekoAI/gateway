@@ -73,10 +73,10 @@ async def gateway_stt_peer(payloads, *, after_eos=False, final_gate=None):
 
 
 @pytest.mark.parametrize("shape", ["terminal", "middle", "whole"])
-@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("nested", [False, True, "reverse"])
 @pytest.mark.parametrize("manual", [False, True])
 @pytest.mark.parametrize("after_eos", [False, True])
-async def test_gateway_background_suppression_keeps_filtered_canonical_turns(shape, nested, manual, after_eos):
+async def test_gateway_background_suppression_keeps_filtered_canonical_turns(shape, nested, manual, after_eos, drop_empty=False):
     from livekit import rtc
     from livekit.agents import Agent, AgentSession, stt
     from livekit.agents.voice import io
@@ -103,6 +103,8 @@ async def test_gateway_background_suppression_keeps_filtered_canonical_turns(sha
                 if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT:
                     finals.extend(data.text for data in event.alternatives if data.text)
                     envelopes.append(dataclasses.asdict(event))
+                if drop_empty and event.type is stt.SpeechEventType.FINAL_TRANSCRIPT and not any(data.text for data in event.alternatives):
+                    continue
                 yield event
                 if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT and event.alternatives[0].text and not first.is_set():
                     first.set()
@@ -128,7 +130,7 @@ async def test_gateway_background_suppression_keeps_filtered_canonical_turns(sha
         client = GatewayClient(socket_path=address, local_auth_token="owned-filtered-canonical")
         model = STT(client, diarization=True)
         speaker = stt.MultiSpeakerAdapter(stt=model, suppress_background_speaker=True)
-        wrapped = stt.FallbackAdapter([speaker], max_retry_per_stt=0) if nested else speaker
+        wrapped = stt.MultiSpeakerAdapter(stt=stt.FallbackAdapter([model], max_retry_per_stt=0), suppress_background_speaker=True) if nested == "reverse" else stt.FallbackAdapter([speaker], max_retry_per_stt=0) if nested else speaker
         session = AgentSession(stt=wrapped, llm=None, tts=None, vad=None, turn_detection="stt", min_endpointing_delay=0, max_endpointing_delay=0)
         session.input.audio = Input()
         session.on("conversation_item_added", lambda event: items.put_nowait(event.item.text_content) if getattr(event.item, "role", None) == "user" else None)
@@ -884,3 +886,11 @@ async def test_gateway_provider_open_error_details(retryable):
             assert "private upstream message" not in str(caught.value)
         finally:
             await client.aclose()
+
+
+@pytest.mark.parametrize("shape", ["terminal", "middle"])
+@pytest.mark.parametrize("nested", [True, "reverse"])
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("after_eos", [False, True])
+async def test_gateway_suppressed_terminal_survives_a_node_dropping_empty_finals(shape, nested, manual, after_eos):
+    await test_gateway_background_suppression_keeps_filtered_canonical_turns(shape, nested, manual, after_eos, drop_empty=True)

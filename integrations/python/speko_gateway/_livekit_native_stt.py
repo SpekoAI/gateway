@@ -631,26 +631,38 @@ class NativeSpeechStream(stt.RecognizeStream):
                 )
             raise
 
-    def _emit(self, event: LiveKitSpeechEvent, kind: stt.SpeechEventType, batch: NativeFinalBatch | None = None, index: int = 0) -> None:
+    def _emit(self, event: LiveKitSpeechEvent, kind: stt.SpeechEventType, batch: NativeFinalBatch | None = None, index: int = 0, capture_end: int | None = None) -> None:
         offset = Fraction(self._request_start_sample, self._sample_rate)
+        whole = (
+            event.speaker_id is not None
+            and event.start_time is None and event.end_time is None
+            and event.canonical_text in (None, event.text)
+        )
+        start, end = event.start_time, event.end_time
+        if whole and capture_end is not None and capture_end > self._request_start_sample:
+            # A single whole-final label covers this physical request. These
+            # are captured request bounds, never invented provider word times.
+            start, end = 0.0, (capture_end - self._request_start_sample) / self._sample_rate
         data = NativeSpeechData(
             language=event.language or self._language,
             text=event.text,
             speaker_id=f"{self._speaker_scope}:{event.speaker_id}" if event.speaker_id is not None else None,
-            start_time=self._source_time(offset + Fraction(str(event.start_time)))
-            if event.start_time is not None
+            start_time=self._source_time(offset + Fraction(str(start)))
+            if start is not None
             else 0.0,
-            end_time=self._source_time(offset + Fraction(str(event.end_time)), end=True)
-            if event.end_time is not None
+            end_time=self._source_time(offset + Fraction(str(end)), end=True)
+            if end is not None
             else 0.0,
         )
         data.canonical_text = event.canonical_text
         data.provider_speaker_id = event.speaker_id
         data._native_speaker_scope = self._speaker_scope
-        if event.start_time is not None and event.end_time is not None:
+        data.timing_source = "captured_request" if whole and start is not None else "provider" if start is not None and end is not None else None
+        data._native_timing_unavailable = whole and start is None
+        if start is not None and end is not None:
             data._native_input_times = (
-                float(offset) + event.start_time,
-                float(offset) + event.end_time,
+                float(offset) + start,
+                float(offset) + end,
             )
         if batch is not None:
             data._native_final = (batch.token, index)
@@ -702,9 +714,10 @@ class NativeSpeechStream(stt.RecognizeStream):
         if self._wait_for_turn_commit and self._turn_text and (self._turn_commit is None or self._turn_commit.done()):
             self._turn_commit = asyncio.get_running_loop().create_future()
         self._pending_transcript = False
-        batch = NativeFinalBatch(self, self._canonical_turn, tuple(event.text for event in self._finals)) if self._wait_for_turn_commit else None
+        batch = NativeFinalBatch(self, self._canonical_turn, tuple(event.text for event in self._finals)) if self._wait_for_turn_commit and self._finals else None
         for index, event in enumerate(self._finals):
-            self._emit(event, stt.SpeechEventType.FINAL_TRANSCRIPT, batch, index)
+            capture_end = (self._processed_samples if speech_end is None else speech_end) if len(self._finals) == 1 else None
+            self._emit(event, stt.SpeechEventType.FINAL_TRANSCRIPT, batch, index, capture_end)
         self._event_ch.send_nowait(
             stt.SpeechEvent(
                 type=stt.SpeechEventType.END_OF_SPEECH,

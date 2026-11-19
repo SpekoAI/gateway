@@ -91,6 +91,10 @@ func TestStreamingLanguagesAreScopedPerModel(t *testing.T) {
 		if err != nil {
 			t.Fatalf("universal-3-6-pro must accept %q: %v", language, err)
 		}
+		// AssemblyAI lists the same 32 languages for the 3.7 agent model.
+		if _, err := streamEndpoint(policy, socket, RealtimeAgent37Model, protocol.RequestOptions{Language: language}, media); err != nil {
+			t.Fatalf("%s must accept %q: %v", RealtimeAgent37Model, language, err)
+		}
 		var codes []string
 		if err := json.Unmarshal([]byte(mustQuery(t, endpoint).Get("language_codes")), &codes); err != nil || len(codes) != 1 {
 			t.Fatalf("language_codes must be a one-element JSON array: %v %s", err, endpoint)
@@ -100,13 +104,84 @@ func TestStreamingLanguagesAreScopedPerModel(t *testing.T) {
 		}
 	}
 	// The shared vocabulary still serves every model, 3.6 Pro included.
-	for _, model := range []string{"universal-3-5-pro", "universal-3-6-pro"} {
+	for _, model := range []string{"universal-3-5-pro", "universal-3-6-pro", RealtimeAgent37Model} {
 		if _, err := streamEndpoint(policy, socket, model, protocol.RequestOptions{Language: "es-419"}, media); err != nil {
 			t.Fatalf("%s must accept es-419 as es: %v", model, err)
 		}
 	}
 	if _, err := streamEndpoint(policy, socket, "universal-3-6-pro", protocol.RequestOptions{Language: "uz"}, media); err == nil {
 		t.Fatal("universal-3-6-pro must refuse a language outside its 32")
+	}
+	if _, err := streamEndpoint(policy, socket, RealtimeAgent37Model, protocol.RequestOptions{Language: "uz"}, media); err == nil {
+		t.Fatalf("%s must refuse a language outside its 32", RealtimeAgent37Model)
+	}
+}
+
+// The 3.7 agent model rides the same socket: its id is the speech_model, and a
+// caller's mode preset reaches the connect URL beside the gateway pins.
+func TestStreamEndpointCarriesRealtimeAgentModelAndMode(t *testing.T) {
+	t.Parallel()
+	policy, err := upstream.NewWebSocketPolicy(officialAPIHost, nil, false)
+	if err != nil {
+		t.Fatalf("endpoint policy: %v", err)
+	}
+	media := protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1}
+	options := protocol.RequestOptions{STT: &protocol.SttOptions{
+		ProviderOptions: map[string]map[string]any{"assemblyai": {"mode": "min_latency"}},
+	}}
+	endpoint, err := streamEndpoint(policy, "wss://streaming.assemblyai.com/v3/ws", RealtimeAgent37Model, options, media)
+	if err != nil {
+		t.Fatalf("stream endpoint: %v", err)
+	}
+	query := mustQuery(t, endpoint)
+	if query.Get("speech_model") != RealtimeAgent37Model || query.Get("mode") != "min_latency" || query.Get("format_turns") != "true" {
+		t.Fatalf("connect URL = %s", endpoint)
+	}
+	// The adapter holds the same rule as the gateway server, so an in-process
+	// caller (the relay) cannot dial a preset the model refuses mid-call.
+	for model, value := range map[string]any{RealtimeAgent37Model: "manual", "universal-3-6-pro": "fastest"} {
+		bad := protocol.RequestOptions{STT: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"assemblyai": {"mode": value}}}}
+		if _, err := streamEndpoint(policy, "wss://streaming.assemblyai.com/v3/ws", model, bad, media); err == nil {
+			t.Fatalf("%s mode=%v must be refused before the dial", model, value)
+		}
+	}
+}
+
+// 3.7 with no caller mode is served the way the benchmark measured it:
+// min_latency. A caller's own mode or turn timing wins, and other models keep
+// the vendor default.
+func TestStreamEndpointDefaultsRealtimeAgentToMinLatency(t *testing.T) {
+	t.Parallel()
+	policy, err := upstream.NewWebSocketPolicy(officialAPIHost, nil, false)
+	if err != nil {
+		t.Fatalf("endpoint policy: %v", err)
+	}
+	media := protocol.MediaFormat{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1}
+	withSettings := func(settings map[string]any) protocol.RequestOptions {
+		return protocol.RequestOptions{STT: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{"assemblyai": settings}}}
+	}
+	cases := []struct {
+		name    string
+		model   string
+		options protocol.RequestOptions
+		mode    string
+	}{
+		{"3.7 without options", RealtimeAgent37Model, protocol.RequestOptions{Language: "en"}, "min_latency"},
+		{"3.7 with unrelated options", RealtimeAgent37Model, withSettings(map[string]any{"voice_focus": "far-field"}), "min_latency"},
+		{"3.7 with the caller's mode", RealtimeAgent37Model, withSettings(map[string]any{"mode": "max_accuracy"}), "max_accuracy"},
+		{"3.7 with the caller's turn timing", RealtimeAgent37Model, withSettings(map[string]any{"max_turn_silence": 1200}), ""},
+		{"3.7 with the caller's confidence threshold", RealtimeAgent37Model, withSettings(map[string]any{"end_of_turn_confidence_threshold": 0.6}), ""},
+		{"3.6 Pro without options", universal36Model, protocol.RequestOptions{}, ""},
+	}
+	for _, tc := range cases {
+		endpoint, err := streamEndpoint(policy, "wss://streaming.assemblyai.com/v3/ws", tc.model, tc.options, media)
+		if err != nil {
+			t.Fatalf("%s: stream endpoint: %v", tc.name, err)
+		}
+		query := mustQuery(t, endpoint)
+		if got := query.Get("mode"); got != tc.mode || len(query["mode"]) > 1 {
+			t.Fatalf("%s: mode = %v, want %q", tc.name, query["mode"], tc.mode)
+		}
 	}
 }
 

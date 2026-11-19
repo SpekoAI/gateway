@@ -39,7 +39,7 @@ func queryOf(t *testing.T, endpoint string) url.Values {
 func TestListenEndpointCarriesDiarization(t *testing.T) {
 	t.Parallel()
 	policy := sttTestPolicy(t)
-	plain, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3", optionsWith(nil), *media(), runtimepkg.AudioDeliveryLive, "")
+	plain, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3", optionsWith(nil), *media(), runtimepkg.AudioDeliveryLive, "", false)
 	if err != nil {
 		t.Fatalf("plain endpoint: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestListenEndpointCarriesDiarization(t *testing.T) {
 		t.Fatalf("a request that asked for nothing must not mention options: %s", plain)
 	}
 	diarized, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3",
-		optionsWith(&protocol.SttOptions{Diarization: boolPointer(true)}), *media(), runtimepkg.AudioDeliveryLive, "")
+		optionsWith(&protocol.SttOptions{Diarization: boolPointer(true)}), *media(), runtimepkg.AudioDeliveryLive, "", false)
 	if err != nil {
 		t.Fatalf("diarized endpoint: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestListenEndpointSpellsKeywordsByModelFamily(t *testing.T) {
 	policy := sttTestPolicy(t)
 	terms := &protocol.SttOptions{Keywords: []string{"Speko", "São Paulo"}}
 
-	nova3, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3", optionsWith(terms), *media(), runtimepkg.AudioDeliveryLive, "")
+	nova3, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-3", optionsWith(terms), *media(), runtimepkg.AudioDeliveryLive, "", false)
 	if err != nil {
 		t.Fatalf("nova-3: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestListenEndpointSpellsKeywordsByModelFamily(t *testing.T) {
 		t.Fatal("nova-3 must not also receive keywords")
 	}
 
-	nova2, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-2", optionsWith(terms), *media(), runtimepkg.AudioDeliveryLive, "")
+	nova2, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-2", optionsWith(terms), *media(), runtimepkg.AudioDeliveryLive, "", false)
 	if err != nil {
 		t.Fatalf("nova-2: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestListenEndpointSpellsKeywordsByModelFamily(t *testing.T) {
 		t.Fatalf("nova-2 takes repeatable keywords: %v", got)
 	}
 
-	flux, err := listenEndpoint(policy, "wss://api.deepgram.com/v2/listen", "flux-general-en", optionsWith(terms), *media(), runtimepkg.AudioDeliveryLive, "")
+	flux, err := listenEndpoint(policy, "wss://api.deepgram.com/v2/listen", "flux-general-en", optionsWith(terms), *media(), runtimepkg.AudioDeliveryLive, "", false)
 	if err != nil {
 		t.Fatalf("flux: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestListenEndpointForwardsProviderOptions(t *testing.T) {
 		// Another provider's settings must not leak onto Deepgram's URL.
 		"elevenlabs": {"vad_silence_threshold_secs": 0.7},
 	}}
-	endpoint, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-2", optionsWith(options), *media(), runtimepkg.AudioDeliveryLive, "")
+	endpoint, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", "nova-2", optionsWith(options), *media(), runtimepkg.AudioDeliveryLive, "", false)
 	if err != nil {
 		t.Fatalf("endpoint: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestListenEndpointSendsOnlyDocumentedRegionalLanguages(t *testing.T) {
 		{"nova-2-phonecall", "en-US", "en-US"},
 		{"nova", "hi-Latn", "hi-Latn"},
 	} {
-		endpoint, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", test.model, protocol.RequestOptions{Language: test.language}, *media(), runtimepkg.AudioDeliveryLive, "")
+		endpoint, err := listenEndpoint(policy, "wss://api.deepgram.com/v1/listen", test.model, protocol.RequestOptions{Language: test.language}, *media(), runtimepkg.AudioDeliveryLive, "", false)
 		if err != nil {
 			t.Fatalf("%s %s: %v", test.model, test.language, err)
 		}
@@ -157,7 +157,7 @@ func TestListenEndpointSendsOnlyDocumentedRegionalLanguages(t *testing.T) {
 		}
 	}
 	for language, want := range map[string]string{"es-419": "es", "sw-KE": "sw", "id-ID": "id", "en": "en"} {
-		endpoint, err := listenEndpoint(policy, "wss://api.deepgram.com/v2/listen", fluxMultilingual, protocol.RequestOptions{Language: language}, *media(), runtimepkg.AudioDeliveryLive, "")
+		endpoint, err := listenEndpoint(policy, "wss://api.deepgram.com/v2/listen", fluxMultilingual, protocol.RequestOptions{Language: language}, *media(), runtimepkg.AudioDeliveryLive, "", false)
 		if err != nil {
 			t.Fatalf("flux %s: %v", language, err)
 		}

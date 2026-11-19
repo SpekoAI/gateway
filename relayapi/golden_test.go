@@ -30,8 +30,24 @@ func TestGoldenFixturesRoundTrip(t *testing.T) {
 	assertGolden[relayapi.LLMRequest](t, "llm-request-structured.json")
 	assertGolden[relayapi.LLMResponse](t, "llm-response.json")
 	assertGolden[relayapi.EvaluationRequest](t, "evaluation-request.json")
+	assertGoldenAudioEvaluationRequest(t)
 	assertGoldenEvaluationResponse(t)
 	assertGoldenFrame[relayapi.LiveSessionStart](t, "ws-live-messages.json", 0)
+}
+
+// The audio evaluation request part has its own validator (state optional,
+// text-only questions), so it cannot use assertGolden's Validate().
+func assertGoldenAudioEvaluationRequest(t *testing.T) {
+	t.Helper()
+	raw := readFixture(t, "evaluation-audio-request.json")
+	var request relayapi.EvaluationRequest
+	if err := json.Unmarshal(raw, &request); err != nil {
+		t.Fatalf("evaluation-audio-request.json: decode: %v", err)
+	}
+	if err := request.ValidateAudio(); err != nil {
+		t.Fatalf("evaluation-audio-request.json: must validate: %v", err)
+	}
+	assertStableBytes(t, "evaluation-audio-request.json", raw, request)
 }
 
 func assertGoldenEvaluationResponse(t *testing.T) {

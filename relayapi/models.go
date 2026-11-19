@@ -53,6 +53,13 @@ type ModelCapabilities struct {
 	// its route carries a target language and returns no assistant turn.
 	Translation             bool     `json:"translation"`
 	EvaluationQuestionTypes []string `json:"evaluation_question_types,omitempty"`
+	// EvaluationInputs lists what an evaluation model decides over: "text"
+	// (a JSON body with state) and/or "audio" (a multipart body with a WAV
+	// clip). Omitted means text only. Evaluation models only.
+	EvaluationInputs []string `json:"evaluation_inputs,omitempty"`
+	// EvaluationLimits are the model's published request bounds. Omitted or
+	// zero fields mean no published bound. Evaluation models only.
+	EvaluationLimits *EvaluationLimits `json:"evaluation_limits,omitempty"`
 }
 
 // SampleRateRange is an inclusive set of sample rates accepted by one audio
@@ -229,7 +236,7 @@ func (m Model) Validate() error {
 			return fmt.Errorf("regions[%d]: region id must not be blank", i)
 		}
 	}
-	if (m.Kind == KindLLM || m.Kind == KindEvaluation) && len(m.AudioFormats) != 0 {
+	if m.Kind == KindLLM && len(m.AudioFormats) != 0 {
 		return fmt.Errorf("audio_formats: must be omitted for non-speech models")
 	}
 	if (m.Kind == KindSTT || m.Kind == KindTTS || m.Kind == KindS2S) && len(m.AudioFormats) == 0 {
@@ -288,8 +295,35 @@ func (m Model) Validate() error {
 			}
 			seenQuestionTypes[questionType] = struct{}{}
 		}
-	} else if len(m.Capabilities.EvaluationQuestionTypes) != 0 {
-		return fmt.Errorf("evaluation_question_types: valid only for evaluation models")
+		seenInputs := make(map[string]struct{}, len(m.Capabilities.EvaluationInputs))
+		for _, input := range m.Capabilities.EvaluationInputs {
+			if input != EvaluationInputText && input != EvaluationInputAudio {
+				return fmt.Errorf("evaluation_inputs: unsupported value %q", input)
+			}
+			if _, duplicate := seenInputs[input]; duplicate {
+				return fmt.Errorf("evaluation_inputs: duplicate value %q", input)
+			}
+			seenInputs[input] = struct{}{}
+		}
+		// An audio evaluation model lists the clip formats it accepts; a
+		// text-only one lists none.
+		if audio := m.Capabilities.AcceptsEvaluationInput(EvaluationInputAudio); audio != (len(m.AudioFormats) != 0) {
+			return fmt.Errorf("audio_formats: required exactly when evaluation_inputs includes audio")
+		}
+		// /v1/evaluations takes one WAV (PCM s16le) clip, so that is the
+		// only format an evaluation model can usefully advertise.
+		for i, format := range m.AudioFormats {
+			if format.Encoding != "pcm_s16le" {
+				return fmt.Errorf("audio_formats[%d]: evaluation models accept pcm_s16le only", i)
+			}
+		}
+		if limits := m.Capabilities.EvaluationLimits; limits != nil {
+			if err := limits.Validate(); err != nil {
+				return fmt.Errorf("evaluation_limits: %w", err)
+			}
+		}
+	} else if len(m.Capabilities.EvaluationQuestionTypes) != 0 || len(m.Capabilities.EvaluationInputs) != 0 || m.Capabilities.EvaluationLimits != nil {
+		return fmt.Errorf("evaluation_question_types, evaluation_inputs and evaluation_limits: valid only for evaluation models")
 	}
 	for i, format := range m.OutputAudioFormats {
 		if err := format.Validate(); err != nil {

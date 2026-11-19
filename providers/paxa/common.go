@@ -71,9 +71,11 @@ func classify(code string, status int) (string, bool) {
 	}
 }
 
+// providerError keeps the problem title as ProviderCode: it is Paxa's stable
+// code, in a field SafeProviderCode's generic envelope reading does not look at.
 func providerError(message string, detail problem, status int, raw []byte) *runtimepkg.ProviderError {
 	canonical, retryable := classify(detail.Title, status)
-	providerErr := &runtimepkg.ProviderError{Code: canonical, Message: message, Retryable: retryable, ProviderStatus: status}
+	providerErr := &runtimepkg.ProviderError{Code: canonical, Message: message, Retryable: retryable, ProviderStatus: status, ProviderCode: detail.Title}
 	if detail.Title != "" {
 		providerErr.Message += " (" + detail.Title + ")"
 	}
