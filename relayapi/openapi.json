@@ -1927,20 +1927,161 @@
             "$ref": "#/components/schemas/EvaluationRouting"
           },
           "state": {
-            "type": "string",
-            "minLength": 1
+            "description": "Optional plain-text context about the clip. Null means absent.",
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AudioEvaluationText"
+              }
+            ]
           },
           "questions": {
             "type": "object",
             "minProperties": 1,
+            "propertyNames": {
+              "pattern": "^[A-Za-z0-9_-]{1,64}$"
+            },
             "additionalProperties": {
-              "$ref": "#/components/schemas/EvaluationQuestion"
+              "$ref": "#/components/schemas/AudioEvaluationQuestion"
             }
           }
         },
         "required": [
           "routing",
           "questions"
+        ],
+        "additionalProperties": false
+      },
+      "AudioEvaluationText": {
+        "type": "string",
+        "description": "A non-blank plain-text string.",
+        "pattern": "\\S"
+      },
+      "AudioEvaluationQuestion": {
+        "description": "A noul, choice, or score question in an audio evaluation. Same primitives as EvaluationQuestion, with plain-text content only. Choice option keys must not start or end with whitespace and must not contain control characters or whitespace other than an ASCII space; their length is bounded per model by max_option_name_chars.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AudioNoulQuestion"
+          },
+          {
+            "$ref": "#/components/schemas/AudioChoiceQuestion"
+          },
+          {
+            "$ref": "#/components/schemas/AudioScoreQuestion"
+          }
+        ]
+      },
+      "AudioNoulQuestion": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "noul"
+            ]
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/AudioEvaluationText"
+          },
+          "criteria": {
+            "type": "object",
+            "minProperties": 1,
+            "properties": {
+              "true": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AudioEvaluationText"
+                  }
+                ]
+              },
+              "false": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AudioEvaluationText"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "type",
+          "instructions"
+        ],
+        "additionalProperties": false
+      },
+      "AudioChoiceQuestion": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "choice"
+            ]
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/AudioEvaluationText"
+          },
+          "criteria": {
+            "type": "object",
+            "minProperties": 2,
+            "maxProperties": 255,
+            "propertyNames": {
+              "pattern": "^\\S(?:[ \\S]*\\S)?$"
+            },
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/AudioEvaluationText"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "instructions",
+          "criteria"
+        ],
+        "additionalProperties": false
+      },
+      "AudioScoreQuestion": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "score"
+            ]
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/AudioEvaluationText"
+          },
+          "criteria": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 10,
+            "items": {
+              "$ref": "#/components/schemas/AudioEvaluationText"
+            }
+          }
+        },
+        "required": [
+          "type",
+          "instructions",
+          "criteria"
         ],
         "additionalProperties": false
       },

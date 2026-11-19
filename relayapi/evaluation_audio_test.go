@@ -36,6 +36,13 @@ func TestValidateAudioAcceptsTextQuestionsWithoutState(t *testing.T) {
 	if err := request.ValidateAudio(); err != nil {
 		t.Fatalf("audio request with text state must validate: %v", err)
 	}
+	// Inner ASCII spaces in an option key are allowed.
+	sentiment := request.Questions["sentiment"]
+	sentiment.Criteria = raw(`{"very angry":null,"other":null}`)
+	request.Questions["sentiment"] = sentiment
+	if err := request.ValidateAudio(); err != nil {
+		t.Fatalf("an option key with an inner space must validate: %v", err)
+	}
 	// The text path still requires state: an audio-shaped body sent as JSON
 	// is not a valid text evaluation.
 	request.State = nil
@@ -73,6 +80,21 @@ func TestValidateAudioRejectsStructuredContentAndBadIDs(t *testing.T) {
 			q.Criteria = raw(`{"true":["explicit"]}`)
 			r.Questions["wants_human"] = q
 		}, "criteria.true"},
+		{"option with a leading space", func(r *EvaluationRequest) {
+			q := r.Questions["sentiment"]
+			q.Criteria = raw(`{" leading":null,"other":null}`)
+			r.Questions["sentiment"] = q
+		}, "start or end with whitespace"},
+		{"option with a tab", func(r *EvaluationRequest) {
+			q := r.Questions["sentiment"]
+			q.Criteria = raw(`{"very\tangry":null,"other":null}`)
+			r.Questions["sentiment"] = q
+		}, "control characters"},
+		{"option with a non-ASCII space", func(r *EvaluationRequest) {
+			q := r.Questions["sentiment"]
+			q.Criteria = raw(`{"very angry":null,"other":null}`)
+			r.Questions["sentiment"] = q
+		}, "control characters"},
 		{"id with a space", func(r *EvaluationRequest) { r.Questions["wants human"] = r.Questions["wants_human"] }, "must match"},
 		{"id too long", func(r *EvaluationRequest) { r.Questions[strings.Repeat("a", 65)] = r.Questions["wants_human"] }, "must match"},
 		{"auto routing", func(r *EvaluationRequest) { r.Routing = Routing{Mode: RoutingModeAuto, Objective: ObjectiveBalanced} }, "explicit"},

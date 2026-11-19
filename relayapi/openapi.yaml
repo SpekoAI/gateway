@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:684730808977477651ac80ccc383cd82d45507026247c1dae5c3dae9edfdfc71
-# yaml-body: sha256:3dc54e02bfa15166d5c243fe1121fb74441a8f6c6ba8895b43c44a88b020e910
+# json-mirror: openapi.json sha256:6e4ab0991cd6919b224b7bbbd7dd67a795aa0ed70e48f3999d2972ad46c65e3f
+# yaml-body: sha256:16f478a4b2127c258b5a78183749615a502edfa8a1204655c0f47b907b374ece
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -1793,14 +1793,92 @@ components:
         routing:
           $ref: "#/components/schemas/EvaluationRouting"
         state:
-          type: string
-          minLength: 1
+          description: Optional plain-text context about the clip. Null means absent.
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/AudioEvaluationText"
         questions:
           type: object
           minProperties: 1
+          propertyNames:
+            pattern: "^[A-Za-z0-9_-]{1,64}$"
           additionalProperties:
-            $ref: "#/components/schemas/EvaluationQuestion"
+            $ref: "#/components/schemas/AudioEvaluationQuestion"
       required: [routing, questions]
+      additionalProperties: false
+    AudioEvaluationText:
+      type: string
+      description: A non-blank plain-text string.
+      pattern: "\\S"
+    AudioEvaluationQuestion:
+      description: >-
+        A noul, choice, or score question in an audio evaluation. Same
+        primitives as EvaluationQuestion, with plain-text content only. Choice
+        option keys must not start or end with whitespace and must not contain
+        control characters or whitespace other than an ASCII space; their
+        length is bounded per model by max_option_name_chars.
+      oneOf:
+        - $ref: "#/components/schemas/AudioNoulQuestion"
+        - $ref: "#/components/schemas/AudioChoiceQuestion"
+        - $ref: "#/components/schemas/AudioScoreQuestion"
+    AudioNoulQuestion:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [noul]
+        instructions:
+          $ref: "#/components/schemas/AudioEvaluationText"
+        criteria:
+          type: object
+          minProperties: 1
+          properties:
+            "true":
+              oneOf:
+                - type: "null"
+                - $ref: "#/components/schemas/AudioEvaluationText"
+            "false":
+              oneOf:
+                - type: "null"
+                - $ref: "#/components/schemas/AudioEvaluationText"
+          additionalProperties: false
+      required: [type, instructions]
+      additionalProperties: false
+    AudioChoiceQuestion:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [choice]
+        instructions:
+          $ref: "#/components/schemas/AudioEvaluationText"
+        criteria:
+          type: object
+          minProperties: 2
+          maxProperties: 255
+          propertyNames:
+            pattern: "^\\S(?:[ \\S]*\\S)?$"
+          additionalProperties:
+            oneOf:
+              - type: "null"
+              - $ref: "#/components/schemas/AudioEvaluationText"
+      required: [type, instructions, criteria]
+      additionalProperties: false
+    AudioScoreQuestion:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [score]
+        instructions:
+          $ref: "#/components/schemas/AudioEvaluationText"
+        criteria:
+          type: array
+          minItems: 2
+          maxItems: 10
+          items:
+            $ref: "#/components/schemas/AudioEvaluationText"
+      required: [type, instructions, criteria]
       additionalProperties: false
     EvaluationLimits:
       type: object

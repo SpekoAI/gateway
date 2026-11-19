@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -107,6 +108,9 @@ func (q EvaluationQuestion) validateText() error {
 		var criteria map[string]json.RawMessage
 		_ = json.Unmarshal(q.Criteria, &criteria)
 		for option, description := range criteria {
+			if err := validateAudioOptionName(option); err != nil {
+				return fmt.Errorf("criteria: option %q %w", option, err)
+			}
 			if !evaluationTextOrNull(description) {
 				return fmt.Errorf("criteria[%q]: must be null or a non-blank string", option)
 			}
@@ -118,6 +122,22 @@ func (q EvaluationQuestion) validateText() error {
 			if _, ok := evaluationText(level); !ok {
 				return fmt.Errorf("criteria[%d]: must be a non-blank string", index)
 			}
+		}
+	}
+	return nil
+}
+
+// validateAudioOptionName applies the option-key rule audio decision vendors
+// share: inner ASCII spaces are fine, but not leading or trailing whitespace,
+// control characters, or any other whitespace (Gemini rejects those keys).
+// Length is a per-model bound, MaxOptionNameChars.
+func validateAudioOptionName(name string) error {
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("must not start or end with whitespace")
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) || (unicode.IsSpace(r) && r != ' ') {
+			return fmt.Errorf("must not contain control characters or whitespace other than an ASCII space")
 		}
 	}
 	return nil
