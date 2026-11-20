@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:57f0d5bda04d678495bc483f1f2a232442697c8878294d1d050f6c525ba6a7f9
-# yaml-body: sha256:cc3fe682e80053f802fe1e05757422981c6a4bde106bd1fcfa1d01946cc0cc80
+# json-mirror: asyncapi.json sha256:4bae36459da922cb00001fffb7af5cb301d148b4a3c4065e20ee18ba592886d9
+# yaml-body: sha256:c9d3329d3638ae0473c437c803d91c1cb7450c3182fd1038cf14cba906a2ec66
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -617,9 +617,9 @@ components:
       title: TTS binary audio frame
       summary: >-
         One binary WebSocket frame of synthesized audio in the format named by
-        session.ready's audio (pcm_s16le 24 kHz mono when session.ready has no
-        audio), sent between the utterance.started and utterance.done events
-        that share its sequence number. Binary frames are untyped: they carry
+        session.ready's audio (see TTSSessionReady for servers that omit it),
+        sent between the utterance.started and utterance.done events that
+        share its sequence number. Binary frames are untyped: they carry
         no JSON envelope.
       contentType: application/octet-stream
       payload:
@@ -1473,8 +1473,11 @@ components:
       description: >-
         Confirms admission and reports the concrete route. It is always the
         first event frame; the client must not append text before it. audio
-        is the format the binary audio frames will carry; servers that
-        predate the field omit it and always send pcm_s16le 24 kHz mono.
+        is the format the binary audio frames will carry. Servers that
+        predate the field omit it and do not report the format: depending on
+        their version they send the requested format or pcm_s16le 24 kHz
+        mono, so a client that must be certain on such a server requests
+        pcm_s16le 24 kHz mono.
       properties:
         type:
           type: string
