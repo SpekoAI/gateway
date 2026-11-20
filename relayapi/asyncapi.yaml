@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:6e3817bd5a8eaa0a66f8f343ea3682244a45260461fe637b8b6004877c8d2362
-# yaml-body: sha256:6a04c5d6e04ac8507995d8694be9bb5fd06db7fb71ae7b9250f697b73c45fcaa
+# json-mirror: asyncapi.json sha256:c0f754611096b9b6a128833b0457ffc60df929c176c01761407baecb7455fdb3
+# yaml-body: sha256:53a454e78f36a3a60f45b09715a164da9116bdd46ad3cb3a82e61989d72468a8
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -1471,7 +1471,9 @@ components:
       type: object
       description: >-
         Confirms admission and reports the concrete route. It is always the
-        first event frame; the client must not append text before it.
+        first event frame; the client must not append text before it. audio
+        is the format the binary audio frames will carry; servers that
+        predate the field omit it and always send pcm_s16le 24 kHz mono.
       properties:
         type:
           type: string
@@ -1481,6 +1483,8 @@ components:
           type: string
         route:
           $ref: "#/components/schemas/Route"
+        audio:
+          $ref: "#/components/schemas/AudioConfig"
       required:
         - type
         - request_id

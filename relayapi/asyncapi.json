@@ -1420,7 +1420,7 @@
       },
       "TTSSessionReady": {
         "type": "object",
-        "description": "Confirms admission and reports the concrete route. It is always the first event frame; the client must not append text before it.",
+        "description": "Confirms admission and reports the concrete route. It is always the first event frame; the client must not append text before it. audio is the format the binary audio frames will carry; servers that predate the field omit it and always send pcm_s16le 24 kHz mono.",
         "properties": {
           "type": {
             "type": "string",
@@ -1433,6 +1433,9 @@
           },
           "route": {
             "$ref": "#/components/schemas/Route"
+          },
+          "audio": {
+            "$ref": "#/components/schemas/AudioConfig"
           }
         },
         "required": [
