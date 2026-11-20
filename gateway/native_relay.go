@@ -70,6 +70,31 @@ var nativeHTTPRoutes = map[string]bool{
 	"/v1/tts/speech":         true,
 }
 
+// The Router's native voice routes. True marks the routes whose model is the
+// one query parameter; GPT-Live and Gemini name it in their first frame.
+var nativeVoiceRoutes = map[string]bool{
+	relayapi.RealtimeRoutePath:        true,
+	relayapi.TranslationRoutePath:     true,
+	relayapi.QwenTranslationRoutePath: true,
+	relayapi.LiveRoutePath:            false,
+	relayapi.BidiRoutePath:            false,
+}
+var nativeVoiceModel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+// nativeQueryAllowed admits no URL parameters except exactly one bounded
+// model on a query-selected voice route, so no caller can steer the relay hop.
+func nativeQueryAllowed(u *url.URL) bool {
+	if u.RawPath != "" || u.ForceQuery {
+		return false
+	}
+	byModel := nativeVoiceRoutes[u.Path]
+	if u.RawQuery == "" {
+		return !byModel
+	}
+	query, err := url.ParseQuery(u.RawQuery)
+	return byModel && err == nil && len(query) == 1 && len(query["model"]) == 1 && nativeVoiceModel.MatchString(query.Get("model"))
+}
+
 func NewNativeRelay(config NativeRelayConfig) (*NativeRelayServer, error) {
 	origin, err := url.Parse(config.RelayOrigin)
 	if err != nil || origin == nil || origin.Host == "" || origin.User != nil || origin.Opaque != "" || origin.RawQuery != "" || origin.ForceQuery || origin.Fragment != "" || (origin.Path != "" && origin.Path != "/") || origin.RawPath != "" {
@@ -255,14 +280,17 @@ func (s *NativeRelayServer) Handler() http.Handler {
 	for path := range nativeHTTPRoutes {
 		mux.HandleFunc("POST "+path, s.modelHTTP)
 	}
+	for path := range nativeVoiceRoutes {
+		mux.HandleFunc("GET "+path, s.speech)
+	}
 	return mux
 }
 func (s *NativeRelayServer) begin(w http.ResponseWriter, r *http.Request) (context.Context, func(), bool) {
 	if !s.authorizeLocal(w, r) || !s.authorizeModel(w, r) {
 		return nil, nil, false
 	}
-	if r.URL.RawQuery != "" || r.URL.ForceQuery || r.URL.RawPath != "" {
-		writeError(w, http.StatusBadRequest, "invalid_request", "native model routes do not accept URL parameters")
+	if !nativeQueryAllowed(r.URL) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "native model routes accept only their model selector")
 		return nil, nil, false
 	}
 	s.mu.Lock()
@@ -386,6 +414,7 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	}
 	endpoint := *s.origin
 	endpoint.Path = r.URL.Path
+	endpoint.RawQuery = r.URL.RawQuery // validated by begin
 	dialCtx, cancelDial := context.WithTimeout(ctx, s.setupTimeout)
 	setupDeadline, _ := dialCtx.Deadline()
 	// websocket.Dial retains only 1 KiB of an unsuccessful upgrade body.

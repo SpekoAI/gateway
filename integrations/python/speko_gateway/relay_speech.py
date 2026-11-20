@@ -134,6 +134,7 @@ class RelaySpeechClient:
         if setup_timeout <= 0:
             raise ValueError("setup_timeout must be positive")
         self._origin = base_url.rstrip("/")
+        self._api_key = api_key
         self._platform_session_id = session_id
         self._setup_timeout = setup_timeout
         trace = aiohttp.TraceConfig()
@@ -142,6 +143,13 @@ class RelaySpeechClient:
             raise GatewayError("Relay redirects are not accepted", retryable=False)
 
         trace.on_request_redirect.append(reject_redirect)
+
+        async def identify_request(_session, _context, params):
+            # Each connection is its own admission. Callers that do not name
+            # one (LiveKit realtime models) get a fresh key, never a shared one.
+            params.headers.setdefault("Idempotency-Key", str(uuid.uuid4()))
+
+        trace.on_request_start.append(identify_request)
 
         async def preserve_rejection(_session, _context, params):
             response = params.response
