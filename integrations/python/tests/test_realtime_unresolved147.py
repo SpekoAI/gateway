@@ -101,11 +101,15 @@ async def test_scoped_gpt_request_reaches_only_its_genuine_delegated_backend(
     native_binary,
 ):
     requests = asyncio.Queue()
+    counted = []
+    ask_seen, backend_rendered = asyncio.Event(), asyncio.Event()
     ask = "Original scoped task 147"
 
     async def peer(request):
         if request.path == "/v1/llm/responses":
-            requests.put_nowait(await request.json())
+            body = await request.json()
+            counted.append(body)
+            requests.put_nowait(body)
             return response(
                 [
                     ("response.text.delta", {"delta": "Owned answer"}),
@@ -114,20 +118,39 @@ async def test_scoped_gpt_request_reaches_only_its_genuine_delegated_backend(
             )
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        await ws.receive_json()
+        startup = await ws.receive_json()
         await ws.send_json(
             {"type": "session.started", "session": {"id": "owned-session"}}
         )
-        await ws.receive_json()
-        await ws.send_json(
-            {
-                "type": "session.delegation.created",
-                "offset_ms": 0,
-                "delegation": {"id": "original-delegation", "target": "client"},
-            }
-        )
+        requested = False
+
+        async def delegate_original():
+            nonlocal requested
+            if requested:
+                return
+            requested = True
+            await ws.send_json(
+                {
+                    "type": "session.delegation.created",
+                    "offset_ms": 0,
+                    "delegation": {"id": "original-delegation", "target": "client"},
+                }
+            )
+
+        # A dedicated original ask installs its immutable scope at startup,
+        # before any auto-delegation. The old single socket receives it later.
+        if ask in startup["session"].get("instructions", ""):
+            ask_seen.set()
+            await delegate_original()
         async for message in ws:
-            if json.loads(message.data)["type"] == "session.close":
+            command = json.loads(message.data)
+            if command.get("type") == "session.commentary.append":
+                if command.get("delegation_id") == "original-delegation":
+                    backend_rendered.set()
+                elif ask in command.get("content", ""):
+                    ask_seen.set()
+                    await delegate_original()
+            if command.get("type") == "session.close":
                 await ws.send_json({"type": "session.closed", "usage": {}})
                 await ws.close()
         return ws
@@ -148,6 +171,9 @@ async def test_scoped_gpt_request_reaches_only_its_genuine_delegated_backend(
             assert ask in json.dumps(request["input"]), (
                 "the genuine scoped request was absent from delegated backend input"
             )
+            await asyncio.wait_for(ask_seen.wait(), 5)
+            await asyncio.wait_for(backend_rendered.wait(), 5)
+            assert len(counted) == 1, "one original ask replayed its backend admission"
         finally:
             if reply is not None:
                 reply.cancel()
@@ -166,6 +192,9 @@ async def test_retired_gpt_ask_cannot_assign_delayed_voice_to_the_next_reply(
     native_binary,
 ):
     generations = asyncio.Queue()
+    first_command, second_command = asyncio.Event(), asyncio.Event()
+    first_socket = None
+    request_count = 0
 
     async def peer(request):
         ws = web.WebSocketResponse()
@@ -174,21 +203,39 @@ async def test_retired_gpt_ask_cannot_assign_delayed_voice_to_the_next_reply(
         await ws.send_json(
             {"type": "session.started", "session": {"id": "owned-session"}}
         )
-        first = await ws.receive_json()
-        second = await ws.receive_json()
-        assert first["type"] == second["type"] == "session.commentary.append"
-        # The owned provider captured the first ask before the second exists.
-        # Its delayed original audio has no request/delegation identity field.
-        await ws.send_json(
-            {
-                "type": "session.output_audio.delta",
-                "delta": base64.b64encode(b"\x01\x10" * 2400).decode(),
-            }
-        )
-        async for message in ws:
-            if json.loads(message.data)["type"] == "session.close":
-                await ws.send_json({"type": "session.closed", "usage": {}})
-                await ws.close()
+
+        async def delayed_original_voice():
+            await second_command.wait()
+            if ws is first_socket:
+                # This exact physical stream received the first genuine ask
+                # before the second API invocation. No inferred provider ID.
+                await ws.send_json(
+                    {
+                        "type": "session.output_audio.delta",
+                        "delta": base64.b64encode(b"\x01\x10" * 2400).decode(),
+                    }
+                )
+
+        task = asyncio.create_task(delayed_original_voice())
+        try:
+            async for message in ws:
+                command = json.loads(message.data)
+                if command.get(
+                    "type"
+                ) == "session.commentary.append" and not command.get("delegation_id"):
+                    nonlocal first_socket, request_count
+                    request_count += 1
+                    if not first_command.is_set():
+                        first_socket = ws
+                        first_command.set()
+                    else:
+                        second_command.set()
+                if command.get("type") == "session.close":
+                    await ws.send_json({"type": "session.closed", "usage": {}})
+                    await ws.close()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         return ws
 
     async with native_stack(native_binary, peer) as (socket, _):
@@ -200,11 +247,15 @@ async def test_retired_gpt_ask_cannot_assign_delayed_voice_to_the_next_reply(
             await session._update_session(chat_ctx=llm.ChatContext.empty(), tools=[])
             await session.duplex_session.start()
             first = session.generate_reply()
+            await asyncio.wait_for(first_command.wait(), 5)
             second = session.generate_reply()
             await asyncio.gather(first, return_exceptions=True)
             await asyncio.wait_for(generations.get(), 5)
             assert not second.done(), (
                 "delayed voice from a retired ask claimed the next reply handle"
+            )
+            assert request_count == 2, (
+                "a genuine ask opened more than one native request"
             )
         finally:
             for future in [first, second]:

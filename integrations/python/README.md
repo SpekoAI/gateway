@@ -35,6 +35,19 @@ delegation IDs do not repeat paid backend work. Tool results remain available
 to later delegations; results that request no reply are sent as silent context.
 Long Unicode results are split losslessly into bounded native appends.
 
+Each genuine application `generate_reply()` opens its own independently admitted
+native GPT operation, with the same selected voice/model and Speko backend.
+The original context, scoped instructions, tools and setup deadline are captured
+before waits. The primary socket continues ordinary caller/tool flow. Each new
+open can consume separate admission, funding and capacity; credentials that
+cannot authorize another operation refuse it without retrying the previous ask.
+Previous streams stay retained through actual cancellation/session close or
+server expiry, so repeated asks can increase concurrent resource usage. A local
+playback pause or Future completion does not prove a provider answer ended.
+Actual heard assistant segments join the primary conversation; private scoped
+instructions stay with their original operation. Close the owning AgentSession
+and model to join their owned streams and cooperative tool tasks.
+
 GPT-Live transcript deltas remain timed fragments, not completed caller turns.
 Use the separately selected and admitted STT leg for canonical caller reporting.
 The model's continuous audio and transcript fragments are segmented by LiveKit's
@@ -683,11 +696,11 @@ Those attachments are posted separately: older Gateways may reject them while
 unrelated turn markers remain deliverable. The probe counts rejected markers
 without retrying them.
 
-The PR147 realtime continuation remains **unaccepted** while its enabled GPT
-scoped/repeated reply ownership gates are failing. Repeated GPT application asks
-remain in the API; a one-ask refusal is not a replacement for the supported
-contract. Gemini cancellation uses an exact private SDK task/registration port;
-missing or noncooperative ownership remains UNKNOWN. See
+The PR147 realtime continuation remains **unaccepted** pending current review,
+CI and the enabled eventless Gemini R1 gates. Repeated GPT application asks keep
+their supported contract through isolated original operations. Exact private SDK
+ports bind original SpeechHandle/generation/tool objects; missing or
+noncooperative ownership remains UNKNOWN. See
 [native realtime review boundaries](../../docs/native-realtime-review-boundaries.md)
-for fixed behavior, retained tests and the missing GPT correlation boundary.
-These library callsites issue no fresh execution or funding authority.
+for the admission costs, retained-operation lifetime, proofs and limits.
+These library callsites issue no execution or funding authority.

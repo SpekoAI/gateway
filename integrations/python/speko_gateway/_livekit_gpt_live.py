@@ -81,6 +81,7 @@ class _GPTLiveDuplexModel(_Model):
         model: str,
         voice: str,
         backend: Any,
+        _original_ask: Any = None,
     ) -> None:
         if _Model is object:
             raise ValueError("GPT-Live requires LiveKit's DuplexModel interface")
@@ -126,6 +127,7 @@ class _GPTLiveDuplexModel(_Model):
             )
         )
         self._client, self._backend = client, backend
+        self._original_ask = _original_ask
         self._model, self._voice = model, voice
         self._used = self._closed = False
         self._sessions: weakref.WeakSet[_GPTLiveSession] = weakref.WeakSet()
@@ -181,6 +183,23 @@ class _GPTLiveSession(_Session):
         self._error_announced = False
         self._running = False
         self._task = asyncio.create_task(self._run(), name="SpekoGPTLive")
+
+    async def _update_session(self, **options) -> None:
+        original = self._model._original_ask
+        if original is None:
+            await super()._update_session(**options)
+            return
+        if self._started or self._configured.is_set():
+            raise llm.RealtimeError("Original application setup is immutable")
+        self._instructions = _text(original.original.base_instructions)
+        if original.original.instructions:
+            self._instructions += "\n" + _text(original.original.instructions)
+        # Full immutable backend/tool history is retained separately from the
+        # native primary's supported text-only startup representation.
+        self._history = original.context()
+        self._tools = llm.ToolContext(list(original.original.tools))
+        _relay_tools(self._tools.flatten())
+        self._configured.set()
 
     @property
     def audio_stream(self) -> AsyncIterable:
@@ -267,16 +286,19 @@ class _GPTLiveSession(_Session):
                 raise llm.RealtimeError(
                     "GPT-Live received an unknown or conflicting tool result"
                 )
-            self._remember([item])
-            if self._started and isinstance(item, llm.ChatMessage):
-                text = item.text_content
-                if text:
-                    self._append(
-                        "session.instructions.append"
-                        if item.role in {"system", "developer"}
-                        else "session.thinking.append",
-                        f"{item.role}: {text}",
-                    )
+            self._append_context_item(item)
+
+    def _append_context_item(self, item: llm.ChatItem) -> None:
+        self._remember([item])
+        if self._started and isinstance(item, llm.ChatMessage):
+            text = item.text_content
+            if text:
+                self._append(
+                    "session.instructions.append"
+                    if item.role in {"system", "developer"}
+                    else "session.thinking.append",
+                    f"{item.role}: {text}",
+                )
 
     def _remember(self, items) -> None:
         combined = self._history.items + items
@@ -303,6 +325,10 @@ class _GPTLiveSession(_Session):
         history = []
         for item in self._history.items:
             if not isinstance(item, llm.ChatMessage) or not item.text_content:
+                if self._model._original_ask is not None and isinstance(
+                    item, (llm.FunctionCall, llm.FunctionCallOutput)
+                ):
+                    continue
                 raise llm.RealtimeError(
                     "GPT-Live startup history requires text messages"
                 )
@@ -407,7 +433,9 @@ class _GPTLiveSession(_Session):
             if len(self._seen_delegations) >= 128:
                 raise _failure()
             self._seen_delegations.add(identity)
-            context = self._history.copy()
+            from ._livekit_context import snapshot_context
+
+            context = snapshot_context(self._history)
             if self._instructions:
                 context.items.insert(
                     0, llm.ChatMessage(role="system", content=[self._instructions])
@@ -448,9 +476,11 @@ class _GPTLiveSession(_Session):
                 self._append("session.commentary.append", text, identity)
                 return
             functions = []
+            allowed_tools = {tool["name"] for tool in _relay_tools(tools)}
             for call in calls:
                 if (
-                    not _ID.fullmatch(call.call_id)
+                    call.name not in allowed_tools
+                    or not _ID.fullmatch(call.call_id)
                     or call.call_id in self._tool_results
                     or call.call_id in self._completed_results
                     or len(self._completed_results) + len(self._tool_results) >= 2048
@@ -500,7 +530,9 @@ class _GPTLiveSession(_Session):
             self._socket = await self._model._client.open(
                 protocol="openai.live.v1", model=self._model.model
             )
-            await self._socket.send_json(startup)
+            await asyncio.wait_for(
+                self._socket.send_json(startup), self._model._client._remaining_setup()
+            )
 
             async def receive():
                 async for frame in self._socket.events():
@@ -515,7 +547,7 @@ class _GPTLiveSession(_Session):
 
             async def send():
                 await asyncio.wait_for(
-                    asyncio.shield(self._ready), self._model._client._setup_timeout
+                    asyncio.shield(self._ready), self._model._client._remaining_setup()
                 )
                 async for command in self._commands:
                     await self._socket.send_json(command)
@@ -597,7 +629,9 @@ class _GPTLiveSession(_Session):
                     self._socket.send_json({"type": "session.close"}), 1
                 )
                 await asyncio.wait_for(self._remote_closed.wait(), 1)
-        if self._running:
+        # An announced error is already in the actual run task's finally/join.
+        # Canceling that join again can leak CancelledError on Python 3.10.
+        if self._running and not self._error_announced:
             self._task.cancel()
         await asyncio.gather(self._task, return_exceptions=True)
 
@@ -621,117 +655,20 @@ class GPTLiveModel(_Adapter):
         super().__init__(
             _GPTLiveDuplexModel(client, model=model, voice=voice, backend=backend)
         )
+        self._owned_sessions: weakref.WeakSet = weakref.WeakSet()
 
     def session(self, *, turn_detection_disabled: bool = False):
-        return _GPTLiveRealtimeSession(
-            self, super().session(turn_detection_disabled=turn_detection_disabled)
+        from ._livekit_gpt_ownership import GptOwnerSession
+        from ._livekit_tool_cancellation import capture_activity
+
+        session = GptOwnerSession(
+            self,
+            super().session(turn_detection_disabled=turn_detection_disabled),
+            capture_activity(self),
         )
-
-
-class _GPTLiveRealtimeSession(llm.RealtimeSession):
-    def __init__(self, model: GPTLiveModel, inner: llm.RealtimeSession):
-        super().__init__(model)
-        self._inner = inner
-        self._reply: asyncio.Future | None = None
-        inner.on("generation_created", self._generation)
-        inner.on("error", self._error)
-        for event in (
-            "input_speech_started",
-            "input_speech_stopped",
-            "input_audio_transcription_completed",
-            "session_reconnected",
-            "metrics_collected",
-            "remote_item_added",
-        ):
-            inner.on(event, lambda value, event=event: self.emit(event, value))
-
-    @property
-    def duplex_session(self):
-        return self._inner.duplex_session
-
-    @property
-    def chat_ctx(self):
-        return self._inner.chat_ctx
-
-    @property
-    def tools(self):
-        return self._inner.tools
-
-    def _generation(self, generation):
-        if self._reply is not None and not self._reply.done():
-            generation.user_initiated = True
-            self._reply.set_result(generation)
-            self._reply = None
-        self.emit("generation_created", generation)
-
-    def _fail_reply(self):
-        if self._reply is not None and not self._reply.done():
-            self._reply.set_exception(
-                llm.RealtimeError("GPT-Live ended before its reply")
-            )
-        self._reply = None
-
-    def _error(self, error):
-        self._fail_reply()
-        self.emit("error", error)
-
-    def generate_reply(
-        self, *, instructions=NOT_GIVEN, tool_choice=NOT_GIVEN, tools=NOT_GIVEN
-    ):
-        self._fail_reply()
-        future = self._reply = asyncio.get_running_loop().create_future()
-        try:
-            self.duplex_session._generate_reply(
-                instructions=instructions, tool_choice=tool_choice, tools=tools
-            )
-        except (llm.RealtimeError, GatewayError):
-            self._fail_reply()
-            return future
-
-        def expire():
-            if self._reply is future:
-                self._fail_reply()
-
-        timer = asyncio.get_running_loop().call_later(15, expire)
-        future.add_done_callback(lambda _: timer.cancel())
-        return future
-
-    async def start(self):
-        await self.duplex_session.start()
-
-    async def _update_session(self, **options):
-        await self._inner._update_session(**options)
-
-    async def update_instructions(self, instructions):
-        await self._inner.update_instructions(instructions)
-
-    async def update_chat_ctx(self, chat_ctx):
-        await self._inner.update_chat_ctx(chat_ctx)
-
-    async def update_tools(self, tools):
-        await self._inner.update_tools(tools)
-
-    def update_options(self, *, tool_choice=NOT_GIVEN):
-        self._inner.update_options(tool_choice=tool_choice)
-
-    def push_audio(self, frame):
-        self._inner.push_audio(frame)
-
-    def push_video(self, frame):
-        self._inner.push_video(frame)
-
-    def commit_audio(self):
-        self._inner.commit_audio()
-
-    def clear_audio(self):
-        self._inner.clear_audio()
-
-    def interrupt(self):
-        self._inner.interrupt()
-
-    def truncate(self, **options):
-        self._inner.truncate(**options)
+        self._owned_sessions.add(session)
+        return session
 
     async def aclose(self):
-        self._fail_reply()
-        await self._inner.aclose()
+        await asyncio.gather(*(session.aclose() for session in self._owned_sessions))
+        await super().aclose()

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any, Literal
@@ -53,6 +55,8 @@ class RelayRealtimeClient(_RelayTransport):
         socket_path: str | None = None,
         local_auth_token: str | None = None,
     ) -> None:
+        if not math.isfinite(setup_timeout) or setup_timeout <= 0:
+            raise ValueError("setup_timeout must be finite and positive")
         super().__init__(
             api_key=api_key,
             session_id=session_id,
@@ -63,6 +67,48 @@ class RelayRealtimeClient(_RelayTransport):
         )
         self._attempted = self._closed = False
         self._voice: RelayRealtimeSession | None = None
+        self._original_setup_deadline: float | None = None
+
+        def capture_original_request():
+            # This captures an UNFUNDED new caller operation. The server must
+            # independently authenticate/admit/fund/cap its actual HTTP open.
+            # Constructor custody avoids extracting secrets from HTTP headers.
+            if self._closed:
+                raise GatewayError("Realtime client is closed", retryable=False)
+            deadline = time.monotonic() + setup_timeout
+            used = False
+
+            def create_once():
+                nonlocal used
+                if used or self._closed or time.monotonic() >= deadline:
+                    raise GatewayError(
+                        "Original realtime request expired", retryable=False
+                    )
+                used = True
+                child = RelayRealtimeClient(
+                    api_key=api_key,
+                    session_id=session_id,
+                    base_url=base_url,
+                    setup_timeout=deadline - time.monotonic(),
+                    socket_path=socket_path,
+                    local_auth_token=local_auth_token,
+                )
+                child._original_setup_deadline = deadline
+                return child
+
+            return deadline, create_once
+
+        self._capture_original_request = capture_original_request
+
+    def _remaining_setup(self) -> float:
+        remaining = (
+            self._setup_timeout
+            if self._original_setup_deadline is None
+            else self._original_setup_deadline - time.monotonic()
+        )
+        if remaining <= 0:
+            raise GatewayError("Original realtime request expired", retryable=False)
+        return remaining
 
     async def open(
         self,
@@ -88,6 +134,7 @@ class RelayRealtimeClient(_RelayTransport):
         if query_model:
             target += "?model=" + model
         try:
+            remaining = self._remaining_setup()
             websocket = await asyncio.wait_for(
                 self._session.ws_connect(
                     target,
@@ -95,7 +142,7 @@ class RelayRealtimeClient(_RelayTransport):
                     max_msg_size=_FRAME_BYTES,
                     heartbeat=15,
                 ),
-                self._setup_timeout,
+                remaining,
             )
         except aiohttp.WSServerHandshakeError as error:
             raise GatewayError(
@@ -110,6 +157,12 @@ class RelayRealtimeClient(_RelayTransport):
                 "Relay realtime connection failed", retryable=False
             ) from None
         self._voice = RelayRealtimeSession(websocket)
+        try:
+            self._remaining_setup()
+        except GatewayError:
+            self._voice.abort()
+            await self._voice.aclose()
+            raise
         return self._voice
 
     async def aclose(self) -> None:

@@ -123,26 +123,58 @@ tasks remain separate controls.
 
 ## Explicit implementation and acceptance blockers
 
-Two enabled desired-behavior gates remain on the ordinary test path:
+Application asks now use separate physical native operations, while the primary
+transport continues ordinary caller/tool flow. Each genuine `generate_reply()`
+invocation captures its immutable context, scoped instructions, selected tools
+and original setup deadline before any await. A constructor-owned one-shot
+factory opens one new **unfunded** request using the same selected GPT model,
+voice and backend. The relay must independently authenticate, authorize, fund
+and cap that request. Reusable API credentials do not reuse the old grant;
+financial-request or otherwise ineligible credentials can refuse the new open.
+There is no reconnect, old-attempt replay, provider substitution or one-ask rule.
 
-1. **Scoped GPT task delivery.** The native commentary request has no echoed
-   causal binding to a later client delegation. The actual delegated backend
-   receives startup/history but not the scoped application ask. Retaining a
-   global or next-delegation instruction would donate the ask to unrelated old
-   work, so that remembered-instruction workaround is not installed.
-2. **Repeated GPT reply ownership.** Two ordinary application asks remain
-   callable. Delayed audio from a retired first ask can resolve the second
-   reply handle. GPT-Live audio has no per-response/delegation identity or
-   response-audio completion marker. Backend completion, a preamble, silence,
-   local playback, cancellation or seeing one delegation cannot prove old
-   provider work drained. The user explicitly requires repeated
-   `generate_reply()` support; a one-ask restriction is not installed.
+The private compatibility port binds the actual synchronous AgentSession call's
+original SpeechHandle, and later accepts generation/tool observations only from
+the inspected original SDK Activity code frame and exact original objects.
+A dedicated stream's first generation resolves only its own Future. Its later
+voice cannot resolve a newer application's Future. Native startup/history can
+delegate before commentary; immutable scoped input is installed before opening,
+and an already-observed startup delegation suppresses the redundant request.
+Backend/tool rounds use that original owner's context and selected tools.
+Identical provider delegation/call IDs on different streams establish no shared
+ownership. Exact SDK tool tasks and callback registration join separately.
 
-The missing boundary is provider-backed per-ask/delegation/audio identity plus
-terminal ownership, or an independently accepted per-ask admission/render path.
-This requirement is not a new wire field, authentication endpoint, issuer or
-mounted adapter. Constructing another client with the same supplied credential
-is not a fresh authority allocation.
+No local silence, first generation, Future resolution, SDK playback or later ask
+proves the physical provider response ended. Streams remain retained until their
+original cancellation, actual root/session close or server-enforced expiry.
+Public AgentSession interruption closes and joins the current application owners
+without retiring the primary conversation; a later genuine ask can independently
+request new admission. This does not invent a native cancellation control for
+ordinary primary audio. Actual session/model close remains the root boundary.
+The original setup deadline bounds queue waits, physical open and first
+generation; it is never renewed after waiting. After generation begins, provider
+authority and expiry remain the server's responsibility. Original-operation
+metadata is bounded by 128 retained operations and a shared 2 MiB captured
+context limit; generation identity retention is bounded by 128 per stream.
+These local resource limits confer no paid capacity or root lifetime.
+
+Actual forwarded/heard SDK assistant segments are copied into the primary's
+ordinary conversation history before its next microphone frame. Private scoped
+instructions and unheard native transcript fragments are never copied there.
+This observation does not close the dedicated physical stream or establish a
+whole-answer terminal. A noncooperative tool remains retained UNKNOWN/unjoined;
+root closure never turns it into a clean stop or NoIO receipt. Direct low-level
+consumers without exact SDK object membership cannot claim that cancellation
+port. The caller must close the actual AgentSession/models before their clients.
+
+The two original GPT scoped/late-voice assertions and original time windows are
+preserved. Only their owned-peer fixture was generalized to accept genuine
+requests over separate primary/per-ask sockets. Both assertions still reproduce
+semantic RED on archived exact `03f819c` production, and pass this composition.
+Additional actual-SDK controls preserve queued and late PCM playback, scoped
+tool/history ownership, ordinary microphone flow, pre-open cancellation and
+canonical refusal without retry. The two eventless Gemini R1 positives described
+above remain enabled RED and are a separate acceptance blocker.
 
 The owned peers use synthetic content and actual Go/SDK transport. They prove
 local behavior, not provider/factory activation, model funding, execution

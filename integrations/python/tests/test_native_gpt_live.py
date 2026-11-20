@@ -453,6 +453,10 @@ async def test_real_agent_session_runs_gpt_live_backend_tool_and_streams_both_au
             {"type": "session.started", "session": {"id": "live_real_agent"}}
         )
         ask = await ws.receive_json()
+        if ask.get("type") == "session.close":
+            await ws.send_json({"type": "session.closed", "usage": {}})
+            await ws.close()
+            return ws
         assert (
             ask["type"] == "session.commentary.append" and ask["delegation_id"] is None
         )
