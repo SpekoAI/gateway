@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 import json
 import os
@@ -1197,9 +1198,19 @@ async def test_native_sidecar_llm_ambiguity_remains_nonretryable(
     assert seen == [1]
 
 
+def realtime_engine(name):
+    engine = pytest.importorskip(name)
+    # Importing it loads the openai SDK: ~70k long-lived objects that make every
+    # later full collection slower. On CI runners that pause overran the 0.1 s
+    # windows in test_relay_speech_livekit, so keep them out of collections.
+    gc.collect()
+    gc.freeze()
+    return engine
+
+
 async def test_livekit_realtime_model_runs_through_the_native_sidecar(native_binary):
     # The engine livekit-plugins-openai and -xai re-export unchanged (>=1.8).
-    engine = pytest.importorskip("livekit.agents.llm._realtime.openai")
+    engine = realtime_engine("livekit.agents.llm._realtime.openai")
     from speko_gateway.livekit import realtime_options
 
     connections, first_frames = [], []
@@ -1256,7 +1267,7 @@ async def test_livekit_realtime_model_runs_through_the_native_sidecar(native_bin
 
 async def test_livekit_gpt_live_model_runs_through_the_native_sidecar(native_binary):
     # The engine livekit-plugins-openai's GPTLiveModel re-exports (>=1.8).
-    engine = pytest.importorskip("livekit.agents.llm._realtime.gpt_live")
+    engine = realtime_engine("livekit.agents.llm._realtime.gpt_live")
     from speko_gateway.livekit import realtime_options
 
     connections, starts = [], []
