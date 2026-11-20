@@ -93,8 +93,6 @@ def realtime_options(client: RelaySpeechClient) -> dict[str, Any]:
         "base_url": f"{client._origin}/v1",
         "api_key": client._api_key,
         "http_session": client._session,
-        # The plugins default to a separately paid transcription model.
-        "input_audio_transcription": None,
         # Every connection is a new paid admission: never retry silently.
         "conn_options": dataclasses.replace(DEFAULT_API_CONNECT_OPTIONS, max_retry=0),
     }

@@ -607,8 +607,7 @@ llm = openai.realtime.RealtimeModel(model="gpt-realtime-2.1", **realtime_options
 ```
 
 Each connection is a separately admitted and metered relay session with its
-own idempotency key. Connection retries are off, and the plugin's paid input
-transcription stays disabled. The native sidecar also forwards the GPT-Live,
+own idempotency key, and connection retries are off. The native sidecar also forwards the GPT-Live,
 Gemini Live and translation routes as raw vendor sockets; their LiveKit
 plugins do not use these routes, so `realtime_options` does not cover them.
 

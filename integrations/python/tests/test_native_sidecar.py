@@ -1251,7 +1251,4 @@ async def test_livekit_realtime_model_runs_through_the_native_sidecar(native_bin
         assert request.headers["Authorization"] == f"Bearer {MODEL_KEY}"
         assert request.headers["Speko-Client-Session-ID"] == session_id
         assert NATIVE_LOCAL_AUTHORIZATION not in request.headers
-    for frame in first_frames:
-        assert frame["type"] == "session.update"
-        transcription = frame["session"].get("audio", {}).get("input", {})
-        assert transcription.get("transcription") is None, "paid ASR enabled implicitly"
+    assert [frame["type"] for frame in first_frames] == ["session.update"] * 2
