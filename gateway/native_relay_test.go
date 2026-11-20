@@ -674,6 +674,10 @@ func TestNativeRelayWebSocketRefusalPreservesStatusEnvelopeAndRequestIdentity(t 
 				_, local := nativeServer(t, peer, nil)
 				req, _ := http.NewRequest("GET", local.URL+"/v1/stt/stream", nil)
 				req.Header = nativeHeaders("sk_speko_agent_owned")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Sec-WebSocket-Version", "13")
+				req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
 				response, err := http.DefaultClient.Do(req)
 				if err != nil {
 					t.Fatal(err)
@@ -685,5 +689,101 @@ func TestNativeRelayWebSocketRefusalPreservesStatusEnvelopeAndRequestIdentity(t 
 				}
 			})
 		}
+	}
+}
+
+func TestNativeRelayVoiceRoutesForwardOnlyTheirModelSelector(t *testing.T) {
+	var calls atomic.Int32
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		_, raw, err := conn.Read(r.Context())
+		if err != nil {
+			return
+		}
+		// Echo the frame with the path and query the relay actually received.
+		_ = conn.Write(r.Context(), websocket.MessageText, []byte(r.URL.RequestURI()+" "+string(raw)))
+	}))
+	defer peer.Close()
+	_, local := nativeServer(t, peer, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, target := range []string{
+		relayapi.RealtimeRoutePath + "?model=gpt-realtime-2.1",
+		relayapi.TranslationRoutePath + "?model=gpt-realtime-translate",
+		relayapi.QwenTranslationRoutePath + "?model=qwen3.8-livetranslate-flash-realtime",
+		relayapi.LiveRoutePath,
+		relayapi.BidiRoutePath,
+	} {
+		conn, _, err := websocket.Dial(ctx, local.URL+target, &websocket.DialOptions{HTTPHeader: nativeHeaders("sk_speko_agent_owned")})
+		if err != nil {
+			t.Fatalf("%s: %v", target, err)
+		}
+		if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"session.update"}`)); err != nil {
+			t.Fatal(err)
+		}
+		_, raw, err := conn.Read(ctx)
+		conn.CloseNow()
+		if err != nil || string(raw) != target+` {"type":"session.update"}` {
+			t.Fatalf("%s: got %q, %v", target, raw, err)
+		}
+	}
+	before := calls.Load()
+	for _, target := range []string{
+		relayapi.RealtimeRoutePath,
+		relayapi.RealtimeRoutePath + "?model=gpt-realtime-2.1&relay_origin=https://untrusted.invalid",
+		relayapi.RealtimeRoutePath + "?model=a&model=b",
+		relayapi.RealtimeRoutePath + "?model=../v1/llm",
+		relayapi.RealtimeRoutePath + "?",
+		relayapi.RealtimeRoutePath + "?model=gpt-realtime-2.1", // valid query, not an upgrade
+		relayapi.LiveRoutePath + "?model=gpt-live-1",
+		relayapi.BidiRoutePath + "?model=gemini-3.8-live",
+		"/v1/stt/stream?model=fixture",
+	} {
+		req, _ := http.NewRequest(http.MethodGet, local.URL+target, nil)
+		req.Header = nativeHeaders("sk_speko_agent_owned")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: status %d", target, response.StatusCode)
+		}
+	}
+	if calls.Load() != before {
+		t.Fatal("a refused voice request reached the relay")
+	}
+}
+
+func TestNativeRelayVoiceRefusesAnInvalidLocalUpgradeBeforeDialing(t *testing.T) {
+	var calls atomic.Int32
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1) }))
+	defer peer.Close()
+	_, local := nativeServer(t, peer, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	headers := nativeHeaders("sk_speko_agent_owned")
+	headers.Set("Origin", "https://untrusted.invalid")
+	_, response, err := websocket.Dial(ctx, local.URL+relayapi.RealtimeRoutePath+"?model=gpt-realtime-2.1", &websocket.DialOptions{HTTPHeader: headers})
+	if err == nil || response == nil || response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cross-origin upgrade accepted: %v", err)
+	}
+	// net/http routes HEAD to GET patterns; websocket.Accept refuses it.
+	head, _ := http.NewRequest(http.MethodHead, local.URL+relayapi.RealtimeRoutePath+"?model=gpt-realtime-2.1", nil)
+	head.Header = nativeHeaders("sk_speko_agent_owned")
+	head.Header.Set("Connection", "Upgrade")
+	head.Header.Set("Upgrade", "websocket")
+	head.Header.Set("Sec-WebSocket-Version", "13")
+	head.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	if response, err := http.DefaultClient.Do(head); err != nil || response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("HEAD upgrade accepted: %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("an invalid local upgrade reached the relay")
 	}
 }
