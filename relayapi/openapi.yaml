@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:6894b708b0f529469e24403bc6fda3a9ae6cdb6e3ba7fdd6536e80904c4469b3
-# yaml-body: sha256:da151211d12b19b344f08442e446d47cca64fbe0d81ccab381308c73124264b1
+# json-mirror: openapi.json sha256:f00eba7ecfa7ea8f5cd2a13cb8af245dd1e3a2708abe333c8e19c74fe579e95a
+# yaml-body: sha256:bed369573d4aef3526ef37aeb7ecf778652ecb4751dc1913a79c976581c621d0
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -35,10 +35,10 @@ info:
     Deprecation header and a Link with rel="deprecation", and provides at
     least 90 days of notice before the Sunset date. See the public
     versioning policy for the complete compatibility contract.
-  x-speko-versioning-policy: https://speko.ai/developers/versioning
+  x-speko-versioning-policy: https://speko.com/developers/versioning
 externalDocs:
   description: Router API lifecycle and deprecation policy
-  url: https://speko.ai/developers/versioning
+  url: https://speko.com/developers/versioning
 servers:
   - url: https://router.speko.dev
     description: >-
