@@ -606,8 +606,12 @@ from speko_gateway.livekit import realtime_options
 llm = openai.realtime.RealtimeModel(model="gpt-realtime-2.1", **realtime_options(speech))
 ```
 
-Each connection is a separately admitted and metered relay session with its
-own idempotency key, and connection retries are off. The native sidecar also forwards the GPT-Live,
+This needs LiveKit Agents 1.8 or later with the matching plugin. Each
+connection is a separately admitted and metered relay session with its own
+idempotency key, and failed connections are not retried. The plugin still
+replaces its connection every 20 minutes by default, replaying the
+conversation into a new admission; pass `max_session_duration` to change that.
+The native sidecar also forwards the GPT-Live,
 Gemini Live and translation routes as raw vendor sockets; their LiveKit
 plugins do not use these routes, so `realtime_options` does not cover them.
 

@@ -83,9 +83,9 @@ def realtime_options(client: RelaySpeechClient) -> dict[str, Any]:
     """Run LiveKit's own OpenAI or xAI ``RealtimeModel`` through Speko.
 
     ``openai.realtime.RealtimeModel(model="gpt-realtime-2.1", **realtime_options(c))``
-    or the same with ``xai.realtime.RealtimeModel``. The relay forwards the
-    vendor's native protocol, so the plugin is unchanged. GPT-Live and Gemini
-    Live are not covered: their LiveKit plugins do not use these routes.
+    or the same with ``xai.realtime.RealtimeModel``, on LiveKit 1.8 or later.
+    The relay forwards the vendor's native protocol, so the plugin is unchanged.
+    Each connection is its own admission; see the README for recycling.
     """
     if not isinstance(client, RelaySpeechClient):
         raise TypeError("realtime_options requires a RelaySpeechClient")
@@ -93,7 +93,7 @@ def realtime_options(client: RelaySpeechClient) -> dict[str, Any]:
         "base_url": f"{client._origin}/v1",
         "api_key": client._api_key,
         "http_session": client._session,
-        # Every connection is a new paid admission: never retry silently.
+        # A failed connection is not reopened as a new paid admission.
         "conn_options": dataclasses.replace(DEFAULT_API_CONNECT_OPTIONS, max_retry=0),
     }
 

@@ -674,6 +674,10 @@ func TestNativeRelayWebSocketRefusalPreservesStatusEnvelopeAndRequestIdentity(t 
 				_, local := nativeServer(t, peer, nil)
 				req, _ := http.NewRequest("GET", local.URL+"/v1/stt/stream", nil)
 				req.Header = nativeHeaders("sk_speko_agent_owned")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Sec-WebSocket-Version", "13")
+				req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
 				response, err := http.DefaultClient.Do(req)
 				if err != nil {
 					t.Fatal(err)
@@ -735,6 +739,7 @@ func TestNativeRelayVoiceRoutesForwardOnlyTheirModelSelector(t *testing.T) {
 		relayapi.RealtimeRoutePath + "?model=a&model=b",
 		relayapi.RealtimeRoutePath + "?model=../v1/llm",
 		relayapi.RealtimeRoutePath + "?",
+		relayapi.RealtimeRoutePath + "?model=gpt-realtime-2.1", // valid query, not an upgrade
 		relayapi.LiveRoutePath + "?model=gpt-live-1",
 		relayapi.BidiRoutePath + "?model=gemini-3.8-live",
 		"/v1/stt/stream?model=fixture",
@@ -752,5 +757,23 @@ func TestNativeRelayVoiceRoutesForwardOnlyTheirModelSelector(t *testing.T) {
 	}
 	if calls.Load() != before {
 		t.Fatal("a refused voice request reached the relay")
+	}
+}
+
+func TestNativeRelayVoiceRefusesAnInvalidLocalUpgradeBeforeDialing(t *testing.T) {
+	var calls atomic.Int32
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1) }))
+	defer peer.Close()
+	_, local := nativeServer(t, peer, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	headers := nativeHeaders("sk_speko_agent_owned")
+	headers.Set("Origin", "https://untrusted.invalid")
+	_, response, err := websocket.Dial(ctx, local.URL+relayapi.RealtimeRoutePath+"?model=gpt-realtime-2.1", &websocket.DialOptions{HTTPHeader: headers})
+	if err == nil || response == nil || response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cross-origin upgrade accepted: %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("an invalid local upgrade reached the relay")
 	}
 }

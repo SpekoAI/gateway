@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,6 +94,32 @@ func nativeQueryAllowed(u *url.URL) bool {
 	}
 	query, err := url.ParseQuery(u.RawQuery)
 	return byModel && err == nil && len(query) == 1 && len(query["model"]) == 1 && nativeVoiceModel.MatchString(query.Get("model"))
+}
+
+// nativeUpgrade mirrors websocket.Accept's own request checks, so an invalid
+// local upgrade is refused before the relay is dialed and admits any work.
+func nativeUpgrade(r *http.Request) bool {
+	token := func(name, want string) bool {
+		for _, value := range r.Header.Values(name) {
+			for _, part := range strings.Split(value, ",") {
+				if strings.EqualFold(strings.TrimSpace(part), want) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(nativeOne(r.Header, "Sec-WebSocket-Key")))
+	if !r.ProtoAtLeast(1, 1) || !token("Connection", "upgrade") || !token("Upgrade", "websocket") ||
+		r.Header.Get("Sec-WebSocket-Version") != "13" || err != nil || len(key) != 16 {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && strings.EqualFold(parsed.Host, r.Host)
 }
 
 func NewNativeRelay(config NativeRelayConfig) (*NativeRelayServer, error) {
@@ -410,6 +437,10 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "close")
 		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 		writeError(w, http.StatusBadRequest, "invalid_request", "native WebSocket upgrades do not accept a body")
+		return
+	}
+	if !nativeUpgrade(r) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "native routes require a valid local WebSocket upgrade")
 		return
 	}
 	endpoint := *s.origin
