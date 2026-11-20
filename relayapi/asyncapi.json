@@ -612,7 +612,7 @@
       "ttsAudioOutput": {
         "name": "audio",
         "title": "TTS binary audio frame",
-        "summary": "One binary WebSocket frame of synthesized audio in the requested output format, sent between the utterance.started and utterance.done events that share its sequence number. Binary frames are untyped: they carry no JSON envelope.",
+        "summary": "One binary WebSocket frame of synthesized audio in the format named by session.ready's audio (pcm_s16le 24 kHz mono when session.ready has no audio), sent between the utterance.started and utterance.done events that share its sequence number. Binary frames are untyped: they carry no JSON envelope.",
         "contentType": "application/octet-stream",
         "payload": {
           "type": "string",
