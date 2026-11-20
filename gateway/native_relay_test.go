@@ -718,6 +718,7 @@ func TestNativeRelayVoiceRoutesForwardOnlyTheirModelSelector(t *testing.T) {
 		relayapi.QwenTranslationRoutePath + "?model=qwen3.8-livetranslate-flash-realtime",
 		relayapi.LiveRoutePath,
 		relayapi.BidiRoutePath,
+		"/v1/live/sessions",
 	} {
 		conn, _, err := websocket.Dial(ctx, local.URL+target, &websocket.DialOptions{HTTPHeader: nativeHeaders("sk_speko_agent_owned")})
 		if err != nil {
@@ -728,7 +729,8 @@ func TestNativeRelayVoiceRoutesForwardOnlyTheirModelSelector(t *testing.T) {
 		}
 		_, raw, err := conn.Read(ctx)
 		conn.CloseNow()
-		if err != nil || string(raw) != target+` {"type":"session.update"}` {
+		want := strings.Replace(target, "/v1/live/sessions", relayapi.LiveRoutePath, 1)
+		if err != nil || string(raw) != want+` {"type":"session.update"}` {
 			t.Fatalf("%s: got %q, %v", target, raw, err)
 		}
 	}
@@ -742,6 +744,7 @@ func TestNativeRelayVoiceRoutesForwardOnlyTheirModelSelector(t *testing.T) {
 		relayapi.RealtimeRoutePath + "?model=gpt-realtime-2.1", // valid query, not an upgrade
 		relayapi.LiveRoutePath + "?model=gpt-live-1",
 		relayapi.BidiRoutePath + "?model=gemini-3.8-live",
+		"/v1/live/sessions?model=gpt-live-1",
 		"/v1/stt/stream?model=fixture",
 	} {
 		req, _ := http.NewRequest(http.MethodGet, local.URL+target, nil)

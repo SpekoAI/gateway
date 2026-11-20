@@ -595,7 +595,7 @@ is in the [Pipecat integration guide](../../docs/PIPECAT.md).
 
 ### Realtime voice models
 
-Speech-to-speech models run on LiveKit's own OpenAI or xAI realtime plugin.
+Speech-to-speech models run on LiveKit's own OpenAI, xAI or GPT-Live plugin.
 The relay speaks each vendor's native protocol, so `realtime_options` only
 points the plugin at the same `RelaySpeechClient`:
 
@@ -604,17 +604,22 @@ from livekit.plugins import openai  # or xai
 from speko_gateway.livekit import realtime_options
 
 llm = openai.realtime.RealtimeModel(model="gpt-realtime-2.1", **realtime_options(speech))
+# or: openai.realtime.GPTLiveModel(**realtime_options(speech))
 ```
 
 This needs LiveKit Agents 1.8 or later with the matching plugin. Each
 connection is a separately admitted and metered relay session with its own
-idempotency key, and failed connections are not retried. The OpenAI plugin
-still replaces its connection every 20 minutes by default, replaying the
-conversation into a new admission; the xAI plugin does not recycle. Pass
-`max_session_duration` to change either.
-The native sidecar also forwards the GPT-Live,
-Gemini Live and translation routes as raw vendor sockets; their LiveKit
-plugins do not use these routes, so `realtime_options` does not cover them.
+idempotency key, and failed connections are not retried. The OpenAI realtime
+plugin still replaces its connection every 20 minutes by default, replaying
+the conversation into a new admission; the xAI and GPT-Live plugins do not
+recycle. Pass `max_session_duration` to change any of them. GPT-Live's
+default `responses` delegation runs its backend model on the relay, which
+reserves and meters it with the session.
+
+Gemini Live is not covered: Google's SDK opens its socket with the
+`websockets` library, which cannot reach the sidecar's Unix socket or send a
+fresh idempotency key per connection. The sidecar still forwards the Gemini
+Live and translation routes as raw vendor sockets.
 
 ### Router-native speech audio
 

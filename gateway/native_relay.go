@@ -79,7 +79,13 @@ var nativeVoiceRoutes = map[string]bool{
 	relayapi.QwenTranslationRoutePath: true,
 	relayapi.LiveRoutePath:            false,
 	relayapi.BidiRoutePath:            false,
+	nativeLiveSessionsPath:            false,
 }
+
+// LiveKit's GPT-Live model always dials the vendor's <base>/live/sessions;
+// the Router serves the same protocol on relayapi.LiveRoutePath.
+const nativeLiveSessionsPath = "/v1/live/sessions"
+
 var nativeVoiceModel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 // nativeQueryAllowed admits no URL parameters except exactly one bounded
@@ -445,6 +451,9 @@ func (s *NativeRelayServer) speech(w http.ResponseWriter, r *http.Request) {
 	}
 	endpoint := *s.origin
 	endpoint.Path = r.URL.Path
+	if endpoint.Path == nativeLiveSessionsPath {
+		endpoint.Path = relayapi.LiveRoutePath
+	}
 	endpoint.RawQuery = r.URL.RawQuery // validated by begin
 	dialCtx, cancelDial := context.WithTimeout(ctx, s.setupTimeout)
 	setupDeadline, _ := dialCtx.Deadline()

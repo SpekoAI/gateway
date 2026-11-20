@@ -9,7 +9,7 @@ import stat
 import subprocess
 import tempfile
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1252,3 +1252,58 @@ async def test_livekit_realtime_model_runs_through_the_native_sidecar(native_bin
         assert request.headers["Speko-Client-Session-ID"] == session_id
         assert NATIVE_LOCAL_AUTHORIZATION not in request.headers
     assert [frame["type"] for frame in first_frames] == ["session.update"] * 2
+
+
+async def test_livekit_gpt_live_model_runs_through_the_native_sidecar(native_binary):
+    # The engine livekit-plugins-openai's GPTLiveModel re-exports (>=1.8).
+    engine = pytest.importorskip("livekit.agents.llm._realtime.gpt_live")
+    from speko_gateway.livekit import realtime_options
+
+    connections, starts = [], []
+    started = asyncio.Event()
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        connections.append(request)
+        starts.append(json.loads((await ws.receive()).data))
+        started.set()
+        await ws.send_json(
+            {"type": "error", "error": {"type": "relay_error", "code": "budget_exhausted"}}
+        )
+        await ws.close()
+        return ws
+
+    async with native_stack(native_binary, handle) as (socket, _):
+        client = RelaySpeechClient(
+            api_key=MODEL_KEY,
+            session_id=str(uuid.uuid4()),
+            socket_path=socket,
+            local_auth_token=LOCAL_TOKEN,
+        )
+        model = engine.GPTLiveModel(**realtime_options(client))
+        session = model.session()
+        try:
+            await session._update_session(instructions="Owned GPT-Live fixture")
+            await asyncio.wait_for(started.wait(), 5)
+            await asyncio.sleep(0.5)
+        finally:
+            with suppress(APIConnectionError):  # aclose re-raises the terminal
+                await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+    assert len(connections) == 1, "a refused session was silently reopened"
+    assert connections[0].path_qs == "/v1/live"
+    start = starts[0]
+    assert start["type"] == "session.start"
+    # relayapi.LiveSessionStart refuses unknown fields.
+    assert set(start) <= {"type", "event_id", "session"}
+    assert set(start["session"]) <= {
+        "model", "instructions", "audio", "input", "delegation", "store"
+    }
+    responses = start["session"].get("delegation", {}).get("responses", {})
+    assert set(responses) <= {
+        "model", "instructions", "tools", "tool_choice", "parallel_tool_calls",
+        "max_output_tokens", "service_tier", "reasoning", "text",
+    }

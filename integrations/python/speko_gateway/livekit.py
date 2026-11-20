@@ -80,10 +80,11 @@ __all__ = ["LLM", "STT", "TTS", "DrainingVAD", "realtime_options"]
 
 
 def realtime_options(client: RelaySpeechClient) -> dict[str, Any]:
-    """Run LiveKit's own OpenAI or xAI ``RealtimeModel`` through Speko.
+    """Run LiveKit's own OpenAI, xAI or GPT-Live model through Speko.
 
-    ``openai.realtime.RealtimeModel(model="gpt-realtime-2.1", **realtime_options(c))``
-    or the same with ``xai.realtime.RealtimeModel``, on LiveKit 1.8 or later.
+    ``openai.realtime.RealtimeModel(model="gpt-realtime-2.1", **realtime_options(c))``,
+    ``xai.realtime.RealtimeModel`` or ``openai.realtime.GPTLiveModel``, on
+    LiveKit 1.8 or later.
     The relay forwards the vendor's native protocol, so the plugin is unchanged.
     Each connection is its own admission; see the README for recycling.
     """
