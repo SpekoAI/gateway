@@ -560,3 +560,42 @@ func smallestTTSConfig(serverURL string) Config {
 	endpoint, _ := url.Parse(serverURL)
 	return Config{AllowedEndpointHosts: []string{endpoint.Hostname()}, AllowInsecureEndpoint: true}
 }
+
+func TestTTSAdapterIdleCancelKeepsTheStreamOpen(t *testing.T) {
+	t.Parallel()
+	server := newSmallestTTSServer(t, func(ctx context.Context, _ *http.Request, conn *websocket.Conn) {
+		for {
+			_, _, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+
+	adapter, err := New(smallestTTSConfig(server.URL))
+	if err != nil {
+		t.Fatalf("new TTS adapter: %v", err)
+	}
+	stream, err := adapter.Open(context.Background(), smallestTTSRequest(server.URL))
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer func() { _ = stream.(runtimepkg.AbortingProviderStream).Abort(context.Background()) }()
+
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("idle cancellation closed a live session: %v", err)
+	}
+	if err := stream.AppendText(context.Background(), "buffered turn"); err != nil {
+		t.Fatalf("session unusable after idle cancel: %v", err)
+	}
+	if err := stream.Cancel(context.Background()); err != nil {
+		t.Fatalf("buffered text cancellation: %v", err)
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Cancel(context.Background()); !errors.Is(err, runtimepkg.ErrSessionClosed) {
+		t.Fatalf("closed session cancel=%v", err)
+	}
+}
