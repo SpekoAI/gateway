@@ -84,7 +84,7 @@ def realtime_options(client: RelaySpeechClient) -> dict[str, Any]:
 
     ``openai.realtime.RealtimeModel(model="gpt-realtime-2.1", **realtime_options(c))``,
     ``xai.realtime.RealtimeModel`` or ``openai.realtime.GPTLiveModel``, on
-    LiveKit 1.8 or later.
+    LiveKit 1.8 or later. GPT-Live needs a client on the native sidecar socket.
     The relay forwards the vendor's native protocol, so the plugin is unchanged.
     Each connection is its own admission; see the README for recycling.
     """

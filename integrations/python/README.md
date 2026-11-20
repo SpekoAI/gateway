@@ -612,7 +612,9 @@ connection is a separately admitted and metered relay session with its own
 idempotency key, and failed connections are not retried. The OpenAI realtime
 plugin still replaces its connection every 20 minutes by default, replaying
 the conversation into a new admission; the xAI and GPT-Live plugins do not
-recycle. Pass `max_session_duration` to change any of them. GPT-Live's
+recycle. Pass `max_session_duration` to change any of them. GPT-Live needs
+the native sidecar socket: its plugin always dials `/live/sessions`, which only
+the sidecar maps to the Router's `/v1/live`. GPT-Live's
 default `responses` delegation runs its backend model on the relay, which
 reserves and meters it with the session.
 
