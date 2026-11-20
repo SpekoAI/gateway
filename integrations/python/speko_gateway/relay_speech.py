@@ -149,7 +149,7 @@ class RelaySpeechClient:
             # one (LiveKit realtime models) get a fresh key, never a shared one.
             params.headers.setdefault("Idempotency-Key", str(uuid.uuid4()))
 
-        trace.on_request_start.append(identify_request)
+        pass  # bisect: hook disabled
 
         async def preserve_rejection(_session, _context, params):
             response = params.response
