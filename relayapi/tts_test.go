@@ -124,6 +124,7 @@ func TestTTSStreamMessageValidation(t *testing.T) {
 		{"cancel with wrong tag", relayapi.TTSInputCancel{Type: "cancel"}, `got "cancel"`},
 		{"close with wrong tag", relayapi.TTSSessionClose{Type: "close"}, `got "close"`},
 		{"ready without request id", relayapi.TTSSessionReady{Type: relayapi.TTSEventSessionReady, Route: relayapi.Route{Provider: "cartesia", Model: "sonic-3", Region: "ap-northeast-1", AttemptID: "att_1"}}, "request_id: required"},
+		{"ready with out-of-bounds audio", relayapi.TTSSessionReady{Type: relayapi.TTSEventSessionReady, RequestID: "req_1", Route: relayapi.Route{Provider: "cartesia", Model: "sonic-3", Region: "ap-northeast-1", AttemptID: "att_1"}, Audio: &relayapi.AudioConfig{Encoding: "pcm_s16le", SampleRateHz: 4_000, Channels: 1}}, "audio: sample_rate_hz"},
 		{"utterance started at zero", relayapi.TTSUtteranceStarted{Type: relayapi.TTSEventUtteranceStarted}, "sequence: must be at least 1"},
 		{"utterance done at zero", relayapi.TTSUtteranceDone{Type: relayapi.TTSEventUtteranceDone}, "sequence: must be at least 1"},
 		{"usage update with negative usage", relayapi.TTSUsageUpdated{Type: relayapi.TTSEventUsageUpdated, Usage: relayapi.Usage{Characters: -1}}, "must not be negative"},

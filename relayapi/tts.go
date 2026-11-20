@@ -197,10 +197,15 @@ func (c TTSSessionClose) Validate() error {
 
 // TTSSessionReady confirms admission and reports the concrete route. It is
 // always the first event frame; the client must not append text before it.
+// Audio is the format the binary audio frames will carry. Servers that predate
+// the field omit it and do not report the format: depending on their version
+// they send the requested format or pcm_s16le 24 kHz mono, so a client that
+// must be certain on such a server requests pcm_s16le 24 kHz mono.
 type TTSSessionReady struct {
 	Type      TTSEventType `json:"type"`
 	RequestID string       `json:"request_id"`
 	Route     Route        `json:"route"`
+	Audio     *AudioConfig `json:"audio,omitempty"`
 }
 
 // Validate checks the frame tag, request id, and route.
@@ -213,6 +218,11 @@ func (e TTSSessionReady) Validate() error {
 	}
 	if err := e.Route.Validate(); err != nil {
 		return fmt.Errorf("route: %w", err)
+	}
+	if e.Audio != nil {
+		if err := e.Audio.Validate(); err != nil {
+			return fmt.Errorf("audio: %w", err)
+		}
 	}
 	return nil
 }

@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:6e3817bd5a8eaa0a66f8f343ea3682244a45260461fe637b8b6004877c8d2362
-# yaml-body: sha256:6a04c5d6e04ac8507995d8694be9bb5fd06db7fb71ae7b9250f697b73c45fcaa
+# json-mirror: asyncapi.json sha256:4bae36459da922cb00001fffb7af5cb301d148b4a3c4065e20ee18ba592886d9
+# yaml-body: sha256:c9d3329d3638ae0473c437c803d91c1cb7450c3182fd1038cf14cba906a2ec66
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -616,10 +616,11 @@ components:
       name: audio
       title: TTS binary audio frame
       summary: >-
-        One binary WebSocket frame of synthesized audio in the requested
-        output format, sent between the utterance.started and utterance.done
-        events that share its sequence number. Binary frames are untyped: they
-        carry no JSON envelope.
+        One binary WebSocket frame of synthesized audio in the format named by
+        session.ready's audio (see TTSSessionReady for servers that omit it),
+        sent between the utterance.started and utterance.done events that
+        share its sequence number. Binary frames are untyped: they carry
+        no JSON envelope.
       contentType: application/octet-stream
       payload:
         type: string
@@ -1471,7 +1472,12 @@ components:
       type: object
       description: >-
         Confirms admission and reports the concrete route. It is always the
-        first event frame; the client must not append text before it.
+        first event frame; the client must not append text before it. audio
+        is the format the binary audio frames will carry. Servers that
+        predate the field omit it and do not report the format: depending on
+        their version they send the requested format or pcm_s16le 24 kHz
+        mono, so a client that must be certain on such a server requests
+        pcm_s16le 24 kHz mono.
       properties:
         type:
           type: string
@@ -1481,6 +1487,8 @@ components:
           type: string
         route:
           $ref: "#/components/schemas/Route"
+        audio:
+          $ref: "#/components/schemas/AudioConfig"
       required:
         - type
         - request_id

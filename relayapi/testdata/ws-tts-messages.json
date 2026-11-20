@@ -12,7 +12,8 @@
   {
     "type": "session.ready",
     "request_id": "req_5cd2f7",
-    "route": {"provider": "cartesia", "model": "sonic-3", "region": "ap-northeast-1", "attempt_id": "att_1"}
+    "route": {"provider": "cartesia", "model": "sonic-3", "region": "ap-northeast-1", "attempt_id": "att_1"},
+    "audio": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1}
   },
   {"type": "utterance.started", "sequence": 1},
   {
