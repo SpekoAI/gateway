@@ -773,6 +773,16 @@ func TestNativeRelayVoiceRefusesAnInvalidLocalUpgradeBeforeDialing(t *testing.T)
 	if err == nil || response == nil || response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("cross-origin upgrade accepted: %v", err)
 	}
+	// net/http routes HEAD to GET patterns; websocket.Accept refuses it.
+	head, _ := http.NewRequest(http.MethodHead, local.URL+relayapi.RealtimeRoutePath+"?model=gpt-realtime-2.1", nil)
+	head.Header = nativeHeaders("sk_speko_agent_owned")
+	head.Header.Set("Connection", "Upgrade")
+	head.Header.Set("Upgrade", "websocket")
+	head.Header.Set("Sec-WebSocket-Version", "13")
+	head.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	if response, err := http.DefaultClient.Do(head); err != nil || response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("HEAD upgrade accepted: %v", err)
+	}
 	if calls.Load() != 0 {
 		t.Fatal("an invalid local upgrade reached the relay")
 	}

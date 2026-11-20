@@ -110,7 +110,7 @@ func nativeUpgrade(r *http.Request) bool {
 		return false
 	}
 	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(nativeOne(r.Header, "Sec-WebSocket-Key")))
-	if !r.ProtoAtLeast(1, 1) || !token("Connection", "upgrade") || !token("Upgrade", "websocket") ||
+	if r.Method != http.MethodGet || !r.ProtoAtLeast(1, 1) || !token("Connection", "upgrade") || !token("Upgrade", "websocket") ||
 		r.Header.Get("Sec-WebSocket-Version") != "13" || err != nil || len(key) != 16 {
 		return false
 	}
