@@ -1027,6 +1027,27 @@ async def test_tts_provider_options_reach_the_session_request() -> None:
     await plain.aclose()
 
 
+async def test_tts_default_max_input_characters_sizes_one_reply() -> None:
+    # Each reply opens its own session, and managed credentials reserve credit
+    # for the whole max_input_characters, so the default must fit one reply,
+    # not a call. An explicit value still wins.
+    from speko_gateway.livekit import DEFAULT_TTS_MAX_INPUT_CHARACTERS
+
+    assert DEFAULT_TTS_MAX_INPUT_CHARACTERS == 10_000
+    for kwargs, expected in (({}, 10_000), ({"max_input_characters": 50_000}, 50_000)):
+        plugin = TTS(FakeClient(), **kwargs)  # type: ignore[arg-type]
+        stream = plugin.stream()
+        recorder = _RecordingOpenClient()
+        stream._bridge._client = recorder  # type: ignore[assignment]
+        await stream._bridge.start()  # type: ignore[attr-defined]
+        assert recorder.opened[0].request["max_input_characters"] == expected
+        await stream.aclose()
+        await plugin.aclose()
+
+    with pytest.raises(ValueError, match="max_input_characters"):
+        TTS(FakeClient(), max_input_characters=0)  # type: ignore[arg-type]
+
+
 async def test_tts_update_options_replaces_and_clears_provider_options() -> None:
     plugin = TTS(  # type: ignore[arg-type]
         FakeClient(), provider_options={"cartesia": {"normalization": "en-IN"}}

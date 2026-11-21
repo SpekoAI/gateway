@@ -992,6 +992,16 @@ def _retrieve(task: asyncio.Task[Any]) -> None:
         )
 
 
+# Each LiveKit reply opens its own TTS session, and a spoken reply is a few
+# hundred characters. With managed credentials the control plane reserves
+# credit for the full max_input_characters of every session it admits, the
+# standby included, so a large default makes each reply hold far more credit
+# than it can spend: at 100,000 characters a Cartesia or ElevenLabs session
+# needed about $10 of headroom. 10,000 characters is roughly ten minutes of
+# speech in one reply, and keeps that hold near $1.
+DEFAULT_TTS_MAX_INPUT_CHARACTERS = 10_000
+
+
 class TTS(tts.TTS):
     """Synthesize speech through a Speko Gateway or native speech relay.
 
@@ -1012,13 +1022,15 @@ class TTS(tts.TTS):
         model: str = "auto",
         provider: str = "auto",
         sample_rate: int = 24_000,
-        max_input_characters: int = 100_000,
+        max_input_characters: int = DEFAULT_TTS_MAX_INPUT_CHARACTERS,
         credential_source: CredentialSource = "auto",
         provider_options: Mapping[str, Mapping[str, Any]] | None = None,
         standby_sessions: int | None = None,
     ) -> None:
         if standby_sessions is not None and standby_sessions < 0:
             raise ValueError("standby_sessions must not be negative")
+        if max_input_characters <= 0:
+            raise ValueError("max_input_characters must be positive")
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
             sample_rate=sample_rate,
