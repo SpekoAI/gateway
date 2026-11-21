@@ -401,7 +401,10 @@ one open Gateway session and provider connection, and during a reply it holds
 two. Both count toward your organization's concurrent-session limit and the
 provider's connection limits. With managed credentials, Speko reserves credit
 for each open session's `max_input_characters`, so the standby holds a second
-reservation. Lower `max_input_characters` to reserve less. Set
+reservation. Each reply gets its own session, so the default is 10,000
+characters, about ten minutes of speech. The Gateway refuses text past that
+limit and the reply fails, so raise it only if one reply can be that long.
+Lower `max_input_characters` to reserve less. Set
 `standby_sessions` to keep more standbys, or to `0` to open each session at
 its reply's first text.
 
