@@ -34,6 +34,9 @@ func (r TranscriptionRequest) Validate() error {
 	if err := r.Options.Validate(); err != nil {
 		return fmt.Errorf("options: %w", err)
 	}
+	if r.Options.IdentifyLanguage() {
+		return fmt.Errorf("options: language_identification is only supported on streaming STT")
+	}
 	return nil
 }
 
@@ -44,6 +47,8 @@ type TranscriptSegment struct {
 	EndMS   int64  `json:"end_ms"`
 	// Speaker is the vendor's own label, carried verbatim.
 	Speaker string `json:"speaker,omitempty"`
+	// Language is the provider's BCP-47 spoken-language label, when requested and known.
+	Language string `json:"language,omitempty"`
 }
 
 // Validate checks that the span is a non-negative, ordered range.
@@ -51,19 +56,22 @@ func (s TranscriptSegment) Validate() error {
 	if s.StartMS < 0 || s.EndMS < s.StartMS {
 		return fmt.Errorf("start_ms and end_ms must form a non-negative ordered range")
 	}
+	if s.Language != "" && !ValidSTTLanguageTag(s.Language) {
+		return fmt.Errorf("language: must be a BCP-47 language tag")
+	}
 	return nil
 }
 
-// TranscriptDeltaSegment is the part of a delta's provisional text one
-// speaker said. StartMS and EndMS come together or not at all: a hypothesis
-// can know who is speaking before it knows when they stopped, so a segment
-// carries its span only when the provider measured both ends.
+// TranscriptDeltaSegment is a speaker or language run in a provisional
+// transcript. It carries its span only when the provider measured both ends.
 type TranscriptDeltaSegment struct {
 	Text    string `json:"text"`
 	StartMS *int64 `json:"start_ms,omitempty"`
 	EndMS   *int64 `json:"end_ms,omitempty"`
 	// Speaker is the vendor's own label, carried verbatim.
 	Speaker string `json:"speaker,omitempty"`
+	// Language is the provider's provisional BCP-47 label, when requested and known.
+	Language string `json:"language,omitempty"`
 }
 
 // Validate checks that the span, when present, is whole, non-negative and
@@ -74,6 +82,9 @@ func (s TranscriptDeltaSegment) Validate() error {
 	}
 	if s.StartMS != nil && (*s.StartMS < 0 || *s.EndMS < *s.StartMS) {
 		return fmt.Errorf("start_ms and end_ms must form a non-negative ordered range")
+	}
+	if s.Language != "" && !ValidSTTLanguageTag(s.Language) {
+		return fmt.Errorf("language: must be a BCP-47 language tag")
 	}
 	return nil
 }
@@ -314,13 +325,10 @@ type STTTranscriptDelta struct {
 	// original words whose translation has not arrived yet, or only a
 	// translation of words already recognised.
 	Translation string `json:"translation,omitempty"`
-	// Segments attributes the hypothesis to speakers before any final: Text
-	// cut wherever the speaker changes, in order, each piece with the
-	// vendor's label and, when the provider measured both its ends, its
-	// span. Present only on a session that asked for diarization, routed to
-	// a provider that labels interim words; absent otherwise, so every other
-	// delta keeps its exact bytes. The labels are provisional: a later delta
-	// or the final may relabel the same words.
+	// Segments attributes the hypothesis to speakers or spoken languages when
+	// requested and supported. It splits on changes in either requested
+	// label and carries a span when both ends are measured. A later delta or
+	// final may change any provisional label.
 	Segments []TranscriptDeltaSegment `json:"segments,omitempty"`
 }
 

@@ -244,7 +244,7 @@ the next piece may continue. Later deltas carry only the rest, with run
 offsets into their own text, and every word and character reaches exactly one
 final, in order.
 
-A session without diarization is never cut, and neither is a diarized session
+A session without requested speaker or language labels is never cut, and neither is a labelled session
 that asked for Soniox's own translation: that translation trails the words and
 is not aligned to them, so such a session keeps one final per segment as
 before.
@@ -257,6 +257,32 @@ diarization gets interim finals from this version on, and must read
 
 Soniox notes that endpoint detection, which this adapter always enables,
 lowers diarization accuracy.
+
+#### Soniox spoken-language labels
+
+Set `request.stt.language_identification: true` for Soniox `stt-rt-v5` or
+`stt-rt-v6`. The Router spelling is `session.configure.options.language_identification`.
+The Gateway refuses an unsupported route with `stt_option_unsupported`.
+The Router uses `capability_unsupported`. Both name the option. This option
+does not apply to batch. `language` on the request still acts as a recognition hint.
+
+Gateway `transcript.delta` and `transcript.final` data add `language_runs`,
+using the same code-point offsets and outer-piece timings as `speaker_runs`.
+Runs split on every change in the vendor's token language or requested speaker
+label, including a change within a word. The BCP-47 `language` field is omitted
+for pieces without an identified language. Adjacent unknown pieces can share a
+run. The existing Soniox final's top-level majority language is independent of
+the runs. Only source tokens contribute. The recognized `text` and native
+`translation` remain separate. Omitted or false adds no fields and preserves
+the legacy event bytes.
+
+On the Router, the runs map to `segments[].language`. Deltas can contain
+untimed runs and later revise their labels. Final segments still require both
+timings. The final's full text remains available even when a run has no ordered
+span. Use only measured, finalized runs to identify audio intervals. With
+language labels enabled, the long-segment interim-final rule also applies
+without diarization. Sessions that request native translation keep their
+existing boundaries. There is no gateway wait for language labels.
 
 ### Realtime sessions: OpenAI Realtime and GPT-Live
 

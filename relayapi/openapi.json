@@ -865,6 +865,10 @@
             "type": "boolean",
             "description": "Labels transcript segments by speaker on the streaming transport. A model whose vendor offers diarization only on a batch API reports false, because this advertises what the Router can serve."
           },
+          "language_identification": {
+            "type": "boolean",
+            "description": "Supports opt-in spoken-language labels on /v1/stt/stream. Omitted when the route does not offer it."
+          },
           "keywords": {
             "type": "boolean",
             "description": "Accepts vocabulary-biasing terms."
@@ -1258,6 +1262,13 @@
             "type": "boolean",
             "description": "Label each transcript segment with the speaker who said it. Omitted leaves the vendor default, which is not the same as false."
           },
+          "language_identification": {
+            "type": "boolean",
+            "enum": [
+              false
+            ],
+            "description": "Only /v1/stt/stream accepts true. Batch has no language labels."
+          },
           "keywords": {
             "type": "array",
             "description": "Vocabulary-biasing terms (names, products, jargon), translated to each vendor's own spelling. At most 100 terms of at most 64 characters each; both bounds count CHARACTERS, which JSON Schema cannot express, so they are normative here in prose and enforced by the Router.",
@@ -1345,6 +1356,13 @@
           "speaker": {
             "type": "string",
             "description": "Whoever said the span, present only when the request asked for diarization and the provider attributed it. The VENDOR's own label carried verbatim (\"A\" from one provider, \"1\" from another): renumbering across providers would invent an identity mapping no vendor promised. Absent means unattributed, which is not the same as a new speaker."
+          },
+          "language": {
+            "type": "string",
+            "description": "BCP-47 spoken-language label for streaming STT. Absent in batch.",
+            "pattern": "^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$",
+            "minLength": 2,
+            "maxLength": 35
           }
         },
         "required": [

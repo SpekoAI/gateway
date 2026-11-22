@@ -29,6 +29,9 @@ type SttOptions struct {
 	// A pointer, not a bool: nil means the caller said nothing and the vendor
 	// default stands, which is not the same as an explicit false.
 	Diarization *bool `json:"diarization,omitempty"`
+	// LanguageIdentification asks for spoken-language labels on streaming
+	// transcript spans. Nil and false leave the adapter's legacy behavior.
+	LanguageIdentification *bool `json:"language_identification,omitempty"`
 	// Keywords biases recognition toward domain terms (names, products,
 	// jargon). Adapters translate to the vendor's own spelling: Deepgram
 	// keyterm/keywords, AssemblyAI keyterms_prompt, ElevenLabs keyterms,
@@ -86,7 +89,7 @@ var reservedSttOptionKeys = map[string]struct{}{
 	"language": {}, "language_code": {}, "language_codes": {}, "language_hints": {},
 	// detect_language routes around the gateway-owned language pin: a vendor
 	// told to auto-detect ignores the language this gateway resolved.
-	"detect_language": {}, "language_detection": {}, "enable_language_identification": {},
+	"detect_language": {}, "language_detection": {}, "enable_language_identification": {}, "language_identification": {},
 	"encoding": {}, "audio_format": {}, "sample_rate": {}, "bit_depth": {}, "channels": {},
 	"api_key": {}, "token": {}, "authorization": {},
 	"diarize": {}, "diarization": {}, "enable_speaker_diarization": {}, "speaker_labels": {},
@@ -111,7 +114,7 @@ func SttOptionKeyReserved(key string) bool {
 // that predates this type.
 func (o *SttOptions) IsZero() bool {
 	return o == nil ||
-		(o.Diarization == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && o.WordTimestamps == nil && o.Translation == nil && len(o.ProviderOptions) == 0)
+		(o.Diarization == nil && o.LanguageIdentification == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && o.WordTimestamps == nil && o.Translation == nil && len(o.ProviderOptions) == 0)
 }
 
 // TranslationTarget returns the trimmed target language, or "" when no
@@ -131,6 +134,11 @@ func (o *SttOptions) WantsWordTimestamps() bool {
 // Diarize reports whether the caller asked for speaker labels.
 func (o *SttOptions) Diarize() bool {
 	return o != nil && o.Diarization != nil && *o.Diarization
+}
+
+// IdentifyLanguage reports whether the caller asked for language labels.
+func (o *SttOptions) IdentifyLanguage() bool {
+	return o != nil && o.LanguageIdentification != nil && *o.LanguageIdentification
 }
 
 // ReduceNoise reports whether the caller asked for audio enhancement.
@@ -204,7 +212,7 @@ func (o *SttOptions) Normalize() error {
 	if o.Translation != nil {
 		// Trimmed in place so every adapter writes the same bytes.
 		o.Translation.TargetLanguage = strings.TrimSpace(o.Translation.TargetLanguage)
-		if !validSttLanguageTag(o.Translation.TargetLanguage) {
+		if !ValidSTTLanguageTag(o.Translation.TargetLanguage) {
 			return fmt.Errorf("stt options: translation.target_language must be a BCP-47 language tag of at most %d characters", maxSttLanguageTagLength)
 		}
 	}
@@ -282,12 +290,12 @@ func validateOptionScalar(prefix, provider, key string, value any) error {
 	}
 }
 
-// validSttLanguageTag is a BCP-47 SHAPE check — a 2-3 letter primary
+// ValidSTTLanguageTag is a BCP-47 shape check — a 2-3 letter primary
 // subtag, then 1-8 character alphanumeric subtags — the same rule as
 // relayapi.ValidSTTLanguageTag. The tag is written into a vendor config
 // frame, so the check keeps arbitrary caller text out of it; whether the
 // vendor translates into the language is the vendor's answer.
-func validSttLanguageTag(tag string) bool {
+func ValidSTTLanguageTag(tag string) bool {
 	if tag == "" || len(tag) > maxSttLanguageTagLength {
 		return false
 	}

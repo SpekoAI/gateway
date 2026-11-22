@@ -136,5 +136,5 @@ func TtsOptionNumber(value any) (float64, bool) {
 // 1-8 character alphanumeric subtags, 35 characters in all. Shape only, not a
 // registry lookup.
 func ValidLanguageTag(tag string) bool {
-	return validSttLanguageTag(tag)
+	return ValidSTTLanguageTag(tag)
 }

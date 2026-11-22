@@ -33,8 +33,11 @@ type ModelCapabilities struct {
 	CachedInput      bool `json:"cached_input"`
 	Reasoning        bool `json:"reasoning"`
 	Diarization      bool `json:"diarization"`
-	Keywords         bool `json:"keywords"`
-	NoiseReduction   bool `json:"noise_reduction"`
+	// LanguageIdentification is support for opt-in language labels on
+	// streaming STT segments, independent of the model's batch support.
+	LanguageIdentification bool `json:"language_identification,omitempty"`
+	Keywords               bool `json:"keywords"`
+	NoiseReduction         bool `json:"noise_reduction"`
 	// WordTimestamps says whether an STT model can be ASKED for per-word
 	// start/end timings on the batch transcription result
 	// (STTOptions.WordTimestamps → TranscriptionResponse.Words). Distinct
@@ -175,6 +178,8 @@ func (c ModelCapabilities) SupportsSTTOptions(options *STTOptions) (string, bool
 	switch {
 	case options.Diarize() && !c.Diarization:
 		return "diarization", false
+	case options.IdentifyLanguage() && !c.LanguageIdentification:
+		return "language_identification", false
 	case len(options.GetKeywords()) > 0 && !c.Keywords:
 		return "keywords", false
 	case options.ReduceNoise() && !c.NoiseReduction:
