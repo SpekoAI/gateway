@@ -84,6 +84,59 @@ func TestTranscriptionRequestValidation(t *testing.T) {
 
 	// Without normalization the zero routing is rejected, not defaulted.
 	assertInvalid(t, relayapi.TranscriptionRequest{}.Validate(), "routing: mode: unsupported value")
+
+	active := true
+	request.Options = &relayapi.STTOptions{LanguageIdentification: &active}
+	assertInvalid(t, request.Validate(), "language_identification")
+	active = false
+	if err := request.Validate(); err != nil {
+		t.Fatalf("batch must accept explicit false: %v", err)
+	}
+}
+
+func TestSTTLanguageSegmentsKeepLegacyFrameBytesWhenUnlabelled(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		body any
+		want string
+	}{
+		{"delta", relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "Hi", Segments: []relayapi.TranscriptDeltaSegment{{Text: "Hi", Speaker: "1"}}},
+			`{"type":"transcript.delta","text":"Hi","segments":[{"text":"Hi","speaker":"1"}]}`},
+		{"final", relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, Text: "Hi", Segments: []relayapi.TranscriptSegment{{Text: "Hi", StartMS: 0, EndMS: 1, Speaker: "1"}}},
+			`{"type":"transcript.final","text":"Hi","segments":[{"text":"Hi","start_ms":0,"end_ms":1,"speaker":"1"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := json.Marshal(tc.body)
+			if err != nil || string(got) != tc.want {
+				t.Errorf("marshal: %s, %v; want %s", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSTTLanguageIdentificationIsCapabilityGated(t *testing.T) {
+	t.Parallel()
+
+	active := true
+	options := &relayapi.STTOptions{LanguageIdentification: &active}
+	if ask, supported := (relayapi.ModelCapabilities{}).SupportsSTTOptions(options); supported || ask != "language_identification" {
+		t.Errorf("unsupported model returned %q, %v", ask, supported)
+	}
+	if ask, supported := (relayapi.ModelCapabilities{LanguageIdentification: true}).SupportsSTTOptions(options); !supported || ask != "" {
+		t.Errorf("supporting model returned %q, %v", ask, supported)
+	}
+	active = false
+	if ask, supported := (relayapi.ModelCapabilities{}).SupportsSTTOptions(options); !supported || ask != "" {
+		t.Errorf("explicit false returned %q, %v", ask, supported)
+	}
+	for _, tag := range []string{"pt-BR", "zh-Hant", "en"} {
+		if err := (relayapi.TranscriptSegment{Language: tag}).Validate(); err != nil {
+			t.Errorf("valid tag %q: %v", tag, err)
+		}
+	}
+	assertInvalid(t, (relayapi.TranscriptDeltaSegment{Language: "en_US"}).Validate(), "language")
 }
 
 func TestTranscriptionResponseValidation(t *testing.T) {

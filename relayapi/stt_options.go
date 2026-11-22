@@ -10,9 +10,12 @@ import (
 
 // STTOptions carries caller transcription options for both STT surfaces.
 type STTOptions struct {
-	Diarization    *bool    `json:"diarization,omitempty"`
-	Keywords       []string `json:"keywords,omitempty"`
-	NoiseReduction *bool    `json:"noise_reduction,omitempty"`
+	Diarization *bool `json:"diarization,omitempty"`
+	// LanguageIdentification asks for spoken-language labels on streaming
+	// transcript segments. Omitted and false both preserve legacy output.
+	LanguageIdentification *bool    `json:"language_identification,omitempty"`
+	Keywords               []string `json:"keywords,omitempty"`
+	NoiseReduction         *bool    `json:"noise_reduction,omitempty"`
 	// WordTimestamps asks for per-word start/end timings on the batch result
 	// (TranscriptionResponse.Words). A pointer like Diarization: nil is
 	// silence, false is a statement.
@@ -54,7 +57,7 @@ const (
 var reservedSTTOptionKeys = map[string]struct{}{
 	"model": {}, "model_id": {}, "speech_model": {},
 	"language": {}, "language_code": {}, "language_codes": {}, "language_hints": {},
-	"detect_language": {}, "language_detection": {}, "enable_language_identification": {},
+	"detect_language": {}, "language_detection": {}, "enable_language_identification": {}, "language_identification": {},
 	"encoding": {}, "audio_format": {}, "sample_rate": {}, "bit_depth": {}, "channels": {},
 	"api_key": {}, "token": {}, "authorization": {},
 	"diarize": {}, "diarization": {}, "enable_speaker_diarization": {},
@@ -71,7 +74,7 @@ var reservedSTTOptionKeys = map[string]struct{}{
 // IsZero reports whether the caller asked for nothing.
 func (o *STTOptions) IsZero() bool {
 	return o == nil ||
-		(o.Diarization == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && o.WordTimestamps == nil && o.Translation == nil && len(o.ProviderOptions) == 0)
+		(o.Diarization == nil && o.LanguageIdentification == nil && len(o.Keywords) == 0 && o.NoiseReduction == nil && o.WordTimestamps == nil && o.Translation == nil && len(o.ProviderOptions) == 0)
 }
 
 // TranslationTarget returns the trimmed target language, or "" when the
@@ -91,6 +94,11 @@ func (o *STTOptions) WantsWordTimestamps() bool {
 // Diarize reports whether the caller asked for speaker labels.
 func (o *STTOptions) Diarize() bool {
 	return o != nil && o.Diarization != nil && *o.Diarization
+}
+
+// IdentifyLanguage reports whether the caller asked for language labels.
+func (o *STTOptions) IdentifyLanguage() bool {
+	return o != nil && o.LanguageIdentification != nil && *o.LanguageIdentification
 }
 
 // ReduceNoise reports whether the caller asked for audio enhancement.

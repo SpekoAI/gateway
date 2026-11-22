@@ -230,6 +230,9 @@ func validateSttRouteSupport(provider, model string, options *protocol.SttOption
 	if detail := support.family(model).noDiarization; options.Diarize() && detail != "" {
 		return &SttSupportError{Provider: name, Option: "diarization", Detail: detail}
 	}
+	if options.IdentifyLanguage() && (name != "soniox" || (model != "stt-rt-v5" && model != "stt-rt-v6")) {
+		return &SttSupportError{Provider: name, Option: "language_identification", Detail: "spoken-language labels require a Soniox stt-rt-v5 or stt-rt-v6 streaming route"}
+	}
 	if len(options.GetKeywords()) > 0 && !support.keywords {
 		return &SttSupportError{Provider: name, Option: "keywords", Detail: "this provider has no vocabulary-biasing parameter on its streaming transport"}
 	}
@@ -429,6 +432,8 @@ func firstSttAsk(options *protocol.SttOptions) string {
 	switch {
 	case options.Diarize():
 		return "diarization"
+	case options.IdentifyLanguage():
+		return "language_identification"
 	case len(options.GetKeywords()) > 0:
 		return "keywords"
 	case options.ReduceNoise():

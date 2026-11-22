@@ -172,6 +172,8 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 	}
 	conn.SetReadLimit(a.maxMessageBytes)
 
+	identifyLanguage := request.Options.STT.IdentifyLanguage()
+	languageHints := sttLanguageHints(request.Options.Language)
 	start := sttStartRequest{
 		Model:       model,
 		AudioFormat: audioFormat,
@@ -182,11 +184,10 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 		// a final transcript, because Soniox commits tokens at word-piece
 		// granularity and never marks an utterance complete on its own.
 		EnableEndpointDetection: true,
-		LanguageHints:           sttLanguageHints(request.Options.Language),
-		// With no hint Soniox already auto-detects; identification only adds
-		// the detected language to each token, which the finals then report
-		// so a multilingual caller can switch its TTS language per turn.
-		EnableLanguageIdentification: len(sttLanguageHints(request.Options.Language)) == 0,
+		LanguageHints:           languageHints,
+		// Keep legacy automatic-language sessions as they were. An opt-in
+		// also asks for labels when the caller supplied a language hint.
+		EnableLanguageIdentification: identifyLanguage || len(languageHints) == 0,
 		ClientReferenceID:            reservationReference(request.Plan),
 		// Speaker labels and vocabulary biasing both ride this one start
 		// frame; the gateway has already refused asks Soniox cannot serve.
@@ -214,13 +215,14 @@ func (a *STTAdapter) Open(ctx context.Context, request runtimepkg.AdapterRequest
 
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &sttStream{
-		conn:         conn,
-		ctx:          streamCtx,
-		cancel:       cancel,
-		events:       make(chan runtimepkg.ProviderEvent, a.eventBuffer),
-		closeTimeout: sttGracefulCloseTimeout,
-		diarize:      start.EnableSpeakerDiariz,
-		translating:  start.Translation != nil,
+		conn:             conn,
+		ctx:              streamCtx,
+		cancel:           cancel,
+		events:           make(chan runtimepkg.ProviderEvent, a.eventBuffer),
+		closeTimeout:     sttGracefulCloseTimeout,
+		diarize:          start.EnableSpeakerDiariz,
+		identifyLanguage: identifyLanguage,
+		translating:      start.Translation != nil,
 	}
 	stream.lastAudio.Store(time.Now().UnixNano())
 	go stream.readLoop()
@@ -337,6 +339,9 @@ type sttStream struct {
 	// speakers, so transcript events carry the labels. A session that did
 	// not ask emits the same bytes it always did.
 	diarize bool
+	// identifyLanguage controls the opt-in runs, independently of legacy
+	// upstream language identification on sessions without a language hint.
+	identifyLanguage bool
 	// translating is set once at Open: the start frame asked Soniox for its
 	// own translation. Such a session is never cut (cutLongSegment).
 	translating bool
@@ -702,7 +707,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 	// diarized session reports; tailHasText says there is such a piece.
 	var tailEndMS, tailOuterEndMS *int64
 	tailHasText := false
-	// tailSpoken is the tail's tokens, kept only on a diarized session.
+	// Keep tail tokens only when building speaker or language runs.
 	var tailSpoken []sttToken
 
 	for _, token := range message.Tokens {
@@ -762,11 +767,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 			token.Speaker = ""
 		}
 		if token.IsFinal {
-			s.segment.appendFinal(token)
-			if s.diarize {
-				s.segment.spoken = append(s.segment.spoken, token)
-				s.segment.runs.add(token)
-			}
+			s.appendFinal(token)
 			continue
 		}
 		tail.WriteString(token.Text)
@@ -776,12 +777,12 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 		if strings.TrimSpace(token.Text) != "" {
 			tailOuterEndMS, tailHasText = token.EndMS, true
 		}
-		if s.diarize {
+		if s.diarize || s.identifyLanguage {
 			tailSpoken = append(tailSpoken, token)
 		}
 	}
 
-	if s.diarize && !s.translating {
+	if (s.diarize || s.identifyLanguage) && !s.translating {
 		if err := s.cutLongSegment(raw); err != nil {
 			return err
 		}
@@ -815,13 +816,29 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 		// The hypothesis is the segment's finals so far plus the tail. The
 		// finals' runs were built as they arrived; only the tail, which
 		// Soniox re-sends whole on every frame, is added here.
-		sttSetSpeakerRuns(data, s.segment.runs.with(tailSpoken))
+		sttSetSpeakerRuns(data, s.segment.runs.with(tailSpoken, false, true))
+	}
+	if s.identifyLanguage {
+		sttSetRuns(data, "language_runs", s.segment.languageRuns.with(tailSpoken, true, s.diarize))
 	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptDelta,
 		Data:       sonioxMarshalData(data),
 		Extensions: sttExtension(raw),
 	})
+}
+
+func (s *sttStream) appendFinal(token sttToken) {
+	s.segment.appendFinal(token)
+	if s.diarize || (s.identifyLanguage && !s.translating) {
+		s.segment.spoken = append(s.segment.spoken, token)
+	}
+	if s.diarize {
+		s.segment.runs.add(token, false, true)
+	}
+	if s.identifyLanguage {
+		s.segment.languageRuns.add(token, true, s.diarize)
+	}
 }
 
 // flushSegment emits the segment's final. On a translating session the final
@@ -838,7 +855,7 @@ func (s *sttStream) handleTokens(message sttInboundMessage, raw json.RawMessage)
 // consumer holding the interim text until its segment closes is not left
 // waiting. It reports whether it emitted a final.
 func (s *sttStream) flushSegment(raw json.RawMessage) (bool, error) {
-	spoken, cut := s.segment.spoken, s.segment.cut
+	spoken, cut, languageRuns := s.segment.spoken, s.segment.cut, s.segment.languageRuns
 	text, language, confidence, startMS, endMS := s.segment.flush(s.diarize)
 	translation := s.translated.flush()
 	if text == "" && translation == "" {
@@ -852,6 +869,9 @@ func (s *sttStream) flushSegment(raw json.RawMessage) (bool, error) {
 	if s.diarize {
 		sttSetSpeakers(data, spoken)
 	}
+	if s.identifyLanguage {
+		sttSetRuns(data, "language_runs", languageRuns)
+	}
 	return true, s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptFinal,
 		Data:       sonioxMarshalData(data),
@@ -859,10 +879,10 @@ func (s *sttStream) flushSegment(raw json.RawMessage) (bool, error) {
 	})
 }
 
-// A diarized segment's finalized part is cut once it spans more than
+// A labelled segment's finalized part is cut once it spans more than
 // sttCutAudioMS of audio or sttCutCharacters characters, so that a long talk
 // without an endpoint does not resend an ever longer hypothesis on every
-// delta (docs/PROTOCOL.md). A session without diarization is never cut, and
+// delta (docs/PROTOCOL.md). A session without labels is never cut, and
 // neither is one with Soniox's own translation: the translation trails the
 // words and is not aligned to them, so a prefix final would take the
 // translation of words still in the tail.
@@ -889,7 +909,11 @@ func (s *sttStream) cutLongSegment(raw json.RawMessage) error {
 	var head sttSegment
 	for _, token := range prefix {
 		head.appendFinal(token)
+		if s.identifyLanguage {
+			head.languageRuns.add(token, true, s.diarize)
+		}
 	}
+	languageRuns := head.languageRuns
 	text, language, confidence, startMS, endMS := head.flush(true)
 	data := sttTranscriptFields(text, s.translated.flush(), language, true, startMS, endMS, confidence, s.requestID)
 	// The speaker has not finished: this only closes a long stretch. interim
@@ -898,12 +922,15 @@ func (s *sttStream) cutLongSegment(raw json.RawMessage) error {
 	// with finals must not take this one as the answer (docs/PROTOCOL.md).
 	data["speech_final"] = false
 	data["interim"] = true
-	sttSetSpeakers(data, prefix)
+	if s.diarize {
+		sttSetSpeakers(data, prefix)
+	}
+	if s.identifyLanguage {
+		sttSetRuns(data, "language_runs", languageRuns)
+	}
 	s.segment = sttSegment{cut: true}
 	for _, token := range rest {
-		s.segment.appendFinal(token)
-		s.segment.spoken = append(s.segment.spoken, token)
-		s.segment.runs.add(token)
+		s.appendFinal(token)
 	}
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       protocol.EventTranscriptFinal,
@@ -1089,11 +1116,10 @@ type sttSegment struct {
 	// languages counts tokens per identified language; only a session with
 	// language identification on gets any.
 	languages map[string]int
-	// spoken is the segment's final tokens and runs their speaker runs, both
-	// kept only on a diarized session: the final reports each word's
-	// speaker, a delta each run's.
-	spoken []sttToken
-	runs   sttRuns
+	// Keep pieces for the long-segment cut and, when diarizing, final words.
+	spoken       []sttToken
+	runs         sttRuns
+	languageRuns sttRuns
 }
 
 func (a *sttSegment) appendFinal(token sttToken) {
@@ -1271,18 +1297,19 @@ func sttSpeakerWords(tokens []sttToken) []sttSpeakerWord {
 	return words
 }
 
-// sttRun is one speaker's stretch of a diarized hypothesis: the vendor's
-// label, the span from its first piece's start to its last piece's end (each
+// sttRun is one stretch with consistent speaker and/or language labels,
+// the span from its first piece's start to its last piece's end (each
 // absent when that piece has no time), and where it sits in the text, in
 // characters (Unicode code points) from the start of the untrimmed segment,
 // from its first non-space character to just past its last.
 type sttRun struct {
 	speaker        string
+	language       string
 	startMS, endMS *int64
 	from, to       int
 }
 
-// sttRuns builds a segment's speaker runs one piece at a time, so a delta
+// sttRuns builds a segment's attribution runs one piece at a time, so a delta
 // costs one entry per run however long the segment grows. A new run starts
 // wherever the label changes, inside a word too: labels are the vendor's,
 // verbatim.
@@ -1293,13 +1320,20 @@ type sttRuns struct {
 	characters int
 }
 
-func (r *sttRuns) add(token sttToken) {
+func (r *sttRuns) add(token sttToken, identify, diarize bool) {
 	length := utf8.RuneCountInString(token.Text)
 	if content := strings.TrimSpace(token.Text); content != "" {
+		speaker, language := "", ""
+		if diarize {
+			speaker = token.Speaker
+		}
+		if identify && protocol.ValidSTTLanguageTag(token.Language) && !strings.EqualFold(token.Language, "und") {
+			language = token.Language
+		}
 		from := r.characters + length - utf8.RuneCountInString(strings.TrimLeftFunc(token.Text, unicode.IsSpace))
 		last := len(r.runs) - 1
-		if last < 0 || r.runs[last].speaker != token.Speaker {
-			r.runs = append(r.runs, sttRun{speaker: token.Speaker, startMS: token.StartMS, from: from})
+		if last < 0 || r.runs[last].speaker != speaker || !strings.EqualFold(r.runs[last].language, language) {
+			r.runs = append(r.runs, sttRun{speaker: speaker, language: language, startMS: token.StartMS, from: from})
 			last++
 		}
 		r.runs[last].endMS = token.EndMS
@@ -1310,10 +1344,10 @@ func (r *sttRuns) add(token sttToken) {
 
 // with returns the runs extended by the tail's pieces, leaving the segment's
 // own runs as they were.
-func (r sttRuns) with(tail []sttToken) sttRuns {
+func (r sttRuns) with(tail []sttToken, identify, diarize bool) sttRuns {
 	extended := sttRuns{runs: slices.Clone(r.runs), characters: r.characters}
 	for _, token := range tail {
-		extended.add(token)
+		extended.add(token, identify, diarize)
 	}
 	return extended
 }
@@ -1326,6 +1360,13 @@ func (r sttRuns) with(tail []sttToken) sttRuns {
 // top-level speaker names the one speaker of a single-run delta. A run Soniox
 // left unlabelled has no speaker. Nothing is added when there are no runs.
 func sttSetSpeakerRuns(data map[string]any, runs sttRuns) {
+	sttSetRuns(data, "speaker_runs", runs)
+	if len(runs.runs) == 1 && runs.runs[0].speaker != "" {
+		data["speaker"] = runs.runs[0].speaker
+	}
+}
+
+func sttSetRuns(data map[string]any, key string, runs sttRuns) {
 	if len(runs.runs) == 0 {
 		return
 	}
@@ -1338,6 +1379,9 @@ func sttSetSpeakerRuns(data map[string]any, runs sttRuns) {
 		if run.speaker != "" {
 			entry["speaker"] = run.speaker
 		}
+		if run.language != "" {
+			entry["language"] = run.language
+		}
 		if run.startMS != nil {
 			entry["start_ms"] = *run.startMS
 		}
@@ -1346,10 +1390,7 @@ func sttSetSpeakerRuns(data map[string]any, runs sttRuns) {
 		}
 		entries[index] = entry
 	}
-	data["speaker_runs"] = entries
-	if len(runs.runs) == 1 && runs.runs[0].speaker != "" {
-		data["speaker"] = runs.runs[0].speaker
-	}
+	data[key] = entries
 }
 
 func startsWithSpace(text string) bool {

@@ -1,5 +1,5 @@
-# json-mirror: asyncapi.json sha256:4bae36459da922cb00001fffb7af5cb301d148b4a3c4065e20ee18ba592886d9
-# yaml-body: sha256:c9d3329d3638ae0473c437c803d91c1cb7450c3182fd1038cf14cba906a2ec66
+# json-mirror: asyncapi.json sha256:f06e18265d1c3e2815a6899b19a06cafdf93a9d8ae4798b49284bd1eb8e0bfba
+# yaml-body: sha256:a15538228d55445baf13ae77db0048fd7b2b964a2ee7d37d1fe5951fc76e3a94
 #
 # This YAML document is the hand-authored, human-readable source of the
 # WebSocket contract. asyncapi.json is its checked-in JSON mirror: the same
@@ -905,6 +905,12 @@ components:
             another): renumbering across providers would invent an identity
             mapping no vendor promised. Absent means unattributed, which is
             not the same as a new speaker.
+        language:
+          type: string
+          description: BCP-47 spoken-language label when requested and identified.
+          pattern: "^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$"
+          minLength: 2
+          maxLength: 35
       required:
         - text
         - start_ms
@@ -913,11 +919,8 @@ components:
     TranscriptDeltaSegment:
       type: object
       description: >-
-        The part of a transcript.delta's provisional text one speaker said.
-        start_ms and end_ms come together or not at all: a hypothesis can
-        know who is speaking before it knows when they stopped, so the span
-        is present only when the provider measured both its ends. A segment
-        without it still attributes its text.
+        A provisional speaker or spoken-language run. start_ms and end_ms
+        come together, and only when the provider measured both ends.
       properties:
         text:
           type: string
@@ -935,6 +938,12 @@ components:
             Whoever said the span, present only when the provider attributed
             it. The VENDOR's own label carried verbatim. Absent means
             unattributed, which is not the same as a new speaker.
+        language:
+          type: string
+          description: Provisional BCP-47 spoken-language label when requested and identified.
+          pattern: "^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$"
+          minLength: 2
+          maxLength: 35
       required:
         - text
       additionalProperties: false
@@ -1081,8 +1090,8 @@ components:
         What a caller asked a transcription to do beyond returning text. The
         same object rides POST /v1/stt/transcriptions and the STT
         session.configure frame, in the same vocabulary the local gateway
-        uses. The canonical asks (diarization, keywords, noise_reduction,
-        word_timestamps, translation) fail closed: a session whose routed model does not advertise the
+        uses. The canonical asks (diarization, language_identification, keywords,
+        noise_reduction, word_timestamps, translation) fail closed: a session whose routed model does not advertise the
         matching capability in GET /v1/models is rejected with
         capability_unsupported, never answered with the feature quietly
         missing. Names arrive lower case and are rejected otherwise rather
@@ -1097,6 +1106,12 @@ components:
             Omitted leaves the vendor default, which is not the same as false.
             On a provider that labels interim words, transcript.delta also
             carries segments, so speakers are known before the final.
+        language_identification:
+          type: boolean
+          description: >-
+            Label source speech by language on streaming transcript segments.
+            Supported on Soniox stt-rt-v5 and stt-rt-v6. Omitted or false
+            preserves legacy output. Does not change the language hint.
         keywords:
           type: array
           description: >-
@@ -1226,13 +1241,10 @@ components:
         segments:
           type: array
           description: >-
-            Who is saying the hypothesis, before any final: text cut wherever
-            the speaker changes, in order, each piece with the vendor's label
-            and, when the provider measured both its ends, its span. Present
-            only on a session that asked for diarization, routed to a
-            provider that labels interim words; absent otherwise, so every
-            other delta keeps its exact bytes. The labels are provisional: a
-            later delta or the transcript.final may relabel the same words.
+            Consecutive runs split when a requested speaker or language label
+            changes or is unavailable. Each span is present when both ends
+            were measured. Present only on sessions that request and support
+            speaker or language labels on deltas. The labels are provisional.
           items:
             $ref: "#/components/schemas/TranscriptDeltaSegment"
       required:
@@ -1256,7 +1268,8 @@ components:
           description: >-
             Time-aligned spans of text, in order. A span the provider did not
             time at both ends is left out rather than given a borrowed time,
-            so the segments can cover less than text.
+            so the segments can cover less than text. With language identification,
+            the spans split on changes in language and any requested speaker label.
           items:
             $ref: "#/components/schemas/TranscriptSegment"
         speaker:

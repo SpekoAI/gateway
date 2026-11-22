@@ -25,6 +25,38 @@
     "type": "input.commit"
   },
   {
+    "type": "session.configure",
+    "routing": {
+      "mode": "explicit",
+      "provider": "soniox",
+      "model": "stt-rt-v6"
+    },
+    "audio": {
+      "encoding": "pcm_s16le",
+      "sample_rate_hz": 16000,
+      "channels": 1
+    },
+    "options": {
+      "language_identification": true
+    }
+  },
+  {
+    "type": "transcript.delta",
+    "text": "Hello мир",
+    "segments": [
+      {"text":"Hello","start_ms":120,"end_ms":380,"language":"en"},
+      {"text":"мир","language":"ru"}
+    ]
+  },
+  {
+    "type": "transcript.final",
+    "text": "Hello мир",
+    "segments": [
+      {"text":"Hello","start_ms":120,"end_ms":380,"language":"en"},
+      {"text":"мир","start_ms":410,"end_ms":650,"language":"ru"}
+    ]
+  },
+  {
     "type": "input.commit",
     "commit_id": "turn-7:a_b.c"
   },

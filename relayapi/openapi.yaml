@@ -1,5 +1,5 @@
-# json-mirror: openapi.json sha256:f00eba7ecfa7ea8f5cd2a13cb8af245dd1e3a2708abe333c8e19c74fe579e95a
-# yaml-body: sha256:bed369573d4aef3526ef37aeb7ecf778652ecb4751dc1913a79c976581c621d0
+# json-mirror: openapi.json sha256:35f8c620d0e1b2e8d8e2052dce986c5e610ca47a00f58bfe9266021133b1e234
+# yaml-body: sha256:00253fae247880009449efac5f61bca5dc388754fe802667fcd07f87a5d1e6a4
 #
 # This YAML document is the hand-authored, human-readable source of the HTTP
 # contract. openapi.json is its checked-in JSON mirror: the same document,
@@ -841,6 +841,11 @@ components:
             Labels transcript segments by speaker on the streaming transport.
             A model whose vendor offers diarization only on a batch API
             reports false, because this advertises what the Router can serve.
+        language_identification:
+          type: boolean
+          description: >-
+            Supports opt-in spoken-language labels on /v1/stt/stream.
+            Omitted when the route does not offer it.
         keywords:
           type: boolean
           description: Accepts vocabulary-biasing terms.
@@ -1179,6 +1184,10 @@ components:
           description: >-
             Label each transcript segment with the speaker who said it.
             Omitted leaves the vendor default, which is not the same as false.
+        language_identification:
+          type: boolean
+          enum: [false]
+          description: Only /v1/stt/stream accepts true. Batch has no language labels.
         keywords:
           type: array
           description: >-
@@ -1267,6 +1276,12 @@ components:
             another): renumbering across providers would invent an identity
             mapping no vendor promised. Absent means unattributed, which is
             not the same as a new speaker.
+        language:
+          type: string
+          description: BCP-47 spoken-language label for streaming STT. Absent in batch.
+          pattern: "^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$"
+          minLength: 2
+          maxLength: 35
       required:
         - text
         - start_ms
