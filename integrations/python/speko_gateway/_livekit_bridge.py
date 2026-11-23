@@ -113,7 +113,7 @@ class LiveKitTTSBridge:
         provider: str = "auto",
         sample_rate: int = 24_000,
         num_channels: int = 1,
-        max_input_characters: int = 100_000,
+        max_input_characters: int = 10_000,
         credential_source: CredentialSource = "auto",
         tts_options: dict[str, Any] | None = None,
     ) -> None:
