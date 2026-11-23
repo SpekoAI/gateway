@@ -1,57 +1,87 @@
-# Attributed instance reporting (protocol 3)
+# Instance reports: protocol 3
 
-The command sends `Speko-Instance-Protocol: 3` and requires the same header plus
-204 in the response. It retains the exact original sequence, lifetime, process
-counts and capacity rows after a lost acknowledgement. It never downgrades to
-protocol 2 or an unversioned request. PUT is limited to 64 KiB; DELETE retains
-the three existing lifetime fields. The cell counterpart must support protocol
-3 before this command is used with hosted managed routing.
+Protocol 3 is [protocol 2](instances-v2.md) plus a `capacity` object that
+says how many sessions the process holds per provider account, capability
+and model. The `speko-gateway` command uses it whenever `SPEKO_API_KEY` is
+set. The Go client methods are `Client.ReportInstanceV3` and
+`Client.DeregisterInstanceV3`.
 
-A v3 PUT includes the existing process metadata and a closed `capacity` object:
+## API
+
+| Method and path | Body |
+| --- | --- |
+| `PUT /v1/runtime-instances/{instance_id}` | The protocol-2 heartbeat plus `capacity`. At most 64 KiB |
+| `DELETE /v1/runtime-instances/{instance_id}` | The three protocol-2 lifetime fields |
+
+Requests send `Speko-Instance-Protocol: 3`. Success is an empty `204` whose
+response carries the same header. The command never downgrades to protocol 2
+or to an unversioned request.
+
+## The `capacity` object
 
 ```json
 {"complete":true,"accounts":[{"account":"account/one","capability":"stt_streams","model":"nova-3","active":1,"pending":0}],"byok_active":0,"byok_pending":0,"unknown_active":0,"unknown_pending":0}
 ```
 
-Every counter is an exact nonnegative int64 JSON number. There are at most 64
-unique account/capability/model rows. The active and pending dimensions each
-sum to the corresponding process count. Capability is one of `stt_streams`,
-`tts_streams`, or `realtime_sessions`. Account ids and model names are bounded
-public registry identities, never key aliases or secret values.
+| Field | Rule |
+| --- | --- |
+| `accounts` | Required array, at most 64 rows, unique by `account`, `capability` and `model` |
+| `accounts[].account` | 1 to 200 characters: a letter or digit, then letters, digits or `._:/-`. A public registry name, never a key alias or secret |
+| `accounts[].capability` | `stt_streams`, `tts_streams` or `realtime_sessions` |
+| `accounts[].model` | 1 to 256 bytes, no surrounding whitespace, no control characters |
+| `accounts[].active`, `accounts[].pending` | Non-negative. Not both zero |
+| `byok_active`, `byok_pending` | Sessions on the customer's own keys |
+| `unknown_active`, `unknown_pending` | Sessions whose plan carries no signed account |
+| `complete` | `true` exactly when both unknown counters are zero |
 
-The cell can add optional signed `capacity` metadata to a managed SessionPlan:
-`{account,capability,model,slots}`. Both normal and credential-digest JWS families
-bind it. The engine validates the model, slots and requested capability and
-publishes this projection to the local metrics callback only after signature
-verification and before physical provider opening. No provider credentials are
-passed to that callback. Failed verification never changes occupancy.
+- Every counter is an exact non-negative int64 JSON number.
+- The active counters sum to `active_sessions` and the pending counters sum
+  to `pending_sessions`.
+- When there are more than 64 rows, the overflow is added to the unknown
+  counters.
 
-The server captures opening and active sessions under the same mutex. The
-opening-to-active handoff counts once, fallback updates the verified selected
-account, and closure removes actual local occupancy. Reserved server-side plans
-remain the cell's separate accounting responsibility. A plan lacking signed
-account metadata stays explicitly unknown. BYOK is counted separately and never
-uses a Speko account. If there are more than 64 dimensions, overflow stays in
-unknown counters rather than disappearing.
+## Where the account comes from
 
-`complete` is true exactly when both unknown counters are zero. An incomplete
-report must not erase previously proved occupancy in the reader. Lifetime-only
-v2 reports remain a separate contract and establish no per-account attribution.
-Old Gateways ignore new plan fields; adding this metadata does not give them
-ownership-epoch or any other new financial enforcement.
+A managed SessionPlan can carry optional signed `capacity` metadata:
+`{account, capability, model, slots}`, with `slots` positive. Both
+session-plan JWS families bind it.
 
-The private cell issuer commits exact account/capability/model leases and its
-signed tail alongside funds and request evidence. The paired cell reader now
-accepts protocol 3, proves account authority from actual issued signed plans for
-that exact organization/process incarnation, and retains immutable observations
-with the original signed liveness TTL. Its common capacity allocator takes
-MAX(attributed physical sessions, reserved slot weight) per lifetime and model;
-covering agent parents count once. Incomplete reports preserve known occupancy,
-and exact lost-ACK retries never refresh it. The actual current command passes
-local TLS/PostgreSQL pairing for enablement, restart, lost ACK and stale shutdown.
+- The engine checks that `capability` matches the session kind, and counts
+  the session only after the plan's signature is verified and before the
+  provider connection opens.
+- A failed verification never changes the counts.
+- A plan without signed account metadata is counted as unknown.
+- BYOK sessions are counted separately and never under a Speko account.
+- No provider credential is passed to the counting code.
 
-Normal hosted Gateway issuer/event routes, media execution and settlement of
-the same work still need their coordinated runtime acceptance. Process reporting
-retains the cell's durable `speko:write` authority; execute-only and managed-session
-credential integration remains a separate runtime concern. Neither the command
-nor the new God switches have been deployed.
+## How the command reports
+
+- It creates one random incarnation and start instant before warm-up.
+- It reports once at start, then every `SPEKO_INSTANCE_HEARTBEAT_INTERVAL`
+  (20 s by default).
+- A report that was not acknowledged keeps its exact sequence and body. The
+  next report first resends it, then reports current counts.
+- Each send makes at most two attempts inside a five-second budget. It
+  retries only transport errors, 429 and 5xx.
+- On a signal, a listener failure or sequence exhaustion, it stops the
+  periodic loop, sends a final draining report, waits up to 30 seconds for
+  sessions to end, and sends DELETE.
+- The last uint32 sequence is kept for DELETE. When the sequence runs out,
+  the process drains instead of wrapping.
+- DELETE is final locally even if its acknowledgement is lost. Every retry
+  uses the same body.
+- Report failures are logged without response details.
+
+## Rules
+
+- The control plane must support protocol 3 before this command is used with
+  managed routing.
+- The API key that reports needs the `speko:write` scope.
+- An incomplete report must not erase occupancy the reader has already
+  proved. An exact retry never refreshes it.
+- The counts are sessions, not plan slot weights. Plans the control plane
+  has reserved but the process has not opened are the control plane's own
+  accounting.
+- Old Gateways ignore new plan fields. Adding `capacity` to a plan gives
+  them no new enforcement.
+- Reports grant no execution authority and release no reservations.

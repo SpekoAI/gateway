@@ -1,18 +1,23 @@
 # Releasing Gateway
 
-Customers pin release tags such as `spekoai/gateway:0.1.0` or `:0.1`.
-`latest`, `edge` and `sha-<commit>` move on every merge to `main` and are not
-a release.
+A release is a `vMAJOR.MINOR.PATCH` git tag on `main`. The `Publish Docker
+image` workflow (`.github/workflows/publish-image.yml`) turns it into Docker
+Hub tags and a GitHub release.
+
+| Image tag | Moves when | For |
+| --- | --- | --- |
+| `spekoai/gateway:0.1.1` | Never | Production pins |
+| `spekoai/gateway:0.1` | A newer `0.1.x` is released | Production, fixes only |
+| `latest`, `edge`, `sha-<commit>` | Every merge to `main` | Testing. Not a release |
 
 ## Cut a release
 
 1. Make sure `main` is green and the change works against the production
    control plane. A field the control plane does not know yet breaks every
-   session with `invalid_request` (HTTP 400). This happened with
-   `sha-1506cd4` on 2026-11-04.
+   session with `invalid_request` (HTTP 400).
 2. Pick the version:
-   - Patch (`0.1.0` → `0.1.1`) for fixes only.
-   - Minor (`0.1.x` → `0.2.0`) for new features or any change to the session
+   - Patch (`0.1.0` to `0.1.1`) for fixes only.
+   - Minor (`0.1.x` to `0.2.0`) for new features or any change to the session
      protocol, environment variables or image layout.
 3. Tag `main` and push the tag:
 
@@ -22,14 +27,21 @@ a release.
    git push origin v0.1.1
    ```
 
-4. The `Publish Docker image` workflow builds the image and pushes the
-   `0.1.1` and `0.1` tags. It then creates the GitHub release with notes
-   generated from the merged pull requests. Only `vMAJOR.MINOR.PATCH` tags
-   publish; a tag that is already released, or older than a released patch
-   on the same minor, is refused. Cut one release at a time: wait for its
-   workflow run to finish before pushing the next tag.
-5. Edit the release notes on the releases page. Start with a short
-   "What changed for you" section in plain words, and call out anything a
-   customer must do.
+4. Wait for the workflow run to finish. It pushes the `0.1.1` and `0.1` image
+   tags, then creates the GitHub release with notes generated from the merged
+   pull requests.
+5. Edit the release notes on the releases page. Start with a short "What
+   changed for you" section in plain words, and call out anything a customer
+   must do.
 6. Post the release link in the shared Slack channel of every customer it
    affects.
+
+## Rules
+
+- Only `vMAJOR.MINOR.PATCH` tags publish. Prerelease tags do not.
+- The workflow refuses a tag that already has a GitHub release, so a released
+  image never changes. Cut a new patch instead.
+- The workflow refuses a tag older than a released patch on the same minor,
+  so the minor alias never moves back.
+- Cut one release at a time. Push the next tag only after the previous run
+  has finished.

@@ -1,78 +1,71 @@
 # Cartesia whole-input TTS
 
-`cartesia.NewBytesTTS(cartesia.BytesTTSConfig{})` implements
-`runtime.Adapter` under `cartesia.tts.bytes.v1`. It accepts a concrete
-`sonic-3`, `sonic-3.5` or `sonic-3.6` HTTP route at
-`https://api.cartesia.ai/tts/bytes`, a delegated credential and explicit voice,
-language and mono PCM16 media options. Registration and native financial
-authority remain the consumer's responsibility.
+`cartesia.NewBytesTTS(cartesia.BytesTTSConfig{})` is a Go adapter that sends a
+whole transcript to Cartesia in one HTTP request and streams the audio back.
+Its adapter ID is `cartesia.tts.bytes.v1`. The `speko-gateway` command does
+not load it: a Go program that embeds the runtime registers it itself. The
+code is in `providers/cartesia/tts_bytes.go` and `tts_bytes_prepared.go`.
 
-The [bytes API](https://docs.cartesia.ai/api-reference/tts/bytes) takes the
-complete transcript and streams audio in one HTTP response. This adapter pins
-API version `2026-08-14`, its string voice field and confidential Authorization
-header. It requests raw `pcm_s16le` at one of the six documented sample rates.
-The existing WebSocket adapter and its wire version remain separately selected.
+The streaming WebSocket adapter `cartesia.tts.v1` is separate and unchanged.
 
-Append preserves exact UTF-8 fragments within a local byte limit and the
-request's optional character ceiling. Commit schedules one typed JSON request
-without blocking the runtime's serialized control dispatcher. Header/status
-failures arrive on Events. Another utterance gets another POST and operation ID. Normalization and
-speed (sent as `generation_config.speed`) use the existing per-model
-provider-option validation. `max_buffer_delay_ms` is refused by name: the bytes
-request has no buffering field because it takes the whole transcript at once. No normalization or trimming is
-applied to the submitted speech text, and no private native binding fields enter
-the provider JSON. Redirects, compressed/ambiguous responses and unsupported
-success content types are refused.
+## How it works
 
-Native owners that must bind final input before admission can call
-`adapter.PrepareInput(request, text)`. This validates the concrete generation
-settings and creates an immutable complete provider body without credentials,
-endpoint resolution or I/O. `prepared.Text()` supplies its exact final transcript
-for the owner's input-binding check. The body and text remain private in memory;
-never store or log them as control or financial evidence.
-The opaque snapshot holds its private implementation by value, so another
-consumer sharing it cannot replace an aliased pointee after the binding check.
-External wrappers and other implementations are refused by `OpenPrepared`.
+The adapter calls Cartesia's
+[bytes API](https://docs.cartesia.ai/api-reference/tts/bytes) at
+`https://api.cartesia.ai/tts/bytes` with API version `2026-08-14`.
 
-After admission, `adapter.OpenPrepared(workContext, fundedRequest, prepared)`
-checks the actual endpoint and credential and requires the funded generation
-settings to produce the same provider bytes within the current input bounds.
-It then sends the original prepared bytes once. No text append or commit can
-replace them or start another utterance, even after completion. This prepared
-stream follows the work context through actual HTTP cancellation and retains
-the ordinary output and billing lifecycle. Preparation supplies no execution
-authority, idempotency guarantee, no-I/O proof or heard-audio evidence; the
-native owner must still establish those separately.
+| Input | Accepted values |
+| --- | --- |
+| Model | `sonic-3`, `sonic-3.5`, `sonic-3.6` |
+| Audio | Mono `pcm_s16le` at 8000, 16000, 22050, 24000, 44100 or 48000 Hz |
+| Voice, language | Required, explicit |
+| `normalization`, `speed` | Same per-model rules as the WebSocket adapter. `speed` is sent as `generation_config.speed` |
+| `max_buffer_delay_ms` | Refused by name. The bytes request has no buffering field |
 
-Audio frames contain whole PCM samples. Only a nonempty, aligned response that
-ends cleanly publishes audio.done and a complete observation. Empty, truncated,
-oversized, failed or interrupted output cannot become complete. Header waits,
-error-body reads, active response-read inactivity and graceful-close inactivity
-are bounded. Cancel/Abort interrupt pending headers as well as audio reads;
-cancellation preserves the session for another utterance. A backpressured
-terminal publication retains its cancellation handle and event order.
-Close failures remain available through TerminalError before Events closes.
-Error messages omit provider body content.
+- `text.append` collects UTF-8 text up to a local byte limit (64 KiB by
+  default) and the request's character ceiling. The text is sent as given,
+  with no trimming or normalization by the adapter.
+- `text.commit` sends one POST. Each further utterance is another POST with
+  its own operation ID.
+- Audio frames hold whole PCM samples. `audio.done` and a complete usage
+  observation are published only when a nonempty, sample-aligned response
+  ends cleanly.
+- Cancel and abort interrupt a pending request. Cancel keeps the session open
+  for another utterance.
+- BYOK and relay keys are reused for the whole session. A managed
+  provider-direct credential that has expired is renewed through the
+  session's `RefreshCredential` hook before the next POST.
 
-Permanent BYOK and relay keys remain reusable throughout the authorized session.
-Managed provider-direct credentials renew through the supplied same-attempt
-RefreshCredential hook before another POST needs an expired credential. The
-runtime still enforces the session lease independently of provider key lifetime.
+## Prepared input
 
-Observations measure the exact submitted Unicode scalar count in `characters`,
-with the protocol's thousandths representation and `streaming` output mode.
-Every potentially dispatched POST first emits an incomplete operation with an
-unknown quantity. Header failures and pre-audio cancellation therefore cannot
-hide behind a previous completed utterance or become a measured zero.
-Credential renewal or request preparation failures before that dispatch boundary
-report an error without creating a provider billing operation.
-They do not infer credits, provider cost, audible delivery or a provider request
-ID. Cartesia's [pricing documentation](https://docs.cartesia.ai/pricing) says
-transcript preprocessing can vary its final credit total. A consumer must use
-an explicitly reviewed character-priced policy or retain unknown provider cost;
-it cannot relabel this count as exact credits or use the local operation ID as
-invoice attribution. Native grant admission, durable receipts and settlement
-remain separate consumer work.
+A caller that must fix the final text before it commits to the request uses
+two steps:
 
-Tests use local HTTP peers only. Live provider acceptance and the paired native
-router/control-plane lifecycle must be proven before enabling this route.
+1. `adapter.PrepareInput(request, text)` validates the settings and builds
+   the exact provider body. It uses no credential and does no I/O.
+   `prepared.Text()` returns the final transcript.
+2. `adapter.OpenPrepared(ctx, request, prepared)` checks the endpoint and
+   credential, requires the request's settings to produce the same bytes, and
+   sends those bytes once. No append or commit can replace them or start
+   another utterance.
+
+Only a value returned by `PrepareInput` is accepted.
+
+## Rules
+
+- Redirects, compressed or ambiguous responses and unexpected content types
+  are refused. Header waits, error-body reads and idle reads are bounded.
+- Error messages never contain the provider's response body.
+- Usage is the Unicode scalar count of the submitted text, reported as
+  `characters` in thousandths, in `streaming` output mode.
+- Every POST that may have been sent first reports an incomplete operation
+  with unknown quantity. An empty, truncated, oversized, failed or
+  interrupted response never becomes complete.
+- A failure before the request is sent (credential renewal, body
+  preparation) reports an error and no billing operation.
+- The character count is not Cartesia credits. Cartesia's
+  [pricing](https://docs.cartesia.ai/pricing) says preprocessing can change
+  the credit total, and the adapter reports no provider cost or request ID.
+- A prepared body and its text stay in memory. Do not store or log them.
+- Preparing input is not permission to run it, and it does not prove that
+  audio was delivered or heard.

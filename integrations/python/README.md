@@ -1,442 +1,166 @@
-# Speko Gateway Python integration
+# speko-gateway
 
-This package connects Python voice-agent frameworks to the authenticated local
-Speko Gateway socket, or to the Speko Router's native STT, TTS, LLM and typed
-evaluation surfaces. Voice classes use an explicitly supplied transport client
-or the local Gateway socket. Relay clients carry their own Speko credential.
+Python client and voice-framework integrations for
+[Speko Gateway](https://github.com/SpekoAI/gateway), the open-source sidecar
+that connects a voice agent to speech providers. The package has LiveKit
+Agents and Pipecat classes for speech-to-text (STT), text-to-speech (TTS) and
+LLM, a plain asyncio client for the Gateway socket, and clients for the hosted
+Speko Router.
 
-## Native relay speech
+## Install
 
-`RelaySpeechClient` sends STT/TTS streams through the router's native execution
-grants. Give each platform session its own registered model credential; the
-client takes the key, platform session UUID and configured relay origin
-explicitly and never reads `SPEKO_API_KEY` or shares warm plans. The relay and
-cell still perform admission, enforce the compiled route and settle usage.
+The package needs Python 3.10 to 3.14. It is shipped inside the Gateway image
+at `/opt/speko/python`, and it installs from a checkout of the repository:
 
-```python
-from speko_gateway import RelaySpeechClient
-from speko_gateway.livekit import STT, TTS
-
-speech = RelaySpeechClient(
-    api_key=model_key,
-    session_id=spec.session_id,
-    base_url=relay_origin,
-)
-stt = STT(speech, provider=stt_provider, model=stt_model,
-          language=stt_language, credential_source="managed", turn_vad=local_vad)
-tts = TTS(speech, provider=tts_provider, model=tts_model, voice="",
-          language=tts_language, credential_source="managed")
-# Before AgentSession.start(agent=agent), bind the owned session.
-stt.bind_session(session)  # bind_agent(agent) also locates its initial session
+```bash
+pip install "./integrations/python[livekit]"   # or [pipecat]
 ```
 
-For the native Go sidecar, pass `socket_path` and `local_auth_token` instead of
-`base_url`. `RelayLLMClient` accepts the same explicit socket parameters and
-session credential. Start the sidecar with `speko-gateway native`; its HTTPS
-relay origin comes from `SPEKO_RELAY_URL`:
+| Extra | Brings | Notes |
+| --- | --- | --- |
+| `livekit` | `livekit-agents>=1.4.5,<2` | |
+| `pipecat` | `pipecat-ai>=1.7,<2` | Python 3.11 or newer |
+
+The voice classes need a running Gateway. See the
+[Gateway README](https://github.com/SpekoAI/gateway#quick-start) for how to
+start one and how to add it to an agent image.
+
+## What is in the package
+
+| Import | Talks to | Use |
+| --- | --- | --- |
+| `speko_gateway.livekit`: `STT`, `TTS` | Local Gateway socket | LiveKit Agents voice legs |
+| `speko_gateway.livekit`: `LLM` | Speko Router | LiveKit Agents LLM |
+| `speko_gateway.pipecat`: `SpekoSTTService`, `SpekoTTSService`, `SpekoLLMService` | Gateway socket, Router | Pipecat services |
+| `speko_gateway`: `GatewayClient` | Local Gateway socket | Sessions without a framework |
+| `speko_gateway.probe`: `ConversationProbe` | Local Gateway socket | Per-turn latency markers |
+| `speko_gateway`: `RelaySpeechClient`, `RelayLLMClient`, `RelayTTSClient`, `RelayEvaluationClient` | Speko Router | See [Speko Router clients](#speko-router-clients) |
+
+## Configuration
+
+| Variable | Read by | Meaning |
+| --- | --- | --- |
+| `SPEKO_LOCAL_AUTH_TOKEN` (or `_FILE`) | `GatewayClient.from_env()`, and so `STT()`, `TTS()`, `ConversationProbe` | Bearer token of the local Gateway. Required |
+| `SPEKO_SOCKET_PATH` | the same | Gateway socket. Default `/run/speko/runtime.sock` |
+| `SPEKO_API_KEY` (or `_FILE`) | `LLM()`, `SpekoLLMService`, `RelayEvaluationClient.from_env()` | Speko API key. Also decides `credential_source="auto"` |
+| `SPEKO_ROUTER_URL` | the same | Router origin. Default `https://router.speko.dev`. `SPEKO_RELAY_URL` is read as a fallback |
+
+`credential_source` on the voice classes chooses whose provider key is used:
+
+| Value | Meaning |
+| --- | --- |
+| `"auto"` (default) | Managed when `SPEKO_API_KEY` is set, otherwise BYOK |
+| `"byok"` | The provider key configured in the Gateway |
+| `"managed"` | Speko's provider credential, billed through Speko |
+
+## LiveKit Agents
 
 ```python
-from speko_gateway import RelayLLMClient, RelaySpeechClient
-
-speech = RelaySpeechClient(
-    api_key=model_key, session_id=spec.session_id,
-    socket_path="/run/speko/runtime.sock", local_auth_token=socket_token,
-)
-llm = RelayLLMClient(
-    api_key=model_key, session_id=spec.session_id,
-    socket_path="/run/speko/runtime.sock", local_auth_token=socket_token,
-)
-```
-
-The socket's local credential stays in the sidecar. Per-session model keys and
-identities reach only its configured relay. Both socket clients refuse implicit
-model-key fallback. Native LLM transport failures and retry hints remain
-non-retryable; the LiveKit LLM adapter also disables its automatic request replay
-for a native socket client.
-
-The provider/model/language fields come from the compiled spec. A managed
-worker leaves the original TTS voice blank so the cell can sign its compiled
-voice override. `SpekoSTTService` and `SpekoTTSService` in `speko_gateway.pipecat`
-accept the same client and explicit managed configuration. Native admission's
-`session.ready` frame checks readiness; these clients use no local health probe
-and Pipecat's optional automatic provider fallback does not apply to them.
-Close both models and then `await speech.aclose()` at the end of the call.
-
-Relay-backed LiveKit STT requires `turn_vad`, the worker's local LiveKit VAD.
-It must acknowledge contiguous unchanged audio in `INFERENCE_DONE.frames`
-before its start/end events, as Silero does. The inference and audio sample
-rates may differ. Only acknowledged audio reaches the relay; queued input
-cannot overtake an earlier speech boundary. Missing VAD is refused before
-admission, and stalled processing has a bounded input backlog.
-
-The LiveKit stream stays open across turns. Each VAD turn uses a separate
-native request, streaming audio and interim text while speech continues.
-Turn ownership follows transcript-preserving `stt.MultiSpeakerAdapter` and
-single-model `stt.FallbackAdapter` wrappers, including nested wrappers. An
-ambiguous native failure fences their later stream and recovery calls too.
-Whole-final speaker labels reach LiveKit's `speaker_id`; attributed segments
-become individual timed finals, with explicit segment labels taking precedence.
-A single untimed whole-final label uses the actual captured physical request
-interval for RMS, marked `timing_source="captured_request"`. It does not invent
-provider word timings. Multiple untimed labels cannot be assigned that same
-interval; unavailable attribution or insufficient captured RMS evidence refuses
-primary detection and fences native recovery instead of silently returning None.
-Native `speaker_id` values are opaque identities scoped to each physical
-request; the original vendor label is available as `provider_speaker_id`.
-The same vendor label in a later request does not identify the same person.
-MultiSpeaker primary selection restarts in that request's identity space,
-while its accepted PCM history and timeline remain intact. Local Gateway
-speaker identities keep their existing stream semantics.
-Unlabeled segments inherit a whole-final label when present. Otherwise they
-remain unattributed. The MultiSpeaker wrapper can use these labels and timings
-for primary-speaker detection. The complete provider final stays authoritative:
-partial attribution, punctuation and text without word spaces retain their
-canonical text. Uncovered spans remain unattributed unless the provider labels
-the whole final; ambiguous alignment preserves the text without inventing a
-speaker. Invalid labels or time ranges refuse the result and fence retries.
-The owned recognition callback reconciles canonical text after SDK processing,
-including adaptive interruption replay on SDKs with a separate processing step,
-including an interim promoted by a timed-out manual commit. It validates that
-attributed final events reach the SDK unchanged and in order. The callback is
-restored when ownership changes or the model closes. Event and SpeechData
-dataclass copies preserve the canonical text, timing witness and ordered-final
-association. Those fields contain only encodable values; pending native batches
-are released after processing or stream close.
-
-Native streaming finals expose `canonical_text` on the last part of each
-provider final; earlier parts carry an empty string. `recognize()` returns the
-complete text with available `speaker_segments`. Local Gateway streaming also
-emits individual attributed finals through standard `speaker_id` fields, so
-MultiSpeaker detection and transcription events receive the labels. Its owned
-recognition hook preserves canonical turn text, including through nested SDK
-wrappers and manual commits partway through a final. Deliberate local wrapper
-formatting is preserved. Ambiguous spans stay unattributed even when a whole
-final has a different speaker label. Live swaps between native and Gateway STT
-restore the preceding owner's hooks before installing the new binding.
-Local background-speaker suppression keeps the SDK's empty-final signal and
-its scalar group association, so a filtered terminal segment still finishes
-the group. Canonical turns include only the surviving parts; filtered speech
-is not restored from the full provider text. Entirely filtered groups do not
-poison later turns. Suppressed text is absent from outward event metadata as
-well as `text`; canonical filtering state stays inside the owned filter until
-the group finishes. Finals arriving after provider end-of-speech retain that
-boundary, and replacing Gateway STT with another SDK model retires its pending
-gate without requiring the old model to close.
-Wrapper registration and synchronous stream entry propagate the owned filter
-before asynchronous fallback children start, for both MultiSpeaker/Fallback
-orders. On older SDKs without wrapper prewarm, actual input forwarding exposes
-that same parent stream before its PCM reaches the child. Only instance-owned
-hooks are installed and released on close. A custom `stt_node` may drop empty
-finals: the outer stream's next consumer pull retains the real redacted terminal
-witness. Retained SDKs put private bookkeeping behind already yielded events in
-their recognition queue. This emits no extra transcript, provider EOS or usage,
-and preserves custom-node pauses and manual deferral.
-An explicit manual decision deferred during a segmented final retains its
-`skip_reply` value through active VAD speech and rearms when that speech ends.
-Without a manual request, late finals do not start a manual turn. The owned
-VAD callback is restored together with the local transcript hooks.
-Speaker RMS lookup uses accepted audio positions, including after custom-node
-filtering; emitted transcript timestamps keep their original input positions.
-Multi-model fallback requires a control-plane recovery decision; wrappers
-that rewrite or suppress transcripts are refused before native admission.
-At speech end the request commits and closes; final transcript segments and
-`END_OF_SPEECH` are emitted only after terminal usage arrives. A final segment
-alone cannot complete a turn. `bind_session(session)` observes that session's
-actual synchronous turn acceptance, including `skip_reply=True`, and follows
-`update_agent()` handoffs and live `Agent.update_options(stt=...)` swaps. The
-current activity has one turn owner; the old callback is restored before a new
-model binds. The binding observes the Agent's input before its custom
-`stt_node` consumes or buffers frames, keeping the SDK's timestamp basis.
-Newer SDKs use the recognition pipeline's timeline. LiveKit 1.4.5 uses the
-session or recording epoch, so the binding also observes source delivery before
-SDK buffering; replacing an input preserves its elapsed gap. Filtered frames
-advance that timeline without being sent to the provider. Buffered audio retains its original position, and
-fresh input retains its configured endpointing delay even when a wrapper omits
-its child's offset. Each input occurrence receives its own frame copy with the
-original PCM and userdata; the producer's frames remain untouched. Custom DSP
-that replaces a frame must preserve its userdata and duration. Repacketization
-that loses the source position is refused. Public Agent lifecycle hooks remain
-untouched; the owned processing-node and option-update hooks are restored on close.
-Handoffs release inactive Agent hooks so the Agent can join another session;
-the original session keeps its retained pipeline. A captured node stays inert
-after its last native owner closes, including SDK restarts for local STT.
-The running source observer follows the session's current native binding, so a
-later native model can reuse the source after a local-STT handoff, including its
-elapsed idle gap. Startup input is observed even before recognition exists.
-Legacy source clocks follow the underlying input through delegation, while
-already-buffered occurrences keep their timestamps. The public input keeps its
-identity, iterator setup and idempotent assignment behavior; modern SDKs use
-their pipeline clock without a source observer.
-
-Detaching and reattaching the same legacy input includes its elapsed gap;
-adding a continuous delegate keeps its existing clock. An owned instance read
-hook observes capture before a delegate can hold a frame. Capture positions stay
-absolute until recognition translates them into the session/recording epoch,
-including the recorder's first-frame epoch publication. Restarting the session
-resets its source scope and clock rather than inheriting the previous run's end.
-Read hooks restore when their captured source pump ends; input-change hooks
-restore with the final native owner.
-
-SDK-generated flush audio is observed at recognition ingress. It retains its
-PCM duration for recognition and VAD, but occupies no captured-media time:
-its source position stays at the last real ingress. Resumed real input and
-source frames held across a flush therefore neither move backwards nor inherit
-the synthetic two-second duration. Enable/disable changes and later ownership
-reanchor new source deliveries without moving buffered frames. These instance
-hooks restore when their ownership ends, and input wrappers share the source
-clock rather than counting a frame twice.
-Duration-preserving DSP may deep-copy userdata without changing its source witness.
-`bind_agent(agent)` locates the same session when its first stream starts.
-The owned SDK activity interface is checked before admission and before each
-turn's final transcript, including SDKs that retain a stream across handoff.
-It is restored on close or handoff; the binding never changes the global SDK.
-Short pauses can span several physical speech requests in one framework turn.
-Resumed speech transcribes while endpointing is pending; a genuinely separate
-queued turn still waits for the preceding framework commit. Between configured
-delay limits, the binding follows the SDK's observed turn-detector decision.
-Withdrawn streaming predictions follow the SDK's resumed-speech state.
-Unprocessed VAD input and incomplete terminal transcripts defer framework
-acceptance. Draining input or delivering the complete transcript rearms a deferred
-decision, preserving an explicit `skip_reply` request. The SDK detector objects
-and streams are observed through owned recognition instances and restored on close.
-Probability-based VADs must expose their activation threshold on the owned
-stream/options or detector. Silero/local inference options supply it directly;
-custom detectors can expose `activation_threshold`. A window above that actual
-threshold keeps a possible onset pending before `START_OF_SPEECH`. A later real
-window below it clears the candidate. Invalid probabilities or thresholds and
-unqualified probability detectors refuse before native admission.
-For the installed local-inference and Silero detectors, a paused partial
-window receives one bounded window of detector-only zero padding. The ordered
-audio ledger removes that padding before provider delivery, history/RMS lookup,
-or source timestamp mapping. Speech/silence minimums and hysteresis use the
-detector's configured thresholds and real sample durations; virtual padding
-cannot create a start/end boundary or clear a possible onset by itself.
-An unresolved native onset fails with a control-plane recovery error after one
-second without real inference progress. Each acknowledged real span renews this
-stall deadline, so continuous speech can reach configured minimums above one
-second. Padding-only inference never renews it. Paused capture cannot hold the previous turn indefinitely or classify
-unprocessed continuation speech as silence. This failure never retries admission.
-Continuous input retains normal inference cadence. Padding is bounded
-independently from the real-input backlog, and a final drain completes remaining
-real samples before the SDK discards its buffers at end of input. Other supplied
-VAD implementations retain their ordered acknowledgement/boundary contract.
-
-An AgentSession with its own local VAD also needs to drain that independent
-stream. Wrap the local detector with `DrainingVAD`; retain the worker's local
-turn detector and VAD interruption policy:
-
-```python
-from livekit.agents import AgentSession, inference
-from speko_gateway.livekit import DrainingVAD
-
-session = AgentSession(
-    stt=stt,
-    llm=llm,
-    tts=tts,
-    vad=DrainingVAD(inference.VAD(model="silero"), flush_mode="reset"),
-    turn_handling={
-        "turn_detection": inference.TurnDetector(version="v1-mini"),
-        "interruption": {"mode": "vad", "enabled": True},
-    },
-)
-stt.bind_session(session)
-```
-
-`DrainingVAD` supports the installed local-inference and Silero VADs, with
-independent state per stream. It preserves captured PCM in inference/boundary
-events, applies the underlying detector's current duration thresholds, and
-uses an explicit `flush_mode`. The `"reset"` mode is for an AgentSession's
-independent VAD: STT already supplies the speech end, so flush fences classified
-old-segment events without adding a queued end that could overwrite newer speech.
-Unprocessed real capture is recovered from the ordered ledger and classified
-again with fresh detector state and duration counters. This preserves resumed
-speech captured before a delayed STT end; old speech durations cannot become a
-new interruption. A replay that ends in old speech stays non-interrupting until
-real quiet separates a fresh onset, including silence captured after replay.
-Already classified real quiet also separates pending resumed capture, even
-when it has not reached the detector's normal end threshold before reset.
-That restores speaking state; it does not establish a fresh interruption. Only
-a fully post-frontier, physically captured voiced inference window starts the
-new interruption duration. Later quiet and padding cannot start that clock or
-reuse pre-EOS speech duration, including with short interruption thresholds.
-If quiet abandons a tentative onset before `START_OF_SPEECH`, its interruption
-clock is cleared even though no `END_OF_SPEECH` exists. A later onset starts
-its own duration; physical boundary timestamps, PCM and minimums are unchanged.
-Recovery never replays detector-only padding. Pending
-real tails rearm after in-flight padding completes, with no packet-duration delay.
-
-Use `DrainingVAD(detector, flush_mode="segment")` for a batch STT
-`StreamAdapter`. Its explicit flush drains captured audio through inference,
-finishes speech once, and starts a fresh detector for subsequent input. It does
-not require EOF to recognize the completed segment. Use separate instances for
-batch recognition and an independent session VAD. Physical EOF drains and
-completes remaining speech in either mode; event PCM and timing share one frontier.
-Public sample indexes use the detector's inference rate, while event PCM retains
-its captured rate. Interruption durations include captured silence while the
-detector is still speaking, following the SDK's transition ordering. It does not feed its
-padding into the separate turn detector. Close its streams through the owning
-AgentSession. Native STT already drains its own `turn_vad` stream separately.
-Binding is
-required for native AgentSession streaming. Explicit event consumers can use
-`stream(manual_turns=True)`; completed-buffer `recognize()` needs no binding
-and joins all final segments. EOS timing excludes the detector's trailing
-silence. Overlapping VAD prefixes exclude samples already assigned to
-an earlier request, and request timestamps map to the persistent stream's
-timeline. All PCM, including VAD prefixes and inference batches, is chunked to
-fit the native frame bound. Pipecat
-uses its pipeline's VAD and explicit commits.
-
-Native LiveKit TTS streams text at confirmed boundaries while upstream text
-continues arriving. An unambiguous sentence delimiter, observed whitespace,
-explicit `flush()`/`commit_text()`, or EOF can complete input. A pause alone
-cannot complete an unfinished word, number or domain: `Ple` may become `Please`,
-`St. Louis` may become `St. Louisville`, and `0.` may become `0.05`. Undelimited
-input now waits for a real boundary instead of flushing merely after 300 ms.
-The existing 300 ms idle lookahead remains for eligible, confirmed abbreviation
-context; it is not enlarged or used to guess the rest of a word.
-
-Every input character and separator stays intact, including literal `<stop>`
-and `<prd>` strings. The original utterance bound is 240 Python string Unicode
-code points, not UTF-8 bytes or grapheme clusters. Bounded commits split only at
-observed separators. A single undelimited unit longer than 240 code points is
-refused without retry; its invalid remainder is not flushed during cleanup.
-A complete unit of up to 240 code points still flushes on explicit completion.
-An explicit `flush()` completes the SDK segment after its audio drains, even
-before `end_input()`.
-
-For plain-text producers that must expose their delimiters immediately,
-LiveKit's existing `tts_text_transforms=[]` option preserves that whitespace.
-The SDK's default Markdown transform can retain a trailing delimiter; the
-adapter then waits for its actual subsequent boundary, flush or EOF. Default
-framework completion remains supported and retains exact post-transform text,
-PCM and canonical reporting. See [the boundary contract](../../docs/native-tts-text-boundaries.md).
-Each native utterance waits for `utterance.done` before appending the next one
-or closing the session, while incoming LLM text continues buffering. This
-supports provider adapters with one active synthesis context.
-
-Native clients preserve the platform's opaque session ID, including IDs such as
-`ses_fixture_web`. IDs follow the `speko.agents.v1` ASCII grammar (1–200 characters,
-starting with an alphanumeric character, then alphanumeric characters or
-`._:-`); they are never replaced with a generated UUID. The cell verifies the
-ID's binding to the per-session model credential.
-
-Native speech disables LiveKit automatic retries for streaming STT, recognition,
-streaming TTS and chunked synthesis, including when retry-enabled connection
-options were supplied. Relay retry hints and timeouts cannot prove no provider
-I/O occurred; a new attempt needs an explicit control-plane decision.
-A failed native STT instance, including cancellation during admission before
-`session.ready`, also refuses new streams and new turn admissions,
-including LiveKit's outer AgentSession recovery loop. The worker must obtain
-its recovery decision before constructing a replacement instance.
-Pipecat native TTS likewise latches ambiguous admission, send, receive/EOF and
-framework-receiver failures before any await that removes the context. It emits
-a fatal error and refuses subsequent SDK sentences/admissions on that instance;
-admission or send cancellation also latches before cleanup and then propagates
-the original cancellation. The owned configuring socket is closed, and later
-sentences cannot open a replacement merely because no ready session returned.
-Cancellation while a queued sentence only waits for the previous admitted
-utterance starts none of that sentence's transport work. Pipecat's ordinary
-interruption cleanup closes the existing context and permits later independent
-turns. Readiness or settings updates do not recover an ambiguous I/O failure. Framework queue failure still
-attempts physical session cleanup. Construct a replacement only after the
-control-plane recovery decision. Ordinary local Gateway error recovery retains
-its existing behavior. These local fences prove neither NoIO nor settlement.
-
-The client preserves binary PCM, stream commits, TTS cancellation and native
-error codes. Live usage updates remain progress events; only a terminal frame
-with final usage produces `usage.reported`. A lost terminal frame fails without
-an automatic retry. These transport tests use owned protocol peers; wiring
-worker claims through the actual cell and settling a full conversation remains
-an integration gate. Managed worker activation also requires current-head review
-of logical-turn coordination and the complete worker/cell/router lifecycle.
-
-For LiveKit Agents:
-
-```python
+from livekit.agents import AgentSession
 from livekit.plugins import openai
 
 from speko_gateway.livekit import STT, TTS
 
 session = AgentSession(
     stt=STT(
-        language="en",         # default
-        provider="auto",       # default; set for BYOK when several STT keys exist
-        model="auto",          # default: the provider's catalog default
-        credential_source="auto", # or "byok" / "managed"
-        sample_rate=16_000,    # default
+        language="en",             # default
+        provider="auto",           # default. Set it when several BYOK STT keys exist
+        model="auto",              # default: the provider's catalog default
+        credential_source="auto",  # default
+        sample_rate=16_000,        # default
     ),
     llm=openai.LLM(model="gpt-4.1-mini"),  # any LiveKit LLM plugin
     tts=TTS(
-        provider="auto",       # default: the configured BYOK vendor, or the managed plan's pick
-        model="auto",          # default: the provider's catalog default
-        voice="",              # default: request, configured fallback, or catalog default
-        language="en",         # default
-        sample_rate=24_000,    # default
-        credential_source="auto", # or "byok" / "managed"
+        provider="auto",           # default
+        model="auto",              # default
+        voice="",                  # default: the configured or catalog voice
+        language="en",             # default
+        sample_rate=24_000,        # default
+        credential_source="auto",  # default
     ),
 )
 ```
 
-`TTS(provider_options=...)` passes a vendor's own synthesis settings, for
-example `{"cartesia": {"normalization": "en-IN"}}` to read numbers and dates
-the Indian-English way in a Hindi session, or `{"elevenlabs": {"stability":
-0.4, "similarity_boost": 0.8, "style": 0.2}}`. `update_options(provider_options=...)`
-changes them for the next reply. The Gateway refuses a setting the routed
-model cannot honor before the session opens.
+### STT options
 
-With `GatewayClient`, `TTS` keeps a Gateway session open in standby, so a reply's
-first text goes out without waiting for a session to open. Opening a session
-also connects to the provider, and some providers hold the first audio until that setup
-finishes. Managed ElevenLabs, for example, checks its token only after the
-WebSocket upgrade. LiveKit calls `prewarm()` when the agent starts, which
-opens the standby, and each reply opens the next standby when it takes the
-current one. A reply opens its own session at its first text, as before, when
-the standby has other settings, has ended, or failed to open. `update_options`
-replaces a standby that has the old settings, so an agent that changes
-language every turn opens one unused session per change. A standby that no
-reply takes within 3 minutes closes, and the next reply opens its own session
-and a new standby. LiveKit does not close the `TTS` when the session ends, so
-call `aclose()` to close the standby sooner. Between replies, each `TTS` holds
-one open Gateway session and provider connection, and during a reply it holds
-two. Both count toward your organization's concurrent-session limit and the
-provider's connection limits. With managed credentials, Speko reserves credit
-for each open session's `max_input_characters`, so the standby holds a second
-reservation. Each reply gets its own session, so the default is 10,000
-characters, about ten minutes of speech. The Gateway refuses text past that
-limit and the reply fails, so raise it only if one reply can be that long.
-Lower `max_input_characters` to reserve less. Set
-`standby_sessions` to keep more standbys, or to `0` to open each session at
-its reply's first text.
+```python
+stt = STT(
+    provider="deepgram",             # pin provider and model when an option is required
+    model="nova-3",                  # Deepgram's default, Flux, has no diarization
+    diarization=True,                # speaker labels
+    keywords=["Speko", "Casey"],     # vocabulary biasing
+    noise_reduction=True,
+    provider_options={               # the vendor's own settings
+        "deepgram": {"numerals": True, "endpointing": 1200},
+        "elevenlabs": {"vad_silence_threshold_secs": 0.7},
+    },
+)
+```
 
-With `RelaySpeechClient`, `TTS` defaults to `standby_sessions=0`: provider
-admission starts at the reply's first text. Set a positive count explicitly
-to preopen native sessions; each standby consumes its own admission, credit
-reservation and provider connection. Native speech never retries a reply's
-failed open, including when standby sessions are enabled.
+- `diarization`, `keywords` and `noise_reduction` fail closed. A session
+  routed to a provider that cannot honor one is refused at create with
+  `stt_option_unsupported` and the option named.
+- With `provider="auto"`, routing may pick a provider that refuses the
+  option. Pin the provider when an option is a requirement.
+- A setting under `provider_options` that the provider's model does not
+  allow is refused by name. Settings for a provider the session does not
+  reach are ignored.
+- Speaker labels arrive on finals as LiveKit `speaker_id`.
 
-`STT()` and `TTS()` read `SPEKO_SOCKET_PATH` and `SPEKO_LOCAL_AUTH_TOKEN`.
-`credential_source="auto"` preserves the original behavior: managed when
-`SPEKO_API_KEY` is present and local BYOK otherwise. Set `"byok"` explicitly
-to use local provider credentials while retaining a Speko API key for LLM or
-other managed traffic.
+ElevenLabs has two realtime Scribe models. `scribe_v2_realtime` is the
+default. `model="scribe_v3_live"` adds `diarization=True` and the provider
+options `turn_prediction` and `multilang_mode`, which other Scribe models
+refuse. With diarization, a final waits up to 0.8 s after its commit for the
+speaker labels and is delivered without them when they do not arrive.
 
-The LiveKit classes support `livekit-agents` 1.4.5 and later. Releases before
-1.6.5 have no keyterm capability flag, so `STT(keywords=...)` still sends the
-keywords to the provider but does not advertise keyterm support to LiveKit.
-From 1.8.9, `STT(provider="soniox")` lets LiveKit flush the stream when the
-user stops speaking (VAD end of speech, a turn detector's end-of-turn verdict,
-or `commit_user_turn`). The Gateway turns the flush into Soniox's `finalize`,
-so the final transcript arrives a few hundred milliseconds later instead of
-waiting for Soniox's own endpointer (up to 2 s by default).
-`STT(provider="omi")` gets the same flush: the Gateway sends Omi's
-`finalize`, which Omi answers in about 50 ms server-side. Other providers
-and `provider="auto"` keep waiting for the provider's endpointer.
-Releases before 1.6.10 import `httpx` without declaring it, and openai 3 no
-longer brings it in; this package depends on `httpx`, so any install of it,
-with or without the `livekit` extra, works without an `openai` pin.
+### TTS options and standby sessions
 
-With a Speko API key the LLM can come from Speko too, served by the hosted
-relay:
+`TTS(provider_options=...)` passes a vendor's synthesis settings, for example
+`{"cartesia": {"normalization": "en-IN"}}` or
+`{"elevenlabs": {"stability": 0.4, "similarity_boost": 0.8, "style": 0.2}}`.
+`update_options(language=..., voice=..., provider_options=...)` changes them
+for the next reply. A setting the routed model cannot honor is refused before
+the session opens.
+
+With the local Gateway, `TTS` keeps one Gateway session open in standby so a
+reply's first text does not wait for a session to open.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `standby_sessions` | `1` with `GatewayClient`, `0` with `RelaySpeechClient` | Sessions kept open ahead of the next reply. `0` opens each session at the reply's first text |
+| `max_input_characters` | `10000` | Character limit of one reply, about ten minutes of speech. The Gateway refuses text past it and the reply fails |
+
+- LiveKit calls `prewarm()` when the agent starts, which opens the standby.
+  Each reply opens the next one.
+- A standby that no reply takes within 3 minutes closes. `update_options`
+  replaces a standby that has the old settings.
+- LiveKit does not close the `TTS` when the session ends. Call `aclose()` to
+  close the standby sooner.
+- Each open session counts toward your organization's concurrent-session
+  limit and the provider's connection limits: one between replies, two
+  during a reply.
+- With managed credentials, Speko reserves credit for each open session's
+  `max_input_characters`, so a standby holds a second reservation. Lower
+  `max_input_characters` to reserve less.
+
+### LiveKit versions
+
+- The classes support `livekit-agents` 1.4.5 and later.
+- Before 1.6.5 there is no keyterm capability flag. `STT(keywords=...)` still
+  sends the keywords to the provider.
+- From 1.8.9, `STT(provider="soniox")` and `STT(provider="omi")` let LiveKit
+  flush the stream when the user stops speaking. The Gateway sends the
+  provider's `finalize`, so the final transcript arrives sooner than the
+  provider's own endpointer would send it. Other providers and
+  `provider="auto"` wait for the provider's endpointer.
+- This package depends on `httpx` because `livekit-agents` before 1.6.10
+  imports it without declaring it.
+
+## Speko LLM
+
+With a Speko API key the LLM can come from Speko too. `LLM()` talks HTTPS to
+the Speko Router, not to the local socket, so the conversation history
+travels through the Router.
 
 ```python
 from speko_gateway.livekit import LLM, STT, TTS
@@ -444,134 +168,57 @@ from speko_gateway.livekit import LLM, STT, TTS
 session = AgentSession(
     stt=STT(),
     llm=LLM(
-        provider="auto",          # default: relay picks; set with model= to pin a route
-        model="auto",             # default: GET router.speko.dev/v1/models lists the options
-        objective="balanced",     # default: or "quality", "latency", "cost"
+        provider="auto",          # default. Set provider and model together to pin
+        model="auto",             # default. GET router.speko.dev/v1/models lists models
+        objective="balanced",     # default, or "quality", "latency", "cost"
         max_output_tokens=8_192,  # default
-        reasoning_effort=None,    # default: provider default; or "none" ... "xhigh"
-        frequency_penalty=None,   # default: unset; -2 to 2
-        presence_penalty=None,    # default: unset; -2 to 2
-        repetition_penalty=None,  # default: unset; greater than 0, at most 2
+        reasoning_effort=None,    # default, or "none" ... "xhigh"
+        frequency_penalty=None,   # default, or -2 to 2
+        presence_penalty=None,    # default, or -2 to 2
+        repetition_penalty=None,  # default, or greater than 0 and at most 2
     ),
     tts=TTS(),
 )
 ```
 
-`reasoning_effort` is the Router's reasoning control. Use `"none"` to turn
-reasoning off. `"minimal"` asks for the least reasoning the routed model allows
-(the Router maps it onto each provider's own scale), and `"low"`, `"medium"`,
-`"high"` and `"xhigh"` ask for more. Unset, no field is sent and the provider
-default applies. Any other value raises `ValueError` when the LLM is
-constructed. While reasoning is enabled (any value but `"none"`) the Router
-refuses `temperature` and `top_p`.
+Function tools are supported. Image and audio content is skipped: only text
+is forwarded.
 
-`"none"` is accepted on models that cannot reason, where it changes nothing,
-except on older Routers, which refuse it there (e.g. on `gpt-4.1`). Four models
-always reason and refuse `"none"`; `"minimal"` is their floor: Inception
-`mercury-voice`, `gpt-oss-120b` on Cerebras and Together, and Together
-`zai-org/GLM-5.3-Flash`. Every other value, `"minimal"` included, needs a model
-that can reason: a pinned model that cannot is refused
-(`capability_unsupported`), and auto routing considers only models that can.
+| `reasoning_effort` | Meaning |
+| --- | --- |
+| `None` | No field is sent. The provider default applies |
+| `"none"` | Reasoning off |
+| `"minimal"` | The least reasoning the routed model allows |
+| `"low"`, `"medium"`, `"high"`, `"xhigh"` | More reasoning |
 
-`frequency_penalty`, `presence_penalty` and `repetition_penalty` guard against
-a model looping on one phrase until `max_output_tokens`. `frequency_penalty`
-lowers a token's odds in proportion to how often it has already appeared and
-`presence_penalty` once it has appeared at all (both -2 to 2, neutral 0);
-`repetition_penalty` divides the odds of every token already in the context
-(greater than 0 and at most 2, neutral 1). Unset, no field is sent; a value
-out of range raises `ValueError` when the LLM is constructed. The Router
-applies a non-neutral penalty only on Together and Baseten: auto routing keeps
-the request to those models, and a model pinned elsewhere is refused
-(`capability_unsupported`). Older Routers ignore all three.
+- Any other value raises `ValueError` when the LLM is built.
+- While reasoning is on (any value but `"none"`), the Router refuses
+  `temperature` and `top_p`.
+- `"none"` is accepted on models that cannot reason, except on older
+  Routers, which refuse it there (for example on `gpt-4.1`).
+- Four models always reason and refuse `"none"`. Their floor is `"minimal"`:
+  Inception `mercury-voice`, `gpt-oss-120b` on Cerebras and on Together, and
+  Together `zai-org/GLM-5.3-Flash`.
+- Every other value needs a model that can reason. A pinned model that
+  cannot is refused with `capability_unsupported`, and auto routing
+  considers only models that can.
 
-`LLM()` requires `SPEKO_API_KEY` (plus optional `SPEKO_ROUTER_URL`; the old
-`SPEKO_RELAY_URL` remains a fallback) and speaks HTTPS directly to
-`router.speko.dev`, not the local socket — so unlike the
-provider-direct voice legs, the conversation history travels through the
-Speko Router. Function tools are supported; image and audio content is
-silently skipped — only text is forwarded.
+The three penalties guard against a model that repeats one phrase until
+`max_output_tokens`.
 
-Cell-registered model work uses `RelayLLMClient.complete_registered_response`
-for an original `stream:false` body, or `stream_registered_response` for an
-original `stream:true` body. Create that client with the work's current bearer,
-the configured router URL and its session ID. Supply the cell's exact
-`rendering`, `request_body`, `work_nonce` and private `input_blinder`, plus the
-original explicit `idempotency_key`. The transport embeds the untouched request
-string in the v1 four-field protected envelope; it never adds a stream setting or
-reconstructs provider JSON. The 262144-byte UTF-8 input bound and exact metadata
-shape are checked before sending. Unknown provider grammar and authority are
-still verified independently by the native router and cell.
+| Parameter | Range | Neutral |
+| --- | --- | --- |
+| `frequency_penalty` | -2 to 2 | 0 |
+| `presence_penalty` | -2 to 2 | 0 |
+| `repetition_penalty` | greater than 0, at most 2 | 1 |
 
-The `agent-graph/openai-responses/v2` and `agent-graph/anthropic-messages/v2`
-renderings additionally require `attempt_id`, the lowercase UUID belonging to
-this invocation's acquired attempt. Supply its matching private `input_blinder`.
-These methods send exactly five fields by adding `speko_model_attempt_id`, while
-preserving the original request string and work idempotency key. Missing/invalid
-IDs and v1 requests mixed with attempt metadata refuse before HTTP. The SDK only
-transports the supplied proof; the cell and native owner verify the winning
-binding and authority. Keep the attempt ID and blinder in memory only. Do not
-reuse an invocation ID after cancellation, restart or an uncertain send, and do
-not replace the work idempotency key with that ID. No retry or fallback is added.
+- A value out of range raises `ValueError`. `None` sends no field.
+- The Router applies a non-neutral penalty only on Together and Baseten.
+  Auto routing then keeps the request on those models, and a model pinned
+  elsewhere is refused with `capability_unsupported`.
+- Older Routers ignore all three.
 
-These methods make one POST to `/v1/llm/responses`, carry
-`Speko-Client-Session-ID`, refuse redirects and do not retry or fall back. An
-explicit v1 retry must reuse the original work/input/key and remains subject to
-current cell authority. For v2, an uncertain send requires canonical recovery;
-replacement work needs separate cell authorization and a newly acquired attempt.
-Neither a transport error nor `retryable` proves no
-provider I/O. Cancellation or a truncated/error stream is not a completed
-result. Responses are router transport payloads: the worker must validate and
-commit its model observation separately. No method grants model authority,
-settles a charge, dispatches tools, claims heard audio or enables graph startup.
-Keep the envelope, bearer and blinder in memory only; do not log or spool them.
-
-Registered responses use bounded original UTF-8 JSON before any field is
-discarded: duplicate keys at any object level, non-finite numbers, invalid
-Unicode and non-object payloads are refused. Raw tool argument strings stay
-untouched, including intentional duplicate keys and exact numeric tokens inside
-that string. HTTP bodies and cumulative SSE bytes each have a 1 MiB bound.
-
-The registered stream rejects malformed/unsupported frames and duplicate event
-headers. It withholds its success terminal until clean HTTP EOF and refuses
-any event after that terminal, including an error or a second completion.
-Comments, multiline data and LF/CRLF framing remain supported. Bare CR framing
-is refused so a line ending cannot hide an additional event inside a comment.
-The caller still
-owns cancellation and the original work deadline; waiting for EOF grants no
-extra time or execution authority. A non-JSON or ambiguous HTTP error keeps only
-fixed status diagnostics. Ordinary unregistered methods retain their existing
-response handling.
-The shared SSE decoder dispatches an event only after its blank-line frame
-terminator. EOF after terminal JSON is a truncated stream, including for the
-ordinary `stream_response` method.
-
-Jev evaluations use the separate pooled async client and require an explicit
-idempotency key:
-
-```python
-from speko_gateway import RelayEvaluationClient
-
-client = RelayEvaluationClient.from_env(session_id="conversation-42")
-result = await client.evaluate(
-    state={"transcript": "Can I speak to someone?"},
-    questions={
-        "handoff": {
-            "type": "noul",
-            "instructions": "Is a human explicitly requested?",
-        }
-    },
-    idempotency_key="conversation-42-turn-7",
-)
-await client.aclose()
-```
-
-Run `python examples/jev_voice_router.py --fake` for the framework-independent
-final-transcript example. It batches Choice, Noul, and Score, applies a 500 ms
-application deadline, cancels superseded turns, and dispatches only allowlisted
-read-only handlers. Its confidence thresholds are example defaults that must be
-evaluated on your own traffic.
-
-For Pipecat 1.7+:
+## Pipecat
 
 ```python
 from speko_gateway.pipecat import SpekoSTTService, SpekoTTSService
@@ -592,15 +239,214 @@ pipeline = Pipeline(
 )
 ```
 
-Use a Pipecat VAD in the pipeline so `VADUserStoppedSpeakingFrame` commits the
-current Gateway STT utterance. The complete container and Pipecat Cloud setup
-is in the [Pipecat integration guide](../../docs/PIPECAT.md).
+Keep a Pipecat VAD in the pipeline: `VADUserStoppedSpeakingFrame` commits the
+current STT utterance. The image setup, `SpekoLLMService` and all options are
+in the
+[Pipecat guide](https://github.com/SpekoAI/gateway/blob/main/docs/PIPECAT.md).
+
+## Direct client
+
+`GatewayClient` opens Gateway sessions without a framework. This example
+writes synthesized speech to a file as 24 kHz mono 16-bit PCM:
+
+```python
+import asyncio
+
+from speko_gateway import GatewayClient
+from speko_gateway.client import SessionConfig
+
+
+async def main() -> None:
+    client = GatewayClient.from_env()
+    session = await client.open(
+        SessionConfig(
+            kind="tts",
+            execution={
+                "provider_route": "provider_direct",
+                "credential_source": "byok",
+                "relay_policy": "forbidden",
+            },
+            request={
+                "provider": "deepgram",
+                "language": "en",
+                "max_input_characters": 1000,
+            },
+            media={"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
+        )
+    )
+    await session.append_text("Hello from Speko Gateway.")
+    await session.commit_text()
+    with open("hello.pcm", "wb") as out:
+        async for event in session.events():
+            if event.audio:
+                out.write(event.audio)
+            elif event.type in ("audio.done", "error"):
+                break
+    await session.aclose()
+    await client.aclose()
+
+
+asyncio.run(main())
+```
+
+A session also has `send_audio`, `commit_audio`, `cancel` and `finish`. The
+request and event shapes are in the
+[protocol document](https://github.com/SpekoAI/gateway/blob/main/docs/PROTOCOL.md).
+`client.wait_until_ready()` waits for a Gateway that is still starting.
+
+## Conversation profiler
+
+`ConversationProbe` ties the STT, LLM, TTS and playback of each turn into one
+latency trace. It sends timing markers only, never content, and never raises
+into the agent. `SPEKO_TELEMETRY_DISABLED=true` on the Gateway suppresses it.
+
+```python
+from speko_gateway.probe import ConversationProbe
+
+session = AgentSession(stt=STT(), llm=LLM(), tts=TTS())
+probe = ConversationProbe(session)
+probe.start()                  # before session.start()
+
+await session.start(...)
+...
+await probe.aclose()           # during shutdown
+```
+
+The marker list is in the
+[trust document](https://github.com/SpekoAI/gateway/blob/main/docs/TRUST.md#conversation-turn-markers).
+
+## Speko Router clients
+
+These clients talk to the Speko Router, either at its HTTPS origin or through
+a Gateway running in native relay mode (`speko-gateway native`). Speko's own
+managed agents use them. Each client carries its own Speko credential.
+
+### Speech: `RelaySpeechClient`
+
+`RelaySpeechClient` streams STT and TTS for one session. It takes the
+session's credential, its session ID and the Router origin explicitly. It
+never reads `SPEKO_API_KEY` and never shares prefetched plans.
+
+```python
+from speko_gateway import RelaySpeechClient
+from speko_gateway.livekit import STT, TTS
+
+speech = RelaySpeechClient(
+    api_key=model_key,            # starts with sk_speko_
+    session_id=spec.session_id,
+    base_url=relay_origin,
+)
+stt = STT(speech, provider=stt_provider, model=stt_model,
+          language=stt_language, credential_source="managed", turn_vad=local_vad)
+tts = TTS(speech, provider=tts_provider, model=tts_model, voice="",
+          language=tts_language, credential_source="managed")
+stt.bind_session(session)         # before AgentSession.start()
+```
+
+For the native sidecar, pass `socket_path` and `local_auth_token` instead of
+`base_url`. `RelayLLMClient` takes the same parameters:
+
+```python
+from speko_gateway import RelayLLMClient, RelaySpeechClient
+
+connection = dict(
+    api_key=model_key,
+    session_id=spec.session_id,
+    socket_path="/run/speko/runtime.sock",
+    local_auth_token=socket_token,
+)
+speech = RelaySpeechClient(**connection)
+llm_client = RelayLLMClient(**connection)
+```
+
+What to supply:
+
+- A concrete `provider` and `model`. `"auto"` is refused.
+- `credential_source="managed"`.
+- `voice=""` for TTS when Speko has configured the session's voice.
+- A session ID of 1 to 200 characters: a letter or digit, then letters,
+  digits or `._:-`. It is sent unchanged.
+- `turn_vad` for LiveKit STT: the worker's local LiveKit VAD, such as
+  Silero. Without it the constructor raises `ValueError`. A VAD that reports
+  probabilities must expose its `activation_threshold`.
+- `stt.bind_session(session)` before the session starts.
+  `bind_agent(agent)` finds the session when the first stream starts. Code
+  that reads the stream itself uses `stream(manual_turns=True)`.
+  `recognize()` on a complete buffer needs no binding.
+
+How LiveKit STT behaves:
+
+- The LiveKit stream stays open across turns. Each VAD turn is its own
+  Router request.
+- Final transcript segments and `END_OF_SPEECH` are emitted only after the
+  request's final usage arrives.
+- `speaker_id` values are valid within one request only. The vendor's label
+  is in `provider_speaker_id`. The same vendor label in a later request is
+  not the same person.
+- The last part of each provider final carries the whole text as
+  `canonical_text`.
+- `stt.MultiSpeakerAdapter` and a single-model `stt.FallbackAdapter` may
+  wrap the STT. A wrapper that rewrites or drops transcripts is refused
+  before the request is admitted. Falling back to another model is the
+  platform's decision, not the wrapper's.
+- Custom audio processing that replaces a frame must keep its userdata and
+  duration.
+- A speech onset that stays unresolved for one second without new VAD output
+  fails the stream.
+
+When the `AgentSession` has its own VAD, wrap it so that it keeps processing
+buffered audio:
+
+```python
+from livekit.agents import AgentSession, inference
+from speko_gateway.livekit import DrainingVAD
+
+session = AgentSession(
+    stt=stt,
+    llm=llm,
+    tts=tts,
+    vad=DrainingVAD(inference.VAD(model="silero"), flush_mode="reset"),
+    turn_handling={
+        "turn_detection": inference.TurnDetector(version="v1-mini"),
+        "interruption": {"mode": "vad", "enabled": True},
+    },
+)
+stt.bind_session(session)
+```
+
+`DrainingVAD` supports the Silero and local-inference VADs. Use
+`flush_mode="reset"` for the session's own VAD and `flush_mode="segment"`
+for a batch STT `StreamAdapter`, with a separate instance for each.
+
+How LiveKit TTS sends text:
+
+- Text goes out sentence by sentence. A sentence ends at `.` followed by
+  whitespace, at `!` or `?`, at a CJK full stop, or at a line break. An
+  explicit `flush()` and the end of input send whatever is left.
+- A pause alone never completes a word or a number: `Ple` can still become
+  `Please`, and `0.` can become `0.05`. Text that stops inside a word waits.
+- A period after an abbreviation (`Dr.`, `St.`, `e.g.`) does not end a
+  sentence. When whitespace follows and nothing more arrives for 300 ms,
+  that text is sent.
+- One utterance holds at most 240 Unicode code points (not bytes, not
+  grapheme clusters). Longer text is cut at whitespace. A single unit longer
+  than that without whitespace is refused and not retried.
+- Every character is sent as given.
+- LiveKit's default Markdown transform can hold back a trailing delimiter.
+  `AgentSession(..., tts_text_transforms=[])` passes plain text through at
+  once.
+- Each utterance waits for the previous one's `utterance.done`.
+
+With Pipecat, `SpekoSTTService` and `SpekoTTSService` accept the same client.
+Pipecat's own VAD commits turns, and the automatic provider fallback does not
+apply.
+
+At the end of the call, close both models and then `await speech.aclose()`.
 
 ### Realtime voice models
 
 Speech-to-speech models run on LiveKit's own OpenAI, xAI or GPT-Live plugin.
-The relay speaks each vendor's native protocol, so `realtime_options` only
-points the plugin at the same `RelaySpeechClient`:
+`realtime_options` points the plugin at the same `RelaySpeechClient`:
 
 ```python
 from livekit.plugins import openai  # or xai
@@ -610,29 +456,23 @@ llm = openai.realtime.RealtimeModel(model="gpt-realtime-2.1", **realtime_options
 # or: openai.realtime.GPTLiveModel(**realtime_options(speech))
 ```
 
-This needs LiveKit Agents 1.8 or later with the matching plugin. Each
-connection is a separately admitted and metered relay session with its own
-idempotency key, and failed connections are not retried. The OpenAI realtime
-plugin still replaces its connection every 20 minutes by default, replaying
-the conversation into a new admission; the xAI and GPT-Live plugins do not
-recycle. Pass `max_session_duration` to change any of them. GPT-Live needs
-the native sidecar socket: its plugin always dials `/live/sessions`, which only
-the sidecar maps to the Router's `/v1/live`. GPT-Live's
-default `responses` delegation runs its backend model on the relay, which
-reserves and meters it with the session.
+- This needs LiveKit Agents 1.8 or later with the matching plugin.
+- Each connection is a separately admitted and metered Router session.
+  Failed connections are not retried.
+- The OpenAI realtime plugin replaces its connection every 20 minutes by
+  default and replays the conversation into a new session. The xAI and
+  GPT-Live plugins do not. Pass `max_session_duration` to change it.
+- GPT-Live needs the native sidecar socket. Its plugin always dials
+  `/live/sessions`, which only the sidecar maps to the Router's `/v1/live`.
+  Its default `responses` delegation runs the backend model on the Router,
+  which reserves and meters it with the session.
+- Gemini Live is not covered. Google's SDK opens its own socket and cannot
+  use the sidecar's Unix socket.
 
-Gemini Live is not covered: Google's SDK opens its socket with the
-`websockets` library, which cannot reach the sidecar's Unix socket or send a
-fresh idempotency key per connection. The sidecar still forwards the Gemini
-Live and translation routes as raw vendor sockets.
+### One-shot speech: `RelayTTSClient`
 
-### Router-native speech audio
-
-`RelayTTSClient` sends one `POST /v1/tts/speech` and yields the original audio
-bytes. It uses a Speko key and an explicit idempotency key; it never retries,
-follows redirects or falls back to a provider or local Gateway transport.
-Retry keys preserve up to 256 UTF-8 bytes, including interior spaces and Unicode.
-Blank keys, HTTP controls and surrounding HTTP whitespace are refused.
+`RelayTTSClient` sends one `POST /v1/tts/speech` and yields the audio bytes
+as they arrive.
 
 ```python
 from speko_gateway import RelayTTSClient
@@ -653,23 +493,92 @@ finally:
     await speech.aclose()
 ```
 
-For caller-bound work, pass its original `work_nonce` and `input_blinder`
-together as keyword arguments. The SDK preserves them and the complete input
-string; it does not mint credentials, choose routes, or authorize another
-attempt. Do not place private work markers inside the request dictionary.
+| Limit | Value |
+| --- | --- |
+| Request body | 1 MiB |
+| Audio | 64 MiB. Lower it with `max_audio_bytes` |
+| `io_timeout` | 30 s of waiting for headers and audio. Time your code spends on a chunk does not count |
+| `idempotency_key` | Required. Up to 256 UTF-8 bytes |
 
-Requests are bounded to 1 MiB; audio defaults to a 64 MiB maximum, configurable
-downward with `max_audio_bytes`. `io_timeout` (default 30 seconds) bounds cumulative
-pending HTTP header/audio waits and excludes time spent consuming a yielded
-chunk. No SDK timeout scope remains active in consumer code. Closure/cancellation
-releases owned responses. HTTP errors expose fixed status diagnostics rather
-than server response content. Audio, EOF, timeouts and failures supply no proof
-of provider non-execution, settlement or actual audible delivery.
+Pass `work_nonce` and `input_blinder` together as keyword arguments when the
+request belongs to registered work. Do not put them in the request
+dictionary.
 
-With an active `ConversationProbe`, the response's `Speko-Request-ID` attaches
-the Router TTS leg to the turn that started the request, provided that turn is
-still open. This request identity is separate from Gateway TTS session/attempt
-identities. The receiving Gateway must support Router TTS leg attachments.
-Those attachments are posted separately: older Gateways may reject them while
-unrelated turn markers remain deliverable. The probe counts rejected markers
-without retrying them.
+### Evaluations: `RelayEvaluationClient`
+
+```python
+from speko_gateway import RelayEvaluationClient
+
+client = RelayEvaluationClient.from_env(session_id="conversation-42")
+result = await client.evaluate(
+    state={"transcript": "Can I speak to someone?"},
+    questions={
+        "handoff": {
+            "type": "noul",
+            "instructions": "Is a human explicitly requested?",
+        }
+    },
+    idempotency_key="conversation-42-turn-7",
+)
+await client.aclose()
+```
+
+`python examples/jev_voice_router.py --fake` runs a framework-independent
+example against a local fake server. It reads final transcripts from standard
+input, asks three questions in one batch, applies a 500 ms deadline, cancels
+superseded turns and calls only allow-listed read-only handlers. Its
+confidence thresholds are examples: tune them on your own traffic.
+
+### Registered model requests
+
+`RelayLLMClient.complete_registered_response` and
+`stream_registered_response` send a model request that the Speko platform
+has prepared and registered for one piece of work. Use the first for a
+`stream:false` body and the second for a `stream:true` body.
+
+| Argument | Meaning |
+| --- | --- |
+| `rendering` | The rendering name the platform gave |
+| `request_body` | The exact request string, at most 262144 UTF-8 bytes. It is sent untouched |
+| `work_nonce`, `input_blinder` | 64 lowercase hex characters each, from the platform |
+| `idempotency_key` | The work's original key |
+| `attempt_id` | Lowercase UUID. Required for `agent-graph/openai-responses/v2` and `agent-graph/anthropic-messages/v2`, refused for other renderings |
+
+- Each call makes one `POST /v1/llm/responses` with
+  `Speko-Client-Session-ID`. Invalid input is refused before any HTTP
+  request.
+- Responses and the cumulative stream are limited to 1 MiB. Duplicate JSON
+  keys, non-finite numbers, invalid Unicode and non-object payloads are
+  refused.
+- The stream yields its success event only after a clean end of the HTTP
+  response. An event after the terminal event, an unknown event, or bare CR
+  line endings fail the stream.
+
+## Rules
+
+- `RelaySpeechClient`, `RelayTTSClient` and the registered-request methods
+  never retry, follow redirects or fall back to another provider or
+  transport. The same holds for `RelayLLMClient` on the native socket. A
+  retry hint, a timeout or a transport error does not prove that the
+  provider was not called.
+- With `RelaySpeechClient`, the LiveKit classes turn off LiveKit's automatic
+  retries for STT and TTS. After a failed native STT or Pipecat native TTS
+  instance, build a new instance only once the platform has decided how to
+  recover.
+- A retry of registered work must reuse the original work, input and key.
+  For the `v2` renderings, do not reuse an attempt ID after cancellation, a
+  restart or an uncertain send, and do not use it as the idempotency key.
+- Keep credentials, `input_blinder`, `attempt_id` and registered request
+  bodies in memory only. Do not log or store them.
+- A response is not a settled charge, and received audio is not proof that
+  anyone heard it.
+- Only a final usage frame produces `usage.reported`. A lost final frame
+  fails the stream.
+
+## Development
+
+```bash
+cd integrations/python
+uv run --locked --extra dev ruff check .
+uv run --locked --extra dev pytest
+```
