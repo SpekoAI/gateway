@@ -14,8 +14,10 @@ occur before the first stable release.
 - The Gateway listens on an owner-only Unix socket and opens no TCP port.
   Every call needs the local bearer token `SPEKO_LOCAL_AUTH_TOKEN`.
 - The agent creates a session, then streams audio or text over a WebSocket.
-  The Gateway dials the provider directly. Audio and text on these routes do
-  not pass through Speko.
+  On a `provider_direct` route the Gateway dials the provider itself, and
+  audio and text do not pass through Speko. Routes served by the Speko Router
+  do pass through it: managed GPT-Live, [native relay mode](#native-relay-mode)
+  and the Python LLM clients.
 - With BYOK, the Gateway plans the session in process. The provider key is
   sent only to that provider.
 - With `SPEKO_API_KEY`, the Gateway asks the Speko control plane for a signed,

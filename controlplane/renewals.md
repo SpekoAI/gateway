@@ -1,8 +1,11 @@
 # Funded Google session renewal
 
 A managed Google realtime session is paid for in short slices. The signed
-SessionPlan funds the first slice, and the Gateway asks the control plane for
-each next one. This page is the contract for those calls and the rules the
+SessionPlan funds the first slice, and the Gateway is built to ask the
+control plane for each next one. Today no session gets a second slice: a
+renewal needs a stream that can resume, and the Google adapter reports none
+for managed credentials, so the session closes at its first lease (see
+[Not built](#not-built)). This page is the contract for those calls and the rules the
 runtime enforces around them. The client code is `controlplane/renewals.go`
 and `controlplane/client.go`. The runtime side is `runtime/continuation.go`.
 

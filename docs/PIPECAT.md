@@ -5,8 +5,8 @@ This guide adds Speko Gateway as a sidecar inside a Pipecat cascade agent
 `speko-gateway` implements Pipecat's `STTService`, `LLMService` and
 `TTSService`. It needs `pipecat-ai>=1.7,<2` and Python 3.11 or newer.
 
-Voice audio goes from the Gateway straight to the speech providers.
-`SpekoLLMService` sends the conversation text to the hosted Speko Router and
+On provider-direct routes, voice audio goes from the Gateway straight to the
+speech providers. `SpekoLLMService` sends the conversation text to the hosted Speko Router and
 needs `SPEKO_API_KEY`.
 
 The steps follow the project that the
@@ -141,6 +141,11 @@ SPEKO_CARTESIA_BYOK_API_KEY=replace-with-cartesia-key
 
 - `credential_source="auto"` uses managed routing when `SPEKO_API_KEY` is set
   and BYOK otherwise.
+- With more than one BYOK key, pin the provider on each voice service
+  (`provider="deepgram"` on STT, `provider="cartesia"` on TTS). Deepgram and
+  Cartesia both serve STT and TTS, so `provider="auto"` is refused.
+- `SpekoLLMService` always needs `SPEKO_API_KEY`. A BYOK-only `.env` runs the
+  voice services, not the LLM.
 - Set `credential_source="byok"` when both are set but voice must stay on
   your own keys.
 - With BYOK, only the Gateway process reads the provider keys. The Pipecat
@@ -188,7 +193,6 @@ stt = SpekoSTTService(
     model="nova-3",
     diarization=True,
     keywords=["Speko", "Pipecat"],
-    noise_reduction=True,
     provider_options={
         "deepgram": {"numerals": True, "endpointing": 1200},
     },

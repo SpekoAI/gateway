@@ -89,7 +89,6 @@ stt = STT(
     model="nova-3",                  # Deepgram's default, Flux, has no diarization
     diarization=True,                # speaker labels
     keywords=["Speko", "Casey"],     # vocabulary biasing
-    noise_reduction=True,
     provider_options={               # the vendor's own settings
         "deepgram": {"numerals": True, "endpointing": 1200},
         "elevenlabs": {"vad_silence_threshold_secs": 0.7},
@@ -99,7 +98,8 @@ stt = STT(
 
 - `diarization`, `keywords` and `noise_reduction` fail closed. A session
   routed to a provider that cannot honor one is refused at create with
-  `stt_option_unsupported` and the option named.
+  `stt_option_unsupported` and the option named. Deepgram, for example, has
+  no `noise_reduction`.
 - With `provider="auto"`, routing may pick a provider that refuses the
   option. Pin the provider when an option is a requirement.
 - A setting under `provider_options` that the provider's model does not
@@ -427,7 +427,8 @@ How LiveKit TTS sends text:
   `Please`, and `0.` can become `0.05`. Text that stops inside a word waits.
 - A period after an abbreviation (`Dr.`, `St.`, `e.g.`) does not end a
   sentence. When whitespace follows and nothing more arrives for 300 ms,
-  that text is sent.
+  that text is sent, except a title on its own (`Dr. `, `Capt. `): it waits
+  for the next word, a `flush()` or the end of input.
 - One utterance holds at most 240 Unicode code points (not bytes, not
   grapheme clusters). Longer text is cut at whitespace. A single unit longer
   than that without whitespace is refused and not retried.
