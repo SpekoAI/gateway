@@ -1,21 +1,21 @@
 # Use Speko Gateway with Pipecat
 
-This guide adds Speko Gateway as a sidecar inside a current Pipecat cascade
-agent. The native integration implements Pipecat's streaming `STTService`,
-`LLMService`, and `TTSService` contracts. Voice audio goes from Gateway to the
-selected speech providers; `SpekoLLMService` sends conversation text to Speko
-Router.
+This guide adds Speko Gateway as a sidecar inside a Pipecat cascade agent
+(speech-to-text, then an LLM, then text-to-speech). The Python package
+`speko-gateway` implements Pipecat's `STTService`, `LLMService` and
+`TTSService`. It needs `pipecat-ai>=1.7,<2` and Python 3.11 or newer.
 
-The supported package range is `pipecat-ai>=1.7,<2` on Python 3.11 or newer.
-The examples below follow the project produced by the current
-[`pipecat init` CLI](https://docs.pipecat.ai/api-reference/cli/init) and its
-`dailyco/pipecat-base` Dockerfile. The adapter follows Pipecat's documented
-[community service contracts](https://github.com/pipecat-ai/pipecat/blob/main/COMMUNITY_INTEGRATIONS.md)
-rather than emulating a provider-specific SDK.
+On provider-direct routes, voice audio goes from the Gateway straight to the
+speech providers. `SpekoLLMService` sends the conversation text to the hosted
+Speko Router. By default it reads `SPEKO_API_KEY`.
+
+The steps follow the project that the
+[`pipecat init` CLI](https://docs.pipecat.ai/api-reference/cli/init) creates,
+with its `dailyco/pipecat-base` Dockerfile.
 
 ## 1. Replace the model services
 
-In `bot.py`, replace the provider-specific model imports:
+In `bot.py`, replace the provider imports:
 
 ```diff
 -from pipecat.services.cartesia.tts import CartesiaTTSService
@@ -24,37 +24,30 @@ In `bot.py`, replace the provider-specific model imports:
 +from speko_gateway.pipecat import SpekoLLMService, SpekoSTTService, SpekoTTSService
 ```
 
-Then replace their construction inside `run_bot`:
+Then build the three services inside `run_bot`:
 
-```diff
--stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
--tts = CartesiaTTSService(
--    api_key=os.environ["CARTESIA_API_KEY"],
--    settings=CartesiaTTSService.Settings(
--        voice="71a7ad14-091c-4e8e-a314-022ece01c121",
--    ),
--)
-+stt = SpekoSTTService(
-+    language="en",
-+    provider="auto",
-+    model="auto",
-+    credential_source="auto",  # or "byok" / "managed"
-+)
-+llm = SpekoLLMService(
-+    provider="auto",
-+    model="auto",
-+    session_id=platform_session_id,
-+)
-+tts = SpekoTTSService(
-+    language="en",
-+    provider="auto",
-+    model="auto",
-+    voice="",                   # catalog/configured default
-+    credential_source="auto",  # or "byok" / "managed"
-+)
+```python
+stt = SpekoSTTService(
+    language="en",
+    provider="auto",
+    model="auto",
+    credential_source="auto",  # or "byok" / "managed"
+)
+llm = SpekoLLMService(
+    provider="auto",
+    model="auto",
+    session_id=platform_session_id,  # optional, see below
+)
+tts = SpekoTTSService(
+    language="en",
+    provider="auto",
+    model="auto",
+    voice="",                  # the configured or catalog default
+    credential_source="auto",  # or "byok" / "managed"
+)
 ```
 
-The resulting pipeline remains the standard Pipecat cascade:
+The pipeline stays the standard Pipecat cascade:
 
 ```python
 pipeline = Pipeline(
@@ -70,30 +63,16 @@ pipeline = Pipeline(
 )
 ```
 
-Keep the generated `SileroVADAnalyzer` on the user aggregator (or another
-Pipecat VAD that emits `VADUserStoppedSpeakingFrame`). The Speko STT service
-uses that frame to commit each utterance before Pipecat's turn aggregator waits
-for the final transcript. TTS commits the first aggregated sentence immediately
-and waits for Gateway's `audio.done` before submitting the next sentence, while
-audio streams to Pipecat on the receiver task. It keeps one Gateway session for
-the whole bot turn and maps Pipecat interruption events to Gateway cancellation
-for barge-in. Interruption or stream termination also releases a waiting sentence.
+Keep the generated `SileroVADAnalyzer` on the user aggregator, or another
+Pipecat VAD that emits `VADUserStoppedSpeakingFrame`. The STT service uses
+that frame to commit each utterance.
 
-Pipecat supplies the pipeline input and output sample rates at startup, so you
-normally should not set `sample_rate`. If a custom transport forces a specific
-format, both services accept `sample_rate=` and `num_channels=`; Gateway audio
-is signed 16-bit little-endian PCM.
+You can keep any other Pipecat LLM service instead of `SpekoLLMService`.
 
-`SpekoLLMService` supports streaming text, function calls and results, context
-and tool updates, cancellation, usage metrics, and out-of-band
-`run_inference`. Pass `session_id` to all three services to correlate each
-request and provider attempt with the Platform conversation while preserving
-their separate request identifiers.
+## 2. Add the sidecar to the image
 
-## 2. Add the sidecar to the Pipecat image
-
-The public Gateway image contains both the binary and this Python package.
-Apply these additions to the Dockerfile generated by `pipecat init`:
+The Gateway image holds both the binary and the Python package. Add these
+lines to the Dockerfile from `pipecat init`:
 
 ```diff
 +FROM spekoai/gateway:0.1 AS speko-gateway
@@ -126,20 +105,18 @@ set -eu
 ```
 
 Do not add or replace the image `CMD`. Pipecat's base image owns the command
-that serves `bot.py`; its
-[published Dockerfile](https://github.com/daily-co/pipecat-cloud-images/blob/main/pipecat-base/Dockerfile)
-deliberately runs `/app/pre-app.sh` first. The Speko services tolerate the
-normal startup race by polling the authenticated Gateway readiness endpoint
-for up to 15 seconds (configurable with `ready_timeout=`), then fail the
-pipeline with a clear error instead of hanging.
+that serves `bot.py`, and its
+[Dockerfile](https://github.com/daily-co/pipecat-cloud-images/blob/main/pipecat-base/Dockerfile)
+runs `/app/pre-app.sh` first.
 
-For a production deployment, pin both base images to versions or digests after
-validation rather than tracking `latest`.
+The Speko services wait for the Gateway to become ready for up to 15 seconds
+(`ready_timeout=`), then fail the pipeline with a clear error.
+
+For production, pin both base images to a version or digest.
 
 ## 3. Configure credentials
 
-Generate one high-entropy token shared only by the two processes in the
-container:
+Generate one token that only the two processes in the container share:
 
 ```bash
 openssl rand -hex 32
@@ -154,7 +131,7 @@ SPEKO_LOCAL_AUTH_TOKEN=replace-with-generated-token
 SPEKO_API_KEY=replace-with-speko-api-key
 ```
 
-Provider-direct BYOK (example):
+BYOK, for example:
 
 ```dotenv
 SPEKO_LOCAL_AUTH_TOKEN=replace-with-generated-token
@@ -162,37 +139,54 @@ SPEKO_DEEPGRAM_BYOK_API_KEY=replace-with-deepgram-key
 SPEKO_CARTESIA_BYOK_API_KEY=replace-with-cartesia-key
 ```
 
-`credential_source="auto"` selects managed voice routing when `SPEKO_API_KEY`
-is present and BYOK otherwise. Set `credential_source="byok"` explicitly when
-both are present but voice must stay provider-direct. With BYOK, provider
-credentials are read only by the Gateway process; the Pipecat service receives
-only the local auth token. Because both processes share a container, use
-separate containers and a shared Unix-socket volume if process-level credential
-isolation is required.
+- `credential_source="auto"` uses managed routing when `SPEKO_API_KEY` is set
+  and BYOK otherwise.
+- With more than one BYOK key, pin the provider on each voice service
+  (`provider="deepgram"` on STT, `provider="cartesia"` on TTS). Deepgram and
+  Cartesia both serve STT and TTS, so `provider="auto"` is refused.
+- `SpekoLLMService()` needs `SPEKO_API_KEY`, unless you pass it your own
+  `client=RelayLLMClient(...)` with another credential. A BYOK-only `.env`
+  runs the voice services, not the default LLM.
+- Set `credential_source="byok"` when both are set but voice must stay on
+  your own keys.
+- With BYOK, only the Gateway process reads the provider keys. The Pipecat
+  services use only the local token. Both processes share one container, so
+  use separate containers and a shared socket volume when the keys must be
+  hidden from the bot process.
 
-The provider variables and `_FILE` secret forms are listed in the main
+All variables and the `_FILE` secret forms are in the
 [configuration table](../README.md#configuration).
 
-## 4. Run and deploy
-
-Build and run the complete container locally:
+## 4. Run
 
 ```bash
 docker build -t my-pipecat-speko-agent .
 docker run --rm --env-file .env -p 7860:7860 my-pipecat-speko-agent
 ```
 
-Open `http://localhost:7860`, connect, and verify the first turn before
-deploying. The adapter reports standard Pipecat transcription, TTS audio,
-usage, TTFB, and TTFA frames, so existing Pipecat observers continue to work.
+Open `http://localhost:7860`, connect, and check the first turn. The services
+emit the standard Pipecat transcription, TTS audio, usage, TTFB and TTFA
+frames, so existing Pipecat observers keep working.
 
-Speko managed agents run this image on Speko's container infrastructure. The
-same integration may be used in customer-owned Pipecat deployments, but Speko
-does not host managed sessions on Pipecat Cloud.
+## How it behaves
 
-## Options and routing
+- STT: one long-lived Gateway stream per pipeline.
+- TTS: one Gateway session per bot turn. The first sentence is sent at once,
+  and each next sentence waits for the Gateway's `audio.done`. A Pipecat
+  interruption cancels the turn on the Gateway and releases a waiting
+  sentence.
+- LLM: streaming text, function calls and results, context and tool updates,
+  cancellation, usage metrics and out-of-band `run_inference`.
+- Pipecat supplies the pipeline sample rates at startup, so `sample_rate` is
+  normally unset. A custom transport can pass `sample_rate=` and
+  `num_channels=`. Gateway audio is signed 16-bit little-endian PCM.
+- Pass the same `session_id` to all three services to tie their requests to
+  one conversation in Speko.
+- All services close their streams and HTTP clients when Pipecat shuts down.
 
-STT supports the same canonical options as the other Speko integrations:
+## Options
+
+STT options:
 
 ```python
 stt = SpekoSTTService(
@@ -200,7 +194,6 @@ stt = SpekoSTTService(
     model="nova-3",
     diarization=True,
     keywords=["Speko", "Pipecat"],
-    noise_reduction=True,
     provider_options={
         "deepgram": {"numerals": True, "endpointing": 1200},
     },
@@ -218,13 +211,18 @@ tts = SpekoTTSService(
 )
 ```
 
-Today that is Cartesia `normalization` (`sonic-3.6`), `max_buffer_delay_ms`
-(0 to 5000, streaming only) and `speed` (0.6 to 1.5), the last two on
-`sonic-3`, `sonic-3.5` and `sonic-3.6`, and ElevenLabs `stability`,
-`similarity_boost`, `style`, `speed` and `use_speaker_boost`.
+| Provider | TTS setting | Models and range |
+| --- | --- | --- |
+| Cartesia | `normalization` | `sonic-3.6` |
+| Cartesia | `max_buffer_delay_ms` | `sonic-3`, `sonic-3.5`, `sonic-3.6`. 0 to 5000, streaming only |
+| Cartesia | `speed` | `sonic-3`, `sonic-3.5`, `sonic-3.6`. 0.6 to 1.5 |
+| ElevenLabs | `stability`, `similarity_boost`, `style`, `speed`, `use_speaker_boost` | |
 
-The LLM takes the Router's reasoning control, and it updates at runtime like
-temperature:
+Options fail closed: a provider that cannot honor one refuses the session.
+Pin both `provider` and `model` when an option is a requirement. With
+`auto`, routing may pick a provider that refuses it.
+
+### LLM reasoning and penalties
 
 ```python
 from pipecat.frames.frames import LLMUpdateSettingsFrame
@@ -236,60 +234,22 @@ await task.queue_frame(
 )
 ```
 
-Use `"none"` to turn reasoning off. `"minimal"` asks for the least reasoning
-the routed model allows (the Router maps it onto each provider's own scale),
-and `"low"`, `"medium"`, `"high"` and `"xhigh"` ask for more. `None`, the
-default, sends no field and keeps the provider default. Any other value raises
-`ValueError`. While reasoning is enabled (any value but `"none"`) the Router
-refuses `temperature` and `top_p`.
+`reasoning_effort` and the penalties `frequency_penalty`, `presence_penalty`
+and `repetition_penalty` work as in the
+[Python package README](../integrations/python/README.md#speko-llm). All four
+can change at runtime with `LLMUpdateSettingsFrame`. `frequency_penalty` and
+`presence_penalty` are Pipecat's own `LLMSettings` fields.
+`repetition_penalty` and `reasoning_effort` are fields of
+`SpekoLLMService.Settings`.
 
-`"none"` is accepted on models that cannot reason, where it changes nothing,
-except on older Routers, which refuse it there (e.g. on `gpt-4.1`). Four models
-always reason and refuse `"none"`; `"minimal"` is their floor: Inception
-`mercury-voice`, `gpt-oss-120b` on Cerebras and Together, and Together
-`zai-org/GLM-5.3-Flash`. Every other value, `"minimal"` included, needs a model
-that can reason: a pinned model that cannot is refused
-(`capability_unsupported`), and auto routing considers only models that can.
+### Fallback to automatic routing
 
-The LLM also takes the Router's repetition penalties, which guard against a
-model looping on one phrase until `max_output_tokens`:
-
-```python
-llm = SpekoLLMService(
-    provider="baseten",
-    model="deepseek-ai/DeepSeek-V4.1-Flash",
-    frequency_penalty=0.3,   # -2 to 2, neutral 0
-    presence_penalty=None,   # -2 to 2, neutral 0
-    repetition_penalty=1.1,  # greater than 0 and at most 2, neutral 1
-)
-
-await task.queue_frame(
-    LLMUpdateSettingsFrame(delta=SpekoLLMService.Settings(repetition_penalty=1.15))
-)
-```
-
-`frequency_penalty` and `presence_penalty` are Pipecat's own `LLMSettings`
-fields; `repetition_penalty` is `SpekoLLMService.Settings`'. `None`, the
-default, sends no field. A value out of range raises `ValueError`. The Router
-applies a non-neutral penalty only on Together and Baseten: auto routing keeps
-the request to those models, and a model pinned elsewhere is refused
-(`capability_unsupported`). Older Routers ignore all three.
-
-Options fail closed when the chosen provider cannot honor them. Pin both
-`provider` and `model` when an option is a hard requirement; with `auto`, the
-router is otherwise free to choose another compatible catalog route.
-
-Managed deployments can opt into availability-first routing with
 `fallback_to_auto_on_no_eligible_route=True` on `SpekoSTTService` and
-`SpekoTTSService`. When an explicit provider/model is rejected with
-`no_eligible_route`, the service retries once with automatic provider and model
-selection. This applies to `credential_source="managed"` and to
-`credential_source="auto"` when it resolves to managed routing. TTS omits the
-configured voice on fallback because voices are provider-specific, and later
-contexts on the same TTS service continue using automatic routing. The option
-is disabled by default and never changes BYOK or other error handling.
+`SpekoTTSService` retries once with automatic provider and model selection
+when a pinned provider or model is refused with `no_eligible_route`.
 
-Each STT pipeline gets one long-lived Gateway stream. Each TTS bot turn gets a
-fresh stream, allowing the route to be selected per response and ensuring a
-barge-in only cancels the interrupted turn. Both services close their streams
-and owned HTTP clients during Pipecat shutdown.
+- It applies to managed routing only (`credential_source="managed"`, or
+  `"auto"` that resolves to managed).
+- TTS drops the configured voice on fallback, because voices belong to one
+  provider. Later turns on the same TTS service stay on automatic routing.
+- It is off by default and changes no other error handling.

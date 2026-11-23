@@ -1,31 +1,35 @@
-# Deepgram STT capacity observations
+# Deepgram STT capacity refusals
 
-`deepgram.STTCapacityRefusedAt(err)` recognizes a private adapter-owned error
-from a failed STT WebSocket handshake. It requires HTTP 429 and the exact native
-`err_code: "TOO_MANY_REQUESTS"` documented in
-[Deepgram's STT errors](https://developers.deepgram.com/docs/errors).
-The existing `runtime.ProviderError` code, status, retryability and safe message
-remain available through `errors.As`.
+`deepgram.STTCapacityRefusedAt(err)` tells a Go caller that Deepgram refused
+to open a speech-to-text WebSocket because the project is at its rate limit.
+It is for programs that embed the Deepgram adapter and track provider
+capacity. The code is in `providers/deepgram/stt_capacity.go`.
 
-The timestamp is sampled when the HTTP response headers arrive, before body
-reads and cleanup. The WebSocket library's 1024-byte diagnostic body is accepted
-only if the original body independently reached EOF without read failure. JSON
-must be complete, contain one exact `err_code` and have no duplicate fields.
-Oversized or truncated responses, redirects, generic 429s, payment/quota errors,
-transport failures and the separate TTS error family supply no observation.
-Each open owns its observation; the configured HTTP client is copied.
+## How it works
 
-Only the original timestamp is exposed. Provider messages, request IDs, bodies
-and credentials are not part of the observation. Error wrapping preserves it;
-constructing a generic `ProviderError` cannot manufacture it.
+The function returns a timestamp and `true` only when the failed handshake
+had both:
 
-This observation proves actual provider I/O, and never proves zero usage,
-no-provider-I/O or permission to retry/fallback. A router must separately bind it
-to the actual selected credential/account, capability, grant and dispatch barrier
-and persist it through its durable receipt lifecycle. This SDK change alone does
-not publish control receipts or activate platform cooldowns.
+- HTTP status 429; and
+- a complete JSON body with exactly one `err_code` field equal to
+  `TOO_MANY_REQUESTS`, as in
+  [Deepgram's STT errors](https://developers.deepgram.com/docs/errors).
 
-[Deepgram's rate-limit documentation](https://developers.deepgram.com/reference/api-rate-limits)
-defines limits by project, not individual API key. Account mapping must reflect
-the actual shared provider limit; this observation does not create additional
-capacity by rotating keys or projects.
+The timestamp is taken when the response headers arrive. The usual
+`runtime.ProviderError` (code, status, retryability, safe message) is still
+reachable through `errors.As`, and wrapping the error keeps the observation.
+
+Everything else returns `false`: a body over 1024 bytes or cut short, a read
+error, duplicate JSON fields, a redirect, any other 429, payment or quota
+errors, transport failures, and text-to-speech errors.
+
+## Rules
+
+- The observation proves that the provider was contacted. It does not prove
+  zero usage, and it does not permit a retry or a fallback.
+- Only the timestamp is exposed. Provider messages, request IDs, bodies and
+  credentials are not.
+- A caller cannot create the observation by building a `ProviderError`.
+- [Deepgram rate limits](https://developers.deepgram.com/reference/api-rate-limits)
+  apply per project, not per API key. Rotating keys inside one project adds
+  no capacity.

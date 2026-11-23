@@ -1,132 +1,144 @@
 # Speko Gateway
 
-Speko Gateway is the open customer-side runtime for real-time voice AI. It
-gives agents one local streaming protocol across voice providers, keeps BYOK
-credentials inside your process, and can optionally use Speko for managed
-routing, observability, and consolidated billing.
+Speko Gateway is an open-source sidecar for real-time voice AI. A voice agent
+talks to it over a local Unix socket with one streaming protocol, and the
+Gateway connects to the speech-to-text (STT), text-to-speech (TTS) or
+speech-to-speech provider. It runs with your own provider keys (BYOK), with a
+Speko API key for managed routing and consolidated billing, or with both.
 
-> Early preview: the protocol is versioned, but breaking changes may occur
-> before the first stable release.
+This is an early preview. The protocol is versioned, but breaking changes may
+occur before the first stable release.
 
-## Native relay sidecar for managed sessions
+## How it works
 
-Run `speko-gateway native` with `SPEKO_RELAY_URL` set to the configured HTTPS
-relay origin and `SPEKO_LOCAL_AUTH_TOKEN` (or `_FILE`) for local socket access.
-`SPEKO_SOCKET_PATH` defaults to `/run/speko/runtime.sock`. The native process
-loads per-session model credentials from each caller, rather than a process-wide
-model key. The relay obtains execution grants from its cell; the cell owns
-policy, reservations and settlement.
+- The Gateway listens on an owner-only Unix socket and opens no TCP port.
+  Every call needs the local bearer token `SPEKO_LOCAL_AUTH_TOKEN`.
+- The agent creates a session, then streams audio or text over a WebSocket.
+  On a `provider_direct` route the Gateway dials the provider itself, and
+  audio and text do not pass through Speko. Routes served by the Speko Router
+  do pass through it: managed GPT-Live, [native relay mode](#native-relay-mode)
+  and the Python LLM clients.
+- With BYOK, the Gateway plans the session in process. The provider key is
+  sent only to that provider.
+- With `SPEKO_API_KEY`, the Gateway asks the Speko control plane for a signed,
+  short-lived session plan that names the provider and carries a short-lived
+  provider credential. The Gateway verifies the plan before it accepts media.
+- Content-free usage telemetry is on by default. See
+  [Telemetry](#telemetry).
 
-The native socket carries STT/TTS streams, batch transcription, speech and LLM
-responses. Python clients select it explicitly:
+The wire format is in [docs/PROTOCOL.md](docs/PROTOCOL.md). What the Gateway
+can see and where it sends data is in [docs/TRUST.md](docs/TRUST.md).
+
+## Quick start
+
+Start the Gateway with one provider key. This example uses Deepgram:
+
+```bash
+export SPEKO_LOCAL_AUTH_TOKEN="$(openssl rand -hex 32)"
+export SPEKO_DEEPGRAM_BYOK_API_KEY=your-deepgram-key
+mkdir -m 700 run
+docker run -d --rm --name speko-gateway \
+  --user "$(id -u):$(id -g)" -v "$PWD/run:/run/speko" \
+  -e SPEKO_LOCAL_AUTH_TOKEN -e SPEKO_DEEPGRAM_BYOK_API_KEY \
+  spekoai/gateway:0.1
+```
+
+Check that it is ready and see what it can open:
+
+```bash
+curl --unix-socket run/runtime.sock http://localhost/readyz
+curl --unix-socket run/runtime.sock "http://localhost/v1/models?provider=deepgram"
+```
+
+In the same shell, install the Python client from a checkout of this
+repository and synthesize a sentence:
+
+```bash
+pip install ./integrations/python
+export SPEKO_SOCKET_PATH="$PWD/run/runtime.sock"
+python hello.py
+docker stop speko-gateway
+```
 
 ```python
-from speko_gateway import RelayLLMClient, RelaySpeechClient
+# hello.py: writes 24 kHz mono 16-bit PCM to hello.pcm
+import asyncio
 
-connection = dict(
-    socket_path="/run/speko/runtime.sock",
-    local_auth_token=socket_token,
-    api_key=registered_session_model_key,
-    session_id=spec.session_id,
-)
-speech = RelaySpeechClient(**connection)
-llm = RelayLLMClient(**connection)
+from speko_gateway import GatewayClient
+from speko_gateway.client import SessionConfig
+
+
+async def main() -> None:
+    client = GatewayClient.from_env()
+    session = await client.open(
+        SessionConfig(
+            kind="tts",
+            execution={
+                "provider_route": "provider_direct",
+                "credential_source": "byok",
+                "relay_policy": "forbidden",
+            },
+            request={
+                "provider": "deepgram",
+                "language": "en",
+                "max_input_characters": 1000,
+            },
+            media={"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
+        )
+    )
+    await session.append_text("Hello from Speko Gateway.")
+    await session.commit_text()
+    with open("hello.pcm", "wb") as out:
+        async for event in session.events():
+            if event.audio:
+                out.write(event.audio)
+            elif event.type in ("audio.done", "error"):
+                break
+    await session.aclose()
+    await client.aclose()
+
+
+asyncio.run(main())
 ```
 
-Use these with the LiveKit/Pipecat integrations and the compiled concrete
-provider/model/language. LiveKit native STT also takes the worker's local
-`turn_vad`. The socket and worker use the same UID; the socket is owner-only.
-The local socket credential is consumed by the sidecar; only the session's model
-credential and identity reach the configured relay. Closing a session cancels
-its transport; SIGTERM drains existing work and refuses new requests.
+To run a long-lived Gateway beside an agent container, use
+[`deploy/docker-compose.yml`](deploy/docker-compose.yml). It puts the socket
+in the `speko-runtime` volume, which the agent container mounts at
+`/run/speko` and reads as UID 65532:
 
-Native mode advertises `speko_relay` on its local `/v1/models`. It caps concurrent
-model operations with `SPEKO_MAX_SESSIONS` (default 100), WebSocket frames at
-2 MiB, and HTTP requests with `SPEKO_NATIVE_MAX_REQUEST_BYTES` (default 128 MiB).
-`SPEKO_NATIVE_SETUP_TIMEOUT` defaults to 30s and bounds network establishment,
-WebSocket admission and stalled HTTP upload reads. A completed upload may wait
-for its model result beyond that setup bound. Each physical downstream write is
-bounded by `SPEKO_NATIVE_WRITE_TIMEOUT` (15s). Canonical relay handshake refusals
-retain their HTTP status, error code and request identity. `/metrics` reports content-free
-native request counts. These are local transport counts, not provider capacity
-or financial evidence.
-
-An explicit container template is in
-[`deploy/docker-compose.native.yml`](deploy/docker-compose.native.yml).
-The socket directory must belong to the process UID with mode 0700. Native
-mode retains a 0600 lock file beside the socket for its entire listener lifetime;
-leave that lock file in place. After SIGKILL or OOM, the next owner can reclaim
-its recorded socket under the lock. The lock file also records the exact socket
-device and inode after binding in a private staging directory. The stable socket
-path is published only after that ownership record is synced, using a hard link
-that refuses to replace any entry. A crash before publication leaves the stable
-path available for restart. An unrecorded socket, including a process still
-between bind and listen, or an unrelated file is refused and needs operator cleanup.
-This native transport does not complete actual platform claim issuance,
-realtime protocols, the general signed-plan relay adapter track, or a settled
-worker conversation; those require their integration gates.
-
-## Versions and changelog
-
-Pin a released version in production. Each release has notes on the
-[releases page](https://github.com/SpekoAI/gateway/releases). Watch the repo
-with **Custom → Releases** to get notified.
-
-| Tag | What it points to | Use it for |
-|---|---|---|
-| `0.1.0` | One exact release. The workflow refuses to rebuild a released version. | Production, when you want to choose every upgrade. |
-| `0.1` | The newest `0.1.x` release. Gets fixes only. | Production, when you want fixes automatically. |
-| `latest`, `edge`, `sha-<commit>` | Every merge to `main`. Moves several times a day. | Testing unreleased changes. Not for production. |
-
-## Add Gateway to a Pipecat agent
-
-Gateway includes native Pipecat `STTService` and `TTSService` processors with
-utterance commits, streaming sentence synthesis, barge-in cancellation, and a
-Pipecat Cloud-compatible sidecar startup hook. See the complete
-[Pipecat integration guide](docs/PIPECAT.md).
-
-## Add Gateway to a LiveKit agent
-
-The public image contains both the Gateway binary and its Python integration.
-Apply this diff to the official
-[LiveKit Python agent starter](https://github.com/livekit-examples/agent-starter-python)
-Dockerfile:
-
-```diff
- ARG PYTHON_VERSION=3.14
-+FROM spekoai/gateway:0.1 AS speko-gateway
- FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim AS base
-
- FROM base AS build
- WORKDIR /app
- COPY pyproject.toml uv.lock ./
- RUN mkdir -p src
- RUN uv sync --locked
-+COPY --from=speko-gateway /opt/speko/python /opt/speko/python
-+RUN uv pip install --python /app/.venv/bin/python /opt/speko/python
- RUN uv run --module livekit.agents download-files
- COPY . .
-
- FROM base
- ARG UID=10001
- RUN adduser \
-     --disabled-password \
-     --gecos "" \
-     --home "/app" \
-     --shell "/sbin/nologin" \
-     --uid "${UID}" \
-     appuser
- COPY --from=build --chown=appuser:appuser /app /app
-+COPY --from=speko-gateway /usr/local/bin/speko-gateway /usr/local/bin/speko-gateway
-+RUN install -d -o appuser -g appuser -m 0700 /run/speko
- WORKDIR /app
- USER appuser
--CMD ["uv", "run", "src/agent.py", "start"]
-+CMD ["sh", "-c", "/usr/local/bin/speko-gateway & exec uv run src/agent.py start"]
+```bash
+docker compose --env-file .env -f deploy/docker-compose.yml up -d
 ```
 
-Then select Speko for the voice legs where the agent creates its
-`AgentSession`:
+[`.env.example`](.env.example) lists the variables it reads.
+
+## Use it in a voice agent
+
+The Python package `speko-gateway` in
+[`integrations/python`](integrations/python/README.md) has LiveKit Agents and
+Pipecat classes. The Gateway image carries the binary and the package, so an
+agent image can copy both.
+
+For the
+[LiveKit Python agent starter](https://github.com/livekit-examples/agent-starter-python),
+add these lines to its Dockerfile:
+
+```dockerfile
+FROM spekoai/gateway:0.1 AS speko-gateway
+
+# Build stage, after `uv sync`:
+COPY --from=speko-gateway /opt/speko/python /opt/speko/python
+RUN uv pip install --python /app/.venv/bin/python /opt/speko/python
+
+# Final stage, before `USER appuser`:
+COPY --from=speko-gateway /usr/local/bin/speko-gateway /usr/local/bin/speko-gateway
+RUN install -d -o appuser -g appuser -m 0700 /run/speko
+
+# Replace the final CMD:
+CMD ["sh", "-c", "/usr/local/bin/speko-gateway & exec uv run src/agent.py start"]
+```
+
+Then use Speko for the voice legs where the agent creates its session:
 
 ```python
 from livekit.plugins import openai
@@ -134,360 +146,187 @@ from livekit.plugins import openai
 from speko_gateway.livekit import STT, TTS
 
 session = AgentSession(
-    stt=STT(
-        language="en",         # default
-        provider="auto",       # default; set when several BYOK STT keys exist
-        model="auto",          # default: the provider's catalog default
-        credential_source="auto", # or "byok" / "managed"
-        sample_rate=16_000,    # default
-    ),
+    stt=STT(),                             # language="en", provider="auto"
     llm=openai.LLM(model="gpt-4.1-mini"),  # any LiveKit LLM plugin
-    tts=TTS(
-        provider="auto",       # default: the configured BYOK vendor, or the managed plan's pick
-        model="auto",          # default: the provider's catalog default
-        voice="",              # default: request, configured fallback, or catalog default
-        language="en",         # default
-        sample_rate=24_000,    # default
-        credential_source="auto", # or "byok" / "managed"
-    ),
-)
-```
-
-With a Speko API key the LLM can come from Speko too, served by the hosted
-Router (`router.speko.dev`):
-
-```python
-from speko_gateway.livekit import LLM, STT, TTS
-
-session = AgentSession(
-    stt=STT(),
-    llm=LLM(
-        provider="auto",          # default: relay picks; set with model= to pin a route
-        model="auto",             # default: GET router.speko.dev/v1/models lists the options
-        objective="balanced",     # default: or "quality", "latency", "cost"
-        max_output_tokens=8_192,  # default
-        reasoning_effort=None,    # default: provider default; or "none" ... "xhigh"
-    ),
     tts=TTS(),
 )
 ```
 
-`reasoning_effort` is the Router's reasoning control. Use `"none"` to turn
-reasoning off. `"minimal"` asks for the least reasoning the routed model allows
-(the Router maps it onto each provider's own scale), and `"low"`, `"medium"`,
-`"high"` and `"xhigh"` ask for more. Unset, no field is sent and the provider
-default applies. Any other value raises `ValueError` when the LLM is
-constructed. While reasoning is enabled (any value but `"none"`) the Router
-refuses `temperature` and `top_p`.
+Set `SPEKO_LOCAL_AUTH_TOKEN` and either `SPEKO_API_KEY` or one BYOK key as
+secrets of the agent. The agent and the Gateway share one container here, so
+the agent process can read the Gateway's environment. Use separate containers
+when the provider keys must be hidden from the agent.
 
-`"none"` is accepted on models that cannot reason, where it changes nothing,
-except on older Routers, which refuse it there (e.g. on `gpt-4.1`). Four models
-always reason and refuse `"none"`; `"minimal"` is their floor: Inception
-`mercury-voice`, `gpt-oss-120b` on Cerebras and Together, and Together
-`zai-org/GLM-5.3-Flash`. Every other value, `"minimal"` included, needs a model
-that can reason: a pinned model that cannot is refused
-(`capability_unsupported`), and auto routing considers only models that can.
-
-STT accepts transcription options in the same canonical vocabulary as the
-hosted Speko API, plus a per-vendor passthrough for each provider's own
-settings:
-
-```python
-stt = STT(
-    provider="deepgram",             # pin provider AND model when an option is a requirement:
-    model="nova-3",                  # deepgram's default is Flux, which has no diarization
-    diarization=True,                # speaker labels (deepgram nova, assemblyai, soniox, elevenlabs scribe_v3_live)
-    keywords=["Speko", "Casey"],     # vocabulary biasing, every provider's own spelling
-    noise_reduction=True,            # gladia enhancer, assemblyai voice focus, openai near-field
-    provider_options={               # vendor-native settings, allow-listed per provider AND model
-        "deepgram": {"numerals": True, "endpointing": 1200},
-        "elevenlabs": {"vad_silence_threshold_secs": 0.7},
-    },
-)
-```
-
-Options fail closed: a session routed to a provider that cannot honor a
-canonical ask is refused at create (`stt_option_unsupported`) with the option
-named, never opened with the feature silently missing. With `provider="auto"`,
-routing may pick a provider that must refuse the ask — pin the provider when
-an option is a requirement. Settings under `provider_options` never narrow
-routing; a provider the session does not reach simply ignores its entry, and a
-setting outside a provider's allow-list is refused by name. Speaker labels
-arrive on the raw vendor frames each event carries in `extensions`.
-
-ElevenLabs serves two realtime Scribe models on one adapter. `scribe_v2_realtime`
-is the default. Pin `model="scribe_v3_live"` for Scribe v3 Live, which adds
-three things the gateway refuses on any other Scribe model:
-
-```python
-stt = STT(
-    provider="elevenlabs",
-    model="scribe_v3_live",
-    diarization=True,                # each final carries the vendor's speaker labels
-    keywords=catalog_terms,          # terms past 50 x 20 characters ride the keyterm library
-    provider_options={
-        "elevenlabs": {
-            "turn_prediction": True, # commit on predicted end of turn; VAD stays active
-            "multilang_mode": True,  # follow speakers who switch languages
-        },
-    },
-)
-```
-
-With `diarization=True` a final is emitted when ElevenLabs sends the
-speaker-labelled transcript for the segment, which follows the commit, so
-finals arrive later than without it. Partials and other events that follow
-the commit wait behind that final, so the next segment's partial never
-arrives before the previous segment's final. Each word carries `speaker`, and the
-final carries `speaker` when one speaker said all of it. A word ElevenLabs has
-not attributed to a speaker carries no `speaker`, and then neither does its
-final. The gateway waits at most 0.8 s after a commit for its labels, also
-while the session closes, so no event is delayed longer than that. A final can
-still arrive with no speakers at all: when ElevenLabs has not labelled a
-segment within 0.8 s, the stream ends first, or ElevenLabs sends no labels for
-it, the committed text is delivered without them rather than dropped, and
-labels that arrive later are ignored. When ElevenLabs
-later decides two labels are one person, the gateway relabels the finals that follow
-and emits a `warning` event with `provider_type: "speakers_merged"`,
-`from_speaker` and `to_speaker`; finals already delivered keep their label.
-
-`LLM()` requires `SPEKO_API_KEY` and speaks HTTPS directly to the relay —
-not the local socket — under the public [`relayapi`](relayapi/doc.go)
-contract. That crosses a different trust boundary: unlike the
-provider-direct voice legs, the conversation history travels through the
-Speko Router.
-
-Optionally, attach the conversation profiler probe to correlate STT, LLM,
-TTS, and playback into per-turn latency traces. It emits content-free timing
-markers only (see [TRUST.md](docs/TRUST.md#conversation-turn-markers)), never
-raises into the agent, and is suppressed by `SPEKO_TELEMETRY_DISABLED=true`:
-
-```python
-from speko_gateway.probe import ConversationProbe
-
-session = AgentSession(stt=STT(), llm=LLM(), tts=TTS())
-probe = ConversationProbe(session)
-probe.start()                  # before session.start()
-
-await session.start(...)
-...
-await probe.aclose()           # during shutdown
-```
-
-Set a local token plus one credential choice:
-
-```bash
-# Speko-managed routing, observability, and consolidated billing
-lk agent update-secrets \
-  --secrets "SPEKO_LOCAL_AUTH_TOKEN=$(openssl rand -hex 32)" \
-  --secrets "SPEKO_API_KEY=your-speko-api-key"
-
-# BYOK. SPEKO_API_KEY may remain set for LLM/managed traffic when the voice
-# classes use credential_source="byok".
-lk agent update-secrets \
-  --secrets "SPEKO_LOCAL_AUTH_TOKEN=$(openssl rand -hex 32)" \
-  --secrets "SPEKO_DEEPGRAM_BYOK_API_KEY=your-deepgram-key"
-```
-
-Both choices can coexist through the same local socket and LiveKit integration.
-With BYOK,
-provider credentials stay in the Gateway process and anonymous telemetry
-remains on unless explicitly disabled. The local image serves
-provider-direct routes; the hosted Speko Router (`router.speko.dev`) is a
-separate, generally available Speko-operated surface whose public wire
-contract lives in this repository's `relayapi` package (OpenAPI + AsyncAPI).
-Any Speko organization can route relay requests to any model in the
-published catalog.
-
-Because the LiveKit agent and Gateway share one container in this setup, the
-agent process can inspect the container environment. Use separate containers
-when process-level credential isolation is required.
-
-## Anonymous telemetry and opt-out
-
-Speko Gateway sends anonymous, content-free usage telemetry by default,
-including when only BYOK is configured. Without `SPEKO_API_KEY`, telemetry is
-unauthenticated and is not associated with a Speko account. Disable it with:
-
-```bash
-SPEKO_TELEMETRY_DISABLED=true
-```
-
-Telemetry contains session lifecycle markers, timings, error classifications,
-and provider request correlation IDs. It never contains audio, transcripts,
-prompts, generated text, tool names/arguments/results, or credentials.
-
-When Speko supplies the provider credential, minimum usage and terminal
-records are still required for consolidated billing even if optional telemetry
-is disabled. The exact payloads and trust boundaries are documented in
-[Trust and data flow](docs/TRUST.md).
+For Pipecat, follow [docs/PIPECAT.md](docs/PIPECAT.md). Options, the Speko
+LLM class, realtime models and the conversation profiler are in the
+[Python package README](integrations/python/README.md).
 
 ## Configuration
 
-| Variable | Default | Purpose |
+The Gateway reads environment variables only. Every secret also has an
+exclusive `_FILE` form, for example
+`SPEKO_API_KEY_FILE=/run/secrets/speko_api_key`. A provider credential file
+is read again for every new session, so a short-lived token can be rotated
+without a restart.
+
+| Variable | Default | Meaning |
 | --- | --- | --- |
-| `SPEKO_LOCAL_AUTH_TOKEN` | required | Local API bearer token |
-| `SPEKO_API_KEY` | unset | Enables managed routing, relay, and billing; explicit BYOK remains local |
-| `SPEKO_<PROVIDER>_BYOK_TTS_VOICE` | catalog default | Operator-selected fallback voice; request voice wins |
-| `SPEKO_TELEMETRY_DISABLED` | `false` | Opts out of telemetry |
+| `SPEKO_LOCAL_AUTH_TOKEN` | required | Bearer token for the local socket |
+| `SPEKO_API_KEY` | unset | Speko API key. Turns on managed routing and billing. Requests that ask for BYOK stay local |
+| `SPEKO_<PROVIDER>_BYOK_API_KEY` | unset | Provider key. Without `SPEKO_API_KEY` at least one is required |
+| `SPEKO_<PROVIDER>_BYOK_TTS_VOICE` | catalog default | Fallback voice for BYOK TTS. A voice in the request wins |
 | `SPEKO_SOCKET_PATH` | `/run/speko/runtime.sock` | Absolute Unix socket path |
-| `SPEKO_LOCAL_MAX_SESSION_DURATION` | `24h` | Local BYOK session ceiling |
+| `SPEKO_MAX_SESSIONS` | `100` | Concurrent sessions in this process |
+| `SPEKO_LOCAL_MAX_SESSION_DURATION` | `24h` | Longest BYOK session |
+| `SPEKO_TELEMETRY_DISABLED` | `false` | `true` turns optional telemetry off |
+| `SPEKO_GATEWAY_REGION` | unset | Cloud region the Gateway runs in, such as `ap-northeast-1`. Managed routing uses it to pick a nearby provider deployment |
+| `SPEKO_RUNTIME_INSTANCE_ID` | hostname | Non-secret name of this process in reports to Speko |
+| `SPEKO_WORKLOAD_ID` | unset | Stable ID of the agent or service that uses this Gateway |
+| `SPEKO_WORKLOAD_TYPE` | `agent` when an ID is set | Workload category in the Speko dashboard |
+| `SPEKO_INSTANCE_HEARTBEAT_INTERVAL` | `20s` | How often a managed Gateway reports its session counts |
+| `SPEKO_WARM_PLAN_TARGET` | `4` | Session plans kept ready per route. `0` turns prefetching off |
+| `SPEKO_WARM_ROUTES` | unset | Routes to prefetch at startup |
+| `SPEKO_WARM_TTS_MAX_CHARACTERS` | `100000` | Character allowance of prefetched TTS plans |
 | `SPEKO_CONTROL_PLANE_URL` | `https://gateway.speko.dev` | Speko control plane |
-| `SPEKO_JWKS_URL` | `<control-plane>/.well-known/jwks.json` | Signing keys |
+| `SPEKO_JWKS_URL` | `<control plane>/.well-known/jwks.json` | Keys that sign session plans |
 | `SPEKO_PLAN_ISSUER` | control-plane URL | Required plan issuer |
 | `SPEKO_PLAN_AUDIENCE` | `speko-runtime` | Required plan audience |
-| `SPEKO_RUNTIME_INSTANCE_ID` | hostname | Non-secret process identity; hosted reports use protocol-2 incarnation/sequence fencing |
-| `SPEKO_GATEWAY_REGION` | unset | Cloud region this gateway runs in (`asia-southeast1`, `ap-northeast-1`). Managed routing uses it to pick a provider deployment nearby; today an Asia-Pacific region gets Soniox's Japan hosts |
-| `SPEKO_WORKLOAD_TYPE` | `agent` when an ID is set | Dashboard workload category |
-| `SPEKO_WORKLOAD_ID` | unset | Stable Agent or custom workload ID |
-| `SPEKO_MAX_SESSIONS` | `100` | Per-process session capacity |
-| `SPEKO_INSTANCE_HEARTBEAT_INTERVAL` | `20s` | Hosted dashboard worker heartbeat interval |
-| `SPEKO_WARM_PLAN_TARGET` | `4` | Prefetched session plans kept per route; `0` disables prefetching |
-| `SPEKO_WARM_ROUTES` | unset | Routes to warm at startup, `kind:provider[:model[:language]]`, comma-separated |
-| `SPEKO_WARM_TTS_MAX_CHARACTERS` | `100000` | Character allowance requested for warmed TTS routes |
+| `SPEKO_LIVE_RELAY_HOSTS` | unset | Extra Speko Router hostnames allowed for managed GPT-Live, comma-separated. `router.speko.dev` is always allowed |
 
-Every catalog provider has a BYOK credential variable:
+### Providers
 
-| Provider | Credential variable | Notes |
-| --- | --- | --- |
-| Alibaba | `SPEKO_ALIBABA_BYOK_API_KEY` | DashScope API key |
-| AssemblyAI | `SPEKO_ASSEMBLYAI_BYOK_API_KEY` | API key |
-| Cartesia | `SPEKO_CARTESIA_BYOK_API_KEY` | API key |
-| Deepgram | `SPEKO_DEEPGRAM_BYOK_API_KEY` | API key |
-| ElevenLabs | `SPEKO_ELEVENLABS_BYOK_API_KEY` | API key |
-| Fish Audio | `SPEKO_FISH_BYOK_API_KEY` | Team API key; `/v1/tts/live` does not accept Fish agent session tokens |
-| Gladia | `SPEKO_GLADIA_BYOK_API_KEY` | API key used for live-session initialization |
-| Google | `SPEKO_GOOGLE_BYOK_ACCESS_TOKEN` | Gemini Live bearer access token; prefer `_FILE` for rotation |
-| Gradium | `SPEKO_GRADIUM_BYOK_API_KEY` | API key |
-| Hamsa | `SPEKO_HAMSA_BYOK_API_KEY` | API key |
-| Hopper | `SPEKO_HOPPER_BYOK_API_KEY` | API key (`sk_hopper_…`), sent as a bearer; BYOK/Relay only because Hopper has no token exchange |
-| Hume | `SPEKO_HUME_BYOK_API_KEY` | API key |
-| Inworld | `SPEKO_INWORLD_BYOK_API_KEY` | Base64 portal credential (`key:secret`) |
-| Maya Research | `SPEKO_MAYA_BYOK_API_KEY` | Permanent API key; BYOK/Relay only because Maya has no short-lived session token |
-| Meta | `SPEKO_META_BYOK_API_KEY` | API key; sent as the bearer inside the realtime handshake frame |
-| MiniMax | `SPEKO_MINIMAX_BYOK_API_KEY` | API key |
-| Munsit | `SPEKO_MUNSIT_BYOK_API_KEY` | API key, sent as `x-api-key`; BYOK/Relay only because Munsit has no token exchange |
-| Nari Labs | `SPEKO_NARI_BYOK_API_KEY` | API key; one key serves both the synthesis endpoint and the transcription socket |
-| Omi Health | `SPEKO_OMI_BYOK_API_KEY` | API key; sent inside the realtime socket's JSON `start` frame and as a bearer on uploads; BYOK/Relay only because Omi has no token exchange |
-| OpenAI | `SPEKO_OPENAI_BYOK_API_KEY` | API key |
-| Palabra | `SPEKO_PALABRA_BYOK_API_KEY` | API key; dedicated STT/TTS sockets do not expose a scoped short-lived grant |
-| Paxa Labs | `SPEKO_PAXA_BYOK_API_KEY` | API key |
-| Rime | `SPEKO_RIME_BYOK_API_KEY` | API key |
-| Smallest | `SPEKO_SMALLEST_BYOK_API_KEY` | API key |
-| Soniox | `SPEKO_SONIOX_BYOK_API_KEY` | API key |
-| Speechify | `SPEKO_SPEECHIFY_BYOK_API_KEY` | API key; Build access-token minting is deprecated |
-| Speechmatics | `SPEKO_SPEECHMATICS_BYOK_API_KEY` | API key; managed direct sessions use a 60-second realtime JWT |
-| xAI | `SPEKO_XAI_BYOK_API_KEY` | API key |
+| Kind | `provider` names |
+| --- | --- |
+| STT | `alibaba`, `assemblyai`, `cartesia`, `deepgram`, `elevenlabs`, `gemini`, `gladia`, `gradium`, `hamsa`, `hopper`, `inworld`, `meta`, `modulate`, `munsit`, `nari`, `omi`, `openai`, `palabra`, `smallest`, `soniox`, `speechmatics`, `xai` |
+| TTS | `alibaba`, `cartesia`, `deepgram`, `elevenlabs`, `fish`, `gemini`, `gradium`, `hamsa`, `hopper`, `hume`, `inworld`, `maya`, `minimax`, `munsit`, `nari`, `openai`, `palabra`, `paxa`, `rime`, `smallest`, `soniox`, `speechify`, `xai` |
+| Realtime | `google`, `openai`, `xai` |
 
-## Zero-overhead session setup
+- The BYOK variable is the name in upper case:
+  `SPEKO_DEEPGRAM_BYOK_API_KEY`. The one exception is
+  `SPEKO_GOOGLE_BYOK_ACCESS_TOKEN`.
+- `google` is Gemini Live and takes a bearer access token. Use the `_FILE`
+  form so a token refresher can rotate it. `gemini` is the separate AI Studio
+  speech API and takes an API key.
+- `inworld` takes the Base64 `key:secret` portal credential. `fish` takes a
+  team API key.
+- `GET /v1/models` lists every model. Default models and endpoints are in
+  `gateway/catalog.go`.
+- The Gateway checks each provider endpoint against an allow-list of the
+  provider's official hosts before it attaches a credential. Provider
+  connections use TLS on port 443.
 
-With Speko-managed routing, the Gateway keeps a small pool of signed session
-plans warm in the background. Creating a session takes one out of memory and
-dials the provider immediately, so using the Gateway costs the provider
-handshake and nothing else — no control-plane round trip on the path a caller
-waits on.
+### Prefetched session plans
 
-The pool learns route shapes from traffic, so it warms itself after the first
-session of each shape. `SPEKO_WARM_ROUTES` covers the one case that cannot
-learn: the first session after a deploy or a scale-up, which is the one a real
-person is waiting on.
+With `SPEKO_API_KEY`, the Gateway keeps a few signed session plans per route
+in memory, so opening a session needs no control-plane round trip. It learns
+routes from traffic. `SPEKO_WARM_ROUTES` covers the first session after a
+start, as `kind:provider[:model[:language]]` entries:
 
 ```bash
 SPEKO_WARM_ROUTES=stt:deepgram:nova-3:en,tts:elevenlabs::en
 ```
 
-A miss — a cold process, an unseen route shape, an unreachable control plane —
-falls through to a synchronous plan request. Nothing fails that would not have
-failed before; it is only slower. `GET /metrics` reports
-`speko_gateway_warm_plan_hits_total` and `speko_gateway_warm_plan_misses_total`;
-a miss rate that does not fall toward zero after warm-up means prefetching is
-not working.
+When no plan is ready, the Gateway asks the control plane during session
+creation. `GET /metrics` reports `speko_gateway_warm_plan_hits_total` and
+`speko_gateway_warm_plan_misses_total`. BYOK sessions are never prefetched.
 
-Prefetching does not apply to BYOK, where plans are signed inside this process
-and already cost nothing.
+## Native relay mode
 
-Every secret also supports an exclusive `*_FILE` form for Docker and
-Kubernetes secrets—for example,
-`SPEKO_API_KEY_FILE=/run/secrets/speko_api_key`.
-Single-value provider credential files are reread for every new session, so an
-external refresher can replace a short-lived Google OAuth token without
-restarting the Gateway.
+`speko-gateway native` is a second mode, used by agents that Speko runs. It
+forwards STT, TTS, LLM and realtime requests from the local socket to one
+Speko Router origin. It holds no provider key and no process-wide Speko key:
+each request carries its own session credential. The local API is in
+[docs/PROTOCOL.md](docs/PROTOCOL.md#native-relay-mode), and a container
+template is in
+[`deploy/docker-compose.native.yml`](deploy/docker-compose.native.yml).
 
-## Included provider adapters
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SPEKO_LOCAL_AUTH_TOKEN` | required | Bearer token for the local socket |
+| `SPEKO_RELAY_URL` | required | HTTPS origin of the Router |
+| `SPEKO_SOCKET_PATH` | `/run/speko/runtime.sock` | Absolute Unix socket path |
+| `SPEKO_MAX_SESSIONS` | `100` | Concurrent requests |
+| `SPEKO_NATIVE_MAX_REQUEST_BYTES` | `134217728` | Largest HTTP request body |
+| `SPEKO_NATIVE_SETUP_TIMEOUT` | `30s` | Limit for connecting to the Router and for a stalled upload |
+| `SPEKO_NATIVE_WRITE_TIMEOUT` | `15s` | Limit for one write to the local client |
 
-| Capability | Provider | Adapter | Default model |
-| --- | --- | --- | --- |
-| STT | Deepgram | `deepgram.stt.v1` | `flux-general-en` |
-| TTS | Deepgram | `deepgram.tts.v1` | `flux-haley-en` |
-| STT | ElevenLabs | `elevenlabs.stt.v1` | `scribe_v2_realtime` (`scribe_v3_live` by pin) |
-| TTS | ElevenLabs | `elevenlabs.tts.v1` | `eleven_flash_v2_5` |
-| TTS | ElevenLabs (v3/v4) | `elevenlabs.dialogue.v1` | `eleven_v4_turbo` |
-| STT | Cartesia | `cartesia.stt.v1` | `ink-2` |
-| TTS | Cartesia | `cartesia.tts.v1` | `sonic-3` |
-| STT | AssemblyAI | `assemblyai.stt.v1` | `universal-3-5-pro` |
-| STT | Modulate | `modulate.stt.v1` | `velma-2-stt-streaming-english-v2` |
-| STT | Gladia | `gladia.stt.v1` | `solaria-1` |
-| TTS | MiniMax | `minimax.tts.v1` | `speech-2.8-hd` |
-| STT | xAI | `xai.stt.v1` | `stt` |
-| TTS | xAI | `xai.tts.v1` | `tts` |
-| STT | Alibaba | `alibaba.stt.v1` | `qwen3-asr-flash-realtime` |
-| TTS | Alibaba | `alibaba.tts.v1` | `qwen3-tts-flash-realtime` |
-| STT | Gradium | `gradium.stt.v1` | `default` |
-| TTS | Gradium | `gradium.tts.v1` | `default` |
-| STT | Hamsa | `hamsa.stt.v1` | `s3` |
-| TTS | Hamsa | `hamsa.tts.v1` | `default` |
-| TTS | Rime | `rime.tts.v1` | `coda` |
-| TTS | Hume | `hume.tts.v1` | `octave-2` |
-| STT | Inworld | `inworld.stt.v1` | `inworld-stt-1` |
-| TTS | Inworld | `inworld.tts.v2` | `inworld-tts-2` |
-| STT | OpenAI | `openai.stt.v1` | `gpt-live-transcribe` |
-| TTS | OpenAI | `openai.tts.v1` | `gpt-4o-mini-tts` |
-| STT | Soniox | `soniox.stt.v1` | `stt-rt-v5` |
-| TTS | Fish Audio | `fish.tts.v1` | `s2.1-pro` (also `drama-3`, `s2-pro`, `s1`, `s2.1-pro-free`) |
-| TTS | Soniox | `soniox.tts.v1` | `tts-rt-v2` |
-| STT | Smallest | `smallest.stt.v1` | `pulse` |
-| TTS | Smallest | `smallest.tts.v1` | `lightning_v3.1` |
-| STT | Palabra | `palabra.stt.v1` | `default` |
-| TTS | Palabra | `palabra.tts.v1` | `auto` |
-| TTS | Maya Research | `maya.tts.v1` | `Maya Calyx` |
-| TTS | Speechify | `speechify.tts.v1` | `simba-3.0` |
-| STT | Speechmatics | `speechmatics.stt.v1` | `standard` |
-| STT | Meta | `meta.stt.v1` | `muse-voice-transcribe-1.0` |
-| STT | Nari Labs | `nari.stt.v1` | `qwen3-asr-fast` |
-| TTS | Nari Labs | `nari.tts.v1` | `qwen3-tts-fast` |
-| TTS | Paxa Labs | `paxa.tts.v1` | `paxa-tts-flash-v1` (also `paxa-tts-flash-v2`) |
-| STT | Munsit | `munsit.stt.v1` | `munsit` |
-| TTS | Munsit | `munsit.tts.v1` | `faseeh-v1-preview` |
-| STT | Hopper | `hopper.stt.v1` | `nemotron-asr` |
-| TTS | Hopper | `hopper.tts.v1` | `qwen3-tts` |
-| STT | Omi Health | `omi.stt.v1` | `omi-medical-1` |
+- The socket directory must belong to the process user with mode 0700.
+- The Gateway keeps a `runtime.sock.lock` file beside the socket. Leave it in
+  place: after a crash, the next process uses it to take over the old socket.
+  A socket that the lock file does not record is refused and needs manual
+  cleanup.
 
-Whole-input HTTP synthesis is available through the explicitly registered
-[Cartesia bytes adapter](docs/CARTESIA_BYTES_TTS.md), `cartesia.tts.bytes.v1`.
+## Telemetry
 
-Provider endpoints are checked against exact official host allowlists before
-credentials are attached. Production connections require TLS and port 443.
-
-## What is open
-
-This repository contains the complete customer-side gateway: local HTTP and
-WebSocket service, protocol and schema, plan verification, BYOK injection,
-provider adapters, bounded telemetry exporter, tests, and container build.
-
-Speko's hosted control plane, credential broker, billing systems, databases,
-and infrastructure are separate and are not included.
-
-## Build
-
-Go 1.26 or newer is required.
+The Gateway sends anonymous, content-free usage telemetry by default, also
+when only BYOK keys are set. Turn it off with:
 
 ```bash
-make check
-make build
+SPEKO_TELEMETRY_DISABLED=true
+```
+
+Telemetry holds session lifecycle events, timings, error classes and provider
+request IDs. It never holds audio, transcripts, prompts, generated text, tool
+names, arguments or results, or credentials. When Speko supplies the provider
+credential, the usage and end-of-session records needed for billing are still
+sent with telemetry off. [docs/TRUST.md](docs/TRUST.md) lists every payload.
+
+## Versions
+
+Pin a released version in production. Each release has notes on the
+[releases page](https://github.com/SpekoAI/gateway/releases).
+
+| Image tag | What it is | Use it for |
+| --- | --- | --- |
+| `spekoai/gateway:0.1.0` | One exact release. It never changes | Production, when you choose every upgrade |
+| `spekoai/gateway:0.1` | The newest `0.1.x` release. Gets fixes only | Production, when you want fixes automatically |
+| `latest`, `edge`, `sha-<commit>` | Every merge to `main` | Testing unreleased changes |
+
+`speko-gateway version` prints the version of a binary.
+
+## Repository layout
+
+| Path | Contents |
+| --- | --- |
+| `cmd/speko-gateway` | The command: configuration, startup, shutdown |
+| `gateway` | Local HTTP and WebSocket server, BYOK planner, provider catalog, native relay mode |
+| `runtime` | Session engine, plan verification, telemetry exporter |
+| `protocol` | Wire types and the session-plan JSON schema |
+| `providers` | One adapter package per provider |
+| `controlplane` | Client for the Speko control plane, and its API notes |
+| `relayapi` | Public wire contract of the hosted Speko Router (OpenAPI and AsyncAPI) |
+| `integrations/python` | Python package for LiveKit Agents and Pipecat |
+| `deploy` | Docker Compose templates |
+
+Speko's hosted control plane, Router, billing and infrastructure are separate
+services and are not in this repository.
+
+## Build and test
+
+Go 1.26 or newer. The Python checks need [uv](https://docs.astral.sh/uv/).
+
+```bash
+make build         # bin/speko-gateway
+make test          # go test ./...
+make check         # go vet, tests, race tests, Python lint and tests
 docker build -t spekoai/gateway:dev .
 ```
 
-See [SECURITY.md](SECURITY.md) to report vulnerabilities and
-[CONTRIBUTING.md](CONTRIBUTING.md) to contribute. Speko Gateway is released
-under the [MIT License](LICENSE) and follows the
-[Code of Conduct](CODE_OF_CONDUCT.md).
+## More documentation
+
+| Document | Subject |
+| --- | --- |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Local HTTP and WebSocket protocol, signed plans |
+| [docs/TRUST.md](docs/TRUST.md) | Trust boundaries, telemetry payloads, credential handling |
+| [docs/PIPECAT.md](docs/PIPECAT.md) | Pipecat setup |
+| [integrations/python/README.md](integrations/python/README.md) | Python package |
+| [controlplane/renewals.md](controlplane/renewals.md) | Funded Google session renewal |
+| [controlplane/instances-v2.md](controlplane/instances-v2.md), [instances-v3.md](controlplane/instances-v3.md) | Process reports to the control plane |
+| [docs/CARTESIA_BYTES_TTS.md](docs/CARTESIA_BYTES_TTS.md) | Cartesia whole-input TTS adapter for Go embedders |
+| [docs/DEEPGRAM-CAPACITY-EVIDENCE.md](docs/DEEPGRAM-CAPACITY-EVIDENCE.md) | Detecting Deepgram rate-limit refusals in Go |
+| [docs/RELEASING.md](docs/RELEASING.md) | Cutting a release |
+
+Report vulnerabilities as described in [SECURITY.md](SECURITY.md). To
+contribute, read [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md). Speko Gateway is released under the
+[MIT License](LICENSE).
