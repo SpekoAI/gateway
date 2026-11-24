@@ -32,7 +32,6 @@ import (
 	"github.com/SpekoAI/gateway/providers/gradium"
 	"github.com/SpekoAI/gateway/providers/hamsa"
 	"github.com/SpekoAI/gateway/providers/hopper"
-	"github.com/SpekoAI/gateway/providers/hume"
 	"github.com/SpekoAI/gateway/providers/inworld"
 	"github.com/SpekoAI/gateway/providers/maya"
 	"github.com/SpekoAI/gateway/providers/meta"
@@ -210,10 +209,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	humeAdapter, err := hume.New(hume.Config{})
-	if err != nil {
-		return err
-	}
 	inworldSTTAdapter, err := inworld.NewSTT(inworld.STTConfig{})
 	if err != nil {
 		return err
@@ -347,7 +342,7 @@ func run() error {
 		inworldAdapter, minimaxAdapter, xaiAdapter,
 		sonioxSTTAdapter, sonioxTTSAdapter, smallestSTTAdapter, smallestTTSAdapter,
 		openaiSTTAdapter, openaiTTSAdapter, openaiRealtimeAdapter, openaiLiveAdapter, xaiRealtimeAdapter, googleRealtimeAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
-		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter, humeAdapter,
+		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter,
 		inworldSTTAdapter, xaiSTTAdapter, hamsaSTTAdapter,
 		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 		geminiSTTAdapter, geminiTTSAdapter, metaSTTAdapter, nariSTTAdapter, nariTTSAdapter,

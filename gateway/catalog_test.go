@@ -248,7 +248,7 @@ func TestCatalogCarriesADefaultVoiceWhereTheVendorDemandsOne(t *testing.T) {
 			voices[entry.Provider] = entry.DefaultVoice
 		}
 	}
-	for _, provider := range []string{"rime", "hume"} {
+	for _, provider := range []string{"rime"} {
 		if voices[provider] == "" {
 			t.Fatalf("%s TTS has no default voice, so a standalone plan cannot open", provider)
 		}
@@ -256,6 +256,10 @@ func TestCatalogCarriesADefaultVoiceWhereTheVendorDemandsOne(t *testing.T) {
 	// google has no TTS row since the 2026-10-26 Chirp withdrawal.
 	if _, ok := voices["google"]; ok {
 		t.Fatal("google TTS is back in the catalog; Google Cloud Chirp was withdrawn")
+	}
+	// hume has no TTS row since the 2026-11-24 removal: its TTS API returns 404.
+	if _, ok := voices["hume"]; ok {
+		t.Fatal("hume TTS is back in the catalog; Hume's TTS API was shut down")
 	}
 }
 
@@ -302,7 +306,7 @@ func TestEveryVoiceDemandingTTSHasADefaultOrAStatedReason(t *testing.T) {
 			continue
 		}
 		switch entry.Provider {
-		case "gradium", "rime", "hume":
+		case "gradium", "rime":
 			if entry.DefaultVoice == "" {
 				t.Fatalf("%s TTS requires a voice but the catalog carries no default", entry.Provider)
 			}
