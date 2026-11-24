@@ -7,7 +7,7 @@
 // they are deliberately not implemented here because the realtime sockets are
 // the lower-latency surface the runtime is built around.
 //
-//	stt: soniox.stt.v1, model stt-rt-v5, wss://stt-rt.soniox.com/transcribe-websocket
+//	stt: soniox.stt.v1, model stt-rt-v6, wss://stt-rt.soniox.com/transcribe-websocket
 //	tts: soniox.tts.v1, model tts-rt-v2,  wss://tts-rt.soniox.com/tts-websocket
 //
 // # Authentication is a single mechanism, not two

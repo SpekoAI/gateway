@@ -10,6 +10,7 @@ import (
 
 	"github.com/SpekoAI/gateway/gateway"
 	"github.com/SpekoAI/gateway/protocol"
+	assemblyaiprovider "github.com/SpekoAI/gateway/providers/assemblyai"
 )
 
 type catalogResponse struct {
@@ -154,7 +155,8 @@ func TestModelsFiltersByKindAndProvider(t *testing.T) {
 		t.Fatalf("provider=elevenlabs returned %v", adapters)
 	}
 	// AssemblyAI serves three published streaming models on one adapter; all
-	// must be discoverable, with the default still resolving to 3.5 Pro.
+	// must be discoverable, with the default resolving to the 3.7 agent model
+	// that replaces 3.5 Pro on 2027-02-01.
 	assemblyai := fetchCatalog(t, "/v1/models?provider=assemblyai")
 	ids := make([]string, 0, len(assemblyai.Models))
 	for _, model := range assemblyai.Models {
@@ -164,9 +166,25 @@ func TestModelsFiltersByKindAndProvider(t *testing.T) {
 		!slices.Contains(ids, "assemblyai:assemblyai-stt-3-7-realtime-agent") {
 		t.Fatalf("provider=assemblyai returned %v, want 3.5 Pro, 3.6 Pro and the 3.7 agent model", ids)
 	}
+	// Soniox lists v6 first for discovery, and a bare or auto pin gets v6:
+	// Soniox removes v5 on 2026-12-15 and routes it to v6.
+	soniox := fetchCatalog(t, "/v1/models?provider=soniox&kind=stt")
+	sonioxIDs := make([]string, 0, len(soniox.Models))
+	for _, model := range soniox.Models {
+		sonioxIDs = append(sonioxIDs, model.ID)
+	}
+	if want := []string{"soniox:stt-rt-v6", "soniox:stt-rt-v5"}; !slices.Equal(sonioxIDs, want) {
+		t.Fatalf("provider=soniox kind=stt returned %v, want %v", sonioxIDs, want)
+	}
+	if assemblyaiprovider.DefaultModel != "assemblyai-stt-3-7-realtime-agent" {
+		t.Fatalf("assemblyai default = %q, want assemblyai-stt-3-7-realtime-agent", assemblyaiprovider.DefaultModel)
+	}
 	for _, entry := range gateway.Catalog() {
-		if entry.Provider == "assemblyai" && entry.DefaultModel != "universal-3-5-pro" {
-			t.Fatalf("assemblyai default = %q, want universal-3-5-pro", entry.DefaultModel)
+		if entry.Provider == "soniox" && entry.Kind == protocol.SessionKindSTT && entry.DefaultModel != "stt-rt-v6" {
+			t.Fatalf("soniox stt default = %q, want stt-rt-v6", entry.DefaultModel)
+		}
+		if entry.Provider == "assemblyai" && entry.DefaultModel != assemblyaiprovider.DefaultModel {
+			t.Fatalf("assemblyai catalog default = %q, adapter default = %q; they must match", entry.DefaultModel, assemblyaiprovider.DefaultModel)
 		}
 		// Listing scribe_v3_live must not move what a bare or auto pin gets.
 		if entry.Provider == "elevenlabs" && entry.Kind == protocol.SessionKindSTT && entry.DefaultModel != "scribe_v2_realtime" {

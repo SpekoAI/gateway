@@ -225,6 +225,21 @@ func TestAssemblyAIVoiceFocusThresholdRequiresVoiceFocus(t *testing.T) {
 	}
 }
 
+// end_of_turn_confidence_threshold stays accepted on every AssemblyAI model, so
+// callers that send it to universal-3-6-pro today keep working. The adapter
+// leaves it off the URL for the models that do not read it.
+func TestAssemblyAIEndOfTurnConfidenceIsAcceptedOnEveryModel(t *testing.T) {
+	t.Parallel()
+	threshold := &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+		"assemblyai": {"end_of_turn_confidence_threshold": 0.6},
+	}}
+	for _, model := range []string{assemblyai.RealtimeAgent37Model, "universal-3-6-pro", "universal-3-5-pro", "universal-streaming-english", "universal-streaming-multilingual"} {
+		if err := validateSttRouteSupport("assemblyai", model, threshold); err != nil {
+			t.Fatalf("%s: threshold refused: %v", model, err)
+		}
+	}
+}
+
 // AssemblyAI answers an unknown mode with validation error 3006 after the
 // handshake. The gateway refuses it at create. manual is not offered.
 func TestAssemblyAIModeIsAKnownPreset(t *testing.T) {

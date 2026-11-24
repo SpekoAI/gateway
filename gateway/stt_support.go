@@ -98,7 +98,9 @@ var sttOptionSupport = map[string]sttSupport{
 	// min_end_of_turn_silence_when_confident stays for callers holding the
 	// earlier documented name. mode is the vendor's turn-detection preset
 	// (assemblyai.ValidateMode holds its values); explicit silence settings
-	// still override the preset's defaults.
+	// still override the preset's defaults. end_of_turn_confidence_threshold
+	// is accepted on every model; the adapter leaves it off the URL for the
+	// 3.6 Pro and 3.7 models, which do not read it.
 	"assemblyai": {diarization: true, keywords: true, noiseReduction: true, providerKeys: []string{
 		"end_of_turn_confidence_threshold", "min_end_of_turn_silence_when_confident",
 		"min_turn_silence", "max_turn_silence", "mode",
