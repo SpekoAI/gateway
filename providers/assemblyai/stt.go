@@ -199,6 +199,19 @@ func readsEndOfTurnConfidence(model string) bool {
 	return !punctuationTurnModel(model)
 }
 
+// ignoredOptions lists the caller's AssemblyAI settings that the model does not
+// read. streamEndpoint leaves them off the URL; the stream reports each one as
+// a warning event when the session starts, so the caller can see it.
+func ignoredOptions(model string, options protocol.RequestOptions) []string {
+	if options.STT == nil || readsEndOfTurnConfidence(strings.TrimSpace(model)) {
+		return nil
+	}
+	if _, set := options.STT.Provider("assemblyai")[EndOfTurnConfidenceOption]; set {
+		return []string{EndOfTurnConfidenceOption}
+	}
+	return nil
+}
+
 // turnTimingOptions are the caller settings that tune when a turn ends. A
 // caller that sets any of them chose its own turn timing, so defaultMode adds
 // no preset. end_of_turn_confidence_threshold stays in this list although 3.7
@@ -366,6 +379,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &stream{
+		ignoredOptions:  ignoredOptions(request.Plan.Route.Model, request.Options),
 		billingModel:    strings.TrimSpace(request.Plan.Route.Model),
 		billingFeatures: billingFeatures(request.Options, false),
 		conn:            conn,
@@ -560,6 +574,9 @@ func audioBytes(sampleRateHz, milliseconds int) int {
 }
 
 type stream struct {
+	// ignoredOptions are caller settings the model does not read. They are
+	// left off the URL and reported once, as a warning event, on Begin.
+	ignoredOptions  []string
 	billingModel    string
 	billingFeatures []string
 	conn            *websocket.Conn
@@ -799,12 +816,28 @@ func (s *stream) handleMessage(payload []byte) (bool, error) {
 		// Server-confirmed session start. `id` is the only identifier the
 		// session ever gets, so every later event is tagged with it.
 		s.sessionID = message.ID
-		return false, s.emit(runtimepkg.ProviderEvent{
+		if err := s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventUsageObserved,
 			Data:       marshalData(map[string]any{"provider_request_id": message.ID, "expires_at_unix": message.ExpiresAt}),
 			Billing:    billing,
 			Extensions: extension(raw),
-		})
+		}); err != nil {
+			return false, err
+		}
+		for _, option := range s.ignoredOptions {
+			if err := s.emit(runtimepkg.ProviderEvent{
+				Type: protocol.EventWarning,
+				Data: marshalData(map[string]any{
+					"provider_request_id": message.ID,
+					"ignored_option":      "provider_options.assemblyai." + option,
+					"model":               s.billingModel,
+					"message":             option + " has no effect on " + s.billingModel + ", which detects turn ends by punctuation; it was not sent. Use min_turn_silence, max_turn_silence or mode to tune turn ends.",
+				}),
+			}); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
 	case "SpeechStarted":
 		return false, s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventSpeechStarted,

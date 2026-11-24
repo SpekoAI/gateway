@@ -1,12 +1,14 @@
 package assemblyai
 
 import (
+	"context"
 	"encoding/json"
 	"net/url"
 	"testing"
 
 	"github.com/SpekoAI/gateway/internal/upstream"
 	"github.com/SpekoAI/gateway/protocol"
+	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
 
 // keyterms_prompt is a JSON-encoded string array on the v3 connect URL — the
@@ -235,4 +237,43 @@ func mustQuery(t *testing.T, endpoint string) url.Values {
 		t.Fatalf("parse %q: %v", endpoint, err)
 	}
 	return parsed.Query()
+}
+
+// A threshold the model does not read is reported once, as a warning event,
+// when AssemblyAI confirms the session. Models that read it report nothing.
+func TestIgnoredEndOfTurnConfidenceIsReportedOnBegin(t *testing.T) {
+	t.Parallel()
+	options := protocol.RequestOptions{STT: &protocol.SttOptions{ProviderOptions: map[string]map[string]any{
+		"assemblyai": {EndOfTurnConfidenceOption: 0.6},
+	}}}
+	for _, model := range []string{"universal-3-5-pro", "universal-streaming-english", "universal-streaming-multilingual"} {
+		if got := ignoredOptions(model, options); len(got) != 0 {
+			t.Fatalf("%s reads the threshold; ignoredOptions = %v", model, got)
+		}
+	}
+	if got := ignoredOptions(RealtimeAgent37Model, protocol.RequestOptions{}); len(got) != 0 {
+		t.Fatalf("no options must report nothing, got %v", got)
+	}
+	for _, model := range []string{RealtimeAgent37Model, universal36Model, "assemblyai-stt-3-7-realtime"} {
+		ignored := ignoredOptions(model, options)
+		if len(ignored) != 1 || ignored[0] != EndOfTurnConfidenceOption {
+			t.Fatalf("%s: ignoredOptions = %v", model, ignored)
+		}
+		s := &stream{ctx: context.Background(), events: make(chan runtimepkg.ProviderEvent, 4), billingModel: model, ignoredOptions: ignored}
+		if _, err := s.handleMessage([]byte(`{"type":"Begin","id":"session-1","expires_at":1780000000}`)); err != nil {
+			t.Fatalf("%s: begin: %v", model, err)
+		}
+		if usage := <-s.events; usage.Type != protocol.EventUsageObserved {
+			t.Fatalf("%s: first event = %q, want usage", model, usage.Type)
+		}
+		warning := <-s.events
+		var data map[string]any
+		if err := json.Unmarshal(warning.Data, &data); err != nil || warning.Type != protocol.EventWarning ||
+			data["ignored_option"] != "provider_options.assemblyai."+EndOfTurnConfidenceOption || data["model"] != model {
+			t.Fatalf("%s: warning = %q %s (err %v)", model, warning.Type, warning.Data, err)
+		}
+		if len(s.events) != 0 {
+			t.Fatalf("%s: want exactly one warning", model)
+		}
+	}
 }
