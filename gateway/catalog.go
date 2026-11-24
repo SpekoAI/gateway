@@ -80,9 +80,11 @@ var providerCatalog = []CatalogEntry{
 	{Provider: "cartesia", Kind: protocol.SessionKindSTT, Adapter: "cartesia.stt.v1", DefaultModel: "ink-2", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/stt/websocket"},
 	{Provider: "cartesia", Kind: protocol.SessionKindTTS, Adapter: "cartesia.tts.v1", DefaultModel: "sonic-3", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.cartesia.ai/tts/websocket"},
 	// universal-3-6-pro (2026-09-29) and assemblyai-stt-3-7-realtime-agent
-	// (2026-11-17) share the socket and parameters and are listed so discovery
-	// shows them; 3.5 Pro stays the default a bare pin gets.
-	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "universal-3-5-pro", Models: []string{"universal-3-5-pro", "universal-3-6-pro", "assemblyai-stt-3-7-realtime-agent"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
+	// (2026-11-17) share the socket and parameters with 3.5 Pro. AssemblyAI
+	// retires realtime 3.5 Pro on 2027-02-01 and names the 3.7 Realtime Agent
+	// as its replacement, so a bare pin gets 3.7; 3.5 Pro stays listed for
+	// explicit pins until then.
+	{Provider: "assemblyai", Kind: protocol.SessionKindSTT, Adapter: "assemblyai.stt.v1", DefaultModel: "assemblyai-stt-3-7-realtime-agent", Models: []string{"universal-3-5-pro", "universal-3-6-pro", "assemblyai-stt-3-7-realtime-agent"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://streaming.assemblyai.com/v3/ws"},
 	// Modulate selects its two streaming transcription models by endpoint path,
 	// not a model query field. English Fast is the conversational default;
 	// multilingual remains explicitly selectable through the same adapter.
@@ -152,7 +154,12 @@ var providerCatalog = []CatalogEntry{
 	// to "high" on 3.0 and is the caller's session.update field to lower.
 	{Provider: "xai", Kind: protocol.SessionKindRealtime, Adapter: "xai.realtime.v1", Protocol: protocol.SpeechProtocolXAIRealtimeV1, DefaultModel: "grok-voice-latest", Models: []string{"grok-voice-latest", "grok-voice-3.0", "grok-voice-think-fast-2.0", "grok-voice-think-fast-1.0", "grok-voice-fast-1.0"}, DefaultVoice: "eve", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.x.ai/v1/realtime"},
 	{Provider: "openai", Kind: protocol.SessionKindTTS, Adapter: "openai.tts.v1", DefaultModel: "gpt-4o-mini-tts", Transport: protocol.TransportHTTP, Endpoint: "https://api.openai.com/v1/audio/speech"},
-	{Provider: "soniox", Kind: protocol.SessionKindSTT, Adapter: "soniox.stt.v1", DefaultModel: "stt-rt-v5", Transport: protocol.TransportWebSocket, Endpoint: "wss://stt-rt.soniox.com/transcribe-websocket"},
+	// stt-rt-v6 shares the socket, start frame and endpoint knobs with v5 and is
+	// the default a bare or auto pin gets: Soniox removes v5 on 2026-12-15 and
+	// routes v5 requests to v6 at the same price. An explicit stt-rt-v5 pin
+	// still resolves here. Unlisted ids (stt-rt-v4, preview ids) also resolve
+	// to this row.
+	{Provider: "soniox", Kind: protocol.SessionKindSTT, Adapter: "soniox.stt.v1", DefaultModel: "stt-rt-v6", Models: []string{"stt-rt-v6", "stt-rt-v5"}, Transport: protocol.TransportWebSocket, Endpoint: "wss://stt-rt.soniox.com/transcribe-websocket"},
 	{Provider: "soniox", Kind: protocol.SessionKindTTS, Adapter: "soniox.tts.v1", DefaultModel: "tts-rt-v2", Transport: protocol.TransportWebSocket, Endpoint: "wss://tts-rt.soniox.com/tts-websocket"},
 	{Provider: "smallest", Kind: protocol.SessionKindSTT, Adapter: "smallest.stt.v1", DefaultModel: "pulse", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.smallest.ai/waves/v1/stt/live"},
 	{Provider: "smallest", Kind: protocol.SessionKindTTS, Adapter: "smallest.tts.v1", DefaultModel: "lightning_v3.1", Transport: protocol.TransportWebSocket, Endpoint: "wss://api.smallest.ai/waves/v1/tts/live"},

@@ -46,11 +46,13 @@ const (
 	// AdapterID is the identifier returned by an AssemblyAI STT session plan.
 	AdapterID = "assemblyai.stt.v1"
 	// DefaultModel is the catalog's default `speech_model`. The adapter never
-	// applies it: a session plan must name a concrete model. It is no longer
-	// the vendor's own default, which moved to universal-3-6-pro on 2026-09-29;
-	// an omitted speech_model would silently change model under us, and is one
-	// more reason the adapter refuses to open without a concrete one.
-	DefaultModel = "universal-3-5-pro"
+	// applies it: a session plan must name a concrete model, because an
+	// omitted speech_model follows the vendor's own default and can change
+	// model under us. AssemblyAI retires realtime universal-3-5-pro on
+	// 2027-02-01 and names 3.7 Realtime Agent as its replacement at the same
+	// $0.45/hr, so the default is that model. An explicit universal-3-5-pro
+	// pin is still accepted until the vendor retires it.
+	DefaultModel = RealtimeAgent37Model
 
 	extensionID = "assemblyai.com/v3"
 
@@ -170,7 +172,51 @@ func ValidateMode(model string, settings map[string]any) error {
 	return errors.New("assemblyai mode takes min_latency, balanced or max_accuracy")
 }
 
-// turnTimingOptions are the caller settings that tune when a turn ends.
+// EndOfTurnConfidenceOption is the Universal-Streaming turn-detection
+// threshold. Only some models read it; see readsEndOfTurnConfidence.
+const EndOfTurnConfidenceOption = "end_of_turn_confidence_threshold"
+
+// realtime37Model is AssemblyAI-STT-3.7-Realtime. This catalog does not
+// offer it, but a plan can name it, and it shares the 3.6 Pro turn detection.
+const realtime37Model = "assemblyai-stt-3-7-realtime"
+
+// punctuationTurnModel reports whether the model uses the Universal-3.6 Pro
+// turn detection (punctuation-based) and its 32 languages: 3.6 Pro and the
+// 3.7 realtime models. One classifier serves languagesFor and
+// readsEndOfTurnConfidence.
+func punctuationTurnModel(model string) bool {
+	return model == universal36Model || model == RealtimeAgent37Model || model == realtime37Model
+}
+
+// readsEndOfTurnConfidence reports whether the model's turn detection reads
+// end_of_turn_confidence_threshold. AssemblyAI's model page (read
+// 2026-11-24) says the parameter does not exist on Universal-3.6 Pro, and the
+// 3.7 models follow the 3.6 Pro turn-detection parameters. Universal-3.5 Pro
+// and Universal-Streaming read it. streamEndpoint leaves it off the URL for
+// the other models instead of refusing it, so callers that send it to
+// universal-3-6-pro today keep working.
+func readsEndOfTurnConfidence(model string) bool {
+	return !punctuationTurnModel(model)
+}
+
+// ignoredOptions lists the caller's AssemblyAI settings that the model does not
+// read. streamEndpoint leaves them off the URL; the stream reports each one as
+// a warning event when the session starts, so the caller can see it.
+func ignoredOptions(model string, options protocol.RequestOptions) []string {
+	if options.STT == nil || readsEndOfTurnConfidence(strings.TrimSpace(model)) {
+		return nil
+	}
+	if _, set := options.STT.Provider("assemblyai")[EndOfTurnConfidenceOption]; set {
+		return []string{EndOfTurnConfidenceOption}
+	}
+	return nil
+}
+
+// turnTimingOptions are the caller settings that tune when a turn ends. A
+// caller that sets any of them chose its own turn timing, so defaultMode adds
+// no preset. end_of_turn_confidence_threshold stays in this list although 3.7
+// does not read it: a caller that sent it before this change got no preset,
+// and keeps getting none.
 var turnTimingOptions = []string{
 	"end_of_turn_confidence_threshold", "min_end_of_turn_silence_when_confident",
 	"min_turn_silence", "max_turn_silence",
@@ -199,7 +245,7 @@ func defaultMode(model string, settings map[string]any) string {
 
 // languagesFor returns the language_codes vocabulary of one streaming model.
 func languagesFor(model string) map[string]struct{} {
-	if model == universal36Model || model == RealtimeAgent37Model {
+	if punctuationTurnModel(model) {
 		return universal36Languages
 	}
 	return streamingLanguages
@@ -333,6 +379,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 	conn.SetReadLimit(a.maxMessageBytes)
 	streamCtx, cancel := context.WithCancel(context.Background())
 	stream := &stream{
+		ignoredOptions:  ignoredOptions(request.Plan.Route.Model, request.Options),
 		billingModel:    strings.TrimSpace(request.Plan.Route.Model),
 		billingFeatures: billingFeatures(request.Options, false),
 		conn:            conn,
@@ -451,6 +498,11 @@ func streamEndpoint(policy upstream.WebSocketPolicy, rawEndpoint, model string, 
 	// gateway (turn-detection thresholds). Set so a caller value is the only
 	// spelling of its key on the URL.
 	for _, key := range options.STT.ProviderKeys("assemblyai") {
+		if key == EndOfTurnConfidenceOption && !readsEndOfTurnConfidence(model) {
+			// The model ignores it (see readsEndOfTurnConfidence); leave it off
+			// the URL rather than send a setting with no effect.
+			continue
+		}
 		query.Set(key, protocol.SttOptionString(options.STT.Provider("assemblyai")[key]))
 	}
 	// Deliberately NOT sent: a Speko reservation marker. Deepgram has an `extra`
@@ -522,6 +574,9 @@ func audioBytes(sampleRateHz, milliseconds int) int {
 }
 
 type stream struct {
+	// ignoredOptions are caller settings the model does not read. They are
+	// left off the URL and reported once, as a warning event, on Begin.
+	ignoredOptions  []string
 	billingModel    string
 	billingFeatures []string
 	conn            *websocket.Conn
@@ -761,12 +816,28 @@ func (s *stream) handleMessage(payload []byte) (bool, error) {
 		// Server-confirmed session start. `id` is the only identifier the
 		// session ever gets, so every later event is tagged with it.
 		s.sessionID = message.ID
-		return false, s.emit(runtimepkg.ProviderEvent{
+		if err := s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventUsageObserved,
 			Data:       marshalData(map[string]any{"provider_request_id": message.ID, "expires_at_unix": message.ExpiresAt}),
 			Billing:    billing,
 			Extensions: extension(raw),
-		})
+		}); err != nil {
+			return false, err
+		}
+		for _, option := range s.ignoredOptions {
+			if err := s.emit(runtimepkg.ProviderEvent{
+				Type: protocol.EventWarning,
+				Data: marshalData(map[string]any{
+					"provider_request_id": message.ID,
+					"ignored_option":      "provider_options.assemblyai." + option,
+					"model":               s.billingModel,
+					"message":             option + " has no effect on " + s.billingModel + ", which detects turn ends by punctuation; it was not sent. Use min_turn_silence, max_turn_silence or mode to tune turn ends.",
+				}),
+			}); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
 	case "SpeechStarted":
 		return false, s.emit(runtimepkg.ProviderEvent{
 			Type:       protocol.EventSpeechStarted,

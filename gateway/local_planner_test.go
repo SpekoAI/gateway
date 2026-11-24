@@ -238,6 +238,35 @@ func TestLocalPlannerResolvesGeminiLiveModelsByName(t *testing.T) {
 	}
 }
 
+// AssemblyAI retires realtime universal-3-5-pro on 2027-02-01. A bare or
+// auto pin gets its named replacement, the 3.7 Realtime Agent, and an
+// explicit 3.5 Pro pin still resolves to 3.5 Pro on the same socket.
+func TestLocalPlannerResolvesAssemblyAIDefaultTo37Agent(t *testing.T) {
+	t.Parallel()
+	planner, err := gateway.NewLocalPlanner(gateway.LocalPlannerConfig{Providers: []string{"assemblyai"}})
+	if err != nil {
+		t.Fatalf("new local planner: %v", err)
+	}
+	for _, tc := range []struct{ model, wantModel string }{
+		{"auto", "assemblyai-stt-3-7-realtime-agent"},
+		{"", "assemblyai-stt-3-7-realtime-agent"},
+		{"universal-3-5-pro", "universal-3-5-pro"},
+		{"universal-3-6-pro", "universal-3-6-pro"},
+	} {
+		request := localPlanRequest()
+		request.Runtime.Adapters = []string{"assemblyai.stt.v1"}
+		request.Request.Provider = "assemblyai"
+		request.Request.Model = tc.model
+		plan, _, err := planner.CreateSessionPlan(context.Background(), request, controlplane.CreateOptions{})
+		if err != nil {
+			t.Fatalf("model %q: create local plan: %v", tc.model, err)
+		}
+		if plan.Route.Adapter != "assemblyai.stt.v1" || plan.Route.Model != tc.wantModel {
+			t.Fatalf("model %q: route = %+v", tc.model, plan.Route)
+		}
+	}
+}
+
 // Grok Voice 3.0 is a model on the existing xai realtime row: reachable by
 // name on the same socket, while "auto" stays on the grok-voice-latest alias.
 func TestLocalPlannerResolvesGrokVoiceModelsByName(t *testing.T) {

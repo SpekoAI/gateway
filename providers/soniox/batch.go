@@ -22,9 +22,10 @@ const (
 	// BatchEndpoint creates an async transcription; the files, status and
 	// transcript resources hang off the same origin.
 	BatchEndpoint = "https://api.soniox.com/v1/transcriptions"
-	// BatchModel is the async counterpart of stt-rt-v5: the same v5
-	// generation exposed through the file API.
-	BatchModel = "stt-async-v5"
+	// BatchModel is the async counterpart of stt-rt-v6: the same v6
+	// generation exposed through the file API. Soniox removes stt-async-v5 on
+	// 2026-12-15 and routes it to stt-async-v6.
+	BatchModel = "stt-async-v6"
 	// BatchMaxDurationSeconds is the documented hard per-file cap (300 min).
 	BatchMaxDurationSeconds int64 = 300 * 60
 

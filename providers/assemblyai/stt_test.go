@@ -178,9 +178,12 @@ func TestManagedSessionTokenAuthQueryAndRealtimePartials(t *testing.T) {
 		want := map[string]string{
 			// speech_model, NOT model: the wrong name is ignored and the session
 			// silently falls back to the account default.
-			"speech_model": "universal-3-5-pro",
-			"encoding":     "pcm_s16le",
-			"sample_rate":  "16000",
+			"speech_model": "assemblyai-stt-3-7-realtime-agent",
+			// The default 3.7 Realtime Agent gets the min_latency preset the
+			// benchmark measured it with (see defaultMode).
+			"mode":        "min_latency",
+			"encoding":    "pcm_s16le",
+			"sample_rate": "16000",
 			// Off by default at AssemblyAI; without it the committed final has no
 			// punctuation, casing, or number formatting.
 			"format_turns": "true",
@@ -245,7 +248,7 @@ func TestBYOKSessionUsesBareAuthorizationHeader(t *testing.T) {
 			t.Fatalf("BYOK session used the temporary-token channel: token=%q", got)
 		}
 		assertQuery(t, received.URL.Query(), map[string]string{
-			"speech_model": "universal-3-5-pro", "encoding": "pcm_s16le", "sample_rate": "16000",
+			"speech_model": "assemblyai-stt-3-7-realtime-agent", "mode": "min_latency", "encoding": "pcm_s16le", "sample_rate": "16000",
 			"format_turns": "true", "include_partial_turns": "true", "language_codes": `["en"]`,
 		})
 	case <-time.After(time.Second):

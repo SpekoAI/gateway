@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
@@ -18,6 +19,7 @@ from .client import (
 from .relay_speech import RelaySpeechClient
 
 _INTEGRATION_VERSION = "0.1.0"
+_logger = logging.getLogger(__name__)
 
 
 class AudioFrameLike(Protocol):
@@ -238,6 +240,17 @@ class LiveKitSTTStream:
         async for event in self._session.events():
             if event.type == "error":
                 raise _stream_error(event)
+            if event.type == "warning":
+                # A non-fatal Gateway notice, such as an ignored provider option.
+                # Log it and keep the stream open.
+                _logger.warning(
+                    "Speko Gateway STT warning: %s (ignored_option=%s, "
+                    "provider_request_id=%s)",
+                    event.data.get("message", ""),
+                    event.data.get("ignored_option", ""),
+                    event.data.get("provider_request_id", ""),
+                )
+                continue
             for mapped in _speech_events(event, local_speakers=self._local_speakers):
                 yield mapped
 
