@@ -257,6 +257,17 @@ class SpekoSTTService(PipecatSTTService):
             async for event in self._session.events():
                 if event.type == "error":
                     raise _stream_error(event)
+                if event.type == "warning":
+                    # A non-fatal Gateway notice, such as an ignored provider
+                    # option. Log it and keep the stream open.
+                    _logger.warning(
+                        "Speko Gateway STT warning: %s (ignored_option=%s, "
+                        "provider_request_id=%s)",
+                        event.data.get("message", ""),
+                        event.data.get("ignored_option", ""),
+                        event.data.get("provider_request_id", ""),
+                    )
+                    continue
                 frame = _transcription_frame(
                     event,
                     user_id=self._user_id,

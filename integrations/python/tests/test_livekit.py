@@ -15,6 +15,7 @@ from livekit.agents import stt as agents_stt
 from speko_gateway import livekit as speko_livekit
 from speko_gateway._livekit_bridge import (
     LiveKitSpeechEvent,
+    LiveKitSTTStream,
     LiveKitTTSEvent,
     execution_from_env,
 )
@@ -238,6 +239,83 @@ async def test_stream_preserves_safe_gateway_error_classification() -> None:
         assert error.retryable is True
     else:
         raise AssertionError("expected the Gateway failure to reach LiveKit")
+
+    await plugin.aclose()
+
+
+
+class WarningGatewaySession:
+    """A Gateway STT session that sends a non-fatal warning mid-stream."""
+
+    def __init__(self) -> None:
+        self.metadata: dict[str, Any] = {}
+        self.finished = asyncio.Event()
+
+    async def send_audio(self, _data: bytes) -> None:
+        pass
+
+    async def commit_audio(self) -> None:
+        pass
+
+    async def finish(self) -> None:
+        self.finished.set()
+
+    async def aclose(self) -> None:
+        pass
+
+    async def events(self) -> AsyncIterator[CanonicalEvent]:
+        yield CanonicalEvent(
+            type="speech.started", data={"provider_request_id": "aai-test"}
+        )
+        yield CanonicalEvent(
+            type="warning",
+            data={
+                "provider_request_id": "aai-test",
+                "ignored_option": (
+                    "provider_options.assemblyai.end_of_turn_confidence_threshold"
+                ),
+                "model": "universal-3-7-pro",
+                "message": "universal-3-7-pro ignores the threshold",
+            },
+        )
+        await self.finished.wait()
+        yield CanonicalEvent(type="transcript.final", data={"text": "hello"})
+        yield CanonicalEvent(type="speech.ended")
+
+
+async def test_stt_logs_a_gateway_warning_and_keeps_the_stream_open(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    plugin = STT(FakeClient())  # type: ignore[arg-type]
+    stream = plugin.stream()
+    stream._bridge = FakeBridge(  # type: ignore[assignment]
+        LiveKitSTTStream(WarningGatewaySession())  # type: ignore[arg-type]
+    )
+
+    stream.push_frame(frame())
+    stream.end_input()
+    with caplog.at_level("WARNING", logger="speko_gateway"):
+        events = [event async for event in stream]
+
+    assert [event.type for event in events] == [
+        agents_stt.SpeechEventType.START_OF_SPEECH,
+        agents_stt.SpeechEventType.FINAL_TRANSCRIPT,
+        agents_stt.SpeechEventType.END_OF_SPEECH,
+    ]
+    assert events[1].alternatives[0].text == "hello"
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelname == "WARNING" and "STT warning" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "universal-3-7-pro ignores the threshold" in message
+    assert (
+        "ignored_option=provider_options.assemblyai.end_of_turn_confidence_threshold"
+        in message
+    )
+    assert "provider_request_id=aai-test" in message
 
     await plugin.aclose()
 

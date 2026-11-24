@@ -932,6 +932,53 @@ async def test_stt_completion_releases_turn_without_waiting_for_safety_timer(
         await strategy.cleanup()
 
 
+
+async def test_stt_logs_a_gateway_warning_and_keeps_the_stream_open(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = FakeGatewaySession([
+        CanonicalEvent(
+            type="warning",
+            data={
+                "provider_request_id": "aai-test",
+                "ignored_option": (
+                    "provider_options.assemblyai.end_of_turn_confidence_threshold"
+                ),
+                "model": "universal-3-7-pro",
+                "message": "universal-3-7-pro ignores the threshold",
+            },
+        ),
+        CanonicalEvent(type="transcript.final", data={"text": "hello"}),
+    ])
+    service = SpekoSTTService(FakeGatewayClient(session), sample_rate=16_000)
+    service.push_frame = AsyncMock()  # type: ignore[method-assign]
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+    try:
+        with caplog.at_level("WARNING", logger="speko_gateway"):
+            await service._connect()
+            await service._receive_task
+
+        service.push_error.assert_not_awaited()
+        frames = [call.args[0] for call in service.push_frame.await_args_list]
+        assert [type(frame) for frame in frames] == [TranscriptionFrame]
+        assert frames[0].text == "hello"
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelname == "WARNING" and "STT warning" in record.getMessage()
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "universal-3-7-pro ignores the threshold" in message
+        assert (
+            "ignored_option="
+            "provider_options.assemblyai.end_of_turn_confidence_threshold"
+        ) in message
+        assert "provider_request_id=aai-test" in message
+    finally:
+        await service.cleanup()
+
+
 def test_cache_write_tokens_are_included_in_llm_usage() -> None:
     from speko_gateway.pipecat import _llm_token_usage
 
