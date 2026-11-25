@@ -662,3 +662,27 @@ func TestBatchInvertedWordRepairDoesNotHideADroppedHead(t *testing.T) {
 		t.Fatalf("Words = %+v, want the first word to start %d ms before its end, not at zero", result.Words, maxRepairedWordMS)
 	}
 }
+
+func TestBatchReportsTheInteractionUsageAsBilling(t *testing.T) {
+	t.Parallel()
+	server, _ := newFakeInteractions(t, http.StatusOK, `{"id":"interactions/abc","status":"completed","usage":{"total_input_tokens":199,"input_tokens_by_modality":[{"modality":"text","tokens":1},{"modality":"audio","tokens":198}],"total_output_tokens":29,"total_thought_tokens":0},"steps":[{"type":"model_output","content":[{"type":"text","text":"hello"}]}]}`)
+	result, err := newBatchAdapter(t, server).Transcribe(context.Background(), batchRequest(server.URL, []byte("RIFFwav-bytes")))
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if result.Billing == nil || !result.Billing.Complete || len(result.Billing.Operations) != 1 {
+		t.Fatalf("Billing = %+v", result.Billing)
+	}
+	op := result.Billing.Operations[0]
+	if op.Model != BatchModel || op.Mode != "batch" || op.Quantities["input_audio_tokens"] != 198_000 || op.Quantities["output_tokens"] != 29_000 {
+		t.Fatalf("operation = %+v", op)
+	}
+
+	// A response with no usage block still transcribes, but its billing is
+	// incomplete: settlement must not price a count Google never reported.
+	bare, _ := newFakeInteractions(t, http.StatusOK, `{"id":"interactions/abc","steps":[{"type":"model_output","content":[{"type":"text","text":"hello"}]}]}`)
+	result, err = newBatchAdapter(t, bare).Transcribe(context.Background(), batchRequest(bare.URL, []byte("RIFFwav-bytes")))
+	if err != nil || result.Billing == nil || result.Billing.Complete {
+		t.Fatalf("bare response: err=%v billing=%+v", err, result.Billing)
+	}
+}
