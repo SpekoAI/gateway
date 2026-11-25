@@ -14,6 +14,7 @@ import (
 
 	"github.com/SpekoAI/gateway/internal/batchhttp"
 	"github.com/SpekoAI/gateway/internal/upstream"
+	"github.com/SpekoAI/gateway/metering"
 	"github.com/SpekoAI/gateway/protocol"
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
@@ -234,6 +235,7 @@ func (a *BatchAdapter) Transcribe(ctx context.Context, request runtimepkg.BatchT
 		// the audio it sent rather than from a number this response invents.
 		ProviderRequestID: decoded.ID,
 		Extensions:        batchhttp.RawExtension(batchExtensionID, response.Body),
+		Billing:           metering.Report(batchBilling(model, decoded.ID, decoded.Usage)),
 	}, nil
 }
 
@@ -349,9 +351,10 @@ func wordTimings(words []batchhttp.Word, options protocol.RequestOptions) []runt
 // flat field only as a fallback — so a response that omits the convenience
 // field still yields a transcript.
 type interaction struct {
-	ID         string `json:"id"`
-	Status     string `json:"status"`
-	OutputText string `json:"output_text"`
+	ID         string          `json:"id"`
+	Status     string          `json:"status"`
+	OutputText string          `json:"output_text"`
+	Usage      json.RawMessage `json:"usage"`
 	Steps      []struct {
 		Type    string `json:"type"`
 		Content []struct {
