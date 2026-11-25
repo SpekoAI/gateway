@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Literal, TypedDict
 
 import aiohttp
+import aiohttp.http_exceptions
 
 from ._relay_socket import NATIVE_SOCKET_ORIGIN, reject_redirects, socket_headers
 from ._user_agent import USER_AGENT
@@ -594,7 +595,14 @@ async def _stream_failures(request_id: str) -> AsyncIterator[None]:
         if not error.request_id:
             error.request_id = request_id
         raise
-    except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as error:
+    except (
+        aiohttp.ClientError,
+        aiohttp.http_exceptions.HttpProcessingError,
+        OSError,
+        asyncio.TimeoutError,
+    ) as error:
+        # The pure-Python HTTP parser raises its framing errors (for example
+        # TransferEncodingError) outside aiohttp.ClientError.
         raise RelayError(
             "relay stream connection failed", retryable=True, request_id=request_id
         ) from error

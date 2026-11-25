@@ -510,6 +510,18 @@ async def test_router_stream_failure_names_the_relay_request(ending) -> None:
             await client.aclose()
 
 
+async def test_stream_framing_error_names_the_relay_request() -> None:
+    from aiohttp.http_exceptions import TransferEncodingError
+
+    from speko_gateway.relay import _stream_failures
+
+    with pytest.raises(RelayError) as caught:
+        async with _stream_failures("rq_fixture.2"):
+            raise TransferEncodingError("bad chunk framing")
+    assert caught.value.retryable is True
+    assert caught.value.request_id == "rq_fixture.2"
+
+
 async def test_router_native_rejection_keeps_error_and_does_not_retry() -> None:
     seen = []
 
