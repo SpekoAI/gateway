@@ -474,6 +474,54 @@ async def test_router_native_sse_preserves_headers_body_and_streaming() -> None:
     assert body["stream"] is False
 
 
+@pytest.mark.parametrize("ending", ["truncated", "dropped"])
+async def test_router_stream_failure_names_the_relay_request(ending) -> None:
+    async def responses(request):
+        await request.read()
+        response = web.StreamResponse(
+            headers={
+                "Content-Type": "text/event-stream",
+                "Speko-Request-ID": "rq_fixture.1",
+            }
+        )
+        await response.prepare(request)
+        await response.write(
+            b'event: response.output_text.delta\ndata: {"delta":"synthetic"}\n\n'
+        )
+        if ending == "dropped":
+            request.transport.close()
+            return response
+        await response.write_eof()
+        return response
+
+    app = web.Application()
+    app.router.add_post("/v1/llm/responses", responses)
+    async with server(app) as address:
+        client = RelayLLMClient(api_key="router-fixture-only", base_url=address)
+        try:
+            stream = client.stream_response({"input": []})
+            first = await asyncio.wait_for(anext(stream), 3)
+            assert first[0] == "response.output_text.delta"
+            with pytest.raises(RelayError) as caught:
+                await asyncio.wait_for(anext(stream), 3)
+            assert caught.value.retryable is True
+            assert caught.value.request_id == "rq_fixture.1"
+        finally:
+            await client.aclose()
+
+
+async def test_stream_framing_error_names_the_relay_request() -> None:
+    from aiohttp.http_exceptions import TransferEncodingError
+
+    from speko_gateway.relay import _stream_failures
+
+    with pytest.raises(RelayError) as caught:
+        async with _stream_failures("rq_fixture.2"):
+            raise TransferEncodingError("bad chunk framing")
+    assert caught.value.retryable is True
+    assert caught.value.request_id == "rq_fixture.2"
+
+
 async def test_router_native_rejection_keeps_error_and_does_not_retry() -> None:
     seen = []
 

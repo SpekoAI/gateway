@@ -9,6 +9,7 @@ conversation content travels to Router. The wire contract is the public
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -18,6 +19,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Literal, TypedDict
 
 import aiohttp
+import aiohttp.http_exceptions
 
 from ._relay_socket import NATIVE_SOCKET_ORIGIN, reject_redirects, socket_headers
 from ._user_agent import USER_AGENT
@@ -479,25 +481,30 @@ class RelayLLMClient:
                 error = await _registered_rejection(response)
                 raise error
             _report_llm_leg(response)
+            request_id = _response_request_id(response)
             terminal = None
-            async for event, payload in _sse_events(response, strict=True):
-                if terminal is not None:
-                    raise RelayError(
-                        "relay stream sent events after its terminal", retryable=False
-                    )
-                if event not in _REGISTERED_EVENTS:
-                    raise RelayError(
-                        "relay stream sent an unsupported event", retryable=False
-                    )
-                if event == "error":
-                    raise _event_error(payload)
-                if event == "response.completed":
-                    terminal = payload
-                else:
-                    yield event, payload
+            async with _stream_failures(request_id):
+                async for event, payload in _sse_events(response, strict=True):
+                    if terminal is not None:
+                        raise RelayError(
+                            "relay stream sent events after its terminal",
+                            retryable=False,
+                        )
+                    if event not in _REGISTERED_EVENTS:
+                        raise RelayError(
+                            "relay stream sent an unsupported event", retryable=False
+                        )
+                    if event == "error":
+                        raise _event_error(payload)
+                    if event == "response.completed":
+                        terminal = payload
+                    else:
+                        yield event, payload
             if terminal is None:
                 raise RelayError(
-                    "relay stream ended without a terminal event", retryable=True
+                    "relay stream ended without a terminal event",
+                    retryable=True,
+                    request_id=request_id,
                 )
             yield "response.completed", terminal
 
@@ -552,18 +559,53 @@ class RelayLLMClient:
             if response.status != 200:
                 raise _envelope_error(response.status, await _decode_json(response))
             _report_llm_leg(response)
+            request_id = _response_request_id(response)
             terminal = False
-            async for event, payload in _sse_events(response):
-                if event == "error":
-                    raise _event_error(payload)
-                yield event, payload
-                if event in _TERMINAL_EVENTS:
-                    terminal = True
+            async with _stream_failures(request_id):
+                async for event, payload in _sse_events(response):
+                    if event == "error":
+                        raise _event_error(payload)
+                    yield event, payload
+                    if event in _TERMINAL_EVENTS:
+                        terminal = True
             if not terminal:
                 raise RelayError(
                     "relay stream ended without a terminal event",
                     retryable=True,
+                    request_id=request_id,
                 )
+
+
+def _response_request_id(response: aiohttp.ClientResponse) -> str:
+    return str(response.headers.get("Speko-Request-ID", ""))
+
+
+@contextlib.asynccontextmanager
+async def _stream_failures(request_id: str) -> AsyncIterator[None]:
+    """Name the relay request on a failure after its headers arrived.
+
+    A stream that fails mid-way (a dropped connection, a malformed or truncated
+    stream) raises RelayError carrying the `Speko-Request-ID`, so a caller can
+    cancel that request at the cell. A connection error becomes a retryable
+    RelayError, which adapters already treat as a connection failure.
+    """
+    try:
+        yield
+    except RelayError as error:
+        if not error.request_id:
+            error.request_id = request_id
+        raise
+    except (
+        aiohttp.ClientError,
+        aiohttp.http_exceptions.HttpProcessingError,
+        OSError,
+        asyncio.TimeoutError,
+    ) as error:
+        # The pure-Python HTTP parser raises its framing errors (for example
+        # TransferEncodingError) outside aiohttp.ClientError.
+        raise RelayError(
+            "relay stream connection failed", retryable=True, request_id=request_id
+        ) from error
 
 
 def _report_llm_leg(response: aiohttp.ClientResponse) -> None:
