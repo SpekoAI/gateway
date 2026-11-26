@@ -202,7 +202,12 @@ class STT(stt.STT):
         noise_reduction: bool | None = None,
         provider_options: Mapping[str, Mapping[str, Any]] | None = None,
         turn_vad: vad.VAD | None = None,
+        auto_reconnect: bool = False,
     ) -> None:
+        # auto_reconnect continues a dropped relay STT stream in a new session
+        # (speko_gateway._relay_continuation). Off until the relay ships it.
+        if auto_reconnect and not isinstance(client, RelaySpeechClient):
+            raise ValueError("auto_reconnect requires a RelaySpeechClient")
         if isinstance(client, RelaySpeechClient) and turn_vad is None:
             raise ValueError(
                 "Native relay STT requires a local turn_vad for speech boundaries"
@@ -241,6 +246,7 @@ class STT(stt.STT):
         self._provider_name = provider
         self._credential_source = credential_source
         self._sample_rate = sample_rate
+        self._auto_reconnect = auto_reconnect
         self._streams: weakref.WeakSet[stt.RecognizeStream] = weakref.WeakSet()
         self._bound_agent: Agent | None = None
         self._bound_session: AgentSession | None = None
@@ -617,6 +623,7 @@ class STT(stt.STT):
             provider=self._provider_name,
             credential_source=self._credential_source,
             stt_options=self._stt_options,
+            auto_reconnect=self._auto_reconnect,
         )
         if isinstance(self._client, RelaySpeechClient):
             def prepare_native_turn() -> None:

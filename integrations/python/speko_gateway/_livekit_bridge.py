@@ -64,13 +64,17 @@ class LiveKitSTTBridge:
         provider: str = "auto",
         credential_source: CredentialSource = "auto",
         stt_options: dict[str, Any] | None = None,
+        auto_reconnect: bool = False,
     ) -> None:
+        if auto_reconnect and not isinstance(client, RelaySpeechClient):
+            raise ValueError("auto_reconnect requires a RelaySpeechClient")
         self._client = client
         self._language = language
         self._model = model
         self._provider = provider
         self._credential_source = credential_source
         self._stt_options = stt_options
+        self._auto_reconnect = auto_reconnect
 
     async def start(self, frame: AudioFrameLike) -> LiveKitSTTStream:
         request: dict[str, Any] = {
@@ -80,6 +84,9 @@ class LiveKitSTTBridge:
         }
         if self._stt_options:
             request["stt"] = self._stt_options
+        # Only a RelaySpeechClient takes the flag; other clients keep their
+        # own signature.
+        reconnect = {"auto_reconnect": True} if self._auto_reconnect else {}
         session = await self._client.open(
             SessionConfig(
                 kind="stt",
@@ -95,7 +102,8 @@ class LiveKitSTTBridge:
                     "version": _INTEGRATION_VERSION,
                     "transport": "livekit-webrtc",
                 },
-            )
+            ),
+            **reconnect,
         )
         return LiveKitSTTStream(
             session, local_speakers=not isinstance(self._client, RelaySpeechClient)

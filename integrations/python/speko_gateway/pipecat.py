@@ -90,8 +90,13 @@ class SpekoSTTService(PipecatSTTService):
         ready_timeout: float = 15.0,
         session_id: str = "",
         fallback_to_auto_on_no_eligible_route: bool = False,
+        auto_reconnect: bool = False,
         **kwargs: Any,
     ) -> None:
+        # auto_reconnect continues a dropped relay STT stream in a new session
+        # (speko_gateway._relay_continuation). Off until the relay ships it.
+        if auto_reconnect and not isinstance(client, RelaySpeechClient):
+            raise ValueError("auto_reconnect requires a RelaySpeechClient")
         native_settings = kwargs.pop("settings", None)
         if native_settings is not None:
             if not isinstance(native_settings, STTSettings):
@@ -129,6 +134,7 @@ class SpekoSTTService(PipecatSTTService):
             noise_reduction=noise_reduction,
             provider_options=provider_options,
         )
+        self._auto_reconnect = auto_reconnect
         self._session: SpeechSession | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._audio_since_commit = False
@@ -218,6 +224,8 @@ class SpekoSTTService(PipecatSTTService):
             request["client_session_id"] = self._platform_session_id
         if self._stt_options:
             request["stt"] = self._stt_options
+        # Only a RelaySpeechClient takes the flag.
+        reconnect = {"auto_reconnect": True} if self._auto_reconnect else {}
         return await self._client.open(
             SessionConfig(
                 kind="stt",
@@ -233,7 +241,8 @@ class SpekoSTTService(PipecatSTTService):
                     "version": _INTEGRATION_VERSION,
                     "transport": "pipecat",
                 },
-            )
+            ),
+            **reconnect,
         )
 
     def _can_fallback_to_auto(self, error: GatewayError) -> bool:
