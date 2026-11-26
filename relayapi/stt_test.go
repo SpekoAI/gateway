@@ -216,6 +216,37 @@ func TestSTTStreamMessageValidation(t *testing.T) {
 		{"delta segment with an end and no start", relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "x", Segments: []relayapi.TranscriptDeltaSegment{{Text: "x", EndMS: ms(10)}}}, "segments[0]"},
 		{"delta segment before zero", relayapi.STTTranscriptDelta{Type: relayapi.STTEventTranscriptDelta, Text: "x", Segments: []relayapi.TranscriptDeltaSegment{{Text: "x", StartMS: ms(-1), EndMS: ms(5)}}}, "segments[0]"},
 		{"final with bad segment", relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, Text: "x", Segments: []relayapi.TranscriptSegment{{StartMS: 10, EndMS: 5}}}, "segments[0]"},
+		{"continuation with of and no offset", func() relayapi.STTSessionConfigure {
+			c := configure
+			c.Continuation = &relayapi.STTContinuation{Of: "req_1"}
+			return c
+		}(), "continuation: of and audio_offset_ms"},
+		{"continuation with offset and no of", func() relayapi.STTSessionConfigure {
+			c := configure
+			c.Continuation = &relayapi.STTContinuation{AudioOffsetMS: ms(10)}
+			return c
+		}(), "continuation: of and audio_offset_ms"},
+		{"continuation with negative offset", func() relayapi.STTSessionConfigure {
+			c := configure
+			c.Continuation = &relayapi.STTContinuation{Of: "req_1", AudioOffsetMS: ms(-1)}
+			return c
+		}(), "continuation: audio_offset_ms"},
+		{"continuation past a day", func() relayapi.STTSessionConfigure {
+			c := configure
+			c.Continuation = &relayapi.STTContinuation{Of: "req_1", AudioOffsetMS: ms(relayapi.MaxContinuationOffsetMS + 1)}
+			return c
+		}(), "continuation: audio_offset_ms"},
+		{"continuation of with a space", func() relayapi.STTSessionConfigure {
+			c := configure
+			c.Continuation = &relayapi.STTContinuation{Of: "req 1", AudioOffsetMS: ms(0)}
+			return c
+		}(), "continuation: of"},
+		{"continuation of too long", func() relayapi.STTSessionConfigure {
+			c := configure
+			c.Continuation = &relayapi.STTContinuation{Of: strings.Repeat("r", relayapi.MaxContinuationOfLength+1), AudioOffsetMS: ms(0)}
+			return c
+		}(), "continuation: of"},
+		{"final with negative covered_ms", relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, CoveredMS: ms(-1)}, "covered_ms"},
 		{"usage update with negative usage", relayapi.STTUsageUpdated{Type: relayapi.STTEventUsageUpdated, Usage: relayapi.Usage{DurationMS: -1}}, "must not be negative"},
 		{"closed with negative usage", relayapi.STTSessionClosed{Type: relayapi.STTEventSessionClosed, Usage: relayapi.Usage{DurationMS: -1}}, "must not be negative"},
 	}
@@ -283,6 +314,89 @@ func TestSTTInterimFinalOnTheWire(t *testing.T) {
 		}
 		if string(encoded) != test.want {
 			t.Errorf("final = %s\nwant    %s", encoded, test.want)
+		}
+	}
+}
+
+// Continuation is opt-in on every frame it touches: a client that never asks
+// sends and reads exactly the bytes it always did, and 0 is a real value
+// distinct from absent.
+func TestSTTContinuationOnTheWire(t *testing.T) {
+	t.Parallel()
+	configure := relayapi.STTSessionConfigure{
+		Type:    relayapi.STTControlSessionConfigure,
+		Routing: relayapi.Routing{}.NormalizeDefault(),
+		Audio:   relayapi.AudioConfig{Encoding: "pcm_s16le", SampleRateHz: 16_000, Channels: 1},
+	}
+	asking, continuing := configure, configure
+	asking.Continuation = &relayapi.STTContinuation{}
+	continuing.Continuation = &relayapi.STTContinuation{Of: strings.Repeat("r", relayapi.MaxContinuationOfLength), AudioOffsetMS: ms(relayapi.MaxContinuationOffsetMS)}
+	ready := relayapi.STTSessionReady{Type: relayapi.STTEventSessionReady, RequestID: "req_1", Route: relayapi.Route{Provider: "deepgram", Model: "nova-3", Region: "eu-west-1", AttemptID: "att_1"}}
+	readyContinued := ready
+	readyContinued.Continuation = true
+	for _, test := range []struct {
+		name  string
+		value interface{ Validate() error }
+		want  string
+	}{
+		{"plain configure", configure, `{"type":"session.configure","routing":{"mode":"auto","objective":"balanced"},"audio":{"encoding":"pcm_s16le","sample_rate_hz":16000,"channels":1}}`},
+		{"configure asking", asking, `{"type":"session.configure","routing":{"mode":"auto","objective":"balanced"},"audio":{"encoding":"pcm_s16le","sample_rate_hz":16000,"channels":1},"continuation":{}}`},
+		{"configure continuing", continuing, `{"type":"session.configure","routing":{"mode":"auto","objective":"balanced"},"audio":{"encoding":"pcm_s16le","sample_rate_hz":16000,"channels":1},"continuation":{"of":"` + strings.Repeat("r", relayapi.MaxContinuationOfLength) + `","audio_offset_ms":86400000}}`},
+		{"plain ready", ready, `{"type":"session.ready","request_id":"req_1","route":{"provider":"deepgram","model":"nova-3","region":"eu-west-1","attempt_id":"att_1"}}`},
+		{"ready continuing", readyContinued, `{"type":"session.ready","request_id":"req_1","route":{"provider":"deepgram","model":"nova-3","region":"eu-west-1","attempt_id":"att_1"},"continuation":true}`},
+		{"plain final", relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, Text: "hi"}, `{"type":"transcript.final","text":"hi"}`},
+		{"final covered at zero", relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, Text: "hi", CoveredMS: ms(0)}, `{"type":"transcript.final","text":"hi","covered_ms":0}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.value.Validate(); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+			encoded, err := json.Marshal(test.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(encoded) != test.want {
+				t.Errorf("got  %s\nwant %s", encoded, test.want)
+			}
+		})
+	}
+	if !continuing.Continuation.Continuing() || asking.Continuation.Continuing() || configure.Continuation.Continuing() {
+		t.Error("Continuing must be true only on a session that names an offset")
+	}
+}
+
+// An offset that does not fit int64, or is not a whole number, is refused at
+// decode rather than wrapped or truncated.
+func TestSTTContinuationOffsetDecode(t *testing.T) {
+	t.Parallel()
+	// What the schema refuses Go refuses too, rather than reading it as {}:
+	// an empty label, a null member, an unknown member.
+	for raw, want := range map[string]string{
+		`{"of":""}`:                                   "of:",
+		`{"of":"","audio_offset_ms":0}`:               "of:",
+		`{"of":null}`:                                 "of: must not be null",
+		`{"audio_offset_ms":null}`:                    "audio_offset_ms: must not be null",
+		`{"of":null,"audio_offset_ms":null}`:          "must not be null",
+		`{"typo":1}`:                                  "typo: unknown member",
+		`{"of":"req_1","audio_offset_ms":0,"x":true}`: "x: unknown member",
+	} {
+		var continuation relayapi.STTContinuation
+		if err := json.Unmarshal([]byte(raw), &continuation); err != nil {
+			t.Fatalf("%s: decode: %v", raw, err)
+		}
+		assertInvalid(t, continuation.Validate(), want)
+	}
+	for _, raw := range []string{`{}`, `{"of":"req_1","audio_offset_ms":0}`} {
+		var continuation relayapi.STTContinuation
+		if err := json.Unmarshal([]byte(raw), &continuation); err != nil || continuation.Validate() != nil {
+			t.Fatalf("%s must decode and validate: %v / %v", raw, err, continuation.Validate())
+		}
+	}
+	assertInvalid(t, (relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, CoveredMS: ms(relayapi.MaxCoveredMS + 1)}).Validate(), "covered_ms")
+	for _, raw := range []string{`{"of":"req_1","audio_offset_ms":9223372036854775808}`, `{"of":"req_1","audio_offset_ms":1.5}`, `{"of":"req_1","audio_offset_ms":"10"}`} {
+		var continuation relayapi.STTContinuation
+		if err := json.Unmarshal([]byte(raw), &continuation); err == nil {
+			t.Errorf("%s: decoded to %+v, want an error", raw, continuation)
 		}
 	}
 }

@@ -536,6 +536,13 @@ func (s *stream) emitTranscript(kind protocol.EventType, message inboundMessage,
 	return s.emit(runtimepkg.ProviderEvent{Type: kind, Data: marshalData(data), Extensions: extension(raw)})
 }
 
+// Finals here carry no covered_ms. An AddTranscript is final and never
+// revised, but its metadata end_time is the approximate end of its last word
+// (https://docs.speechmatics.com/api-ref/realtime-transcription-websocket#addtranscript),
+// and a final can land mid-speech under max_delay, so end_time is not a
+// proven lower bound on the audio reflected in finals. A continuing client
+// falls back to its overlap replay for this provider.
+
 func transcriptConfidence(results []result) (float64, bool) {
 	var total float64
 	var count int

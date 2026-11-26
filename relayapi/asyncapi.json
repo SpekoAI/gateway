@@ -1044,12 +1044,48 @@
           "options": {
             "$ref": "#/components/schemas/STTOptions",
             "description": "Transcription feature asks and per-provider settings for the whole session. They ride this frame — and therefore the session's idempotency hash — because they are session intent, not stream content: later frames cannot change them."
+          },
+          "continuation": {
+            "$ref": "#/components/schemas/STTContinuation"
           }
         },
         "required": [
           "type",
           "audio"
         ],
+        "additionalProperties": false
+      },
+      "STTContinuation": {
+        "type": "object",
+        "description": "Stream continuation: when a live session drops, the client opens a new session that continues the old one on the same timeline. The empty object {} asks for the feature on a first session. A continuing session sends both of and audio_offset_ms; the server then adds audio_offset_ms to every start_ms, end_ms and covered_ms it sends. of is a label for logs, never checked for ownership: the continuing session is an ordinary request, admitted and billed on its own. Send both members or neither; one without the other is refused as an invalid request. Omitted entirely, the session behaves exactly as before.",
+        "oneOf": [
+          {
+            "description": "The first session asks for continuation.",
+            "maxProperties": 0
+          },
+          {
+            "description": "This session continues an earlier one.",
+            "required": [
+              "of",
+              "audio_offset_ms"
+            ]
+          }
+        ],
+        "properties": {
+          "of": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "description": "The request_id of the session this one continues."
+          },
+          "audio_offset_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 86400000,
+            "description": "Where this session's audio starts on the continued session's timeline, in milliseconds. 0 is valid and differs from absent."
+          }
+        },
         "additionalProperties": false
       },
       "STTTranslation": {
@@ -1179,6 +1215,10 @@
           "commit_ids": {
             "type": "boolean",
             "description": "True when the server echoes each input.commit's commit_id on the transcript.final that answers it; only true lets a client rely on commit_id correlation. Absent or false means the server does not echo commit ids. The Router sends it only as true."
+          },
+          "continuation": {
+            "type": "boolean",
+            "description": "True when the server honours the session.configure continuation ask: timestamps carry the requested audio_offset_ms and finals may carry covered_ms. Absent means the server does not: a client that reconnects must treat the new session as a plain new session with its own timeline. Sent only as true, and only to a session that asked."
           }
         },
         "required": [
@@ -1257,6 +1297,12 @@
           "interim": {
             "type": "boolean",
             "description": "True on an interim final: the provider closed part of a long segment that is still being spoken, and more of the same segment follows. An interim final never answers an input.commit and never carries a commit_id; the segment's last final does. A client that stops reading at its commit's answer still gets the whole segment. Absent on every other final."
+          },
+          "covered_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "A position on the session timeline (with continuation's audio_offset_ms added): all audio before it is reflected in finals already sent, this one included. It never goes backwards within a session. Present only on a session that asked for continuation and only when the route can prove the boundary; absent differs from 0. A final the server makes up itself (an empty answer to a commit) never carries it."
           }
         },
         "required": [

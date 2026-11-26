@@ -688,6 +688,14 @@ func (s *stream) handleMessage(payload []byte) error {
 	}
 }
 
+// Gladia finals carry no covered_ms, the proof a relay client needs to replay
+// a dropped stream exactly. A final is never revised, but an utterance closed
+// by maximum_duration_without_endpointing "can end mid-word"
+// (https://eu1.docs.gladia.io/live/endpointing, limits and gotchas), and the
+// normal final after such a cut would then claim the cut word as covered.
+// The "forced" marker that would expose the cut is not guaranteed by the
+// cloud schema, so no utterance end is a proven bound. A continuing client
+// replays its overlap for this provider instead.
 func (s *stream) emitTranscript(message inboundMessage, raw json.RawMessage) error {
 	// Gladia pads utterance text with a leading space; only the emptiness test
 	// trims, so the provider's own spacing survives into the transcript.

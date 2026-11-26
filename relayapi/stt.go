@@ -1,8 +1,11 @@
 package relayapi
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -190,6 +193,9 @@ type STTSessionConfigure struct {
 	Audio    AudioConfig    `json:"audio"`
 	Language string         `json:"language,omitempty"`
 	Options  *STTOptions    `json:"options,omitempty"`
+	// Continuation is nil on a session that does not take part in stream
+	// continuation; see STTContinuation.
+	Continuation *STTContinuation `json:"continuation,omitempty"`
 }
 
 // Validate checks the frame tag, routing, declared audio format, and option
@@ -207,7 +213,139 @@ func (c STTSessionConfigure) Validate() error {
 	if err := c.Options.Validate(); err != nil {
 		return fmt.Errorf("options: %w", err)
 	}
+	if err := c.Continuation.Validate(); err != nil {
+		return fmt.Errorf("continuation: %w", err)
+	}
 	return nil
+}
+
+// MaxContinuationOffsetMS bounds STTContinuation.AudioOffsetMS: 24 hours of
+// audio, far past any vendor session limit, and small enough that adding it
+// to a provider timestamp cannot overflow int64.
+const MaxContinuationOffsetMS int64 = 24 * 60 * 60 * 1000
+
+// MaxCoveredMS bounds STTTranscriptFinal.CoveredMS: the largest integer a
+// JSON number holds exactly (2^53 - 1), far past any offset plus session.
+const MaxCoveredMS int64 = 1<<53 - 1
+
+// MaxContinuationOfLength bounds STTContinuation.Of.
+const MaxContinuationOfLength = 128
+
+// STTContinuation is how a client takes part in stream continuation: when a
+// live session drops, the client opens a new session that continues the old
+// one on the same timeline. The empty object asks for the feature on a first
+// session. A continuing session names the session it continues in Of and the
+// audio position it starts at in AudioOffsetMS; the server then adds that
+// offset to every start_ms, end_ms and covered_ms it sends, so the client sees
+// one timeline across both sessions. Of is a label for logs, never checked
+// for ownership: the new session is an ordinary request in every other way.
+type STTContinuation struct {
+	// Of is the request_id of the session this one continues. Present
+	// exactly when AudioOffsetMS is.
+	Of string `json:"of,omitempty"`
+	// malformed names what the decoded object carried that the schema
+	// refuses (an unknown member, a null, an empty of), so Validate can
+	// refuse it rather than read it as {}.
+	malformed string
+	// AudioOffsetMS is where this session's audio starts on the continued
+	// session's timeline, in milliseconds. A pointer because 0 is a valid
+	// offset and differs from absent.
+	AudioOffsetMS *int64 `json:"audio_offset_ms,omitempty"`
+}
+
+// UnmarshalJSON decodes the object strictly, as the schema reads it: an
+// unknown member, a null member or an empty of is recorded for Validate to
+// refuse. Unlike elsewhere in relayapi a null is not absent here, because
+// {} has a meaning of its own (ask for continuation) that a stray member
+// must not take on.
+func (c *STTContinuation) UnmarshalJSON(data []byte) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	*c = STTContinuation{}
+	for _, name := range sortedKeys(members) {
+		raw := members[name]
+		if c.malformed == "" && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			c.malformed = name + ": must not be null"
+			continue
+		}
+		switch name {
+		case "of":
+			if err := json.Unmarshal(raw, &c.Of); err != nil {
+				return err
+			}
+			if c.Of == "" && c.malformed == "" {
+				c.malformed = fmt.Sprintf("of: want 1-%d characters of A-Z a-z 0-9 . _ : -", MaxContinuationOfLength)
+			}
+		case "audio_offset_ms":
+			var offset int64
+			if err := json.Unmarshal(raw, &offset); err != nil {
+				return err
+			}
+			c.AudioOffsetMS = &offset
+		default:
+			if c.malformed == "" {
+				c.malformed = fmt.Sprintf("%s: unknown member", name)
+			}
+		}
+	}
+	return nil
+}
+
+func sortedKeys(members map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(members))
+	for key := range members {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// Continuing reports whether the session continues an earlier one rather
+// than only asking for the feature. Nil-safe.
+func (c *STTContinuation) Continuing() bool {
+	return c != nil && c.AudioOffsetMS != nil
+}
+
+// Validate checks that Of and AudioOffsetMS come together, the label's form,
+// and the offset's bounds. Nil is valid: the session did not ask.
+func (c *STTContinuation) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.malformed != "" {
+		return errors.New(c.malformed)
+	}
+	if (c.Of == "") != (c.AudioOffsetMS == nil) {
+		return fmt.Errorf("of and audio_offset_ms: send both to continue a session, or neither to ask for continuation")
+	}
+	if c.AudioOffsetMS == nil {
+		return nil
+	}
+	if !validContinuationOf(c.Of) {
+		return fmt.Errorf("of: want 1-%d characters of A-Z a-z 0-9 . _ : -", MaxContinuationOfLength)
+	}
+	if offset := *c.AudioOffsetMS; offset < 0 || offset > MaxContinuationOffsetMS {
+		return fmt.Errorf("audio_offset_ms: want 0 to %d", MaxContinuationOffsetMS)
+	}
+	return nil
+}
+
+// validContinuationOf accepts a request id: the commit id alphabet, up to
+// MaxContinuationOfLength characters.
+func validContinuationOf(of string) bool {
+	if of == "" || len(of) > MaxContinuationOfLength {
+		return false
+	}
+	for i := 0; i < len(of); i++ {
+		switch c := of[i]; {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == ':', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // STTInputCommit marks the end of the audio the client wants finalized.
@@ -298,6 +436,11 @@ type STTSessionReady struct {
 	// correlated commits up front instead of guessing. False and absent both
 	// mean no echo.
 	CommitIDs bool `json:"commit_ids,omitempty"`
+	// Continuation is true when the server honours the session.configure
+	// continuation ask: it adds the requested audio_offset_ms to every
+	// timestamp and may send covered_ms on finals. Absent means the client
+	// must treat a reconnect as a plain new session.
+	Continuation bool `json:"continuation,omitempty"`
 }
 
 // Validate checks the frame tag, request id, and route.
@@ -376,6 +519,11 @@ type STTTranscriptFinal struct {
 	// follows. It never answers an input.commit, so it never carries a
 	// commit_id; the segment's last final does. Absent on every other final.
 	Interim bool `json:"interim,omitempty"`
+	// CoveredMS is a position on the session timeline: all audio before it
+	// is reflected in finals already sent, this one included. It never goes
+	// backwards within a session. Present only on a continuation session
+	// whose route can prove the boundary; nil (absent) differs from 0.
+	CoveredMS *int64 `json:"covered_ms,omitempty"`
 }
 
 // Validate checks the frame tag, segments and, when present, the commit id.
@@ -389,6 +537,9 @@ func (e STTTranscriptFinal) Validate() error {
 	}
 	if e.Interim && e.CommitID != "" {
 		return fmt.Errorf("commit_id: an interim final never answers a commit")
+	}
+	if e.CoveredMS != nil && (*e.CoveredMS < 0 || *e.CoveredMS > MaxCoveredMS) {
+		return fmt.Errorf("covered_ms: want 0 to %d", MaxCoveredMS)
 	}
 	for i, segment := range e.Segments {
 		if err := segment.Validate(); err != nil {

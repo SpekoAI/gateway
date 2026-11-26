@@ -64,6 +64,60 @@
     "type": "session.close"
   },
   {
+    "type": "session.configure",
+    "routing": {
+      "mode": "auto",
+      "objective": "balanced"
+    },
+    "audio": {
+      "encoding": "pcm_s16le",
+      "sample_rate_hz": 16000,
+      "channels": 1
+    },
+    "continuation": {}
+  },
+  {
+    "type": "session.configure",
+    "routing": {
+      "mode": "explicit",
+      "provider": "deepgram",
+      "model": "nova-3"
+    },
+    "audio": {
+      "encoding": "pcm_s16le",
+      "sample_rate_hz": 16000,
+      "channels": 1
+    },
+    "continuation": {
+      "of": "req_3ab9e0",
+      "audio_offset_ms": 0
+    }
+  },
+  {
+    "type": "session.ready",
+    "request_id": "req_4cd1f2",
+    "route": {
+      "provider": "deepgram",
+      "model": "nova-3",
+      "region": "eu-west-1",
+      "attempt_id": "att_1"
+    },
+    "commit_ids": true,
+    "continuation": true
+  },
+  {
+    "type": "transcript.final",
+    "text": "hello again",
+    "segments": [
+      {
+        "text": "hello again",
+        "start_ms": 61040,
+        "end_ms": 61920
+      }
+    ],
+    "covered_ms": 62000
+  },
+  {
     "type": "session.ready",
     "request_id": "req_3ab9e0",
     "route": {

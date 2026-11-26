@@ -95,12 +95,15 @@ func TestAdapterUsesDeepgramWireContractAndMapsEvents(t *testing.T) {
 		Text              string `json:"text"`
 		AudioStartMS      int64  `json:"audio_start_ms"`
 		AudioEndMS        int64  `json:"audio_end_ms"`
+		CoveredMS         *int64 `json:"covered_ms"`
 		ProviderRequestID string `json:"provider_request_id"`
 	}
 	if err := json.Unmarshal(events[3].Data, &final); err != nil {
 		t.Fatalf("decode final transcript: %v", err)
 	}
-	if final.Text != "hello world" || final.AudioStartMS != 250 || final.AudioEndMS != 1000 || final.ProviderRequestID != "dg_req_123" {
+	// The only final window starts at 250 ms: the first 250 ms were never
+	// finalized, so nothing is proven covered.
+	if final.Text != "hello world" || final.AudioStartMS != 250 || final.AudioEndMS != 1000 || final.CoveredMS == nil || *final.CoveredMS != 0 || final.ProviderRequestID != "dg_req_123" {
 		t.Fatalf("final transcript = %+v", final)
 	}
 	var usage struct {

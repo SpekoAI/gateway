@@ -240,6 +240,21 @@ Turn consumers can stop waiting for more text.
 - Do not infer completion from `is_final` alone.
 - Do not use `speech.ended` instead. It can precede the last transcript.
 
+### Finalized audio: covered_ms
+
+Gateway sessions never carry `covered_ms`: the session drops it from
+`transcript.final` data. It is evidence for the hosted relay's stream
+continuation, which a client asks for on the relay wire.
+
+The Deepgram Listen (not Flux) adapter puts it on its mono finals: all audio
+before that position is reflected in finals already sent, this one included.
+
+- It is measured from the first audio byte sent on the provider connection.
+- It is rounded down and never goes backwards within a stream.
+- It moves only along unbroken is_final windows from 0.
+- Every other adapter, Speechmatics and Gladia included, leaves it out.
+  Absent means unknown, not 0.
+
 ### Speakers: ElevenLabs Scribe v3 Live
 
 On a diarized Scribe v3 Live session, `transcript.final` data has:
