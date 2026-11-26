@@ -127,7 +127,7 @@ reply's first text does not wait for a session to open.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `standby_sessions` | `1` with `GatewayClient`, `0` with `RelaySpeechClient` | Sessions kept open ahead of the next reply. `0` opens each session at the reply's first text |
+| `standby_sessions` | `1` with `GatewayClient`, `0` with `RelaySpeechClient` | Sessions kept open ahead of the next reply. `0` opens each session at the reply's first text. With `RelaySpeechClient`, `0` keeps one stream for all replies (below); more than `0` opens a stream per reply |
 | `max_input_characters` | `10000` | Character limit of one reply, about ten minutes of speech. The Gateway refuses text past it and the reply fails |
 
 - LiveKit calls `prewarm()` when the agent starts, which opens the standby.
@@ -142,6 +142,33 @@ reply's first text does not wait for a session to open.
 - With managed credentials, Speko reserves credit for each open session's
   `max_input_characters`, so a standby holds a second reservation. Lower
   `max_input_characters` to reserve less.
+
+### One TTS stream per call on the native relay
+
+With `RelaySpeechClient` and no `standby_sessions`, `TTS` opens one admitted
+relay stream at the first reply's text and sends each later reply as more
+utterances on it (`input.commit` per utterance). The relay renews the
+stream's lease itself.
+
+- The stream is reused while the options are unchanged. A change through
+  `update_options` closes it and the next reply opens a new one.
+- A stream that the relay or the provider ended, or that failed while idle,
+  is dropped and the next reply opens a new one. A reply that meets a failure
+  fails; its text is never sent again.
+- A stream idle for 3 minutes closes, so a quiet call does not hold its
+  reservation. The next reply reopens it.
+- Before a reply would pass `max_input_characters` on one stream, the stream
+  closes between utterances and the reply continues on a new one.
+- When the caller interrupts a reply, only that utterance is cancelled
+  (`input.cancel`) and the stream stays open. The relay does not acknowledge
+  a cancel, so audio of the cancelled utterance is dropped until the next
+  `utterance.started`. A cancel before the utterance's first audio closes the
+  stream instead, because its start could not be told from the next one's.
+- Replies share the stream one at a time. A reply waits for the previous one
+  to let go.
+- `aclose()` ends the stream with `session.close`. Until then the stream is
+  open and holds the organization's TTS slot and its reservation. The
+  terminal receipt for the call's speech arrives when the stream closes.
 
 ### LiveKit versions
 

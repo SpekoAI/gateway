@@ -59,6 +59,7 @@ from ._livekit_native_transcript import (
     bind_native_transcript,
     restore_native_transcript,
 )
+from ._livekit_native_tts import NativeTTS, NativeTTSReply
 from ._livekit_native_turns import NativeTurnPolicy
 from ._livekit_tts_text import NativeTextBuffer
 from ._speech_client import SpeechClient
@@ -1040,6 +1041,12 @@ class TTS(tts.TTS):
         if standby_sessions is None:
             standby_sessions = 0 if isinstance(self._client, RelaySpeechClient) else 1
         self._owns_client = client is None
+        # One stream for the whole call, unless standbys were asked for.
+        self._native = (
+            NativeTTS(self._client)
+            if isinstance(self._client, RelaySpeechClient) and not standby_sessions
+            else None
+        )
         self._voice = voice
         self._language = language
         self._model = model
@@ -1124,6 +1131,8 @@ class TTS(tts.TTS):
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
+        if self._native is not None:
+            await self._native.aclose()
         await self._release_standbys()
         if self._owns_client:
             await self._client.aclose()
@@ -1197,6 +1206,7 @@ class SynthesisStream(tts.SynthesizeStream):
         self._bridge = bridge
         self._options = options
         self._session: _TTSSession | None = None
+        self._reply: NativeTTSReply | None = None
         self._gateway_stream: LiveKitTTSStream | None = None
         self._native_utterance_done = asyncio.Event()
         self._native_text_finished = False
@@ -1255,12 +1265,20 @@ class SynthesisStream(tts.SynthesizeStream):
         except OSError as err:
             raise APIConnectionError("Speko Gateway TTS transport failed") from err
         finally:
-            if self._session is not None:
+            if self._reply is not None:
+                self._reply.release()
+            elif self._session is not None:
                 closing = self._plugin._close_soon(self._session)
                 if not self._session.opening:
                     await asyncio.shield(closing)
 
     async def _open_for_text(self, first_token: str) -> None:
+        if self._plugin._native is not None:
+            self._reply = self._session = await self._plugin._native.acquire(
+                self._options
+            )
+            self._attach_stream(self._reply)
+            return
         standby = self._plugin._take_standby(self._options)
         if standby is not None:
             self._session = standby

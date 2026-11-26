@@ -454,6 +454,8 @@ async def test_native_tts_explicit_flush_finishes_audio_before_end_input(native_
             assert not closed, "final audio must precede end_input and session.close"
             stream.end_input()
             assert await asyncio.wait_for(collect_stream(stream), 3) == []
+            assert not closed, "the reply ends; the call's stream stays open"
+            await model.aclose()
             assert closed
         finally:
             await stream.aclose()
