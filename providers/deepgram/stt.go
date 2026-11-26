@@ -162,6 +162,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		events:    make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		flux:      isFluxModel(request.Plan.Route.Model),
 		extension: extensionID,
+		mono:      request.Media.Channels == 1,
 		// The Listen model is what Deepgram bills under; Flux (/v2) reports
 		// no processed duration at all, so it stays unmetered here.
 		billingModel: request.Plan.Route.Model,
@@ -315,6 +316,13 @@ type stream struct {
 	requestID string
 	flux      bool
 	extension string
+
+	// mono gates covered_ms: Deepgram finalizes each channel on its own, so
+	// one channel's final proves nothing about the others. coveredMS is the
+	// highest covered_ms sent, so the value never goes backwards; only the
+	// read loop touches it.
+	mono      bool
+	coveredMS int64
 
 	// billingModel, billingLanguage and billingFeatures are the frozen
 	// identity of the request that was actually dispatched. They are read
@@ -615,9 +623,10 @@ func (s *stream) emitResults(message inboundMessage, raw json.RawMessage) error 
 	if message.IsFinal {
 		kind = protocol.EventTranscriptFinal
 	}
+	data := transcriptData(transcript, message, s.currentRequestID(), s.covered(message))
 	if err := s.emit(runtimepkg.ProviderEvent{
 		Type:       kind,
-		Data:       transcriptData(transcript, message, s.currentRequestID()),
+		Data:       data,
 		Extensions: extension(raw),
 	}); err != nil {
 		return err
@@ -630,6 +639,26 @@ func (s *stream) emitResults(message inboundMessage, raw json.RawMessage) error 
 		})
 	}
 	return nil
+}
+
+// covered returns the covered_ms a Listen result proves, or nil. Deepgram:
+// "When Deepgram reaches maximum accuracy for a segment, it sends a finalized
+// transcript with is_final: true" and "start" and "duration" give that
+// segment's window in seconds from the start of the stream's audio
+// (https://developers.deepgram.com/docs/interim-results). Finalized windows
+// follow one another without overlap, whether speech_final is set or not
+// (speech_final only marks an endpoint and rides an is_final result), so the
+// end of an is_final window is how far the stream's audio is finalized.
+// Interim results never move it, and it never goes backwards.
+func (s *stream) covered(message inboundMessage) *int64 {
+	if !message.IsFinal || !s.mono {
+		return nil
+	}
+	if end := milliseconds(message.Start + message.Duration); end > s.coveredMS {
+		s.coveredMS = end
+	}
+	covered := s.coveredMS
+	return &covered
 }
 
 func (s *stream) emit(event runtimepkg.ProviderEvent) error {
@@ -709,15 +738,19 @@ func speechFinalData(end float64) json.RawMessage {
 	return marshalData(map[string]any{"audio_end_ms": milliseconds(end), "reason": "speech_final"})
 }
 
-func transcriptData(text string, message inboundMessage, requestID string) json.RawMessage {
-	return marshalData(map[string]any{
+func transcriptData(text string, message inboundMessage, requestID string, coveredMS *int64) json.RawMessage {
+	data := map[string]any{
 		"text":                text,
 		"is_final":            message.IsFinal,
 		"speech_final":        message.SpeechFinal,
 		"audio_start_ms":      milliseconds(message.Start),
 		"audio_end_ms":        milliseconds(message.Start + message.Duration),
 		"provider_request_id": requestID,
-	})
+	}
+	if coveredMS != nil {
+		data["covered_ms"] = *coveredMS
+	}
+	return marshalData(data)
 }
 
 func fluxTranscriptData(message inboundMessage, final bool, requestID string) json.RawMessage {

@@ -146,6 +146,13 @@ func TestAdapterInitialisesSessionAndStreamsPartialsBeforeCommit(t *testing.T) {
 		final.Language != "fr" || final.UtteranceID != "utt_1" || final.ProviderRequestID != testSessionID {
 		t.Fatalf("final transcript = %+v", final)
 	}
+	// A mono session's final says how far its audio is finalized.
+	if covered, ok := coveredMS(t, after[0].Data); !ok || covered != 1_000 {
+		t.Fatalf("final covered_ms = %d, %v; want 1000", covered, ok)
+	}
+	if _, ok := coveredMS(t, before[2].Data); ok {
+		t.Fatal("a partial must not carry covered_ms")
+	}
 	if after[0].Extensions[extensionID] == nil {
 		t.Fatal("final transcript must retain its raw Gladia frame")
 	}

@@ -219,6 +219,7 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		cancel:         cancel,
 		events:         make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		seenSessionIDs: make(map[string]struct{}),
+		mono:           request.Media.Channels == 1,
 	}
 	// A BYOK open already knows the provider-side correlation id, so report it
 	// before any audio flows. Managed opens learn the same id from the
@@ -518,6 +519,13 @@ type stream struct {
 	closeErr  error
 
 	seenSessionIDs map[string]struct{}
+
+	// mono gates covered_ms: Gladia finalizes each channel's utterances on
+	// their own, so one channel's final proves nothing about the others.
+	// coveredMS is the highest covered_ms sent, so the value never goes
+	// backwards; only the read loop touches it.
+	mono      bool
+	coveredMS int64
 }
 
 func (s *stream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -702,9 +710,28 @@ func (s *stream) emitTranscript(message inboundMessage, raw json.RawMessage) err
 	// requests real speech events, so Gladia sends its own speech_end.
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       kind,
-		Data:       transcriptData(message),
+		Data:       transcriptData(message, s.covered(message)),
 		Extensions: extension(raw),
 	})
+}
+
+// covered returns the covered_ms a final transcript proves, or nil. Gladia:
+// "is_final: true" means the message carries "the final, most accurate
+// transcript for an utterance, and it will not change", and utterance.end is
+// the utterance's end in seconds from the start of the session's audio
+// (https://docs.gladia.io/api-reference/v2/live/message/transcript). On one
+// channel utterances follow one another and each final arrives before the
+// next utterance's, so every word before the end of a final utterance has
+// been sent. Partials never move it, and it never goes backwards.
+func (s *stream) covered(message inboundMessage) *int64 {
+	if !message.Data.IsFinal || !s.mono {
+		return nil
+	}
+	if end := milliseconds(message.Data.Utterance.End); end > s.coveredMS {
+		s.coveredMS = end
+	}
+	covered := s.coveredMS
+	return &covered
 }
 
 // observeSessionID reports the Gladia session id once per stream as the
@@ -817,9 +844,9 @@ func extension(raw json.RawMessage) map[string]json.RawMessage {
 	return map[string]json.RawMessage{extensionID: raw}
 }
 
-func transcriptData(message inboundMessage) json.RawMessage {
+func transcriptData(message inboundMessage, coveredMS *int64) json.RawMessage {
 	utterance := message.Data.Utterance
-	return marshalData(map[string]any{
+	data := map[string]any{
 		"text":                utterance.Text,
 		"is_final":            message.Data.IsFinal,
 		"audio_start_ms":      milliseconds(utterance.Start),
@@ -830,7 +857,11 @@ func transcriptData(message inboundMessage) json.RawMessage {
 		"words":               utterance.Words,
 		"utterance_id":        message.Data.ID,
 		"provider_request_id": message.SessionID,
-	})
+	}
+	if coveredMS != nil {
+		data["covered_ms"] = *coveredMS
+	}
+	return marshalData(data)
 }
 
 func speechData(key string, message inboundMessage) json.RawMessage {
