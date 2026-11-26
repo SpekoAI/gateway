@@ -310,9 +310,6 @@ type stream struct {
 	events    chan runtimepkg.ProviderEvent
 	requestID string
 	language  string
-	// coveredMS is the highest covered_ms sent, so the value never goes
-	// backwards; only the read loop touches it.
-	coveredMS int64
 
 	writeMu     sync.Mutex
 	closeOnce   sync.Once
@@ -536,26 +533,15 @@ func (s *stream) emitTranscript(kind protocol.EventType, message inboundMessage,
 	if confidence, ok := transcriptConfidence(message.Results); ok {
 		data["confidence"] = confidence
 	}
-	if final {
-		data["covered_ms"] = s.covered(message.Metadata.EndTime)
-	}
 	return s.emit(runtimepkg.ProviderEvent{Type: kind, Data: marshalData(data), Extensions: extension(raw)})
 }
 
-// covered returns the covered_ms an AddTranscript proves. Speechmatics: an
-// AddTranscript is "the final transcript for a section of audio", and its
-// metadata end_time is the end of that section in seconds from the start of
-// the stream's audio (https://docs.speechmatics.com/rt-api-ref, AddTranscript).
-// Final transcripts are never revised and arrive in audio order, so every
-// word before end_time has been sent. Raw audio here is mono only
-// (validateMedia), so no other channel can lag behind. AddPartialTranscript
-// never moves it, and it never goes backwards.
-func (s *stream) covered(endTime float64) int64 {
-	if end := milliseconds(endTime); end > s.coveredMS {
-		s.coveredMS = end
-	}
-	return s.coveredMS
-}
+// Finals here carry no covered_ms. An AddTranscript is final and never
+// revised, but its metadata end_time is the approximate end of its last word
+// (https://docs.speechmatics.com/api-ref/realtime-transcription-websocket#addtranscript),
+// and a final can land mid-speech under max_delay, so end_time is not a
+// proven lower bound on the audio reflected in finals. A continuing client
+// falls back to its overlap replay for this provider.
 
 func transcriptConfidence(results []result) (float64, bool) {
 	var total float64

@@ -369,6 +369,19 @@ func TestSTTContinuationOnTheWire(t *testing.T) {
 // decode rather than wrapped or truncated.
 func TestSTTContinuationOffsetDecode(t *testing.T) {
 	t.Parallel()
+	// An empty label is refused, not read as "no label", matching the schema.
+	for _, raw := range []string{`{"of":""}`, `{"of":"","audio_offset_ms":0}`} {
+		var continuation relayapi.STTContinuation
+		if err := json.Unmarshal([]byte(raw), &continuation); err != nil {
+			t.Fatalf("%s: decode: %v", raw, err)
+		}
+		assertInvalid(t, continuation.Validate(), "of:")
+	}
+	var asking relayapi.STTContinuation
+	if err := json.Unmarshal([]byte(`{"of":null}`), &asking); err != nil || asking.Validate() != nil {
+		t.Fatalf("a null of is absent: %v", err)
+	}
+	assertInvalid(t, (relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, CoveredMS: ms(relayapi.MaxCoveredMS + 1)}).Validate(), "covered_ms")
 	for _, raw := range []string{`{"of":"req_1","audio_offset_ms":9223372036854775808}`, `{"of":"req_1","audio_offset_ms":1.5}`, `{"of":"req_1","audio_offset_ms":"10"}`} {
 		var continuation relayapi.STTContinuation
 		if err := json.Unmarshal([]byte(raw), &continuation); err == nil {

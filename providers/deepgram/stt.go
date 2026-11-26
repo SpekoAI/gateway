@@ -612,6 +612,9 @@ func (s *stream) emitResults(message inboundMessage, raw json.RawMessage) error 
 			return err
 		}
 	}
+	// An empty final still finalizes its window (silence), so the chain
+	// advances before the empty result is dropped.
+	s.extendCovered(message)
 	transcript := ""
 	if len(message.Channel.Alternatives) > 0 {
 		transcript = message.Channel.Alternatives[0].Transcript
@@ -641,21 +644,35 @@ func (s *stream) emitResults(message inboundMessage, raw json.RawMessage) error 
 	return nil
 }
 
-// covered returns the covered_ms a Listen result proves, or nil. Deepgram:
-// "When Deepgram reaches maximum accuracy for a segment, it sends a finalized
-// transcript with is_final: true" and "start" and "duration" give that
-// segment's window in seconds from the start of the stream's audio
-// (https://developers.deepgram.com/docs/interim-results). Finalized windows
-// follow one another without overlap, whether speech_final is set or not
-// (speech_final only marks an endpoint and rides an is_final result), so the
-// end of an is_final window is how far the stream's audio is finalized.
-// Interim results never move it, and it never goes backwards.
+// coveredGapToleranceMS is how far an is_final window may start past the
+// covered point and still extend the chain: float seconds on the wire, not a
+// gap in the audio.
+const coveredGapToleranceMS = 50
+
+// extendCovered moves covered_ms along the chain of is_final windows.
+// Deepgram: "When Deepgram reaches maximum accuracy for a segment, it sends a
+// finalized transcript with is_final: true", and "start" and "duration" give
+// that segment's window in seconds from the start of the stream's audio
+// (https://developers.deepgram.com/docs/interim-results). A finalized window
+// is never revised, so audio inside a chain of finalized windows that starts
+// at 0 and has no holes is reflected in finals already sent. The docs show the
+// windows tiling the audio but do not promise it, so a window that starts
+// after a hole leaves covered_ms where it is: the hole is not proven. Interim
+// results never move it, the end is rounded down, and it never goes backwards.
+func (s *stream) extendCovered(message inboundMessage) {
+	if !message.IsFinal || !s.mono {
+		return
+	}
+	start, end := floorMilliseconds(message.Start), floorMilliseconds(message.Start+message.Duration)
+	if start <= s.coveredMS+coveredGapToleranceMS && end > s.coveredMS {
+		s.coveredMS = end
+	}
+}
+
+// covered returns the covered_ms to put on a Listen result, or nil.
 func (s *stream) covered(message inboundMessage) *int64 {
 	if !message.IsFinal || !s.mono {
 		return nil
-	}
-	if end := milliseconds(message.Start + message.Duration); end > s.coveredMS {
-		s.coveredMS = end
 	}
 	covered := s.coveredMS
 	return &covered
@@ -780,6 +797,13 @@ func marshalData(value any) json.RawMessage {
 
 func milliseconds(seconds float64) int64 {
 	return int64(math.Round(seconds * 1_000))
+}
+
+// floorMilliseconds rounds down, for a boundary that must not claim audio
+// past what the vendor finalized. The 1e-6 ms only absorbs float error
+// (2.3 s * 1000 is 2299.9999999999995).
+func floorMilliseconds(seconds float64) int64 {
+	return int64(math.Floor(seconds*1_000 + 1e-6))
 }
 
 func deepgramErrorMessage(description string) string {

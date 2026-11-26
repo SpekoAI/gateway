@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -845,9 +846,35 @@ func (s *Session) runEvents() {
 			if event.Type == protocol.EventUsageObserved {
 				s.record("usage.observed", event.Data)
 			}
+			if event.Type == protocol.EventTranscriptFinal {
+				event.Data = withoutCoveredMS(event.Data)
+			}
 			s.emitRegular(event.Type, event.Data, event.Extensions, event.Audio)
 		}
 	}
+}
+
+// withoutCoveredMS drops an STT adapter's covered_ms from final data. It is
+// evidence for the relay's stream continuation, which a client must ask for;
+// this session's clients have no way to ask, so they never see it. Data that
+// does not decode as an object, or has no covered_ms, passes through as is.
+func withoutCoveredMS(data json.RawMessage) json.RawMessage {
+	if !bytes.Contains(data, []byte(`"covered_ms"`)) {
+		return data
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return data
+	}
+	if _, ok := fields["covered_ms"]; !ok {
+		return data
+	}
+	delete(fields, "covered_ms")
+	stripped, err := json.Marshal(fields)
+	if err != nil {
+		return data
+	}
+	return stripped
 }
 
 func (s *Session) closeProvider() {

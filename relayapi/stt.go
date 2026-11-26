@@ -221,6 +221,10 @@ func (c STTSessionConfigure) Validate() error {
 // to a provider timestamp cannot overflow int64.
 const MaxContinuationOffsetMS int64 = 24 * 60 * 60 * 1000
 
+// MaxCoveredMS bounds STTTranscriptFinal.CoveredMS: the largest integer a
+// JSON number holds exactly (2^53 - 1), far past any offset plus session.
+const MaxCoveredMS int64 = 1<<53 - 1
+
 // MaxContinuationOfLength bounds STTContinuation.Of.
 const MaxContinuationOfLength = 128
 
@@ -236,10 +240,31 @@ type STTContinuation struct {
 	// Of is the request_id of the session this one continues. Present
 	// exactly when AudioOffsetMS is.
 	Of string `json:"of,omitempty"`
+	// ofSent records an "of" member on the wire, so Validate can refuse
+	// "of":"" instead of reading it as no label.
+	ofSent bool
 	// AudioOffsetMS is where this session's audio starts on the continued
 	// session's timeline, in milliseconds. A pointer because 0 is a valid
 	// offset and differs from absent.
 	AudioOffsetMS *int64 `json:"audio_offset_ms,omitempty"`
+}
+
+// UnmarshalJSON notes whether the object carried "of". A null counts as
+// absent, as a null member does everywhere in relayapi.
+func (c *STTContinuation) UnmarshalJSON(data []byte) error {
+	type wire STTContinuation
+	var decoded struct {
+		wire
+		Of *string `json:"of"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = STTContinuation(decoded.wire)
+	if decoded.Of != nil {
+		c.Of, c.ofSent = *decoded.Of, true
+	}
+	return nil
 }
 
 // Continuing reports whether the session continues an earlier one rather
@@ -253,6 +278,9 @@ func (c *STTContinuation) Continuing() bool {
 func (c *STTContinuation) Validate() error {
 	if c == nil {
 		return nil
+	}
+	if c.ofSent && c.Of == "" {
+		return fmt.Errorf("of: want 1-%d characters of A-Z a-z 0-9 . _ : -", MaxContinuationOfLength)
 	}
 	if (c.Of == "") != (c.AudioOffsetMS == nil) {
 		return fmt.Errorf("of and audio_offset_ms: send both to continue a session, or neither to ask for continuation")
@@ -475,8 +503,8 @@ func (e STTTranscriptFinal) Validate() error {
 	if e.Interim && e.CommitID != "" {
 		return fmt.Errorf("commit_id: an interim final never answers a commit")
 	}
-	if e.CoveredMS != nil && *e.CoveredMS < 0 {
-		return fmt.Errorf("covered_ms: must not be negative")
+	if e.CoveredMS != nil && (*e.CoveredMS < 0 || *e.CoveredMS > MaxCoveredMS) {
+		return fmt.Errorf("covered_ms: want 0 to %d", MaxCoveredMS)
 	}
 	for i, segment := range e.Segments {
 		if err := segment.Validate(); err != nil {

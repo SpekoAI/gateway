@@ -719,15 +719,19 @@ func (s *stream) emitTranscript(message inboundMessage, raw json.RawMessage) err
 // "is_final: true" means the message carries "the final, most accurate
 // transcript for an utterance, and it will not change", and utterance.end is
 // the utterance's end in seconds from the start of the session's audio
-// (https://docs.gladia.io/api-reference/v2/live/message/transcript). On one
-// channel utterances follow one another and each final arrives before the
-// next utterance's, so every word before the end of a final utterance has
-// been sent. Partials never move it, and it never goes backwards.
+// (https://docs.gladia.io/api-reference/v2/live/message/transcript). An
+// utterance closed by a pause ends at that pause, and on one channel each
+// final arrives before the next utterance's, so every word before its end has
+// been sent. A forced final ("forced": "max_duration") is closed by a timer
+// and "can end mid-word" (https://eu1.docs.gladia.io/live/endpointing, limits and
+// gotchas), so it never moves the value. Partials never move it, the end is
+// rounded down, and it never goes backwards.
 func (s *stream) covered(message inboundMessage) *int64 {
 	if !message.Data.IsFinal || !s.mono {
 		return nil
 	}
-	if end := milliseconds(message.Data.Utterance.End); end > s.coveredMS {
+	utterance := message.Data.Utterance
+	if end := floorMilliseconds(utterance.End); utterance.Forced == "" && end > s.coveredMS {
 		s.coveredMS = end
 	}
 	covered := s.coveredMS
@@ -898,6 +902,13 @@ func marshalData(value any) json.RawMessage {
 
 func milliseconds(seconds float64) int64 { return int64(math.Round(seconds * 1_000)) }
 
+// floorMilliseconds rounds down, for a boundary that must not claim audio
+// past what the vendor finalized. The 1e-6 ms only absorbs float error
+// (2.3 s * 1000 is 2299.9999999999995).
+func floorMilliseconds(seconds float64) int64 {
+	return int64(math.Floor(seconds*1_000 + 1e-6))
+}
+
 func truncate(value string, limit int) string {
 	if len(value) <= limit {
 		return value
@@ -936,6 +947,9 @@ type utterance struct {
 	Confidence float64         `json:"confidence"`
 	Channel    int             `json:"channel"`
 	Words      json.RawMessage `json:"words"`
+	// Forced names what closed the utterance when a pause did not
+	// ("max_duration"); empty on an utterance a pause closed.
+	Forced string `json:"forced"`
 }
 
 type errorObject struct {

@@ -823,6 +823,11 @@ func TestSubsetValidatorRejectsInvalidValues(t *testing.T) {
 		{"wrong primitive type", "openapi.json", "ResponseTextDelta", `{"output_index":"0","delta":"hi"}`, "not of type integer"},
 		{"below minimum", "asyncapi.json", "TTSUtteranceStarted", `{"type":"utterance.started","sequence":0}`, "below minimum"},
 		{"fractional integer", "asyncapi.json", "TTSUtteranceStarted", `{"type":"utterance.started","sequence":1.5}`, "not of type integer"},
+		// Continuation takes {} or both members, in the schema as in Go.
+		{"continuation of without offset", "asyncapi.json", "STTContinuation", `{"of":"req_1"}`, "matches 0 oneOf branches"},
+		{"continuation offset without of", "asyncapi.json", "STTContinuation", `{"audio_offset_ms":0}`, "matches 0 oneOf branches"},
+		{"continuation with an empty of", "asyncapi.json", "STTContinuation", `{"of":"","audio_offset_ms":0}`, "does not match pattern"},
+		{"covered_ms past exact JSON integers", "asyncapi.json", "STTTranscriptFinal", `{"type":"transcript.final","text":"","covered_ms":9007199254740992}`, "above maximum"},
 	} {
 		doc := docs[tc.doc]
 		var value any

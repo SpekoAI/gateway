@@ -9,9 +9,11 @@ import (
 	runtimepkg "github.com/SpekoAI/gateway/runtime"
 )
 
-// covered_ms on a Listen stream is the end of the latest is_final window:
-// interim results never carry it, a chunk final (is_final without
-// speech_final) moves it like an endpoint does, and it never goes backwards.
+// covered_ms on a Listen stream is the end of the chain of is_final windows
+// from 0: interim results never carry it, a chunk final (is_final without
+// speech_final) moves it like an endpoint does, an empty final extends the
+// chain, a window after a hole does not, it rounds down, and it never goes
+// backwards.
 func TestListenFinalsCarryCoveredMS(t *testing.T) {
 	t.Parallel()
 	s := &stream{ctx: context.Background(), events: make(chan runtimepkg.ProviderEvent, 16), mono: true}
@@ -25,6 +27,10 @@ func TestListenFinalsCarryCoveredMS(t *testing.T) {
 		// An empty final is silence: no event, and covered_ms waits for the next final.
 		`{"type":"Results","start":3.75,"duration":3.0,"is_final":true,"channel":{"alternatives":[{"transcript":""}]}}`,
 		`{"type":"Results","start":6.75,"duration":1.0,"is_final":true,"channel":{"alternatives":[{"transcript":"bye"}]}}`,
+		// A window after a hole proves nothing about the hole.
+		`{"type":"Results","start":9.0,"duration":1.0,"is_final":true,"channel":{"alternatives":[{"transcript":"later"}]}}`,
+		// A window starting within the tolerance extends the chain, rounded down.
+		`{"type":"Results","start":7.79,"duration":0.5006,"is_final":true,"channel":{"alternatives":[{"transcript":"on"}]}}`,
 	} {
 		var message inboundMessage
 		if err := json.Unmarshal([]byte(raw), &message); err != nil {
@@ -55,7 +61,7 @@ func TestListenFinalsCarryCoveredMS(t *testing.T) {
 			finals = append(finals, *data.CoveredMS)
 		}
 	}
-	want := []int64{2500, 3750, 3750, 7750}
+	want := []int64{2500, 3750, 3750, 7750, 7750, 8290}
 	if len(finals) != len(want) {
 		t.Fatalf("finals covered_ms = %v, want %v", finals, want)
 	}
