@@ -403,6 +403,7 @@ func wireSchemaTable() []struct {
 		{relayapi.ResponseItemCompleted{}, openapi("ResponseItemCompleted")},
 		{relayapi.ResponseCompleted{}, openapi("ResponseCompleted")},
 		{relayapi.STTSessionConfigure{}, asyncapi("STTSessionConfigure")},
+		{relayapi.STTContinuation{}, asyncapi("STTContinuation")},
 		{relayapi.STTInputCommit{}, asyncapi("STTInputCommit")},
 		{relayapi.STTSessionClose{}, asyncapi("STTSessionClose")},
 		{relayapi.STTSessionReady{}, asyncapi("STTSessionReady")},
