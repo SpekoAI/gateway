@@ -3,34 +3,46 @@
 A dropped live STT stream continues in a new relay session. The server stays
 stateless: it adds the continued session's audio offset to every timestamp and
 says on finals how far the audio is finalized (``covered_ms``). This client
-keeps an ordered log of the audio and commits it sent since that point and
-replays it into the new session, so the app sees one transcript on one
-timeline. Where the server cannot prove the boundary, the client replays a few
-seconds of overlap and drops the words it already delivered, and says so.
+keeps an ordered log of the audio and commits since that point and replays it
+into the new session, so the app sees one transcript on one timeline. Where
+the server cannot prove the boundary, the client replays a few seconds of
+overlap and drops the words it already delivered, and says so.
+
+Positions are byte offsets into the stream's audio, each byte counted once
+however often it is replayed. Two of them matter: what the app handed over
+(the end of the log) and what was delivered to the current socket. Only
+delivered audio reached a provider, so only it can be finalized, proven
+covered, or judged silent.
 
 Events this adds to the stream (all other events are unchanged):
 
 - ``session.reconnecting`` ``{cause}``: the socket dropped; the transcript
   pauses while a new session opens. Interim text is void.
-- ``session.continued`` ``{request_id, route, replayed_ms, exact}``: the server
-  confirmed continuation and the log was replayed. ``exact`` is false when the
-  seam rests on overlap and word matching rather than ``covered_ms``.
-- ``session.restarted`` ``{request_id, route, replayed_ms, from_ms}``: the server
-  did not confirm continuation. The log was replayed into a plain new session
-  whose timestamps start at 0 again; ``from_ms`` is where on the old timeline
-  that session's audio starts.
+- ``session.continued`` ``{request_id, route, replayed_ms, exact}``: the new
+  session confirmed continuation and the replay has begun (its first frame is
+  out). ``exact`` is false when the seam rests on overlap and matching rather
+  than ``covered_ms``.
+- ``session.restarted`` ``{request_id, route, replayed_ms, from_ms}``: the new
+  session did not confirm continuation. The log is replayed into a plain new
+  session whose timestamps start at 0 again; ``from_ms`` is where on the old
+  timeline that session's audio starts.
 - ``session.gap`` ``{from_ms, to_ms}``: the transcript of that span of audio is
-  not reliable: its audio fell out of the log, or the overlap could not be
+  not reliable: its audio fell out of the log, or the seam could not be
   matched, so words in it may be missing or repeated.
 
-After a continuation the replayed log, and input that arrives meanwhile, goes
-out at no more than 1.25x realtime until it has caught up. Audio the provider
-heard no speech in (no non-empty delta since the last final) that overflows the
-15 s log is silence: it is dropped without a gap.
+The replay, and input that arrives meanwhile, goes out in 100 ms frames at no
+more than 1.25x realtime until it has caught up; ``recovering`` is true from
+the drop until then. Delivered audio a provider found no speech in (no
+non-empty delta since the last final) that overflows the 15 s log is silence:
+it is dropped without a gap. While a new session is being opened the log is
+not trimmed, so the offset it was opened with stays the replay's start; the
+outage budget bounds that growth.
 
 Every ``input.commit`` resolves with exactly one ``transcript.final`` carrying
-its ``commit_id``. A commit whose audio fell out of the log resolves with an
-empty final that also carries ``commit_failed`` (the reason).
+its ``commit_id``, and no id reaches the app twice. A commit that cannot be
+answered (its own audio fell out of the log, the session closed or failed, the
+new session does not echo commit ids) resolves with an empty final that also
+carries ``commit_failed`` (the reason).
 """
 
 from __future__ import annotations
@@ -56,9 +68,12 @@ OUTAGE_SECONDS = 30.0
 RETRY_DELAY_SECONDS = 0.5
 # Deepgram asks for no more than 1.25x realtime: "if you send a large buffer
 # of audio, the stream may wind up being significantly delayed"; Speechmatics
-# warns that sending fast fills TCP buffers. The backlog after a continuation
-# goes out no faster than this.
+# warns that sending fast fills TCP buffers.
 REPLAY_SPEED = 1.25
+REPLAY_FRAME_MS = 100
+MAX_PENDING_COMMITS = 256
+# Segment times are whole milliseconds on both sides of a seam.
+SEAM_TOLERANCE_MS = 30
 
 # Errors that a new session cannot fix: the same request would fail again, or
 # the account cannot pay for it.
@@ -71,8 +86,9 @@ _NEVER_RETRY = frozenset(
     }
 )
 _REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
-_TAIL_WORDS = 64
+_COMMIT_ID = re.compile(r"speko-c([0-9]+)")
 _EVENTS = {"transcript.delta", "transcript.final", "usage.updated"}
+_PUNCTUATION = "\"'.,;:!?()[]{}«»“”‘’…-"
 
 
 class DialUnknown(Exception):
@@ -95,11 +111,38 @@ class _Audio:
     start: int
     data: bytes
 
+    @property
+    def end(self) -> int:
+        return self.start + len(self.data)
+
 
 @dataclass
 class _Commit:
     position: int
-    commit_id: str
+    # None: the session does not echo ids, so the answer cannot be matched.
+    commit_id: str | None
+    # Where this commit's own audio starts: the previous commit's position.
+    audio_from: int
+
+
+@dataclass
+class _Final:
+    words: list[str]
+    # End of the final's last timed segment on the stream timeline, or None.
+    end_ms: int | None
+    # Audio delivered when it arrived: it holds no word after this.
+    arrived: int
+
+
+@dataclass
+class _Seam:
+    from_ms: int
+    to_ms: int
+    # The old finals that may hold words inside the replay: their words, and
+    # the end of the last one when every one of them was timed.
+    old_words: list[str]
+    old_end_ms: int | None
+    aligned: bool = False
 
 
 @dataclass
@@ -110,13 +153,18 @@ class Limits:
     outage_seconds: float = OUTAGE_SECONDS
     retry_delay: float = RETRY_DELAY_SECONDS
     replay_speed: float = REPLAY_SPEED
+    replay_frame_ms: int = REPLAY_FRAME_MS
+    max_pending_commits: int = MAX_PENDING_COMMITS
 
 
 def _words(text: str) -> list[tuple[int, str]]:
-    """(token index, normalized word) for every token that holds a word."""
+    """(token index, normalized word) for every token that holds a word.
+
+    Only surrounding punctuation goes, so "1.5" and "15" stay different.
+    """
     words = []
     for index, token in enumerate(text.split()):
-        normalized = re.sub(r"[^\w]", "", token.casefold())
+        normalized = token.casefold().strip(_PUNCTUATION)
         if normalized:
             words.append((index, normalized))
     return words
@@ -141,6 +189,21 @@ def align(tail: list[str], head: list[str]) -> int | None:
     if best is None or tie or best[1] < 2:
         return None
     return best[0]
+
+
+def _timed_segments(data: dict[str, Any]) -> list[dict[str, Any]] | None:
+    segments = data.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return None
+    for segment in segments:
+        if (
+            not isinstance(segment, dict)
+            or not isinstance(segment.get("text"), str)
+            or type(segment.get("start_ms")) is not int
+            or type(segment.get("end_ms")) is not int
+        ):
+            return None
+    return segments
 
 
 class ContinuingSpeechSession:
@@ -172,34 +235,34 @@ class ContinuingSpeechSession:
         self._supported = ready.get("continuation") is True
         self._confirmed = self._supported
         self._commit_ids = ready.get("commit_ids") is True
-        # Positions are byte offsets into the stream's audio, each byte
-        # counted once however often it is replayed.
-        self._sent = 0
+        self._appended = 0
+        self._delivered = 0
         self._trim = 0
         self._exact = True
+        self._covered_seen = False
+        self._heard = False
         self._log: list[_Audio | _Commit] = []
         self._pending: dict[str, _Commit] = {}
         self._commit_seq = 0
-        self._tail: deque[str] = deque(maxlen=_TAIL_WORDS)
-        self._seam: list[str] | None = None
-        self._seam_aligned = False
-        self._seam_span = (0, 0)
+        self._last_commit = 0
+        self._history: deque[_Final] = deque(maxlen=32)
+        self._seam: _Seam | None = None
+        # The current session's timestamps count from this stream position:
+        # 0 on a confirmed continuation, its replay start on a plain one.
+        self._base = 0
         self._attempts = 0
+        self._deadline: float | None = None
         self._replay_end = 0
-        # A provider that heard speech says so with deltas; none since the
-        # last final means the audio since then is silence as far as it knows.
-        self._heard = False
-        self._covered_seen = False
-        # Audio sent when the latest final arrived: every delivered word lies
-        # before it, so a replay that starts past it repeats none.
-        self._last_final_at = 0
-        # Where the socket went down: audio past it reached no provider.
-        self._down_at = 1 << 62
-        # After a continuation the log goes out paced from this backlog;
-        # input that arrives meanwhile joins it, in order.
-        self._backlog: deque[_Audio | _Commit] = deque()
+        self._recovering = False
+        self._pinned = False
+        self._queue: deque[_Audio | _Commit] = deque()
         self._draining = False
         self._drainer: asyncio.Task[None] | None = None
+
+    @property
+    def recovering(self) -> bool:
+        """True from a drop until the replay has caught up with live input."""
+        return self._recovering
 
     # Positions ------------------------------------------------------------
 
@@ -207,50 +270,59 @@ class ContinuingSpeechSession:
         return position * 1000 // self._bytes_per_second
 
     def _position(self, ms: int) -> int:
+        """The stream position at ``ms``, on a frame and so a sample boundary."""
         position = ms * self._bytes_per_second // 1000
         return position - position % self._frame
+
+    def _aligned(self, position: int) -> int:
+        """``position`` rounded down to a whole millisecond, which is what an
+        offset on the wire can name."""
+        return self._position(self._ms(max(0, position)))
 
     def _log_start(self) -> int:
         for entry in self._log:
             if isinstance(entry, _Audio):
                 return entry.start
-        return self._sent
+        return self._appended
 
     def _drop_audio_before(self, position: int) -> None:
         kept: list[_Audio | _Commit] = []
         for entry in self._log:
             if isinstance(entry, _Audio):
-                end = entry.start + len(entry.data)
-                if end <= position:
+                if entry.end <= position:
                     continue
                 if entry.start < position:
                     entry = _Audio(position, entry.data[position - entry.start :])
+            elif entry.commit_id is None and entry.position < position:
+                continue
             kept.append(entry)
         self._log = kept
 
     def _enforce_cap(self) -> None:
-        cap = self._position(self._limits.log_cap_ms)
-        if self._sent - self._log_start() <= cap:
+        if self._pinned:
             return
-        start = self._sent - cap
-        # Audio the live provider heard no speech in is silence: dropping it
-        # loses no word, so the replay point moves past it without a gap. It
-        # stays exact only on a boundary covered_ms proved. Audio sent while
-        # no provider listens, or after speech was heard, is a real loss.
-        silent = (
-            not self._draining
-            and not self._heard
-            and self._log_start() <= self._trim
+        # Audio that never reached a provider is never dropped: the session it
+        # goes to would see a hole in its timeline.
+        cut = self._aligned(
+            min(
+                self._appended - self._position(self._limits.log_cap_ms),
+                self._delivered,
+            )
         )
-        self._drop_audio_before(start)
+        start = self._log_start()
+        if cut <= start:
+            return
+        # Delivered audio a provider heard no speech in is silence: dropping it
+        # loses no word, so the replay point moves past it without a gap. It
+        # stays exact only on a boundary covered_ms proved.
+        silent = not self._heard and start <= self._trim
+        self._drop_audio_before(cut)
         if silent:
-            # Only up to where the socket went down: no provider heard the
-            # audio after that, so nothing is known about it.
-            self._trim = max(self._trim, min(self._log_start(), self._down_at))
+            self._trim = max(self._trim, cut)
             self._exact = self._exact and self._covered_seen
 
     def _advance(self, position: int, *, exact: bool) -> None:
-        position = max(0, min(position, self._sent))
+        position = self._aligned(min(position, self._delivered))
         if position > self._trim:
             self._trim = position
             self._drop_audio_before(position)
@@ -261,25 +333,49 @@ class ContinuingSpeechSession:
             isinstance(entry, _Audio) for entry in self._log
         )
 
+    def _timeline_ms(self, ms: int) -> int:
+        return ms + self._ms(self._base)
+
     # Controls -------------------------------------------------------------
 
     def _check_open(self) -> None:
         if self._closed or self._finishing:
             raise GatewayError("Relay speech session is closed", retryable=False)
 
-    async def _send_live(self, value: dict[str, Any] | bytes) -> None:
-        if not self._live:
+    async def _deliver(self, entry: _Audio | _Commit) -> None:
+        """Write one log entry to the current socket. A failed write leaves it
+        undelivered: the reader sees the drop and the replay sends it."""
+        if self._closed or not self._live:
             return
         try:
-            if isinstance(value, bytes):
-                await self._ws.send_bytes(value)
+            if isinstance(entry, _Audio):
+                await self._ws.send_bytes(entry.data)
+                self._delivered = entry.end
+            elif entry.commit_id is None:
+                await self._ws.send_json({"type": "input.commit"})
             else:
-                await self._ws.send_json(value)
+                await self._ws.send_json(
+                    {"type": "input.commit", "commit_id": entry.commit_id}
+                )
         except (ConnectionError, aiohttp.ClientError, RuntimeError):
-            # The reader sees the drop and continues the stream; this input
-            # is already in the log.
             self._live = False
-            self._down_at = min(self._down_at, self._sent)
+
+    async def _send_control(self, value: dict[str, Any]) -> None:
+        if self._closed or not self._live:
+            return
+        try:
+            await self._ws.send_json(value)
+        except (ConnectionError, aiohttp.ClientError, RuntimeError):
+            self._live = False
+
+    def _check_backlog(self) -> None:
+        limit = self._position(
+            self._limits.log_cap_ms + int(self._limits.outage_seconds * 1000)
+        )
+        if self._appended - self._delivered > limit:
+            raise GatewayError(
+                "Relay speech input fell too far behind", retryable=False
+            )
 
     async def send_audio(self, data: bytes | bytearray | memoryview) -> None:
         chunk = bytes(data)
@@ -287,36 +383,41 @@ class ContinuingSpeechSession:
             self._check_open()
             if not chunk:
                 return
-            entry = _Audio(self._sent, chunk)
+            self._check_backlog()
+            entry = _Audio(self._appended, chunk)
             self._log.append(entry)
-            self._sent += len(chunk)
-            self._enforce_cap()
+            self._appended = entry.end
             self._input.set()
             if self._draining:
-                self._backlog.append(entry)
-            else:
-                await self._send_live(chunk)
+                self._queue.extend(self._pieces(entry))
+            elif self._live and not self._recovering:
+                await self._deliver(entry)
+            self._enforce_cap()
 
     async def commit_audio(self) -> str | None:
         async with self._lock:
             self._check_open()
-            if not self._commit_ids:
-                # Without echoed ids an answer cannot be matched to its commit,
-                # so the commit is sent but cannot be carried across a drop.
-                await self._send_live({"type": "input.commit"})
-                return None
-            self._commit_seq += 1
-            commit = _Commit(self._sent, f"speko-c{self._commit_seq}")
+            commit_id = None
+            if self._commit_ids:
+                if len(self._pending) >= self._limits.max_pending_commits:
+                    raise GatewayError(
+                        "Relay speech has too many unanswered commits",
+                        retryable=False,
+                    )
+                self._commit_seq += 1
+                commit_id = f"speko-c{self._commit_seq}"
+            commit = _Commit(self._appended, commit_id, self._last_commit)
+            self._last_commit = self._appended
             self._log.append(commit)
-            self._pending[commit.commit_id] = commit
+            if commit_id is not None:
+                self._pending[commit_id] = commit
             self._input.set()
+            # A commit never overtakes audio queued before it.
             if self._draining:
-                self._backlog.append(commit)
-            else:
-                await self._send_live(
-                    {"type": "input.commit", "commit_id": commit.commit_id}
-                )
-            return commit.commit_id
+                self._queue.append(commit)
+            elif self._live and not self._recovering:
+                await self._deliver(commit)
+            return commit_id
 
     async def append_text(self, text: str) -> None:
         raise ValueError("Nonempty text input requires TTS")
@@ -333,9 +434,9 @@ class ContinuingSpeechSession:
                 return
             self._finishing = True
             self._input.set()
-            if not self._draining:
-                # Otherwise the drainer closes once the backlog is out.
-                await self._send_live({"type": "session.close"})
+            if not self._recovering:
+                await self._send_control({"type": "session.close"})
+            # Otherwise the replay closes the session once it has caught up.
 
     async def aclose(self) -> None:
         self._closed = True
@@ -376,8 +477,6 @@ class ContinuingSpeechSession:
                             if error.get("retryable") is True and code not in _NEVER_RETRY:
                                 cause = str(code or "error")
                                 break
-                            for event in self._fail_pending("session_failed"):
-                                yield event
                             raise _relay_error(payload)
                         if kind == "session.closed":
                             if not isinstance(payload.get("usage"), dict):
@@ -385,6 +484,8 @@ class ContinuingSpeechSession:
                                     "Relay speech ended without final usage",
                                     retryable=False,
                                 )
+                            for event in self._fail_pending("session_closed"):
+                                yield event
                             yield CanonicalEvent(
                                 type="usage.reported", data=payload["usage"]
                             )
@@ -402,6 +503,13 @@ class ContinuingSpeechSession:
                     return
                 async for event in self._recover(cause):
                     yield event
+        except Exception as error:
+            # Whatever ends the stream, every commit still waiting is answered.
+            for event in self._fail_pending(
+                str(getattr(error, "code", "") or "stream_failed")
+            ):
+                yield event
+            raise
         finally:
             await self.aclose()
 
@@ -415,94 +523,190 @@ class ContinuingSpeechSession:
             if data.get("text"):
                 self._heard = True
             return [CanonicalEvent(type=kind, data=data)]
+        return self._on_final(data)
+
+    def _on_final(self, data: dict[str, Any]) -> list[CanonicalEvent]:
         events: list[CanonicalEvent] = []
         commit_id = data.get("commit_id")
-        answered = isinstance(commit_id, str) and commit_id in self._pending
-        if answered:
-            commit = self._pending.pop(commit_id)
-            self._log = [entry for entry in self._log if entry is not commit]
-        text = data.get("text")
+        if isinstance(commit_id, str):
+            if commit_id in self._pending:
+                commit = self._pending.pop(commit_id)
+                self._log = [entry for entry in self._log if entry is not commit]
+            elif self._ours(commit_id):
+                # Already answered or failed: the app never sees an id twice.
+                del data["commit_id"]
+        arrived = self._delivered
         deliver = True
+        text = data.get("text")
         if self._seam is not None and isinstance(text, str) and _words(text):
             gap, deliver = self._stitch(data)
             events.extend(gap)
         self._heard = False
-        self._last_final_at = self._sent
         # The replay point is covered_ms while it keeps up: at most the overlap
-        # behind the audio sent when this final arrived. A covered_ms that
-        # stopped moving (a broken Deepgram chain, forced Gladia finals) would
-        # pin the log and turn every later drop into a gap, so it then falls
-        # back to the overlap rule like a provider without covered_ms.
+        # behind the audio delivered when this final arrived. A covered_ms
+        # that stopped moving would pin the log and turn every later drop into
+        # a gap, so it then falls back to the overlap rule.
         covered = data.get("covered_ms")
-        overlap_start = self._sent - self._position(self._limits.overlap_ms)
-        if (
-            self._confirmed
-            and type(covered) is int
-            and covered >= 0
-            and self._position(covered) >= overlap_start
-        ):
-            self._covered_seen = True
-            self._advance(self._position(covered), exact=True)
+        overlap_start = arrived - self._position(self._limits.overlap_ms)
+        if self._confirmed and type(covered) is int and covered >= 0:
+            position = self._position(covered)
+            if position >= overlap_start:
+                self._covered_seen = True
+                self._advance(position, exact=True)
+            else:
+                self._advance(overlap_start, exact=False)
         else:
+            covered = None
             self._advance(overlap_start, exact=False)
-        if not self._draining and self._sent > self._replay_end:
-            # A final on audio sent after the last replay: the stream works.
-            self._attempts = 0
+        segments = _timed_segments(data)
+        end_ms = self._timeline_ms(segments[-1]["end_ms"]) if segments else None
+        if self._on_new_audio(covered, end_ms, arrived):
+            # A final on audio sent after the last replay: the stream works,
+            # so the next drop starts a new outage.
+            self._attempts, self._deadline = 0, None
         text = data.get("text")
-        if isinstance(text, str):
-            self._tail.extend(word for _, word in _words(text))
+        if isinstance(text, str) and deliver:
+            words = [word for _, word in _words(text)]
+            if words:
+                self._history.append(_Final(words, end_ms, arrived))
         if deliver:
             _final_span(data)
-            events.append(CanonicalEvent(type=kind, data=data))
+            events.append(CanonicalEvent(type="transcript.final", data=data))
         return events
+
+    def _ours(self, commit_id: str) -> bool:
+        match = _COMMIT_ID.fullmatch(commit_id)
+        return match is not None and int(match.group(1)) <= self._commit_seq
+
+    def _on_new_audio(
+        self, covered: int | None, end_ms: int | None, arrived: int
+    ) -> bool:
+        if covered is not None:
+            return self._position(covered) > self._replay_end
+        if end_ms is not None:
+            return self._position(end_ms) > self._replay_end
+        # Untimed: a final arriving once the overlap past the replay has been
+        # delivered can no longer be about the replay alone.
+        return arrived > self._replay_end + self._position(self._limits.overlap_ms)
 
     def _stitch(self, data: dict[str, Any]) -> tuple[list[CanonicalEvent], bool]:
         """Drop the words of a final that repeat what was already delivered.
 
-        Returns a gap event when the overlap cannot be matched, and whether the
-        final still has anything to deliver.
+        Both sides are on one timeline, so time decides: a new segment that
+        ends by the time the last old word ended is a repeat. Text matching
+        only confirms a segment that straddles that point, or stands in when
+        the segments carry no times. Returns a gap event when the seam cannot
+        be matched, and whether the final still has anything to deliver.
         """
-        assert self._seam is not None
-        text: str = data["text"]
-        words = _words(text)
+        seam = self._seam
+        assert seam is not None
+        words = _words(data["text"])
         head = [word for _, word in words]
-        if self._seam_aligned:
-            length = min(len(head), len(self._seam))
-            start = 0 if head[:length] == self._seam[:length] else None
+        segments = _timed_segments(data)
+        counts = [len(_words(segment["text"])) for segment in segments or []]
+        if (
+            seam.old_end_ms is not None
+            and segments is not None
+            and sum(counts) == len(words)
+        ):
+            repeated, kept, done, gap = 0, [], False, False
+            for segment, count in zip(segments, counts):
+                start = self._timeline_ms(segment["start_ms"])
+                end = self._timeline_ms(segment["end_ms"])
+                if done:
+                    kept.append(segment)
+                elif end <= seam.old_end_ms + SEAM_TOLERANCE_MS:
+                    repeated += count
+                elif start >= seam.old_end_ms - SEAM_TOLERANCE_MS:
+                    kept.append(segment)
+                    done = True
+                else:
+                    # Straddles the seam: only its text can say how much of it
+                    # was already delivered.
+                    own = head[repeated : repeated + count]
+                    overlap = 0
+                    for size in range(min(len(own), len(seam.old_words)), 0, -1):
+                        if own[:size] == seam.old_words[-size:]:
+                            overlap = size
+                            break
+                    if overlap:
+                        repeated += overlap
+                    else:
+                        gap = True
+                    kept.append(segment)
+                    done = True
+            if done:
+                self._seam = None
+            self._cut_words(data, words, repeated)
+            if kept:
+                data["segments"] = kept
+            else:
+                data.pop("segments", None)
+            events = [self._gap_event(seam)] if gap else []
+            return events, bool(data["text"]) or "commit_id" in data
+        if not seam.old_words:
+            self._seam = None
+            return [], True
+        if seam.aligned:
+            length = min(len(head), len(seam.old_words))
+            start = 0 if head[:length] == seam.old_words[:length] else None
         else:
-            start = align(self._seam, head)
+            start = align(seam.old_words, head)
         if start is None:
             self._seam = None
-            gap = CanonicalEvent(
-                type="session.gap",
-                data={"from_ms": self._seam_span[0], "to_ms": self._seam_span[1]},
-            )
-            return [gap], True
-        repeated = min(len(head), len(self._seam) - start)
-        rest = self._seam[start + repeated :]
-        self._seam, self._seam_aligned = (rest, True) if rest and repeated == len(head) else (None, False)
-        tokens = text.split()
-        data["text"] = " ".join(tokens[words[repeated - 1][0] + 1 :])
+            return [self._gap_event(seam)], True
+        repeated = min(len(head), len(seam.old_words) - start)
+        rest = seam.old_words[start + repeated :]
+        if rest and repeated == len(head):
+            seam.old_words, seam.aligned = rest, True
+        else:
+            self._seam = None
+        self._cut_words(data, words, repeated)
         _drop_segment_words(data, repeated)
         return [], bool(data["text"]) or "commit_id" in data
 
-    def _fail_pending(self, reason: str, *, only: list[_Commit] | None = None) -> list[CanonicalEvent]:
-        failed = list(self._pending.values()) if only is None else only
+    @staticmethod
+    def _cut_words(
+        data: dict[str, Any], words: list[tuple[int, str]], count: int
+    ) -> None:
+        if count:
+            tokens = data["text"].split()
+            data["text"] = " ".join(tokens[words[count - 1][0] + 1 :])
+
+    @staticmethod
+    def _gap_event(seam: _Seam) -> CanonicalEvent:
+        return CanonicalEvent(
+            type="session.gap", data={"from_ms": seam.from_ms, "to_ms": seam.to_ms}
+        )
+
+    def _fail_commits(
+        self, commits: list[_Commit], reason: str
+    ) -> list[CanonicalEvent]:
         events = []
-        for commit in failed:
-            self._pending.pop(commit.commit_id, None)
-            self._log = [entry for entry in self._log if entry is not commit]
+        for commit in commits:
+            commit_id = commit.commit_id
+            if commit_id is None or self._pending.pop(commit_id, None) is None:
+                continue
+            # Its flush still goes out, without an id nobody would answer.
+            commit.commit_id = None
             events.append(
                 CanonicalEvent(
                     type="transcript.final",
-                    data={"text": "", "commit_id": commit.commit_id, "commit_failed": reason},
+                    data={
+                        "text": "",
+                        "commit_id": commit_id,
+                        "commit_failed": reason,
+                    },
                 )
             )
         return events
 
+    def _fail_pending(self, reason: str) -> list[CanonicalEvent]:
+        return self._fail_commits(list(self._pending.values()), reason)
+
     # Recovery -------------------------------------------------------------
 
-    def _continuation_configure(self) -> tuple[str, bool]:
+    def _continuation_configure(self, start: int) -> tuple[str, bool]:
         """The configure frame for the next session, and whether it continues."""
         configure = dict(self._configure)
         request_id = self.metadata.get("request_id")
@@ -514,7 +718,7 @@ class ContinuingSpeechSession:
         if asked:
             configure["continuation"] = {
                 "of": request_id,
-                "audio_offset_ms": self._ms(self._trim),
+                "audio_offset_ms": self._ms(start),
             }
         return json.dumps(configure, separators=(",", ":")), asked
 
@@ -527,13 +731,12 @@ class ContinuingSpeechSession:
         )
 
     async def _recover(self, cause: str) -> AsyncIterator[CanonicalEvent]:
-        self._live = False
-        self._down_at = min(self._down_at, self._sent)
+        self._live, self._recovering = False, True
         if self._drainer is not None:
             self._drainer.cancel()
             self._drainer = None
         self._draining = False
-        self._backlog.clear()
+        self._queue.clear()
         await self._ws.close()
         yield CanonicalEvent(type="session.reconnecting", data={"cause": cause})
         # Not while there is no audio to send: a new session would bill an idle
@@ -549,55 +752,73 @@ class ContinuingSpeechSession:
             await self._input.wait()
         if self._closed:
             return
-        deadline = time.monotonic() + self._limits.outage_seconds
-        # The seam's audio offset is the trim point. It cannot move while no
-        # session runs, so a retried dial sends the same configure bytes.
-        key, (configure, asked) = str(uuid.uuid4()), self._continuation_configure()
-        while True:
-            if self._closed:
-                return
-            remaining = deadline - time.monotonic()
-            if self._attempts >= self._limits.max_attempts or remaining <= 0:
-                for event in self._fail_pending("stream_not_continued"):
-                    yield event
-                raise self._give_up(cause)
-            self._attempts += 1
-            try:
-                websocket, ready = await self._dial(configure, key)
-            except DialUnknown:
-                # The server may have started this request: same key, same
-                # bytes, so it answers this one rather than starting another.
-                await asyncio.sleep(min(self._limits.retry_delay, remaining))
-                continue
-            except DialRefused as refusal:
-                cause = refusal.code
-                if refusal.code == "request_in_progress":
-                    self._attempts -= 1
-                elif refusal.code == "request_already_started":
-                    key = str(uuid.uuid4())
+        # One budget per outage: repeated drops share it until a final on new
+        # audio proves the stream works again.
+        if self._deadline is None:
+            self._deadline = time.monotonic() + self._limits.outage_seconds
+        # The log is not trimmed while a session is being opened, so the
+        # offset the dial names stays the replay's start, and a retried dial
+        # sends the same bytes.
+        self._pinned = True
+        try:
+            start = max(self._trim, self._log_start())
+            key = str(uuid.uuid4())
+            configure, asked = self._continuation_configure(start)
+            while True:
+                if self._closed:
+                    return
+                remaining = self._deadline - time.monotonic()
+                if self._attempts >= self._limits.max_attempts or remaining <= 0:
+                    raise self._give_up(cause)
+                self._attempts += 1
+                try:
+                    websocket, ready = await asyncio.wait_for(
+                        self._dial(configure, key), remaining
+                    )
+                except (DialUnknown, asyncio.TimeoutError):
+                    # The server may have started this request: same key, same
+                    # bytes, so it answers this one rather than starting another.
+                    cause = "dial_unknown"
+                    await self._pause()
                     continue
-                elif refusal.code == "concurrency_exhausted":
-                    # The old session frees its slot shortly; wait inside the
-                    # outage budget without spending an attempt.
-                    self._attempts -= 1
-                    key = str(uuid.uuid4())
-                elif refusal.code in _NEVER_RETRY or not refusal.retryable:
-                    for event in self._fail_pending(refusal.code):
-                        yield event
-                    raise self._give_up(refusal.code) from None
-                else:
-                    key = str(uuid.uuid4())
-                await asyncio.sleep(min(self._limits.retry_delay, remaining))
-                continue
-            replayed = await self._resume(websocket, ready, asked=asked)
-            if replayed is None:
-                # The new socket failed during replay; that session started,
-                # so the next dial needs a new key.
-                key, cause = str(uuid.uuid4()), "socket_closed"
-                continue
-            for event in replayed:
-                yield event
-            return
+                except DialRefused as refusal:
+                    cause = refusal.code
+                    if refusal.code == "request_in_progress":
+                        self._attempts -= 1
+                    elif refusal.code == "request_already_started":
+                        key = str(uuid.uuid4())
+                        continue
+                    elif refusal.code == "concurrency_exhausted":
+                        # The old session frees its slot shortly; wait inside the
+                        # outage budget without spending an attempt.
+                        self._attempts -= 1
+                        key = str(uuid.uuid4())
+                    elif refusal.code in _NEVER_RETRY or not refusal.retryable:
+                        raise self._give_up(refusal.code) from None
+                    else:
+                        key = str(uuid.uuid4())
+                    await self._pause()
+                    continue
+                for event in await self._resume(
+                    websocket, ready, asked=asked, start=start
+                ):
+                    yield event
+                return
+        finally:
+            self._pinned = False
+
+    async def _pause(self) -> None:
+        assert self._deadline is not None
+        remaining = self._deadline - time.monotonic()
+        if remaining > 0:
+            await asyncio.sleep(min(self._limits.retry_delay, remaining))
+
+    def _pieces(self, entry: _Audio) -> list[_Audio]:
+        size = max(self._frame, self._position(self._limits.replay_frame_ms))
+        return [
+            _Audio(entry.start + offset, entry.data[offset : offset + size])
+            for offset in range(0, len(entry.data), size)
+        ]
 
     async def _resume(
         self,
@@ -605,102 +826,140 @@ class ContinuingSpeechSession:
         ready: dict[str, Any],
         *,
         asked: bool,
-    ) -> list[CanonicalEvent] | None:
+        start: int,
+    ) -> list[CanonicalEvent]:
         events: list[CanonicalEvent] = []
         confirmed = asked and ready.get("continuation") is True
         async with self._lock:
-            log_start = self._log_start()
-            lost = log_start > self._trim
+            if self._closed:
+                # Cancelled while dialling: the new session is never used.
+                await websocket.close()
+                return []
+            # Audio between the replay point and the log's start fell out
+            # while speech was heard: report it, and fail the commits whose
+            # own audio lay there. Later commits keep their whole audio.
+            lost = start > self._trim
             if lost:
+                lost_from, lost_to = self._trim, start
                 events.extend(
-                    self._fail_pending(
+                    self._fail_commits(
+                        [
+                            commit
+                            for commit in self._pending.values()
+                            if commit.position > lost_from
+                            and commit.audio_from < lost_to
+                        ],
                         "audio_fell_out_of_log",
-                        only=[c for c in self._pending.values() if c.position > self._trim],
                     )
                 )
                 events.append(
                     CanonicalEvent(
                         type="session.gap",
-                        data={"from_ms": self._ms(self._trim), "to_ms": self._ms(log_start)},
+                        data={
+                            "from_ms": self._ms(lost_from),
+                            "to_ms": self._ms(lost_to),
+                        },
                     )
                 )
-            self._ws, self._live = websocket, True
-            self._down_at = 1 << 62
-            self._confirmed = confirmed
+                self._trim = start
             self._commit_ids = ready.get("commit_ids") is True
+            if not self._commit_ids:
+                # Ids the new session will not echo could never be answered:
+                # fail those commits and send their markers without ids.
+                events.extend(self._fail_pending("commit_ids_not_echoed"))
+            self._ws, self._live = websocket, True
+            self._confirmed = confirmed
+            self._base = 0 if confirmed else start
+            self._delivered = start
             self.metadata = {
                 **self.metadata,
                 "request_id": ready["request_id"],
                 "route": dict(ready["route"]),
             }
-            # The log goes out paced, from a task, while the reader takes the new
-            # session's events; input that arrives meanwhile joins the backlog.
-            self._backlog = deque(self._log)
+            # Old finals that may hold words inside the replay. Without them
+            # the replay repeats nothing already delivered.
+            start_ms = self._ms(start)
+            window = [
+                final
+                for final in self._history
+                if (final.end_ms is not None and final.end_ms > start_ms)
+                or (final.end_ms is None and final.arrived > start)
+            ]
+            self._seam = None
+            if window:
+                self._seam = _Seam(
+                    from_ms=start_ms,
+                    to_ms=self._ms(self._appended),
+                    old_words=[word for final in window for word in final.words],
+                    old_end_ms=window[-1].end_ms
+                    if all(final.end_ms is not None for final in window)
+                    else None,
+                )
+            self._queue = deque()
+            for entry in self._log:
+                if isinstance(entry, _Audio):
+                    self._queue.extend(self._pieces(entry))
+                else:
+                    if (
+                        entry.commit_id is not None
+                        and entry.commit_id not in self._pending
+                    ):
+                        entry = _Commit(entry.position, None, entry.audio_from)
+                    self._queue.append(entry)
+            self._replay_end = self._appended
+            replayed_ms = self._ms(self._appended - start)
+            exact = self._exact and self._seam is None and not lost
+            # The replay begins before the app hears about it. A failed first
+            # write is a drop like any other: the reader finds this socket
+            # closed and continues again.
+            loop = asyncio.get_running_loop()
+            started, sent = loop.time(), 0
+            if self._queue:
+                first = self._queue.popleft()
+                await self._deliver(first)
+                if isinstance(first, _Audio):
+                    sent = len(first.data)
             self._draining = True
-            self._replay_end = self._sent
-            self._drainer = asyncio.get_running_loop().create_task(
-                self._drain(websocket), name="speko.relay.stt.replay"
+            self._drainer = loop.create_task(
+                self._drain(websocket, started, sent), name="speko.relay.stt.replay"
             )
-            replayed_ms = self._ms(self._sent - max(self._trim, log_start))
-            if not self._exact and self._tail and self._trim < self._last_final_at:
-                self._seam, self._seam_aligned = list(self._tail), False
-                self._seam_span = (self._ms(self._trim), self._ms(self._sent))
-            else:
-                self._seam = None
-            if confirmed:
-                events.append(
-                    CanonicalEvent(
-                        type="session.continued",
-                        data={
-                            "request_id": ready["request_id"],
-                            "route": dict(ready["route"]),
-                            "replayed_ms": replayed_ms,
-                            "exact": self._exact and not lost,
-                        },
-                    )
-                )
-            else:
-                events.append(
-                    CanonicalEvent(
-                        type="session.restarted",
-                        data={
-                            "request_id": ready["request_id"],
-                            "route": dict(ready["route"]),
-                            "replayed_ms": replayed_ms,
-                            "from_ms": self._ms(max(self._trim, log_start)),
-                        },
-                    )
-                )
+        kind = "session.continued" if confirmed else "session.restarted"
+        data: dict[str, Any] = {
+            "request_id": ready["request_id"],
+            "route": dict(ready["route"]),
+            "replayed_ms": replayed_ms,
+        }
+        if confirmed:
+            data["exact"] = exact
+        else:
+            data["from_ms"] = start_ms
+        events.append(CanonicalEvent(type=kind, data=data))
         return events
 
-    async def _drain(self, websocket: aiohttp.ClientWebSocketResponse) -> None:
-        """Send the backlog in order at no more than replay_speed x realtime,
-        then hand over to live sends."""
+    async def _drain(
+        self, websocket: aiohttp.ClientWebSocketResponse, started: float, sent: int
+    ) -> None:
+        """Send the backlog in order, in frames, at no more than replay_speed x
+        realtime, then hand over to live sends."""
         loop = asyncio.get_running_loop()
-        started, sent = loop.time(), 0
         rate = self._bytes_per_second * self._limits.replay_speed
         while True:
-            async with self._lock:
-                if self._ws is not websocket or not self._live:
-                    return
-                if not self._backlog:
-                    self._draining = False
-                    self._replay_end = self._sent
-                    if self._finishing:
-                        await self._send_live({"type": "session.close"})
-                    self._drainer = None
-                    return
-                entry = self._backlog.popleft()
-                if isinstance(entry, _Audio):
-                    await self._send_live(entry.data)
-                    sent += len(entry.data)
-                else:
-                    await self._send_live(
-                        {"type": "input.commit", "commit_id": entry.commit_id}
-                    )
             delay = started + sent / rate - loop.time()
             if delay > 0:
                 await asyncio.sleep(delay)
+            async with self._lock:
+                if self._ws is not websocket or not self._live or self._closed:
+                    return
+                if not self._queue:
+                    self._draining = self._recovering = False
+                    self._drainer = None
+                    if self._finishing:
+                        await self._send_control({"type": "session.close"})
+                    return
+                entry = self._queue.popleft()
+                await self._deliver(entry)
+                if isinstance(entry, _Audio):
+                    sent += len(entry.data)
 
 
 def _payload(raw: Any) -> dict[str, Any]:

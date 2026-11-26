@@ -56,6 +56,12 @@ class FakeRelay:
     refuse: Callable[[int], dict[str, Any] | None] = lambda _: None
     # covered_ms stops moving at this value (a broken chain), when set.
     freeze_covered: int | None = None
+    # False: finals carry no segment times (text-only seams).
+    timed: bool = True
+    # False: session.ready does not promise to echo commit ids.
+    commit_ids: bool = True
+    # Seconds a dial waits before session.ready, by dial index.
+    ready_delay: Callable[[int], float] = lambda _: 0.0
     # Per connection: ("bytes", monotonic time, total) and ("commit", total).
     received: dict[int, list[tuple]] = field(default_factory=dict)
     dials: list[Dial] = field(default_factory=list)
@@ -95,8 +101,12 @@ class FakeRelay:
             "type": "session.ready",
             "request_id": f"req_{connection}",
             "route": {"provider": "fixture", "model": "fixture-model", "region": "r1"},
-            "commit_ids": True,
         }
+        if self.commit_ids:
+            ready["commit_ids"] = True
+        delay = self.ready_delay(dial_index)
+        if delay:
+            await asyncio.sleep(delay)
         if confirmed:
             ready["continuation"] = True
         await ws.send_json(ready)
@@ -106,12 +116,12 @@ class FakeRelay:
             nonlocal pending, finals
             words = [word for word, _ in pending]
             payload: dict[str, Any] = {"type": "transcript.final", "text": " ".join(words)}
-            if pending:
+            if pending and self.timed:
                 payload["segments"] = [
                     {"text": word, "start_ms": start, "end_ms": start + BLOCK_MS}
                     for word, start in pending
                 ]
-            if commit_id is not None:
+            if commit_id is not None and self.commit_ids:
                 payload["commit_id"] = commit_id
             if confirmed and self.covered:
                 payload["covered_ms"] = offset + (received // BLOCK) * BLOCK_MS
@@ -467,7 +477,7 @@ async def test_overlap_seam_without_covered_ms():
 async def test_unclear_overlap_reports_a_gap_instead_of_guessing():
     # Every word sounds the same, so no place in the old tail fits best.
     values = [7] * 40
-    fake = FakeRelay(covered=False, drop=lambda conn, event, info: conn == 0 and event == "bytes" and info == 23 * BLOCK)
+    fake = FakeRelay(covered=False, timed=False, drop=lambda conn, event, info: conn == 0 and event == "bytes" and info == 23 * BLOCK)
     events, _, _ = await run(fake, values, chunk=BLOCK)
     assert [event for event in events if event.type == "session.gap"]
 
@@ -612,3 +622,346 @@ async def test_backlog_is_paced_and_commits_stay_in_place():
     for moment, total in times:
         assert total <= rate * (moment - first) + 2 * BLOCK, (moment - first, total)
     assert times[-1][0] - first >= (20 * BLOCK - 2 * BLOCK) / rate
+
+
+# Unit checks on one session over a stub socket -------------------------------
+
+
+class StubSocket:
+    """Records what the session writes; replays scripted incoming frames."""
+
+    def __init__(self, incoming: list[dict[str, Any]] | None = None, fail: bool = False) -> None:
+        self.incoming = list(incoming or [])
+        self.fail = fail
+        self.sent: list[Any] = []
+        self.closed = False
+
+    async def send_bytes(self, data: bytes) -> None:
+        if self.fail or self.closed:
+            raise ConnectionResetError("closed")
+        self.sent.append(data)
+
+    async def send_json(self, value: Any) -> None:
+        if self.fail or self.closed:
+            raise ConnectionResetError("closed")
+        self.sent.append(value)
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def __aiter__(self):
+        return self._messages()
+
+    async def _messages(self):
+        for value in self.incoming:
+            yield aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, json.dumps(value), None)
+        yield aiohttp.WSMessage(aiohttp.WSMsgType.CLOSE, None, None)
+
+
+READY = {"type": "session.ready", "request_id": "req_0", "route": {"provider": "fixture"}, "continuation": True, "commit_ids": True}
+
+
+def stub_session(socket: StubSocket, dial=None, **limits: Any) -> ContinuingSpeechSession:
+    async def no_dial(configure, key):
+        raise AssertionError("no dial expected")
+
+    return ContinuingSpeechSession(
+        dial=dial or no_dial,
+        configure={"type": "session.configure"},
+        websocket=socket,
+        ready=READY,
+        metadata={"request_id": "req_0", "route": {"provider": "fixture"}},
+        sample_rate=RATE,
+        channels=1,
+        limits=Limits(retry_delay=0.01, replay_speed=50, **limits),
+    )
+
+
+def ms(value: int) -> int:
+    return value * RATE * 2 // 1000
+
+
+async def test_failed_sends_are_not_delivered_and_never_dropped():
+    session = stub_session(StubSocket(fail=True), log_cap_ms=1_000)
+    for _ in range(30):
+        await session.send_audio(block(1))
+    # Nothing reached a provider: nothing is delivered, nothing is silence.
+    assert session._delivered == 0
+    assert session._log_start() == 0
+    session._on_final({"text": "", "covered_ms": 2_000})
+    assert session._trim == 0
+
+
+async def test_queued_audio_does_not_make_covered_ms_stale():
+    # 2 s delivered, then 10 s queued while the socket is down. A final
+    # covering 1 s is fresh against what was delivered (not what was queued),
+    # so it stays the exact replay point.
+    socket = StubSocket()
+    session = stub_session(socket, log_cap_ms=1_000)
+    for _ in range(20):
+        await session.send_audio(block(1))
+    session._heard = True  # speech: the cap may not treat it as silence
+    session._live, session._recovering = False, True
+    for _ in range(100):
+        await session.send_audio(block(2))
+    assert session._delivered == ms(2_000)
+    session._on_final({"text": "w1", "covered_ms": 1_000})
+    assert session._trim == ms(1_000) and session._exact
+    # The cap never cuts past what was delivered.
+    assert session._log_start() <= session._delivered
+
+
+def seam_session(old: list[tuple[str, int | None]], start_ms: int) -> ContinuingSpeechSession:
+    from speko_gateway._relay_continuation import _Final
+
+    session = stub_session(StubSocket())
+    for text, end_ms in old:
+        session._history.append(_Final(text.split(), end_ms, ms(start_ms + 5_000)))
+    return session
+
+
+async def resume(session: ContinuingSpeechSession, start_ms: int, ready: dict[str, Any] | None = None) -> tuple[list[Any], StubSocket]:
+    socket = StubSocket()
+    events = await session._resume(socket, ready or READY, asked=True, start=ms(start_ms))
+    return events, socket
+
+
+def seg(text: str, start: int, end: int) -> dict[str, Any]:
+    return {"text": text, "start_ms": start, "end_ms": end}
+
+
+async def test_seam_drops_repeats_by_time_and_keeps_new_repeats_of_old_words():
+    session = seam_session([("we said yes", 1_000)], 500)
+    from speko_gateway._relay_continuation import _Audio
+
+    session._log = [_Audio(ms(500), block(1) * 30)]
+    session._appended = session._log[0].end
+    await resume(session, 500)
+    # "yes yes please" after a pause: it all starts after the last old word
+    # ended, so none of it is a repeat, although "yes" matches the old text.
+    final = {"text": "yes yes please", "segments": [seg("yes", 3_000, 3_100), seg("yes", 3_200, 3_300), seg("please", 3_400, 3_500)]}
+    events = session._on_final(final)
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "yes yes please"
+    await session.aclose()
+
+
+@pytest.mark.parametrize("old, new, new_end", [("about 1.5", "15", 1_000), ("about twenty one", "21", 990)])
+async def test_seam_by_time_ignores_how_numbers_are_written(old, new, new_end):
+    from speko_gateway._relay_continuation import _Audio
+
+    session = seam_session([(old, 1_000)], 500)
+    session._log = [_Audio(ms(500), block(1) * 30)]
+    session._appended = session._log[0].end
+    await resume(session, 500)
+    final = {"text": f"{new} apples", "segments": [seg(new, 800, new_end), seg("apples", 1_100, 1_200)]}
+    events = session._on_final(final)
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "apples"
+    assert [segment["text"] for segment in events[0].data["segments"]] == ["apples"]
+    await session.aclose()
+
+
+@pytest.mark.parametrize("old, new", [("about 1.5", "15 apples"), ("about twenty one", "21 apples")])
+async def test_untimed_seam_does_not_guess_on_numbers(old, new):
+    from speko_gateway._relay_continuation import _Audio
+
+    session = seam_session([(old, None)], 500)
+    session._log = [_Audio(ms(500), block(1) * 30)]
+    session._appended = session._log[0].end
+    await resume(session, 500)
+    events = session._on_final({"text": new})
+    # Neither a false match ("1.5" is not "15") nor a silent duplicate.
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[1].data["text"] == new
+    await session.aclose()
+
+
+async def test_seam_only_looks_at_old_words_inside_the_replay():
+    from speko_gateway._relay_continuation import _Audio
+
+    session = seam_session([("yes yes", 400)], 500)
+    session._log = [_Audio(ms(500), block(1) * 30)]
+    session._appended = session._log[0].end
+    await resume(session, 500)
+    assert session._seam is None
+    events = session._on_final({"text": "yes yes please"})
+    assert events[0].data["text"] == "yes yes please"
+    await session.aclose()
+
+
+async def test_cancel_during_dial_adopts_no_socket():
+    adopted = StubSocket()
+    dialing = asyncio.Event()
+    release = asyncio.Event()
+
+    async def dial(configure, key):
+        dialing.set()
+        await release.wait()
+        return adopted, {**READY, "request_id": "req_1"}
+
+    session = stub_session(StubSocket(), dial=dial)
+    await session.send_audio(block(1))
+    collected = []
+
+    async def read():
+        async for event in session.events():
+            collected.append(event)
+
+    reader = asyncio.create_task(read())
+    await asyncio.wait_for(dialing.wait(), 2)
+    await session.cancel()
+    release.set()
+    await asyncio.wait_for(reader, 2)
+    assert adopted.closed and adopted.sent == []
+    assert [event.type for event in collected] == ["session.reconnecting"]
+    with pytest.raises(GatewayError):
+        await session.send_audio(block(2))
+
+
+async def test_commit_ids_reach_the_app_once():
+    session = stub_session(StubSocket())
+    await session.send_audio(block(1))
+    commit_id = await session.commit_audio()
+    first = session._on_final({"text": "w1", "commit_id": commit_id})
+    again = session._on_final({"text": "", "commit_id": commit_id})
+    assert first[-1].data["commit_id"] == commit_id
+    assert "commit_id" not in again[-1].data
+
+
+async def test_session_closed_resolves_pending_commits():
+    socket = StubSocket([{"type": "session.closed", "usage": {"duration_ms": 100}}])
+    session = stub_session(socket)
+    await session.send_audio(block(1))
+    commit_id = await session.commit_audio()
+    events = [event async for event in session.events()]
+    failed = [event for event in finals(events) if event.data.get("commit_failed")]
+    assert [(event.data["commit_id"], event.data["commit_failed"]) for event in failed] == [(commit_id, "session_closed")]
+    assert events[-1].type == "session.closed"
+
+
+async def test_any_dial_failure_resolves_pending_commits():
+    async def dial(configure, key):
+        raise RuntimeError("unexpected")
+
+    session = stub_session(StubSocket(), dial=dial)
+    await session.send_audio(block(1))
+    commit_id = await session.commit_audio()
+    events = []
+    with pytest.raises(RuntimeError):
+        async for event in session.events():
+            events.append(event)
+    assert [event.data["commit_id"] for event in finals(events)] == [commit_id]
+    assert finals(events)[0].data["commit_failed"] == "stream_failed"
+
+
+async def test_overflow_fails_only_commits_whose_own_audio_fell_out():
+    from speko_gateway._relay_continuation import _Audio, _Commit
+
+    session = stub_session(StubSocket())
+    early = _Commit(ms(1_000), "speko-c1", 0)
+    late = _Commit(ms(3_000), "speko-c2", ms(2_500))
+    session._commit_seq = 2
+    session._pending = {"speko-c1": early, "speko-c2": late}
+    session._log = [early, _Audio(ms(2_000), block(1) * 20), late]
+    session._appended = ms(4_000)
+    events, _ = await resume(session, 2_000)
+    failed = [event.data["commit_id"] for event in finals(events)]
+    assert failed == ["speko-c1"]
+    assert "speko-c2" in session._pending
+    gap = next(event for event in events if event.type == "session.gap")
+    assert gap.data == {"from_ms": 0, "to_ms": 2_000}
+    await session.aclose()
+
+
+async def test_offset_is_the_replay_start_after_overflow():
+    values = list(range(1, 31))
+    fake = FakeRelay(final_every=100, drop=lambda conn, event, info: conn == 0 and event == "bytes" and info == 25 * BLOCK)
+    events, _, _ = await run(fake, values, chunk=BLOCK, limits=Limits(retry_delay=0.01, log_cap_ms=1_000, replay_speed=50))
+    gap = next(event for event in events if event.type == "session.gap")
+    offset = json.loads(fake.dials[1].configure)["continuation"]["audio_offset_ms"]
+    assert offset == gap.data["to_ms"] > 0
+    # Words after the gap sit at their own place on the one timeline.
+    assert_timeline(events, values)
+    assert words(events)[-1] == "w30"
+
+
+async def test_repeated_drops_share_one_outage_budget():
+    # Every new session drops after one replayed block, before any final on
+    # new audio: that is one outage, so three attempts in all.
+    fake = FakeRelay(drop=lambda conn, event, info: (conn == 0 and event == "bytes" and info == 15 * BLOCK) or (conn >= 1 and event == "bytes" and info >= BLOCK))
+    with pytest.raises(GatewayError):
+        await run(fake, VALUES)
+    assert len(fake.dials) == 1 + 3
+
+
+async def test_a_dial_is_bounded_by_the_remaining_budget():
+    dials = []
+
+    async def dial(configure, key):
+        dials.append(key)
+        await asyncio.sleep(5)
+        raise AssertionError("not reached")
+
+    session = stub_session(StubSocket(), dial=dial, outage_seconds=0.3)
+    await session.send_audio(block(1))
+    started = time.monotonic()
+    with pytest.raises(GatewayError):
+        async for _ in session.events():
+            pass
+    assert time.monotonic() - started < 1
+    # The timed-out dial may have started a session: its retry reuses the key.
+    assert len(set(dials)) == 1
+
+
+async def test_unanswered_commits_and_undelivered_audio_are_bounded():
+    session = stub_session(StubSocket(), max_pending_commits=2)
+    await session.commit_audio()
+    await session.commit_audio()
+    with pytest.raises(GatewayError):
+        await session.commit_audio()
+
+    session = stub_session(StubSocket(), log_cap_ms=500, outage_seconds=0.5)
+    session._live, session._recovering = False, True
+    with pytest.raises(GatewayError):
+        for _ in range(20):
+            await session.send_audio(block(1))
+    assert len(session._log) <= 11
+
+
+async def test_replay_starts_before_continued_and_goes_in_small_frames():
+    from speko_gateway._relay_continuation import _Audio
+
+    session = stub_session(StubSocket())
+    session._log = [_Audio(0, block(1) * 50)]
+    session._appended = session._log[0].end
+    events, socket = await resume(session, 0)
+    # The first frame is out by the time session.continued is reported.
+    assert events[-1].type == "session.continued"
+    assert len(socket.sent) == 1 and len(socket.sent[0]) == BLOCK
+    await asyncio.sleep(0.3)
+    assert all(len(frame) <= BLOCK for frame in socket.sent if isinstance(frame, bytes))
+    assert sum(len(frame) for frame in socket.sent if isinstance(frame, bytes)) == 50 * BLOCK
+    await session.aclose()
+
+
+async def test_without_commit_ids_flush_keeps_its_place():
+    values = list(range(1, 21))
+    fake = FakeRelay(commit_ids=False, final_every=100, drop=lambda conn, event, info: conn == 0 and event == "commit")
+    events, commits, _ = await run(fake, values, chunk=BLOCK, commits=(9,), limits=Limits(retry_delay=0.01))
+    assert commits == [None]
+    assert words(events) == expected(values)
+    assert ("commit", 10 * BLOCK) in fake.received[1]
+
+
+async def test_ids_the_new_session_will_not_echo_are_not_sent():
+    session = stub_session(StubSocket())
+    session._live = False
+    await session.send_audio(block(1))
+    commit_id = await session.commit_audio()
+    events, socket = await resume(session, 0, {**READY, "request_id": "req_1", "commit_ids": False})
+    assert [(event.data["commit_id"], event.data["commit_failed"]) for event in finals(events)] == [(commit_id, "commit_ids_not_echoed")]
+    await asyncio.sleep(0.2)
+    assert {"type": "input.commit"} in socket.sent
+    assert not [frame for frame in socket.sent if isinstance(frame, dict) and "commit_id" in frame]
+    await session.aclose()
