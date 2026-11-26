@@ -33,7 +33,6 @@ import (
 	"github.com/SpekoAI/gateway/providers/hamsa"
 	"github.com/SpekoAI/gateway/providers/hopper"
 	"github.com/SpekoAI/gateway/providers/inworld"
-	"github.com/SpekoAI/gateway/providers/maya"
 	"github.com/SpekoAI/gateway/providers/meta"
 	"github.com/SpekoAI/gateway/providers/minimax"
 	"github.com/SpekoAI/gateway/providers/modulate"
@@ -287,10 +286,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	mayaTTSAdapter, err := maya.New(maya.Config{})
-	if err != nil {
-		return err
-	}
 	speechifyTTSAdapter, err := speechify.New(speechify.Config{})
 	if err != nil {
 		return err
@@ -344,7 +339,7 @@ func run() error {
 		openaiSTTAdapter, openaiTTSAdapter, openaiRealtimeAdapter, openaiLiveAdapter, xaiRealtimeAdapter, googleRealtimeAdapter, alibabaSTTAdapter, alibabaTTSAdapter,
 		gradiumSTTAdapter, gradiumTTSAdapter, rimeAdapter,
 		inworldSTTAdapter, xaiSTTAdapter, hamsaSTTAdapter,
-		palabraSTTAdapter, palabraTTSAdapter, mayaTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
+		palabraSTTAdapter, palabraTTSAdapter, speechifyTTSAdapter, speechmaticsSTTAdapter,
 		geminiSTTAdapter, geminiTTSAdapter, metaSTTAdapter, nariSTTAdapter, nariTTSAdapter,
 		paxaTTSAdapter, munsitSTTAdapter, munsitTTSAdapter, hamsaTTSAdapter,
 		hopperSTTAdapter, hopperTTSAdapter, omiSTTAdapter,

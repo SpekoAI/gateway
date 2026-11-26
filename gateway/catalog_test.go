@@ -261,20 +261,11 @@ func TestCatalogCarriesADefaultVoiceWhereTheVendorDemandsOne(t *testing.T) {
 	if _, ok := voices["hume"]; ok {
 		t.Fatal("hume TTS is back in the catalog; Hume's TTS API was shut down")
 	}
-}
-
-func TestMayaCatalogUsesCurrentCalyxDefaults(t *testing.T) {
-	t.Parallel()
-	for _, entry := range gateway.Catalog() {
-		if entry.Provider != "maya" || entry.Kind != protocol.SessionKindTTS {
-			continue
-		}
-		if entry.DefaultModel != "Maya Calyx" || entry.DefaultVoice != "Aarav" || len(entry.Models) != 0 {
-			t.Fatalf("Maya catalog entry = %+v, want the single Calyx model with Aarav", entry)
-		}
-		return
+	// maya has no TTS row since its removal: Maya Research is retired and
+	// Speko does not route it.
+	if _, ok := voices["maya"]; ok {
+		t.Fatal("maya TTS is back in the catalog; Maya Research is retired")
 	}
-	t.Fatal("Maya TTS catalog entry is missing")
 }
 
 // Greptile caught both of these on review, and both were real: a published route
