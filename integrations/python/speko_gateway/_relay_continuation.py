@@ -23,6 +23,11 @@ Events this adds to the stream (all other events are unchanged):
   not reliable: its audio fell out of the log, or the overlap could not be
   matched, so words in it may be missing or repeated.
 
+After a continuation the replayed log, and input that arrives meanwhile, goes
+out at no more than 1.25x realtime until it has caught up. Audio the provider
+heard no speech in (no non-empty delta since the last final) that overflows the
+15 s log is silence: it is dropped without a gap.
+
 Every ``input.commit`` resolves with exactly one ``transcript.final`` carrying
 its ``commit_id``. A commit whose audio fell out of the log resolves with an
 empty final that also carries ``commit_failed`` (the reason).
@@ -49,6 +54,11 @@ OVERLAP_MS = 5_000
 MAX_ATTEMPTS = 3
 OUTAGE_SECONDS = 30.0
 RETRY_DELAY_SECONDS = 0.5
+# Deepgram asks for no more than 1.25x realtime: "if you send a large buffer
+# of audio, the stream may wind up being significantly delayed"; Speechmatics
+# warns that sending fast fills TCP buffers. The backlog after a continuation
+# goes out no faster than this.
+REPLAY_SPEED = 1.25
 
 # Errors that a new session cannot fix: the same request would fail again, or
 # the account cannot pay for it.
@@ -99,6 +109,7 @@ class Limits:
     max_attempts: int = MAX_ATTEMPTS
     outage_seconds: float = OUTAGE_SECONDS
     retry_delay: float = RETRY_DELAY_SECONDS
+    replay_speed: float = REPLAY_SPEED
 
 
 def _words(text: str) -> list[tuple[int, str]]:
@@ -175,6 +186,20 @@ class ContinuingSpeechSession:
         self._seam_span = (0, 0)
         self._attempts = 0
         self._replay_end = 0
+        # A provider that heard speech says so with deltas; none since the
+        # last final means the audio since then is silence as far as it knows.
+        self._heard = False
+        self._covered_seen = False
+        # Audio sent when the latest final arrived: every delivered word lies
+        # before it, so a replay that starts past it repeats none.
+        self._last_final_at = 0
+        # Where the socket went down: audio past it reached no provider.
+        self._down_at = 1 << 62
+        # After a continuation the log goes out paced from this backlog;
+        # input that arrives meanwhile joins it, in order.
+        self._backlog: deque[_Audio | _Commit] = deque()
+        self._draining = False
+        self._drainer: asyncio.Task[None] | None = None
 
     # Positions ------------------------------------------------------------
 
@@ -205,8 +230,24 @@ class ContinuingSpeechSession:
 
     def _enforce_cap(self) -> None:
         cap = self._position(self._limits.log_cap_ms)
-        if self._sent - self._log_start() > cap:
-            self._drop_audio_before(self._sent - cap)
+        if self._sent - self._log_start() <= cap:
+            return
+        start = self._sent - cap
+        # Audio the live provider heard no speech in is silence: dropping it
+        # loses no word, so the replay point moves past it without a gap. It
+        # stays exact only on a boundary covered_ms proved. Audio sent while
+        # no provider listens, or after speech was heard, is a real loss.
+        silent = (
+            not self._draining
+            and not self._heard
+            and self._log_start() <= self._trim
+        )
+        self._drop_audio_before(start)
+        if silent:
+            # Only up to where the socket went down: no provider heard the
+            # audio after that, so nothing is known about it.
+            self._trim = max(self._trim, min(self._log_start(), self._down_at))
+            self._exact = self._exact and self._covered_seen
 
     def _advance(self, position: int, *, exact: bool) -> None:
         position = max(0, min(position, self._sent))
@@ -238,6 +279,7 @@ class ContinuingSpeechSession:
             # The reader sees the drop and continues the stream; this input
             # is already in the log.
             self._live = False
+            self._down_at = min(self._down_at, self._sent)
 
     async def send_audio(self, data: bytes | bytearray | memoryview) -> None:
         chunk = bytes(data)
@@ -245,11 +287,15 @@ class ContinuingSpeechSession:
             self._check_open()
             if not chunk:
                 return
-            self._log.append(_Audio(self._sent, chunk))
+            entry = _Audio(self._sent, chunk)
+            self._log.append(entry)
             self._sent += len(chunk)
             self._enforce_cap()
             self._input.set()
-            await self._send_live(chunk)
+            if self._draining:
+                self._backlog.append(entry)
+            else:
+                await self._send_live(chunk)
 
     async def commit_audio(self) -> str | None:
         async with self._lock:
@@ -264,7 +310,12 @@ class ContinuingSpeechSession:
             self._log.append(commit)
             self._pending[commit.commit_id] = commit
             self._input.set()
-            await self._send_live({"type": "input.commit", "commit_id": commit.commit_id})
+            if self._draining:
+                self._backlog.append(commit)
+            else:
+                await self._send_live(
+                    {"type": "input.commit", "commit_id": commit.commit_id}
+                )
             return commit.commit_id
 
     async def append_text(self, text: str) -> None:
@@ -282,11 +333,15 @@ class ContinuingSpeechSession:
                 return
             self._finishing = True
             self._input.set()
-            await self._send_live({"type": "session.close"})
+            if not self._draining:
+                # Otherwise the drainer closes once the backlog is out.
+                await self._send_live({"type": "session.close"})
 
     async def aclose(self) -> None:
         self._closed = True
         self._input.set()
+        if self._drainer is not None:
+            self._drainer.cancel()
         await self._ws.close()
 
     # Events ---------------------------------------------------------------
@@ -357,6 +412,8 @@ class ContinuingSpeechSession:
                 raise GatewayError("Relay speech protocol failed", retryable=False)
             return [CanonicalEvent(type="usage.progress", data=payload["usage"])]
         if kind == "transcript.delta":
+            if data.get("text"):
+                self._heard = True
             return [CanonicalEvent(type=kind, data=data)]
         events: list[CanonicalEvent] = []
         commit_id = data.get("commit_id")
@@ -369,18 +426,26 @@ class ContinuingSpeechSession:
         if self._seam is not None and isinstance(text, str) and _words(text):
             gap, deliver = self._stitch(data)
             events.extend(gap)
+        self._heard = False
+        self._last_final_at = self._sent
+        # The replay point is covered_ms while it keeps up: at most the overlap
+        # behind the audio sent when this final arrived. A covered_ms that
+        # stopped moving (a broken Deepgram chain, forced Gladia finals) would
+        # pin the log and turn every later drop into a gap, so it then falls
+        # back to the overlap rule like a provider without covered_ms.
         covered = data.get("covered_ms")
+        overlap_start = self._sent - self._position(self._limits.overlap_ms)
         if (
             self._confirmed
             and type(covered) is int
             and covered >= 0
+            and self._position(covered) >= overlap_start
         ):
+            self._covered_seen = True
             self._advance(self._position(covered), exact=True)
         else:
-            self._advance(
-                self._sent - self._position(self._limits.overlap_ms), exact=False
-            )
-        if self._sent > self._replay_end:
+            self._advance(overlap_start, exact=False)
+        if not self._draining and self._sent > self._replay_end:
             # A final on audio sent after the last replay: the stream works.
             self._attempts = 0
         text = data.get("text")
@@ -463,6 +528,12 @@ class ContinuingSpeechSession:
 
     async def _recover(self, cause: str) -> AsyncIterator[CanonicalEvent]:
         self._live = False
+        self._down_at = min(self._down_at, self._sent)
+        if self._drainer is not None:
+            self._drainer.cancel()
+            self._drainer = None
+        self._draining = False
+        self._backlog.clear()
         await self._ws.close()
         yield CanonicalEvent(type="session.reconnecting", data={"cause": cause})
         # Not while there is no audio to send: a new session would bill an idle
@@ -554,6 +625,7 @@ class ContinuingSpeechSession:
                     )
                 )
             self._ws, self._live = websocket, True
+            self._down_at = 1 << 62
             self._confirmed = confirmed
             self._commit_ids = ready.get("commit_ids") is True
             self.metadata = {
@@ -561,21 +633,16 @@ class ContinuingSpeechSession:
                 "request_id": ready["request_id"],
                 "route": dict(ready["route"]),
             }
-            for entry in self._log:
-                if isinstance(entry, _Audio):
-                    await self._send_live(entry.data)
-                else:
-                    await self._send_live(
-                        {"type": "input.commit", "commit_id": entry.commit_id}
-                    )
-            if self._finishing:
-                await self._send_live({"type": "session.close"})
-            if not self._live:
-                await websocket.close()
-                return None
+            # The log goes out paced, from a task, while the reader takes the new
+            # session's events; input that arrives meanwhile joins the backlog.
+            self._backlog = deque(self._log)
+            self._draining = True
             self._replay_end = self._sent
+            self._drainer = asyncio.get_running_loop().create_task(
+                self._drain(websocket), name="speko.relay.stt.replay"
+            )
             replayed_ms = self._ms(self._sent - max(self._trim, log_start))
-            if not self._exact and self._tail:
+            if not self._exact and self._tail and self._trim < self._last_final_at:
                 self._seam, self._seam_aligned = list(self._tail), False
                 self._seam_span = (self._ms(self._trim), self._ms(self._sent))
             else:
@@ -605,6 +672,35 @@ class ContinuingSpeechSession:
                     )
                 )
         return events
+
+    async def _drain(self, websocket: aiohttp.ClientWebSocketResponse) -> None:
+        """Send the backlog in order at no more than replay_speed x realtime,
+        then hand over to live sends."""
+        loop = asyncio.get_running_loop()
+        started, sent = loop.time(), 0
+        rate = self._bytes_per_second * self._limits.replay_speed
+        while True:
+            async with self._lock:
+                if self._ws is not websocket or not self._live:
+                    return
+                if not self._backlog:
+                    self._draining = False
+                    self._replay_end = self._sent
+                    if self._finishing:
+                        await self._send_live({"type": "session.close"})
+                    self._drainer = None
+                    return
+                entry = self._backlog.popleft()
+                if isinstance(entry, _Audio):
+                    await self._send_live(entry.data)
+                    sent += len(entry.data)
+                else:
+                    await self._send_live(
+                        {"type": "input.commit", "commit_id": entry.commit_id}
+                    )
+            delay = started + sent / rate - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
 
 
 def _payload(raw: Any) -> dict[str, Any]:

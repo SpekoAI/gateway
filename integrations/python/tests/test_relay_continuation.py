@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import struct
+import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -53,6 +54,10 @@ class FakeRelay:
     drop: Callable[[int, str, int], bool] = lambda *_: False
     # refuse(dial index) -> error object sent instead of session.ready.
     refuse: Callable[[int], dict[str, Any] | None] = lambda _: None
+    # covered_ms stops moving at this value (a broken chain), when set.
+    freeze_covered: int | None = None
+    # Per connection: ("bytes", monotonic time, total) and ("commit", total).
+    received: dict[int, list[tuple]] = field(default_factory=dict)
     dials: list[Dial] = field(default_factory=list)
     started: set[str] = field(default_factory=set)
     connections: int = 0
@@ -110,14 +115,18 @@ class FakeRelay:
                 payload["commit_id"] = commit_id
             if confirmed and self.covered:
                 payload["covered_ms"] = offset + (received // BLOCK) * BLOCK_MS
+                if self.freeze_covered is not None:
+                    payload["covered_ms"] = self.freeze_covered
             pending = []
             await ws.send_json(payload)
             finals += 1
 
+        record = self.received.setdefault(connection, [])
         async for message in ws:
             if message.type is aiohttp.WSMsgType.BINARY:
                 buffer += message.data
                 received += len(message.data)
+                record.append(("bytes", time.monotonic(), received))
                 if self.drop(connection, "bytes", received):
                     await ws.close()
                     return ws
@@ -136,6 +145,7 @@ class FakeRelay:
                 continue
             control = json.loads(message.data)
             if control["type"] == "input.commit":
+                record.append(("commit", received))
                 if self.drop(connection, "commit", 0):
                     await ws.close()
                     return ws
@@ -174,7 +184,7 @@ def config() -> SessionConfig:
     )
 
 
-FAST = Limits(retry_delay=0.01)
+FAST = Limits(retry_delay=0.01, replay_speed=50)
 
 
 async def run(
@@ -342,7 +352,7 @@ async def test_concurrency_exhausted_waits_inside_the_outage_budget():
         refuse=lambda index: {"code": "concurrency_exhausted", "retryable": True} if index >= 1 else None,
     )
     with pytest.raises(GatewayError) as failure:
-        await run(fake, VALUES, limits=Limits(retry_delay=0.05, outage_seconds=0.3))
+        await run(fake, VALUES, limits=Limits(retry_delay=0.05, outage_seconds=0.3, replay_speed=50))
     assert failure.value.code == "concurrency_exhausted"
 
 
@@ -466,7 +476,7 @@ async def test_commit_whose_audio_fell_out_of_the_log_fails_once():
     # A 1 s log, no final before the drop, and the drop takes the commit with
     # it: the start of the commit's audio has fallen out of the log.
     fake = FakeRelay(final_every=100, drop=lambda conn, event, info: conn == 0 and event == "commit")
-    events, commits, _ = await run(fake, VALUES, commits=(14,), limits=Limits(retry_delay=0.01, log_cap_ms=1_000))
+    events, commits, _ = await run(fake, VALUES, commits=(14,), limits=Limits(retry_delay=0.01, log_cap_ms=1_000, replay_speed=50))
     failed = [event for event in finals(events) if "commit_failed" in event.data]
     assert [event.data["commit_id"] for event in failed] == commits
     assert failed[0].data["commit_failed"] == "audio_fell_out_of_log"
@@ -544,3 +554,61 @@ def test_align_is_unique_or_nothing():
     assert align(tail, ["x", "y"]) is None
     assert align(tail, ["e", "f"]) is None  # one word is too little
     assert align(["a", "b", "a", "b"], ["a", "b"]) is None  # two places fit
+
+
+async def test_silence_overflow_is_dropped_without_a_gap():
+    # Three words, then 3 s of silence against a 1 s log, a drop at the end
+    # of the silence, then three more words. No delta came after the last
+    # final, so the dropped audio is silence: no gap, and covered_ms keeps it
+    # exact.
+    values = [1, 2, 3] + [0] * 30 + [4, 5, 6]
+    limits = Limits(retry_delay=0.01, log_cap_ms=1_000, replay_speed=50)
+    for covered in (True, False):
+        fake = FakeRelay(covered=covered, drop=lambda conn, event, info: conn == 0 and event == "bytes" and info == 33 * BLOCK)
+        events, _, _ = await run(fake, values, chunk=BLOCK, limits=limits)
+        assert words(events) == expected(values)
+        assert not [event for event in events if event.type == "session.gap"]
+        continued = [event for event in events if event.type == "session.continued"]
+        assert continued and continued[0].data["exact"] is covered
+
+
+async def test_overflow_after_speech_is_a_gap():
+    # Words heard (deltas) but not finalized, against a 1 s log: the dropped
+    # audio held speech, so its loss is reported.
+    values = list(range(1, 31))
+    fake = FakeRelay(final_every=100, drop=lambda conn, event, info: conn == 0 and event == "bytes" and info == 25 * BLOCK)
+    events, _, _ = await run(fake, values, chunk=BLOCK, limits=Limits(retry_delay=0.01, log_cap_ms=1_000, replay_speed=50))
+    gaps = [event for event in events if event.type == "session.gap"]
+    assert gaps and gaps[0].data["from_ms"] == 0 and gaps[0].data["to_ms"] > 0
+
+
+async def test_frozen_covered_ms_falls_back_to_overlap():
+    # covered_ms stops at 0 while finals keep coming; a drop 35 s in must not
+    # find the log pinned at 0 (overflowed, a gap) but take the overlap seam.
+    values = list(range(1, 401))
+    fake = FakeRelay(freeze_covered=0, drop=lambda conn, event, info: conn == 0 and event == "bytes" and info == 350 * BLOCK)
+    events, _, _ = await run(fake, values, chunk=BLOCK, pace=0.001)
+    assert words(events) == expected(values)
+    assert not [event for event in events if event.type == "session.gap"]
+    continued = [event for event in events if event.type == "session.continued"]
+    assert continued and continued[0].data["exact"] is False
+    assert_timeline(events, values)
+
+
+async def test_backlog_is_paced_and_commits_stay_in_place():
+    # The drop takes the commit after block 9; blocks 10-19 queue during the
+    # outage. The new session gets all 20 blocks at no more than 1.25x
+    # realtime, with the commit right after block 9.
+    values = list(range(1, 21))
+    fake = FakeRelay(final_every=100, drop=lambda conn, event, info: conn == 0 and event == "commit")
+    events, commits, _ = await run(fake, values, chunk=BLOCK, commits=(9,), limits=Limits(retry_delay=0.01))
+    assert words(events) == expected(values)
+    assert_commits_once(events, commits)
+    record = fake.received[1]
+    assert ("commit", 10 * BLOCK) in record
+    times = [(moment, total) for kind, moment, *rest in record if kind == "bytes" for total in rest]
+    first = times[0][0]
+    rate = RATE * 2 * 1.25
+    for moment, total in times:
+        assert total <= rate * (moment - first) + 2 * BLOCK, (moment - first, total)
+    assert times[-1][0] - first >= (20 * BLOCK - 2 * BLOCK) / rate
