@@ -11,8 +11,10 @@ lends it to one reply at a time.
   provider ended, or that failed while idle, is dropped and the next reply
   opens a new one. Nothing is ever replayed: a reply that meets a dead stream
   fails like any other dropped request.
-- An idle stream closes after ``_IDLE_CLOSE`` seconds, so a quiet call does not
-  hold its reservation, and the next reply reopens it.
+- An idle stream closes after ``_IDLE_CLOSE`` seconds and the next reply
+  reopens it. The relay's own progress timer (30 s) is armed by the first
+  commit and nothing disarms it, so it ends a stream that is idle that long
+  with ``request_timeout``; the close has to come first.
 - Past ``max_input_characters`` the stream rotates between utterances.
 - A reply that is interrupted sends ``input.cancel`` for its own utterance and
   leaves the stream open. The relay does not acknowledge a cancel, so events
@@ -35,9 +37,10 @@ from .client import GatewayError
 
 _logger = logging.getLogger(__name__)
 
-# Under the default idle timeouts of the NAT gateways on Azure (4 minutes) and
-# AWS (350 s), which drop an idle connection without telling either end.
-_IDLE_CLOSE = 180.0
+# Well under the relay's 30 s provider-inactivity timeout, which ends a stream
+# that has had a commit and then no provider event for that long. A stream the
+# relay kills is a failed request (and a provider-health signal), not a close.
+_IDLE_CLOSE = 15.0
 # How long a closing stream waits for the relay's terminal frame.
 _CLOSE_GRACE = 5.0
 

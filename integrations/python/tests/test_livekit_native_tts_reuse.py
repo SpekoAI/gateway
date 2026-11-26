@@ -22,7 +22,11 @@ STALE = b"\x09\x00" * 480
 class Relay:
     """An owned relay peer: counts admissions and records what each stream was sent."""
 
-    def __init__(self, *, hold_first: bool = False, silent_start: bool = False) -> None:
+    def __init__(
+        self, *, hold_first: bool = False, silent_start: bool = False, kill_idle_after: float = 0
+    ) -> None:
+        self.kill_idle_after = kill_idle_after
+        self.killed = 0
         self.connections = 0
         self.controls: list[list[str]] = []
         self.closed: list[bool] = []
@@ -50,7 +54,20 @@ class Relay:
             }
         )
         sequence, late = 0, False
+        killer: asyncio.Task[None] | None = None
+
+        async def kill() -> None:
+            # The relay's progress timer: no provider event for a while ends the stream.
+            await asyncio.sleep(self.kill_idle_after)
+            self.killed += 1
+            await ws.send_json(
+                {"type": "error", "error": {"code": "request_timeout", "retryable": True}}
+            )
+            await ws.close()
+
         async for message in ws:
+            if killer is not None:
+                killer.cancel()
             control = json.loads(message.data)
             controls.append(control["type"])
             if control["type"] == "input.commit":
@@ -70,6 +87,8 @@ class Relay:
                 await ws.send_json({"type": "utterance.started", "sequence": sequence})
                 await ws.send_bytes(PCM["two" if self.commits > 1 else "one"])
                 await ws.send_json({"type": "utterance.done", "sequence": sequence})
+                if self.kill_idle_after:
+                    killer = asyncio.create_task(kill())
             elif control["type"] == "input.cancel" and self.hold_first:
                 # The relay does not acknowledge a cancel.
                 late = True
@@ -168,6 +187,25 @@ async def test_a_stream_idle_too_long_is_reopened_for_the_next_reply(
         assert relay.connections == 2
         # The second reply is a new utterance on a new stream, never a replay.
         assert relay.commits == 2
+
+
+async def test_the_idle_close_comes_before_the_relay_would_end_the_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The relay ends a stream that is idle after a commit; the client must close it first.
+    monkeypatch.setattr(native_tts, "_IDLE_CLOSE", 0.05)
+    relay = Relay(kill_idle_after=0.3)
+    async with model_on(relay) as model:
+        await speak(model)
+        await until(lambda: relay.closed == [True])
+        await asyncio.sleep(0.4)
+        assert relay.killed == 0
+        assert PCM["two"] in await speak(model)
+        assert relay.connections == 2
+
+
+def test_the_idle_close_is_well_under_the_relays_inactivity_timeout() -> None:
+    assert native_tts._IDLE_CLOSE <= 15.0
 
 
 async def test_barge_in_cancels_only_the_utterance_and_keeps_the_stream() -> None:

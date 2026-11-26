@@ -155,8 +155,10 @@ stream's lease itself.
 - A stream that the relay or the provider ended, or that failed while idle,
   is dropped and the next reply opens a new one. A reply that meets a failure
   fails; its text is never sent again.
-- A stream idle for 3 minutes closes, so a quiet call does not hold its
-  reservation. The next reply reopens it.
+- A stream idle for 15 seconds closes, before the relay's 30-second
+  inactivity timeout would end it as a failed request. The next reply
+  reopens it, so a reply that comes within 15 seconds of the previous one
+  skips the open and a later one opens a new stream as before.
 - Before a reply would pass `max_input_characters` on one stream, the stream
   closes between utterances and the reply continues on a new one.
 - When the caller interrupts a reply, only that utterance is cancelled
