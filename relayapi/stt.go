@@ -1,8 +1,11 @@
 package relayapi
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -240,31 +243,63 @@ type STTContinuation struct {
 	// Of is the request_id of the session this one continues. Present
 	// exactly when AudioOffsetMS is.
 	Of string `json:"of,omitempty"`
-	// ofSent records an "of" member on the wire, so Validate can refuse
-	// "of":"" instead of reading it as no label.
-	ofSent bool
+	// malformed names what the decoded object carried that the schema
+	// refuses (an unknown member, a null, an empty of), so Validate can
+	// refuse it rather than read it as {}.
+	malformed string
 	// AudioOffsetMS is where this session's audio starts on the continued
 	// session's timeline, in milliseconds. A pointer because 0 is a valid
 	// offset and differs from absent.
 	AudioOffsetMS *int64 `json:"audio_offset_ms,omitempty"`
 }
 
-// UnmarshalJSON notes whether the object carried "of". A null counts as
-// absent, as a null member does everywhere in relayapi.
+// UnmarshalJSON decodes the object strictly, as the schema reads it: an
+// unknown member, a null member or an empty of is recorded for Validate to
+// refuse. Unlike elsewhere in relayapi a null is not absent here, because
+// {} has a meaning of its own (ask for continuation) that a stray member
+// must not take on.
 func (c *STTContinuation) UnmarshalJSON(data []byte) error {
-	type wire STTContinuation
-	var decoded struct {
-		wire
-		Of *string `json:"of"`
-	}
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
 		return err
 	}
-	*c = STTContinuation(decoded.wire)
-	if decoded.Of != nil {
-		c.Of, c.ofSent = *decoded.Of, true
+	*c = STTContinuation{}
+	for _, name := range sortedKeys(members) {
+		raw := members[name]
+		if c.malformed == "" && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			c.malformed = name + ": must not be null"
+			continue
+		}
+		switch name {
+		case "of":
+			if err := json.Unmarshal(raw, &c.Of); err != nil {
+				return err
+			}
+			if c.Of == "" && c.malformed == "" {
+				c.malformed = fmt.Sprintf("of: want 1-%d characters of A-Z a-z 0-9 . _ : -", MaxContinuationOfLength)
+			}
+		case "audio_offset_ms":
+			var offset int64
+			if err := json.Unmarshal(raw, &offset); err != nil {
+				return err
+			}
+			c.AudioOffsetMS = &offset
+		default:
+			if c.malformed == "" {
+				c.malformed = fmt.Sprintf("%s: unknown member", name)
+			}
+		}
 	}
 	return nil
+}
+
+func sortedKeys(members map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(members))
+	for key := range members {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // Continuing reports whether the session continues an earlier one rather
@@ -279,8 +314,8 @@ func (c *STTContinuation) Validate() error {
 	if c == nil {
 		return nil
 	}
-	if c.ofSent && c.Of == "" {
-		return fmt.Errorf("of: want 1-%d characters of A-Z a-z 0-9 . _ : -", MaxContinuationOfLength)
+	if c.malformed != "" {
+		return errors.New(c.malformed)
 	}
 	if (c.Of == "") != (c.AudioOffsetMS == nil) {
 		return fmt.Errorf("of and audio_offset_ms: send both to continue a session, or neither to ask for continuation")

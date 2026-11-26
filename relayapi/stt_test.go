@@ -369,17 +369,28 @@ func TestSTTContinuationOnTheWire(t *testing.T) {
 // decode rather than wrapped or truncated.
 func TestSTTContinuationOffsetDecode(t *testing.T) {
 	t.Parallel()
-	// An empty label is refused, not read as "no label", matching the schema.
-	for _, raw := range []string{`{"of":""}`, `{"of":"","audio_offset_ms":0}`} {
+	// What the schema refuses Go refuses too, rather than reading it as {}:
+	// an empty label, a null member, an unknown member.
+	for raw, want := range map[string]string{
+		`{"of":""}`:                                   "of:",
+		`{"of":"","audio_offset_ms":0}`:               "of:",
+		`{"of":null}`:                                 "of: must not be null",
+		`{"audio_offset_ms":null}`:                    "audio_offset_ms: must not be null",
+		`{"of":null,"audio_offset_ms":null}`:          "must not be null",
+		`{"typo":1}`:                                  "typo: unknown member",
+		`{"of":"req_1","audio_offset_ms":0,"x":true}`: "x: unknown member",
+	} {
 		var continuation relayapi.STTContinuation
 		if err := json.Unmarshal([]byte(raw), &continuation); err != nil {
 			t.Fatalf("%s: decode: %v", raw, err)
 		}
-		assertInvalid(t, continuation.Validate(), "of:")
+		assertInvalid(t, continuation.Validate(), want)
 	}
-	var asking relayapi.STTContinuation
-	if err := json.Unmarshal([]byte(`{"of":null}`), &asking); err != nil || asking.Validate() != nil {
-		t.Fatalf("a null of is absent: %v", err)
+	for _, raw := range []string{`{}`, `{"of":"req_1","audio_offset_ms":0}`} {
+		var continuation relayapi.STTContinuation
+		if err := json.Unmarshal([]byte(raw), &continuation); err != nil || continuation.Validate() != nil {
+			t.Fatalf("%s must decode and validate: %v / %v", raw, err, continuation.Validate())
+		}
 	}
 	assertInvalid(t, (relayapi.STTTranscriptFinal{Type: relayapi.STTEventTranscriptFinal, CoveredMS: ms(relayapi.MaxCoveredMS + 1)}).Validate(), "covered_ms")
 	for _, raw := range []string{`{"of":"req_1","audio_offset_ms":9223372036854775808}`, `{"of":"req_1","audio_offset_ms":1.5}`, `{"of":"req_1","audio_offset_ms":"10"}`} {

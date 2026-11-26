@@ -318,11 +318,12 @@ type stream struct {
 	extension string
 
 	// mono gates covered_ms: Deepgram finalizes each channel on its own, so
-	// one channel's final proves nothing about the others. coveredMS is the
-	// highest covered_ms sent, so the value never goes backwards; only the
+	// one channel's final proves nothing about the others. coveredEnd is the
+	// raw end, in the vendor's seconds, of the chain of is_final windows from
+	// 0, so the value never goes backwards; only the
 	// read loop touches it.
-	mono      bool
-	coveredMS int64
+	mono       bool
+	coveredEnd float64
 
 	// billingModel, billingLanguage and billingFeatures are the frozen
 	// identity of the request that was actually dispatched. They are read
@@ -644,10 +645,11 @@ func (s *stream) emitResults(message inboundMessage, raw json.RawMessage) error 
 	return nil
 }
 
-// coveredGapToleranceMS is how far an is_final window may start past the
-// covered point and still extend the chain: float seconds on the wire, not a
-// gap in the audio.
-const coveredGapToleranceMS = 50
+// coveredJoinTolerance is how far, in seconds, an is_final window may start
+// past the chain's raw end and still join it. It absorbs float error in the
+// vendor's start + duration arithmetic, not a gap in the audio: Deepgram's
+// times carry millisecond precision at best.
+const coveredJoinTolerance = 0.001
 
 // extendCovered moves covered_ms along the chain of is_final windows.
 // Deepgram: "When Deepgram reaches maximum accuracy for a segment, it sends a
@@ -663,9 +665,9 @@ func (s *stream) extendCovered(message inboundMessage) {
 	if !message.IsFinal || !s.mono {
 		return
 	}
-	start, end := floorMilliseconds(message.Start), floorMilliseconds(message.Start+message.Duration)
-	if start <= s.coveredMS+coveredGapToleranceMS && end > s.coveredMS {
-		s.coveredMS = end
+	end := message.Start + message.Duration
+	if message.Start <= s.coveredEnd+coveredJoinTolerance && end > s.coveredEnd {
+		s.coveredEnd = end
 	}
 }
 
@@ -674,7 +676,7 @@ func (s *stream) covered(message inboundMessage) *int64 {
 	if !message.IsFinal || !s.mono {
 		return nil
 	}
-	covered := s.coveredMS
+	covered := floorMilliseconds(s.coveredEnd)
 	return &covered
 }
 
@@ -799,11 +801,17 @@ func milliseconds(seconds float64) int64 {
 	return int64(math.Round(seconds * 1_000))
 }
 
-// floorMilliseconds rounds down, for a boundary that must not claim audio
-// past what the vendor finalized. The 1e-6 ms only absorbs float error
-// (2.3 s * 1000 is 2299.9999999999995).
+// floorMilliseconds rounds a boundary down to whole milliseconds, so it never
+// claims audio past what the vendor finalized. It first rounds to whole
+// microseconds, the vendor's decimal value, which undoes float error
+// (2.3 s * 1000 is 2299.9999999999995) and cannot exceed that value by more
+// than half a microsecond; Deepgram's times have no digits that fine.
 func floorMilliseconds(seconds float64) int64 {
-	return int64(math.Floor(seconds*1_000 + 1e-6))
+	microseconds := int64(math.Round(seconds * 1_000_000))
+	if microseconds < 0 {
+		return 0
+	}
+	return microseconds / 1_000
 }
 
 func deepgramErrorMessage(description string) string {

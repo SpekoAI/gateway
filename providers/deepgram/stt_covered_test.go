@@ -29,8 +29,10 @@ func TestListenFinalsCarryCoveredMS(t *testing.T) {
 		`{"type":"Results","start":6.75,"duration":1.0,"is_final":true,"channel":{"alternatives":[{"transcript":"bye"}]}}`,
 		// A window after a hole proves nothing about the hole.
 		`{"type":"Results","start":9.0,"duration":1.0,"is_final":true,"channel":{"alternatives":[{"transcript":"later"}]}}`,
-		// A window starting within the tolerance extends the chain, rounded down.
+		// 40 ms past the chain's end is a hole, not float error.
 		`{"type":"Results","start":7.79,"duration":0.5006,"is_final":true,"channel":{"alternatives":[{"transcript":"on"}]}}`,
+		// Float error at the joint (under 1 ms) still joins; the end is rounded down.
+		`{"type":"Results","start":7.7504,"duration":0.5006,"is_final":true,"channel":{"alternatives":[{"transcript":"so"}]}}`,
 	} {
 		var message inboundMessage
 		if err := json.Unmarshal([]byte(raw), &message); err != nil {
@@ -61,7 +63,7 @@ func TestListenFinalsCarryCoveredMS(t *testing.T) {
 			finals = append(finals, *data.CoveredMS)
 		}
 	}
-	want := []int64{2500, 3750, 3750, 7750, 7750, 8290}
+	want := []int64{2500, 3750, 3750, 7750, 7750, 7750, 8251}
 	if len(finals) != len(want) {
 		t.Fatalf("finals covered_ms = %v, want %v", finals, want)
 	}

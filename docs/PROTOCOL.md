@@ -246,16 +246,14 @@ Gateway sessions never carry `covered_ms`: the session drops it from
 `transcript.final` data. It is evidence for the hosted relay's stream
 continuation, which a client asks for on the relay wire.
 
-The Deepgram Listen (not Flux) and Gladia adapters put it on their mono
-finals: all audio before that position is reflected in finals already sent,
-this one included.
+The Deepgram Listen (not Flux) adapter puts it on its mono finals: all audio
+before that position is reflected in finals already sent, this one included.
 
 - It is measured from the first audio byte sent on the provider connection.
 - It is rounded down and never goes backwards within a stream.
-- Deepgram moves it only along unbroken is_final windows from 0.
-- Gladia never moves it on a forced final (`max_duration`).
-- Every other adapter, Speechmatics included, leaves it out. Absent means
-  unknown, not 0.
+- It moves only along unbroken is_final windows from 0.
+- Every other adapter, Speechmatics and Gladia included, leaves it out.
+  Absent means unknown, not 0.
 
 ### Speakers: ElevenLabs Scribe v3 Live
 

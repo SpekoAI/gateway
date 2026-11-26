@@ -827,6 +827,8 @@ func TestSubsetValidatorRejectsInvalidValues(t *testing.T) {
 		{"continuation of without offset", "asyncapi.json", "STTContinuation", `{"of":"req_1"}`, "matches 0 oneOf branches"},
 		{"continuation offset without of", "asyncapi.json", "STTContinuation", `{"audio_offset_ms":0}`, "matches 0 oneOf branches"},
 		{"continuation with an empty of", "asyncapi.json", "STTContinuation", `{"of":"","audio_offset_ms":0}`, "does not match pattern"},
+		{"continuation with an unknown member", "asyncapi.json", "STTContinuation", `{"typo":1}`, "matches 0 oneOf branches"},
+		{"continuation with a null of", "asyncapi.json", "STTContinuation", `{"of":null,"audio_offset_ms":0}`, "not of type string"},
 		{"covered_ms past exact JSON integers", "asyncapi.json", "STTTranscriptFinal", `{"type":"transcript.final","text":"","covered_ms":9007199254740992}`, "above maximum"},
 	} {
 		doc := docs[tc.doc]

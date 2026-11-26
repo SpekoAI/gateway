@@ -219,7 +219,6 @@ func (a *Adapter) Open(ctx context.Context, request runtimepkg.AdapterRequest) (
 		cancel:         cancel,
 		events:         make(chan runtimepkg.ProviderEvent, a.eventBuffer),
 		seenSessionIDs: make(map[string]struct{}),
-		mono:           request.Media.Channels == 1,
 	}
 	// A BYOK open already knows the provider-side correlation id, so report it
 	// before any audio flows. Managed opens learn the same id from the
@@ -519,13 +518,6 @@ type stream struct {
 	closeErr  error
 
 	seenSessionIDs map[string]struct{}
-
-	// mono gates covered_ms: Gladia finalizes each channel's utterances on
-	// their own, so one channel's final proves nothing about the others.
-	// coveredMS is the highest covered_ms sent, so the value never goes
-	// backwards; only the read loop touches it.
-	mono      bool
-	coveredMS int64
 }
 
 func (s *stream) Events() <-chan runtimepkg.ProviderEvent { return s.events }
@@ -696,6 +688,14 @@ func (s *stream) handleMessage(payload []byte) error {
 	}
 }
 
+// Gladia finals carry no covered_ms, the proof a relay client needs to replay
+// a dropped stream exactly. A final is never revised, but an utterance closed
+// by maximum_duration_without_endpointing "can end mid-word"
+// (https://eu1.docs.gladia.io/live/endpointing, limits and gotchas), and the
+// normal final after such a cut would then claim the cut word as covered.
+// The "forced" marker that would expose the cut is not guaranteed by the
+// cloud schema, so no utterance end is a proven bound. A continuing client
+// replays its overlap for this provider instead.
 func (s *stream) emitTranscript(message inboundMessage, raw json.RawMessage) error {
 	// Gladia pads utterance text with a leading space; only the emptiness test
 	// trims, so the provider's own spacing survives into the transcript.
@@ -710,32 +710,9 @@ func (s *stream) emitTranscript(message inboundMessage, raw json.RawMessage) err
 	// requests real speech events, so Gladia sends its own speech_end.
 	return s.emit(runtimepkg.ProviderEvent{
 		Type:       kind,
-		Data:       transcriptData(message, s.covered(message)),
+		Data:       transcriptData(message),
 		Extensions: extension(raw),
 	})
-}
-
-// covered returns the covered_ms a final transcript proves, or nil. Gladia:
-// "is_final: true" means the message carries "the final, most accurate
-// transcript for an utterance, and it will not change", and utterance.end is
-// the utterance's end in seconds from the start of the session's audio
-// (https://docs.gladia.io/api-reference/v2/live/message/transcript). An
-// utterance closed by a pause ends at that pause, and on one channel each
-// final arrives before the next utterance's, so every word before its end has
-// been sent. A forced final ("forced": "max_duration") is closed by a timer
-// and "can end mid-word" (https://eu1.docs.gladia.io/live/endpointing, limits and
-// gotchas), so it never moves the value. Partials never move it, the end is
-// rounded down, and it never goes backwards.
-func (s *stream) covered(message inboundMessage) *int64 {
-	if !message.Data.IsFinal || !s.mono {
-		return nil
-	}
-	utterance := message.Data.Utterance
-	if end := floorMilliseconds(utterance.End); utterance.Forced == "" && end > s.coveredMS {
-		s.coveredMS = end
-	}
-	covered := s.coveredMS
-	return &covered
 }
 
 // observeSessionID reports the Gladia session id once per stream as the
@@ -848,9 +825,9 @@ func extension(raw json.RawMessage) map[string]json.RawMessage {
 	return map[string]json.RawMessage{extensionID: raw}
 }
 
-func transcriptData(message inboundMessage, coveredMS *int64) json.RawMessage {
+func transcriptData(message inboundMessage) json.RawMessage {
 	utterance := message.Data.Utterance
-	data := map[string]any{
+	return marshalData(map[string]any{
 		"text":                utterance.Text,
 		"is_final":            message.Data.IsFinal,
 		"audio_start_ms":      milliseconds(utterance.Start),
@@ -861,11 +838,7 @@ func transcriptData(message inboundMessage, coveredMS *int64) json.RawMessage {
 		"words":               utterance.Words,
 		"utterance_id":        message.Data.ID,
 		"provider_request_id": message.SessionID,
-	}
-	if coveredMS != nil {
-		data["covered_ms"] = *coveredMS
-	}
-	return marshalData(data)
+	})
 }
 
 func speechData(key string, message inboundMessage) json.RawMessage {
@@ -901,13 +874,6 @@ func marshalData(value any) json.RawMessage {
 }
 
 func milliseconds(seconds float64) int64 { return int64(math.Round(seconds * 1_000)) }
-
-// floorMilliseconds rounds down, for a boundary that must not claim audio
-// past what the vendor finalized. The 1e-6 ms only absorbs float error
-// (2.3 s * 1000 is 2299.9999999999995).
-func floorMilliseconds(seconds float64) int64 {
-	return int64(math.Floor(seconds*1_000 + 1e-6))
-}
 
 func truncate(value string, limit int) string {
 	if len(value) <= limit {
@@ -947,9 +913,6 @@ type utterance struct {
 	Confidence float64         `json:"confidence"`
 	Channel    int             `json:"channel"`
 	Words      json.RawMessage `json:"words"`
-	// Forced names what closed the utterance when a pause did not
-	// ("max_duration"); empty on an utterance a pause closed.
-	Forced string `json:"forced"`
 }
 
 type errorObject struct {
