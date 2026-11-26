@@ -347,6 +347,14 @@ async def test_native_tts_preserves_literal_text(native_binary, text):
             stream.end_input()
             frames = await asyncio.wait_for(collect_stream(stream), 3)
             assert frames and sum(event.is_final for event in frames) == 1
+
+            async def sent() -> None:
+                # The reply ends without a session.close round trip, so a
+                # trailing separator reaches the peer just after the audio.
+                while "".join(appended) != text:
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(sent(), 3)
             assert "".join(appended) == text
         finally:
             await stream.aclose()

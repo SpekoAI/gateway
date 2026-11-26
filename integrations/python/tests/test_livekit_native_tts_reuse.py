@@ -16,6 +16,10 @@ from speko_gateway import _livekit_native_tts as native_tts
 from speko_gateway.livekit import TTS
 
 PCM = {name: bytes([value, 0]) * 480 for name, value in (("one", 1), ("two", 2))}
+# livekit-agents before 1.6 holds the last frame back until the next one, with
+# frames of 200 ms (4,800 samples at 24 kHz): audio heard mid-utterance needs
+# more than two frames to reach the reader before the utterance is done.
+HELD = PCM["one"] * 30
 STALE = b"\x09\x00" * 480
 
 
@@ -23,8 +27,15 @@ class Relay:
     """An owned relay peer: counts admissions and records what each stream was sent."""
 
     def __init__(
-        self, *, hold_first: bool = False, silent_start: bool = False, kill_idle_after: float = 0
+        self,
+        *,
+        hold_first: bool = False,
+        silent_start: bool = False,
+        kill_idle_after: float = 0,
+        ignore_close: bool = False,
     ) -> None:
+        self.ignore_close = ignore_close
+        self.texts: list[list[str]] = []
         self.kill_idle_after = kill_idle_after
         self.killed = 0
         self.connections = 0
@@ -43,6 +54,7 @@ class Relay:
         self.connections += 1
         controls: list[str] = []
         self.controls.append(controls)
+        self.texts.append([])
         self.closed.append(False)
         index = len(self.closed) - 1
         self.sockets.append(ws)
@@ -61,7 +73,10 @@ class Relay:
             await asyncio.sleep(self.kill_idle_after)
             self.killed += 1
             await ws.send_json(
-                {"type": "error", "error": {"code": "request_timeout", "retryable": True}}
+                {
+                    "type": "error",
+                    "error": {"code": "request_timeout", "retryable": True},
+                }
             )
             await ws.close()
 
@@ -70,12 +85,14 @@ class Relay:
                 killer.cancel()
             control = json.loads(message.data)
             controls.append(control["type"])
+            if control["type"] == "input.append":
+                self.texts[index].append(control["text"])
             if control["type"] == "input.commit":
                 self.commits += 1
                 if self.hold_first and self.commits == 1:
                     if not self.silent_start:
                         await ws.send_json({"type": "utterance.started", "sequence": 1})
-                        await ws.send_bytes(PCM["one"])
+                        await ws.send_bytes(HELD)
                     self.first_audio.set()
                     continue
                 if late:
@@ -92,7 +109,7 @@ class Relay:
             elif control["type"] == "input.cancel" and self.hold_first:
                 # The relay does not acknowledge a cancel.
                 late = True
-            elif control["type"] == "session.close":
+            elif control["type"] == "session.close" and not self.ignore_close:
                 self.closed[index] = True
                 await ws.send_json({"type": "session.closed", "usage": {}})
                 await ws.close()
@@ -141,9 +158,11 @@ async def speak(model: TTS, text: str = "hello there") -> bytes:
 
 
 async def until(condition, timeout: float = 3.0) -> None:
-    async with asyncio.timeout(timeout):
+    async def poll() -> None:
         while not condition():
             await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(poll(), timeout)
 
 
 async def test_two_replies_share_one_admitted_stream() -> None:
@@ -204,8 +223,70 @@ async def test_the_idle_close_comes_before_the_relay_would_end_the_stream(
         assert relay.connections == 2
 
 
-def test_the_idle_close_is_well_under_the_relays_inactivity_timeout() -> None:
-    assert native_tts._IDLE_CLOSE <= 15.0
+async def test_the_real_idle_timer_is_armed_under_the_relays_inactivity_timeout() -> (
+    None
+):
+    relay_inactivity = 30.0  # the relay's progress timer, armed by a commit
+    async with model_on(Relay()) as model:
+        await speak(model)
+        await until(lambda: model._native._conn.idle_timer is not None)
+        remaining = (
+            model._native._conn.idle_timer.when() - asyncio.get_running_loop().time()
+        )
+        assert 0 < remaining <= native_tts._IDLE_CLOSE < relay_inactivity
+
+
+def test_the_close_grace_ends_before_the_agent_workers_teardown_bound() -> None:
+    # platform-agents closes call resources within 5 s; a slow close ends here first.
+    assert 0 < native_tts._CLOSE_GRACE <= 2.0
+
+
+async def test_a_close_the_relay_never_answers_ends_within_the_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(native_tts, "_CLOSE_GRACE", 0.2)
+    relay = Relay(ignore_close=True)
+    async with model_on(relay) as model:
+        await speak(model)
+        started = asyncio.get_running_loop().time()
+        await asyncio.wait_for(model.aclose(), 2)
+        assert asyncio.get_running_loop().time() - started < 1.0
+        assert relay.controls[0][-1] == "session.close"
+
+
+@pytest.mark.parametrize("ending", ["\n", " ", ".  \n"])
+async def test_a_reply_ending_in_whitespace_sends_no_cancel(ending: str) -> None:
+    relay = Relay()
+    async with model_on(relay) as model:
+        assert PCM["one"] in await speak(model, f"hello there.{ending}")
+        assert PCM["two"] in await speak(model, "again")
+        await model.aclose()
+        # Every character is sent; the separator is never cancelled away.
+        assert "".join(relay.texts[0]) == f"hello there.{ending}again"
+        assert "input.cancel" not in relay.controls[0]
+        assert relay.connections == 1
+
+
+async def test_a_reply_released_with_uncommitted_text_is_cancelled() -> None:
+    relay = Relay()
+    async with model_on(relay) as model:
+        reply = await model._native.acquire(model._session_options())
+        await reply.append_text("   ")
+        await reply.append_text("half a sentence")
+        reply.release()
+        await until(lambda: "input.cancel" in relay.controls[0])
+        assert relay.connections == 1
+        assert "session.close" not in relay.controls[0]
+
+
+async def test_a_released_reply_with_only_whitespace_is_not_cancelled() -> None:
+    relay = Relay()
+    async with model_on(relay) as model:
+        reply = await model._native.acquire(model._session_options())
+        await reply.append_text(" \n")
+        reply.release()
+        await asyncio.sleep(0.05)
+        assert relay.controls[0] == ["input.append"]
 
 
 async def test_barge_in_cancels_only_the_utterance_and_keeps_the_stream() -> None:
@@ -235,6 +316,9 @@ async def test_barge_in_before_any_audio_does_not_reuse_an_unclear_stream() -> N
         first.end_input()
         await asyncio.wait_for(relay.first_audio.wait(), 3)
         await first.aclose()
+        # The cancel is sent and the stream closed gracefully, so its usage is reported.
+        await until(lambda: relay.closed[0])
+        assert relay.controls[0][-2:] == ["input.cancel", "session.close"]
         assert PCM["two"] in await speak(model)
         assert relay.connections == 2
 

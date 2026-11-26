@@ -164,8 +164,13 @@ stream's lease itself.
 - When the caller interrupts a reply, only that utterance is cancelled
   (`input.cancel`) and the stream stays open. The relay does not acknowledge
   a cancel, so audio of the cancelled utterance is dropped until the next
-  `utterance.started`. A cancel before the utterance's first audio closes the
-  stream instead, because its start could not be told from the next one's.
+  `utterance.started`. A cancel before the utterance's first audio is sent
+  and then the stream is closed with `session.close` (so its usage is
+  reported), because that utterance's start could not be told from the next
+  one's. The next reply opens a new stream.
+- A closing stream waits up to 2 seconds in all for the relay's terminal
+  frame, so a slow close ends before an agent worker's own 5-second
+  teardown bound.
 - Replies share the stream one at a time. A reply waits for the previous one
   to let go.
 - `aclose()` ends the stream with `session.close`. Until then the stream is

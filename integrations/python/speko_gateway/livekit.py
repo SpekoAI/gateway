@@ -993,13 +993,14 @@ def _retrieve(task: asyncio.Task[Any]) -> None:
         )
 
 
-# Each LiveKit reply opens its own TTS session, and a spoken reply is a few
-# hundred characters. With managed credentials the control plane reserves
-# credit for the full max_input_characters of every session it admits, the
-# standby included, so a large default makes each reply hold far more credit
-# than it can spend: at 100,000 characters a Cartesia or ElevenLabs session
-# needed about $10 of headroom. 10,000 characters is roughly ten minutes of
-# speech in one reply, and keeps that hold near $1.
+# A TTS session is admitted for max_input_characters. The Gateway client opens
+# one per reply (plus any standby); a relay client keeps one for the whole call
+# and rotates it past this many characters. With managed credentials the
+# control plane reserves credit for the full limit of every session it admits,
+# so a large default holds far more credit than a call spends: at 100,000
+# characters a Cartesia or ElevenLabs session needed about $10 of headroom.
+# 10,000 characters is roughly ten minutes of speech, and keeps that hold near
+# $1.
 DEFAULT_TTS_MAX_INPUT_CHARACTERS = 10_000
 
 

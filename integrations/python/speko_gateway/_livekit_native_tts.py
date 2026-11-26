@@ -20,7 +20,9 @@ lends it to one reply at a time.
   leaves the stream open. The relay does not acknowledge a cancel, so events
   of the cancelled utterance are dropped until the next ``utterance.started``.
   A cancel before the first audio cannot be told apart from that next
-  utterance's start, so that stream is closed instead.
+  utterance's start, so that stream gets the cancel and then a graceful
+  ``session.close`` (the edge reports the call's usage only to a closed stream)
+  and the next reply opens a new one.
 """
 
 from __future__ import annotations
@@ -41,8 +43,10 @@ _logger = logging.getLogger(__name__)
 # that has had a commit and then no provider event for that long. A stream the
 # relay kills is a failed request (and a provider-health signal), not a close.
 _IDLE_CLOSE = 15.0
-# How long a closing stream waits for the relay's terminal frame.
-_CLOSE_GRACE = 5.0
+# The whole of a closing stream's cancel, ``session.close`` and wait for the
+# relay's terminal frame. The agent worker bounds call teardown at 5 s, so this
+# stays well under it: a slow close must end here, not be cut off outside.
+_CLOSE_GRACE = 2.0
 
 _CLOSE_ERRORS = (GatewayError, OSError, asyncio.TimeoutError, aiohttp.ClientError)
 _END = object()
@@ -94,13 +98,19 @@ class _Conn:
         if self.sink is not None:
             self.sink.put_nowait(outcome)
 
-    async def close(self, *, graceful: bool) -> None:
+    async def _end(self, *, cancel: bool) -> None:
+        if cancel:
+            await self.stream.cancel()
+        await self.stream.finish()
+        await asyncio.shield(self.reader)
+
+    async def close(self, *, cancel: bool = False) -> None:
+        """Cancel the utterance in flight if asked, then close and await the terminal frame."""
         if self.idle_timer is not None:
             self.idle_timer.cancel()
-        if graceful and not self.dead:
+        if not self.dead:
             try:
-                await self.stream.finish()
-                await asyncio.wait_for(asyncio.shield(self.reader), _CLOSE_GRACE)
+                await asyncio.wait_for(self._end(cancel=cancel), _CLOSE_GRACE)
             except _CLOSE_ERRORS:
                 _logger.debug("Speko Gateway TTS stream did not close cleanly")
         try:
@@ -139,7 +149,8 @@ class NativeTTSReply:
             and not conn.appended
         ):
             conn = self._conn = await self._shared._rotate(conn, self._queue)
-        conn.appended = True
+        # Whitespace alone is pending separator, never an utterance to cancel.
+        conn.appended = conn.appended or bool(text.strip())
         conn.characters += len(text)
         await conn.stream.append_text(text)
 
@@ -213,7 +224,7 @@ class NativeTTS:
                 return
             if conn.appended or conn.phase != "idle":
                 if conn.phase == "committed":
-                    self._retire(conn, graceful=False)
+                    self._retire(conn, cancel=True)
                     return
                 conn.discard = conn.phase == "started"
                 conn.phase, conn.appended = "idle", False
@@ -237,11 +248,11 @@ class NativeTTS:
         if conn is self._conn and not self._lock.locked():
             self._retire(conn)
 
-    def _retire(self, conn: _Conn, *, graceful: bool = True) -> None:
+    def _retire(self, conn: _Conn, *, cancel: bool = False) -> None:
         if self._conn is conn:
             self._conn = None
         conn.sink = None
-        task = asyncio.create_task(conn.close(graceful=graceful))
+        task = asyncio.create_task(conn.close(cancel=cancel))
         self._closing.add(task)
         task.add_done_callback(self._closing.discard)
         task.add_done_callback(_retrieve)
