@@ -12,13 +12,18 @@ import ipaddress
 import json
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 from urllib.parse import urlsplit
 
 import aiohttp
 
-from ._relay_continuation import ContinuingSpeechSession, DialRefused, DialUnknown
+from ._relay_continuation import (
+    ContinuingSpeechSession,
+    DialCancelled,
+    DialRefused,
+    DialUnknown,
+)
 from ._relay_socket import NATIVE_SOCKET_ORIGIN, socket_headers, validate_session_id
 from ._user_agent import USER_AGENT
 from .client import CanonicalEvent, GatewayError, SessionConfig
@@ -333,12 +338,16 @@ class RelaySpeechClient:
         media: dict[str, Any],
         idempotency_key: str | None,
     ) -> ContinuingSpeechSession:
-        async def dial(text: str, key: str) -> tuple[Any, dict[str, Any]]:
-            return await self._dial(kind, text, key, provider, model)
+        async def dial(
+            text: str, key: str, cancelled: Callable[[], bool]
+        ) -> tuple[Any, dict[str, Any]]:
+            return await self._dial(kind, text, key, provider, model, cancelled)
 
         first = json.dumps({**configure, "continuation": {}}, separators=(",", ":"))
         try:
-            websocket, ready = await dial(first, idempotency_key or str(uuid.uuid4()))
+            websocket, ready = await dial(
+                first, idempotency_key or str(uuid.uuid4()), lambda: False
+            )
         except DialRefused as refusal:
             raise GatewayError(
                 "Relay speech request failed",
@@ -365,10 +374,17 @@ class RelaySpeechClient:
         )
 
     async def _dial(
-        self, kind: str, text: str, key: str, provider: str, model: str
+        self,
+        kind: str,
+        text: str,
+        key: str,
+        provider: str,
+        model: str,
+        cancelled: Callable[[], bool],
     ) -> tuple[aiohttp.ClientWebSocketResponse, dict[str, Any]]:
         """One dial: DialRefused when the relay answered with an error,
-        DialUnknown when it may or may not have started the request."""
+        DialUnknown when it may or may not have started the request,
+        DialCancelled when the stream was cancelled before the configure."""
         websocket: aiohttp.ClientWebSocketResponse | None = None
 
         async def establish() -> tuple[aiohttp.ClientWebSocketResponse, dict]:
@@ -379,6 +395,9 @@ class RelaySpeechClient:
                 max_msg_size=2 << 20,
                 heartbeat=15,
             )
+            if cancelled():
+                # No configure went out, so no session started.
+                raise DialCancelled()
             await websocket.send_str(text)
             message = await websocket.receive()
             if message.type is not aiohttp.WSMsgType.TEXT:

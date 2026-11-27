@@ -662,7 +662,7 @@ READY = {"type": "session.ready", "request_id": "req_0", "route": {"provider": "
 
 
 def stub_session(socket: StubSocket, dial=None, **limits: Any) -> ContinuingSpeechSession:
-    async def no_dial(configure, key):
+    async def no_dial(configure, key, cancelled):
         raise AssertionError("no dial expected")
 
     return ContinuingSpeechSession(
@@ -795,7 +795,7 @@ async def test_cancel_during_dial_adopts_no_socket():
     dialing = asyncio.Event()
     release = asyncio.Event()
 
-    async def dial(configure, key):
+    async def dial(configure, key, cancelled):
         dialing.set()
         await release.wait()
         return adopted, {**READY, "request_id": "req_1"}
@@ -841,7 +841,7 @@ async def test_session_closed_resolves_pending_commits():
 
 
 async def test_any_dial_failure_resolves_pending_commits():
-    async def dial(configure, key):
+    async def dial(configure, key, cancelled):
         raise RuntimeError("unexpected")
 
     session = stub_session(StubSocket(), dial=dial)
@@ -871,6 +871,8 @@ async def test_overflow_fails_only_commits_whose_own_audio_fell_out():
     assert "speko-c2" in session._pending
     gap = next(event for event in events if event.type == "session.gap")
     assert gap.data == {"from_ms": 0, "to_ms": 2_000}
+    # The gap comes before the failed commit it explains.
+    assert events.index(gap) < events.index(finals(events)[0])
     await session.aclose()
 
 
@@ -898,7 +900,7 @@ async def test_repeated_drops_share_one_outage_budget():
 async def test_a_dial_is_bounded_by_the_remaining_budget():
     dials = []
 
-    async def dial(configure, key):
+    async def dial(configure, key, cancelled):
         dials.append(key)
         await asyncio.sleep(5)
         raise AssertionError("not reached")
@@ -965,3 +967,194 @@ async def test_ids_the_new_session_will_not_echo_are_not_sent():
     assert {"type": "input.commit"} in socket.sent
     assert not [frame for frame in socket.sent if isinstance(frame, dict) and "commit_id" in frame]
     await session.aclose()
+
+
+
+class HangingSocket(StubSocket):
+    """A socket whose writes and reads never complete."""
+
+    async def send_bytes(self, data: bytes) -> None:
+        await asyncio.Event().wait()
+
+    async def send_json(self, value: Any) -> None:
+        await asyncio.Event().wait()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await asyncio.Event().wait()
+
+
+async def test_a_hung_replay_ends_recovery_at_the_outage_deadline():
+    hung = HangingSocket()
+
+    async def dial(configure, key, cancelled):
+        return hung, {**READY, "request_id": "req_1"}
+
+    session = stub_session(StubSocket(), dial=dial, outage_seconds=0.5)
+    await session.send_audio(block(1))
+    events = []
+
+    async def read():
+        async for event in session.events():
+            events.append(event)
+
+    started = time.monotonic()
+    reader = asyncio.create_task(read())
+    await asyncio.sleep(0.1)
+    # The first replay write hangs under the lock; commit and finish (what
+    # LiveKit and Pipecat call before their wait loops) still return.
+    commit_id = await asyncio.wait_for(session.commit_audio(), 2)
+    await asyncio.wait_for(session.finish(), 2)
+    with pytest.raises(GatewayError):
+        await asyncio.wait_for(reader, 2)
+    assert time.monotonic() - started < 2
+    assert "session.continued" not in [event.type for event in events]
+    assert [event.data["commit_id"] for event in finals(events)] == [commit_id]
+
+
+async def test_seam_uses_one_tolerance_around_the_old_end():
+    from speko_gateway._relay_continuation import _Audio
+
+    for text, segments, kept in [
+        # A new word just after the old end is new, whatever its length.
+        ("fine", [seg("fine", 1_002, 1_028)], "fine"),
+        # The old last word again, timed across the old end: a repeat.
+        ("yes fine", [seg("yes", 985, 1_035), seg("fine", 1_100, 1_200)], "fine"),
+    ]:
+        session = seam_session([("we said yes", 1_000)], 500)
+        session._log = [_Audio(ms(500), block(1) * 30)]
+        session._appended = session._log[0].end
+        await resume(session, 500)
+        events = session._on_final({"text": text, "segments": segments})
+        assert [event.type for event in events] == ["transcript.final"], text
+        assert events[0].data["text"] == kept
+        assert [segment["text"] for segment in events[0].data["segments"]] == [kept]
+        await session.aclose()
+
+
+async def test_seam_trims_a_straddling_segment_with_the_text():
+    from speko_gateway._relay_continuation import _Audio, _drop_segment_words
+
+    session = seam_session([("a b c", 1_000)], 500)
+    session._log = [_Audio(ms(500), block(1) * 30)]
+    session._appended = session._log[0].end
+    await resume(session, 500)
+    events = session._on_final({"text": "b c d", "segments": [{**seg("b c d", 900, 1_200), "speaker": "S1"}]})
+    assert events[-1].data["text"] == "d"
+    assert events[-1].data["segments"] == [{"text": "d", "start_ms": 1_000, "end_ms": 1_200, "speaker": "S1"}]
+    await session.aclose()
+    # The text path keeps the rest of a partly repeated segment too.
+    data = {"text": "b c d e", "segments": [{"text": "b c d"}, {"text": "e"}]}
+    _drop_segment_words(data, 2)
+    assert data["segments"] == [{"text": "d"}, {"text": "e"}]
+
+
+async def test_the_input_bound_counts_the_new_chunk_and_every_flush():
+    session = stub_session(StubSocket(), log_cap_ms=500, outage_seconds=0.5)
+    session._live, session._recovering = False, True
+    with pytest.raises(GatewayError):
+        await session.send_audio(block(1) * 20)  # 2 s in one call, limit 1 s
+    assert session._log == []
+
+    session = stub_session(StubSocket(), max_pending_commits=3)
+    session._commit_ids = False
+    for _ in range(3):
+        assert await session.commit_audio() is None
+    with pytest.raises(GatewayError):
+        await session.commit_audio()
+
+
+async def test_the_cap_holds_while_the_reader_sits_on_continued():
+    async def dial(configure, key, cancelled):
+        return StubSocket(), {**READY, "request_id": "req_1"}
+
+    session = stub_session(StubSocket(), dial=dial, log_cap_ms=1_000)
+    session._heard = True
+    for _ in range(10):
+        await session.send_audio(block(1))
+    session._live = False
+    recovery = session._recover("socket_closed")
+    seen = [(await recovery.__anext__()).type]
+    while seen[-1] != "session.continued":
+        seen.append((await recovery.__anext__()).type)
+    # The reader has not come back for the next event; input keeps coming.
+    for _ in range(100):
+        await session.send_audio(block(2))
+        await asyncio.sleep(0.001)
+    await asyncio.sleep(0.2)
+    audio = sum(len(entry.data) for entry in session._log if hasattr(entry, "data"))
+    assert audio <= ms(1_000) + 2 * BLOCK
+    await recovery.aclose()
+    await session.aclose()
+
+
+async def test_an_untimed_late_final_keeps_the_outage_budget():
+    session = stub_session(StubSocket())
+    for _ in range(100):
+        await session.send_audio(block(1))
+    session._replay_end, session._attempts, session._deadline = ms(1_000), 2, time.monotonic() + 30
+    commit_id = await session.commit_audio()
+    session._on_final({"text": "late words"})
+    session._on_final({"text": "", "commit_id": commit_id})
+    assert session._attempts == 2 and session._deadline is not None
+    session._on_final({"text": "w1", "covered_ms": 2_000})
+    assert session._attempts == 0 and session._deadline is None
+
+
+async def test_no_commit_is_taken_once_pending_commits_are_answered():
+    socket = StubSocket([{"type": "session.closed", "usage": {"duration_ms": 100}}])
+    session = stub_session(socket)
+    await session.send_audio(block(1))
+    commit_id = await session.commit_audio()
+    stream = session.events()
+    failed = await stream.__anext__()
+    assert failed.data["commit_id"] == commit_id
+    # Before the stream's end runs, a new commit could never be answered.
+    with pytest.raises(GatewayError):
+        await session.commit_audio()
+    await stream.aclose()
+
+
+async def test_no_continued_when_the_first_replay_write_fails():
+    from speko_gateway._relay_continuation import _Audio
+
+    session = stub_session(StubSocket())
+    session._log = [_Audio(0, block(1) * 5)]
+    session._appended = session._log[0].end
+    socket = StubSocket(fail=True)
+    events = await session._resume(socket, {**READY, "request_id": "req_1"}, asked=True, start=0)
+    assert "session.continued" not in [event.type for event in events]
+    assert socket.closed
+    await session.aclose()
+
+
+async def test_a_cancelled_dial_sends_no_configure():
+    from speko_gateway._relay_continuation import DialCancelled
+
+    frames = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        async for message in ws:
+            frames.append(message.data)
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/v1/{kind}/stream", handle)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id="00000000-0000-4000-8000-000000000000", base_url=f"http://127.0.0.1:{runner.addresses[0][1]}")
+        try:
+            with pytest.raises(DialCancelled):
+                await client._dial("stt", "{}", "key", "fixture", "fixture-model", lambda: True)
+        finally:
+            await client.aclose()
+        await asyncio.sleep(0.1)
+    finally:
+        await runner.cleanup()
+    assert frames == []
