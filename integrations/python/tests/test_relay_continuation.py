@@ -761,7 +761,7 @@ async def test_seam_drops_repeats_by_time_and_keeps_new_repeats_of_old_words():
 
 
 @pytest.mark.parametrize("old, new, new_end", [("about 1.5", "15", 1_000), ("about twenty one", "21", 990)])
-async def test_a_word_in_delivered_audio_that_matches_nothing_gets_a_gap(old, new, new_end):
+async def test_a_segment_inside_delivered_audio_is_a_repeat(old, new, new_end):
     from speko_gateway._relay_continuation import _Audio
 
     session = seam_session([(old, 1_000)], 500)
@@ -770,12 +770,10 @@ async def test_a_word_in_delivered_audio_that_matches_nothing_gets_a_gap(old, ne
     await resume(session, 500)
     final = {"text": f"{new} apples", "segments": [seg(new, 800, new_end), seg("apples", 1_100, 1_200)]}
     events = session._on_final(final)
-    # Live finals carry segment times only: a word inside the delivered audio
-    # that matches no old word there may be a respelling or a word the old
-    # session missed. It is kept, with a gap for its span: never silent.
-    assert [event.type for event in events] == ["session.gap", "transcript.final"]
-    assert events[0].data == {"from_ms": 800, "to_ms": new_end}
-    assert events[1].data["text"] == f"{new} apples"
+    # Live finals carry segment times only: a segment that lies inside the
+    # delivered audio is a repeat, however its words are spelled.
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "apples"
     await session.aclose()
 
 
@@ -1416,11 +1414,11 @@ async def test_no_covered_seam_trims_a_straddling_segment_by_the_old_tail():
 async def test_a_straddling_segment_that_diverges_gets_a_gap_for_its_span_only():
     old = [old_final(("a", 700, 800), ("b", 800, 900), ("c", 900, 1_000))]
     events = await stitched(old, 500, [{"text": "a x y", "segments": [seg("a x y", 750, 1_300)]}])
-    # "a" repeats the old "a"; "x" lies over the old "c" it does not match:
-    # kept, with a gap for its own span.
+    # The delivered tail "a b c" is no prefix of "a x y": kept whole, with a
+    # gap up to the old end.
     assert [event.type for event in events] == ["session.gap", "transcript.final"]
-    assert events[0].data == {"from_ms": 933, "to_ms": 1_116}
-    assert events[1].data["text"] == "x y"
+    assert events[0].data == {"from_ms": 750, "to_ms": 1_000}
+    assert events[1].data["text"] == "a x y"
 
 
 def word(text: str, start: int, end: int) -> dict[str, Any]:
@@ -1441,7 +1439,7 @@ async def test_words_match_one_to_one_by_text_and_start():
     old = [_Final(["we", "said", "yes"], 1_000, ms(30_000), ((("we", "said", "yes"), 300, 1_000),), (("we", 300, 500), ("said", 500, 750), ("yes", 750, 1_000)))]
     events = await stitched(old, 200, [{"text": "we said no", "words": [word("we", 310, 500), word("said", 510, 740), word("no", 760, 990)], "segments": [seg("we said no", 310, 990)]}])
     assert [event.type for event in events] == ["session.gap", "transcript.final"]
-    assert events[0].data == {"from_ms": 760, "to_ms": 990}
+    assert events[0].data == {"from_ms": 760, "to_ms": 1_000}
     assert events[1].data["text"] == "no"
 
 
@@ -1542,23 +1540,24 @@ async def test_one_old_word_repeats_one_new_word_only():
         500,
         [
             {"text": "no", "segments": [seg("no", 800, 1_000)], "words": [word("no", 800, 1_000)]},
-            {"text": "no", "segments": [seg("no", 900, 1_000)], "words": [word("no", 900, 1_000)]},
+            {"text": "no", "segments": [seg("no", 1_000, 1_200)], "words": [word("no", 1_000, 1_200)]},
         ],
     )
-    assert [event.type for event in events] == ["session.gap", "transcript.final"]
-    assert events[0].data == {"from_ms": 900, "to_ms": 1_000}
-    assert events[1].data["text"] == "no"
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "no"
+    assert events[0].data["words"] == [word("no", 1_000, 1_200)]
 
 
-async def test_an_inserted_word_is_kept_with_a_gap_and_repeats_go():
+async def test_an_inserted_word_keeps_the_whole_segment_with_a_gap():
     # Old "no I said no" (400-1450), new "no uh I said no wait" (410-1750):
-    # "I said no" is no silent repeat; "uh" is kept with a gap, "wait" is new.
+    # the old words all lie in the new span and are no exact prefix of it, so
+    # the segment is kept whole and the seam reported: never a silent repeat.
     old = [old_final(("no I said no", 400, 1_450))]
     text = "no uh I said no wait"
     events = await stitched(old, 300, [{"text": text, "segments": [seg(text, 410, 1_750)]}])
     assert [event.type for event in events] == ["session.gap", "transcript.final"]
-    assert events[0].data == {"from_ms": 633, "to_ms": 856}
-    assert events[1].data["text"] == "uh wait"
+    assert events[0].data == {"from_ms": 410, "to_ms": 1_450}
+    assert events[1].data["text"] == text
 
 
 async def test_a_word_past_the_old_end_survives_a_straddling_repeat():
@@ -1567,3 +1566,43 @@ async def test_a_word_past_the_old_end_survives_a_straddling_repeat():
     events = await stitched(old, 400, [{"text": "send it to", "segments": [seg("send it to", 510, 1_100)]}])
     assert [event.type for event in events] == ["transcript.final"]
     assert events[0].data["text"] == "to"
+
+
+async def test_a_straddling_segment_loses_exactly_the_repeated_tail():
+    # Old "call me back" (12500-13000), new "call me back tomorrow"
+    # (12500-14200): "tomorrow" only, starting where the old words ended.
+    old = [old_final(("call me back", 12_500, 13_000))]
+    text = "call me back tomorrow"
+    events = await stitched(old, 12_000, [{"text": text, "segments": [seg(text, 12_500, 14_200)]}])
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "tomorrow"
+    assert events[0].data["segments"] == [seg("tomorrow", 13_000, 14_200)]
+
+
+async def test_a_new_command_after_a_repeated_word_is_kept_with_a_gap():
+    # Old "say go left" (200-800), new "say go now" (210-1200): the tail is no
+    # prefix of it, so all of it is kept and the seam reported.
+    old = [old_final(("say go left", 200, 800))]
+    text = "say go now"
+    events = await stitched(old, 100, [{"text": text, "segments": [seg(text, 210, 1_200)]}])
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 210, "to_ms": 800}
+    assert events[1].data["text"] == "say go now"
+
+
+async def test_a_second_reconnect_uses_the_latest_delivered_end():
+    # "turn left" ended at 1000; the first reconnect delivered "um" ending at
+    # 830. A second reconnect still knows the words up to 1000 were
+    # delivered, so a replayed "left" is a repeat.
+    old = [old_final(("turn left", 600, 1_000)), old_final(("um", 700, 830))]
+    events = await stitched(old, 500, [{"text": "left", "segments": [seg("left", 790, 1_000)]}, {"text": "go", "segments": [seg("go", 1_000, 1_200)]}])
+    assert [event.data["text"] for event in events] == ["go"]
+
+
+async def test_an_untimed_final_after_a_timed_repeat_is_kept_with_a_gap():
+    # The timed "go now" repeats the old one and goes. An untimed "go now"
+    # after it cannot be told from it by text: kept, and the seam reported.
+    old = [old_final(("go now", 500, 1_000))]
+    events = await stitched(old, 400, [{"text": "go now", "segments": [seg("go now", 510, 1_000)]}, {"text": "go now"}])
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[1].data["text"] == "go now"
