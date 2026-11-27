@@ -150,6 +150,18 @@ This repository contributes the verifier (`runtime.RelayPlanVerifier`), the
 relay-route adapter arms (credential kind `relay_access` beside `bearer`;
 BYOK unchanged) and the public `relayapi` wire contract.
 
+- With `auto_reconnect`, the Python relay STT client re-sends buffered PCM
+  to a new relay session after a drop: from `covered_ms`, else from the end
+  of the last timed final, else 5 s before a final arrived.
+- The buffer keeps about `log_cap_ms` (15 s by default) of sent audio. It can
+  hold more while a new session is being dialled, and it goes only to the
+  relay. Audio after the replay point that fell out of it is reported as
+  `session.gap` (except what delivered finals already cover), silence or
+  not.
+- Known limit: when a provider sends neither `covered_ms` nor segment times,
+  the replay point is a guess (5 s before the last final arrived), so a final
+  that arrives more than 5 s late can lose speech without a `session.gap`.
+
 ## Telemetry and billing
 
 Content-free usage telemetry is on by default for every installation.

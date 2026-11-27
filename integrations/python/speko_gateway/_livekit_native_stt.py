@@ -618,6 +618,9 @@ class NativeSpeechStream(stt.RecognizeStream):
                     self._finals.append(event)
                 elif event.type == "transcript.delta":
                     self._emit(event, stt.SpeechEventType.INTERIM_TRANSCRIPT)
+                elif event.type == "session.reconnecting":
+                    # The dropped session's interim text is void: clear it.
+                    self._emit(event, stt.SpeechEventType.INTERIM_TRANSCRIPT)
             if not self._finishing:
                 raise GatewayError(
                     "Native speech ended before its input boundary", retryable=False
@@ -691,13 +694,37 @@ class NativeSpeechStream(stt.RecognizeStream):
             and (not self._turn_text or " ".join(transcript.split()) == self._turn_text)
         )
 
+    async def _wait_for_receiver(
+        self, stream: LiveKitSTTStream, receiver: asyncio.Task[None]
+    ) -> None:
+        """Wait for the turn's finals within conn_options.timeout, renewed while
+        a dropped stream is being continued and for one period after it caught
+        up (its last finals still arrive then). Reaching a session is bounded
+        by the outage budget and catching up by the bounded backlog at 2x."""
+        counts = getattr(stream, "continuation_counts", None)
+        seen = counts["session.reconnecting"] if counts is not None else 0
+        # A recovery already under way on entry earns its extra period too.
+        was_recovering = getattr(stream, "recovering", False) is True
+        while True:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(receiver), self._conn_options.timeout
+                )
+                return
+            except (TimeoutError, asyncio.TimeoutError):
+                reconnects = counts["session.reconnecting"] if counts is not None else 0
+                recovering = getattr(stream, "recovering", False) is True
+                if not (recovering or was_recovering or reconnects != seen):
+                    raise
+                seen, was_recovering = reconnects, recovering
+
     async def _finish_turn(self, speech_end: int | None = None) -> None:
         assert self._gateway_stream is not None and self._receiver is not None
         stream, receiver = self._gateway_stream, self._receiver
         self._finishing = True
         await stream.flush()
         await stream.finish()
-        await asyncio.wait_for(asyncio.shield(receiver), self._conn_options.timeout)
+        await self._wait_for_receiver(stream, receiver)
         if self._wait_for_turn_commit:
             # Some SDK versions retain this stream across Agent handoffs.
             # Bind the actual current activity again before publishing finals,

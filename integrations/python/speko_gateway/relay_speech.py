@@ -12,12 +12,18 @@ import ipaddress
 import json
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 from urllib.parse import urlsplit
 
 import aiohttp
 
+from ._relay_continuation import (
+    ContinuingSpeechSession,
+    DialCancelled,
+    DialRefused,
+    DialUnknown,
+)
 from ._relay_socket import NATIVE_SOCKET_ORIGIN, socket_headers, validate_session_id
 from ._user_agent import USER_AGENT
 from .client import CanonicalEvent, GatewayError, SessionConfig
@@ -48,7 +54,7 @@ def _error(payload: dict[str, Any], *, status: int | None = None) -> GatewayErro
     request_id = value.get("request_id", "")
     if not isinstance(request_id, str) or not re.fullmatch(r"[!-~]{1,256}", request_id):
         request_id = ""
-    return GatewayError(
+    error = GatewayError(
         "Relay speech request failed",
         code=code,
         source="relay",
@@ -58,6 +64,10 @@ def _error(payload: dict[str, Any], *, status: int | None = None) -> GatewayErro
         # Framework retries open a new request and could charge it twice.
         retryable=False,
     )
+    # Stream continuation reads the relay's own hint to decide on a new
+    # session; it never reaches framework retries.
+    error.relay_retryable = value.get("retryable") is True  # type: ignore[attr-defined]
+    return error
 
 
 def _json(message: aiohttp.WSMessage) -> dict[str, Any]:
@@ -203,7 +213,14 @@ class RelaySpeechClient:
         config: SessionConfig,
         *,
         idempotency_key: str | None = None,
-    ) -> RelaySpeechSession:
+        auto_reconnect: bool = False,
+    ) -> RelaySpeechSession | ContinuingSpeechSession:
+        """Open a native relay speech session.
+
+        With ``auto_reconnect`` (STT on 16-bit PCM only), a dropped stream
+        continues in a new session; see ``speko_gateway._relay_continuation``.
+        The server must accept the continuation field, so it is off by default.
+        """
         if config.kind not in _EVENTS:
             raise ValueError("RelaySpeechClient supports only STT and TTS")
         execution = config.execution
@@ -239,6 +256,20 @@ class RelaySpeechClient:
             configure["voice"] = request.get("voice", "")
         if request.get(config.kind):
             configure["options"] = request[config.kind]
+        if auto_reconnect:
+            media = config.media or {}
+            if (
+                config.kind != "stt"
+                or media.get("encoding") != "pcm_s16le"
+                or type(media.get("sample_rate_hz")) is not int
+                or type(media.get("channels")) is not int
+                or media["sample_rate_hz"] <= 0
+                or media["channels"] <= 0
+            ):
+                raise ValueError("auto_reconnect requires STT on pcm_s16le audio")
+            return await self._open_continuing(
+                config.kind, configure, provider, model, media, idempotency_key
+            )
         text_limit = request.get("max_input_characters")
         if text_limit is not None and (type(text_limit) is not int or text_limit <= 0):
             raise ValueError("max_input_characters must be a positive integer")
@@ -296,6 +327,125 @@ class RelaySpeechClient:
                 raise GatewayError(
                     "Relay speech connection failed", retryable=False
                 ) from None
+            raise
+
+    async def _open_continuing(
+        self,
+        kind: str,
+        configure: dict[str, Any],
+        provider: str,
+        model: str,
+        media: dict[str, Any],
+        idempotency_key: str | None,
+    ) -> ContinuingSpeechSession:
+        async def dial(
+            text: str, key: str, cancelled: Callable[[], bool]
+        ) -> tuple[Any, dict[str, Any]]:
+            return await self._dial(kind, text, key, provider, model, cancelled)
+
+        first = json.dumps({**configure, "continuation": {}}, separators=(",", ":"))
+        try:
+            websocket, ready = await dial(
+                first, idempotency_key or str(uuid.uuid4()), lambda: False
+            )
+        except DialRefused as refusal:
+            raise GatewayError(
+                "Relay speech request failed",
+                code=refusal.code,
+                source="relay",
+                retryable=False,
+            ) from None
+        except DialUnknown:
+            raise GatewayError(
+                "Relay speech connection failed", retryable=False
+            ) from None
+        return ContinuingSpeechSession(
+            dial=dial,
+            configure=configure,
+            websocket=websocket,
+            ready=ready,
+            metadata={
+                "session_id": self._platform_session_id,
+                "request_id": ready["request_id"],
+                "route": dict(ready["route"]),
+            },
+            sample_rate=media["sample_rate_hz"],
+            channels=media["channels"],
+        )
+
+    async def _dial(
+        self,
+        kind: str,
+        text: str,
+        key: str,
+        provider: str,
+        model: str,
+        cancelled: Callable[[], bool],
+    ) -> tuple[aiohttp.ClientWebSocketResponse, dict[str, Any]]:
+        """One dial: DialRefused when the relay answered with an error,
+        DialUnknown when it may or may not have started the request,
+        DialCancelled when the stream was cancelled before the configure."""
+        websocket: aiohttp.ClientWebSocketResponse | None = None
+
+        async def establish() -> tuple[aiohttp.ClientWebSocketResponse, dict]:
+            nonlocal websocket
+            websocket = await self._session.ws_connect(
+                f"{self._origin}/v1/{kind}/stream",
+                headers={"Idempotency-Key": key},
+                max_msg_size=2 << 20,
+                heartbeat=15,
+            )
+            if cancelled():
+                # No configure went out, so no session started.
+                raise DialCancelled()
+            await websocket.send_str(text)
+            message = await websocket.receive()
+            if message.type is not aiohttp.WSMsgType.TEXT:
+                raise DialUnknown()
+            ready = _json(message)
+            if ready["type"] == "error":
+                error = ready.get("error")
+                error = error if isinstance(error, dict) else {}
+                raise DialRefused(
+                    str(error.get("code") or ""), error.get("retryable") is True
+                )
+            route = ready.get("route")
+            if (
+                ready["type"] != "session.ready"
+                or not isinstance(ready.get("request_id"), str)
+                or not ready["request_id"]
+                or not isinstance(route, dict)
+                or route.get("provider") != provider
+                or route.get("model") != model
+            ):
+                raise GatewayError("Relay speech admission failed", retryable=False)
+            return websocket, ready
+
+        try:
+            return await asyncio.wait_for(establish(), self._setup_timeout)
+        except BaseException as error:
+            if websocket is not None:
+                await websocket.close()
+            if isinstance(error, GatewayError) and error.code and error.status:
+                if error.code.startswith("http_"):
+                    # No relay envelope: a proxy answered. A 5xx proves nothing
+                    # about the request behind it.
+                    if error.status >= 500:
+                        raise DialUnknown() from None
+                    raise
+                raise DialRefused(
+                    error.code, getattr(error, "relay_retryable", False)
+                ) from None
+            if isinstance(
+                error,
+                (
+                    aiohttp.ClientError,
+                    ConnectionError,
+                    TimeoutError,
+                    asyncio.TimeoutError,
+                ),
+            ):
+                raise DialUnknown() from None
             raise
 
 

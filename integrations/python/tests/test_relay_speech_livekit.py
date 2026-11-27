@@ -4626,3 +4626,87 @@ async def test_native_onset_recovery_distinguishes_paused_and_progressing_real_t
 @pytest.mark.parametrize("duration", [0.05, 0.2])
 async def test_draining_quiet_after_reset_cannot_start_the_fresh_interruption_clock(duration):
     await test_draining_framework_vad_preserves_actual_response_interruption("stt_flush_quiet_old", interruption=duration)
+
+
+
+async def test_native_turn_waits_for_a_continuation_beyond_the_connect_timeout():
+    source = ControlledVAD()
+    connections = []
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        index = len(connections)
+        connections.append(await ws.receive_json())
+        if index == 1:
+            # Opening the continued session outlasts conn_options.timeout.
+            await asyncio.sleep(0.8)
+        await ws.send_json(
+            {
+                "type": "session.ready",
+                "request_id": f"owned-livekit-{index}",
+                "route": {"provider": "fixture", "model": "fixture-model", "region": "owned"},
+                "continuation": True,
+                "commit_ids": True,
+            }
+        )
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.BINARY:
+                if index == 0:
+                    await ws.send_json({"type": "transcript.delta", "text": "streaming"})
+                    await ws.close()
+                    return ws
+                continue
+            control = json.loads(message.data)
+            if control["type"] == "input.commit":
+                await ws.send_json({"type": "transcript.final", "text": "complete", "commit_id": control["commit_id"]})
+            elif control["type"] == "session.close":
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(
+            api_key="sk_speko_agent_fixture",
+            session_id=str(uuid.uuid4()),
+            base_url=origin,
+        )
+        model = STT(
+            client,
+            provider="fixture",
+            model="fixture-model",
+            credential_source="managed",
+            turn_vad=source,
+            auto_reconnect=True,
+        )
+        stream = model.stream(
+            manual_turns=True,
+            conn_options=APIConnectOptions(max_retry=0, timeout=0.3),
+        )
+        try:
+            audio = frame()
+            stream.push_frame(audio)
+            await asyncio.wait_for(source.frames.get(), 2)
+            source.processed(audio)
+            source.emit(vad.VADEventType.START_OF_SPEECH)
+            assert (
+                await asyncio.wait_for(anext(stream), 2)
+            ).type is stt.SpeechEventType.START_OF_SPEECH
+            interim = await asyncio.wait_for(anext(stream), 2)
+            assert interim.alternatives[0].text == "streaming"
+            # The drop voids the interim text.
+            cleared = await asyncio.wait_for(anext(stream), 2)
+            assert cleared.type is stt.SpeechEventType.INTERIM_TRANSCRIPT
+            assert cleared.alternatives[0].text == ""
+            source.emit(vad.VADEventType.END_OF_SPEECH)
+            final = await asyncio.wait_for(anext(stream), 3)
+            assert final.type is stt.SpeechEventType.FINAL_TRANSCRIPT
+            assert final.alternatives[0].text == "complete"
+            assert (
+                await asyncio.wait_for(anext(stream), 2)
+            ).type is stt.SpeechEventType.END_OF_SPEECH
+            assert connections[1]["continuation"]["of"] == "owned-livekit-0"
+        finally:
+            await stream.aclose()
+            await model.aclose()
+            await client.aclose()
