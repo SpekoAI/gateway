@@ -23,6 +23,9 @@ from .client import GatewayError
 
 _log = logging.getLogger(__name__)
 
+# Padded windows one framework commit attempt may add before it slows to one per this many windows of audio.
+_COMMIT_PAD_BUDGET = 16
+
 
 class _InputChannel(utils.aio.Chan[Any]):
     def __init__(self, on_audio: Callable[[rtc.AudioFrame], None]) -> None:
@@ -722,21 +725,27 @@ class NativeSpeechStream(stt.RecognizeStream):
         (so the turn is going to commit unless this audio resumes speech), never from the stream's own events:
         speech detection before and between turns, and while the framework still waits, never sees the padded
         window from here."""
+        detector = self._probability_vad
         if (
-            self._wait_for_turn_commit
-            and self._commit_attempted
-            and self._commit_pads < 16
-            and self._turn_commit is not None
-            and not self._turn_commit.done()
-            and not self._pending_transcript
-            and not self._classifying_boundary
-            and not self._vad_speaking
-            and not self._vad_onset_pending
-            and self._available_samples > 0
-            # Only windows actually added count against the budget; once it is spent the commit waits for
-            # frame and window boundaries to line up, as before.
-            and self._drain_vad_tail()
+            detector is None
+            or not self._wait_for_turn_commit
+            or not self._commit_attempted
+            or self._turn_commit is None
+            or self._turn_commit.done()
+            or self._pending_transcript
+            or self._classifying_boundary
+            or self._vad_speaking
+            or self._vad_onset_pending
+            or self._available_samples <= 0
         ):
+            return
+        if self._commit_pads >= _COMMIT_PAD_BUDGET:
+            # The budget bounds how much synthetic silence one attempt adds while audio keeps arriving; spent,
+            # one more window is allowed per budget's worth of new audio, so a silent tail still commits.
+            window = detector.window_samples * 2 * self._channels
+            if self._vad_audio.real_fed - self._vad_audio.last_padded < _COMMIT_PAD_BUDGET * window:
+                return
+        if self._drain_vad_tail():
             self._commit_pads += 1
 
     def _log_gate(self, source: str, permitted: bool) -> None:
