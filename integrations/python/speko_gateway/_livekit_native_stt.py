@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import uuid
 from bisect import bisect_left, bisect_right
@@ -19,6 +20,8 @@ from ._livekit_native_speaker import NativeSpeechData
 from ._livekit_native_transcript import NativeFinalBatch, NativeTranscript
 from ._livekit_vad_audio import ProbabilityVAD, VADAudio
 from .client import GatewayError
+
+_log = logging.getLogger(__name__)
 
 
 class _InputChannel(utils.aio.Chan[Any]):
@@ -114,6 +117,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._pending_transcript = False
         self._classifying_boundary = False
         self._awaiting_new_turn = False
+        self._last_commit_gate = True
         self._turn_commit: asyncio.Future[None] | None = None
         self._turn_text = ""
         self._canonical_turn: NativeTranscript | None = None
@@ -684,20 +688,35 @@ class NativeSpeechStream(stt.RecognizeStream):
             self._turn_commit.set_result(None)
 
     def permits_framework_commit(self, transcript: str) -> bool:
-        return not self._wait_for_turn_commit or self._task.done() or (
+        text_match = not self._turn_text or " ".join(transcript.split()) == self._turn_text
+        idle = not self._vad_speaking and not self._vad_onset_pending and self._available_samples == 0
+        permitted = not self._wait_for_turn_commit or self._task.done() or (
             not self._pending_transcript
             and not self._classifying_boundary
-            and (self._awaiting_new_turn or self._vad_finished or (not self._vad_speaking and not self._vad_onset_pending and self._available_samples == 0))
-            and (not self._turn_text or " ".join(transcript.split()) == self._turn_text)
+            and (self._awaiting_new_turn or self._vad_finished or idle)
+            and text_match
         )
+        if permitted != self._last_commit_gate:
+            # Only the gate's flips are logged: state names and counts, never the transcript.
+            self._last_commit_gate = permitted
+            _log.info(
+                "native stt commit gate permitted=%s available=%d pending=%s classifying=%s awaiting_new=%s "
+                "vad_finished=%s speaking=%s onset=%s text_match=%s",
+                permitted, self._available_samples, self._pending_transcript, self._classifying_boundary,
+                self._awaiting_new_turn, self._vad_finished, self._vad_speaking, self._vad_onset_pending, text_match,
+            )
+        return permitted
 
     async def _finish_turn(self, speech_end: int | None = None) -> None:
         assert self._gateway_stream is not None and self._receiver is not None
         stream, receiver = self._gateway_stream, self._receiver
         self._finishing = True
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         await stream.flush()
         await stream.finish()
         await asyncio.wait_for(asyncio.shield(receiver), self._conn_options.timeout)
+        _log.info("native stt turn closed after %.0f ms", (loop.time() - started) * 1000)
         if self._wait_for_turn_commit:
             # Some SDK versions retain this stream across Agent handoffs.
             # Bind the actual current activity again before publishing finals,
