@@ -1693,3 +1693,57 @@ async def test_frame_alignment_never_turns_new_audio_into_a_repeat():
     assert [event.type for event in events] == ["transcript.final"]
     assert events[0].data["text"] == "left"
     await session.aclose()
+
+
+async def _covered_hole_session(**limits: Any) -> ContinuingSpeechSession:
+    # covered_ms 1000 while a later final lies at 1500-1800: 1000-1500 was
+    # never finalized, a hole in the delivered audio.
+    session = stub_session(StubSocket(), **limits)
+    for _ in range(30):
+        await session.send_audio(block(1))
+    session._on_final({"text": "turn left", "covered_ms": 1_000, "segments": [seg("turn left", 500, 1_000)]})
+    session._on_final({"text": "go now", "covered_ms": 1_000, "segments": [seg("go now", 1_500, 1_800)]})
+    assert session._trim == ms(1_000)
+    return session
+
+
+async def test_a_new_word_in_a_hole_of_delivered_audio_is_new():
+    session = await _covered_hole_session()
+    events, _ = await resume(session, 1_000)
+    assert "session.gap" not in [event.type for event in events]
+    events = session._on_final({"text": "wait", "covered_ms": 1_300, "segments": [seg("wait", 1_100, 1_300)]})
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "wait"
+    # The words of the later delivered final repeat and go; after it, new.
+    assert session._on_final({"text": "go now", "covered_ms": 1_800, "segments": [seg("go now", 1_500, 1_800)]}) == []
+    events = session._on_final({"text": "please", "covered_ms": 2_000, "segments": [seg("please", 1_800, 2_000)]})
+    assert [event.data["text"] for event in events] == ["please"]
+    await session.aclose()
+
+
+async def test_a_hole_the_log_lost_is_reported_exactly():
+    # The log no longer holds 1000-1600: the hole 1000-1500 is lost, while
+    # 1500-1600 lies in the delivered final.
+    session = await _covered_hole_session()
+    session._drop_audio_before(ms(1_600))
+    events, _ = await resume(session, 1_600)
+    gaps = [event.data for event in events if event.type == "session.gap"]
+    assert gaps == [{"from_ms": 1_000, "to_ms": 1_500}]
+    await session.aclose()
+
+
+async def test_a_segment_from_a_hole_into_delivered_audio_loses_the_repeated_words():
+    session = await _covered_hole_session()
+    await resume(session, 1_000)
+    events = session._on_final({"text": "wait go now", "covered_ms": 1_800, "segments": [seg("wait go now", 1_100, 1_800)]})
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "wait"
+    assert events[0].data["segments"] == [seg("wait", 1_100, 1_500)]
+    # Not an exact repeat of the delivered "go now": kept whole, with a gap.
+    session = await _covered_hole_session()
+    await resume(session, 1_000)
+    events = session._on_final({"text": "wait go home", "covered_ms": 1_800, "segments": [seg("wait go home", 1_100, 1_800)]})
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 1_500, "to_ms": 1_800}
+    assert events[1].data["text"] == "wait go home"
+    await session.aclose()
