@@ -290,6 +290,8 @@ class ContinuingSpeechSession:
         self._trim = 0
         self._exact = True
         self._covered_seen = False
+        # The current session has sent covered_ms.
+        self._session_covered = False
         self._heard = False
         self._log: list[_Audio | _Commit] = []
         self._pending: dict[str, _Commit] = {}
@@ -388,12 +390,20 @@ class ContinuingSpeechSession:
         self._exact = exact
 
     def _boundary_ms(self, start: int) -> int:
-        """Where finalized audio ends for a replay from ``start``: covered_ms
-        when it set this point, though the offset had to round it down to a
-        whole ms of samples; otherwise the start itself."""
+        """Where finalized audio ends for a replay from ``start``: covered_ms,
+        or else the last final's end, when it set this point, though the
+        offset had to round it down to a whole ms of samples; otherwise the
+        start itself. Alignment never turns new audio into a repeat."""
         covered = self._covered_boundary
         if covered is not None and self._aligned(self._position(covered)) == start:
             return covered
+        end = self._final_end_ms
+        if (
+            not self._session_covered
+            and end is not None
+            and self._aligned(self._position(end)) == start
+        ):
+            return end
         return self._ms(start)
 
     def _has_work(self) -> bool:
@@ -651,10 +661,7 @@ class ContinuingSpeechSession:
             gap, deliver = self._stitch(data)
             events.extend(gap)
         self._heard = False
-        # The replay point is covered_ms while it keeps up: at most the overlap
-        # behind the audio delivered when this final arrived. A covered_ms
-        # that stopped moving would pin the log and turn every later drop into
-        # a gap, so it then falls back to the overlap rule.
+        # The replay point is covered_ms when the session sends it.
         covered = data.get("covered_ms")
         # Without a usable covered_ms the replay point is the end of the last
         # timed final's words: the next session's words start there and are
@@ -666,21 +673,25 @@ class ContinuingSpeechSession:
         else:
             overlap_start = arrived - self._position(self._limits.overlap_ms)
         if self._confirmed and type(covered) is int and covered >= 0:
+            # Once a session sends covered_ms it alone moves the replay point:
+            # audio after it is not closed yet, whatever finals say. Behind
+            # the last final's end (beyond rounding) the seam rules take the
+            # overlap, so the replay is not exact.
+            self._session_covered = self._covered_seen = True
             position = self._position(covered)
-            # covered_ms is floored and segment ends are rounded: it may be
-            # up to ROUNDING_MS before the last final's end and still be fresh.
-            if position >= overlap_start - self._position(ROUNDING_MS):
-                self._covered_seen = True
-                self._advance(position, exact=True)
-                if self._aligned(position) == self._trim:
-                    # covered_ms names the replay point, even when it moved
-                    # within the same whole ms of samples.
-                    self._covered_boundary = covered
-            else:
-                self._advance(overlap_start, exact=False)
+            behind = (
+                self._final_end_ms is not None
+                and covered < self._final_end_ms - ROUNDING_MS
+            )
+            self._advance(position, exact=not behind)
+            if self._aligned(position) == self._trim:
+                # covered_ms names the replay point, even when it moved
+                # within the same whole ms of samples.
+                self._covered_boundary = covered
         else:
             covered = None
-            self._advance(overlap_start, exact=False)
+            if not self._session_covered:
+                self._advance(overlap_start, exact=False)
         segments = _timed_segments(data)
         end_ms = segments[-1]["end_ms"] if segments else None
         if self._on_new_audio(covered, end_ms):
@@ -1143,16 +1154,18 @@ class ContinuingSpeechSession:
                 if self._final_end_ms is not None:
                     gap_from = max(gap_from, min(self._final_end_ms, self._ms(lost_to)))
                 # The gap first: a consumer that stops at a failed commit has
-                # already been told why.
-                events.append(
-                    CanonicalEvent(
-                        type="session.gap",
-                        data={
-                            "from_ms": gap_from,
-                            "to_ms": self._ms(lost_to),
-                        },
+                # already been told why. Finals that reach the log start leave
+                # nothing missing.
+                if gap_from < self._ms(lost_to):
+                    events.append(
+                        CanonicalEvent(
+                            type="session.gap",
+                            data={
+                                "from_ms": gap_from,
+                                "to_ms": self._ms(lost_to),
+                            },
+                        )
                     )
-                )
                 events.extend(
                     self._fail_commits(
                         [
@@ -1172,6 +1185,7 @@ class ContinuingSpeechSession:
                 events.extend(self._fail_pending("commit_ids_not_echoed"))
             self._ws, self._live = websocket, True
             self._confirmed = confirmed
+            self._session_covered = False
             self._base = 0 if confirmed else start
             self._delivered = start
             self.metadata = {

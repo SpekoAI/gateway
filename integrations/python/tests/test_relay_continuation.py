@@ -598,9 +598,10 @@ async def test_overflow_after_speech_is_a_gap():
     assert gaps and gaps[0].data["from_ms"] == 0 and gaps[0].data["to_ms"] > 0
 
 
-async def test_frozen_covered_ms_falls_back_to_overlap():
-    # covered_ms stops at 0 while finals keep coming; a drop 35 s in must not
-    # find the log pinned at 0 (overflowed, a gap) but take the overlap seam.
+async def test_frozen_covered_ms_stays_the_replay_point_without_a_false_gap():
+    # covered_ms stops at 0 while finals keep coming. It stays the replay
+    # point, so the log overflows; but the finals reach past the log start,
+    # so nothing is missing: the replay from the log start takes the seam.
     values = list(range(1, 401))
     fake = FakeRelay(freeze_covered=0, drop=lambda conn, event, info: conn == 0 and event == "bytes" and info == 350 * BLOCK)
     events, _, _ = await run(fake, values, chunk=BLOCK, pace=0.001)
@@ -1481,7 +1482,7 @@ async def test_covered_ms_moving_within_one_ms_of_samples_keeps_the_seam_exact()
     await session.aclose()
 
 
-async def test_without_covered_ms_the_replay_starts_before_the_last_final_ended():
+async def test_without_covered_ms_the_replay_starts_at_the_last_final_end():
     # Live Deepgram without covered_ms: the final "[9230-13865] six ... fifty
     # cents" arrived with 20 s delivered. The replay at the 23.7 s cut must
     # start at 13865, not 5 s before arrival (15 s), or "the weather in
@@ -1651,3 +1652,44 @@ async def test_a_word_after_the_old_end_is_new_on_the_words_path():
     events = await stitched(old, 500, [{"text": "no", "segments": [seg("no", 1_005, 1_195)], "words": [word("no", 1_005, 1_195)]}])
     assert [event.type for event in events] == ["transcript.final"]
     assert events[0].data["text"] == "no"
+
+
+async def test_covered_ms_behind_a_later_final_is_the_replay_point():
+    # covered_ms 1000 while a later final ends at 1800: 1000-1800 is not
+    # closed, so the replay starts at 1000 (not exact) and the seam drops the
+    # replayed repeat; the word after it is new.
+    session = stub_session(StubSocket())
+    for _ in range(30):
+        await session.send_audio(block(1))
+    session._on_final({"text": "turn left", "covered_ms": 1_000, "segments": [seg("turn left", 500, 1_000)]})
+    session._on_final({"text": "go now", "covered_ms": 1_000, "segments": [seg("go now", 1_000, 1_800)]})
+    assert session._trim == ms(1_000)
+    events, _ = await resume(session, 1_000)
+    continued = next(event for event in events if event.type == "session.continued")
+    assert continued.data["exact"] is False
+    events = session._on_final({"text": "go now", "covered_ms": 1_800, "segments": [seg("go now", 1_000, 1_800)]})
+    assert events == []
+    events = session._on_final({"text": "please", "covered_ms": 2_000, "segments": [seg("please", 1_800, 2_000)]})
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "please"
+    await session.aclose()
+
+
+async def test_frame_alignment_never_turns_new_audio_into_a_repeat():
+    # 44.1 kHz without covered_ms: a final ending at 1013 aligns the replay
+    # start down to 1011. A new "left" from 1012 is new, not a repeat of the
+    # old "left", and there is no seam to report.
+    rate = 44_100
+    session = stub_session(StubSocket(), sample_rate=rate)
+    for _ in range(60):
+        await session.send_audio(block(1))
+    session._on_final({"text": "turn left", "segments": [seg("turn", 500, 800), seg("left", 800, 1_013)]})
+    start_ms = session._trim * 1000 // (rate * 2)
+    assert start_ms < 1_013
+    events = await session._resume(StubSocket(), {**READY, "request_id": "req_1"}, asked=True, start=session._trim)
+    assert session._seam is None
+    assert "session.gap" not in [event.type for event in events]
+    events = session._on_final({"text": "left", "segments": [seg("left", 1_012, 1_300)]})
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "left"
+    await session.aclose()
