@@ -1128,3 +1128,33 @@ async def test_stt_finish_still_gives_up_on_a_stalled_stream(monkeypatch: pytest
         service.push_frame.assert_not_awaited()
     finally:
         await service.cleanup()
+
+
+
+async def test_stt_finish_waits_after_a_recovery_that_ends_before_the_first_timer(monkeypatch: pytest.MonkeyPatch) -> None:
+    from speko_gateway import pipecat
+
+    monkeypatch.setattr(pipecat, "_RECEIVE_GRACE_SECONDS", 0.1)
+    release = asyncio.Event()
+    session = ContinuingFakeSession([], release)
+    session.recovering = True
+    service = SpekoSTTService(FakeGatewayClient(session), sample_rate=16_000)
+    service.push_frame = AsyncMock()  # type: ignore[method-assign]
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+
+    async def caught_up() -> None:
+        # Recovery ends before the first timer; the last final comes later.
+        await asyncio.sleep(0.03)
+        session.recovering = False
+        await asyncio.sleep(0.12)
+        release.set()
+
+    try:
+        await service._connect()
+        helper = asyncio.create_task(caught_up())
+        await service._finish(graceful=True)
+        await helper
+        frames = [call.args[0] for call in service.push_frame.await_args_list]
+        assert [frame.text for frame in frames] == ["after the replay"]
+    finally:
+        await service.cleanup()

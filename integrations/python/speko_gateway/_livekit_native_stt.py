@@ -703,7 +703,8 @@ class NativeSpeechStream(stt.RecognizeStream):
         by the outage budget and catching up by the bounded backlog at 2x."""
         counts = getattr(stream, "continuation_counts", None)
         seen = counts["session.reconnecting"] if counts is not None else 0
-        was_recovering = False
+        # A recovery already under way on entry earns its extra period too.
+        was_recovering = getattr(stream, "recovering", False) is True
         while True:
             try:
                 await asyncio.wait_for(

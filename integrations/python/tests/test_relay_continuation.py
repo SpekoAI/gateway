@@ -761,7 +761,7 @@ async def test_seam_drops_repeats_by_time_and_keeps_new_repeats_of_old_words():
 
 
 @pytest.mark.parametrize("old, new, new_end", [("about 1.5", "15", 1_000), ("about twenty one", "21", 990)])
-async def test_seam_needs_the_same_words_at_the_same_time(old, new, new_end):
+async def test_a_segment_inside_delivered_audio_is_a_repeat(old, new, new_end):
     from speko_gateway._relay_continuation import _Audio
 
     session = seam_session([(old, 1_000)], 500)
@@ -770,10 +770,10 @@ async def test_seam_needs_the_same_words_at_the_same_time(old, new, new_end):
     await resume(session, 500)
     final = {"text": f"{new} apples", "segments": [seg(new, 800, new_end), seg("apples", 1_100, 1_200)]}
     events = session._on_final(final)
-    # Other words over already delivered audio: kept, and the disagreement is
-    # reported rather than guessed away.
-    assert [event.type for event in events] == ["session.gap", "transcript.final"]
-    assert events[1].data["text"] == f"{new} apples"
+    # Live finals carry segment times only: a segment that lies inside the
+    # delivered audio is a repeat, however its words are spelled.
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "apples"
     await session.aclose()
 
 
@@ -1352,3 +1352,123 @@ async def test_the_commit_limit_names_every_marker():
     with pytest.raises(GatewayError) as failure:
         await session.commit_audio()
     assert "commit markers" in str(failure.value)
+
+
+
+def old_final(*segments: tuple[str, int, int]):
+    from speko_gateway._relay_continuation import _Final
+
+    words = [word for text, _, _ in segments for word in text.split()]
+    return _Final(words, segments[-1][2], ms(30_000), tuple((tuple(text.split()), start, end) for text, start, end in segments))
+
+
+async def stitched(old: list[Any], start_ms: int, finals: list[dict[str, Any]], ready: dict[str, Any] | None = None) -> list[Any]:
+    from speko_gateway._relay_continuation import _Audio
+
+    session = stub_session(StubSocket())
+    session._history.extend(old)
+    session._log = [_Audio(ms(start_ms), block(1) * 100)]
+    session._trim = ms(start_ms)
+    session._appended = session._log[0].end
+    await resume(session, start_ms, ready)
+    events = []
+    for final in finals:
+        events.extend(session._on_event("transcript.final", {"type": "transcript.final", **final}))
+    await session.aclose()
+    return events
+
+
+async def test_real_restarted_session_drops_a_segment_inside_delivered_audio():
+    # Live Deepgram, restarted-old-server: the plain new session started at
+    # 9500 ms and re-transcribed the rest of an already delivered segment.
+    old = [old_final(("six seven eight nine and the amount is fifteen dollars and fifty cents", 9_240, 13_875))]
+    events = await stitched(
+        old,
+        9_500,
+        [
+            {"text": "seven eight nine and the amount is fifteen dollars and fifty cents", "segments": [seg("seven eight nine and the amount is fifteen dollars and fifty cents", 0, 4_365)]},
+            {"text": "the weather in almaty today is cold about minus five degrees", "segments": [seg("the weather in almaty today is cold about minus five degrees", 4_365, 8_370)]},
+        ],
+        {**READY, "request_id": "req_22", "continuation": False},
+    )
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "the weather in almaty today is cold about minus five degrees"
+    assert events[0].data["segments"][0]["start_ms"] == 13_865
+
+
+async def test_no_covered_seam_trims_a_straddling_segment_by_the_old_tail():
+    # Fake relay without covered_ms, cut at 17.3 s: one new segment straddles
+    # the old end (16000) and its first 10 words repeat the old tail.
+    old = [
+        old_final(("w98 w176 w252 w22", 10_000, 12_000)),
+        old_final(("w13 w17 w56 w176", 12_000, 14_000)),
+        old_final(("w254 w233 w33 w38", 14_000, 16_000)),
+    ]
+    text = "w252 w22 w13 w17 w56 w176 w254 w233 w33 w38 w252 w117 w168 w103"
+    events = await stitched(old, 11_000, [{"text": text, "segments": [seg(text, 11_002, 18_000)]}])
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "w252 w117 w168 w103"
+    assert events[0].data["segments"] == [seg("w252 w117 w168 w103", 16_000, 18_000)]
+
+
+async def test_a_straddling_segment_that_diverges_gets_a_gap_for_its_span_only():
+    old = [old_final(("a", 700, 800), ("b", 800, 900), ("c", 900, 1_000))]
+    events = await stitched(old, 500, [{"text": "a x y", "segments": [seg("a x y", 750, 1_300)]}])
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 750, "to_ms": 1_000}
+    assert events[1].data["text"] == "a x y"
+
+
+def word(text: str, start: int, end: int) -> dict[str, Any]:
+    return {"text": text, "start_ms": start, "end_ms": end}
+
+
+async def test_words_match_one_to_one_by_text_and_start():
+    from speko_gateway._relay_continuation import _Final
+
+    old = [_Final(["no"], 700, ms(30_000), ((("no",), 500, 700),), (("no", 500, 700),))]
+    # Two new "no"s 200 ms apart: the one old "no" repeats only the first.
+    events = await stitched(old, 400, [{"text": "no no", "segments": [seg("no no", 510, 900)], "words": [word("no", 510, 690), word("no", 710, 900)]}])
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "no"
+    assert events[0].data["words"] == [word("no", 710, 900)]
+    assert events[0].data["segments"][0]["start_ms"] == 710
+    # A common prefix that then diverges over delivered audio: a gap there.
+    old = [_Final(["we", "said", "yes"], 1_000, ms(30_000), ((("we", "said", "yes"), 300, 1_000),), (("we", 300, 500), ("said", 500, 750), ("yes", 750, 1_000)))]
+    events = await stitched(old, 200, [{"text": "we said no", "words": [word("we", 310, 500), word("said", 510, 740), word("no", 760, 990)], "segments": [seg("we said no", 310, 990)]}])
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 760, "to_ms": 1_000}
+    assert events[1].data["text"] == "no"
+
+
+async def test_the_budget_stops_at_ready_not_after_the_first_write():
+    from speko_gateway._relay_continuation import _Audio
+
+    class Slow(StubSocket):
+        async def send_bytes(self, data: bytes) -> None:
+            await asyncio.sleep(0.3)
+            await super().send_bytes(data)
+
+    session = stub_session(StubSocket())
+    session._log = [_Audio(0, block(1) * 3)]
+    session._appended = session._log[0].end
+    session._deadline = time.monotonic() + 1.0
+    await session._resume(Slow(), {**READY, "request_id": "req_1"}, asked=True, start=0)
+    assert session._deadline is None
+    assert session._budget_left > 0.9
+    await session.aclose()
+
+
+async def test_covered_ms_moving_within_one_ms_of_samples_keeps_the_seam_exact():
+    rate = 44_100
+    session = stub_session(StubSocket(), sample_rate=rate)
+    for _ in range(60):
+        await session.send_audio(block(1))
+    session._on_final({"text": "six", "covered_ms": 1_000, "segments": [seg("six", 500, 1_000)]})
+    # 1001 ms rounds to the same whole ms of samples as 1000.
+    session._on_final({"text": "seven", "covered_ms": 1_001, "segments": [seg("seven", 1_000, 1_002)]})
+    events = await session._resume(StubSocket(), {**READY, "request_id": "req_1"}, asked=True, start=session._trim)
+    assert session._seam is None
+    continued = next(event for event in events if event.type == "session.continued")
+    assert continued.data["exact"] is True
+    await session.aclose()

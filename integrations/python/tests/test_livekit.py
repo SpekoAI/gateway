@@ -1903,3 +1903,23 @@ async def test_stt_stream_keeps_the_session_timeline_after_restart() -> None:
     )
     events = [event async for event in stream.events() if event.type == "transcript.final"]
     assert (events[0].start_time, events[0].end_time) == (5.1, 5.4)
+
+
+
+async def test_native_turn_waits_after_a_recovery_that_ends_before_the_first_timer() -> None:
+    from collections import Counter
+    from types import SimpleNamespace
+
+    from speko_gateway._livekit_native_stt import NativeSpeechStream
+
+    stream = SimpleNamespace(recovering=True, continuation_counts=Counter())
+    owner = SimpleNamespace(_conn_options=SimpleNamespace(timeout=0.1))
+
+    async def receive() -> None:
+        await asyncio.sleep(0.03)
+        stream.recovering = False
+        await asyncio.sleep(0.12)
+
+    receiver = asyncio.create_task(receive())
+    await NativeSpeechStream._wait_for_receiver(owner, stream, receiver)  # type: ignore[arg-type]
+    assert receiver.done()

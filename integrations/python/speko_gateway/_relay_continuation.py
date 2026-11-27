@@ -163,6 +163,9 @@ class _Final:
     # Its timed segments: (normalized words, start_ms, end_ms) on the stream
     # timeline; empty when the final had none.
     segments: tuple[tuple[tuple[str, ...], int, int], ...] = ()
+    # Its words with their own times (normalized word, start_ms, end_ms),
+    # when the final carried words[]; empty otherwise.
+    timed_words: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass
@@ -175,6 +178,8 @@ class _Seam:
     old_end_ms: int | None
     # The old finals' timed segments, when every one of them was timed.
     old_segments: tuple[tuple[tuple[str, ...], int, int], ...] = ()
+    # The old finals' timed words, when every one of them carried words[].
+    old_timed_words: tuple[tuple[str, int, int], ...] = ()
     aligned: bool = False
 
 
@@ -643,9 +648,10 @@ class ContinuingSpeechSession:
             position = self._position(covered)
             if position >= overlap_start:
                 self._covered_seen = True
-                trim = self._trim
                 self._advance(position, exact=True)
-                if self._trim != trim:
+                if self._aligned(position) == self._trim:
+                    # covered_ms names the replay point, even when it moved
+                    # within the same whole ms of samples.
                     self._covered_boundary = covered
             else:
                 self._advance(overlap_start, exact=False)
@@ -676,6 +682,7 @@ class ContinuingSpeechSession:
                             )
                             for segment in segments or ()
                         ),
+                        tuple(_timed_words(data) or ()),
                     )
                 )
         if deliver:
@@ -716,18 +723,29 @@ class ContinuingSpeechSession:
     def _stitch(self, data: dict[str, Any]) -> tuple[list[CanonicalEvent], bool]:
         """Drop the words of a final that repeat what was already delivered.
 
-        With times, a replayed word repeats an old one only when the old one
-        has the same text and starts within REPEAT_START_TOLERANCE_MS of it
-        (both are on one timeline). Anything else past the old end is new;
-        anything else before it is kept, with a gap, since the old and new
-        sessions disagree there. Text alone decides only for segments without
-        times. Returns the gap event, if any, and whether the final still has
-        anything to deliver.
+        Both sessions are on one timeline. With words[] on both sides, a new
+        word repeats an old one when it has the same text and starts within
+        REPEAT_START_TOLERANCE_MS of it, each old word matching one new word
+        at most. With segment times only (what live finals carry), a segment
+        inside the delivered audio is a repeat, one that starts after the old
+        end is new, and one across or at the old end loses the leading words
+        that align with the old delivered tail. A gap is reported only for a
+        span where the two sessions disagree. Text alone decides only for
+        segments without times. Returns the gap event, if any, and whether the
+        final still has anything to deliver.
         """
         seam = self._seam
         assert seam is not None
         words = _words(data["text"])
         head = [word for _, word in words]
+        new_words = _timed_words(data)
+        if (
+            seam.old_end_ms is not None
+            and seam.old_timed_words
+            and new_words is not None
+            and [word for word, _, _ in new_words] == head
+        ):
+            return self._stitch_words(data, words, new_words)
         segments = _timed_segments(data)
         counts = [len(_words(segment["text"])) for segment in segments or []]
         if (
@@ -736,39 +754,113 @@ class ContinuingSpeechSession:
             and segments is not None
             and sum(counts) == len(words)
         ):
-            old_end = seam.old_end_ms
-            repeated, kept, done, gap = 0, [], False, False
-            # Words are cut from the front of the text, so only a leading run
-            # of repeats can go: after the first kept word, all is kept.
-            for segment, count in zip(segments, counts):
-                if done:
-                    kept.append(segment)
-                    continue
-                own = head[repeated : repeated + count]
-                matched, matched_end = _repeat_of(
-                    seam.old_segments, own, segment["start_ms"]
-                )
-                if count and matched == count:
-                    repeated += count
-                    continue
-                if matched:
-                    # Its repeated words go with the text; what is left starts
-                    # where the old words it repeats ended.
-                    repeated += matched
-                    kept.append(_trim_segment(segment, matched, matched_end))
-                else:
-                    gap = segment["start_ms"] < old_end
-                    kept.append(segment)
-                done = True
+            return self._stitch_segments(data, words, segments, counts)
+        return self._stitch_text(data, words)
+
+    def _stitch_words(
+        self,
+        data: dict[str, Any],
+        words: list[tuple[int, str]],
+        new_words: list[tuple[str, int, int]],
+    ) -> tuple[list[CanonicalEvent], bool]:
+        seam = self._seam
+        assert seam is not None and seam.old_end_ms is not None
+        old, cursor, repeated, gap = seam.old_timed_words, 0, 0, None
+        for word, start, _ in new_words:
+            match = next(
+                (
+                    index
+                    for index in range(cursor, len(old))
+                    if old[index][0] == word
+                    and abs(old[index][1] - start) <= REPEAT_START_TOLERANCE_MS
+                ),
+                None,
+            )
+            if match is None:
+                if start < seam.old_end_ms - REPEAT_START_TOLERANCE_MS:
+                    # A different word over audio already delivered.
+                    gap = (start, seam.old_end_ms)
+                break
+            cursor, repeated = match + 1, repeated + 1
+        if repeated < len(new_words):
+            self._seam = None
+        self._cut_words(data, words, repeated)
+        data["words"] = data["words"][repeated:]
+        _drop_segment_words(data, repeated)
+        if repeated < len(new_words):
+            first = data["words"][0]["start_ms"]
+            segments = data.get("segments")
+            if segments and type(segments[0].get("start_ms")) is int:
+                segments[0] = {
+                    **segments[0],
+                    "start_ms": min(
+                        max(segments[0]["start_ms"], first), segments[0]["end_ms"]
+                    ),
+                }
+        events = [_span_gap(*gap)] if gap else []
+        return events, bool(data["text"]) or "commit_id" in data
+
+    def _stitch_segments(
+        self,
+        data: dict[str, Any],
+        words: list[tuple[int, str]],
+        segments: list[dict[str, Any]],
+        counts: list[int],
+    ) -> tuple[list[CanonicalEvent], bool]:
+        seam = self._seam
+        assert seam is not None and seam.old_end_ms is not None
+        old_end, tolerance = seam.old_end_ms, REPEAT_START_TOLERANCE_MS
+        head = [word for _, word in words]
+        repeated, kept, done, gap = 0, [], False, None
+        # Words are cut from the front of the text, so only a leading run of
+        # repeats can go: after the first kept word, all is kept.
+        for segment, count in zip(segments, counts):
             if done:
-                self._seam = None
-            self._cut_words(data, words, repeated)
-            if kept:
-                data["segments"] = kept
+                kept.append(segment)
+                continue
+            start, end = segment["start_ms"], segment["end_ms"]
+            own = head[repeated : repeated + count]
+            if start > old_end + ROUNDING_MS:
+                # Starts after every delivered word ended: new.
+                kept.append(segment)
+                done = True
+                continue
+            if start < old_end - tolerance and end <= old_end + tolerance:
+                # Lies inside audio whose words were delivered: a repeat.
+                repeated += count
+                continue
+            aligned = _tail_alignment(seam.old_words, own)
+            if count and aligned == count:
+                repeated += count
+                continue
+            if aligned:
+                # Its leading words repeat the old tail; the rest starts where
+                # the old words ended.
+                repeated += aligned
+                kept.append(_trim_segment(segment, aligned, old_end))
             else:
-                data.pop("segments", None)
-            events = [self._gap_event(seam)] if gap else []
-            return events, bool(data["text"]) or "commit_id" in data
+                if start < old_end - tolerance:
+                    # Across the old end with nothing that aligns: the two
+                    # sessions disagree over this span.
+                    gap = (start, old_end)
+                kept.append(segment)
+            done = True
+        if done:
+            self._seam = None
+        self._cut_words(data, words, repeated)
+        if kept:
+            data["segments"] = kept
+        else:
+            data.pop("segments", None)
+        events = [_span_gap(*gap)] if gap else []
+        return events, bool(data["text"]) or "commit_id" in data
+
+    def _stitch_text(
+        self, data: dict[str, Any], words: list[tuple[int, str]]
+    ) -> tuple[list[CanonicalEvent], bool]:
+        seam = self._seam
+        assert seam is not None
+        head = [word for _, word in words]
         if not seam.old_words:
             self._seam = None
             return [], True
@@ -963,6 +1055,12 @@ class ContinuingSpeechSession:
     ) -> list[CanonicalEvent]:
         events: list[CanonicalEvent] = []
         confirmed = asked and ready.get("continuation") is True
+        # A session is reached: the outage budget stops running here, before
+        # waiting for the lock or the first write. What is left of it carries
+        # over to a drop before a final on new audio.
+        if self._deadline is not None:
+            self._budget_left = max(0.0, self._deadline - time.monotonic())
+            self._deadline = None
         async with self._lock:
             # From here the log is no longer held at the dial's offset: the cap
             # applies again, however long the reader takes over these events.
@@ -1042,6 +1140,11 @@ class ContinuingSpeechSession:
                     )
                     if timed
                     else (),
+                    old_timed_words=tuple(
+                        word for final in window for word in final.timed_words
+                    )
+                    if all(final.timed_words for final in window)
+                    else (),
                 )
             self._queue = deque()
             for entry in self._log:
@@ -1074,11 +1177,6 @@ class ContinuingSpeechSession:
             self._drainer = loop.create_task(
                 self._drain(websocket, started, sent), name="speko.relay.stt.replay"
             )
-            # A session is reached: the outage budget stops running. What is
-            # left of it carries over to a drop before a final on new audio.
-            if self._deadline is not None:
-                self._budget_left = max(0.0, self._deadline - time.monotonic())
-                self._deadline = None
         kind = "session.continued" if confirmed else "session.restarted"
         data: dict[str, Any] = {
             "request_id": ready["request_id"],
@@ -1146,32 +1244,44 @@ def _final_span(data: dict[str, Any]) -> None:
         data["audio_end_ms"] = segments[-1].get("end_ms")
 
 
-def _repeat_of(
-    old: tuple[tuple[tuple[str, ...], int, int], ...], words: list[str], start_ms: int
-) -> tuple[int, int | None]:
-    """How many leading ``words`` (a segment starting at ``start_ms``) repeat
-    old delivered words, and where the last of those old words ended.
+def _tail_alignment(old: list[str], new: list[str]) -> int:
+    """How many leading ``new`` words repeat the end of the delivered ``old``
+    words, one to one: ``new`` must start somewhere in ``old`` and match it
+    word for word up to old's end (or its own end). The longest such run
+    wins; a run that diverges before either end aligns nothing."""
+    for index in range(len(old)):
+        size = min(len(new), len(old) - index)
+        if size and new[:size] == old[index : index + size]:
+            return size
+    return 0
 
-    An old segment repeats when it has the same words and starts within
-    REPEAT_START_TOLERANCE_MS of the new one; a longer new segment may repeat
-    several old ones in a row.
-    """
-    best, best_end = 0, None
-    for index, (old_words, old_start, _) in enumerate(old):
-        if not old_words or abs(old_start - start_ms) > REPEAT_START_TOLERANCE_MS:
-            continue
-        matched, end = 0, None
-        for next_words, _, next_end in old[index:]:
-            size = min(len(next_words), len(words) - matched)
-            if not size or list(next_words[:size]) != words[matched : matched + size]:
-                break
-            matched += size
-            end = next_end
-            if size < len(next_words):
-                break
-        if matched > best:
-            best, best_end = matched, end
-    return best, best_end
+
+def _timed_words(data: dict[str, Any]) -> list[tuple[str, int, int]] | None:
+    """A final's words[] as (normalized word, start_ms, end_ms), or None when
+    it has none or any entry is malformed or holds other than one word."""
+    entries = data.get("words")
+    if not isinstance(entries, list) or not entries:
+        return None
+    words = []
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("text"), str)
+            or type(entry.get("start_ms")) is not int
+            or type(entry.get("end_ms")) is not int
+        ):
+            return None
+        normalized = _words(entry["text"])
+        if len(normalized) != 1:
+            return None
+        words.append((normalized[0][1], entry["start_ms"], entry["end_ms"]))
+    return words
+
+
+def _span_gap(from_ms: int, to_ms: int) -> CanonicalEvent:
+    return CanonicalEvent(
+        type="session.gap", data={"from_ms": from_ms, "to_ms": max(from_ms, to_ms)}
+    )
 
 
 def _shifted(data: dict[str, Any], offset_ms: int) -> dict[str, Any]:
@@ -1180,9 +1290,15 @@ def _shifted(data: dict[str, Any], offset_ms: int) -> dict[str, Any]:
     for key in ("audio_start_ms", "audio_end_ms", "start_ms", "end_ms"):
         if type(shifted.get(key)) in (int, float):
             shifted[key] += offset_ms
-    segments = shifted.get("segments")
-    if isinstance(segments, list):
-        shifted["segments"] = [
+    for key in ("segments", "words"):
+        if key in shifted:
+            shifted[key] = _shifted_list(shifted[key], offset_ms)
+    return shifted
+
+
+def _shifted_list(items: Any, offset_ms: int) -> Any:
+    if isinstance(items, list):
+        return [
             {
                 **segment,
                 **{
@@ -1193,10 +1309,9 @@ def _shifted(data: dict[str, Any], offset_ms: int) -> dict[str, Any]:
             }
             if isinstance(segment, dict)
             else segment
-            for segment in segments
+            for segment in items
         ]
-    return shifted
-
+    return items
 
 
 def _trim_segment(segment: dict[str, Any], count: int, start_ms: int | None) -> dict[str, Any]:

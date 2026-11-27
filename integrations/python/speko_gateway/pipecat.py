@@ -334,7 +334,8 @@ class SpekoSTTService(PipecatSTTService):
         last finals still arrive then). Reaching a session is bounded by the
         outage budget and catching up by the bounded backlog at 2x."""
         seen = self.continuation_counts["session.reconnecting"]
-        was_recovering = False
+        # A recovery already under way on entry earns its extra period too.
+        was_recovering = getattr(session, "recovering", False) is True
         while True:
             try:
                 await asyncio.wait_for(
