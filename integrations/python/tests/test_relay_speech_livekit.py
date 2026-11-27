@@ -883,6 +883,74 @@ async def test_native_worker_framework_vad_and_local_turn_detector_drain_partial
             await client.aclose()
 
 
+@pytest.mark.parametrize("frame_samples", [161, 337])
+async def test_native_worker_turn_commits_while_live_frames_keep_arriving(frame_samples):
+    """A live call never goes idle: frames keep arriving after the speaker stops, so the count of audio the
+    local detector has not analysed yet is almost never exactly zero. The turn must commit with a partial
+    inference window pending; waiting for zero stalled live turns for seconds (eu1, 2026-11-27)."""
+    source = owned_probability_vad("inference", min_silence_duration=0.032)
+    framework_vad = DrainingVAD(owned_probability_vad("inference", min_silence_duration=0.25), flush_mode="reset")
+    predictions, turns = [], asyncio.Queue()
+    detector = owned_local_turn_detector(predictions)
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "live turn"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+        session = AgentSession(
+            stt=model, llm=None, tts=None, vad=framework_vad,
+            turn_handling={"turn_detection": detector, "endpointing": {"min_delay": 0.05, "max_delay": 0.5}, "interruption": {"mode": "vad", "enabled": True}},
+        )
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        agent = OwnedAgent(instructions="Live frame cadence")
+        model.bind_session(session)
+        stop = asyncio.Event()
+        pace = frame_samples / 16000
+
+        async def feed(payload):
+            for offset in range(0, len(payload), frame_samples * 2):
+                chunk = payload[offset : offset + frame_samples * 2]
+                await audio.frames.put(rtc.AudioFrame(data=chunk, sample_rate=16000, num_channels=1, samples_per_channel=len(chunk) // 2))
+                await asyncio.sleep(pace)
+
+        async def silence():
+            while not stop.is_set():
+                await feed(b"\0\0" * frame_samples)
+
+        feeder = None
+        try:
+            await session.start(agent=agent, record=False)
+            await feed(b"\xff\x0f" * 16000)
+            feeder = asyncio.create_task(silence())
+            committed = await asyncio.wait_for(turns.get(), 2)
+            assert committed == "live turn"
+            assert not model._native_failed
+        finally:
+            stop.set()
+            if feeder is not None:
+                await feeder
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
 async def test_native_end_input_drains_new_real_audio_behind_inflight_padding():
     from livekit.agents import inference
 

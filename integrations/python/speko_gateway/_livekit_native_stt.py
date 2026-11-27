@@ -695,7 +695,12 @@ class NativeSpeechStream(stt.RecognizeStream):
 
     def _gate_open(self, transcript: str) -> bool:
         text_match = not self._turn_text or " ".join(transcript.split()) == self._turn_text
-        idle = not self._vad_speaking and not self._vad_onset_pending and self._available_samples == 0
+        # Live frames keep a partial inference window, and one in flight, pending: the count of audio the
+        # detector has not analysed is exactly zero only when frame and window boundaries line up (about
+        # every 6 s on a room track). Under two windows (about 64 ms) cannot hold a turn change, so it
+        # does not hold the commit.
+        slack = 2 * self._probability_vad.window_samples if self._probability_vad is not None else 1
+        idle = not self._vad_speaking and not self._vad_onset_pending and self._available_samples < slack
         return not self._wait_for_turn_commit or self._task.done() or (
             not self._pending_transcript
             and not self._classifying_boundary
