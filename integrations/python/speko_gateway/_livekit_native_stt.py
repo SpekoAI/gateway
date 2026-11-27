@@ -117,7 +117,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._pending_transcript = False
         self._classifying_boundary = False
         self._awaiting_new_turn = False
-        self._last_commit_gate = True
+        self._last_gate: dict[str, bool] = {}
         self._turn_commit: asyncio.Future[None] | None = None
         self._turn_text = ""
         self._canonical_turn: NativeTranscript | None = None
@@ -689,28 +689,36 @@ class NativeSpeechStream(stt.RecognizeStream):
 
     def _observe_commit_gate(self) -> None:
         # The stream's own state changes (inference done, turn finished, new speech) reach here before any
-        # SDK commit attempt, so the log shows when the gate really opened.
+        # SDK commit attempt, so the log shows when the gate's stream-side conditions really opened.
         if self._wait_for_turn_commit:
-            self.permits_framework_commit(self._turn_text)
+            self._log_gate("stream", self._gate_open(self._turn_text))
 
-    def permits_framework_commit(self, transcript: str) -> bool:
+    def _gate_open(self, transcript: str) -> bool:
         text_match = not self._turn_text or " ".join(transcript.split()) == self._turn_text
         idle = not self._vad_speaking and not self._vad_onset_pending and self._available_samples == 0
-        permitted = not self._wait_for_turn_commit or self._task.done() or (
+        return not self._wait_for_turn_commit or self._task.done() or (
             not self._pending_transcript
             and not self._classifying_boundary
             and (self._awaiting_new_turn or self._vad_finished or idle)
             and text_match
         )
-        if permitted != self._last_commit_gate:
-            # Only the gate's flips are logged: state names and counts, never the transcript.
-            self._last_commit_gate = permitted
-            _log.info(
-                "native stt commit gate permitted=%s available=%d pending=%s classifying=%s awaiting_new=%s "
-                "vad_finished=%s speaking=%s onset=%s text_match=%s",
-                permitted, self._available_samples, self._pending_transcript, self._classifying_boundary,
-                self._awaiting_new_turn, self._vad_finished, self._vad_speaking, self._vad_onset_pending, text_match,
-            )
+
+    def _log_gate(self, source: str, permitted: bool) -> None:
+        if self._last_gate.get(source) == permitted:
+            return
+        self._last_gate[source] = permitted
+        # Only flips are logged: state names and counts, never the transcript. `stream` is the stream's own
+        # view, `sdk` is what the framework's commit attempt saw (it also compares the transcript).
+        _log.info(
+            "native stt commit gate source=%s permitted=%s available=%d pending=%s classifying=%s "
+            "awaiting_new=%s vad_finished=%s speaking=%s onset=%s",
+            source, permitted, self._available_samples, self._pending_transcript, self._classifying_boundary,
+            self._awaiting_new_turn, self._vad_finished, self._vad_speaking, self._vad_onset_pending,
+        )
+
+    def permits_framework_commit(self, transcript: str) -> bool:
+        permitted = self._gate_open(transcript)
+        self._log_gate("sdk", permitted)
         return permitted
 
     async def _finish_turn(self, speech_end: int | None = None) -> None:
