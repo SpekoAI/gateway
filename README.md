@@ -198,7 +198,7 @@ without a restart.
 | Kind | `provider` names |
 | --- | --- |
 | STT | `alibaba`, `assemblyai`, `cartesia`, `deepgram`, `elevenlabs`, `gemini`, `gladia`, `gradium`, `hamsa`, `hopper`, `inworld`, `meta`, `modulate`, `munsit`, `nari`, `omi`, `openai`, `palabra`, `smallest`, `soniox`, `speechmatics`, `xai` |
-| TTS | `alibaba`, `cartesia`, `deepgram`, `elevenlabs`, `fish`, `gemini`, `gradium`, `hamsa`, `hopper`, `inworld`, `maya`, `minimax`, `munsit`, `nari`, `openai`, `palabra`, `paxa`, `rime`, `smallest`, `soniox`, `speechify`, `xai` |
+| TTS | `alibaba`, `cartesia`, `deepgram`, `elevenlabs`, `fish`, `gemini`, `gradium`, `hamsa`, `hopper`, `inworld`, `minimax`, `munsit`, `nari`, `openai`, `palabra`, `paxa`, `rime`, `smallest`, `soniox`, `speechify`, `xai` |
 | Realtime | `google`, `openai`, `xai` |
 
 - The BYOK variable is the name in upper case:
