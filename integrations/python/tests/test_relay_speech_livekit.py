@@ -890,13 +890,14 @@ async def test_native_worker_turn_commits_while_live_frames_keep_arriving(frame_
     inference window pending; waiting for zero stalled live turns for seconds (eu1, 2026-11-27)."""
     source = owned_probability_vad("inference", min_silence_duration=0.032)
     framework_vad = DrainingVAD(owned_probability_vad("inference", min_silence_duration=0.25), flush_mode="reset")
-    predictions, turns = [], asyncio.Queue()
+    predictions, turns, opened = [], asyncio.Queue(), []
     detector = owned_local_turn_detector(predictions)
 
     async def handle(request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         await ws.receive_json()
+        opened.append(1)
         await ready(ws)
         async for message in ws:
             if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
@@ -936,10 +937,13 @@ async def test_native_worker_turn_commits_while_live_frames_keep_arriving(frame_
         feeder = None
         try:
             await session.start(agent=agent, record=False)
-            await feed(b"\xff\x0f" * 16000)
+            # Quiet, then a short voiced burst, then quiet: nothing here may insert silence into the burst.
+            await feed(b"\0\0" * frame_samples * 40)
+            await feed(b"\x4c\x04" * frame_samples * 9)
             feeder = asyncio.create_task(silence())
             committed = await asyncio.wait_for(turns.get(), 2)
             assert committed == "live turn"
+            assert len(opened) == 1, "the burst is one speech request"
             assert not model._native_failed
         finally:
             stop.set()

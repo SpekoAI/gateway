@@ -713,9 +713,12 @@ class NativeSpeechStream(stt.RecognizeStream):
         """Only audio the detector has not analysed yet holds the turn commit. Live frames never let the input go
         idle, so the partial window is completed now (as the idle drain would) instead of waiting for frame and
         window boundaries to line up; the commit still waits for that audio's own result, so resumed speech in it
-        is classified first."""
+        is classified first. It runs only for a turn that already has its final transcript and awaits commit, so
+        speech detection before and between turns never sees synthetic silence from here."""
         if (
             self._wait_for_turn_commit
+            and self._turn_commit is not None
+            and not self._turn_commit.done()
             and not self._pending_transcript
             and not self._classifying_boundary
             and not self._vad_speaking
