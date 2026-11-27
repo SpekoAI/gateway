@@ -110,7 +110,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._request_start_sample = 0
         self._wait_for_turn_commit = wait_for_turn_commit
         self._continuation_delay = continuation_delay
-        self._reconsider_turn = reconsider_turn
+        self._reconsider_turn = lambda: (self._observe_commit_gate(), reconsider_turn())
         self._vad_speaking = False
         self._vad_onset_pending = False
         self._last_speech_end: int | None = None
@@ -687,6 +687,12 @@ class NativeSpeechStream(stt.RecognizeStream):
         ):
             self._turn_commit.set_result(None)
 
+    def _observe_commit_gate(self) -> None:
+        # The stream's own state changes (inference done, turn finished, new speech) reach here before any
+        # SDK commit attempt, so the log shows when the gate really opened.
+        if self._wait_for_turn_commit:
+            self.permits_framework_commit(self._turn_text)
+
     def permits_framework_commit(self, transcript: str) -> bool:
         text_match = not self._turn_text or " ".join(transcript.split()) == self._turn_text
         idle = not self._vad_speaking and not self._vad_onset_pending and self._available_samples == 0
@@ -711,12 +717,9 @@ class NativeSpeechStream(stt.RecognizeStream):
         assert self._gateway_stream is not None and self._receiver is not None
         stream, receiver = self._gateway_stream, self._receiver
         self._finishing = True
-        loop = asyncio.get_running_loop()
-        started = loop.time()
         await stream.flush()
         await stream.finish()
         await asyncio.wait_for(asyncio.shield(receiver), self._conn_options.timeout)
-        _log.info("native stt turn closed after %.0f ms", (loop.time() - started) * 1000)
         if self._wait_for_turn_commit:
             # Some SDK versions retain this stream across Agent handoffs.
             # Bind the actual current activity again before publishing finals,
