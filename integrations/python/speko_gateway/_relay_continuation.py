@@ -31,7 +31,7 @@ Events this adds to the stream (all other events are unchanged):
   matched, so words in it may be missing or repeated.
 
 The replay, and input that arrives meanwhile, goes out in 100 ms frames at no
-more than 1.25x realtime until it has caught up; ``recovering`` is true from
+more than 2x realtime until it has caught up; ``recovering`` is true from
 the drop until then. Every write and read in that time ends by the outage
 deadline: a socket that hangs ends the stream with an error, never a wait
 without end. Delivered audio a provider found no speech in (no
@@ -68,10 +68,16 @@ OVERLAP_MS = 5_000
 MAX_ATTEMPTS = 3
 OUTAGE_SECONDS = 30.0
 RETRY_DELAY_SECONDS = 0.5
-# Deepgram asks for no more than 1.25x realtime: "if you send a large buffer
-# of audio, the stream may wind up being significantly delayed"; Speechmatics
-# warns that sending fast fills TCP buffers.
-REPLAY_SPEED = 1.25
+# Deepgram advises against sending much faster than realtime ("if you send a
+# large buffer of audio, the stream may wind up being significantly delayed",
+# 1.25x in its guidance) and Speechmatics warns that sending fast fills TCP
+# buffers. At 1.25x a 4.4 s backlog took 18 s to catch up on a live Deepgram
+# run, the transcript lagging all along; 2x catches up in about the backlog's
+# own length, in 100 ms frames.
+REPLAY_SPEED = 2.0
+# Segment ends are rounded to whole ms and covered_ms is floored, so a word
+# that ends at the covered boundary may end up to 1 ms past it.
+ROUNDING_MS = 1
 REPLAY_FRAME_MS = 100
 MAX_PENDING_COMMITS = 256
 # Segment times are whole milliseconds on both sides of a seam.
@@ -261,6 +267,8 @@ class ContinuingSpeechSession:
         self._last_commit = 0
         self._history: deque[_Final] = deque(maxlen=32)
         self._seam: _Seam | None = None
+        # End of the last delivered timed segment, on the stream timeline.
+        self._last_end_ms: int | None = None
         # The current session's timestamps count from this stream position:
         # 0 on a confirmed continuation, its replay start on a plain one.
         self._base = 0
@@ -630,9 +638,26 @@ class ContinuingSpeechSession:
             if words:
                 self._history.append(_Final(words, end_ms, arrived))
         if deliver:
+            self._keep_order(data)
             _final_span(data)
             events.append(CanonicalEvent(type="transcript.final", data=data))
         return events
+
+    def _keep_order(self, data: dict[str, Any]) -> None:
+        """Keep timed segments in order across a seam: the first word after a
+        covered_ms boundary (floored) may start up to ROUNDING_MS before the
+        last delivered word ended (rounded). It starts where that one ended."""
+        segments = _timed_segments(data)
+        if not segments:
+            return
+        last = self._last_end_ms
+        first = segments[0]
+        start = self._timeline_ms(first["start_ms"])
+        if last is not None and start < last <= start + ROUNDING_MS:
+            local = last - self._ms(self._base)
+            segments[0] = {**first, "start_ms": min(local, first["end_ms"])}
+            data["segments"] = segments
+        self._last_end_ms = self._timeline_ms(segments[-1]["end_ms"])
 
     def _ours(self, commit_id: str) -> bool:
         match = _COMMIT_ID.fullmatch(commit_id)
@@ -843,10 +868,13 @@ class ContinuingSpeechSession:
                     )
                 except DialCancelled:
                     return
-                except (DialUnknown, TimeoutError):
+                except (DialUnknown, TimeoutError) as error:
                     # The server may have started this request: same key, same
                     # bytes, so it answers this one rather than starting another.
-                    cause = "dial_unknown"
+                    # A dial cut short by the end of the budget keeps the cause
+                    # that spent it.
+                    if isinstance(error, DialUnknown) or self._deadline > time.monotonic():
+                        cause = "dial_unknown"
                     await self._pause()
                     continue
                 except DialRefused as refusal:
@@ -955,7 +983,7 @@ class ContinuingSpeechSession:
             window = [
                 final
                 for final in self._history
-                if (final.end_ms is not None and final.end_ms > start_ms)
+                if (final.end_ms is not None and final.end_ms > start_ms + ROUNDING_MS)
                 or (final.end_ms is None and final.arrived > start)
             ]
             self._seam = None

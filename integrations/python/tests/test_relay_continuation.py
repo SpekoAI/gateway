@@ -24,7 +24,12 @@ import pytest
 from aiohttp import web
 
 from speko_gateway import GatewayError, RelaySpeechClient
-from speko_gateway._relay_continuation import ContinuingSpeechSession, Limits, align
+from speko_gateway._relay_continuation import (
+    REPLAY_SPEED,
+    ContinuingSpeechSession,
+    Limits,
+    align,
+)
 from speko_gateway.client import SessionConfig
 
 RATE = 16_000
@@ -607,7 +612,7 @@ async def test_frozen_covered_ms_falls_back_to_overlap():
 
 async def test_backlog_is_paced_and_commits_stay_in_place():
     # The drop takes the commit after block 9; blocks 10-19 queue during the
-    # outage. The new session gets all 20 blocks at no more than 1.25x
+    # outage. The new session gets all 20 blocks at no more than 2x
     # realtime, with the commit right after block 9.
     values = list(range(1, 21))
     fake = FakeRelay(final_every=100, drop=lambda conn, event, info: conn == 0 and event == "commit")
@@ -618,7 +623,7 @@ async def test_backlog_is_paced_and_commits_stay_in_place():
     assert ("commit", 10 * BLOCK) in record
     times = [(moment, total) for kind, moment, *rest in record if kind == "bytes" for total in rest]
     first = times[0][0]
-    rate = RATE * 2 * 1.25
+    rate = RATE * 2 * REPLAY_SPEED
     for moment, total in times:
         assert total <= rate * (moment - first) + 2 * BLOCK, (moment - first, total)
     assert times[-1][0] - first >= (20 * BLOCK - 2 * BLOCK) / rate
@@ -1158,3 +1163,29 @@ async def test_a_cancelled_dial_sends_no_configure():
     finally:
         await runner.cleanup()
     assert frames == []
+
+
+async def test_a_covered_seam_is_exact_despite_rounding():
+    # Real Deepgram: covered_ms 28754 (floored) while the last word's segment
+    # ends at 28755 (rounded). The replay starts at the covered boundary, so
+    # nothing old lies inside it: exact, no seam. The first new word starts
+    # where the old one ended, not 1 ms before it.
+
+    session = stub_session(StubSocket())
+    for _ in range(30):
+        await session.send_audio(block(1))
+    session._on_final({"text": "seven thirty", "covered_ms": 1_000, "segments": [seg("seven thirty", 400, 1_001)]})
+    assert session._trim == ms(1_000)
+    events, _ = await resume(session, 1_000)
+    assert session._seam is None
+    continued = next(event for event in events if event.type == "session.continued")
+    assert continued.data["exact"] is True
+    final = session._on_final({"text": "my account", "covered_ms": 1_800, "segments": [seg("my account", 1_000, 1_700)]})
+    assert final[-1].data["segments"][0]["start_ms"] == 1_001
+    assert final[-1].data["text"] == "my account"
+    await session.aclose()
+
+
+def test_backlog_pacing_is_twice_realtime():
+    assert REPLAY_SPEED == 2.0
+    assert Limits().replay_frame_ms == 100
