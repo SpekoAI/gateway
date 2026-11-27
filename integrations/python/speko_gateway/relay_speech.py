@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import re
+import time
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -21,6 +23,8 @@ import aiohttp
 from ._relay_socket import NATIVE_SOCKET_ORIGIN, socket_headers, validate_session_id
 from ._user_agent import USER_AGENT
 from .client import CanonicalEvent, GatewayError, SessionConfig
+
+_log = logging.getLogger(__name__)
 
 _EVENTS = {
     "stt": {"transcript.delta", "transcript.final", "usage.updated"},
@@ -313,6 +317,7 @@ class RelaySpeechSession:
         self._websocket, self._kind, self.metadata = websocket, kind, metadata
         self._lock = asyncio.Lock()
         self._finishing = self._closed = self._reading = self._terminal = False
+        self._commit_sent_at: float | None = None
         self._text_limit, self._text_characters = text_limit, 0
 
     async def _send(self, value: dict[str, Any] | bytes) -> None:
@@ -347,6 +352,7 @@ class RelaySpeechSession:
     async def commit_audio(self) -> None:
         if self._kind != "stt":
             raise ValueError("Audio commit requires STT")
+        self._commit_sent_at = time.monotonic()
         await self._send({"type": "input.commit"})
 
     async def append_text(self, text: str) -> None:
@@ -400,6 +406,8 @@ class RelaySpeechSession:
                             "Relay speech ended without final usage", retryable=False
                         )
                     self._terminal = True
+                    if self._commit_sent_at is not None:
+                        _log.info("relay speech closed %.0f ms after commit", (time.monotonic() - self._commit_sent_at) * 1000)
                     yield CanonicalEvent(
                         type="usage.reported", data=payload.get("usage") or {}
                     )
