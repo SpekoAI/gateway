@@ -1028,3 +1028,103 @@ async def test_tts_provider_options_ride_every_session_request() -> None:
 def test_tts_without_provider_options_sends_no_tts_block() -> None:
     service = SpekoTTSService(FakeGatewayClient())  # type: ignore[arg-type]
     assert service._tts_options is None
+
+
+
+class ContinuingFakeSession(FakeGatewaySession):
+    """Reports a continuation, then holds its last final until released."""
+
+    def __init__(self, events: list[CanonicalEvent], release: asyncio.Event) -> None:
+        super().__init__(events)
+        self.release = release
+        self.recovering = False
+
+    async def events(self) -> AsyncIterator[CanonicalEvent]:
+        for event in self._events:
+            yield event
+        await self.release.wait()
+        yield CanonicalEvent(type="transcript.final", data={"text": "after the replay"})
+
+
+async def test_stt_surfaces_continuation_and_failed_commits() -> None:
+    seen: list[str] = []
+    session = ContinuingFakeSession(
+        [
+            CanonicalEvent(type="transcript.delta", data={"text": "hel"}),
+            CanonicalEvent(type="session.reconnecting", data={"cause": "socket_closed"}),
+            CanonicalEvent(type="session.continued", data={"request_id": "req_1", "route": {}, "replayed_ms": 900, "exact": False}),
+            CanonicalEvent(type="session.gap", data={"from_ms": 0, "to_ms": 400}),
+            CanonicalEvent(type="transcript.final", data={"text": "", "commit_id": "speko-c1", "commit_failed": "audio_fell_out_of_log"}),
+            CanonicalEvent(type="transcript.final", data={"text": "hello"}),
+        ],
+        asyncio.Event(),
+    )
+    session.release.set()
+    service = SpekoSTTService(
+        FakeGatewayClient(session), sample_rate=16_000, on_continuation=lambda event: seen.append(event.type)
+    )
+    service.push_frame = AsyncMock()  # type: ignore[method-assign]
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+    try:
+        await service._connect()
+        await service._receive_task
+        frames = [call.args[0] for call in service.push_frame.await_args_list]
+        # The interim is cleared on reconnecting; the failed commit is not a
+        # final but a non-fatal error; the stream goes on.
+        assert [(type(frame), frame.text) for frame in frames] == [
+            (InterimTranscriptionFrame, "hel"),
+            (InterimTranscriptionFrame, ""),
+            (TranscriptionFrame, "hello"),
+            (TranscriptionFrame, "after the replay"),
+        ]
+        service.push_error.assert_awaited_once()
+        assert "audio_fell_out_of_log" in service.push_error.await_args.args[0]
+        assert service.push_error.await_args.kwargs["fatal"] is False
+        assert seen == ["session.reconnecting", "session.continued", "session.gap"]
+        assert service.continuation_counts["session.gap"] == 1
+        assert service.continuation_counts["commit_failed"] == 1
+    finally:
+        await service.cleanup()
+
+
+async def test_stt_finish_waits_while_the_stream_is_continued(monkeypatch: pytest.MonkeyPatch) -> None:
+    from speko_gateway import pipecat
+
+    monkeypatch.setattr(pipecat, "_RECEIVE_GRACE_SECONDS", 0.1)
+    release = asyncio.Event()
+    session = ContinuingFakeSession([], release)
+    session.recovering = True
+    service = SpekoSTTService(FakeGatewayClient(session), sample_rate=16_000)
+    service.push_frame = AsyncMock()  # type: ignore[method-assign]
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+
+    async def caught_up() -> None:
+        # The replay takes several grace periods, then the final arrives.
+        await asyncio.sleep(0.5)
+        session.recovering = False
+        release.set()
+
+    try:
+        await service._connect()
+        helper = asyncio.create_task(caught_up())
+        await service._finish(graceful=True)
+        await helper
+        frames = [call.args[0] for call in service.push_frame.await_args_list]
+        assert [frame.text for frame in frames] == ["after the replay"]
+    finally:
+        await service.cleanup()
+
+
+async def test_stt_finish_still_gives_up_on_a_stalled_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    from speko_gateway import pipecat
+
+    monkeypatch.setattr(pipecat, "_RECEIVE_GRACE_SECONDS", 0.1)
+    session = ContinuingFakeSession([], asyncio.Event())
+    service = SpekoSTTService(FakeGatewayClient(session), sample_rate=16_000)
+    service.push_frame = AsyncMock()  # type: ignore[method-assign]
+    try:
+        await service._connect()
+        await asyncio.wait_for(service._finish(graceful=True), 1)
+        service.push_frame.assert_not_awaited()
+    finally:
+        await service.cleanup()

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import AsyncIterator
+from collections import Counter
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import Any, Protocol
@@ -65,10 +66,12 @@ class LiveKitSTTBridge:
         credential_source: CredentialSource = "auto",
         stt_options: dict[str, Any] | None = None,
         auto_reconnect: bool = False,
+        on_continuation: Callable[[CanonicalEvent], None] | None = None,
     ) -> None:
         if auto_reconnect and not isinstance(client, RelaySpeechClient):
             raise ValueError("auto_reconnect requires a RelaySpeechClient")
         self._client = client
+        self._on_continuation = on_continuation
         self._language = language
         self._model = model
         self._provider = provider
@@ -106,7 +109,9 @@ class LiveKitSTTBridge:
             **reconnect,
         )
         return LiveKitSTTStream(
-            session, local_speakers=not isinstance(self._client, RelaySpeechClient)
+            session,
+            local_speakers=not isinstance(self._client, RelaySpeechClient),
+            on_continuation=self._on_continuation,
         )
 
 
@@ -212,9 +217,25 @@ class LiveKitTTSStream:
 
 
 class LiveKitSTTStream:
-    def __init__(self, session: SpeechSession, *, local_speakers: bool = False) -> None:
+    def __init__(
+        self,
+        session: SpeechSession,
+        *,
+        local_speakers: bool = False,
+        on_continuation: Callable[[CanonicalEvent], None] | None = None,
+    ) -> None:
         self._session = session
         self._local_speakers = local_speakers
+        self._on_continuation = on_continuation
+        # Each session.continued or restarted starts a new provider session,
+        # whose speaker labels name other people than the same labels before.
+        self._generation = 0
+        self.continuation_counts: Counter[str] = Counter()
+
+    @property
+    def recovering(self) -> bool:
+        """True while a dropped stream is being continued (auto_reconnect)."""
+        return getattr(self._session, "recovering", False) is True
 
     @property
     def request_id(self) -> str:
@@ -259,8 +280,59 @@ class LiveKitSTTStream:
                     event.data.get("provider_request_id", ""),
                 )
                 continue
+            if event.type in _CONTINUATION_EVENTS:
+                self._continuation_event(event)
+                # The stream sees session.reconnecting (interim text is void)
+                # and session.gap (the turn's transcript may miss words).
+                yield LiveKitSpeechEvent(type=event.type)
+                continue
+            if event.type == "transcript.final" and event.data.get("commit_failed"):
+                # A commit answered without its transcript: its audio was lost.
+                # Fail the turn rather than finish it with words missing.
+                self.continuation_counts["commit_failed"] += 1
+                raise GatewayError(
+                    "Speko Gateway STT commit failed",
+                    code="commit_failed",
+                    source="relay",
+                    retryable=False,
+                )
             for mapped in _speech_events(event, local_speakers=self._local_speakers):
-                yield mapped
+                yield self._scoped(mapped)
+
+    def _continuation_event(self, event: CanonicalEvent) -> None:
+        self.continuation_counts[event.type] += 1
+        if event.type in {"session.continued", "session.restarted"}:
+            self._generation += 1
+        log = _logger.warning if event.type == "session.gap" else _logger.info
+        log("Speko Gateway STT %s: %s", event.type, event.data)
+        if self._on_continuation is not None:
+            self._on_continuation(event)
+
+    def _scoped(self, event: LiveKitSpeechEvent) -> LiveKitSpeechEvent:
+        if not self._generation:
+            return event
+
+        def scope(speaker: str | None) -> str | None:
+            return None if speaker is None else f"{speaker}@{self._generation}"
+
+        return replace(
+            event,
+            speaker_id=scope(event.speaker_id),
+            speaker_segments=tuple(
+                replace(part, speaker_id=scope(part.speaker_id))
+                for part in event.speaker_segments
+            ),
+        )
+
+
+_CONTINUATION_EVENTS = frozenset(
+    {
+        "session.reconnecting",
+        "session.continued",
+        "session.restarted",
+        "session.gap",
+    }
+)
 
 
 def _stream_error(event: CanonicalEvent) -> GatewayError:

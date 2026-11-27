@@ -1831,3 +1831,62 @@ async def test_tts_closes_a_standby_no_reply_took(
 def test_tts_rejects_a_negative_standby_count() -> None:
     with pytest.raises(ValueError):
         TTS(FakeClient(), standby_sessions=-1)  # type: ignore[arg-type]
+
+
+
+class ScriptedGatewaySession:
+    """Yields a fixed list of canonical events."""
+
+    def __init__(self, events: list[CanonicalEvent]) -> None:
+        self.metadata: dict[str, Any] = {}
+        self._events = events
+        self.recovering = False
+
+    async def events(self) -> AsyncIterator[CanonicalEvent]:
+        for event in self._events:
+            yield event
+
+
+def _speaker_final(speaker: str) -> CanonicalEvent:
+    return CanonicalEvent(
+        type="transcript.final",
+        data={"text": "hi", "speaker": speaker, "segments": [{"text": "hi", "start_ms": 0, "end_ms": 100, "speaker": speaker}]},
+    )
+
+
+async def test_stt_stream_surfaces_continuation_and_scopes_speakers_per_session() -> None:
+    seen: list[str] = []
+    stream = LiveKitSTTStream(
+        ScriptedGatewaySession([
+            _speaker_final("S1"),
+            CanonicalEvent(type="session.reconnecting", data={"cause": "socket_closed"}),
+            CanonicalEvent(type="session.continued", data={"request_id": "req_1", "route": {}, "replayed_ms": 100, "exact": True}),
+            CanonicalEvent(type="session.gap", data={"from_ms": 0, "to_ms": 100}),
+            _speaker_final("S1"),
+        ]),  # type: ignore[arg-type]
+        on_continuation=lambda event: seen.append(event.type),
+    )
+    events = [event async for event in stream.events()]
+    assert [event.type for event in events] == [
+        "transcript.final",
+        "session.reconnecting",
+        "session.continued",
+        "session.gap",
+        "transcript.final",
+    ]
+    # The same provider label on both sides of the seam names two speakers.
+    assert events[0].speaker_id == "S1"
+    assert events[-1].speaker_id == "S1@1"
+    assert seen == ["session.reconnecting", "session.continued", "session.gap"]
+    assert stream.continuation_counts["session.reconnecting"] == 1
+
+
+async def test_stt_stream_fails_the_turn_on_a_failed_commit() -> None:
+    stream = LiveKitSTTStream(
+        ScriptedGatewaySession([
+            CanonicalEvent(type="transcript.final", data={"text": "", "commit_id": "speko-c1", "commit_failed": "session_closed"}),
+        ])  # type: ignore[arg-type]
+    )
+    with pytest.raises(GatewayError) as failure:
+        [event async for event in stream.events()]
+    assert failure.value.code == "commit_failed"

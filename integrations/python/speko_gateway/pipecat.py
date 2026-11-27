@@ -6,7 +6,8 @@ import asyncio
 import dataclasses
 import json
 import logging
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections import Counter
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -91,10 +92,13 @@ class SpekoSTTService(PipecatSTTService):
         session_id: str = "",
         fallback_to_auto_on_no_eligible_route: bool = False,
         auto_reconnect: bool = False,
+        on_continuation: Callable[[CanonicalEvent], None] | None = None,
         **kwargs: Any,
     ) -> None:
         # auto_reconnect continues a dropped relay STT stream in a new session
         # (speko_gateway._relay_continuation). Off until the relay ships it.
+        # on_continuation receives its session.reconnecting, continued,
+        # restarted and gap events; continuation_counts counts them.
         if auto_reconnect and not isinstance(client, RelaySpeechClient):
             raise ValueError("auto_reconnect requires a RelaySpeechClient")
         native_settings = kwargs.pop("settings", None)
@@ -135,6 +139,8 @@ class SpekoSTTService(PipecatSTTService):
             provider_options=provider_options,
         )
         self._auto_reconnect = auto_reconnect
+        self._on_continuation = on_continuation
+        self.continuation_counts: Counter[str] = Counter()
         self._session: SpeechSession | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._audio_since_commit = False
@@ -277,6 +283,19 @@ class SpekoSTTService(PipecatSTTService):
                         event.data.get("provider_request_id", ""),
                     )
                     continue
+                if event.type in _CONTINUATION_EVENTS:
+                    await self._continuation_event(event)
+                    continue
+                if event.type == "transcript.final" and event.data.get("commit_failed"):
+                    # The commit was answered, but with no transcript: its
+                    # audio was lost. Say so without ending the stream.
+                    self.continuation_counts["commit_failed"] += 1
+                    await self.push_error(
+                        "Speko Gateway STT commit failed "
+                        f"({event.data['commit_failed']})",
+                        fatal=False,
+                    )
+                    continue
                 frame = _transcription_frame(
                     event,
                     user_id=self._user_id,
@@ -293,6 +312,39 @@ class SpekoSTTService(PipecatSTTService):
                 _gateway_failure("STT", error), exception=error, fatal=True
             )
 
+    async def _continuation_event(self, event: CanonicalEvent) -> None:
+        self.continuation_counts[event.type] += 1
+        log = _logger.warning if event.type == "session.gap" else _logger.info
+        log("Speko Gateway STT %s: %s", event.type, event.data)
+        if event.type == "session.reconnecting":
+            # Interim text from the dropped session is void.
+            await self.push_frame(
+                InterimTranscriptionFrame(
+                    text="", user_id=self._user_id, timestamp=time_now_iso8601()
+                )
+            )
+        if self._on_continuation is not None:
+            self._on_continuation(event)
+
+    async def _wait_for_receiver(
+        self, session: SpeechSession, task: asyncio.Task[None]
+    ) -> None:
+        """Wait for the last transcript, 5 s at a time, renewed for as long as
+        a dropped stream is being continued: a continuation dials and replays
+        up to 15 s of audio, and its own outage budget bounds it."""
+        seen = self.continuation_counts["session.reconnecting"]
+        while True:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=_RECEIVE_GRACE_SECONDS
+                )
+                return
+            except TimeoutError:
+                reconnects = self.continuation_counts["session.reconnecting"]
+                if not getattr(session, "recovering", False) and reconnects == seen:
+                    return
+                seen = reconnects
+
     async def _finish(self, *, graceful: bool) -> None:
         session = self._session
         task = self._receive_task
@@ -305,10 +357,7 @@ class SpekoSTTService(PipecatSTTService):
                     self._audio_since_commit = False
                 await session.finish()
                 if task is not None:
-                    try:
-                        await asyncio.wait_for(task, timeout=5.0)
-                    except TimeoutError:
-                        pass
+                    await self._wait_for_receiver(session, task)
             else:
                 try:
                     await session.cancel()
@@ -1030,6 +1079,17 @@ def _speko_llm_delta(delta: LLMSettings) -> SpekoLLMSettings:
     }
     return SpekoLLMSettings(**values, **merged, extra=extra)
 
+
+# How long a finishing stream waits for its last transcript.
+_RECEIVE_GRACE_SECONDS = 5.0
+_CONTINUATION_EVENTS = frozenset(
+    {
+        "session.reconnecting",
+        "session.continued",
+        "session.restarted",
+        "session.gap",
+    }
+)
 
 # Short aliases mirror the naming style of the existing LiveKit integration.
 STT = SpekoSTTService

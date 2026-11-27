@@ -13,7 +13,7 @@ import inspect
 import logging
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any
 
 import aiohttp
@@ -63,7 +63,7 @@ from ._livekit_native_turns import NativeTurnPolicy
 from ._livekit_tts_text import NativeTextBuffer
 from ._speech_client import SpeechClient
 from ._voice import CredentialSource, stt_options_payload, tts_options_payload
-from .client import GatewayClient, GatewayError
+from .client import CanonicalEvent, GatewayClient, GatewayError
 from .probe import report_leg as _report_probe_leg
 from .probe import report_marker as _report_probe_marker
 from .relay import (
@@ -203,9 +203,12 @@ class STT(stt.STT):
         provider_options: Mapping[str, Mapping[str, Any]] | None = None,
         turn_vad: vad.VAD | None = None,
         auto_reconnect: bool = False,
+        on_continuation: Callable[[CanonicalEvent], None] | None = None,
     ) -> None:
         # auto_reconnect continues a dropped relay STT stream in a new session
         # (speko_gateway._relay_continuation). Off until the relay ships it.
+        # on_continuation receives its session.reconnecting, continued,
+        # restarted and gap events.
         if auto_reconnect and not isinstance(client, RelaySpeechClient):
             raise ValueError("auto_reconnect requires a RelaySpeechClient")
         if isinstance(client, RelaySpeechClient) and turn_vad is None:
@@ -247,6 +250,7 @@ class STT(stt.STT):
         self._credential_source = credential_source
         self._sample_rate = sample_rate
         self._auto_reconnect = auto_reconnect
+        self._on_continuation = on_continuation
         self._streams: weakref.WeakSet[stt.RecognizeStream] = weakref.WeakSet()
         self._bound_agent: Agent | None = None
         self._bound_session: AgentSession | None = None
@@ -624,6 +628,7 @@ class STT(stt.STT):
             credential_source=self._credential_source,
             stt_options=self._stt_options,
             auto_reconnect=self._auto_reconnect,
+            on_continuation=self._on_continuation,
         )
         if isinstance(self._client, RelaySpeechClient):
             def prepare_native_turn() -> None:
