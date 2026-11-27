@@ -151,8 +151,8 @@ relay-route adapter arms (credential kind `relay_access` beside `bearer`;
 BYOK unchanged) and the public `relayapi` wire contract.
 
 - With `auto_reconnect`, the Python relay STT client re-sends buffered PCM
-  to a new relay session after a drop: from `covered_ms`, else from 1 s
-  before the end of the last timed final, else 5 s before a final arrived.
+  to a new relay session after a drop: from `covered_ms`, else from the end
+  of the last timed final, else 5 s before a final arrived.
 - The buffer keeps about `log_cap_ms` (15 s by default) of sent audio. It can
   hold more while a new session is being dialled, and it goes only to the
   relay. Speech that fell out of it is reported as `session.gap`; silence

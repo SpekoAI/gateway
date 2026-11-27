@@ -81,9 +81,6 @@ REPLAY_SPEED = 2.0
 # that ends at the covered boundary may end up to 1 ms past it.
 ROUNDING_MS = 1
 REPLAY_FRAME_MS = 100
-# Without covered_ms, the replay starts this long before the end of the last
-# final's words: enough for a word the provider timed a little late.
-FINAL_OVERLAP_MS = 1_000
 MAX_PENDING_COMMITS = 256
 # A write that does not finish in this long is treated as a dropped socket: a
 # 100 ms frame only blocks this long when the connection is gone.
@@ -659,17 +656,20 @@ class ContinuingSpeechSession:
         # that stopped moving would pin the log and turn every later drop into
         # a gap, so it then falls back to the overlap rule.
         covered = data.get("covered_ms")
-        # Without a usable covered_ms the replay point trails the end of the
-        # last final's words by a second. Final latency grows while a replay
+        # Without a usable covered_ms the replay point is the end of the last
+        # timed final's words: the next session's words start there and are
+        # new, with nothing to dedupe. Final latency grows while a replay
         # catches up, so the audio delivered by arrival can be far past them:
         # 5 s before arrival is only for finals that carry no times at all.
         if self._final_end_ms is not None:
-            overlap_start = self._position(max(0, self._final_end_ms - FINAL_OVERLAP_MS))
+            overlap_start = self._position(self._final_end_ms)
         else:
             overlap_start = arrived - self._position(self._limits.overlap_ms)
         if self._confirmed and type(covered) is int and covered >= 0:
             position = self._position(covered)
-            if position >= overlap_start:
+            # covered_ms is floored and segment ends are rounded: it may be
+            # up to ROUNDING_MS before the last final's end and still be fresh.
+            if position >= overlap_start - self._position(ROUNDING_MS):
                 self._covered_seen = True
                 self._advance(position, exact=True)
                 if self._aligned(position) == self._trim:

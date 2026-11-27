@@ -1484,29 +1484,29 @@ async def test_covered_ms_moving_within_one_ms_of_samples_keeps_the_seam_exact()
 async def test_without_covered_ms_the_replay_starts_before_the_last_final_ended():
     # Live Deepgram without covered_ms: the final "[9230-13865] six ... fifty
     # cents" arrived with 20 s delivered. The replay at the 23.7 s cut must
-    # start a second before 13865, not 5 s before arrival (15 s), or "the
-    # weather in almaty today is cold about" (13865-16400) is lost silently.
+    # start at 13865, not 5 s before arrival (15 s), or "the weather in
+    # almaty today is cold about" (13865-16400) is lost silently. Starting
+    # exactly there, the new session's words are new: no repeat, no gap.
     session = stub_session(StubSocket())
     session._on_event("transcript.delta", {"type": "transcript.delta", "text": "six"})
     for _ in range(200):
         await session.send_audio(block(1))
     text = "six seven eight nine and the amount is fifteen dollars and fifty cents"
     session._on_final({"text": text, "segments": [seg(text, 9_230, 13_865)]})
-    assert session._trim == ms(12_865)
+    assert session._trim == ms(13_865)
     session._on_event("transcript.delta", {"type": "transcript.delta", "text": "the weather"})
     for _ in range(37):
         await session.send_audio(block(1))
     start = max(session._trim, session._log_start())
-    assert start == ms(12_865)
-    events, _ = await resume(session, 12_865, {**READY, "request_id": "req_1", "continuation": False})
+    assert start == ms(13_865)
+    events, _ = await resume(session, 13_865, {**READY, "request_id": "req_1", "continuation": False})
+    assert session._seam is None
     assert "session.gap" not in [event.type for event in events]
-    new = "fifty cents the weather in almaty today is cold about minus five degrees please call me back"
-    events = session._on_event("transcript.final", {"type": "transcript.final", "text": new, "segments": [seg(new, 0, 8_410)]})
-    # "fifty cents" overlaps the whole old segment, which it does not repeat
-    # in full: kept, with a gap; nothing after 13865 is lost.
-    assert [event.type for event in events] == ["session.gap", "transcript.final"]
-    assert events[0].data == {"from_ms": 12_865, "to_ms": 13_865}
-    assert events[1].data["text"] == new
+    new = "the weather in almaty today is cold about minus five degrees please call me back"
+    events = session._on_event("transcript.final", {"type": "transcript.final", "text": new, "segments": [seg(new, 0, 7_410)]})
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == new
+    assert events[0].data["segments"][0]["start_ms"] == 13_865
     await session.aclose()
 
 
