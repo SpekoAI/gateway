@@ -361,14 +361,17 @@ class NativeSpeechStream(stt.RecognizeStream):
 
         def drain() -> None:
             self._vad_tail_timer = None
-            try:
-                self._pad_vad_tail()
-            except Exception:  # noqa: BLE001 -- detector errors can contain content
-                if not self._fatal.done():
-                    self._fatal.set_exception(GatewayError("Local speech inference could not drain input", retryable=False))
+            self._drain_vad_tail()
 
         loop = asyncio.get_running_loop()
         self._vad_tail_timer = loop.call_later(max(0, self._vad_idle_deadline - loop.time()), drain)
+
+    def _drain_vad_tail(self) -> None:
+        try:
+            self._pad_vad_tail()
+        except Exception:  # noqa: BLE001 -- detector errors can contain content
+            if not self._fatal.done():
+                self._fatal.set_exception(GatewayError("Local speech inference could not drain input", retryable=False))
 
     def _bound_vad_onset(self, *, progress: bool) -> None:
         if progress and self._vad_onset_timer is not None:
@@ -691,7 +694,10 @@ class NativeSpeechStream(stt.RecognizeStream):
         # The stream's own state changes (inference done, turn finished, new speech) reach here before any
         # SDK commit attempt, so the log shows when the gate's stream-side conditions really opened.
         if self._wait_for_turn_commit:
-            self._log_gate("stream", self._gate_open(self._turn_text))
+            permitted = self._gate_open(self._turn_text)
+            self._log_gate("stream", permitted)
+            if not permitted:
+                self._flush_for_commit()
 
     def _gate_open(self, transcript: str) -> bool:
         text_match = not self._turn_text or " ".join(transcript.split()) == self._turn_text
@@ -702,6 +708,24 @@ class NativeSpeechStream(stt.RecognizeStream):
             and (self._awaiting_new_turn or self._vad_finished or idle)
             and text_match
         )
+
+    def _flush_for_commit(self) -> None:
+        """Only audio the detector has not analysed yet holds the turn commit. Live frames never let the input go
+        idle, so the partial window is completed now (as the idle drain would) instead of waiting for frame and
+        window boundaries to line up; the commit still waits for that audio's own result, so resumed speech in it
+        is classified first. It runs only for a turn that already has its final transcript and awaits commit, so
+        speech detection before and between turns never sees synthetic silence from here."""
+        if (
+            self._wait_for_turn_commit
+            and self._turn_commit is not None
+            and not self._turn_commit.done()
+            and not self._pending_transcript
+            and not self._classifying_boundary
+            and not self._vad_speaking
+            and not self._vad_onset_pending
+            and self._available_samples > 0
+        ):
+            self._drain_vad_tail()
 
     def _log_gate(self, source: str, permitted: bool) -> None:
         if self._last_gate.get(source) == permitted:
@@ -719,6 +743,8 @@ class NativeSpeechStream(stt.RecognizeStream):
     def permits_framework_commit(self, transcript: str) -> bool:
         permitted = self._gate_open(transcript)
         self._log_gate("sdk", permitted)
+        if not permitted:
+            self._flush_for_commit()
         return permitted
 
     async def _finish_turn(self, speech_end: int | None = None) -> None:
