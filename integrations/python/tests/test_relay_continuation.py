@@ -708,7 +708,6 @@ async def test_queued_audio_does_not_make_covered_ms_stale():
     session = stub_session(socket, log_cap_ms=1_000)
     for _ in range(20):
         await session.send_audio(block(1))
-    session._heard = True  # speech: the cap may not treat it as silence
     session._live, session._recovering = False, True
     for _ in range(100):
         await session.send_audio(block(2))
@@ -1101,7 +1100,6 @@ async def test_the_cap_holds_while_the_reader_sits_on_continued():
         return StubSocket(), {**READY, "request_id": "req_1"}
 
     session = stub_session(StubSocket(), dial=dial, log_cap_ms=1_000)
-    session._heard = True
     for _ in range(10):
         await session.send_audio(block(1))
     session._live = False
@@ -1816,4 +1814,59 @@ async def test_a_repeat_trimmed_to_punctuation_is_not_delivered():
     session._on_final({"text": "- bonjour", "covered_ms": 1_000, "segments": [seg("- bonjour", 1_000, 1_800)]})
     await resume(session, 1_000)
     assert session._on_final({"text": "- bonjour", "covered_ms": 1_800, "segments": [seg("- bonjour", 1_000, 1_800)]}) == []
+    await session.aclose()
+
+
+async def test_a_suppressed_repeat_never_moves_the_replay_point():
+    # No covered_ms: "go now" (950-1800) was delivered, the replay restarts
+    # at 950 and the new session repeats it with its end jittered to 1900.
+    # The repeat goes, and the replay point stays at 1800, so a new word at
+    # 1810-1890 is still in the log for a second drop.
+    session = stub_session(StubSocket())
+    for _ in range(30):
+        await session.send_audio(block(1))
+    session._on_final({"text": "go now", "segments": [seg("go now", 950, 1_800)]})
+    assert session._trim == ms(1_800)
+    session._trim = ms(950)
+    from speko_gateway._relay_continuation import _Audio
+
+    session._log = [_Audio(ms(950), block(1) * 21)]
+    await resume(session, 950, {**READY, "continuation": False})
+    assert session._on_event("transcript.final", {"type": "transcript.final", "text": "go now", "segments": [seg("go now", 10, 950)]}) == []
+    assert session._final_end_ms == 1_800
+    assert session._trim <= ms(1_800)
+    events = session._on_event("transcript.final", {"type": "transcript.final", "text": "I", "segments": [seg("I", 860, 940)]})
+    assert [event.data["text"] for event in events] == ["I"]
+    await session.aclose()
+
+
+async def test_the_uncertain_stretch_stays_conservative_over_a_second_drop():
+    # covered_ms 1000 behind "go now" (1500-1800): the first replay reports
+    # 1000-1800. It drops again before any final; the second replay stays
+    # conservative, so a new "go now" at 1790-2400 is kept, not trimmed by
+    # its text against the old one.
+    session = await _covered_hole_session()
+    events, _ = await resume(session, 1_000)
+    assert [event.data for event in events if event.type == "session.gap"] == [{"from_ms": 1_000, "to_ms": 1_800}]
+    events, _ = await resume(session, 1_000)
+    assert session._seam is not None and session._seam.hole
+    events = session._on_final({"text": "go now", "covered_ms": 2_400, "segments": [seg("go now", 1_790, 2_400)]})
+    assert [event.data["text"] for event in events] == ["go now"]
+    # Past the stretch: the next replay judges by the rules again.
+    assert session._hole_end_ms is None
+    await session.aclose()
+
+
+async def test_an_untimed_old_final_never_removes_timed_new_words():
+    # "go now" was delivered without times; a timed "go now" after the
+    # replay start is kept, and the stretch with no time evidence reported.
+    session = seam_session([("go now", None)], 500)
+    from speko_gateway._relay_continuation import _Audio
+
+    session._log = [_Audio(ms(500), block(1) * 30)]
+    session._appended = session._log[0].end
+    await resume(session, 500)
+    events = session._on_final({"text": "go now", "segments": [seg("go now", 1_200, 1_600)]})
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[1].data["text"] == "go now"
     await session.aclose()

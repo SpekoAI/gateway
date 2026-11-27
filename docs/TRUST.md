@@ -158,6 +158,9 @@ BYOK unchanged) and the public `relayapi` wire contract.
   relay. Audio after the replay point that fell out of it is reported as
   `session.gap` (except what delivered finals already cover), silence or
   not.
+- Known limit: when a provider sends neither `covered_ms` nor segment times,
+  the replay point is a guess (5 s before the last final arrived), so a final
+  that arrives more than 5 s late can lose speech without a `session.gap`.
 
 ## Telemetry and billing
 

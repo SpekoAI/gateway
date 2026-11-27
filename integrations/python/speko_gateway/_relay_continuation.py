@@ -41,7 +41,10 @@ the part of it no delivered final closes is reported as a gap at the next
 replay, whether or not a delta came: it is never taken for silence. When
 covered_ms lies behind delivered finals, the replay starts at covered_ms,
 only new segments wholly inside delivered audio are dropped, and the stretch
-up to the end of that audio is reported once as a gap. While a new session is being opened the log is
+up to the end of that audio is reported once as a gap. Known limit: for a
+session with neither covered_ms nor segment times the replay point is a
+guess, 5 s before the last final arrived, so a final that arrives more than
+5 s late can lose speech before it without a gap. While a new session is being opened the log is
 not trimmed, so the offset it was opened with stays the replay's start; the
 outage budget bounds that growth.
 
@@ -313,6 +316,10 @@ class ContinuingSpeechSession:
         self._spans: list[tuple[int, int]] = []
         # Where the current session's audio starts on the stream timeline.
         self._session_start_ms = 0
+        # End of the uncertain stretch behind covered_ms while one is open:
+        # replays stay conservative until a final passes it.
+        self._hole_end_ms: int | None = None
+        self._hole_reported: tuple[int, int] | None = None
         # The current session's timestamps count from this stream position:
         # 0 on a confirmed continuation, its replay start on a plain one.
         self._base = 0
@@ -656,9 +663,6 @@ class ContinuingSpeechSession:
                 # Already answered or failed: the app never sees an id twice.
                 del data["commit_id"]
         arrived = self._delivered
-        incoming = _timed_segments(data)
-        if incoming:
-            self._final_end_ms = max(self._final_end_ms or 0, incoming[-1]["end_ms"])
         deliver = True
         text = data.get("text")
         if self._seam is not None and isinstance(text, str) and _words(text):
@@ -669,6 +673,11 @@ class ContinuingSpeechSession:
                 # unless it answers a commit.
                 data["text"] = ""
                 deliver = "commit_id" in data
+        # Only words the app got move the replay point: a suppressed repeat,
+        # however its end jittered, never does.
+        emitted = _timed_segments(data) if deliver else None
+        if emitted:
+            self._final_end_ms = max(self._final_end_ms or 0, emitted[-1]["end_ms"])
         # The replay point is covered_ms when the session sends it.
         covered = data.get("covered_ms")
         # Without a usable covered_ms the replay point is the end of the last
@@ -701,9 +710,15 @@ class ContinuingSpeechSession:
             covered = None
             if not self._session_covered:
                 self._advance(overlap_start, exact=False)
-                if incoming:
+                if emitted:
                     # No covered_ms: audio up to the final's end is closed.
-                    self._close(self._session_start_ms, incoming[-1]["end_ms"])
+                    self._close(self._session_start_ms, emitted[-1]["end_ms"])
+        if self._hole_end_ms is not None and (
+            (emitted and emitted[-1]["end_ms"] > self._hole_end_ms + ROUNDING_MS)
+            or (covered is not None and covered >= self._hole_end_ms)
+        ):
+            # Past the uncertain stretch: later replays judge by the rules.
+            self._hole_end_ms = None
         segments = _timed_segments(data)
         end_ms = segments[-1]["end_ms"] if segments else None
         if self._on_new_audio(covered, end_ms):
@@ -801,11 +816,17 @@ class ContinuingSpeechSession:
             counts = [len(_words(segment["text"])) for segment in segments or []]
             if segments is not None and sum(counts) == len(words):
                 return self._stitch_segments(data, words, segments, counts)
-            if seam.removed:
+            if seam.removed and _timed_segments(data) is None:
                 # A timed repeat already went: text alone cannot tell this
                 # final from it, so it is kept and the seam reported.
                 self._seam = None
                 return [self._gap_event(seam)], True
+        if _timed_segments(data) is not None:
+            # Text alone never removes timed words: with no time evidence on
+            # the old side (or segments that do not spell out the text), the
+            # stretch is unsure, so it is kept and reported.
+            self._seam = None
+            return [self._gap_event(seam)], True
         return self._stitch_text(data, words)
 
     def _stitch_words(
@@ -1233,10 +1254,16 @@ class ContinuingSpeechSession:
                 if span[1] > boundary_ms + ROUNDING_MS
             ]
             # covered_ms behind delivered audio: the replay starts there and
-            # this stretch may hold repeats or losses, so it is reported.
-            hole = self._session_covered and bool(spans)
-            if hole:
-                events.append(_span_gap(boundary_ms, spans[-1][1]))
+            # this stretch may hold repeats or losses, so it is reported. It
+            # stays open over later drops until a final passes its end.
+            hole_end = spans[-1][1] if self._session_covered and spans else None
+            if self._hole_end_ms is not None:
+                hole_end = max(hole_end or 0, self._hole_end_ms)
+            hole = hole_end is not None and hole_end > boundary_ms + ROUNDING_MS
+            self._hole_end_ms = hole_end if hole else None
+            if hole and self._hole_reported != (boundary_ms, hole_end):
+                self._hole_reported = (boundary_ms, hole_end)
+                events.append(_span_gap(boundary_ms, hole_end))
             self._session_covered = False
             self._seam = None
             if window:
