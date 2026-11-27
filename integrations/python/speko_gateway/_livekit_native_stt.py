@@ -23,9 +23,6 @@ from .client import GatewayError
 
 _log = logging.getLogger(__name__)
 
-# Padded windows one framework commit attempt may add before it slows to one per this many windows of audio.
-_COMMIT_PAD_BUDGET = 16
-
 
 class _InputChannel(utils.aio.Chan[Any]):
     def __init__(self, on_audio: Callable[[rtc.AudioFrame], None]) -> None:
@@ -121,9 +118,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._classifying_boundary = False
         self._awaiting_new_turn = False
         self._last_gate: dict[str, bool] = {}
-        # The framework has ended its endpointing delay and tried to commit; cleared by resumed speech or a commit.
-        self._commit_attempted = False
-        self._commit_pads = 0
+        self._commit_mark: int | None = None
         self._turn_commit: asyncio.Future[None] | None = None
         self._turn_text = ""
         self._canonical_turn: NativeTranscript | None = None
@@ -372,13 +367,12 @@ class NativeSpeechStream(stt.RecognizeStream):
         loop = asyncio.get_running_loop()
         self._vad_tail_timer = loop.call_later(max(0, self._vad_idle_deadline - loop.time()), drain)
 
-    def _drain_vad_tail(self) -> bool:
+    def _drain_vad_tail(self) -> None:
         try:
-            return self._pad_vad_tail()
+            self._pad_vad_tail()
         except Exception:  # noqa: BLE001 -- detector errors can contain content
             if not self._fatal.done():
                 self._fatal.set_exception(GatewayError("Local speech inference could not drain input", retryable=False))
-            return False
 
     def _bound_vad_onset(self, *, progress: bool) -> None:
         if progress and self._vad_onset_timer is not None:
@@ -402,20 +396,18 @@ class NativeSpeechStream(stt.RecognizeStream):
 
         self._vad_onset_timer = asyncio.get_running_loop().call_later(1.0, unresolved)
 
-    def _pad_vad_tail(self, *, final: bool = False) -> bool:
-        """True when a padding window was added."""
+    def _pad_vad_tail(self, *, final: bool = False) -> None:
         detector, audio = self._probability_vad, self._vad_audio
         if detector is None or self._input_finished or not audio.real_pending:
-            return False
+            return
         size = detector.window_samples * 2 * self._channels
         # One bounded inference window completes a partial input window,
         # including the detector resampler's filter tail. Never add repeated
         # empty windows, and bound outstanding padding independently of PCM.
         if not final and (audio.last_padded == audio.real_fed or audio.padding_pending >= size):
-            return False
+            return
         audio.last_padded = audio.real_fed
         self._push_vad_audio(self._frame(bytes(size)), padding=True)
-        return True
 
     async def _consume_vad(self) -> None:
         assert self._vad_stream is not None
@@ -555,7 +547,7 @@ class NativeSpeechStream(stt.RecognizeStream):
             self._canonical_turn = None
         self._awaiting_new_turn = False
         self._pending_transcript = True
-        self._commit_attempted = False
+        self._commit_mark = None
         self._vad_speaking = True
         self._vad_onset_pending = False
         self._event_ch.send_nowait(
@@ -699,7 +691,7 @@ class NativeSpeechStream(stt.RecognizeStream):
             and " ".join(transcript.split()) == self._turn_text
         ):
             self._turn_commit.set_result(None)
-            self._commit_attempted = False
+            self._commit_mark = None
 
     def _observe_commit_gate(self) -> None:
         # The stream's own state changes (inference done, turn finished, new speech) reach here before any
@@ -709,44 +701,20 @@ class NativeSpeechStream(stt.RecognizeStream):
 
     def _gate_open(self, transcript: str) -> bool:
         text_match = not self._turn_text or " ".join(transcript.split()) == self._turn_text
-        idle = not self._vad_speaking and not self._vad_onset_pending and self._available_samples == 0
+        # Live frames never let the input go idle, so the count of audio the detector has not analysed is
+        # exactly zero only when frame and window boundaries line up (about every 6 s on a room track). The
+        # commit needs the audio that existed when the framework tried to commit to be analysed, not audio
+        # that arrived after, so resumed speech in it is still classified first.
+        analysed = self._available_samples == 0 or (
+            self._commit_mark is not None and self._processed_samples >= self._commit_mark
+        )
+        idle = not self._vad_speaking and not self._vad_onset_pending and analysed
         return not self._wait_for_turn_commit or self._task.done() or (
             not self._pending_transcript
             and not self._classifying_boundary
             and (self._awaiting_new_turn or self._vad_finished or idle)
             and text_match
         )
-
-    def _flush_for_commit(self) -> None:
-        """Only audio the detector has not analysed yet holds the turn commit. Live frames never let the input go
-        idle, so the partial window is completed now (as the idle drain would) instead of waiting for frame and
-        window boundaries to line up; the commit still waits for that audio's own result, so resumed speech in it
-        is classified first. It runs only when the framework has ended its endpointing delay and tries to commit
-        (so the turn is going to commit unless this audio resumes speech), never from the stream's own events:
-        speech detection before and between turns, and while the framework still waits, never sees the padded
-        window from here."""
-        detector = self._probability_vad
-        if (
-            detector is None
-            or not self._wait_for_turn_commit
-            or not self._commit_attempted
-            or self._turn_commit is None
-            or self._turn_commit.done()
-            or self._pending_transcript
-            or self._classifying_boundary
-            or self._vad_speaking
-            or self._vad_onset_pending
-            or self._available_samples <= 0
-        ):
-            return
-        if self._commit_pads >= _COMMIT_PAD_BUDGET:
-            # The budget bounds how much synthetic silence one attempt adds while audio keeps arriving; spent,
-            # one more window is allowed per budget's worth of new audio, so a silent tail still commits.
-            window = detector.window_samples * 2 * self._channels
-            if self._vad_audio.real_fed - self._vad_audio.last_padded < _COMMIT_PAD_BUDGET * window:
-                return
-        if self._drain_vad_tail():
-            self._commit_pads += 1
 
     def _log_gate(self, source: str, permitted: bool) -> None:
         if self._last_gate.get(source) == permitted:
@@ -762,14 +730,13 @@ class NativeSpeechStream(stt.RecognizeStream):
         )
 
     def permits_framework_commit(self, transcript: str, *, attempt: bool = False) -> bool:
-        if attempt:
-            # A new framework attempt: its endpointing delay is over, so completing the window is allowed again.
-            self._commit_attempted = True
-            self._commit_pads = 0
+        if attempt and self._commit_mark is None:
+            # The framework's endpointing delay is over and it is committing: the audio received so far must be
+            # analysed first; later audio does not hold this commit. The mark stays for the framework's retries
+            # of the same turn (each is another attempt) and clears when speech resumes or the turn commits.
+            self._commit_mark = self._processed_samples + self._available_samples
         permitted = self._gate_open(transcript)
         self._log_gate("sdk", permitted)
-        if not permitted:
-            self._flush_for_commit()
         return permitted
 
     async def _finish_turn(self, speech_end: int | None = None) -> None:

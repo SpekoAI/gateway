@@ -956,8 +956,8 @@ async def test_native_worker_turn_commits_while_live_frames_keep_arriving(frame_
 
 
 async def test_native_worker_resumed_speech_while_endpointing_waits_is_still_detected():
-    """The padded window that completes a pending partial window must not run while the framework is still
-    in its endpointing delay: speech that resumes then must open its own request."""
+    """Speech that resumes while the framework is still in its endpointing delay must open its own request,
+    whatever the commit gate does with the audio pending at the time."""
     source = owned_probability_vad("inference", min_silence_duration=0.032)
     framework_vad = DrainingVAD(owned_probability_vad("inference", min_silence_duration=0.25), flush_mode="reset")
     predictions, turns, opened = [], asyncio.Queue(), []
@@ -1032,8 +1032,8 @@ async def test_native_worker_resumed_speech_while_endpointing_waits_is_still_det
 
 
 async def test_native_worker_each_resumed_burst_in_a_renewed_endpointing_delay_is_detected():
-    """After a rejected commit the framework starts a new endpointing delay when speech continues. The padded
-    window must not run during it: each further burst opens its own request."""
+    """After a rejected commit the framework starts a new endpointing delay when speech continues; each further
+    burst in it opens its own request."""
     source = owned_probability_vad("inference", min_silence_duration=0.032)
     framework_vad = DrainingVAD(owned_probability_vad("inference", min_silence_duration=0.25), flush_mode="reset")
     predictions, turns, opened = [], asyncio.Queue(), []
