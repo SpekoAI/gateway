@@ -155,8 +155,9 @@ BYOK unchanged) and the public `relayapi` wire contract.
   of the last timed final, else 5 s before a final arrived.
 - The buffer keeps about `log_cap_ms` (15 s by default) of sent audio. It can
   hold more while a new session is being dialled, and it goes only to the
-  relay. Speech that fell out of it is reported as `session.gap`; silence
-  dropped from it (no transcript heard) is not reported.
+  relay. Audio after the replay point that fell out of it is reported as
+  `session.gap` (except what delivered finals already cover), silence or
+  not.
 
 ## Telemetry and billing
 

@@ -36,9 +36,12 @@ more than 2x realtime until it has caught up; ``recovering`` is true from
 the drop until then. The outage budget (3 attempts, 30 s without a session)
 bounds reaching a new session, not catching up. A write that does not finish
 in 10 s is a drop like any other, so a hung socket never holds the stream.
-Delivered audio a provider found no speech in (no
-non-empty delta since the last final) that overflows the 15 s log is silence:
-it is dropped without a gap. While a new session is being opened the log is
+Audio after the replay point that overflows the 15 s log is dropped, and
+the part of it no delivered final closes is reported as a gap at the next
+replay, whether or not a delta came: it is never taken for silence. When
+covered_ms lies behind delivered finals, the replay starts at covered_ms,
+only new segments wholly inside delivered audio are dropped, and the stretch
+up to the end of that audio is reported once as a gap. While a new session is being opened the log is
 not trimmed, so the offset it was opened with stays the replay's start; the
 outage budget bounds that growth.
 
@@ -178,6 +181,13 @@ class _Seam:
     old_end_ms: int | None
     # Delivered audio ending after this can hold words inside the replay.
     boundary_ms: int
+    # Delivered spans past the boundary and the old segments in them, as they
+    # were when the replay began: the new session's own finals never count.
+    spans: list[tuple[int, int]]
+    old_segments: list[tuple[tuple[str, ...], int, int]]
+    # covered_ms lay behind delivered audio: a new segment goes only when it
+    # lies inside a delivered span, and the stretch is reported as a gap.
+    hole: bool = False
     # The old finals' timed words, when every one of them carried words[].
     old_timed_words: tuple[tuple[str, int, int], ...] = ()
     # Old timed words before this index have repeated a new word already.
@@ -285,10 +295,8 @@ class ContinuingSpeechSession:
         self._delivered = 0
         self._trim = 0
         self._exact = True
-        self._covered_seen = False
         # The current session has sent covered_ms.
         self._session_covered = False
-        self._heard = False
         self._log: list[_Audio | _Commit] = []
         self._pending: dict[str, _Commit] = {}
         self._commit_seq = 0
@@ -375,14 +383,10 @@ class ContinuingSpeechSession:
         start = self._log_start()
         if cut <= start:
             return
-        # Delivered audio a provider heard no speech in is silence: dropping it
-        # loses no word, so the replay point moves past it without a gap. It
-        # stays exact only on a boundary covered_ms proved.
-        silent = not self._heard and start <= self._trim
+        # The replay point stays: audio dropped after it is reported as a gap
+        # at the next replay (where no delivered final closes it), never
+        # taken for silence.
         self._drop_audio_before(cut)
-        if silent:
-            self._trim = max(self._trim, cut)
-            self._exact = self._exact and self._covered_seen
 
     def _advance(self, position: int, *, exact: bool) -> None:
         position = self._aligned(min(position, self._delivered))
@@ -638,8 +642,6 @@ class ContinuingSpeechSession:
                 raise GatewayError("Relay speech protocol failed", retryable=False)
             return [CanonicalEvent(type="usage.progress", data=payload["usage"])]
         if kind == "transcript.delta":
-            if data.get("text"):
-                self._heard = True
             return [CanonicalEvent(type=kind, data=data)]
         return self._on_final(data)
 
@@ -662,7 +664,11 @@ class ContinuingSpeechSession:
         if self._seam is not None and isinstance(text, str) and _words(text):
             gap, deliver = self._stitch(data)
             events.extend(gap)
-        self._heard = False
+            if deliver and not _words(data["text"]):
+                # Only punctuation is left of a repeat: nothing to deliver,
+                # unless it answers a commit.
+                data["text"] = ""
+                deliver = "commit_id" in data
         # The replay point is covered_ms when the session sends it.
         covered = data.get("covered_ms")
         # Without a usable covered_ms the replay point is the end of the last
@@ -679,7 +685,7 @@ class ContinuingSpeechSession:
             # audio after it is not closed yet, whatever finals say. Behind
             # the last final's end (beyond rounding) the seam rules take the
             # overlap, so the replay is not exact.
-            self._session_covered = self._covered_seen = True
+            self._session_covered = True
             position = self._position(covered)
             behind = (
                 self._final_end_ms is not None
@@ -883,17 +889,7 @@ class ContinuingSpeechSession:
     ) -> tuple[list[CanonicalEvent], bool]:
         seam = self._seam
         assert seam is not None
-        spans = [
-            span
-            for span in self._delivered_spans()
-            if span[1] > seam.boundary_ms + ROUNDING_MS
-        ]
-        old = [
-            segment
-            for final in self._history
-            for segment in final.segments
-            if segment[2] > seam.boundary_ms + ROUNDING_MS
-        ]
+        spans, old = seam.spans, seam.old_segments
         head = [word for _, word in words]
         dropped: set[int] = set()
         kept, gaps, first = [], [], 0
@@ -916,6 +912,11 @@ class ContinuingSpeechSession:
             if len(hit) == 1 and start >= low - ROUNDING_MS and end <= high + ROUNDING_MS:
                 # Inside audio whose words were delivered: a repeat.
                 dropped.update(indexes)
+                continue
+            if seam.hole:
+                # Behind covered_ms: no edge is trusted; the gap reported at
+                # the replay covers this stretch.
+                kept.append(segment)
                 continue
             if len(hit) == 1 and start >= low - ROUNDING_MS:
                 # Across the end of a delivered span: its leading words go
@@ -1205,7 +1206,6 @@ class ContinuingSpeechSession:
                 events.extend(self._fail_pending("commit_ids_not_echoed"))
             self._ws, self._live = websocket, True
             self._confirmed = confirmed
-            self._session_covered = False
             self._session_start_ms = self._ms(start)
             self._base = 0 if confirmed else start
             self._delivered = start
@@ -1227,6 +1227,17 @@ class ContinuingSpeechSession:
                 )
                 or (final.end_ms is None and final.arrived > start)
             ]
+            spans = [
+                span
+                for span in self._delivered_spans()
+                if span[1] > boundary_ms + ROUNDING_MS
+            ]
+            # covered_ms behind delivered audio: the replay starts there and
+            # this stretch may hold repeats or losses, so it is reported.
+            hole = self._session_covered and bool(spans)
+            if hole:
+                events.append(_span_gap(boundary_ms, spans[-1][1]))
+            self._session_covered = False
             self._seam = None
             if window:
                 timed = all(
@@ -1242,6 +1253,14 @@ class ContinuingSpeechSession:
                     if timed
                     else None,
                     boundary_ms=boundary_ms,
+                    spans=spans,
+                    old_segments=[
+                        segment
+                        for final in window
+                        for segment in final.segments
+                        if segment[2] > boundary_ms + ROUNDING_MS
+                    ],
+                    hole=hole,
                     old_timed_words=tuple(
                         word for final in window for word in final.timed_words
                     )

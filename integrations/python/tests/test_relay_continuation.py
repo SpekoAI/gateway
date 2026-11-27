@@ -572,20 +572,20 @@ def test_align_is_unique_or_nothing():
     assert align(["a", "b", "a", "b"], ["a", "b"]) is None  # two places fit
 
 
-async def test_silence_overflow_is_dropped_without_a_gap():
+async def test_overflow_past_the_replay_point_is_reported_even_in_silence():
     # Three words, then 3 s of silence against a 1 s log, a drop at the end
-    # of the silence, then three more words. No delta came after the last
-    # final, so the dropped audio is silence: no gap, and covered_ms keeps it
-    # exact.
+    # of the silence, then three more words. Audio after the replay point
+    # fell out of the log: reported as a gap, never taken for silence.
     values = [1, 2, 3] + [0] * 30 + [4, 5, 6]
     limits = Limits(retry_delay=0.01, log_cap_ms=1_000, replay_speed=50)
     for covered in (True, False):
         fake = FakeRelay(covered=covered, drop=lambda conn, event, info: conn == 0 and event == "bytes" and info == 33 * BLOCK)
         events, _, _ = await run(fake, values, chunk=BLOCK, limits=limits)
         assert words(events) == expected(values)
-        assert not [event for event in events if event.type == "session.gap"]
+        gaps = [event.data for event in events if event.type == "session.gap"]
+        assert len(gaps) == 1 and gaps[0]["from_ms"] == 300
         continued = [event for event in events if event.type == "session.continued"]
-        assert continued and continued[0].data["exact"] is covered
+        assert continued and continued[0].data["exact"] is False
 
 
 async def test_overflow_after_speech_is_a_gap():
@@ -598,15 +598,16 @@ async def test_overflow_after_speech_is_a_gap():
     assert gaps and gaps[0].data["from_ms"] == 0 and gaps[0].data["to_ms"] > 0
 
 
-async def test_frozen_covered_ms_stays_the_replay_point_without_a_false_gap():
+async def test_frozen_covered_ms_stays_the_replay_point_and_flags_the_stretch():
     # covered_ms stops at 0 while finals keep coming. It stays the replay
-    # point, so the log overflows; but the finals reach past the log start,
-    # so nothing is missing: the replay from the log start takes the seam.
+    # point, so the log overflows; the finals reach past the log start, so
+    # nothing fell out unheard. covered_ms lies behind delivered audio, so
+    # the replayed stretch is reported once and its repeats still go.
     values = list(range(1, 401))
     fake = FakeRelay(freeze_covered=0, drop=lambda conn, event, info: conn == 0 and event == "bytes" and info == 350 * BLOCK)
     events, _, _ = await run(fake, values, chunk=BLOCK, pace=0.001)
     assert words(events) == expected(values)
-    assert not [event for event in events if event.type == "session.gap"]
+    assert [event.data for event in events if event.type == "session.gap"] == [{"from_ms": 20_000, "to_ms": 34_800}]
     continued = [event for event in events if event.type == "session.continued"]
     assert continued and continued[0].data["exact"] is False
     assert_timeline(events, values)
@@ -1710,7 +1711,8 @@ async def _covered_hole_session(**limits: Any) -> ContinuingSpeechSession:
 async def test_a_new_word_in_a_hole_of_delivered_audio_is_new():
     session = await _covered_hole_session()
     events, _ = await resume(session, 1_000)
-    assert "session.gap" not in [event.type for event in events]
+    # covered_ms behind delivered audio: the stretch is reported once.
+    assert [event.data for event in events if event.type == "session.gap"] == [{"from_ms": 1_000, "to_ms": 1_800}]
     events = session._on_final({"text": "wait", "covered_ms": 1_300, "segments": [seg("wait", 1_100, 1_300)]})
     assert [event.type for event in events] == ["transcript.final"]
     assert events[0].data["text"] == "wait"
@@ -1723,27 +1725,95 @@ async def test_a_new_word_in_a_hole_of_delivered_audio_is_new():
 
 async def test_a_hole_the_log_lost_is_reported_exactly():
     # The log no longer holds 1000-1600: the hole 1000-1500 is lost, while
-    # 1500-1600 lies in the delivered final.
+    # 1500-1600 lies in the delivered final. The replayed rest of that final
+    # (1600-1800) is the stretch behind covered_ms, reported too.
     session = await _covered_hole_session()
     session._drop_audio_before(ms(1_600))
     events, _ = await resume(session, 1_600)
     gaps = [event.data for event in events if event.type == "session.gap"]
-    assert gaps == [{"from_ms": 1_000, "to_ms": 1_500}]
+    assert gaps == [{"from_ms": 1_000, "to_ms": 1_500}, {"from_ms": 1_600, "to_ms": 1_800}]
     await session.aclose()
 
 
-async def test_a_segment_from_a_hole_into_delivered_audio_loses_the_repeated_words():
+async def test_behind_covered_ms_a_segment_across_a_span_edge_is_kept_whole():
+    # No edge is trusted behind covered_ms: the segment from the hole into
+    # the delivered "go now" is kept whole; the gap at the replay flags it.
     session = await _covered_hole_session()
-    await resume(session, 1_000)
+    events, _ = await resume(session, 1_000)
+    assert [event.data for event in events if event.type == "session.gap"] == [{"from_ms": 1_000, "to_ms": 1_800}]
     events = session._on_final({"text": "wait go now", "covered_ms": 1_800, "segments": [seg("wait go now", 1_100, 1_800)]})
     assert [event.type for event in events] == ["transcript.final"]
-    assert events[0].data["text"] == "wait"
-    assert events[0].data["segments"] == [seg("wait", 1_100, 1_500)]
-    # Not an exact repeat of the delivered "go now": kept whole, with a gap.
+    assert events[0].data["text"] == "wait go now"
+    await session.aclose()
+
+
+async def test_codex_eviction_without_deltas_reports_the_lost_hole():
+    # No delta at all; the log drops 1000-1600 while covered_ms is 1000 and
+    # a final lies at 1500-1800. The hole is lost, not silence.
+    session = stub_session(StubSocket(), log_cap_ms=1_400)
+    for _ in range(26):
+        await session.send_audio(block(1))
+    session._on_final({"text": "turn left", "covered_ms": 1_000, "segments": [seg("turn left", 500, 1_000)]})
+    session._on_final({"text": "go now", "covered_ms": 1_000, "segments": [seg("go now", 1_500, 1_800)]})
+    for _ in range(4):
+        await session.send_audio(block(1))
+    start = max(session._trim, session._log_start())
+    assert start == ms(1_600)
+    events, _ = await resume(session, 1_600)
+    gaps = [event.data for event in events if event.type == "session.gap"]
+    assert gaps == [{"from_ms": 1_000, "to_ms": 1_500}, {"from_ms": 1_600, "to_ms": 1_800}]
+    await session.aclose()
+
+
+async def test_codex_switch_to_a_session_without_covered_ms_is_flagged():
+    # covered_ms 950 behind "go now" (950-1800); a plain restart re-delivers
+    # "go now" with jitter (950-1900), then a new "I" (1810-1890). Both are
+    # kept, and the stretch is reported: never a silent loss.
+    session = stub_session(StubSocket())
+    for _ in range(30):
+        await session.send_audio(block(1))
+    session._on_event("transcript.final", {"type": "transcript.final", "text": "go now", "covered_ms": 950, "segments": [seg("go now", 950, 1_800)]})
+    events, _ = await resume(session, 950, {**READY, "continuation": False})
+    assert [event.data for event in events if event.type == "session.gap"] == [{"from_ms": 950, "to_ms": 1_800}]
+    texts = []
+    for text, start, end in [("go now", 0, 950), ("I", 860, 940)]:
+        out = session._on_event("transcript.final", {"type": "transcript.final", "text": text, "segments": [seg(text, start, end)]})
+        texts += [event.data["text"] for event in out if event.type == "transcript.final"]
+    assert texts == ["go now", "I"]
+    await session.aclose()
+
+
+async def test_codex_new_word_across_a_span_start_behind_covered_ms_is_kept():
+    # A new "go" at 1180-1520 overlaps the start of the delivered "go now"
+    # (1500-1800) a little: kept, inside the reported stretch.
     session = await _covered_hole_session()
+    events, _ = await resume(session, 1_000)
+    assert [event.data for event in events if event.type == "session.gap"] == [{"from_ms": 1_000, "to_ms": 1_800}]
+    events = session._on_final({"text": "go", "covered_ms": 1_520, "segments": [seg("go", 1_180, 1_520)]})
+    assert [event.data["text"] for event in events] == ["go"]
+    await session.aclose()
+
+
+async def test_codex_jittered_repeat_in_a_hole_is_flagged():
+    # "no" was delivered at 1050-1150 behind covered_ms 1000; replayed with
+    # jitter at 950-1050 it lands in no delivered span and is kept, inside
+    # the reported stretch 1000-1150.
+    session = stub_session(StubSocket())
+    for _ in range(30):
+        await session.send_audio(block(1))
+    session._on_final({"text": "no", "covered_ms": 1_000, "segments": [seg("no", 1_050, 1_150)]})
+    events, _ = await resume(session, 1_000)
+    assert [event.data for event in events if event.type == "session.gap"] == [{"from_ms": 1_000, "to_ms": 1_150}]
+    events = session._on_final({"text": "no", "covered_ms": 1_150, "segments": [seg("no", 950, 1_050)]})
+    assert [event.data["text"] for event in events] == ["no"]
+    await session.aclose()
+
+
+async def test_a_repeat_trimmed_to_punctuation_is_not_delivered():
+    session = stub_session(StubSocket())
+    for _ in range(30):
+        await session.send_audio(block(1))
+    session._on_final({"text": "- bonjour", "covered_ms": 1_000, "segments": [seg("- bonjour", 1_000, 1_800)]})
     await resume(session, 1_000)
-    events = session._on_final({"text": "wait go home", "covered_ms": 1_800, "segments": [seg("wait go home", 1_100, 1_800)]})
-    assert [event.type for event in events] == ["session.gap", "transcript.final"]
-    assert events[0].data == {"from_ms": 1_500, "to_ms": 1_800}
-    assert events[1].data["text"] == "wait go home"
+    assert session._on_final({"text": "- bonjour", "covered_ms": 1_800, "segments": [seg("- bonjour", 1_000, 1_800)]}) == []
     await session.aclose()
