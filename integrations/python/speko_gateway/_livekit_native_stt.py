@@ -118,6 +118,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._classifying_boundary = False
         self._awaiting_new_turn = False
         self._last_gate: dict[str, bool] = {}
+        self._commit_mark: int | None = None
         self._turn_commit: asyncio.Future[None] | None = None
         self._turn_text = ""
         self._canonical_turn: NativeTranscript | None = None
@@ -546,6 +547,7 @@ class NativeSpeechStream(stt.RecognizeStream):
             self._canonical_turn = None
         self._awaiting_new_turn = False
         self._pending_transcript = True
+        self._commit_mark = None
         self._vad_speaking = True
         self._vad_onset_pending = False
         self._event_ch.send_nowait(
@@ -689,43 +691,30 @@ class NativeSpeechStream(stt.RecognizeStream):
             and " ".join(transcript.split()) == self._turn_text
         ):
             self._turn_commit.set_result(None)
+            self._commit_mark = None
 
     def _observe_commit_gate(self) -> None:
         # The stream's own state changes (inference done, turn finished, new speech) reach here before any
         # SDK commit attempt, so the log shows when the gate's stream-side conditions really opened.
         if self._wait_for_turn_commit:
-            permitted = self._gate_open(self._turn_text)
-            self._log_gate("stream", permitted)
-            if not permitted:
-                self._flush_for_commit()
+            self._log_gate("stream", self._gate_open(self._turn_text))
 
     def _gate_open(self, transcript: str) -> bool:
         text_match = not self._turn_text or " ".join(transcript.split()) == self._turn_text
-        idle = not self._vad_speaking and not self._vad_onset_pending and self._available_samples == 0
+        # Live frames never let the input go idle, so the count of audio the detector has not analysed is
+        # exactly zero only when frame and window boundaries line up (about every 6 s on a room track). The
+        # commit needs the audio that existed when the framework tried to commit to be analysed, not audio
+        # that arrived after, so resumed speech in it is still classified first.
+        analysed = self._available_samples == 0 or (
+            self._commit_mark is not None and self._processed_samples >= self._commit_mark
+        )
+        idle = not self._vad_speaking and not self._vad_onset_pending and analysed
         return not self._wait_for_turn_commit or self._task.done() or (
             not self._pending_transcript
             and not self._classifying_boundary
             and (self._awaiting_new_turn or self._vad_finished or idle)
             and text_match
         )
-
-    def _flush_for_commit(self) -> None:
-        """Only audio the detector has not analysed yet holds the turn commit. Live frames never let the input go
-        idle, so the partial window is completed now (as the idle drain would) instead of waiting for frame and
-        window boundaries to line up; the commit still waits for that audio's own result, so resumed speech in it
-        is classified first. It runs only for a turn that already has its final transcript and awaits commit, so
-        speech detection before and between turns never sees synthetic silence from here."""
-        if (
-            self._wait_for_turn_commit
-            and self._turn_commit is not None
-            and not self._turn_commit.done()
-            and not self._pending_transcript
-            and not self._classifying_boundary
-            and not self._vad_speaking
-            and not self._vad_onset_pending
-            and self._available_samples > 0
-        ):
-            self._drain_vad_tail()
 
     def _log_gate(self, source: str, permitted: bool) -> None:
         if self._last_gate.get(source) == permitted:
@@ -740,11 +729,14 @@ class NativeSpeechStream(stt.RecognizeStream):
             self._awaiting_new_turn, self._vad_finished, self._vad_speaking, self._vad_onset_pending,
         )
 
-    def permits_framework_commit(self, transcript: str) -> bool:
+    def permits_framework_commit(self, transcript: str, *, attempt: bool = False) -> bool:
+        if attempt and self._commit_mark is None:
+            # The framework's endpointing delay is over and it is committing: the audio received so far must be
+            # analysed first; later audio does not hold this commit. The mark stays for the framework's retries
+            # of the same turn (each is another attempt) and clears when speech resumes or the turn commits.
+            self._commit_mark = self._processed_samples + self._available_samples
         permitted = self._gate_open(transcript)
         self._log_gate("sdk", permitted)
-        if not permitted:
-            self._flush_for_commit()
         return permitted
 
     async def _finish_turn(self, speech_end: int | None = None) -> None:

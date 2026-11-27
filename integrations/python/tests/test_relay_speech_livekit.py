@@ -955,6 +955,161 @@ async def test_native_worker_turn_commits_while_live_frames_keep_arriving(frame_
             await client.aclose()
 
 
+async def test_native_worker_resumed_speech_while_endpointing_waits_is_still_detected():
+    """Speech that resumes while the framework is still in its endpointing delay must open its own request,
+    whatever the commit gate does with the audio pending at the time."""
+    source = owned_probability_vad("inference", min_silence_duration=0.032)
+    framework_vad = DrainingVAD(owned_probability_vad("inference", min_silence_duration=0.25), flush_mode="reset")
+    predictions, turns, opened = [], asyncio.Queue(), []
+    detector = owned_local_turn_detector(predictions)
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        opened.append(1)
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "live turn"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    frame_samples = 161
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+        session = AgentSession(
+            stt=model, llm=None, tts=None, vad=framework_vad,
+            turn_handling={"turn_detection": detector, "endpointing": {"min_delay": 1.0, "max_delay": 1.5}, "interruption": {"mode": "vad", "enabled": True}},
+        )
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        agent = OwnedAgent(instructions="Resumed speech")
+        model.bind_session(session)
+        stop = asyncio.Event()
+
+        async def feed(payload):
+            for offset in range(0, len(payload), frame_samples * 2):
+                chunk = payload[offset : offset + frame_samples * 2]
+                await audio.frames.put(rtc.AudioFrame(data=chunk, sample_rate=16000, num_channels=1, samples_per_channel=len(chunk) // 2))
+                await asyncio.sleep(frame_samples / 16000)
+
+        async def silence():
+            while not stop.is_set():
+                await feed(b"\0\0" * frame_samples)
+
+        async def until(check):
+            while not check():
+                await asyncio.sleep(0.01)
+
+        feeder = None
+        try:
+            await session.start(agent=agent, record=False)
+            await feed(b"\0\0" * frame_samples * 40)
+            await feed(b"\x4c\x04" * frame_samples * 9)
+            await feed(b"\0\0" * frame_samples * 22)
+            await asyncio.wait_for(until(lambda: len(opened) == 1), 2)
+            # The first turn has its transcript and the framework waits out its 1 s delay; the speaker resumes.
+            await feed(b"\x4c\x04" * frame_samples * 9)
+            feeder = asyncio.create_task(silence())
+            await asyncio.wait_for(until(lambda: len(opened) == 2), 2)
+            assert await asyncio.wait_for(turns.get(), 5)
+            assert not model._native_failed
+        finally:
+            stop.set()
+            if feeder is not None:
+                await feeder
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
+async def test_native_worker_each_resumed_burst_in_a_renewed_endpointing_delay_is_detected():
+    """After a rejected commit the framework starts a new endpointing delay when speech continues; each further
+    burst in it opens its own request."""
+    source = owned_probability_vad("inference", min_silence_duration=0.032)
+    framework_vad = DrainingVAD(owned_probability_vad("inference", min_silence_duration=0.25), flush_mode="reset")
+    predictions, turns, opened = [], asyncio.Queue(), []
+    detector = owned_local_turn_detector(predictions)
+
+    async def handle(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive_json()
+        opened.append(1)
+        await ready(ws)
+        async for message in ws:
+            if message.type is aiohttp.WSMsgType.TEXT and json.loads(message.data)["type"] == "session.close":
+                await ws.send_json({"type": "transcript.final", "text": "live turn"})
+                await ws.send_json({"type": "session.closed", "usage": {}})
+                await ws.close()
+        return ws
+
+    class OwnedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            turns.put_nowait(new_message.text_content)
+
+    frame_samples = 161
+    async with peer(handle) as origin:
+        client = RelaySpeechClient(api_key="sk_speko_agent_fixture", session_id=str(uuid.uuid4()), base_url=origin)
+        model = STT(client, provider="fixture", model="fixture-model", credential_source="managed", turn_vad=source)
+        session = AgentSession(
+            stt=model, llm=None, tts=None, vad=framework_vad,
+            turn_handling={"turn_detection": detector, "endpointing": {"min_delay": 1.0, "max_delay": 1.5}, "interruption": {"mode": "vad", "enabled": True}},
+        )
+        audio = OwnedAudioInput()
+        session.input.audio = audio
+        agent = OwnedAgent(instructions="Resumed speech")
+        model.bind_session(session)
+        stop = asyncio.Event()
+
+        async def feed(payload):
+            for offset in range(0, len(payload), frame_samples * 2):
+                chunk = payload[offset : offset + frame_samples * 2]
+                await audio.frames.put(rtc.AudioFrame(data=chunk, sample_rate=16000, num_channels=1, samples_per_channel=len(chunk) // 2))
+                await asyncio.sleep(frame_samples / 16000)
+
+        async def silence():
+            while not stop.is_set():
+                await feed(b"\0\0" * frame_samples)
+
+        async def until(check):
+            while not check():
+                await asyncio.sleep(0.01)
+
+        feeder = None
+        try:
+            await session.start(agent=agent, record=False)
+            await feed(b"\0\0" * frame_samples * 40)
+            await feed(b"\x4c\x04" * frame_samples * 9)
+            await feed(b"\0\0" * frame_samples * 22)
+            await asyncio.wait_for(until(lambda: len(opened) == 1), 2)
+            # The first turn has its transcript and the framework waits out its 1 s delay; the speaker resumes.
+            await feed(b"\x4c\x04" * frame_samples * 9)
+            await feed(b"\0\0" * frame_samples * 22)
+            await asyncio.wait_for(until(lambda: len(opened) == 2), 2)
+            await feed(b"\x4c\x04" * frame_samples * 9)
+            feeder = asyncio.create_task(silence())
+            await asyncio.wait_for(until(lambda: len(opened) == 3), 2)
+            assert await asyncio.wait_for(turns.get(), 5)
+            assert not model._native_failed
+        finally:
+            stop.set()
+            if feeder is not None:
+                await feeder
+            await audio.frames.put(None)
+            await session.aclose()
+            await model.aclose()
+            await client.aclose()
+
+
 async def test_native_end_input_drains_new_real_audio_behind_inflight_padding():
     from livekit.agents import inference
 
