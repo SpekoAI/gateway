@@ -369,12 +369,13 @@ class NativeSpeechStream(stt.RecognizeStream):
         loop = asyncio.get_running_loop()
         self._vad_tail_timer = loop.call_later(max(0, self._vad_idle_deadline - loop.time()), drain)
 
-    def _drain_vad_tail(self) -> None:
+    def _drain_vad_tail(self) -> bool:
         try:
-            self._pad_vad_tail()
+            return self._pad_vad_tail()
         except Exception:  # noqa: BLE001 -- detector errors can contain content
             if not self._fatal.done():
                 self._fatal.set_exception(GatewayError("Local speech inference could not drain input", retryable=False))
+            return False
 
     def _bound_vad_onset(self, *, progress: bool) -> None:
         if progress and self._vad_onset_timer is not None:
@@ -398,18 +399,20 @@ class NativeSpeechStream(stt.RecognizeStream):
 
         self._vad_onset_timer = asyncio.get_running_loop().call_later(1.0, unresolved)
 
-    def _pad_vad_tail(self, *, final: bool = False) -> None:
+    def _pad_vad_tail(self, *, final: bool = False) -> bool:
+        """True when a padding window was added."""
         detector, audio = self._probability_vad, self._vad_audio
         if detector is None or self._input_finished or not audio.real_pending:
-            return
+            return False
         size = detector.window_samples * 2 * self._channels
         # One bounded inference window completes a partial input window,
         # including the detector resampler's filter tail. Never add repeated
         # empty windows, and bound outstanding padding independently of PCM.
         if not final and (audio.last_padded == audio.real_fed or audio.padding_pending >= size):
-            return
+            return False
         audio.last_padded = audio.real_fed
         self._push_vad_audio(self._frame(bytes(size)), padding=True)
+        return True
 
     async def _consume_vad(self) -> None:
         assert self._vad_stream is not None
@@ -722,7 +725,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         if (
             self._wait_for_turn_commit
             and self._commit_attempted
-            and self._commit_pads < 8
+            and self._commit_pads < 16
             and self._turn_commit is not None
             and not self._turn_commit.done()
             and not self._pending_transcript
@@ -730,9 +733,11 @@ class NativeSpeechStream(stt.RecognizeStream):
             and not self._vad_speaking
             and not self._vad_onset_pending
             and self._available_samples > 0
+            # Only windows actually added count against the budget; once it is spent the commit waits for
+            # frame and window boundaries to line up, as before.
+            and self._drain_vad_tail()
         ):
             self._commit_pads += 1
-            self._drain_vad_tail()
 
     def _log_gate(self, source: str, permitted: bool) -> None:
         if self._last_gate.get(source) == permitted:
