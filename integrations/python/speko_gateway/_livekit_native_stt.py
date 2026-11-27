@@ -118,6 +118,9 @@ class NativeSpeechStream(stt.RecognizeStream):
         self._classifying_boundary = False
         self._awaiting_new_turn = False
         self._last_gate: dict[str, bool] = {}
+        # The framework has ended its endpointing delay and tried to commit; cleared by resumed speech or a commit.
+        self._commit_attempted = False
+        self._commit_pads = 0
         self._turn_commit: asyncio.Future[None] | None = None
         self._turn_text = ""
         self._canonical_turn: NativeTranscript | None = None
@@ -546,6 +549,7 @@ class NativeSpeechStream(stt.RecognizeStream):
             self._canonical_turn = None
         self._awaiting_new_turn = False
         self._pending_transcript = True
+        self._commit_attempted = False
         self._vad_speaking = True
         self._vad_onset_pending = False
         self._event_ch.send_nowait(
@@ -689,6 +693,7 @@ class NativeSpeechStream(stt.RecognizeStream):
             and " ".join(transcript.split()) == self._turn_text
         ):
             self._turn_commit.set_result(None)
+            self._commit_attempted = False
 
     def _observe_commit_gate(self) -> None:
         # The stream's own state changes (inference done, turn finished, new speech) reach here before any
@@ -716,6 +721,8 @@ class NativeSpeechStream(stt.RecognizeStream):
         window from here."""
         if (
             self._wait_for_turn_commit
+            and self._commit_attempted
+            and self._commit_pads < 8
             and self._turn_commit is not None
             and not self._turn_commit.done()
             and not self._pending_transcript
@@ -724,6 +731,7 @@ class NativeSpeechStream(stt.RecognizeStream):
             and not self._vad_onset_pending
             and self._available_samples > 0
         ):
+            self._commit_pads += 1
             self._drain_vad_tail()
 
     def _log_gate(self, source: str, permitted: bool) -> None:
@@ -739,7 +747,11 @@ class NativeSpeechStream(stt.RecognizeStream):
             self._awaiting_new_turn, self._vad_finished, self._vad_speaking, self._vad_onset_pending,
         )
 
-    def permits_framework_commit(self, transcript: str) -> bool:
+    def permits_framework_commit(self, transcript: str, *, attempt: bool = False) -> bool:
+        if attempt:
+            # A new framework attempt: its endpointing delay is over, so completing the window is allowed again.
+            self._commit_attempted = True
+            self._commit_pads = 0
         permitted = self._gate_open(transcript)
         self._log_gate("sdk", permitted)
         if not permitted:

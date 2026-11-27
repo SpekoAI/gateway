@@ -423,7 +423,7 @@ class STT(stt.STT):
                 return False
             if any(
                 isinstance(stream, NativeSpeechStream)
-                and not stream.permits_framework_commit(info.new_transcript)
+                and not stream.permits_framework_commit(info.new_transcript, attempt=True)
                 for stream in list(self._streams)
             ):
                 previous = self._native_deferred_turn
