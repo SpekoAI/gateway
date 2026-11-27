@@ -183,6 +183,9 @@ class LiveKitTTSStream:
     async def commit(self) -> None:
         await self._session.commit_text()
 
+    async def cancel(self) -> None:
+        await self._session.cancel()
+
     async def finish(self) -> None:
         await self._session.finish()
 
