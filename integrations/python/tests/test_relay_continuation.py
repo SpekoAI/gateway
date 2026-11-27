@@ -761,7 +761,7 @@ async def test_seam_drops_repeats_by_time_and_keeps_new_repeats_of_old_words():
 
 
 @pytest.mark.parametrize("old, new, new_end", [("about 1.5", "15", 1_000), ("about twenty one", "21", 990)])
-async def test_a_segment_inside_delivered_audio_is_a_repeat(old, new, new_end):
+async def test_a_word_in_delivered_audio_that_matches_nothing_gets_a_gap(old, new, new_end):
     from speko_gateway._relay_continuation import _Audio
 
     session = seam_session([(old, 1_000)], 500)
@@ -770,10 +770,12 @@ async def test_a_segment_inside_delivered_audio_is_a_repeat(old, new, new_end):
     await resume(session, 500)
     final = {"text": f"{new} apples", "segments": [seg(new, 800, new_end), seg("apples", 1_100, 1_200)]}
     events = session._on_final(final)
-    # Live finals carry segment times only: a segment that lies inside the
-    # delivered audio is a repeat, however its words are spelled.
-    assert [event.type for event in events] == ["transcript.final"]
-    assert events[0].data["text"] == "apples"
+    # Live finals carry segment times only: a word inside the delivered audio
+    # that matches no old word there may be a respelling or a word the old
+    # session missed. It is kept, with a gap for its span: never silent.
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 800, "to_ms": new_end}
+    assert events[1].data["text"] == f"{new} apples"
     await session.aclose()
 
 
@@ -1414,9 +1416,11 @@ async def test_no_covered_seam_trims_a_straddling_segment_by_the_old_tail():
 async def test_a_straddling_segment_that_diverges_gets_a_gap_for_its_span_only():
     old = [old_final(("a", 700, 800), ("b", 800, 900), ("c", 900, 1_000))]
     events = await stitched(old, 500, [{"text": "a x y", "segments": [seg("a x y", 750, 1_300)]}])
+    # "a" repeats the old "a"; "x" lies over the old "c" it does not match:
+    # kept, with a gap for its own span.
     assert [event.type for event in events] == ["session.gap", "transcript.final"]
-    assert events[0].data == {"from_ms": 750, "to_ms": 1_000}
-    assert events[1].data["text"] == "a x y"
+    assert events[0].data == {"from_ms": 933, "to_ms": 1_116}
+    assert events[1].data["text"] == "x y"
 
 
 def word(text: str, start: int, end: int) -> dict[str, Any]:
@@ -1437,7 +1441,7 @@ async def test_words_match_one_to_one_by_text_and_start():
     old = [_Final(["we", "said", "yes"], 1_000, ms(30_000), ((("we", "said", "yes"), 300, 1_000),), (("we", 300, 500), ("said", 500, 750), ("yes", 750, 1_000)))]
     events = await stitched(old, 200, [{"text": "we said no", "words": [word("we", 310, 500), word("said", 510, 740), word("no", 760, 990)], "segments": [seg("we said no", 310, 990)]}])
     assert [event.type for event in events] == ["session.gap", "transcript.final"]
-    assert events[0].data == {"from_ms": 760, "to_ms": 1_000}
+    assert events[0].data == {"from_ms": 760, "to_ms": 990}
     assert events[1].data["text"] == "no"
 
 
@@ -1472,3 +1476,94 @@ async def test_covered_ms_moving_within_one_ms_of_samples_keeps_the_seam_exact()
     continued = next(event for event in events if event.type == "session.continued")
     assert continued.data["exact"] is True
     await session.aclose()
+
+
+async def test_without_covered_ms_the_replay_starts_before_the_last_final_ended():
+    # Live Deepgram without covered_ms: the final "[9230-13865] six ... fifty
+    # cents" arrived with 20 s delivered. The replay at the 23.7 s cut must
+    # start a second before 13865, not 5 s before arrival (15 s), or "the
+    # weather in almaty today is cold about" (13865-16400) is lost silently.
+    session = stub_session(StubSocket())
+    session._on_event("transcript.delta", {"type": "transcript.delta", "text": "six"})
+    for _ in range(200):
+        await session.send_audio(block(1))
+    text = "six seven eight nine and the amount is fifteen dollars and fifty cents"
+    session._on_final({"text": text, "segments": [seg(text, 9_230, 13_865)]})
+    assert session._trim == ms(12_865)
+    session._on_event("transcript.delta", {"type": "transcript.delta", "text": "the weather"})
+    for _ in range(37):
+        await session.send_audio(block(1))
+    start = max(session._trim, session._log_start())
+    assert start == ms(12_865)
+    events, _ = await resume(session, 12_865, {**READY, "request_id": "req_1", "continuation": False})
+    assert "session.gap" not in [event.type for event in events]
+    new = "fifty cents the weather in almaty today is cold about minus five degrees please call me back"
+    events = session._on_event("transcript.final", {"type": "transcript.final", "text": new, "segments": [seg(new, 0, 8_410)]})
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "the weather in almaty today is cold about minus five degrees please call me back"
+    await session.aclose()
+
+
+async def test_without_covered_ms_a_log_that_fell_short_reports_the_missing_span():
+    # The same stream with a 5 s log: by the cut the log starts at 18.7 s, so
+    # 13865-18700 (after the last final's words) is reported, not dropped.
+    session = stub_session(StubSocket(), log_cap_ms=5_000)
+    session._on_event("transcript.delta", {"type": "transcript.delta", "text": "six"})
+    for _ in range(200):
+        await session.send_audio(block(1))
+    text = "six seven eight nine and the amount is fifteen dollars and fifty cents"
+    session._on_final({"text": text, "segments": [seg(text, 9_230, 13_865)]})
+    session._on_event("transcript.delta", {"type": "transcript.delta", "text": "the weather"})
+    for _ in range(37):
+        await session.send_audio(block(1))
+    start = max(session._trim, session._log_start())
+    assert start == ms(18_700)
+    events, _ = await resume(session, 18_700, {**READY, "request_id": "req_1", "continuation": False})
+    gaps = [event.data for event in events if event.type == "session.gap"]
+    assert gaps == [{"from_ms": 13_865, "to_ms": 18_700}]
+    await session.aclose()
+
+
+async def test_one_old_word_repeats_one_new_word_only():
+    # Old "no" (800-1000) and new "no no" (800-1200): one "no" is kept, in one
+    # final or across two.
+    old = [old_final(("no", 800, 1_000))]
+    events = await stitched(old, 500, [{"text": "no no", "segments": [seg("no no", 800, 1_200)]}])
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "no"
+    events = await stitched(old, 500, [{"text": "no", "segments": [seg("no", 800, 1_000)]}, {"text": "no", "segments": [seg("no", 1_000, 1_200)]}])
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "no"
+    # With words[] the old word cannot match twice across finals either.
+    old = [old_final(("no", 800, 1_000))]
+    old[0].timed_words = (("no", 800, 1_000),)
+    events = await stitched(
+        old,
+        500,
+        [
+            {"text": "no", "segments": [seg("no", 800, 1_000)], "words": [word("no", 800, 1_000)]},
+            {"text": "no", "segments": [seg("no", 900, 1_000)], "words": [word("no", 900, 1_000)]},
+        ],
+    )
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 900, "to_ms": 1_000}
+    assert events[1].data["text"] == "no"
+
+
+async def test_an_inserted_word_is_kept_with_a_gap_and_repeats_go():
+    # Old "no I said no" (400-1450), new "no uh I said no wait" (410-1750):
+    # "I said no" is no silent repeat; "uh" is kept with a gap, "wait" is new.
+    old = [old_final(("no I said no", 400, 1_450))]
+    text = "no uh I said no wait"
+    events = await stitched(old, 300, [{"text": text, "segments": [seg(text, 410, 1_750)]}])
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 633, "to_ms": 856}
+    assert events[1].data["text"] == "uh wait"
+
+
+async def test_a_word_past_the_old_end_survives_a_straddling_repeat():
+    # Old "send it" (500-1000), new "send it to" (510-1100): "to" is new.
+    old = [old_final(("send it", 500, 1_000))]
+    events = await stitched(old, 400, [{"text": "send it to", "segments": [seg("send it to", 510, 1_100)]}])
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "to"
