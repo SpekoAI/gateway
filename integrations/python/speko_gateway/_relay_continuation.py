@@ -24,17 +24,19 @@ Events this adds to the stream (all other events are unchanged):
   than ``covered_ms``.
 - ``session.restarted`` ``{request_id, route, replayed_ms, from_ms}``: the new
   session did not confirm continuation. The log is replayed into a plain new
-  session whose timestamps start at 0 again; ``from_ms`` is where on the old
-  timeline that session's audio starts.
+  session, which counts its times from 0; the client adds ``from_ms`` (where on
+  the stream that session's audio starts), so its times stay on the stream's
+  one timeline as after ``session.continued``.
 - ``session.gap`` ``{from_ms, to_ms}``: the transcript of that span of audio is
   not reliable: its audio fell out of the log, or the seam could not be
   matched, so words in it may be missing or repeated.
 
 The replay, and input that arrives meanwhile, goes out in 100 ms frames at no
 more than 2x realtime until it has caught up; ``recovering`` is true from
-the drop until then. Every write and read in that time ends by the outage
-deadline: a socket that hangs ends the stream with an error, never a wait
-without end. Delivered audio a provider found no speech in (no
+the drop until then. The outage budget (3 attempts, 30 s without a session)
+bounds reaching a new session, not catching up. A write that does not finish
+in 10 s is a drop like any other, so a hung socket never holds the stream.
+Delivered audio a provider found no speech in (no
 non-empty delta since the last final) that overflows the 15 s log is silence:
 it is dropped without a gap. While a new session is being opened the log is
 not trimmed, so the offset it was opened with stays the replay's start; the
@@ -80,8 +82,17 @@ REPLAY_SPEED = 2.0
 ROUNDING_MS = 1
 REPLAY_FRAME_MS = 100
 MAX_PENDING_COMMITS = 256
-# Segment times are whole milliseconds on both sides of a seam.
-SEAM_TOLERANCE_MS = 30
+# A write that does not finish in this long is treated as a dropped socket: a
+# 100 ms frame only blocks this long when the connection is gone.
+WRITE_TIMEOUT_SECONDS = 10.0
+# A replayed word repeats an old one only if it has the same text and starts
+# within this of it. Two sessions decoding the same audio place a word's start
+# tens of ms apart (10-20 ms acoustic frames, decoder alignment), while a word
+# said again starts at least one word's length later: spoken words last well
+# over 120 ms, so a real repeat ("yes yes") falls outside it.
+REPEAT_START_TOLERANCE_MS = 120
+# asyncio.TimeoutError is its own class before Python 3.11.
+_TIMEOUTS = (TimeoutError, asyncio.TimeoutError)
 
 # Errors that a new session cannot fix: the same request would fail again, or
 # the account cannot pay for it.
@@ -149,6 +160,9 @@ class _Final:
     end_ms: int | None
     # Audio delivered when it arrived: it holds no word after this.
     arrived: int
+    # Its timed segments: (normalized words, start_ms, end_ms) on the stream
+    # timeline; empty when the final had none.
+    segments: tuple[tuple[tuple[str, ...], int, int], ...] = ()
 
 
 @dataclass
@@ -159,6 +173,8 @@ class _Seam:
     # the end of the last one when every one of them was timed.
     old_words: list[str]
     old_end_ms: int | None
+    # The old finals' timed segments, when every one of them was timed.
+    old_segments: tuple[tuple[tuple[str, ...], int, int], ...] = ()
     aligned: bool = False
 
 
@@ -172,6 +188,7 @@ class Limits:
     replay_speed: float = REPLAY_SPEED
     replay_frame_ms: int = REPLAY_FRAME_MS
     max_pending_commits: int = MAX_PENDING_COMMITS
+    write_timeout: float = WRITE_TIMEOUT_SECONDS
 
 
 def _words(text: str) -> list[tuple[int, str]]:
@@ -273,7 +290,12 @@ class ContinuingSpeechSession:
         # 0 on a confirmed continuation, its replay start on a plain one.
         self._base = 0
         self._attempts = 0
+        # Outage time left: spent only while there is no session, so catching
+        # up never runs it down. Reset by a final on new audio.
+        self._budget_left = self._limits.outage_seconds
         self._deadline: float | None = None
+        # covered_ms behind the current replay point, when it set it.
+        self._covered_boundary: int | None = None
         self._replay_end = 0
         self._recovering = False
         self._pinned = False
@@ -350,13 +372,19 @@ class ContinuingSpeechSession:
             self._drop_audio_before(position)
         self._exact = exact
 
+    def _boundary_ms(self, start: int) -> int:
+        """Where finalized audio ends for a replay from ``start``: covered_ms
+        when it set this point, though the offset had to round it down to a
+        whole ms of samples; otherwise the start itself."""
+        covered = self._covered_boundary
+        if covered is not None and self._aligned(self._position(covered)) == start:
+            return covered
+        return self._ms(start)
+
     def _has_work(self) -> bool:
         return bool(self._pending) or any(
             isinstance(entry, _Audio) for entry in self._log
         )
-
-    def _timeline_ms(self, ms: int) -> int:
-        return ms + self._ms(self._base)
 
     # Controls -------------------------------------------------------------
 
@@ -381,36 +409,36 @@ class ContinuingSpeechSession:
                         {"type": "input.commit", "commit_id": entry.commit_id}
                     )
                 )
-        except (ConnectionError, aiohttp.ClientError, RuntimeError, TimeoutError):
+        except (ConnectionError, aiohttp.ClientError, RuntimeError):
             self._live = False
+        except _TIMEOUTS:
+            await self._write_timed_out()
 
     async def _send_control(self, value: dict[str, Any]) -> None:
         if self._closed or not self._live:
             return
         try:
             await self._bounded(self._ws.send_json(value))
-        except (ConnectionError, aiohttp.ClientError, RuntimeError, TimeoutError):
+        except (ConnectionError, aiohttp.ClientError, RuntimeError):
             self._live = False
-
-    def _remaining(self) -> float | None:
-        """Seconds left in the outage budget while recovering, else None."""
-        if not self._recovering or self._deadline is None:
-            return None
-        return max(0.0, self._deadline - time.monotonic())
+        except _TIMEOUTS:
+            await self._write_timed_out()
 
     async def _bounded(self, operation: Awaitable[Any]) -> Any:
-        """Await a socket operation; while recovering, only until the outage
-        deadline, so a hung write cannot hold the lock (and every caller of
-        commit, finish or send) past it."""
-        remaining = self._remaining()
-        if remaining is None:
-            return await operation
-        return await asyncio.wait_for(operation, remaining)
+        """Await a write for at most write_timeout, so a hung socket cannot
+        hold the lock that send, commit, finish and adopting a new session
+        all wait on."""
+        return await asyncio.wait_for(operation, self._limits.write_timeout)
+
+    async def _write_timed_out(self) -> None:
+        # A drop: close the socket so the reader sees it end and continues.
+        self._live = False
+        await self._close_socket(self._ws)
 
     async def _close_socket(self, websocket: aiohttp.ClientWebSocketResponse) -> None:
         try:
             await asyncio.wait_for(websocket.close(), 1.0)
-        except (TimeoutError, ConnectionError, aiohttp.ClientError, RuntimeError):
+        except (*_TIMEOUTS, ConnectionError, aiohttp.ClientError, RuntimeError):
             pass
 
     def _check_backlog(self, size: int) -> None:
@@ -451,7 +479,8 @@ class ContinuingSpeechSession:
                 >= self._limits.max_pending_commits
             ):
                 raise GatewayError(
-                    "Relay speech has too many unanswered commits",
+                    "Relay speech holds too many commit markers in its log "
+                    "(answered or not, with or without an id)",
                     retryable=False,
                 )
             if self._commit_ids:
@@ -511,9 +540,7 @@ class ContinuingSpeechSession:
                 try:
                     while True:
                         try:
-                            # While recovering, the new socket must answer
-                            # within the outage budget, or recovery ends.
-                            message = await self._bounded(messages.__anext__())
+                            message = await messages.__anext__()
                         except StopAsyncIteration:
                             break
                         if message.type is not aiohttp.WSMsgType.TEXT:
@@ -556,10 +583,8 @@ class ContinuingSpeechSession:
                             )
                         for event in self._on_event(kind, payload):
                             yield event
-                except (aiohttp.ClientError, ConnectionError):
+                except (aiohttp.ClientError, ConnectionError, *_TIMEOUTS):
                     cause = "socket_error"
-                except TimeoutError:
-                    cause = "outage_timeout"
                 if self._closed:
                     return
                 async for event in self._recover(cause):
@@ -577,6 +602,10 @@ class ContinuingSpeechSession:
 
     def _on_event(self, kind: str, payload: dict[str, Any]) -> list[CanonicalEvent]:
         data = {key: value for key, value in payload.items() if key != "type"}
+        if self._base and kind != "usage.updated":
+            # A plain new session counts from 0: put its times on the stream's
+            # timeline, as a continued session does itself.
+            data = _shifted(data, self._ms(self._base))
         if kind == "usage.updated":
             if not isinstance(payload.get("usage"), dict):
                 raise GatewayError("Relay speech protocol failed", retryable=False)
@@ -614,29 +643,41 @@ class ContinuingSpeechSession:
             position = self._position(covered)
             if position >= overlap_start:
                 self._covered_seen = True
+                trim = self._trim
                 self._advance(position, exact=True)
+                if self._trim != trim:
+                    self._covered_boundary = covered
             else:
                 self._advance(overlap_start, exact=False)
         else:
             covered = None
             self._advance(overlap_start, exact=False)
         segments = _timed_segments(data)
-        end_ms = self._timeline_ms(segments[-1]["end_ms"]) if segments else None
+        end_ms = segments[-1]["end_ms"] if segments else None
         if self._on_new_audio(covered, end_ms):
             # A final on audio sent after the last replay: the stream works,
-            # so the next drop starts a new outage. A replay still catching
-            # up stays bounded, by a fresh budget.
+            # so the next drop starts a new outage.
             self._attempts = 0
-            self._deadline = (
-                time.monotonic() + self._limits.outage_seconds
-                if self._recovering
-                else None
-            )
+            self._budget_left = self._limits.outage_seconds
         text = data.get("text")
         if isinstance(text, str) and deliver:
             words = [word for _, word in _words(text)]
             if words:
-                self._history.append(_Final(words, end_ms, arrived))
+                self._history.append(
+                    _Final(
+                        words,
+                        end_ms,
+                        arrived,
+                        tuple(
+                            (
+                                tuple(word for _, word in _words(segment["text"])),
+                                segment["start_ms"],
+                                segment["end_ms"],
+                            )
+                            for segment in segments or ()
+                        ),
+                    )
+                )
         if deliver:
             self._keep_order(data)
             _final_span(data)
@@ -652,12 +693,11 @@ class ContinuingSpeechSession:
             return
         last = self._last_end_ms
         first = segments[0]
-        start = self._timeline_ms(first["start_ms"])
+        start = first["start_ms"]
         if last is not None and start < last <= start + ROUNDING_MS:
-            local = last - self._ms(self._base)
-            segments[0] = {**first, "start_ms": min(local, first["end_ms"])}
+            segments[0] = {**first, "start_ms": min(last, first["end_ms"])}
             data["segments"] = segments
-        self._last_end_ms = self._timeline_ms(segments[-1]["end_ms"])
+        self._last_end_ms = segments[-1]["end_ms"]
 
     def _ours(self, commit_id: str) -> bool:
         match = _COMMIT_ID.fullmatch(commit_id)
@@ -667,18 +707,22 @@ class ContinuingSpeechSession:
         if covered is not None:
             return self._position(covered) > self._replay_end
         if end_ms is not None:
-            return self._position(end_ms) > self._replay_end
+            # Segment ends are rounded: one that ends within the rounding of
+            # the replay's end may hold replayed audio only.
+            return end_ms > self._ms(self._replay_end) + ROUNDING_MS
         # An untimed final proves nothing about which audio it covers.
         return False
 
     def _stitch(self, data: dict[str, Any]) -> tuple[list[CanonicalEvent], bool]:
         """Drop the words of a final that repeat what was already delivered.
 
-        Both sides are on one timeline, so time decides: a new segment that
-        ends by the time the last old word ended is a repeat. Text matching
-        only confirms a segment that straddles that point, or stands in when
-        the segments carry no times. Returns a gap event when the seam cannot
-        be matched, and whether the final still has anything to deliver.
+        With times, a replayed word repeats an old one only when the old one
+        has the same text and starts within REPEAT_START_TOLERANCE_MS of it
+        (both are on one timeline). Anything else past the old end is new;
+        anything else before it is kept, with a gap, since the old and new
+        sessions disagree there. Text alone decides only for segments without
+        times. Returns the gap event, if any, and whether the final still has
+        anything to deliver.
         """
         seam = self._seam
         assert seam is not None
@@ -688,44 +732,34 @@ class ContinuingSpeechSession:
         counts = [len(_words(segment["text"])) for segment in segments or []]
         if (
             seam.old_end_ms is not None
+            and seam.old_segments
             and segments is not None
             and sum(counts) == len(words)
         ):
-            # One tolerance around the last old word's end: a segment well
-            # before it is a repeat, one well after it is new, and one near or
-            # across it is decided by its text against the old words' tail.
-            old_end, tolerance = seam.old_end_ms, SEAM_TOLERANCE_MS
+            old_end = seam.old_end_ms
             repeated, kept, done, gap = 0, [], False, False
+            # Words are cut from the front of the text, so only a leading run
+            # of repeats can go: after the first kept word, all is kept.
             for segment, count in zip(segments, counts):
-                start = self._timeline_ms(segment["start_ms"])
-                end = self._timeline_ms(segment["end_ms"])
                 if done:
                     kept.append(segment)
-                elif start >= old_end + tolerance:
-                    kept.append(segment)
-                    done = True
-                elif start < old_end - tolerance and end <= old_end + tolerance:
+                    continue
+                own = head[repeated : repeated + count]
+                matched, matched_end = _repeat_of(
+                    seam.old_segments, own, segment["start_ms"]
+                )
+                if count and matched == count:
                     repeated += count
+                    continue
+                if matched:
+                    # Its repeated words go with the text; what is left starts
+                    # where the old words it repeats ended.
+                    repeated += matched
+                    kept.append(_trim_segment(segment, matched, matched_end))
                 else:
-                    own = head[repeated : repeated + count]
-                    overlap = _tail_overlap(seam.old_words, own)
-                    repeated += overlap
-                    if overlap == count:
-                        continue
-                    if overlap:
-                        # Its repeated words go with the text; what is left
-                        # starts where the old words ended.
-                        kept.append(
-                            _trim_segment(
-                                segment, overlap, old_end - self._ms(self._base)
-                            )
-                        )
-                    else:
-                        # Near the seam with other words: new. Across it with
-                        # nothing matching: unknown, so say so.
-                        gap = start < old_end - tolerance
-                        kept.append(segment)
-                    done = True
+                    gap = segment["start_ms"] < old_end
+                    kept.append(segment)
+                done = True
             if done:
                 self._seam = None
             self._cut_words(data, words, repeated)
@@ -813,13 +847,11 @@ class ContinuingSpeechSession:
             }
         return json.dumps(configure, separators=(",", ":")), asked
 
-    def _give_up(self, cause: str) -> GatewayError:
-        return GatewayError(
-            "Relay speech stream could not be continued",
-            code=cause,
-            source="relay",
-            retryable=False,
-        )
+    def _give_up(self, code: str, last: str = "") -> GatewayError:
+        message = "Relay speech stream could not be continued"
+        if last and last != code:
+            message += f" (last failure: {last})"
+        return GatewayError(message, code=code, source="relay", retryable=False)
 
     async def _recover(self, cause: str) -> AsyncIterator[CanonicalEvent]:
         self._live, self._recovering = False, True
@@ -844,9 +876,10 @@ class ContinuingSpeechSession:
         if self._closed:
             return
         # One budget per outage: repeated drops share it until a final on new
-        # audio proves the stream works again.
+        # audio proves the stream works again. It runs only while there is no
+        # session: time spent catching up on one does not count.
         if self._deadline is None:
-            self._deadline = time.monotonic() + self._limits.outage_seconds
+            self._deadline = time.monotonic() + self._budget_left
         # The log is not trimmed while a session is being opened, so the
         # offset the dial names stays the replay's start, and a retried dial
         # sends the same bytes.
@@ -859,7 +892,9 @@ class ContinuingSpeechSession:
                 if self._closed:
                     return
                 remaining = self._deadline - time.monotonic()
-                if self._attempts >= self._limits.max_attempts or remaining <= 0:
+                if remaining <= 0:
+                    raise self._give_up("outage_timeout", cause)
+                if self._attempts >= self._limits.max_attempts:
                     raise self._give_up(cause)
                 self._attempts += 1
                 try:
@@ -868,13 +903,15 @@ class ContinuingSpeechSession:
                     )
                 except DialCancelled:
                     return
-                except (DialUnknown, TimeoutError) as error:
+                except (DialUnknown, *_TIMEOUTS) as error:
+                    if not isinstance(error, DialUnknown) and (
+                        self._deadline <= time.monotonic()
+                    ):
+                        # The dial hung until the budget ran out.
+                        raise self._give_up("outage_timeout", cause) from None
                     # The server may have started this request: same key, same
                     # bytes, so it answers this one rather than starting another.
-                    # A dial cut short by the end of the budget keeps the cause
-                    # that spent it.
-                    if isinstance(error, DialUnknown) or self._deadline > time.monotonic():
-                        cause = "dial_unknown"
+                    cause = "dial_unknown"
                     await self._pause()
                     continue
                 except DialRefused as refusal:
@@ -980,21 +1017,31 @@ class ContinuingSpeechSession:
             # Old finals that may hold words inside the replay. Without them
             # the replay repeats nothing already delivered.
             start_ms = self._ms(start)
+            boundary_ms = self._boundary_ms(start)
             window = [
                 final
                 for final in self._history
-                if (final.end_ms is not None and final.end_ms > start_ms + ROUNDING_MS)
+                if (
+                    final.end_ms is not None
+                    and final.end_ms > boundary_ms + ROUNDING_MS
+                )
                 or (final.end_ms is None and final.arrived > start)
             ]
             self._seam = None
             if window:
+                timed = all(
+                    final.end_ms is not None and final.segments for final in window
+                )
                 self._seam = _Seam(
                     from_ms=start_ms,
                     to_ms=self._ms(self._appended),
                     old_words=[word for final in window for word in final.words],
-                    old_end_ms=window[-1].end_ms
-                    if all(final.end_ms is not None for final in window)
-                    else None,
+                    old_end_ms=window[-1].end_ms if timed else None,
+                    old_segments=tuple(
+                        segment for final in window for segment in final.segments
+                    )
+                    if timed
+                    else (),
                 )
             self._queue = deque()
             for entry in self._log:
@@ -1027,6 +1074,11 @@ class ContinuingSpeechSession:
             self._drainer = loop.create_task(
                 self._drain(websocket, started, sent), name="speko.relay.stt.replay"
             )
+            # A session is reached: the outage budget stops running. What is
+            # left of it carries over to a drop before a final on new audio.
+            if self._deadline is not None:
+                self._budget_left = max(0.0, self._deadline - time.monotonic())
+                self._deadline = None
         kind = "session.continued" if confirmed else "session.restarted"
         data: dict[str, Any] = {
             "request_id": ready["request_id"],
@@ -1094,12 +1146,57 @@ def _final_span(data: dict[str, Any]) -> None:
         data["audio_end_ms"] = segments[-1].get("end_ms")
 
 
-def _tail_overlap(old: list[str], new: list[str]) -> int:
-    """How many leading words of ``new`` repeat the last words of ``old``."""
-    for size in range(min(len(new), len(old)), 0, -1):
-        if new[:size] == old[-size:]:
-            return size
-    return 0
+def _repeat_of(
+    old: tuple[tuple[tuple[str, ...], int, int], ...], words: list[str], start_ms: int
+) -> tuple[int, int | None]:
+    """How many leading ``words`` (a segment starting at ``start_ms``) repeat
+    old delivered words, and where the last of those old words ended.
+
+    An old segment repeats when it has the same words and starts within
+    REPEAT_START_TOLERANCE_MS of the new one; a longer new segment may repeat
+    several old ones in a row.
+    """
+    best, best_end = 0, None
+    for index, (old_words, old_start, _) in enumerate(old):
+        if not old_words or abs(old_start - start_ms) > REPEAT_START_TOLERANCE_MS:
+            continue
+        matched, end = 0, None
+        for next_words, _, next_end in old[index:]:
+            size = min(len(next_words), len(words) - matched)
+            if not size or list(next_words[:size]) != words[matched : matched + size]:
+                break
+            matched += size
+            end = next_end
+            if size < len(next_words):
+                break
+        if matched > best:
+            best, best_end = matched, end
+    return best, best_end
+
+
+def _shifted(data: dict[str, Any], offset_ms: int) -> dict[str, Any]:
+    """Event data with its audio times moved by offset_ms."""
+    shifted = dict(data)
+    for key in ("audio_start_ms", "audio_end_ms", "start_ms", "end_ms"):
+        if type(shifted.get(key)) in (int, float):
+            shifted[key] += offset_ms
+    segments = shifted.get("segments")
+    if isinstance(segments, list):
+        shifted["segments"] = [
+            {
+                **segment,
+                **{
+                    key: segment[key] + offset_ms
+                    for key in ("start_ms", "end_ms")
+                    if type(segment.get(key)) in (int, float)
+                },
+            }
+            if isinstance(segment, dict)
+            else segment
+            for segment in segments
+        ]
+    return shifted
+
 
 
 def _trim_segment(segment: dict[str, Any], count: int, start_ms: int | None) -> dict[str, Any]:

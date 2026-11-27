@@ -1892,20 +1892,14 @@ async def test_stt_stream_fails_the_turn_on_a_failed_commit() -> None:
     assert failure.value.code == "commit_failed"
 
 
-async def test_stt_stream_places_a_restarted_session_on_the_original_timeline() -> None:
+async def test_stt_stream_keeps_the_session_timeline_after_restart() -> None:
+    # The continuing session already puts a restarted session's times on the
+    # stream's timeline; the bridge must not add from_ms again.
     stream = LiveKitSTTStream(
         ScriptedGatewaySession([
             CanonicalEvent(type="session.restarted", data={"request_id": "req_1", "route": {}, "replayed_ms": 900, "from_ms": 5_000}),
-            CanonicalEvent(
-                type="transcript.final",
-                data={"text": "hi", "audio_start_ms": 100, "audio_end_ms": 400, "speaker": "S1", "segments": [{"text": "hi", "start_ms": 100, "end_ms": 400, "speaker": "S1"}]},
-            ),
-            CanonicalEvent(type="session.continued", data={"request_id": "req_2", "route": {}, "replayed_ms": 100, "exact": True}),
-            CanonicalEvent(type="transcript.final", data={"text": "yo", "audio_start_ms": 6_000, "audio_end_ms": 6_200}),
+            CanonicalEvent(type="transcript.final", data={"text": "hi", "audio_start_ms": 5_100, "audio_end_ms": 5_400}),
         ])  # type: ignore[arg-type]
     )
     events = [event async for event in stream.events() if event.type == "transcript.final"]
-    # The restarted session counts from 0; its audio starts at 5 s.
     assert (events[0].start_time, events[0].end_time) == (5.1, 5.4)
-    # A confirmed continuation is already on the original timeline.
-    assert (events[1].start_time, events[1].end_time) == (6.0, 6.2)

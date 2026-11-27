@@ -230,9 +230,6 @@ class LiveKitSTTStream:
         # Each session.continued or restarted starts a new provider session,
         # whose speaker labels name other people than the same labels before.
         self._generation = 0
-        # After session.restarted the new session counts its times from 0;
-        # its audio starts at from_ms on the original request's timeline.
-        self._offset_ms = 0
         self.continuation_counts: Counter[str] = Counter()
 
     @property
@@ -299,8 +296,6 @@ class LiveKitSTTStream:
                     source="relay",
                     retryable=False,
                 )
-            if self._offset_ms:
-                event = replace(event, data=_shifted(event.data, self._offset_ms))
             for mapped in _speech_events(event, local_speakers=self._local_speakers):
                 yield self._scoped(mapped)
 
@@ -308,12 +303,6 @@ class LiveKitSTTStream:
         self.continuation_counts[event.type] += 1
         if event.type in {"session.continued", "session.restarted"}:
             self._generation += 1
-            from_ms = event.data.get("from_ms")
-            self._offset_ms = (
-                from_ms
-                if event.type == "session.restarted" and type(from_ms) is int
-                else 0
-            )
         log = _logger.warning if event.type == "session.gap" else _logger.info
         log("Speko Gateway STT %s: %s", event.type, event.data)
         if self._on_continuation is not None:
@@ -334,30 +323,6 @@ class LiveKitSTTStream:
                 for part in event.speaker_segments
             ),
         )
-
-
-def _shifted(data: dict[str, Any], offset_ms: int) -> dict[str, Any]:
-    """Event data with its audio times moved by offset_ms."""
-    shifted = dict(data)
-    for key in ("audio_start_ms", "audio_end_ms"):
-        if isinstance(shifted.get(key), (int, float)):
-            shifted[key] += offset_ms
-    segments = shifted.get("segments")
-    if isinstance(segments, list):
-        shifted["segments"] = [
-            {
-                **segment,
-                **{
-                    key: segment[key] + offset_ms
-                    for key in ("start_ms", "end_ms")
-                    if isinstance(segment.get(key), (int, float))
-                },
-            }
-            if isinstance(segment, dict)
-            else segment
-            for segment in segments
-        ]
-    return shifted
 
 
 _CONTINUATION_EVENTS = frozenset(

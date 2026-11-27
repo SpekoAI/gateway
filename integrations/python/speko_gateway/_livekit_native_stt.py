@@ -697,11 +697,13 @@ class NativeSpeechStream(stt.RecognizeStream):
     async def _wait_for_receiver(
         self, stream: LiveKitSTTStream, receiver: asyncio.Task[None]
     ) -> None:
-        """Wait for the turn's finals within conn_options.timeout, renewed for
-        as long as a dropped stream is being continued: a continuation dials
-        and replays up to 15 s of audio, and its own outage budget bounds it."""
+        """Wait for the turn's finals within conn_options.timeout, renewed while
+        a dropped stream is being continued and for one period after it caught
+        up (its last finals still arrive then). Reaching a session is bounded
+        by the outage budget and catching up by the bounded backlog at 2x."""
         counts = getattr(stream, "continuation_counts", None)
         seen = counts["session.reconnecting"] if counts is not None else 0
+        was_recovering = False
         while True:
             try:
                 await asyncio.wait_for(
@@ -710,9 +712,10 @@ class NativeSpeechStream(stt.RecognizeStream):
                 return
             except (TimeoutError, asyncio.TimeoutError):
                 reconnects = counts["session.reconnecting"] if counts is not None else 0
-                if not getattr(stream, "recovering", False) and reconnects == seen:
+                recovering = getattr(stream, "recovering", False) is True
+                if not (recovering or was_recovering or reconnects != seen):
                     raise
-                seen = reconnects
+                seen, was_recovering = reconnects, recovering
 
     async def _finish_turn(self, speech_end: int | None = None) -> None:
         assert self._gateway_stream is not None and self._receiver is not None

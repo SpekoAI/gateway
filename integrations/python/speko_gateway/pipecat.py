@@ -329,21 +329,24 @@ class SpekoSTTService(PipecatSTTService):
     async def _wait_for_receiver(
         self, session: SpeechSession, task: asyncio.Task[None]
     ) -> None:
-        """Wait for the last transcript, 5 s at a time, renewed for as long as
-        a dropped stream is being continued: a continuation dials and replays
-        up to 15 s of audio, and its own outage budget bounds it."""
+        """Wait for the last transcript, 5 s at a time, renewed while a dropped
+        stream is being continued and for one period after it caught up (its
+        last finals still arrive then). Reaching a session is bounded by the
+        outage budget and catching up by the bounded backlog at 2x."""
         seen = self.continuation_counts["session.reconnecting"]
+        was_recovering = False
         while True:
             try:
                 await asyncio.wait_for(
                     asyncio.shield(task), timeout=_RECEIVE_GRACE_SECONDS
                 )
                 return
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 reconnects = self.continuation_counts["session.reconnecting"]
-                if not getattr(session, "recovering", False) and reconnects == seen:
+                recovering = getattr(session, "recovering", False) is True
+                if not (recovering or was_recovering or reconnects != seen):
                     return
-                seen = reconnects
+                seen, was_recovering = reconnects, recovering
 
     async def _finish(self, *, graceful: bool) -> None:
         session = self._session
