@@ -751,9 +751,11 @@ class ContinuingSpeechSession:
         word repeats an old one when it has the same text and starts within
         REPEAT_START_TOLERANCE_MS of it, each old word matching once over the
         whole seam. With segment times only, a segment inside the delivered
-        audio is a repeat, one that starts at the old end is new, and one
-        across it loses the leading words that exactly repeat the delivered
-        tail; when none do, it is kept whole with a gap up to the old end.
+        audio is a repeat, one that starts at the old end is new (both within
+        ROUNDING_MS), and one across it loses its leading words only when they
+        exactly repeat every old word it overlaps; otherwise it is kept whole
+        with a gap up to the old end. On the words[] path a word that starts
+        at the old end is new too.
         Finals without times are aligned by text. Returns the gap event, if
         any, and whether the final still has anything to deliver.
         """
@@ -799,6 +801,10 @@ class ContinuingSpeechSession:
                 ),
                 None,
             )
+            if start >= seam.old_end_ms - ROUNDING_MS:
+                # Starts where every delivered word had ended: new, whatever
+                # it matches.
+                break
             if match is None:
                 if start < seam.old_end_ms - REPEAT_START_TOLERANCE_MS:
                     # A different word over audio already delivered.
@@ -835,7 +841,7 @@ class ContinuingSpeechSession:
     ) -> tuple[list[CanonicalEvent], bool]:
         seam = self._seam
         assert seam is not None and seam.old_end_ms is not None
-        old_end, tolerance = seam.old_end_ms, REPEAT_START_TOLERANCE_MS
+        old_end = seam.old_end_ms
         head = [word for _, word in words]
         repeated, kept, done, gap = 0, [], False, None
         # Words are cut from the front of the text, so only a leading run of
@@ -851,25 +857,21 @@ class ContinuingSpeechSession:
                 kept.append(segment)
                 done = True
                 continue
-            inside = start < old_end - tolerance and end <= old_end + tolerance
-            if inside and end <= old_end + ROUNDING_MS:
+            if end <= old_end + ROUNDING_MS:
                 # Lies inside audio whose words were delivered: a repeat.
                 repeated += count
                 continue
-            size = self._tail_repeat(seam, own, start, end)
-            if inside and not size or count and size == count:
-                # A repeat, though it may end up to the tolerance past the
-                # old end: only an exact repeat of the tail can leave words.
+            size = self._tail_repeat(seam, own, start)
+            if count and size == count:
                 repeated += count
                 continue
             if size:
                 repeated += size
                 kept.append(_trim_segment(segment, size, old_end))
             else:
-                if start < old_end - tolerance:
-                    # Across the old end and no exact repeat of the delivered
-                    # tail: the seam is unsure over this span.
-                    gap = (start, old_end)
+                # Across the old end and no exact repeat of the delivered
+                # tail: the seam is unsure over this span, however short.
+                gap = (start, old_end)
                 kept.append(segment)
             done = True
         if repeated:
@@ -882,7 +884,7 @@ class ContinuingSpeechSession:
             data["segments"] = kept
         else:
             data.pop("segments", None)
-        if any(segment["end_ms"] > old_end + tolerance for segment in kept):
+        if any(segment["end_ms"] > old_end + ROUNDING_MS for segment in kept):
             self._seam = None
         elif kept:
             # Still at the seam: what this final delivers is old from now on.
@@ -902,25 +904,17 @@ class ContinuingSpeechSession:
         return events, bool(data["text"]) or "commit_id" in data
 
     @staticmethod
-    def _tail_repeat(seam: _Seam, own: list[str], start: int, end: int) -> int:
-        """How many leading words of a segment over ``start``-``end`` exactly
-        repeat the delivered tail: the longest such run, no shorter than the
-        old words mostly inside the segment's span and no longer than those
-        that overlap it. 0 when there is none."""
-        tolerance = REPEAT_START_TOLERANCE_MS
-        least = sum(
-            len(words)
-            for words, begin, finish in seam.old_segments
-            if (begin + finish) / 2 >= start and begin < end
+    def _tail_repeat(seam: _Seam, own: list[str], start: int) -> int:
+        """How many leading words of a segment starting at ``start`` exactly
+        repeat the delivered tail. The old words in play are those of every
+        old segment that overlaps it; the repeat must cover all of them, or
+        all of the segment when it is shorter. 0 when it does not."""
+        in_play = sum(
+            len(words) for words, _, finish in seam.old_segments if finish > start
         )
-        most = sum(
-            len(words)
-            for words, _, finish in seam.old_segments
-            if finish > start - tolerance
-        )
-        for size in range(min(most, len(own), len(seam.tail)), max(least, 1) - 1, -1):
-            if seam.tail[-size:] == own[:size]:
-                return size
+        size = min(in_play, len(own), len(seam.tail))
+        if size and seam.tail[-size:] == own[:size]:
+            return size
         return 0
 
     def _stitch_text(

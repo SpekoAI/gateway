@@ -1068,7 +1068,8 @@ async def test_seam_trims_a_straddling_segment_with_the_text():
     session._log = [_Audio(ms(500), block(1) * 30)]
     session._appended = session._log[0].end
     await resume(session, 500)
-    events = session._on_final({"text": "b c d", "segments": [{**seg("b c d", 900, 1_200), "speaker": "S1"}]})
+    # "b c d" from 810: it overlaps old "b" and "c", and repeats them exactly.
+    events = session._on_final({"text": "b c d", "segments": [{**seg("b c d", 810, 1_200), "speaker": "S1"}]})
     assert events[-1].data["text"] == "d"
     assert events[-1].data["segments"] == [{"text": "d", "start_ms": 1_000, "end_ms": 1_200, "speaker": "S1"}]
     await session.aclose()
@@ -1391,14 +1392,18 @@ async def test_real_restarted_session_drops_a_segment_inside_delivered_audio():
         ],
         {**READY, "request_id": "req_22", "continuation": False},
     )
-    assert [event.type for event in events] == ["transcript.final"]
-    assert events[0].data["text"] == "the weather in almaty today is cold about minus five degrees"
-    assert events[0].data["segments"][0]["start_ms"] == 13_865
+    # The second final starts 10 ms before the old end and does not repeat
+    # the old words it overlaps: kept whole, with an honest 10 ms gap.
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 13_865, "to_ms": 13_875}
+    assert events[1].data["text"] == "the weather in almaty today is cold about minus five degrees"
+    assert events[1].data["segments"][0]["start_ms"] == 13_865
 
 
-async def test_no_covered_seam_trims_a_straddling_segment_by_the_old_tail():
+async def test_no_covered_seam_keeps_a_straddler_that_does_not_repeat_every_old_word_it_overlaps():
     # Fake relay without covered_ms, cut at 17.3 s: one new segment straddles
-    # the old end (16000) and its first 10 words repeat the old tail.
+    # the old end (16000). It overlaps all 12 old words but repeats only the
+    # last 10: kept whole, with a gap up to the old end.
     old = [
         old_final(("w98 w176 w252 w22", 10_000, 12_000)),
         old_final(("w13 w17 w56 w176", 12_000, 14_000)),
@@ -1406,9 +1411,9 @@ async def test_no_covered_seam_trims_a_straddling_segment_by_the_old_tail():
     ]
     text = "w252 w22 w13 w17 w56 w176 w254 w233 w33 w38 w252 w117 w168 w103"
     events = await stitched(old, 11_000, [{"text": text, "segments": [seg(text, 11_002, 18_000)]}])
-    assert [event.type for event in events] == ["transcript.final"]
-    assert events[0].data["text"] == "w252 w117 w168 w103"
-    assert events[0].data["segments"] == [seg("w252 w117 w168 w103", 16_000, 18_000)]
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 11_002, "to_ms": 16_000}
+    assert events[1].data["text"] == text
 
 
 async def test_a_straddling_segment_that_diverges_gets_a_gap_for_its_span_only():
@@ -1497,8 +1502,11 @@ async def test_without_covered_ms_the_replay_starts_before_the_last_final_ended(
     assert "session.gap" not in [event.type for event in events]
     new = "fifty cents the weather in almaty today is cold about minus five degrees please call me back"
     events = session._on_event("transcript.final", {"type": "transcript.final", "text": new, "segments": [seg(new, 0, 8_410)]})
-    assert [event.type for event in events] == ["transcript.final"]
-    assert events[0].data["text"] == "the weather in almaty today is cold about minus five degrees please call me back"
+    # "fifty cents" overlaps the whole old segment, which it does not repeat
+    # in full: kept, with a gap; nothing after 13865 is lost.
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 12_865, "to_ms": 13_865}
+    assert events[1].data["text"] == new
     await session.aclose()
 
 
@@ -1606,3 +1614,40 @@ async def test_an_untimed_final_after_a_timed_repeat_is_kept_with_a_gap():
     events = await stitched(old, 400, [{"text": "go now", "segments": [seg("go now", 510, 1_000)]}, {"text": "go now"}])
     assert [event.type for event in events] == ["session.gap", "transcript.final"]
     assert events[1].data["text"] == "go now"
+
+
+async def test_a_straddler_that_changes_a_word_is_kept_with_a_gap():
+    # "send it" (500-1000), then "send this now" (510-1100): not a repeat.
+    old = [old_final(("send it", 500, 1_000))]
+    events = await stitched(old, 400, [{"text": "send this now", "segments": [seg("send this now", 510, 1_100)]}])
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 510, "to_ms": 1_000}
+    assert events[1].data["text"] == "send this now"
+
+
+async def test_only_old_words_overlapping_the_segment_count():
+    # Old "go" (500-840) and "go" (850-1000), new "go go" (850-1200): only the
+    # second old "go" overlaps it, so one "go" repeats and one is new.
+    old = [old_final(("go", 500, 840), ("go", 850, 1_000))]
+    events = await stitched(old, 400, [{"text": "go go", "segments": [seg("go go", 850, 1_200)]}])
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "go"
+
+
+async def test_a_straddler_over_a_different_word_is_kept_with_a_gap():
+    # "turn left" (650-1000), then "a left now" (890-1380): not a repeat of
+    # the overlapped "turn left", so kept whole with a gap.
+    old = [old_final(("turn left", 650, 1_000))]
+    events = await stitched(old, 500, [{"text": "a left now", "segments": [seg("a left now", 890, 1_380)]}])
+    assert [event.type for event in events] == ["session.gap", "transcript.final"]
+    assert events[0].data == {"from_ms": 890, "to_ms": 1_000}
+    assert events[1].data["text"] == "a left now"
+
+
+async def test_a_word_after_the_old_end_is_new_on_the_words_path():
+    # Old "no" (890-1000); a new "no" at 1005-1195 lies after the old end.
+    old = [old_final(("no", 890, 1_000))]
+    old[0].timed_words = (("no", 890, 1_000),)
+    events = await stitched(old, 500, [{"text": "no", "segments": [seg("no", 1_005, 1_195)], "words": [word("no", 1_005, 1_195)]}])
+    assert [event.type for event in events] == ["transcript.final"]
+    assert events[0].data["text"] == "no"
