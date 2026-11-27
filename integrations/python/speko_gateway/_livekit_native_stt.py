@@ -694,10 +694,7 @@ class NativeSpeechStream(stt.RecognizeStream):
         # The stream's own state changes (inference done, turn finished, new speech) reach here before any
         # SDK commit attempt, so the log shows when the gate's stream-side conditions really opened.
         if self._wait_for_turn_commit:
-            permitted = self._gate_open(self._turn_text)
-            self._log_gate("stream", permitted)
-            if not permitted:
-                self._flush_for_commit()
+            self._log_gate("stream", self._gate_open(self._turn_text))
 
     def _gate_open(self, transcript: str) -> bool:
         text_match = not self._turn_text or " ".join(transcript.split()) == self._turn_text
@@ -713,8 +710,10 @@ class NativeSpeechStream(stt.RecognizeStream):
         """Only audio the detector has not analysed yet holds the turn commit. Live frames never let the input go
         idle, so the partial window is completed now (as the idle drain would) instead of waiting for frame and
         window boundaries to line up; the commit still waits for that audio's own result, so resumed speech in it
-        is classified first. It runs only for a turn that already has its final transcript and awaits commit, so
-        speech detection before and between turns never sees synthetic silence from here."""
+        is classified first. It runs only when the framework has ended its endpointing delay and tries to commit
+        (so the turn is going to commit unless this audio resumes speech), never from the stream's own events:
+        speech detection before and between turns, and while the framework still waits, never sees the padded
+        window from here."""
         if (
             self._wait_for_turn_commit
             and self._turn_commit is not None
